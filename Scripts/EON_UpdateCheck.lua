@@ -20,9 +20,11 @@ local GMEM_SECTION      = "Swing_Media_Transfer"
 -- the SAME repo the ReaPack index is served from, so one publish bumps both
 -- the available-update notification and the ReaPack package.
 -- Returns JSON with tag_name (e.g. "3.0") and html_url (release page).
--- ⚠️ Deliberately NOT the dev repo (mequaz-sudo/Swing-2): that one stays
--- PRIVATE, and making it public to answer this query would expose its whole
--- history, including scratchpad paths carrying a username.
+-- ⚠️ Deliberately the DISTRIBUTION repo, never the development one. The dev
+-- repo is private and must stay that way; making it public just to answer
+-- this query would expose its entire history. Do not repoint this at it.
+-- (This file ships to customers -- keep account/repo names other than the
+-- public distribution repo out of it.)
 local UPDATE_URL        = "https://api.github.com/repos/EON-Audio/swing/releases/latest"
 -- Must match the latest released ReaPack index.xml <version> AND the
 -- JSFX version (Swing_ReaKit.jsfx: version: 3.0). Compared against the
