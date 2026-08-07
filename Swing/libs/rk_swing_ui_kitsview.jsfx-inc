@@ -1,0 +1,320 @@
+// rk_swing_ui_kitsview.jsfx-inc — LOAD-button kits view (VIEW_KITS big view)
+// Spec_Swing_Kits_View.md. Replaces the native OS kit menu: type filter pills
+// (All/SMP/SYN/HYB) + folder column (folders = Data/Swing_Kits subdirs, one
+// deep) + wheel-scrolled kit list + info footer. Roster is BRIDGE-published
+// (EON_KITLIST band, seqlock SEQ even = stable); this file only READS the
+// band and re-requests via the REQ cell. A kit click re-enters the proven
+// browser-load funnel via CMD 24 (path staged in GS_BROWSER_PATH, RELATIVE
+// to Data/Swing_Kits — the bridge prefixes the dir; JSFX never writes
+// GS_KIT_LOAD_REQ / GS_PENDING_LOAD_INST / GS_LOAD_EPOCH and never pre-arms
+// kit_import_state — the @block arm gate raises busy when staging is real).
+//
+// Template = rk_swing_ui_outputs.jsfx-inc (full big-view contract: 5-var
+// _ov_* restore at top, dim + panel on the grid rect, X / click-outside
+// close guarded by active_id == -1, mandatory 5-var re-zero at the end).
+// Scratch prefix _kv_* per the @gfx/@block concurrency convention.
+// (c) EON Studios — All Rights Reserved
+
+@init
+
+// snapshot buffers (copied from gmem under seqlock on GEN change)
+function swing_kitsview_init(_mem) (
+  kv_folders = _mem; _mem += 31 * 32;    // [0]=len, [1..31]=chars per folder
+  kv_recs    = _mem; _mem += 128 * 56;   // 56-cell records (see spec §3)
+  kv_view    = _mem; _mem += 128;        // filtered indices, rebuilt per frame
+  memset(kv_folders, 0, 31 * 32);
+  memset(kv_recs, 0, 128 * 56);
+  kv_nkits = 0; kv_nfolders = 0; kv_gen_seen = -1;
+  kv_scroll = 0; kv_fsel = -1; kv_tfilter = 0; kv_hover = -1;
+  _mem;
+);
+
+// Open helper — the LOAD button calls this instead of arming CMD 2.
+// REQ bump asks the bridge for a fresh scan (stale roster self-heals).
+function swing_kitsview_open() (
+  gmem[EON_KITLIST_BASE + 5] += 1;
+  kv_scroll = 0; kv_hover = -1;
+  swing_bigview_open(VIEW_KITS);
+);
+
+// name/folder chars → #dest (records store char codes, not strings)
+function _kv_str(_ks_dest, _ks_base, _ks_len) local(_ks_i) (
+  str_setlen(_ks_dest, 0);
+  _ks_i = 0;
+  loop(min(_ks_len, 40),
+    str_setchar(_ks_dest, _ks_i, _ks_base[_ks_i] | 0);
+    _ks_i += 1;
+  );
+  str_setlen(_ks_dest, min(_ks_len, 40));
+);
+
+// ── Pick emitter (SHARED: view click @gfx + probe dev hook @block) ─────────
+// Reads the record straight from the PUBLISHED band (not the display
+// snapshot) so a click can never assemble a path from torn/stale copies, and
+// so the headless probe exercises the REAL assembly. Stages the RELATIVE
+// path (folder '/' name '.swing' — FORWARD slash: POSIX keeps it, Windows
+// io.open accepts it; audit 2026-07-30 caught the hardcoded backslash) into
+// GS_BROWSER_PATH, then WANT, then CMD 24 LAST. Gate mirrors the funnel
+// contract; returns 1 on emit.
+function swing_kitsview_emit_pick(_ep_i)
+local(_ep_rb, _ep_o, _ep_f, _ep_fb, _ep_fl, _ep_j, _ep_nl)
+(
+  _ep_i >= 0 && _ep_i < (gmem[EON_KITLIST_BASE + 2] | 0) &&
+  (gmem[EON_KITLIST_BASE] | 0) % 2 == 0 &&
+  gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 &&
+  !kit_busy && kit_import_state == 0 ? (
+    _ep_rb = EON_KITLIST_RECORDS + _ep_i * 56;
+    _ep_o = 0;
+    _ep_f = gmem[_ep_rb + 41] | 0;
+    _ep_f > 0 ? (
+      _ep_fb = EON_KITLIST_FOLDERS + _ep_f * 32;
+      _ep_fl = gmem[_ep_fb] | 0;
+      _ep_j = 0;
+      loop(min(_ep_fl, 31),
+        gmem[GS_BROWSER_PATH + _ep_o] = gmem[_ep_fb + 1 + _ep_j] | 0;
+        _ep_o += 1; _ep_j += 1;
+      );
+      gmem[GS_BROWSER_PATH + _ep_o] = 47;   // '/' — portable separator
+      _ep_o += 1;
+    );
+    _ep_nl = gmem[_ep_rb] | 0;
+    _ep_j = 0;
+    loop(min(_ep_nl, 40),
+      gmem[GS_BROWSER_PATH + _ep_o] = gmem[_ep_rb + 1 + _ep_j] | 0;
+      _ep_o += 1; _ep_j += 1;
+    );
+    // ".swing"
+    gmem[GS_BROWSER_PATH + _ep_o] = 46;  _ep_o += 1;
+    gmem[GS_BROWSER_PATH + _ep_o] = 115; _ep_o += 1;
+    gmem[GS_BROWSER_PATH + _ep_o] = 119; _ep_o += 1;
+    gmem[GS_BROWSER_PATH + _ep_o] = 105; _ep_o += 1;
+    gmem[GS_BROWSER_PATH + _ep_o] = 110; _ep_o += 1;
+    gmem[GS_BROWSER_PATH + _ep_o] = 103; _ep_o += 1;
+    gmem[GS_BROWSER_PATH_LEN] = _ep_o;
+    gmem[GS_LOAD_WANT] = instance_id;
+    gmem[KIT_GMEM_CMD] = 24;              // publish flag LAST
+    1;
+  ) : 0;
+);
+
+function swing_kitsview_draw()
+local(_kv_seq0, _kv_seq1, _kv_gen, _kv_i, _kv_j, _kv_b, _kv_x, _kv_y, _kv_w,
+      _kv_h, _kv_px, _kv_pw, _kv_hovp, _kv_fx, _kv_fy, _kv_fw, _kv_row_h,
+      _kv_n, _kv_ly0, _kv_lh, _kv_rows_vis, _kv_ri, _kv_rb, _kv_typ, _kv_cnt,
+      _kv_kb, _kv_fold, _kv_ry, _kv_hov_row, _kv_pick, _kv_o, _kv_fb, _kv_fl,
+      _kv_chov, _kv_out, _kv_cxb, _kv_cyb, tw, th, _kv_a, _kv_fcnt, _kv_lx,
+      _kv_lw, _kv_sel_ok)
+(
+  // ── modal-gate restore (mandatory big-view contract) ──
+  lmb_down = _ov_lmb_down; rmb_down = _ov_rmb_down;
+  LMB = _ov_LMB; RMB = _ov_RMB; frame_wheel = _ov_wheel;
+
+  // ── seqlock snapshot on GEN change. The copy is in-place, so a torn read
+  // has already dirtied the buffers — zero the counts for this frame (one
+  // frame of "refreshing", picks impossible from mixed data) and retry;
+  // counts are captured INSIDE the validated window (audit 2026-07-30). ──
+  _kv_seq0 = gmem[EON_KITLIST_BASE] | 0;
+  _kv_gen  = gmem[EON_KITLIST_BASE + 1] | 0;
+  (_kv_seq0 % 2) == 0 && _kv_gen != kv_gen_seen ? (
+    _kv_n = min(gmem[EON_KITLIST_BASE + 2] | 0, 128);
+    _kv_i = min(gmem[EON_KITLIST_BASE + 3] | 0, 31);
+    _kv_j = 0; loop(31 * 32, kv_folders[_kv_j] = gmem[EON_KITLIST_FOLDERS + _kv_j]; _kv_j += 1;);
+    _kv_j = 0; loop(128 * 56, kv_recs[_kv_j] = gmem[EON_KITLIST_RECORDS + _kv_j]; _kv_j += 1;);
+    _kv_seq1 = gmem[EON_KITLIST_BASE] | 0;
+    _kv_seq1 == _kv_seq0 ? (
+      kv_gen_seen = _kv_gen;
+      kv_nkits    = _kv_n;
+      kv_nfolders = _kv_i;
+      kv_fsel >= kv_nfolders ? kv_fsel = -1;
+    ) : (
+      kv_nkits = 0;   // torn — buffers are mixed; hide until the clean recopy
+    );
+  );
+
+  // ── backdrop + panel (grid rect, blue identity = LOAD family) ──
+  gfx_set(0, 0, 0, 0.45); gfx_rect(0, 28, gfx_w, gfx_h - 28);
+  gfx_set(0.07, 0.09, 0.12, 0.98); gfx_rect(grid_x, grid_y, grid_w, grid_h);
+  gfx_set(0.30, 0.55, 0.90, 0.9);  gfx_rect(grid_x, grid_y, grid_w, grid_h, 0);
+
+  gfx_setfont(1, "Arial", 13, 'b');
+  gfx_set(0.85, 0.90, 0.96, 1);
+  gfx_x = grid_x + 10; gfx_y = grid_y + 4; gfx_drawstr("LOAD KIT");
+
+  // X (canonical rect + close at the bottom of this fn)
+  _kv_cxb = grid_x + grid_w - 20; _kv_cyb = grid_y + 3;
+  _kv_chov = mx >= _kv_cxb - 3 && mx <= _kv_cxb + 17 && my >= _kv_cyb - 2 && my <= _kv_cyb + 15;
+  gfx_setfont(1, "Arial", 13, 'b');
+  gfx_set(1, 1, 1, _kv_chov ? 0.95 : 0.55);
+  gfx_x = _kv_cxb + 3; gfx_y = _kv_cyb; gfx_drawstr("X");
+
+  // ── type filter pills + REFRESH ──
+  _kv_px = grid_x + 10; _kv_y = grid_y + 26; _kv_pw = 46;
+  _kv_i = 0;
+  loop(4,
+    _kv_hovp = mx >= _kv_px && mx <= _kv_px + _kv_pw - 4 && my >= _kv_y && my <= _kv_y + 16;
+    kv_tfilter == _kv_i ? gfx_set(0.16, 0.32, 0.50, 1)
+                        : gfx_set(0.11, 0.14, 0.19, _kv_hovp ? 1 : 0.85);
+    gfx_rect(_kv_px, _kv_y, _kv_pw - 4, 16);
+    _kv_i == 0 ? gfx_set(0.85, 0.88, 0.92, kv_tfilter == 0 ? 1 : 0.75) :
+    _kv_i == 1 ? gfx_set(0.40, 0.65, 1.00, kv_tfilter == 1 ? 1 : 0.75) :
+    _kv_i == 2 ? gfx_set(0.35, 0.85, 0.50, kv_tfilter == 2 ? 1 : 0.75) :
+                 gfx_set(0.95, 0.70, 0.25, kv_tfilter == 3 ? 1 : 0.75);
+    gfx_setfont(1, "Arial", 9, 'b');
+    strcpy(#kv_tag, _kv_i == 0 ? "ALL" : _kv_i == 1 ? "SMP" : _kv_i == 2 ? "SYN" : "HYB");
+    gfx_measurestr(#kv_tag, tw, th);
+    gfx_x = _kv_px + (_kv_pw - 4 - tw) / 2; gfx_y = _kv_y + (16 - th) / 2; gfx_drawstr(#kv_tag);
+    _kv_hovp && lmb_down ? ( kv_tfilter = _kv_i; kv_scroll = 0; );
+    _kv_px += _kv_pw;
+    _kv_i += 1;
+  );
+  // refresh (re-scan request)
+  _kv_hovp = mx >= _kv_px && mx <= _kv_px + 58 && my >= _kv_y && my <= _kv_y + 16;
+  gfx_set(0.11, 0.14, 0.19, _kv_hovp ? 1 : 0.85); gfx_rect(_kv_px, _kv_y, 58, 16);
+  gfx_set(0.60, 0.75, 0.90, 0.85);
+  gfx_measurestr("RESCAN", tw, th);
+  gfx_x = _kv_px + (58 - tw) / 2; gfx_y = _kv_y + (16 - th) / 2; gfx_drawstr("RESCAN");
+  _kv_hovp && lmb_down ? gmem[EON_KITLIST_BASE + 5] += 1;
+
+  // ── folder column ──
+  _kv_fx = grid_x + 10; _kv_fy = grid_y + 50; _kv_fw = 118; _kv_row_h = 18;
+  gfx_setfont(1, "Arial", 10, 'b');
+  _kv_i = -1;   // -1 = "All kits" row, then folder 0..kv_nfolders-1
+  loop(kv_nfolders + 1,
+    _kv_ry = _kv_fy + (_kv_i + 1) * _kv_row_h;
+    _kv_ry + _kv_row_h < grid_y + grid_h - 22 ? (
+      _kv_hovp = mx >= _kv_fx && mx <= _kv_fx + _kv_fw && my >= _kv_ry && my <= _kv_ry + _kv_row_h - 2;
+      kv_fsel == _kv_i ? gfx_set(0.14, 0.28, 0.42, 1)
+                       : gfx_set(0.10, 0.13, 0.17, _kv_hovp ? 1 : 0.0);
+      (kv_fsel == _kv_i || _kv_hovp) ? gfx_rect(_kv_fx, _kv_ry, _kv_fw, _kv_row_h - 2);
+      _kv_i < 0 ? (
+        strcpy(#kv_nm, "All kits");
+        _kv_fcnt = kv_nkits;
+      ) : (
+        _kv_str(#kv_nm, kv_folders + _kv_i * 32 + 1, kv_folders[_kv_i * 32] | 0);
+        // count kits in this folder (unfiltered)
+        _kv_fcnt = 0; _kv_j = 0;
+        loop(kv_nkits,
+          (kv_recs[_kv_j * 56 + 41] | 0) == _kv_i ? _kv_fcnt += 1;
+          _kv_j += 1;
+        );
+      );
+      gfx_set(0.80, 0.84, 0.90, kv_fsel == _kv_i ? 1 : 0.75);
+      gfx_x = _kv_fx + 5; gfx_y = _kv_ry + 3; gfx_drawstr(#kv_nm);
+      sprintf(#kv_tag, "%d", _kv_fcnt);
+      gfx_measurestr(#kv_tag, tw, th);
+      gfx_set(0.45, 0.55, 0.65, 0.8);
+      gfx_x = _kv_fx + _kv_fw - tw - 4; gfx_y = _kv_ry + 3; gfx_drawstr(#kv_tag);
+      _kv_hovp && lmb_down ? ( kv_fsel = _kv_i; kv_scroll = 0; );
+    );
+    _kv_i += 1;
+  );
+
+  // ── filtered view (indices into kv_recs) ──
+  _kv_n = 0; _kv_i = 0;
+  loop(kv_nkits,
+    _kv_typ  = kv_recs[_kv_i * 56 + 42] | 0;
+    _kv_fold = kv_recs[_kv_i * 56 + 41] | 0;
+    (kv_fsel < 0 || _kv_fold == kv_fsel) &&
+    (kv_tfilter == 0 || _kv_typ == kv_tfilter) ? (
+      kv_view[_kv_n] = _kv_i; _kv_n += 1;
+    );
+    _kv_i += 1;
+  );
+
+  // ── kit list (wheel-scrolled) ──
+  _kv_lx = grid_x + 138; _kv_lw = grid_w - 148;
+  _kv_ly0 = grid_y + 50; _kv_lh = grid_h - 50 - 24;
+  _kv_rows_vis = max(1, (_kv_lh / 20) | 0);
+  // wheel anywhere over the list scrolls it
+  frame_wheel != 0 && mx >= _kv_lx && my >= _kv_ly0 && my <= _kv_ly0 + _kv_lh ? (
+    kv_scroll -= (frame_wheel > 0 ? 3 : -3);
+    frame_wheel = 0;
+  );
+  kv_scroll = max(0, min(kv_scroll, max(0, _kv_n - _kv_rows_vis)));
+
+  kv_hover = -1;
+  _kv_pick = -1;
+  gfx_setfont(1, "Arial", 10, 'b');
+  _kv_ri = 0;
+  loop(min(_kv_rows_vis, _kv_n),
+    _kv_i  = kv_view[kv_scroll + _kv_ri] | 0;
+    _kv_rb = _kv_i * 56;
+    _kv_ry = _kv_ly0 + _kv_ri * 20;
+    _kv_hovp = mx >= _kv_lx && mx <= _kv_lx + _kv_lw && my >= _kv_ry && my <= _kv_ry + 18;
+    _kv_hovp ? ( kv_hover = _kv_i; gfx_set(0.13, 0.24, 0.36, 1); gfx_rect(_kv_lx, _kv_ry, _kv_lw, 18); );
+    _kv_str(#kv_nm, kv_recs + _kv_rb + 1, kv_recs[_kv_rb] | 0);
+    gfx_set(0.88, 0.91, 0.95, _kv_hovp ? 1 : 0.85);
+    gfx_x = _kv_lx + 6; gfx_y = _kv_ry + 3; gfx_drawstr(#kv_nm);
+    // type tag, right-aligned
+    _kv_typ = kv_recs[_kv_rb + 42] | 0;
+    strcpy(#kv_tag, _kv_typ == 1 ? "SMP" : _kv_typ == 2 ? "SYN" : _kv_typ == 3 ? "HYB" : "?");
+    _kv_typ == 1 ? gfx_set(0.40, 0.65, 1.00, 0.9) :
+    _kv_typ == 2 ? gfx_set(0.35, 0.85, 0.50, 0.9) :
+    _kv_typ == 3 ? gfx_set(0.95, 0.70, 0.25, 0.9) : gfx_set(0.50, 0.52, 0.56, 0.9);
+    gfx_measurestr(#kv_tag, tw, th);
+    gfx_x = _kv_lx + _kv_lw - tw - 6; gfx_y = _kv_ry + 3; gfx_drawstr(#kv_tag);
+    _kv_hovp && lmb_down ? _kv_pick = _kv_i;
+    _kv_ri += 1;
+  );
+  // scrollbar
+  _kv_n > _kv_rows_vis ? (
+    gfx_set(0.25, 0.35, 0.48, 0.6);
+    gfx_rect(_kv_lx + _kv_lw + 3,
+             _kv_ly0 + (kv_scroll / _kv_n) * _kv_lh,
+             3, max(12, (_kv_rows_vis / _kv_n) * _kv_lh));
+  );
+  // empty / offline states
+  _kv_n == 0 ? (
+    gfx_setfont(1, "Arial", 10, 0);
+    gfx_set(0.55, 0.60, 0.66, 0.8);
+    gfx_x = _kv_lx + 6; gfx_y = _kv_ly0 + 8;
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0
+      ? gfx_drawstr("No kits — save one, or drop .swing files in Data/Swing_Kits")
+      : gfx_drawstr("Bridge offline — kit list unavailable");
+  );
+
+  // ── footer: hover detail ──
+  gfx_setfont(1, "Arial", 9, 0);
+  gfx_set(0.55, 0.62, 0.70, 0.9);
+  gfx_x = grid_x + 10; gfx_y = grid_y + grid_h - 16;
+  kv_hover >= 0 ? (
+    _kv_rb = kv_hover * 56;
+    _kv_str(#kv_nm, kv_recs + _kv_rb + 1, kv_recs[_kv_rb] | 0);
+    _kv_cnt = kv_recs[_kv_rb + 43] | 0;
+    _kv_kb  = kv_recs[_kv_rb + 44] | 0;
+    _kv_typ = kv_recs[_kv_rb + 42] | 0;
+    strcpy(#kv_tag, _kv_typ == 1 ? "sample" : _kv_typ == 2 ? "synth" : _kv_typ == 3 ? "hybrid" : "?");
+    _kv_fold = kv_recs[_kv_rb + 41] | 0;
+    _kv_fold > 0 ? _kv_str(#kv_fold, kv_folders + _kv_fold * 32 + 1, kv_folders[_kv_fold * 32] | 0)
+                 : strcpy(#kv_fold, "Kits");
+    _kv_kb >= 1024 ? sprintf(#kv_info, "%s  ·  %s  ·  %d pads  ·  %.1f MB  ·  %s", #kv_nm, #kv_tag, _kv_cnt, _kv_kb / 1024, #kv_fold)
+                   : sprintf(#kv_info, "%s  ·  %s  ·  %d pads  ·  %d KB  ·  %s", #kv_nm, #kv_tag, _kv_cnt, _kv_kb, #kv_fold);
+    gfx_drawstr(#kv_info);
+  ) : (
+    gfx_drawstr("Click a kit to load it  ·  wheel scrolls  ·  folders = Data/Swing_Kits subfolders");
+  );
+
+  // ── pick → shared emitter (reads the PUBLISHED band, not the snapshot;
+  // GEN guard: a click on a just-republished roster is dropped — the next
+  // frame's recopy re-syncs the rows the user is looking at) ──
+  _kv_pick >= 0 ? (
+    (gmem[EON_KITLIST_BASE + 1] | 0) == kv_gen_seen ? (
+      swing_kitsview_emit_pick(_kv_pick) ? (
+        swing_bigview_close();
+        active_id = -1;
+      ) : (
+        gmem[KIT_GMEM_BRIDGE_ALIVE] <= 0 ? kit_bridge_warn = 1;
+      );
+    );
+  );
+
+  // ── close: X or click outside (canonical, active_id-guarded) ──
+  _kv_out = mx < grid_x || mx > grid_x + grid_w || my < grid_y || my > grid_y + grid_h;
+  lmb_down && (_kv_chov || (_kv_out && active_id == -1)) ? (
+    swing_bigview_close();
+    active_id = -1;
+  );
+
+  // ── mandatory re-zero: nothing after the dispatch may see live input ──
+  lmb_down = 0; rmb_down = 0; LMB = 0; RMB = 0; frame_wheel = 0;
+);

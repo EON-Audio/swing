@@ -1,0 +1,827 @@
+// rk_drumkit_dsp.jsfx-inc — DSP + utility functions for Swing
+// (c) EON Studios — All Rights Reserved
+//
+// Extracted from the main JSFX to keep it focused on
+// memory layout, MIDI, serialization, and GUI.
+//
+// Requires the following global arrays/variables to be allocated before import:
+//   p_attack, p_decay, p_sustain, p_release, p_tune, p_pan, p_note, p_note_lock
+//   p_att_c, p_dec_c, p_rel_c, p_panL, p_panR
+//   fx_hpf_freq, fx_lpf_freq, fx_eq_lo, fx_eq_mid, fx_eq_mid2, fx_eq_hi, fx_sat_drv, fx_drv_mode
+//   fx_eq_lo_freq, fx_eq_mid_freq, fx_eq_mid2_freq, fx_eq_hi_freq
+//   s_sr, root_note, srate
+//   gfx_hpf_freq, gfx_lpf_freq, gfx_sat_drv
+
+@init
+
+// ─── Frequency ↔ normalized (0–1) log mapping for filter knobs ───────────
+// 0→20Hz, 0.5→632Hz, 1→20kHz  (20 * 1000^n)
+function freq_to_norm(hz) ( log10(max(20, hz) / 20.0) / 3.0; );
+function norm_to_freq(n)  ( 20.0 * pow(1000.0, max(0, min(1, n))); );
+
+// ─── HSL → RGB conversion ──────────────────────────────────────────────
+// h = hue (0–1), s = saturation (0–1), l = lightness (0–1)
+// Returns via globals: _hsl_r, _hsl_g, _hsl_b (0–1 each)
+function hsl_to_rgb(h, s, l)
+local(_c, _x, _m, _hp, _r1, _g1, _b1, _hp_mod2)
+(
+  _c = (1.0 - abs(2.0 * l - 1.0)) * s;
+  _hp = h * 6.0;
+  // Float modulo: JSFX % is integer-only, so use floor-based fmod
+  _hp_mod2 = _hp - floor(_hp * 0.5) * 2.0;
+  _x = _c * (1.0 - abs(_hp_mod2 - 1.0));
+  _r1 = 0; _g1 = 0; _b1 = 0;
+  _hp < 1 ? ( _r1 = _c; _g1 = _x; ) :
+  _hp < 2 ? ( _r1 = _x; _g1 = _c; ) :
+  _hp < 3 ? ( _g1 = _c; _b1 = _x; ) :
+  _hp < 4 ? ( _g1 = _x; _b1 = _c; ) :
+  _hp < 5 ? ( _r1 = _x; _b1 = _c; ) :
+             ( _r1 = _c; _b1 = _x; );
+  _m = l - _c * 0.5;
+  _hsl_r = _r1 + _m;
+  _hsl_g = _g1 + _m;
+  _hsl_b = _b1 + _m;
+);
+
+// ─── Velocity curve ──────────────────────────────────────────────────────
+// Takes 0–1 velocity, returns shaped 0–1 value
+function apply_vel_curve(vel, curve) (
+  curve == 1 ? vel * vel :        // soft  — need harder hits for loud
+  curve == 2 ? sqrt(vel) :        // hard  — light hits still loud
+  curve == 3 ? 1.0 :              // fixed — always full velocity
+  vel;                             // 0 = linear (default)
+);
+
+// ─── Repeat interval (samples per division at current tempo) ─────────────
+// Division map: 0=OFF, then groups of 3: straight, triplet, dotted
+// 1=1/4  2=1/4T  3=1/4D   4=1/8  5=1/8T  6=1/8D
+// 7=1/16 8=1/16T 9=1/16D  10=1/32 11=1/32T 12=1/32D
+// 13=1/64 14=1/64T 15=1/64D
+RPT_NUM_DIVS = 15;
+function get_rpt_interval(div) local(beat_samples, base) (
+  beat_samples = (60.0 / (tempo > 0 ? tempo : 120)) * srate;  // samples per quarter note
+  div == 1  ? beat_samples :                 // 1/4
+  div == 2  ? beat_samples * 2.0 / 3.0 :    // 1/4T
+  div == 3  ? beat_samples * 1.5 :           // 1/4D
+  div == 4  ? beat_samples * 0.5 :           // 1/8
+  div == 5  ? beat_samples * 0.5 * 2.0 / 3.0 : // 1/8T
+  div == 6  ? beat_samples * 0.5 * 1.5 :     // 1/8D
+  div == 7  ? beat_samples * 0.25 :          // 1/16
+  div == 8  ? beat_samples * 0.25 * 2.0 / 3.0 : // 1/16T
+  div == 9  ? beat_samples * 0.25 * 1.5 :    // 1/16D
+  div == 10 ? beat_samples * 0.125 :         // 1/32
+  div == 11 ? beat_samples * 0.125 * 2.0 / 3.0 : // 1/32T
+  div == 12 ? beat_samples * 0.125 * 1.5 :   // 1/32D
+  div == 13 ? beat_samples * 0.0625 :        // 1/64
+  div == 14 ? beat_samples * 0.0625 * 2.0 / 3.0 : // 1/64T
+  div == 15 ? beat_samples * 0.0625 * 1.5 :  // 1/64D
+  0;
+);
+
+// Get division display name into #_rpt_name
+function get_rpt_div_name(div) (
+  div == 0  ? strcpy(#_rpt_name, "OFF") :
+  div == 1  ? strcpy(#_rpt_name, "1/4") :
+  div == 2  ? strcpy(#_rpt_name, "1/4T") :
+  div == 3  ? strcpy(#_rpt_name, "1/4D") :
+  div == 4  ? strcpy(#_rpt_name, "1/8") :
+  div == 5  ? strcpy(#_rpt_name, "1/8T") :
+  div == 6  ? strcpy(#_rpt_name, "1/8D") :
+  div == 7  ? strcpy(#_rpt_name, "1/16") :
+  div == 8  ? strcpy(#_rpt_name, "1/16T") :
+  div == 9  ? strcpy(#_rpt_name, "1/16D") :
+  div == 10 ? strcpy(#_rpt_name, "1/32") :
+  div == 11 ? strcpy(#_rpt_name, "1/32T") :
+  div == 12 ? strcpy(#_rpt_name, "1/32D") :
+  div == 13 ? strcpy(#_rpt_name, "1/64") :
+  div == 14 ? strcpy(#_rpt_name, "1/64T") :
+  div == 15 ? strcpy(#_rpt_name, "1/64D") :
+  strcpy(#_rpt_name, "?");
+);
+
+// ─── DSP coefficient recalc for pad i ─────────────────────────────────────
+function recalc_pad(i) (
+  // Factor of 5.0 makes envelope reach ~99% of target within the specified time
+  p_att_c[i]  = exp(-5.0 / max(1, p_attack[i]  * 0.001 * srate));
+  p_dec_c[i]  = exp(-5.0 / max(1, p_decay[i]   * 0.001 * srate));
+  p_rel_c[i]  = exp(-5.0 / max(1, p_release[i] * 0.001 * srate));
+  p_panL[i] = 1.0 - max(0.0, p_pan[i]);
+  p_panR[i] = 1.0 + min(0.0, p_pan[i]);
+  !p_note_lock[i] ? p_note[i] = root_note + i;
+);
+
+// ─── Per-pad compressor coefficient recalc ───────────────────────────────
+// Fixed presets by mode: PUNCH(0), GLUE(1), SQUASH(2).
+// All coefficients derived from mode + srate — no per-pad tuning needed.
+function recalc_pad_comp(i)
+local(_mode, _amt, _atk_ms, _rel_ms, _ratio, _knee, _max_thresh, _thresh, _sr, _makeup_db)
+(
+  _mode = fx_cmp_mode[i] | 0;
+  _amt  = max(0, min(1, fx_cmp_amt[i]));
+  _sr = max(srate, 1);
+
+  // Mode sets character (attack/release/ratio/knee) + the threshold floor
+  // reached at amt = 1. Knob amt acts as a "drive into the compressor"
+  // control: higher amt = lower threshold = more material above threshold
+  // = more compression. This is how Sitala-style one-knob compressors work,
+  // and it lets sends handle parallel compression separately.
+  _mode == 0 ? ( // PUNCH: fast attack, short release, strong ratio
+    _atk_ms = 1; _rel_ms = 50; _ratio = 4; _knee = 3; _max_thresh = -30;
+  ) :
+  _mode == 1 ? ( // GLUE: slow attack, medium release, light ratio
+    _atk_ms = 30; _rel_ms = 150; _ratio = 2; _knee = 6; _max_thresh = -24;
+  ) : ( // SQUASH: medium attack, long release, heavy ratio
+    _atk_ms = 10; _rel_ms = 300; _ratio = 8; _knee = 2; _max_thresh = -40;
+  );
+
+  // Threshold scales with amount: 0 dB at amt=0 (effectively off — no signal
+  // exceeds 0 dBFS), mode-defined floor at amt=1. Linear in dB.
+  _thresh = _max_thresh * _amt;
+
+  fx_cmp_at_c[i]      = exp(-1 / (_sr * _atk_ms * 0.001));
+  fx_cmp_rel_c[i]     = exp(-1 / (_sr * _rel_ms * 0.001));
+  fx_cmp_inv_ratio[i] = 1 / max(_ratio, 1.0001);
+  fx_cmp_thresh[i]    = _thresh;
+  fx_cmp_knee_lo[i]   = _thresh - _knee * 0.5;
+  fx_cmp_knee_hi[i]   = _thresh + _knee * 0.5;
+  fx_cmp_knee_inv[i]  = _knee > 0 ? 1 / (2 * _knee) : 0;
+  fx_cmp_knee_lo_lin[i] = exp((_thresh - _knee * 0.5) * 0.11512925465);
+
+  // Auto-makeup: 1/4 of theoretical max GR at threshold (was 1/2 — too
+  // aggressive, masked the compression effect by boosting everything). At
+  // 1/4 the makeup partially compensates for level loss but leaves the
+  // compression audibly present. User can use master gain or sends for
+  // parallel/wet level control.
+  _makeup_db = -_thresh * (1 - 1 / _ratio) * 0.25;
+  fx_cmp_makeup_lin[i] = exp(_makeup_db * 0.11512925465);
+);
+
+// ─── Per-pad FX coefficient recalc ──────────────────────────────────────
+function recalc_fx(i) local(_svf_base, _sfi) (
+  // Bitcrush: precompute quantization levels (avoid per-sample pow())
+  fx_bc_lvl[i] = pow(2, max(1, min(16, fx_bc_bits[i] | 0)) - 1);
+
+  // ── SVF filter retargeting (rk_svf) ──
+  // Sets glide targets; coefficients chase them in @sample via svf_tick —
+  // a one-pole glide with a SVF_SMOOTH_MS (12 ms) time constant, not a
+  // fixed-length ramp (rk_svf.jsfx-inc documents the 2026-06-17 switch).
+  // svf_set_* dedups unchanged targets, so re-running all five filters
+  // here whenever one knob moves does not restart the others' glides.
+  _svf_base = svf_pad + i * SVF_PER_PAD * SVF_STEREO_SIZE;
+  // HPF: 2nd-order highpass (Q from per-pad resonance knob)
+  fx_hpf_freq[i] > 25 ?
+    svf_set_highpass(_svf_base + SVF_PAD_HPF * SVF_STEREO_SIZE, fx_hpf_freq[i], fx_reso[i])
+  : (
+    svf_set_bypass(_svf_base + SVF_PAD_HPF * SVF_STEREO_SIZE);
+    // Clear residual-tracking state so bypassed filter doesn't block pad sleep
+    fx_hpf_stL[i] = 0; fx_hpf_stR[i] = 0;
+  );
+  // LPF: 2nd-order lowpass (Q from per-pad resonance knob)
+  fx_lpf_freq[i] < 19500 ?
+    svf_set_lowpass(_svf_base + SVF_PAD_LPF * SVF_STEREO_SIZE, fx_lpf_freq[i], fx_reso[i])
+  : (
+    svf_set_bypass(_svf_base + SVF_PAD_LPF * SVF_STEREO_SIZE);
+    fx_lpf_stL[i] = 0; fx_lpf_stR[i] = 0;
+  );
+  // Low shelf: frequency from fx_eq_lo_freq[i], per-pad Q (v48; 0.7071 == old S=1.0)
+  svf_set_lowshelf_q(_svf_base + SVF_PAD_LO * SVF_STEREO_SIZE, fx_eq_lo_freq[i], fx_eq_lo[i], fx_eq_lo_q[i]);
+  // Mid peaking: frequency from fx_eq_mid_freq[i], per-pad Q (default 0.8)
+  svf_set_bell(_svf_base + SVF_PAD_MID * SVF_STEREO_SIZE, fx_eq_mid_freq[i], fx_eq_mid[i], fx_eq_mid_q[i]);
+  // Hi-mid peaking (v46 4th band): frequency from fx_eq_mid2_freq[i], per-pad Q
+  svf_set_bell(_svf_base + SVF_PAD_MID2 * SVF_STEREO_SIZE, fx_eq_mid2_freq[i], fx_eq_mid2[i], fx_eq_mid2_q[i]);
+  // High shelf: frequency from fx_eq_hi_freq[i], per-pad Q (v48)
+  svf_set_highshelf_q(_svf_base + SVF_PAD_HI * SVF_STEREO_SIZE, fx_eq_hi_freq[i], fx_eq_hi[i], fx_eq_hi_q[i]);
+
+  // Pad silent (same condition as process_pad_fx's signal gate, which is
+  // what runs svf_tick)? Then the coefficient glide is FROZEN mid-chase —
+  // svf_tick only runs while audio flows — and would resume across the
+  // NEXT hit's first SVF_SMOOTH_MS (12 ms): the transient, so the first
+  // hit after a silent tweak sounds like the OLD curve. No audio is
+  // flowing, so snapping straight to the new targets is inaudible and the
+  // next hit starts on the new curve. The glide still applies to tweaks
+  // made while the pad is sounding (the case smoothing exists for).
+  (abs(pad_accL[i]) < 0.0000001 && abs(pad_accR[i]) < 0.0000001 &&
+   abs(fx_hpf_stL[i]) < 0.0000001 && abs(fx_lpf_stL[i]) < 0.0000001) ? (
+    _sfi = 0; loop(SVF_PER_PAD,
+      svf_snap(_svf_base + _sfi * SVF_STEREO_SIZE);
+      _sfi += 1;
+    );
+  );
+
+  // Per-pad compressor coefficients (mode-dependent)
+  recalc_pad_comp(i);
+);
+
+// ─── Drive mode processing (per-sample, called from @sample FX chain) ──
+// Takes pre-driven stereo pair (already multiplied by 8x drive gain),
+// applies selected curve, returns via _doL/_doR.
+// mode: 0=SOFT, 1=TUBE, 2=TAPE, 3=FUZZ, 4=CLIP
+// All curves are normalized so unity-in ≈ unity-out at moderate drive.
+function drive_process(xL, xR, mode)
+local(_x2L, _x2R, _absL, _absR)
+(
+  mode == 0 ? (
+    // SOFT — rational tanh: x*(27+x²)/(27+9x²)
+    _x2L = xL * xL; _x2R = xR * xR;
+    _doL = xL * (27.0 + _x2L) / (27.0 + 9.0 * _x2L);
+    _doR = xR * (27.0 + _x2R) / (27.0 + 9.0 * _x2R);
+  ) :
+  mode == 1 ? (
+    // TUBE — asymmetric soft clip (even harmonics, warm 2nd-order character)
+    // Positive half: softer, negative half: harder compression
+    _absL = abs(xL); _absR = abs(xR);
+    _doL = xL >= 0
+      ? xL / (1.0 + _absL)                          // gentle positive
+      : xL / (1.0 + _absL * _absL * 0.6);           // squashed negative
+    _doR = xR >= 0
+      ? xR / (1.0 + _absR)
+      : xR / (1.0 + _absR * _absR * 0.6);
+    // Slight DC offset characteristic of real tubes — removed by HPF downstream
+    _doL *= 1.2; _doR *= 1.2;
+  ) :
+  mode == 2 ? (
+    // TAPE — smooth cubic-ish saturation with gentle knee + soft limiting
+    // Emulates magnetic hysteresis compression on transients
+    _doL = xL > 1.0  ?  0.6667 + (xL - 1.0) / (1.0 + (xL - 1.0) * 3.0) * 0.3333
+         : xL < -1.0 ? -0.6667 - (-xL - 1.0) / (1.0 + (-xL - 1.0) * 3.0) * 0.3333
+         : xL - xL * xL * xL / 3.0;
+    _doR = xR > 1.0  ?  0.6667 + (xR - 1.0) / (1.0 + (xR - 1.0) * 3.0) * 0.3333
+         : xR < -1.0 ? -0.6667 - (-xR - 1.0) / (1.0 + (-xR - 1.0) * 3.0) * 0.3333
+         : xR - xR * xR * xR / 3.0;
+    // Tape tends to glue — slightly reduce output for natural compression feel
+    _doL *= 1.15; _doR *= 1.15;
+  ) :
+  mode == 3 ? (
+    // FUZZ — hard asymmetric clip with bias, gnarly transistor breakup
+    // Adds odd + even harmonics, heavy coloring for aggressive drum sounds
+    _doL = max(-0.7, min(1.0, xL * 1.3 + 0.1));
+    _doR = max(-0.7, min(1.0, xR * 1.3 + 0.1));
+    // Remove bias DC
+    _doL -= 0.1; _doR -= 0.1;
+  ) :
+  (
+    // CLIP — hard digital brick-wall, clean and punchy
+    _doL = max(-1.0, min(1.0, xL));
+    _doR = max(-1.0, min(1.0, xR));
+  );
+);
+
+// ─── Unified master chain recalc (HPF + LPF + EQ + sat) ─────────────────
+// Single function eliminates any state desync between EQ and HPF/LPF/sat.
+// Called from all paths: UI drags, @slider, preset load, srate change, etc.
+function recalc_global_fx() local(_bm) (
+  // ── Master SVF filters (audio only — curve computes its own) ──
+  // Sets one-pole glide targets; coefficients chase in @sample via svf_tick.
+  // Off HPF/LPF glide to unity-dry (svf_set_bypass) so the @sample chain can
+  // always-process them click-free. Magnitude matches the old RBJ biquads at
+  // matching knob values (svf_parity_check.py): shelves S=1.0, bells Q=0.8,
+  // HPF/LPF Q=0.707.
+  _bm = svf_master;
+  // HPF
+  gfx_hpf_freq > 25 ?
+    svf_set_highpass(_bm + SVF_MST_HPF * SVF_STEREO_SIZE, gfx_hpf_freq, 0.707)
+  : svf_set_bypass(_bm + SVF_MST_HPF * SVF_STEREO_SIZE);
+  // LPF
+  gfx_lpf_freq < 19500 ?
+    svf_set_lowpass(_bm + SVF_MST_LPF * SVF_STEREO_SIZE, gfx_lpf_freq, 0.707)
+  : svf_set_bypass(_bm + SVF_MST_LPF * SVF_STEREO_SIZE);
+  // EQ bands — NO ternary, flat if-blocks to avoid JSFX parse ambiguity
+  meq_lo_bell == 0 ? (
+    svf_set_lowshelf(_bm + SVF_MST_LO * SVF_STEREO_SIZE, gfx_eq_lo_freq, gfx_eq_lo, 1.0);
+  );
+  meq_lo_bell != 0 ? (
+    svf_set_bell(_bm + SVF_MST_LO * SVF_STEREO_SIZE, gfx_eq_lo_freq, gfx_eq_lo, 0.8);
+  );
+  svf_set_bell(_bm + SVF_MST_MID * SVF_STEREO_SIZE, gfx_eq_mid_freq, gfx_eq_mid, 0.8);
+  meq_hi_bell == 0 ? (
+    svf_set_highshelf(_bm + SVF_MST_HI * SVF_STEREO_SIZE, gfx_eq_hi_freq, gfx_eq_hi, 1.0);
+  );
+  meq_hi_bell != 0 ? (
+    svf_set_bell(_bm + SVF_MST_HI * SVF_STEREO_SIZE, gfx_eq_hi_freq, gfx_eq_hi, 0.8);
+  );
+);
+
+function recalc_master_eq() ( recalc_global_fx(); );
+
+// ─── Check if pad has any audio loaded ─────────────────────────────────────
+// pad_has_audio = "has SAMPLE audio" (storage truth — blank-pad/embed logic
+// depends on this staying sample-only).
+function pad_has_audio(i) local(li) (
+  s_len[i] > 0 ? 1 : (
+    p_layer_cnt[i] > 0 ? (
+      li = 0;
+      while(li < p_layer_cnt[i] && l_len[i * MAX_LAYERS + li] <= 0) ( li += 1; );
+      li < p_layer_cnt[i];
+    ) : 0;
+  );
+);
+
+// Trigger/preview paths use THIS: an enabled SYN slot makes a pad playable
+// with no samples (the emergent synth-only pad, Spec_Swing_Synth_Layer §1).
+// Defined AFTER pad_has_audio — EEL2 resolves function refs at def time.
+function pad_is_playable(i) (
+  pad_has_audio(i) || ps_enable[i] > 0.5;
+);
+
+// ─── Get effective sample length for a pad (first available layer or legacy) ─
+function pad_eff_len(i) local(li, _lidx) (
+  p_layer_cnt[i] > 0 ? (
+    li = 0;
+    while(li < p_layer_cnt[i]) (
+      _lidx = i * MAX_LAYERS + li;
+      l_len[_lidx] > 0 ? ( li = p_layer_cnt[i] + 1; ); // break
+      li += 1;
+    );
+    li > p_layer_cnt[i] ? l_len[_lidx] : 0;
+  ) : s_len[i];
+);
+
+// ════════════════════════════════════════════════════════════════════════
+// Internal per-pad PARAM undo/redo engine (v2, Phase 1A)
+//
+// Swing's orange UNDO/REDO buttons formerly fired REAPER's GLOBAL Ctrl+Z
+// (gmem CMD 80/81 -> bridge -> Main_OnCommand 40029/40030), which restores a
+// whole-project chunk — one click could roll a loaded kit back to empty (the
+// "pads 10-16 wiped after Undo" bug). This engine gives Swing a Swing-scoped,
+// action-granular undo of per-pad PARAMETER edits (knob drags: tune / pan /
+// vol / ADSR / FX / etc.), held in freemem, session-volatile.
+//
+// Capture model (wired in the @gfx frame + mark_dirty_pad):
+//   * mouse-DOWN edge  -> undo_capture_baseline()  snapshots all pads (pre-edit)
+//   * a param edit      -> mark_dirty_pad() sets _udo_pend[pad]
+//   * mouse-UP edge    -> undo_commit_gesture()    pushes ONE entry per pad
+//                         touched this gesture (one knob drag = one undo step)
+//
+// 1-level structural rule: any audio-structural op (clear / load / swap /
+// kit / new) calls undo_stack_reset() — undoing param tweaks from before a
+// structural change is meaningless. Real structural (audio) undo = Phase 2.
+//
+// Field set = per-pad undoable scalars + per-layer metadata. NOT audio, NOT
+// names/paths (param edits never change those). The pointer tables udo_fs[] /
+// udo_fl[] are built once in the main @init (Swing_ReaKit.jsfx) and are the
+// single source of truth for which arrays get snapshotted.
+//
+// Defined here (after recalc_pad/recalc_fx above, before swap_pads + the core
+// clear/load functions below) so every caller can resolve these at def-time.
+// Globals (udo_*, UDO_*) are set in the main @init and resolve at run-time.
+// ════════════════════════════════════════════════════════════════════════
+
+function undo_stack_reset() (
+  _udo_uc = 0;
+  _udo_rc = 0;
+);
+
+// Copy one pad's live field set into the packed slot at base `dst`.
+function undo_pack(dst, pad) local(k, off, _fb, l) (
+  k = 0;
+  loop(UDO_NS,
+    _fb = udo_fs[k];
+    dst[k] = _fb[pad];
+    k += 1;
+  );
+  off = UDO_NS;
+  k = 0;
+  loop(UDO_NL,
+    _fb = udo_fl[k];
+    l = 0;
+    loop(MAX_LAYERS,
+      dst[off] = _fb[pad * MAX_LAYERS + l];
+      off += 1; l += 1;
+    );
+    k += 1;
+  );
+);
+
+// Restore one pad's field set from the packed slot at base `src`.
+function undo_unpack(src, pad) local(k, off, _fb, l) (
+  k = 0;
+  loop(UDO_NS,
+    _fb = udo_fs[k];
+    _fb[pad] = src[k];
+    k += 1;
+  );
+  off = UDO_NS;
+  k = 0;
+  loop(UDO_NL,
+    _fb = udo_fl[k];
+    l = 0;
+    loop(MAX_LAYERS,
+      _fb[pad * MAX_LAYERS + l] = src[off];
+      off += 1; l += 1;
+    );
+    k += 1;
+  );
+);
+
+// Snapshot every pad's pre-edit state into the baseline buffer. Called on the
+// mouse-DOWN edge so a subsequent edit can be reverted to this state. No-op
+// while we are restoring (so an undo can't re-snapshot its own result).
+function undo_capture_baseline() local(p) (
+  _udo_applying ? 0 : (
+    p = 0;
+    loop(NUM_PADS,
+      undo_pack(udo_base + p * UDO_STRIDE, p);
+      p += 1;
+    );
+  );
+);
+
+// Push the baseline snapshot of `pad` as a new undo entry (drops oldest when
+// the ring is full).
+function undo_push_param(pad) (
+  _udo_uc >= UDO_DEPTH ? (
+    memcpy(udo_ust, udo_ust + UDO_STRIDE, (UDO_DEPTH - 1) * UDO_STRIDE);
+    memcpy(udo_ust_pad, udo_ust_pad + 1, UDO_DEPTH - 1);
+    _udo_uc = UDO_DEPTH - 1;
+  );
+  memcpy(udo_ust + _udo_uc * UDO_STRIDE, udo_base + pad * UDO_STRIDE, UDO_STRIDE);
+  udo_ust_pad[_udo_uc] = pad;
+  _udo_uc += 1;
+);
+
+// On the mouse-UP edge: commit one undo entry per pad touched this gesture.
+function undo_commit_gesture() local(p, pushed, k, _changed, _b) (
+  pushed = 0;
+  p = 0;
+  loop(NUM_PADS,
+    _udo_pend[p] ? (
+      _udo_pend[p] = 0;
+      // Only record an undo entry if the pad's state ACTUALLY changed vs the
+      // pre-edit baseline — a mere select/hit (mark_dirty without a real edit)
+      // must not leave a no-op entry that "wastes" an undo click.
+      undo_pack(udo_cmp, p);
+      _b = udo_base + p * UDO_STRIDE; _changed = 0; k = 0;
+      loop(UDO_STRIDE, udo_cmp[k] != _b[k] ? _changed = 1; k += 1;);
+      _changed ? ( undo_push_param(p); pushed = 1; );
+    );
+    p += 1;
+  );
+  pushed ? ( _udo_rc = 0; );  // a fresh edit invalidates the redo branch
+);
+
+// ──────────────────────────────────────────────────────────────────────────
+// Phase 2: structural (audio) undo — 1-level WHOLE-KIT snapshot.
+// The outermost structural op (clear/load/swap/kit/new) captures the entire
+// kit's pre-op state — metadata + audio (byte-exact) + visible names — into one
+// snapshot slot. Undoing it restores that snapshot. A re-entrancy guard
+// (undo_cap_begin/end) makes nested low-level calls capture only ONCE.
+// ──────────────────────────────────────────────────────────────────────────
+
+// NOTE (v1): pad NAME/label strings are intentionally NOT captured here.
+// get_name_slot/get_cname_slot live in rk_swing_core (import #71), which is
+// AFTER this file (#66) — referencing them would be a def-time forward-ref
+// compile error. Audio + all numeric params restore byte-exact; pad labels may
+// read stale after a structural undo (same cosmetic limitation the preserve
+// helper documents). udo_st_str stays reserved for a later names pass (which
+// would move get_name_slot earlier, or relocate the engine after core).
+
+// Back up ONE pad's slot (audio + metadata) — the reversible record for a
+// per-pad structural op. Full-slot audio copy (no per-layer offset math, the
+// source of the old last-pad bugs). Scoped: restore touches only this pad.
+function undo_capture_pad(pad) local(l, _li) (
+  _udo_ready ? (
+    memcpy(udo_s2_audio, s_audio_start + pad * SLOT_SIZE, SLOT_SIZE);
+    undo_pack(udo_st_meta, pad);
+    udo_s2_aud[0] = s_len[pad]; udo_s2_aud[1] = s_sr[pad]; udo_s2_aud[2] = p_layer_cnt[pad];
+    l = 0; loop(MAX_LAYERS,
+      _li = pad * MAX_LAYERS + l;
+      udo_s2_aud[3 + l]  = l_len[_li];
+      udo_s2_aud[7 + l]  = l_sr[_li];
+      udo_s2_aud[11 + l] = sp_baked_tune[_li];
+      l += 1;
+    );
+    udo_s2_type = 1; udo_s2_pad = pad; _udo_st_valid = 1;
+  );
+  // any structural op drops the param branch + pending gestures (1-level rule)
+  _udo_uc = 0; _udo_rc = 0;
+  l = 0; loop(NUM_PADS, _udo_pend[l] = 0; l += 1;);
+);
+
+// Per-pad structural op (load/clear/clear-layer): outermost call records the
+// one-pad backup; nested calls (clear_pad -> clear_layer) just raise depth.
+function udo_struct_begin_pad(pad) (
+  (_udo_cap_depth == 0 && !_udo_applying) ? undo_capture_pad(pad);
+  _udo_cap_depth += 1;
+);
+
+// Swap is self-inverse: record only the two indices; undo re-swaps.
+function udo_struct_begin_swap(a, b) local(l) (
+  (_udo_cap_depth == 0 && !_udo_applying) ? (
+    udo_s2_type = 2; udo_s2_pad = a; udo_s2_pad2 = b; _udo_st_valid = 1;
+    _udo_uc = 0; _udo_rc = 0;
+    l = 0; loop(NUM_PADS, _udo_pend[l] = 0; l += 1;);
+  );
+  _udo_cap_depth += 1;
+);
+
+// Kit / New / Clear-All — kit-level undo is PARKED (2026-06-29). The disk-
+// based design (bridge dumps the outgoing kit to a temp .swing via CMD 83,
+// undo reloads via CMD 82) is fully plumbed on both sides but the bridge half
+// never engaged in live testing; until that's resolved, the entry stays
+// INVALID so the UNDO button honestly greys for kit ops instead of lying.
+// The 1-level rule still applies: a kit op drops the param-undo branch.
+function udo_struct_begin_kit() local(l) (
+  (_udo_cap_depth == 0 && !_udo_applying) ? (
+    udo_s2_type = 3; _udo_st_valid = 0;   // PARKED: not undoable (was 1)
+    _udo_uc = 0; _udo_rc = 0;
+    l = 0; loop(NUM_PADS, _udo_pend[l] = 0; l += 1;);
+  );
+  _udo_cap_depth += 1;
+);
+
+// Restore the structural undo entry (scoped). Dispatches by type:
+//   per-pad → restore just that pad's slot + metadata (no collateral)
+//   swap    → re-swap (self-inverse; capture suppressed via _udo_applying)
+function undo_restore_struct() local(pad, l, _li, _vi) (
+  _udo_st_valid ? (
+    udo_s2_type == 1 ? (
+      _udo_applying = 1;
+      // silence voices so none reads a half-restored slot (anti-garble)
+      _vi = 0; loop(MAX_VOICES + 1, v_pos[_vi] = -1; v_env[_vi] = 0; v_stage[_vi] = 0; _vi += 1;);
+      pad = udo_s2_pad;
+      undo_unpack(udo_st_meta, pad);
+      s_len[pad] = udo_s2_aud[0]; s_sr[pad] = udo_s2_aud[1]; p_layer_cnt[pad] = udo_s2_aud[2];
+      l = 0; loop(MAX_LAYERS,
+        _li = pad * MAX_LAYERS + l;
+        l_len[_li]  = udo_s2_aud[3 + l];
+        l_sr[_li]   = udo_s2_aud[7 + l];
+        sp_baked_tune[_li] = udo_s2_aud[11 + l];
+        l += 1;
+      );
+      memcpy(s_audio_start + pad * SLOT_SIZE, udo_s2_audio, SLOT_SIZE);
+      sp_src_gen[pad] += 1;       // invalidate Extension cache / Tuned-Stretch re-bake
+      recalc_pad(pad); recalc_fx(pad);
+      s_dirty[pad] = 1; col_dirty = 1;
+      _udo_name_req = 1; _udo_name_pad = pad;  // names restored in @gfx (get_*_slot is core-only)
+      _udo_st_valid = 0; _udo_rc = 0;
+      gmem[GS_PROJ_DIRTY] = 1;
+      _udo_applying = 0;
+    ) : udo_s2_type == 2 ? (
+      // Swap is self-inverse, but swap_pads is defined LATER in this file.
+      // Defer the call to @gfx (runtime) to avoid a def-time forward reference.
+      _udo_swap_req = 1;
+      _udo_st_valid = 0; _udo_rc = 0;
+    ) : udo_s2_type == 3 ? (
+      // Kit-level undo: ask the bridge (via the @gfx processor) to reload the
+      // temp undo sidecar it dumped before the kit op. Entry is consumed now;
+      // if the file is missing the bridge no-ops (rare, acceptable).
+      _udo_kitundo_req = 1;
+      _udo_st_valid = 0; _udo_rc = 0;
+    );
+  );
+);
+
+// Close a structural op's capture window (paired with each udo_struct_begin_*).
+function undo_cap_end() (
+  _udo_cap_depth > 0 ? _udo_cap_depth -= 1;
+);
+
+// UNDO: restore the newest entry; stash current pad state onto the redo ring.
+function undo_do() local(ei, pad) (
+  _udo_uc > 0 ? (
+    _udo_applying = 1;
+    ei  = _udo_uc - 1;
+    pad = udo_ust_pad[ei];
+    // push CURRENT live state of this pad onto the redo ring
+    _udo_rc >= UDO_DEPTH ? (
+      memcpy(udo_urd, udo_urd + UDO_STRIDE, (UDO_DEPTH - 1) * UDO_STRIDE);
+      memcpy(udo_urd_pad, udo_urd_pad + 1, UDO_DEPTH - 1);
+      _udo_rc = UDO_DEPTH - 1;
+    );
+    undo_pack(udo_urd + _udo_rc * UDO_STRIDE, pad);
+    udo_urd_pad[_udo_rc] = pad;
+    _udo_rc += 1;
+    // restore the undo entry into the live pad
+    undo_unpack(udo_ust + ei * UDO_STRIDE, pad);
+    _udo_uc = ei;
+    recalc_pad(pad); recalc_fx(pad);
+    s_dirty[pad] = 1; col_dirty = 1;
+    gmem[GS_PROJ_DIRTY] = 1;  // Phase 1B: project-dirty (no REAPER undo point)
+    _udo_applying = 0;
+  ) : _udo_st_valid ? (
+    // param ring empty -> the structural snapshot is the next thing to undo
+    undo_restore_struct();
+  );
+);
+
+// REDO: re-apply the newest redo entry; stash current state onto the undo ring.
+function redo_do() local(ei, pad) (
+  _udo_rc > 0 ? (
+    _udo_applying = 1;
+    ei  = _udo_rc - 1;
+    pad = udo_urd_pad[ei];
+    _udo_uc >= UDO_DEPTH ? (
+      memcpy(udo_ust, udo_ust + UDO_STRIDE, (UDO_DEPTH - 1) * UDO_STRIDE);
+      memcpy(udo_ust_pad, udo_ust_pad + 1, UDO_DEPTH - 1);
+      _udo_uc = UDO_DEPTH - 1;
+    );
+    undo_pack(udo_ust + _udo_uc * UDO_STRIDE, pad);
+    udo_ust_pad[_udo_uc] = pad;
+    _udo_uc += 1;
+    undo_unpack(udo_urd + ei * UDO_STRIDE, pad);
+    _udo_rc = ei;
+    recalc_pad(pad); recalc_fx(pad);
+    s_dirty[pad] = 1; col_dirty = 1;
+    gmem[GS_PROJ_DIRTY] = 1;  // Phase 1B: project-dirty (no REAPER undo point)
+    _udo_applying = 0;
+  );
+);
+
+// ─── Swap two pads (all metadata, FX, layers, audio) ─────────────────────
+function swap_pads(a, b)
+  local(tmp, li, la, lb, j, _swap_len_a, _swap_len_b, _swap_len)
+(
+  a == b ? 0 : (
+    udo_struct_begin_swap(a, b);  // Phase 2: self-inverse swap entry (1-level structural undo)
+    // Helper macro-style: swap scalar array values
+    // ── Sample metadata ──
+    tmp = s_len[a]; s_len[a] = s_len[b]; s_len[b] = tmp;
+    tmp = s_start[a]; s_start[a] = s_start[b]; s_start[b] = tmp;
+    tmp = s_end[a]; s_end[a] = s_end[b]; s_end[b] = tmp;
+    tmp = s_skip[a]; s_skip[a] = s_skip[b]; s_skip[b] = tmp;
+    tmp = s_norm[a]; s_norm[a] = s_norm[b]; s_norm[b] = tmp;
+    tmp = s_norm_gain[a]; s_norm_gain[a] = s_norm_gain[b]; s_norm_gain[b] = tmp;
+    tmp = s_sr[a]; s_sr[a] = s_sr[b]; s_sr[b] = tmp;
+    s_dirty[a] = 1; s_dirty[b] = 1;
+
+    // ── Pad params ──
+    tmp = p_gain[a]; p_gain[a] = p_gain[b]; p_gain[b] = tmp;
+    tmp = p_pan[a]; p_pan[a] = p_pan[b]; p_pan[b] = tmp;
+    tmp = p_attack[a]; p_attack[a] = p_attack[b]; p_attack[b] = tmp;
+    tmp = p_decay[a]; p_decay[a] = p_decay[b]; p_decay[b] = tmp;
+    tmp = p_sustain[a]; p_sustain[a] = p_sustain[b]; p_sustain[b] = tmp;
+    tmp = p_release[a]; p_release[a] = p_release[b]; p_release[b] = tmp;
+    tmp = p_tune[a]; p_tune[a] = p_tune[b]; p_tune[b] = tmp;
+    tmp = p_note[a]; p_note[a] = p_note[b]; p_note[b] = tmp;
+    tmp = p_note_lock[a]; p_note_lock[a] = p_note_lock[b]; p_note_lock[b] = tmp;
+    tmp = p_rng_lo[a]; p_rng_lo[a] = p_rng_lo[b]; p_rng_lo[b] = tmp;
+    tmp = p_rng_hi[a]; p_rng_hi[a] = p_rng_hi[b]; p_rng_hi[b] = tmp;
+    tmp = p_color[a]; p_color[a] = p_color[b]; p_color[b] = tmp; col_dirty = 1;
+    tmp = p_mute[a]; p_mute[a] = p_mute[b]; p_mute[b] = tmp;
+    tmp = p_solo[a]; p_solo[a] = p_solo[b]; p_solo[b] = tmp;
+    tmp = p_choke[a]; p_choke[a] = p_choke[b]; p_choke[b] = tmp;
+    tmp = p_oneshot[a]; p_oneshot[a] = p_oneshot[b]; p_oneshot[b] = tmp;
+    tmp = p_reverse[a]; p_reverse[a] = p_reverse[b]; p_reverse[b] = tmp;
+    tmp = p_swapLR[a];  p_swapLR[a]  = p_swapLR[b];  p_swapLR[b]  = tmp;
+    tmp = p_output[a]; p_output[a] = p_output[b]; p_output[b] = tmp;
+    // ── SYN slot (ps_* travels with the pad exactly like l_* metadata) ──
+    tmp = ps_enable[a]; ps_enable[a] = ps_enable[b]; ps_enable[b] = tmp;
+    tmp = ps_engine[a]; ps_engine[a] = ps_engine[b]; ps_engine[b] = tmp;
+    tmp = ps_level[a]; ps_level[a] = ps_level[b]; ps_level[b] = tmp;
+    tmp = ps_vel_lo[a]; ps_vel_lo[a] = ps_vel_lo[b]; ps_vel_lo[b] = tmp;
+    tmp = ps_vel_hi[a]; ps_vel_hi[a] = ps_vel_hi[b]; ps_vel_hi[b] = tmp;
+    tmp = ps_rr_order[a]; ps_rr_order[a] = ps_rr_order[b]; ps_rr_order[b] = tmp;
+    tmp = ps_mac0[a]; ps_mac0[a] = ps_mac0[b]; ps_mac0[b] = tmp;
+    tmp = ps_mac1[a]; ps_mac1[a] = ps_mac1[b]; ps_mac1[b] = tmp;
+    tmp = ps_mac2[a]; ps_mac2[a] = ps_mac2[b]; ps_mac2[b] = tmp;
+    tmp = ps_mac3[a]; ps_mac3[a] = ps_mac3[b]; ps_mac3[b] = tmp;
+    tmp = ps_mac4[a]; ps_mac4[a] = ps_mac4[b]; ps_mac4[b] = tmp;
+    tmp = ps_mac5[a]; ps_mac5[a] = ps_mac5[b]; ps_mac5[b] = tmp;
+    tmp = ps_mac6[a]; ps_mac6[a] = ps_mac6[b]; ps_mac6[b] = tmp;
+    tmp = ps_mac7[a]; ps_mac7[a] = ps_mac7[b]; ps_mac7[b] = tmp;
+    // ── FX params ──
+    tmp = fx_hpf_freq[a]; fx_hpf_freq[a] = fx_hpf_freq[b]; fx_hpf_freq[b] = tmp;
+    tmp = fx_lpf_freq[a]; fx_lpf_freq[a] = fx_lpf_freq[b]; fx_lpf_freq[b] = tmp;
+    tmp = fx_eq_lo[a]; fx_eq_lo[a] = fx_eq_lo[b]; fx_eq_lo[b] = tmp;
+    tmp = fx_eq_mid[a]; fx_eq_mid[a] = fx_eq_mid[b]; fx_eq_mid[b] = tmp;
+    tmp = fx_eq_mid2[a]; fx_eq_mid2[a] = fx_eq_mid2[b]; fx_eq_mid2[b] = tmp;
+    tmp = fx_eq_mid_q[a]; fx_eq_mid_q[a] = fx_eq_mid_q[b]; fx_eq_mid_q[b] = tmp;
+    tmp = fx_eq_mid2_q[a]; fx_eq_mid2_q[a] = fx_eq_mid2_q[b]; fx_eq_mid2_q[b] = tmp;
+    tmp = fx_eq_lo_q[a]; fx_eq_lo_q[a] = fx_eq_lo_q[b]; fx_eq_lo_q[b] = tmp;
+    tmp = fx_eq_hi_q[a]; fx_eq_hi_q[a] = fx_eq_hi_q[b]; fx_eq_hi_q[b] = tmp;
+    tmp = fx_eq_hi[a]; fx_eq_hi[a] = fx_eq_hi[b]; fx_eq_hi[b] = tmp;
+    tmp = fx_eq_lo_freq[a]; fx_eq_lo_freq[a] = fx_eq_lo_freq[b]; fx_eq_lo_freq[b] = tmp;
+    tmp = fx_eq_mid_freq[a]; fx_eq_mid_freq[a] = fx_eq_mid_freq[b]; fx_eq_mid_freq[b] = tmp;
+    tmp = fx_eq_mid2_freq[a]; fx_eq_mid2_freq[a] = fx_eq_mid2_freq[b]; fx_eq_mid2_freq[b] = tmp;
+    tmp = fx_eq_hi_freq[a]; fx_eq_hi_freq[a] = fx_eq_hi_freq[b]; fx_eq_hi_freq[b] = tmp;
+    tmp = fx_sat_drv[a]; fx_sat_drv[a] = fx_sat_drv[b]; fx_sat_drv[b] = tmp;
+    tmp = fx_drv_mode[a]; fx_drv_mode[a] = fx_drv_mode[b]; fx_drv_mode[b] = tmp;
+    tmp = fx_bc_rate[a]; fx_bc_rate[a] = fx_bc_rate[b]; fx_bc_rate[b] = tmp;
+    tmp = fx_bc_bits[a]; fx_bc_bits[a] = fx_bc_bits[b]; fx_bc_bits[b] = tmp;
+    tmp = fx_snd_dly[a]; fx_snd_dly[a] = fx_snd_dly[b]; fx_snd_dly[b] = tmp;
+    tmp = fx_snd_rvb[a]; fx_snd_rvb[a] = fx_snd_rvb[b]; fx_snd_rvb[b] = tmp;
+
+    // ── Layer + repeat data ──
+    tmp = p_layer_cnt[a]; p_layer_cnt[a] = p_layer_cnt[b]; p_layer_cnt[b] = tmp;
+    tmp = p_layer_mode[a]; p_layer_mode[a] = p_layer_mode[b]; p_layer_mode[b] = tmp;
+    tmp = p_rr_idx[a]; p_rr_idx[a] = p_rr_idx[b]; p_rr_idx[b] = tmp;
+    tmp = p_sum_tight[a]; p_sum_tight[a] = p_sum_tight[b]; p_sum_tight[b] = tmp;
+    tmp = p_rpt_div[a]; p_rpt_div[a] = p_rpt_div[b]; p_rpt_div[b] = tmp;
+    tmp = p_sample_offset[a]; p_sample_offset[a] = p_sample_offset[b]; p_sample_offset[b] = tmp;
+    li = 0;
+    loop(MAX_LAYERS,
+      la = a * MAX_LAYERS + li;
+      lb = b * MAX_LAYERS + li;
+      tmp = l_len[la]; l_len[la] = l_len[lb]; l_len[lb] = tmp;
+      tmp = l_start[la]; l_start[la] = l_start[lb]; l_start[lb] = tmp;
+      tmp = l_end[la]; l_end[la] = l_end[lb]; l_end[lb] = tmp;
+      tmp = l_norm[la]; l_norm[la] = l_norm[lb]; l_norm[lb] = tmp;
+      tmp = l_norm_gain[la]; l_norm_gain[la] = l_norm_gain[lb]; l_norm_gain[lb] = tmp;
+      tmp = l_vel_lo[la]; l_vel_lo[la] = l_vel_lo[lb]; l_vel_lo[lb] = tmp;
+      tmp = l_vel_hi[la]; l_vel_hi[la] = l_vel_hi[lb]; l_vel_hi[lb] = tmp;
+      tmp = l_rr_order[la]; l_rr_order[la] = l_rr_order[lb]; l_rr_order[lb] = tmp;
+      tmp = l_sr[la]; l_sr[la] = l_sr[lb]; l_sr[lb] = tmp;
+      tmp = l_gain[la]; l_gain[la] = l_gain[lb]; l_gain[lb] = tmp;
+      li += 1;
+    );
+
+    // ── Audio buffer swap (interleaved stereo, SLOT_SIZE per pad) ──
+    // Only swap the used portions to avoid moving 4M zeros
+    _swap_len_a = max(s_len[a], pad_eff_len(a)) * 2 + 64;  // stereo interleaved + safety margin
+    _swap_len_b = max(s_len[b], pad_eff_len(b)) * 2 + 64;
+    _swap_len = max(_swap_len_a, _swap_len_b);
+    _swap_len = min(_swap_len, SLOT_SIZE);  // clamp
+    _swap_len > 0 ? (
+      // Use _swap_tmp_buf (allocated after send FX memory) for temp storage
+      memcpy(_swap_tmp_buf, s_audio_start + a * SLOT_SIZE, _swap_len);
+      memcpy(s_audio_start + a * SLOT_SIZE, s_audio_start + b * SLOT_SIZE, _swap_len);
+      memcpy(s_audio_start + b * SLOT_SIZE, _swap_tmp_buf, _swap_len);
+    );
+
+    // NOTE: pad name strings must be swapped by caller (get_cname_slot defined in main file)
+
+    // Recalculate derived values
+    recalc_pad(a); recalc_pad(b);
+    recalc_fx(a); recalc_fx(b);
+    undo_cap_end();
+  );
+);
+
+// ─── Layer selection for voice launch ──────────────────────────────────────
+// Returns layer index (0–MAX_LAYERS-1) based on mode and velocity
+// vel = 0.0–1.0, mode: 0=single, 1=vel-split, 2=round-robin, 3=sum (handled externally)
+// For mode=3 (sum), caller loops all layers — this function is not called.
+// Returns a layer index 0..MAX_LAYERS-1, or MAX_LAYERS = the SYN slot sentinel
+// (round-robin only: the synth competes in the rotation via ps_rr_order,
+// clamped into the effective range so the default order MAX_LAYERS still
+// plays last on pads with fewer layers). Spec_Swing_Synth_Layer §2.2.
+function select_layer(pad, vel, mode) local(cnt, li, fi, _base, best, _oidx, _syn_on, _tot, _spos, _scan) (
+  cnt = p_layer_cnt[pad];
+  // RR pads with an enabled synth must reach the mode-2 branch even at one
+  // layer (sweep finding: the cnt<=1 early-out silently muted the synth turn)
+  cnt <= 1 && !(mode == 2 && ps_enable[pad]) ? 0 : (
+    mode == 1 ? (  // velocity split: use per-layer vel_lo/vel_hi ranges
+      best = -1; li = 0;
+      while(li < cnt) (
+        _base = pad * MAX_LAYERS + li;
+        vel >= l_vel_lo[_base] && (vel < l_vel_hi[_base] || l_vel_hi[_base] >= 1.0) && l_len[_base] > 0 ? (
+          best = li; li = cnt; // found — break
+        );
+        li += 1;
+      );
+      // Fallback: if no range matched, find nearest layer with audio
+      best < 0 ? (
+        fi = 0;
+        while(fi < cnt && l_len[pad * MAX_LAYERS + fi] <= 0) ( fi += 1; );
+        fi < cnt ? best = fi : best = 0;
+      );
+      best;
+    ) :
+    mode == 2 ? (  // round-robin: follow l_rr_order sequence (+ SYN slot)
+      // p_rr_idx tracks position in the order sequence (0, 1, 2, ...).
+      // An enabled synth extends the rotation by one position; when the
+      // rotation lands on ps_rr_order (clamped), the SYN sentinel is returned
+      // and launch_voices_for_pad plays the synth instead of a sample layer.
+      _syn_on = ps_enable[pad] ? 1 : 0;
+      _tot = max(cnt, 1) + _syn_on;
+      _oidx = p_rr_idx[pad] % _tot;
+      p_rr_idx[pad] = (_oidx + 1) % _tot;
+      _spos = min(ps_rr_order[pad], _tot - 1);   // synth's rotation position
+      _syn_on && _oidx == _spos ? (
+        MAX_LAYERS;   // SYN sentinel — early return
+      ) : (
+      // Find the layer whose rr_order matches. The synth consumed one rotation
+      // position, so scan positions past it shift down by one — otherwise the
+      // layer at order == _spos becomes unreachable and the last layer doubles
+      // (sweep finding).
+      _scan = _syn_on && _oidx > _spos ? _oidx - 1 : _oidx;
+      best = -1; li = 0;
+      while(li < cnt) (
+        _base = pad * MAX_LAYERS + li;
+        l_rr_order[_base] == _scan && l_len[_base] > 0 ? (
+          best = li; li = cnt; // break
+        );
+        li += 1;
+      );
+      // Fallback: just use the compensated position directly if lookup fails
+      best < 0 ? (
+        best = max(0, min(_scan, cnt - 1));
+        // Skip empty
+        fi = 0;
+        while(fi < cnt && l_len[pad * MAX_LAYERS + best] <= 0) (
+          best = (best + 1) % cnt;
+          fi += 1;
+        );
+      );
+      best;
+      );
+    ) :
+    (  // single (mode 0) — first layer with audio (prefer layer 0)
+      l_len[pad * MAX_LAYERS] > 0 ? 0 : (
+        fi = 1;
+        while(fi < cnt && l_len[pad * MAX_LAYERS + fi] <= 0) ( fi += 1; );
+        fi < cnt ? fi : 0;
+      );
+    );
+  );
+);

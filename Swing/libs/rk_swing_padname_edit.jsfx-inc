@@ -1,0 +1,377 @@
+// rk_swing_padname_edit.jsfx-inc
+// In-place pad-name editor — replaces the CMD 50 native rename dialog.
+// (c) EON Studios — All Rights Reserved
+//
+// The pad-name pill (rk_swing_ui_grid_pads.jsfx-inc top strip) opens this
+// editor on click; the box takes over the pad's whole top strip, left-aligned,
+// with a blinking caret. Enter / click-outside / keyboard-focus-loss commit;
+// the box swallows clicks inside itself (caret placement).
+//
+// WHY IN-PLACE (measured 2026-08-04, .dev_tests/kbprobe_default.jsfx header
+// is the canonical writeup):
+//   - Plain gfx_getchar() delivers letters/digits/punct, BackSpace, Enter,
+//     Left/Right/Home/End/Del in floating AND in-chain contexts. SPACE and
+//     ctrl-combos arrive only when the per-instance "Send all keyboard input
+//     to plug-in" toggle (WAK chunk line) is on; Swing ships want_all_kb so
+//     fresh inserts get it pre-checked. ESC NEVER arrives; embedded contexts
+//     get NO keyboard at all (this module stays inert on embed frames).
+//   - Multiple chars can land in ONE @gfx frame (measured 3), so the tick
+//     DRAINS the queue instead of relying on the once-per-frame _char.
+//   - gfx_getchar(65536)&2 == "my gfx has keyboard focus" (15/13/5/1 raw
+//     values measured); we commit after ~15 consecutive unfocused frames.
+//
+// COMMIT CONTRACT — mirrors the CMD 51 tail (rk_swing_ui_state.jsfx-inc:1391,
+// the flow this replaces) plus one addition:
+//   1. strcpy into get_cname_slot(pad)
+//   2. write the pad's KIT_GMEM_PADNAMES row DIRECTLY. The bridge used to do
+//      this before raising CMD 51; without it the unslotted-instance reverse
+//      name adopt (rk_swing_ui_state.jsfx-inc "REVERSE-DIRECTION NAME SYNC",
+//      _reg_my_slot < 0 fallback) would see gmem != cname one frame later and
+//      revert the commit from stale gmem.
+//   3. mark_dirty_pad(pad)  4. sync_note_names()  5. col_dirty = 1
+// Multi-out lane renames need NO explicit signal: identity-active sessions
+// are serviced by the per-instance walker (bridge
+// refresh_multiout_identity_per_instance, ~10Hz, reads the 26010000 band the
+// @block identity publisher feeds from cname), legacy sessions by the
+// PADNAMES hash watcher (bridge refresh_multiout_names_if_changed). Both are
+// state-watchers — nothing edge-triggered to miss.
+//
+// AUTO-CLOSE RULES (tick, in order):
+//   - cname changed underneath us (undo apply, INCMD TCP-rename adopt, kit
+//     import, browser load, synth autoname, @serialize reload — any of the
+//     12 cname writers) → DROP the edit. One strcmp vs #pne_orig catches
+//     every writer without enumerating them.
+//   - kit_busy / kit_import_state != 0 → DROP (THIS instance is importing;
+//     the incoming kit's names supersede the edit).
+//   - KIT_GMEM_CMD != 0 alone → HOLD. The CMD bus is SHARED across
+//     instances (and Swing Lite); another instance's transaction must not
+//     destroy this instance's typed text. A blocked commit sets
+//     pne_commit_pend and the tick retries every frame until the bus
+//     clears (typically 1-2 frames) — see swing_pne_commit.
+//   - a modal opened (overlay / big view / range / category / popup) →
+//     COMMIT (benign context change; the user's typing survives).
+//   - keyboard focus lost > 15 frames, Enter, click outside → COMMIT.
+//   - ESC → drop the edit, restoring the original name. ⚠️ The 2026-08-04
+//     probes never logged char 27 and this was first written off as
+//     unreachable. Cause since found: that run drove every key by synthetic
+//     injection, which delivers ESC to nothing. A physical keypress logs 27
+//     in BOTH probe variants, want_all_kb or not. It is a REAL path — do NOT
+//     let the probe matrix talk anyone into deleting this branch or the
+//     sibling ESC closes in rk_swing_popup / rk_swing_ui_grid_overlay.
+//   - commit with buf == orig short-circuits to a plain close: no gmem
+//     writes, no mark_dirty, no CMD 52 churn for a click-in/click-out.
+//
+// Synth autoname safety: _syn_name_owned() derives ownership by comparing
+// cname to engine names, so a user-typed name from this editor is
+// automatically "not owned" and never clobbered — no integration needed.
+//
+// Draw order (Swing_ReaKit.jsfx @gfx): swing_pne_tick() right after
+// swing_ui_modal_gate() — its click-swallow must precede the grid's
+// handlers; swing_pne_draw() between swing_tooltip_draw() and
+// swing_popup_tick() — above the pad face and tooltips, below popups.
+// Geometry: the grid pass publishes pne_px/pne_py/pne_pw for the editing
+// pad each frame it draws (pne_geom_ok); the draw publishes pne_hit_* for
+// the NEXT frame's click tests (one frame stale, 16ms, fine).
+//
+// Visual tokens: popup-strip dark bg (0.03,0.05,0.07,0.97), live theme
+// accent border (ac_r/g/b — swing_ui_set_colors runs before our draw),
+// pill font (id 1, Arial, 13, 'b'), StepSeq insertion-caret color.
+
+@init
+
+// ─── State (all @gfx-thread only — never touched from @block/@sample) ────
+pne_pad        = -1;   // pad being edited, -1 = inactive
+pne_caret      = 0;    // caret position in chars, 0..strlen(#pne_buf)
+pne_i0         = 0;    // first visible char (horizontal scroll anchor)
+pne_unfocus    = 0;    // consecutive frames without keyboard focus
+pne_geom_ok    = 0;    // grid published pne_px/py/pw this frame
+pne_px = 0; pne_py = 0; pne_pw = 0;          // pad-face geometry (grid)
+pne_hit_valid  = 0;    // pne_hit_* holds last drawn box rect
+pne_hit_x = 0; pne_hit_y = 0; pne_hit_w = 0; pne_hit_h = 0;
+pne_commit_pend = 0;   // commit blocked by a FOREIGN CMD-bus transaction — retry
+
+// Cap = the storage truth everywhere (gmem rows, identity band, undo
+// backup, bridge trim) — NOT the old dialog's "max 16" label, which lied
+// (the bridge trimmed at 32 all along).
+PNE_MAX_LEN = 32;
+
+function swing_pne_active() ( pne_pad >= 0 );
+
+// Mouse inside the (last drawn) editor box. Shared by the tick's click and
+// wheel swallows and by grid_pads' hover suppression — the box must own
+// EVERY input channel over its rect, not just clicks.
+function swing_pne_mouse_in_box() (
+  pne_pad >= 0 && pne_hit_valid &&
+  mx >= pne_hit_x && mx <= pne_hit_x + pne_hit_w &&
+  my >= pne_hit_y && my <= pne_hit_y + pne_hit_h;
+);
+
+// Width in px of #pne_buf[_a.._b) with the pill font. Sets the font itself —
+// gfx_setfont is global and gfx_measurestr fails silently on a stale font.
+function swing_pne_substr_w(_a, _b)
+local(_w, _h)
+(
+  _b <= _a ? 0 : (
+    gfx_setfont(1, "Arial", 13, 'b');
+    strcpy_substr(#pne_sub, #pne_buf, _a, _b - _a);
+    gfx_measurestr(#pne_sub, _w, _h);
+    _w;
+  );
+);
+
+// Insert printable char at the caret (no-op at the 32-char cap).
+function swing_pne_ins(_c)
+local(_len)
+(
+  _len = strlen(#pne_buf);
+  _len < PNE_MAX_LEN ? (
+    pne_caret > _len ? pne_caret = _len;
+    strcpy_substr(#pne_tmp, #pne_buf, 0, pne_caret);
+    sprintf(#pne_chr, "%c", _c);
+    strcat(#pne_tmp, #pne_chr);
+    strcpy_substr(#pne_tail, #pne_buf, pne_caret, _len - pne_caret);
+    strcat(#pne_tmp, #pne_tail);
+    strcpy(#pne_buf, #pne_tmp);
+    pne_caret += 1;
+  );
+);
+
+// Delete the char at _pos (Del at caret; Backspace passes caret-1).
+function swing_pne_del(_pos)
+local(_len)
+(
+  _len = strlen(#pne_buf);
+  _pos >= 0 && _pos < _len ? (
+    strcpy_substr(#pne_tmp, #pne_buf, 0, _pos);
+    strcpy_substr(#pne_tail, #pne_buf, _pos + 1, _len - _pos - 1);
+    strcat(#pne_tmp, #pne_tail);
+    strcpy(#pne_buf, #pne_tmp);
+  );
+);
+
+// Commit — the CMD 51 tail, plus the direct PADNAMES row write (header
+// "COMMIT CONTRACT"). Three outcomes:
+//   local import in flight → DROP (incoming kit names supersede the edit);
+//   foreign CMD-bus traffic → HOLD (pne_commit_pend; tick retries — another
+//     instance's transaction must not cost this instance its typed text);
+//   bus clear → write (skipped entirely when nothing changed) and close.
+// The tick's strcmp watch guarantees #pne_orig still equals the live cname
+// here, so buf == orig means cname AND the gmem row already hold this exact
+// value — a no-change close needs no write, no dirty, no CMD 52.
+function swing_pne_commit()
+local(_cn, _cj, _cnl)
+(
+  pne_pad >= 0 ? (
+    kit_busy || kit_import_state != 0 ? (
+      pne_pad = -1; pne_commit_pend = 0;
+    ) : gmem[KIT_GMEM_CMD] == 0 ? (
+      strcmp(#pne_buf, #pne_orig) != 0 ? (
+        _cn = get_cname_slot(pne_pad);
+        strcpy(_cn, #pne_buf);
+        _cnl = strlen(_cn);
+        _cj = 0;
+        loop(KIT_GMEM_PADNAME_LEN,
+          gmem[KIT_GMEM_PADNAMES + pne_pad * KIT_GMEM_PADNAME_LEN + _cj] =
+            _cj < _cnl ? str_getchar(_cn, _cj) : 0;
+          _cj += 1;
+        );
+        mark_dirty_pad(pne_pad);
+        sync_note_names();
+        col_dirty = 1;  // re-derive auto-color from new cname (CMD 51 parity)
+      );
+      pne_pad = -1; pne_commit_pend = 0;
+    ) : (
+      pne_commit_pend = 1;   // foreign bus busy — hold open, tick retries
+    );
+  );
+);
+
+// Open on _pad. Gates only on LOCAL transactions (this instance importing a
+// kit — the incoming names supersede any edit). Deliberately NO KIT_GMEM_CMD
+// gate: the bus is shared, and our OWN commit leaves CMD 52 on it for a
+// bridge-poll cycle — requiring CMD==0 here broke the serial-rename gesture
+// (commit pad A by clicking pill B: B refused to open against A's sync).
+// Live-verified 2026-08-04. Editing during foreign CMD traffic is safe:
+// the buffer is local, the strcmp watch drops the edit if cname mutates,
+// and swing_pne_commit holds until the bus clears before writing.
+function swing_pne_open(_pad)
+local(_cn)
+(
+  _pad >= 0 && _pad < NUM_PADS && !kit_busy && kit_import_state == 0 ? (
+    pne_pad = _pad;
+    _cn = get_cname_slot(_pad);
+    strcpy(#pne_orig, _cn);               // exact copy — external-mutation watch
+    strcpy(#pne_buf, _cn);
+    strlen(#pne_buf) > PNE_MAX_LEN ? str_setlen(#pne_buf, PNE_MAX_LEN);
+    pne_caret = strlen(#pne_buf);
+    pne_i0 = 0;
+    pne_unfocus = 0;
+    pne_hit_valid = 0;
+    1;
+  ) : 0;
+);
+
+// Caret from a click inside the box (uses the same scroll anchor the draw
+// used last frame, so click x maps to the glyphs the user actually saw).
+// Rounds to the NEAREST glyph boundary via cell midpoints — comparing
+// against full boundary widths would bias every click one position right
+// (a click 1px into a glyph's body would land the caret after it).
+function swing_pne_click_caret(_cx)
+local(_rel, _i, _len, _done, _mid)
+(
+  _rel = _cx - (pne_hit_x + 4);
+  _len = strlen(#pne_buf);
+  _i = pne_i0; _done = 0;
+  loop(_len - pne_i0 + 1,
+    !_done ? (
+      _mid = _i < _len ?
+        (swing_pne_substr_w(pne_i0, _i) + swing_pne_substr_w(pne_i0, _i + 1)) * 0.5 :
+        swing_pne_substr_w(pne_i0, _i);
+      _mid >= _rel ? ( pne_caret = _i; _done = 1; );
+    );
+    _i += 1;
+  );
+  !_done ? pne_caret = _len;
+);
+
+// Per-frame input tick. Call right after swing_ui_modal_gate() so the
+// click-swallow below precedes every grid handler.
+function swing_pne_tick()
+local(_c, _n, _f, _in)
+(
+  pne_pad >= 0 ? (
+    strcmp(get_cname_slot(pne_pad), #pne_orig) != 0 ? (
+      pne_pad = -1; pne_commit_pend = 0;  // renamed under us — their write wins
+    ) : kit_busy || kit_import_state != 0 ? (
+      pne_pad = -1; pne_commit_pend = 0;  // LOCAL import — incoming names win
+    ) : overlay_pad >= 0 || big_view_id != VIEW_NONE || rng_ov_pad >= 0 || pk_ov_pad >= 0 ||
+        cat_ov_pad >= 0 || swing_popup_active ? (
+      swing_pne_commit();   // modal took the screen — keep the typing
+    ) : (
+      // Held commit (foreign CMD-bus traffic at commit time) — retry until
+      // the bus clears. Runs first so a pending Enter lands before new input.
+      pne_commit_pend ? swing_pne_commit();
+      // Focus-loss commit. Only meaningful on non-embed frames: when a TCP
+      // embed and the float are both live their frames alternate, and the
+      // embed context always reads unfocused — counting it would false-fire.
+      !is_embedded ? (
+        _f = gfx_getchar(65536);
+        (_f & 2) ? pne_unfocus = 0 : pne_unfocus += 1;
+        pne_unfocus > 15 ? swing_pne_commit();
+      );
+      // Clicks: inside the box = caret placement, box owns the click
+      // (zeroed like swing_ui_modal_gate does — the note pill and pad
+      // handlers underneath must not fire). Outside = commit; the click
+      // stays live so the pad it landed on responds normally — clicking
+      // pill B while editing pad A commits A and opens B in one gesture.
+      // !is_embedded like the focus check: embed frames carry embed-space
+      // mouse coords, and pne_hit_* is float-space — testing across spaces
+      // would eat embedded pad clicks (or force-commit from noise).
+      !is_embedded && pne_pad >= 0 && (lmb_down || rmb_down) ? (
+        _in = swing_pne_mouse_in_box();
+        _in ? (
+          lmb_down ? swing_pne_click_caret(mx);
+          lmb_down = 0; LMB = 0; rmb_down = 0; RMB = 0;
+        ) : (
+          swing_pne_commit();
+        );
+      );
+      // The box owns the wheel too — without this, a wheel over the box
+      // falls through to the pad-face handlers underneath.
+      !is_embedded && swing_pne_mouse_in_box() ? frame_wheel = 0;
+      // Char drain: first the frame global (captured once at the @gfx top),
+      // then empty the queue — 3 chars in one frame measured, and Swing's
+      // single call would smear a fast burst across frames.
+      pne_pad >= 0 ? (
+        _c = _char; _n = 0;
+        while(
+          _c > 0 && _n < 64 && pne_pad >= 0 ? (
+            _c == 13 ? (
+              swing_pne_commit();
+            ) : _c == 27 ? (
+              pne_pad = -1;   // ESC cancel — live path, hand-verified 2026-08-04
+            ) : _c == 8 ? (
+              pne_caret > 0 ? ( swing_pne_del(pne_caret - 1); pne_caret -= 1; );
+            ) : _c == 'left' ? (
+              pne_caret > 0 ? pne_caret -= 1;
+            ) : _c == 'rght' ? (
+              pne_caret < strlen(#pne_buf) ? pne_caret += 1;
+            ) : _c == 'home' ? (
+              pne_caret = 0;
+            ) : _c == 'end' ? (
+              pne_caret = strlen(#pne_buf);
+            ) : _c == 'del' ? (
+              swing_pne_del(pne_caret);
+            ) : _c >= 32 && _c <= 126 ? (
+              swing_pne_ins(_c);
+            );
+            _n += 1;
+            pne_pad >= 0 ? ( _c = gfx_getchar(); 1; ) : 0;
+          ) : 0
+        );
+        _char = 0;  // consumed — the popup/overlay ESC checks must not fire
+      );
+    );
+    pne_geom_ok = 0;  // grid re-publishes below if it draws the pad this frame
+  );
+);
+
+// Editor box. Call between swing_tooltip_draw() and swing_popup_tick().
+function swing_pne_draw()
+local(_len, _avail, _i1, _cw, _th, _tw, _bx, _by, _bw, _bh, _t)
+(
+  pne_pad >= 0 && !is_embedded && pne_geom_ok ? (
+    gfx_setfont(1, "Arial", 13, 'b');
+    gfx_measurestr("Ay", _tw, _th);
+    // 1px inset, not 2: the grid draws the meter track / clip bar / L meter
+    // in the pad_x+1 column — a 2px inset leaves that column peeking along
+    // the box's left edge. pad border columns (pad_x, pad_x+pw-1) untouched.
+    _bx = pne_px + 1; _by = pne_py + 1;
+    _bw = pne_pw - 2; _bh = _th + 4;
+    // hit rect for the NEXT frame's tick
+    pne_hit_x = _bx; pne_hit_y = _by; pne_hit_w = _bw; pne_hit_h = _bh;
+    pne_hit_valid = 1;
+    // popup-strip shadow + bg, theme-accent 1px border (edit-mode signal)
+    gfx_set(0, 0, 0, 0.45);          gfx_rect(_bx + 2, _by + 2, _bw, _bh);
+    gfx_set(0.03, 0.05, 0.07, 0.97); gfx_rect(_bx, _by, _bw, _bh);
+    gfx_set(ac_r, ac_g, ac_b, 0.95);
+    gfx_rect(_bx, _by, _bw, 1); gfx_rect(_bx, _by + _bh - 1, _bw, 1);
+    gfx_rect(_bx, _by, 1, _bh); gfx_rect(_bx + _bw - 1, _by, 1, _bh);
+    // Horizontal scroll: advance the anchor until the caret fits, then
+    // extend the visible run to fill the box. Quantized to whole chars —
+    // JSFX has no scissor rect, so we only ever draw what fits.
+    _len = strlen(#pne_buf);
+    _avail = _bw - 8;
+    (pne_i0 < 0 || pne_i0 > _len) ? pne_i0 = 0;
+    pne_caret < pne_i0 ? pne_i0 = pne_caret;
+    while(
+      swing_pne_substr_w(pne_i0, pne_caret) > _avail - 3 && pne_i0 < pne_caret ? (
+        pne_i0 += 1; 1;
+      ) : 0
+    );
+    _i1 = pne_caret;
+    while(
+      _i1 < _len && swing_pne_substr_w(pne_i0, _i1 + 1) <= _avail ? (
+        _i1 += 1; 1;
+      ) : 0
+    );
+    gfx_setfont(1, "Arial", 13, 'b');
+    strcpy_substr(#pne_sub, #pne_buf, pne_i0, _i1 - pne_i0);
+    gfx_set(0.95, 0.97, 0.98, 1);   // popup item text — always white-ish
+    gfx_x = _bx + 4; gfx_y = _by + 2;
+    gfx_drawstr(#pne_sub);
+    // Caret — 2px near-white bar (the StepSeq insertion-caret idiom), 62%
+    // duty blink off time_precise (the repo's only other blink is a sin
+    // pulse; a text caret wants a crisp square). ⚠️ EEL2 `%` truncates BOTH
+    // operands to integers — `t % 1.0` is always 0 — so take the fractional
+    // part explicitly.
+    _t = time_precise();
+    _t - (_t|0) < 0.62 ? (
+      _cw = swing_pne_substr_w(pne_i0, pne_caret);
+      gfx_set(0.99, 1.0, 1.0, 0.9);
+      gfx_rect(_bx + 4 + _cw, _by + 2, 2, _bh - 4);
+    );
+  ) : (
+    pne_pad < 0 ? pne_hit_valid = 0;
+  );
+);

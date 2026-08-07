@@ -1,0 +1,285 @@
+desc:EON FX Return View — pad contributors monitor (Verb / Delay)
+// Read-only monitor that sits on an EON Verb/Delay Return track and shows WHICH
+// pads are feeding the bus: a vertical bar list of each contributing pad's send
+// level + a live "hitting" glow, inside a classic-rack hardware faceplate
+// (Lexicon-homage skin for the verb bus, Eventide-homage for the delay bus).
+//
+// Data is READ from the per-instance strip band in gmem (published by
+// Swing_ReaKit.jsfx). This plugin never writes gmem and does NOT process audio
+// (no @sample → samples pass through untouched). The owning Swing instance's
+// registry slot is pushed into link_slot by EON_Swing_Strip_Sync.lua (slots are
+// session-volatile, so it can't be baked at build time); bus_id is set by the
+// bridge when the return track is built.
+
+options:gmem=Swing_Media_Transfer
+
+// Hidden/internal — driven by the bridge (bus_id) and the strip-sync companion
+// (link_slot). Not meant for the user.
+slider1:link_slot=-1<-1,64,1>-Linked registry slot (internal; Lua-pushed)
+slider2:bus_id=0<0,1,1>-Bus (0 = Reverb, 1 = Delay) (internal)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+ext_noinit = 1.0;
+gfx_ext_retina == 0 ? gfx_ext_retina = 1;
+// Embed support — bit 0x100 MUST be set in @init (no effect later; REAPER 7.45+).
+gfx_ext_flags |= 0x100;
+
+// ── gmem strip-band layout — MUST match Swing_ReaKit.jsfx / rk_lua_core.lua ──
+GS_STRIP_BASE       = 26050000;
+GS_STRIP_STRIDE     = 1024;
+GS_STRIP_PADS       = 8;
+GS_STRIP_PAD_STRIDE = 32;
+FX_PID_SND_DLY      = 15;
+FX_PID_SND_RVB      = 16;
+PAD_OFF_PEAK        = 23;
+PAD_OFF_HUE         = 24;
+NUM_PADS            = 16;
+// Per-instance pad NAME band (Swing publishes 0-terminated 32-char names here,
+// keyed by the same registry slot as the strip band). MUST match Swing_ReaKit.jsfx.
+INST_PADNAME_BASE   = 26010000;
+INST_PADNAME_STRIDE = 512;   // 16 pads * 32
+INST_PADNAME_LEN    = 32;
+// Strip CMD mailbox — Swing consumes this every block (the shipped strip-send
+// feature), applying (pad, pid, value) via swing_fx_apply. The viewer writes it
+// directly to set a pad's send, so editing needs no extra plumbing. MUST match
+// Swing_ReaKit.jsfx GS_STRIP_OFF_CMD_*. For a pad with no Drum Strip the strip-sync
+// companion never touches this mailbox, so the viewer is the sole writer; on a
+// strip-equipped pad the companion's strip-authoritative sync can still override.
+CMD_SEQ = 4; CMD_PAD = 5; CMD_PID = 6; CMD_VAL = 7;
+
+// Per-pad snapshot + smoothed glow (frame-rate decay of the live-hit overlay).
+freemem  = 0;
+m_send   = freemem; freemem += NUM_PADS;
+m_peak   = freemem; freemem += NUM_PADS;
+m_hue    = freemem; freemem += NUM_PADS;
+m_glow   = freemem; freemem += NUM_PADS;
+
+// Drag state (persist across @gfx frames).
+drag_pad = -1;   // pad currently being dragged, -1 = none
+vcmd_seq = 0;    // edit counter, bumped per write (Swing's strip-CMD consume applies on change)
+plmb     = 0;    // previous left-mouse state for press-edge detection
+
+// hue (0..1, or sentinel <0) → gfx_r/g/b at a fixed S/V (matches the pad-face look)
+function hue2rgb(h) local(i, f, p, q, t, s, v) (
+  h < 0 ? ( gfx_r = 0.72; gfx_g = 0.72; gfx_b = 0.74; ) : (
+    s = 0.62; v = 0.96;
+    h = h - floor(h);
+    i = floor(h * 6); f = h * 6 - i;
+    p = v * (1 - s); q = v * (1 - s * f); t = v * (1 - s * (1 - f));
+    i == 0 ? ( gfx_r = v; gfx_g = t; gfx_b = p; ) :
+    i == 1 ? ( gfx_r = q; gfx_g = v; gfx_b = p; ) :
+    i == 2 ? ( gfx_r = p; gfx_g = v; gfx_b = t; ) :
+    i == 3 ? ( gfx_r = p; gfx_g = q; gfx_b = v; ) :
+    i == 4 ? ( gfx_r = t; gfx_g = p; gfx_b = v; ) :
+             ( gfx_r = v; gfx_g = p; gfx_b = q; );
+  );
+);
+
+function screw(cx, cy, r) (
+  gfx_set(0.05, 0.05, 0.06, 1); gfx_circle(cx, cy, r, 1, 1);
+  gfx_set(0.42, 0.44, 0.48, 1); gfx_circle(cx, cy, r * 0.7, 1, 1);
+  gfx_set(0.12, 0.12, 0.14, 1);
+  gfx_line(cx - r * 0.5, cy, cx + r * 0.5, cy);   // slotted head
+);
+
+// Draw "NN Name" for pad i at the current gfx_x/gfx_y (number, then the live pad
+// name read char-by-char from the per-instance name band; number only if blank).
+function draw_padlabel(i) local(c, ch, nb) (
+  sprintf(#num, "%02d ", i + 1); gfx_drawstr(#num);
+  nb = INST_PADNAME_BASE + (max(0, link_slot) | 0) * INST_PADNAME_STRIDE + i * INST_PADNAME_LEN;
+  c = 0;
+  loop(INST_PADNAME_LEN,
+    ch = gmem[nb + c] | 0;
+    ch > 0 ? gfx_drawchar(ch);
+    c += 1;
+  );
+);
+
+// Push one send edit to Swing via the viewer mailbox (pid is the current bus's
+// send id, set in @gfx). SEQ bumped LAST so Swing consumes exactly once.
+function vcmd_write(pad, v) local(vb) (
+  vb = GS_STRIP_BASE + (max(0, link_slot) | 0) * GS_STRIP_STRIDE;
+  gmem[vb + CMD_PAD] = pad;
+  gmem[vb + CMD_PID] = pid;
+  gmem[vb + CMD_VAL] = v;
+  vcmd_seq += 1;
+  gmem[vb + CMD_SEQ] = vcmd_seq;   // bump LAST → the live Swing strip-CMD consume applies it
+);
+
+@gfx 440 560
+ret   = max(1, gfx_ext_retina);
+micro = gfx_ext_flags & 1;
+W = gfx_w; H = gfx_h;
+sc = micro ? ret : max(0.7, min(W / 440, H / 560));
+verb = bus_id < 0.5;
+
+// Mouse (drag to edit). Clear the embed click-through bit now; re-arm it at the
+// END of @gfx only when the cursor is NOT over a draggable bar — so a drag is
+// handled inline here instead of popping the floating window (Drum Strip trick).
+mx = mouse_x; my = mouse_y; lmb = mouse_cap & 1;
+// Consume the wheel ONCE per frame (don't let it accumulate between frames while
+// the cursor is off the bars — that caused a big jump on the next hover).
+wheel = mouse_wheel; mouse_wheel = 0;
+micro ? gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
+over_bar = 0;
+!lmb ? drag_pad = -1;                   // release ends the drag
+
+// Phosphor (display) colour — fixed per unit type, NOT theme-driven (hardware).
+verb ? ( phr = 0.36; phg = 1.00; phb = 0.60; ) : ( phr = 1.00; phg = 0.56; phb = 0.18; );
+
+// ── Read the per-pad contribution snapshot from the strip band ─────────────
+linked = link_slot >= 0;
+pb  = GS_STRIP_BASE + (max(0, link_slot) | 0) * GS_STRIP_STRIDE + GS_STRIP_PADS;
+pid = verb ? FX_PID_SND_RVB : FX_PID_SND_DLY;
+count = 0;
+i = 0; loop(NUM_PADS,
+  linked ? (
+    _b = pb + i * GS_STRIP_PAD_STRIDE;
+    m_send[i] = gmem[_b + pid];
+    m_peak[i] = gmem[_b + PAD_OFF_PEAK];
+    m_hue[i]  = gmem[_b + PAD_OFF_HUE];
+  ) : ( m_send[i] = 0; m_peak[i] = 0; m_hue[i] = -1; );
+  // live-hit target = send × peak (boosted so audible hits pop); fast attack,
+  // slow release so the glow reads as a flash that fades.
+  _g = min(1, m_send[i] * m_peak[i] * 4);
+  m_glow[i] < _g ? m_glow[i] = _g : m_glow[i] += (_g - m_glow[i]) * 0.18;
+  (m_send[i] > 0.005 || drag_pad == i) ? count += 1;   // keep a dragged row visible
+  i += 1;
+);
+
+// ── Faceplate chrome ───────────────────────────────────────────────────────
+verb ? ( plr = 0.16; plg = 0.17; plb = 0.19; ) : ( plr = 0.075; plg = 0.08; plb = 0.095; );
+gfx_set(plr, plg, plb, 1); gfx_rect(0, 0, W, H);
+// brushed sheen: a soft lighter band across the upper third
+gfx_set(1, 1, 1, 0.04); gfx_rect(0, 0, W, floor(H * 0.34));
+
+show_chrome = !micro && H >= floor(96 * ret);
+top = show_chrome ? floor(30 * sc) : floor(2 * sc);
+
+show_chrome ? (
+  // brand block (amber on verb, orange on delay) + model sub-label
+  gfx_setfont(3, "Arial", max(11, floor(17 * sc)), 'b');
+  verb ? gfx_set(1.0, 0.72, 0.32, 1) : gfx_set(1.0, 0.55, 0.16, 1);
+  gfx_x = floor(14 * sc); gfx_y = floor(7 * sc);
+  gfx_drawstr(verb ? "EON 480" : "EON H9");
+  gfx_setfont(4, "Arial", max(8, floor(10 * sc)));
+  gfx_set(0.58, 0.60, 0.64, 0.9);
+  gfx_drawstr(verb ? "   DIGITAL REVERB" : "   HARMONIZED DELAY");
+  // unit tag on the right
+  gfx_x = W - floor(96 * sc); gfx_y = floor(9 * sc);
+  gfx_set(0.40, 0.42, 0.46, 0.8); gfx_drawstr(verb ? "RETURN · RV" : "RETURN · DL");
+  // rack-ear screws
+  screw(floor(9 * sc),     floor(10 * sc),     floor(4 * sc));
+  screw(W - floor(9 * sc), floor(10 * sc),     floor(4 * sc));
+  screw(floor(9 * sc),     H - floor(9 * sc),  floor(4 * sc));
+  screw(W - floor(9 * sc), H - floor(9 * sc),  floor(4 * sc));
+);
+
+// ── Display window (recessed, dark with a fixed-phosphor tint) ─────────────
+mgn = show_chrome ? floor(12 * sc) : floor(3 * sc);
+dx = mgn; dy = top; dw = W - 2 * mgn; dh = H - top - mgn;
+// Skinny MCP strip (e.g. a 2-channel return) → compact layout: short header,
+// no % gutter, so the pad name + bar get the width.
+narrow = dw < floor(220 * ret);
+gfx_set(0, 0, 0, 1); gfx_rect(dx - 1, dy - 1, dw + 2, dh + 2);        // bezel
+verb ? gfx_set(0.02, 0.07, 0.04, 1) : gfx_set(0.06, 0.035, 0.0, 1);  // screen bg
+gfx_rect(dx, dy, dw, dh);
+// faint scanlines for the hardware read
+gfx_set(0, 0, 0, 0.18);
+_ly = dy + 2; loop(floor(dh / 3), gfx_line(dx, _ly, dx + dw, _ly); _ly += 3;);
+
+// display header
+gfx_setfont(1, "Arial", max(8, floor(11 * sc)), 'b');
+gfx_set(phr, phg, phb, 0.92);
+gfx_x = dx + floor(6 * sc); gfx_y = dy + floor(4 * sc);
+gfx_drawstr(narrow ? (verb ? "REVERB" : "DELAY")
+                   : (verb ? "REVERB — CONTRIBUTORS" : "DELAY — CONTRIBUTORS"));
+
+listy = dy + floor(20 * sc);
+listh = dh - floor(24 * sc);
+
+!linked ? (
+  gfx_set(phr, phg, phb, 0.55);
+  gfx_x = dx + floor(6 * sc); gfx_y = listy;
+  gfx_drawstr("LINKING…");
+) : count == 0 ? (
+  gfx_set(phr, phg, phb, 0.45);
+  gfx_x = dx + floor(6 * sc); gfx_y = listy;
+  gfx_drawstr("NO SENDS");
+) : (
+  rowh = min(floor(listh / count), floor(34 * sc));
+  rowh = max(rowh, floor(12 * sc));
+  yy = listy;
+  i = 0; loop(NUM_PADS,
+    ((m_send[i] > 0.005 || drag_pad == i) && yy + rowh <= dy + dh) ? (
+      // bar geometry — leave a right gutter for the % readout (none when narrow)
+      sw = floor(rowh * 0.40);
+      valw = narrow ? 0 : floor(36 * sc);
+      bx = dx + floor(5 * sc) + sw + floor(6 * sc);
+      bw = dx + dw - bx - floor(6 * sc) - valw;
+      bh = max(5, floor(rowh * 0.66));
+      by = yy + floor((rowh - bh) * 0.5);
+      // ── Drag to edit this pad's send to the bus ──
+      _inrow = my >= yy && my < yy + rowh;
+      _inrow ? over_bar = 1;                              // whole row interactive (embed gating)
+      (_inrow && mx >= bx && lmb && !plmb) ? drag_pad = i;   // press on the bar/value area starts a drag
+      (drag_pad == i && lmb && linked) ? (
+        _nv = max(0, min(1, (mx - bx) / bw));
+        _nv != m_send[i] ? ( m_send[i] = _nv; vcmd_write(i, _nv); );  // optimistic + push
+      );
+      // scroll wheel anywhere on the row nudges its send. Sign-based (±4%/notch)
+      // so it works regardless of the platform's wheel-delta scale.
+      (_inrow && linked && wheel != 0) ? (
+        _nv = max(0, min(1, m_send[i] + (wheel > 0 ? 0.04 : -0.04)));
+        _nv != m_send[i] ? ( m_send[i] = _nv; vcmd_write(i, _nv); );
+      );
+      lv = min(1, m_send[i]);
+      // pad hue swatch
+      hue2rgb(m_hue[i]); gfx_a = 0.95;
+      gfx_rect(dx + floor(5 * sc), yy + floor((rowh - sw) * 0.5), sw, sw);
+      // track
+      gfx_set(phr, phg, phb, 0.13); gfx_rect(bx, by, bw, bh);
+      // scale gridlines (25/50/75 %) so you can read where the value lands
+      gfx_set(phr, phg, phb, 0.24);
+      gfx_line(bx + bw * 0.25, by, bx + bw * 0.25, by + bh);
+      gfx_line(bx + bw * 0.50, by, bx + bw * 0.50, by + bh);
+      gfx_line(bx + bw * 0.75, by, bx + bw * 0.75, by + bh);
+      // fill + live-hit glow
+      gfx_set(phr, phg, phb, 0.60); gfx_rect(bx, by, bw * lv, bh);
+      m_glow[i] > 0.01 ? ( gfx_set(1, 1, 1, 0.5 * m_glow[i]); gfx_rect(bx, by, bw * lv, bh); );
+      // slider thumb / cap at the value end
+      tx  = bx + bw * lv;
+      tww = max(2, floor(3 * sc));
+      gfx_set(1, 1, 1, 0.95);
+      gfx_rect(tx - tww * 0.5, by - floor(2 * sc), tww, bh + floor(4 * sc));
+      // pad NN + name, overlaid at the left of the bar (shadowed for legibility)
+      gfx_setfont(2, "Arial", max(7, floor(rowh * 0.44)), 'b');
+      ty = yy + floor((rowh - gfx_texth) * 0.5);
+      gfx_set(0, 0, 0, 0.55);     gfx_x = bx + floor(5 * sc) + 1; gfx_y = ty + 1; draw_padlabel(i);
+      gfx_set(0.96, 0.98, 0.96, 0.96); gfx_x = bx + floor(5 * sc); gfx_y = ty; draw_padlabel(i);
+      // % value readout (right gutter) — skipped when narrow (no gutter)
+      !narrow ? (
+        gfx_setfont(3, "Arial", max(7, floor(rowh * 0.42)), 'b');
+        gfx_set(phr, phg, phb, 0.92);
+        sprintf(#val, "%d%%", floor(lv * 100 + 0.5));
+        gfx_measurestr(#val, _vw, _vh);
+        gfx_x = dx + dw - floor(5 * sc) - _vw; gfx_y = yy + floor((rowh - _vh) * 0.5);
+        gfx_drawstr(#val);
+      );
+      yy += rowh;
+    );
+    i += 1;
+  );
+);
+
+// ── End of frame: re-arm embed click-through unless hovering a bar ──────────
+// When embedded, leave 0x200 cleared over a bar so the drag is handled inline;
+// elsewhere set it so a click opens the floating window (Drum Strip pattern).
+micro && !over_bar && drag_pad < 0 ? gfx_ext_flags |= 0x200;
+plmb = lmb;
+

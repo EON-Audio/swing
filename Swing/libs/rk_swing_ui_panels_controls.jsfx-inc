@@ -1,0 +1,1627 @@
+// rk_swing_ui_panels_controls.jsfx-inc
+// Swing left panel: buttons (SAVE/LOAD, COLORS, STEREO, VEL, MAP, RPT, EXPLORE, BROWSE, CLEAR, UNDO/REDO) + master DRIVE/VOL
+// (c) EON Studios — All Rights Reserved
+
+@init
+
+// ── EON tools row helpers ─────────────────────────────────────────────────
+// (The pad-knob style helpers live in rk_swing_ui_state.jsfx-inc now — the KNOB
+// selector moved up to the header next to THEME.)
+//
+// Shared rounded-button chrome (bg fill + cream corners + 3D bevel), matching
+// the inline EXPLORE/BROWSE style. Caller draws the centered label afterwards.
+function swing_panels_toolbtn_chrome(_x, _y, _w, _h, _br, _bg, _bb, _hilite) (
+  gfx_set(_br, _bg, _bb, 0.9);
+  gfx_rect(_x, _y, _w, _h);
+  gfx_set(pad_well_r, pad_well_g, pad_well_b, 1);
+  gfx_rect(_x, _y, _btn_corner, 1); gfx_rect(_x, _y, 1, _btn_corner);
+  gfx_rect(_x + _w - _btn_corner, _y, _btn_corner, 1); gfx_rect(_x + _w - 1, _y, 1, _btn_corner);
+  gfx_rect(_x, _y + _h - 1, _btn_corner, 1); gfx_rect(_x, _y + _h - _btn_corner, 1, _btn_corner);
+  gfx_rect(_x + _w - _btn_corner, _y + _h - 1, _btn_corner, 1); gfx_rect(_x + _w - 1, _y + _h - _btn_corner, 1, _btn_corner);
+  gfx_set(1, 1, 1, 0.15); gfx_rect(_x + _btn_corner, _y, _w - _btn_corner * 2, 1);
+  gfx_rect(_x, _y + _btn_corner, 1, _h - _btn_corner * 2);
+  gfx_set(0, 0, 0, 0.20);
+  gfx_rect(_x + _btn_corner, _y + _h - 1, _w - _btn_corner * 2, 1);
+  gfx_rect(_x + _w - 1, _y + _btn_corner, 1, _h - _btn_corner * 2);
+  _hilite ? ( gfx_set(1, 1, 1, 0.10); gfx_rect(_x + 1, _y + 1, _w - 2, 1); );
+);
+
+// Section header — small colour-coded caps label + an underline rule out to the
+// panel's right edge. Caller sets #_sec_lbl before calling. This is the visible
+// "colour coding" for the left-panel grouping (KIT / SOUND / PLAY / SAMPLES /
+// TOOLS / PREFS); the stateful buttons keep their own meaning-colours.
+function swing_panels_section_hdr(_y, _hr, _hg, _hb) (
+  gfx_setfont(1, "Arial", 10, 'b');
+  // The section hue must read on the LIVE body colour: on a light body (cream
+  // default / EON / Light themes) the bright hue washes out, so darken it there;
+  // on a dark body keep it bright.
+  _sec_mul = (bg_r * 0.299 + bg_g * 0.587 + bg_b * 0.114) > 0.55 ? 0.55 : 1;
+  gfx_set(_hr * _sec_mul, _hg * _sec_mul, _hb * _sec_mul, _sec_mul < 1 ? 1 : 0.95);
+  gfx_measurestr(#_sec_lbl, _shw, _shh);
+  gfx_x = 8; gfx_y = _y + 1;
+  gfx_drawstr(#_sec_lbl);
+  gfx_set(_hr * _sec_mul, _hg * _sec_mul, _hb * _sec_mul, 0.40);
+  gfx_rect(8 + _shw + 6, _y + 1 + (_shh * 0.5 | 0), left_w - 16 - _shw - 6, 1);
+);
+
+// Build the RPT division popup string with per-type colours — OFF = grey,
+// straight = blue, triplet = green, dotted = amber — and a "> " marker on the
+// active division (inactive items get a 2-space pad so the menu width doesn't
+// jitter as the marker moves). Result indices are unchanged (colours/markers
+// are just '^X' tags): 1=OFF, 2=1/4, 3=1/4 T, 4=1/4 D, 5=1/8, ... so the click
+// dispatch (repeat_div = result - 1) and hover-scroll both stay correct.
+// Map the feel-first RPT menu POSITION (1-based, = popup result) to the internal
+// repeat_div enum, and back. The enum (0=OFF; 1/2/3 = 1/4 straight/trip/dot;
+// 4/5/6 = 1/8; … 13/14/15 = 1/64) is FIXED — the rk_delay lookup depends on it —
+// so the menu reorders only visually via these maps.
+function swing_panels_rpt_pos2div(_p) (
+  _p <= 1  ? 0 :
+  _p <= 6  ? 1 + (_p - 2)  * 3 :   // straights: pos 2..6   -> 1,4,7,10,13
+  _p <= 11 ? 2 + (_p - 7)  * 3 :   // triplets:  pos 7..11  -> 2,5,8,11,14
+             3 + (_p - 12) * 3 ;   // dotted:    pos 12..16 -> 3,6,9,12,15
+);
+function swing_panels_rpt_div2pos(_d) (
+  _d <= 0 ? 1 : 2 + ((_d - 1) % 3) * 5 + ((_d - 1) / 3 | 0);
+);
+// Step the wheel through the menu in VISUAL order (not enum order), wrapping.
+function swing_panels_rpt_wheel(_d, _dir)
+local(_p) (
+  _p = swing_panels_rpt_div2pos(_d) + _dir;
+  _p < 1 ? _p = RPT_NUM_DIVS + 1 : _p > RPT_NUM_DIVS + 1 ? _p = 1;
+  swing_panels_rpt_pos2div(_p);
+);
+
+// Build the global RPT popup, feel-first: OFF, then all straights (blue), all
+// triplets (green), all dotted (amber) — five speeds each. '||' separates the
+// groups; the current division gets the '> ' marker.
+function swing_panels_build_rpt_menu()
+local(_g, _rd, _bn)
+(
+  strcpy(#_rpt_menu, repeat_div == 0 ? "^g > OFF" : "^g   OFF");
+  _g = 0;
+  loop(5,                                               // straights (blue), repeat_div 1,4,7,10,13
+    _bn = _g == 0 ? "1/4" : _g == 1 ? "1/8" : _g == 2 ? "1/16" : _g == 3 ? "1/32" : "1/64";
+    _rd = 1 + _g * 3;
+    strcat(#_rpt_menu, _g == 0 ? "||" : "|");           // blank separator before the group, then pipes
+    strcat(#_rpt_menu, repeat_div == _rd ? "^b > " : "^b   ");
+    strcat(#_rpt_menu, _bn);
+    _g += 1;
+  );
+  _g = 0;
+  loop(5,                                               // triplets (green), repeat_div 2,5,8,11,14
+    _bn = _g == 0 ? "1/4" : _g == 1 ? "1/8" : _g == 2 ? "1/16" : _g == 3 ? "1/32" : "1/64";
+    _rd = 2 + _g * 3;
+    strcat(#_rpt_menu, _g == 0 ? "||" : "|");
+    strcat(#_rpt_menu, repeat_div == _rd ? "^G > " : "^G   ");
+    strcat(#_rpt_menu, _bn);
+    strcat(#_rpt_menu, " T");
+    _g += 1;
+  );
+  _g = 0;
+  loop(5,                                               // dotted (amber), repeat_div 3,6,9,12,15
+    _bn = _g == 0 ? "1/4" : _g == 1 ? "1/8" : _g == 2 ? "1/16" : _g == 3 ? "1/32" : "1/64";
+    _rd = 3 + _g * 3;
+    strcat(#_rpt_menu, _g == 0 ? "||" : "|");
+    strcat(#_rpt_menu, repeat_div == _rd ? "^a > " : "^a   ");
+    strcat(#_rpt_menu, _bn);
+    strcat(#_rpt_menu, " D");
+    _g += 1;
+  );
+);
+
+// Multi-out build PREP — flip to MULTI routing, auto-assign one channel per
+// pad, take the bridge LOCK, and publish pad names + effective hues to gmem
+// (do_build_multiout reads these before creating the destination tracks).
+// Shared by the STEREO/MULTI right-click builder and the MATRIX build menu so
+// the gmem publish format stays in lockstep. Caller sets KIT_GMEM_CMD after.
+function swing_panels_multiout_prep()
+local(_ki, _cj, _cn, _cnl, gi)  // localized 2026-07-09: these globals raced the @block kit-import loop (phantom-pad-16 pad-0 poison)
+(
+  multi_out = 1;
+  gi = 0; loop(NUM_PADS, p_output[gi] = gi; gi += 1;);
+  mark_dirty_kit();
+  gmem[KIT_GMEM_LOCK] = instance_id;
+  _ki = 0; loop(NUM_PADS,
+    _cn = get_cname_slot(_ki);
+    _cnl = strlen(_cn);
+    _cj = 0; loop(KIT_GMEM_PADNAME_LEN,
+      gmem[KIT_GMEM_PADNAMES + _ki * KIT_GMEM_PADNAME_LEN + _cj] =
+        _cj < _cnl ? str_getchar(_cn, _cj) : 0;
+      _cj += 1;
+    );
+    gmem[KIT_GMEM_META + _ki * KIT_GMEM_META_PP + 12] =
+      col_auto_mode_id > 0 ? col_auto_hue[_ki] : p_color[_ki];   // EON: publish the EFFECTIVE hue (auto drum-type or manual)
+    _ki += 1;
+  );
+);
+
+// Controller note-map presets, wrapped so the MAP button and the manual-capture
+// mailbox open the SAME menu from ONE builder. Item 17 is the MAP-override
+// toggle; separators '||' are not counted in the result index, so the 16 presets
+// keep resp 1..16. The label carries the current state, so no checkmark support
+// is needed — and so this string must not exist in two places.
+function swing_panels_mapmenu_open(px, py) (
+  sprintf(#_map_menu,
+    "Chromatic from C2|White Keys from C2|GM Drum Map|Black Keys from C#2||MPC Bank A (C#1)|MPC Bank B (F2)|MPC Bank C (A3)|MPC Bank D (C#5)||Maschine Grp A (C1)|Maschine Grp B (E2)|Maschine Grp C (G#3)|Maschine Grp D (C5)||Launchpad (Drum Rack)|Push (Drum Rack)|MPC Classic||Set Custom Root...||Override locked pads: %s",
+    map_override_locked ? "ON" : "OFF");
+  swing_popup_open(px, py, #_map_menu, SP_POPUP_CALLER_MAP_PRESET);
+);
+
+function swing_panels_draw_controls() (
+  // Tooltip state + render lives in rk_swing_tooltips.jsfx-inc.
+  // Per-control hover sites call swing_tooltip_check(zone_id, text);
+  // swing_tooltip_draw() is called once at end of @gfx from
+  // Swing_ReaKit.jsfx (renders the box, resets per-frame state).
+
+  // Button appearance (must be defined before first use)
+  _btn_corner = 2;
+  _btn_cream_r = 0.78; _btn_cream_g = 0.76; _btn_cream_b = 0.72;
+
+  // Button grid area (below LCD panel)
+  _btn_area_y = lcd_y + lcd_h + 4;
+  _btn_area_h = left_h - (lcd_y - left_y + lcd_h + 4);
+  _btn_w = (left_w - 12) / 2;
+  _btn_h = 28;
+  _btn_gap = 4;
+
+  // ── Section layout, computed up front ─────────────────────────────────────
+  // The draw blocks below stay in their original source positions; only the
+  // (x, y, w) they read change. Immediate-mode gfx means visual order is set by
+  // these Y anchors, not source order. Visual order:
+  //   KIT → SOUND → PLAY → SAMPLES → TOOLS → PREFS → (master, pinned below).
+  // The COLORS inline panel push uses last frame's col_panel_h (1-frame settle).
+  _hdr_h   = 15;                       // section-label band height
+  _sec_gap = 8;                        // gap after a section's last row
+  _full_w  = _btn_w * 2 + _btn_gap;    // full-panel button width
+  _cy = _btn_area_y;
+
+  // KIT — SAVE | LOAD | NEW · CLEAR
+  _kit_hdr_y = _cy; _cy += _hdr_h;
+  _bk0_y = _cy; _cy += _btn_h + _btn_gap;
+  _clr_y = _cy; _cy += _btn_h + _sec_gap;
+
+  // SOUND — COLORS | STEREO/MULTI · VEL | MAP
+  _snd_hdr_y = _cy; _cy += _hdr_h;
+  _btn1_y = _cy;
+  _cy += _btn_h + (col_panel_open ? col_panel_h + 2 : 0) + _btn_gap;
+  _btn3_y = _cy; _cy += _btn_h + _sec_gap;
+
+  // PLAY — RPT | MODE (1Shot/Gate toggle)  (single row)
+  _play_hdr_y = _cy; _cy += _hdr_h;
+  _play_y = _cy; _cy += _btn_h + _sec_gap;
+
+  // SAMPLES — BROWSE | EXPLORE
+  _smp_hdr_y = _cy; _cy += _hdr_h;
+  _smp_y = _cy; _cy += _btn_h + _sec_gap;
+
+  // TOOLS — STEP SEQ | PAD FX · MATRIX | PAINT · DM GRID (full)
+  _tool_hdr_y = _cy; _cy += _hdr_h;
+  _tool_a_y = _cy; _cy += _btn_h + _btn_gap;
+  _tool_b_y = _cy; _cy += _btn_h + _btn_gap;
+  _tool_c_y = _cy; _cy += _btn_h + _sec_gap;
+
+  // (PREFS — SEL TRK / TIPS / MIDI Thru — moved to the header gear menu.)
+
+  // Master section flows below TOOLS (swing_panels_draw_master reads _btn7_y).
+  _btn7_y = _tool_c_y;
+
+  // Colour-coded section headers (the grouping's main colour signal).
+  strcpy(#_sec_lbl, "KIT");     swing_panels_section_hdr(_kit_hdr_y,  0.94, 0.62, 0.15);
+  strcpy(#_sec_lbl, "SOUND");   swing_panels_section_hdr(_snd_hdr_y,  0.18, 0.72, 0.56);
+  strcpy(#_sec_lbl, "PLAY");    swing_panels_section_hdr(_play_hdr_y, 0.59, 0.77, 0.35);
+  strcpy(#_sec_lbl, "SAMPLES"); swing_panels_section_hdr(_smp_hdr_y,  0.36, 0.64, 0.91);
+  strcpy(#_sec_lbl, "TOOLS");   swing_panels_section_hdr(_tool_hdr_y, 0.61, 0.58, 0.93);
+
+  // Row 0: SAVE | SAVE AS | LOAD | NEW  (_bk0_y from the section layout above)
+  // Went 4-up (was 3) when SAVE split into overwrite-vs-name. Kept to ONE row
+  // rather than adding a second: _cy flows every section below this one, so an
+  // extra row pushes the whole panel — including the pinned master — down 32px.
+  // _btn_w3 keeps its name (every button block below reads it) but is now the
+  // 4-up width; _bk2_x/_bk3_x are simply re-pointed one slot right, so the LOAD
+  // and NEW draw blocks move without being touched.
+  _btn_w3  = ((left_w - 12) - _btn_gap * 3) / 4;
+  _bk1_x   = 4;                                  // SAVE
+  _bksa_x  = _bk1_x  + _btn_w3 + _btn_gap;       // SAVE AS
+  _bk2_x   = _bksa_x + _btn_w3 + _btn_gap;       // LOAD
+  _bk3_x   = _bk2_x  + _btn_w3 + _btn_gap;       // NEW
+
+  // ── SAVE KIT button ── (green)
+  // Was amber; green reads as "commit" and is the only unused hue in this row
+  // (SAVE AS amber, LOAD blue, NEW coral). Both fills are luminance-matched to
+  // the amber pair they replaced (~0.32 idle, ~0.59 active by Rec.709), so the
+  // row's visual weight is unchanged and only the hue moves.
+  _kit_sav_active = kit_busy && kit_export_state > 0;
+  _kit_sav_active ? gfx_set(0.22, 0.72, 0.35, 0.9) : gfx_set(0.15, 0.38, 0.22, 1);
+  gfx_rect(_bk1_x, _bk0_y, _btn_w3, _btn_h);
+  gfx_set(pad_well_r, pad_well_g, pad_well_b, 1);
+  gfx_rect(_bk1_x, _bk0_y, _btn_corner, 1); gfx_rect(_bk1_x, _bk0_y, 1, _btn_corner);
+  gfx_rect(_bk1_x + _btn_w3 - _btn_corner, _bk0_y, _btn_corner, 1); gfx_rect(_bk1_x + _btn_w3 - 1, _bk0_y, 1, _btn_corner);
+  gfx_rect(_bk1_x, _bk0_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_bk1_x, _bk0_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_rect(_bk1_x + _btn_w3 - _btn_corner, _bk0_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_bk1_x + _btn_w3 - 1, _bk0_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_set(1, 1, 1, 0.15); gfx_rect(_bk1_x + _btn_corner, _bk0_y, _btn_w3 - _btn_corner * 2, 1);
+  gfx_rect(_bk1_x, _bk0_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_set(0, 0, 0, 0.20);
+  gfx_rect(_bk1_x + _btn_corner, _bk0_y + _btn_h - 1, _btn_w3 - _btn_corner * 2, 1);
+  gfx_rect(_bk1_x + _btn_w3 - 1, _bk0_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  _kit_sav_active ? (
+    gfx_set(1, 1, 1, 0.10);
+    gfx_rect(_bk1_x + 1, _bk0_y + 1, _btn_w3 - 2, 1);
+  );
+  gfx_setfont(1, "Arial", 9, 'b');
+  _kit_sav_active ? gfx_set(1, 1, 1, 1) : gfx_set(0.70, 0.68, 0.65, 1);
+  gfx_measurestr("SAVE", tw, th);
+  gfx_x = _bk1_x + (_btn_w3 - tw) / 2; gfx_y = _bk0_y + (_btn_h - th) / 2; gfx_drawstr("SAVE");
+  // Transient "SAVED" flash — the positive confirmation SAVE never had (the
+  // only feedback was the dirty dot going out). kit_saved_at is stamped by the
+  // export CMD 99 ack (rk_swing_ui_state, same @gfx thread — no race). Bright
+  // button face + label for 1.2s, then a 0.6s fade; wall-time driven so the
+  // shape is frame-rate independent (pad_flash's alpha ramp, _reb_restored_at's
+  // clock). Drawn OVER the idle face/label, so no layout moves and the flash
+  // needs no state beyond the timestamp.
+  kit_saved_at > 0 ? (
+    _sv_el = time_precise() - kit_saved_at;
+    _sv_el >= 0 && _sv_el < 1.8 ? (
+      _sv_a = _sv_el < 1.2 ? 1 : (1.8 - _sv_el) / 0.6;
+      gfx_set(0.22, 0.72, 0.35, 0.92 * _sv_a);
+      gfx_rect(_bk1_x + 1, _bk0_y + 1, _btn_w3 - 2, _btn_h - 2);
+      gfx_setfont(1, "Arial", 9, 'b');
+      gfx_set(1, 1, 1, _sv_a);
+      gfx_measurestr("SAVED", tw, th);
+      gfx_x = _bk1_x + (_btn_w3 - tw) / 2; gfx_y = _bk0_y + (_btn_h - th) / 2; gfx_drawstr("SAVED");
+    );
+  );
+  // Phase 3 save guard: also refuse while ANY load owns the shared pipeline —
+  // CMD nonzero (another instance's staging latch included) or a data-ready
+  // REQ==2 in flight. The state-11 dump reads the SHARED META/AUDIO bands; a
+  // save during someone else's load snapshots the in-flight kit's staging
+  // under this kit's name (the chimera-file vector). kit_busy alone only saw
+  // THIS instance's import.
+  _in_save = !kit_busy && gmem[KIT_GMEM_CMD] == 0 && gmem[GS_KIT_LOAD_REQ] != 2
+          && mx >= _bk1_x && mx <= _bk1_x+_btn_w3 && my >= _bk0_y && my <= _bk0_y+_btn_h;
+  // Unsaved-changes dot — top-right of the button. Deliberately kept amber now
+  // that the button is green: it is an alert, and amber-on-green is the strongest
+  // contrast available here (it used to match the button's own active amber, which
+  // made it quieter than it should have been). kit_dirty is set by the pad-mutation
+  // chokepoint and cleared on load/save, so it answers "is there anything to save".
+  kit_dirty ? (
+    gfx_set(0.95, 0.72, 0.25, 0.95);
+    gfx_circle(_bk1_x + _btn_w3 - 6, _bk0_y + 5, 2.5, 1, 1);
+  );
+  _in_save ? (
+    // TEMP DIAGNOSTIC: while the dot is lit, the tooltip names the FIRST
+    // setter (1000 = kit-scoped edit, 1..16 = that pad) + seconds since
+    // instance start + how many times pads marked since. Remove with the
+    // _kd_* lines in rk_swing_core once the open-time false dirty is found.
+    kit_dirty ? (
+      sprintf(#_kd_tt, "SAVE — unsaved changes. [diag: src=%d t=%.1fs n=%d]",
+              _kd_src, _kd_t - _kd_t0, _kd_n);
+      swing_tooltip_check(10, #_kd_tt);
+    ) : swing_tooltip_check(10, "SAVE overwrites the kit you loaded — no dialog. Falls back to Save As for a kit you have not saved yet, or a factory kit (installer updates overwrite those). Right-click for browse-save / SFZ / RS5k export.");
+  );
+  // LOCK + CMD must be written in the SAME @gfx evaluation. Bridge has a
+  // stale-LOCK self-heal in poll_sidecar_events that clears LOCK whenever
+  // it sees CMD==0 && LOCK!=0 — if we write LOCK here and let state 1 write
+  // CMD=10 on the next tick, the self-heal can fire in the gap and clear
+  // our LOCK before the save flow ever reaches the bridge. Same pattern
+  // as the LOAD button (line ~90), which writes LOCK + CMD=2 atomically.
+  // Skip state 1 entirely and go straight to state 10 with CMD already set.
+  // CMD 12, not 10: overwrite the loaded kit silently. The bridge deflects to
+  // the CMD 10 name prompt itself when there is no kit source yet or the kit
+  // is a factory kit, so this single click is always correct — the button does
+  // not need to know which case it is in (and cannot: the path lives bridge-side).
+  _in_save && lmb_down ? (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      gmem[KIT_GMEM_LOCK] = instance_id;
+      gmem[KIT_GMEM_CMD]  = 12;
+      kit_export_state = 10;
+      kit_busy = 1;
+    ) : (
+      kit_bridge_warn = 1;
+    );
+  );
+  // ── SAVE AS button ── (amber, dimmer than SAVE: the secondary action)
+  // Raises CMD 10 — the name prompt SAVE used to raise. Same bevel/geometry as
+  // SAVE, one slot right, so the pair reads as a group.
+  _kit_sva_active = kit_busy && kit_export_state > 0;
+  _kit_sva_active ? gfx_set(0.85, 0.55, 0.15, 0.9) : gfx_set(0.33, 0.27, 0.14, 1);
+  gfx_rect(_bksa_x, _bk0_y, _btn_w3, _btn_h);
+  gfx_set(pad_well_r, pad_well_g, pad_well_b, 1);
+  gfx_rect(_bksa_x, _bk0_y, _btn_corner, 1); gfx_rect(_bksa_x, _bk0_y, 1, _btn_corner);
+  gfx_rect(_bksa_x + _btn_w3 - _btn_corner, _bk0_y, _btn_corner, 1); gfx_rect(_bksa_x + _btn_w3 - 1, _bk0_y, 1, _btn_corner);
+  gfx_rect(_bksa_x, _bk0_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_bksa_x, _bk0_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_rect(_bksa_x + _btn_w3 - _btn_corner, _bk0_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_bksa_x + _btn_w3 - 1, _bk0_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_set(1, 1, 1, 0.15); gfx_rect(_bksa_x + _btn_corner, _bk0_y, _btn_w3 - _btn_corner * 2, 1);
+  gfx_rect(_bksa_x, _bk0_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_set(0, 0, 0, 0.20);
+  gfx_rect(_bksa_x + _btn_corner, _bk0_y + _btn_h - 1, _btn_w3 - _btn_corner * 2, 1);
+  gfx_rect(_bksa_x + _btn_w3 - 1, _bk0_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_setfont(1, "Arial", 9, 'b');
+  _kit_sva_active ? gfx_set(1, 1, 1, 1) : gfx_set(0.70, 0.68, 0.65, 1);
+  gfx_measurestr("SAVE AS", tw, th);
+  gfx_x = _bksa_x + (_btn_w3 - tw) / 2; gfx_y = _bk0_y + (_btn_h - th) / 2; gfx_drawstr("SAVE AS");
+  // Same save guard as SAVE — see its comment for the chimera-file vector.
+  _in_svas = !kit_busy && gmem[KIT_GMEM_CMD] == 0 && gmem[GS_KIT_LOAD_REQ] != 2
+          && mx >= _bksa_x && mx <= _bksa_x+_btn_w3 && my >= _bk0_y && my <= _bk0_y+_btn_h;
+  // id 17: the low band is denser than it looks — 1-3, 10-16 and 18-30 are all
+  // spoken for (17 is the only gap below 100, where the pad-face band 100+gi
+  // begins). Duplicate ids make two controls share one hover timer, so this
+  // needs a genuinely free number, not the next one that looks unused.
+  _in_svas ? swing_tooltip_check(17, "Save As — prompts for a name and writes a NEW kit file. The new file then becomes what SAVE overwrites.");
+  _in_svas && lmb_down ? (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      gmem[KIT_GMEM_LOCK] = instance_id;
+      gmem[KIT_GMEM_CMD]  = 10;
+      kit_export_state = 10;
+      kit_busy = 1;
+    ) : (
+      kit_bridge_warn = 1;
+    );
+  );
+
+  // Right-click SAVE → extended save options (migrated to Swing popup).
+  // Bridge-alive check stays at click time; result handled in poll block
+  // below. Both branches acquire LOCK + set CMD atomically — see comment
+  // on left-click handler above for the race we're avoiding.
+  _in_save && rmb_down ? (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      swing_popup_open(mx, my, "Save Kit As... (name it)|Save Kit To... (Browse PC)|Export as SFZ Sample Map...|Export as RS5k Rack...", SP_POPUP_CALLER_SAVE_KIT);
+    ) : (
+      kit_bridge_warn = 1;
+    );
+  );
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_SAVE_KIT ? (
+    resp = swing_popup_result;
+    swing_popup_result = 0;
+    // Phase 3: the popup result lands FRAMES after it opened — re-check the
+    // save guard (a load may have started while the menu was up). Refused =
+    // the same bridge-warn flash as a dead bridge; the user retries.
+    (kit_busy || gmem[KIT_GMEM_CMD] != 0 || gmem[GS_KIT_LOAD_REQ] == 2) ? (
+      kit_bridge_warn = 1;
+      resp = 0;
+    );
+    resp == 1 ? (
+      gmem[KIT_GMEM_LOCK] = instance_id;
+      gmem[KIT_GMEM_CMD]  = 10;
+      kit_export_state = 10;
+      kit_busy = 1;
+    );
+    resp == 2 ? (
+      gmem[KIT_GMEM_LOCK] = instance_id;
+      gmem[KIT_GMEM_CMD]  = 15;
+      kit_export_state = 10;
+      kit_busy = 1;
+    );
+    // SFZ export: kick the SAME dump state machine as a normal save, but send
+    // CMD 19 so the bridge browses for a .sfz path and writes a sample map
+    // (do_export_sfz_browse -> CMD 11 -> write_kit_sfz). Critically this sets
+    // kit_export_state = 10 so the JSFX actually performs the gmem dump when
+    // the bridge replies CMD 11 — the piece a cold companion-fired CMD 19 lacked.
+    resp == 3 ? (
+      gmem[KIT_GMEM_LOCK] = instance_id;
+      gmem[KIT_GMEM_CMD]  = 19;
+      kit_export_state = 10;
+      kit_busy = 1;
+    );
+    // RS5k rack export: identical dump handshake to SFZ, but CMD 21 so the
+    // bridge bakes the WAVs and builds a ReaSamplOmatic5000 rack on a new track.
+    resp == 4 ? (
+      gmem[KIT_GMEM_LOCK] = instance_id;
+      gmem[KIT_GMEM_CMD]  = 21;
+      kit_export_state = 10;
+      kit_busy = 1;
+    );
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_SAVE_KIT ? (
+    swing_popup_result = 0;
+  );
+
+  // ── LOAD KIT button ── (blue)
+  _kit_lod_active = kit_busy && kit_import_state > 0;
+  _kit_lod_active ? gfx_set(0.20, 0.55, 0.85, 0.9) : gfx_set(0.18, 0.28, 0.42, 1);
+  gfx_rect(_bk2_x, _bk0_y, _btn_w3, _btn_h);
+  gfx_set(pad_well_r, pad_well_g, pad_well_b, 1);
+  gfx_rect(_bk2_x, _bk0_y, _btn_corner, 1); gfx_rect(_bk2_x, _bk0_y, 1, _btn_corner);
+  gfx_rect(_bk2_x + _btn_w3 - _btn_corner, _bk0_y, _btn_corner, 1); gfx_rect(_bk2_x + _btn_w3 - 1, _bk0_y, 1, _btn_corner);
+  gfx_rect(_bk2_x, _bk0_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_bk2_x, _bk0_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_rect(_bk2_x + _btn_w3 - _btn_corner, _bk0_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_bk2_x + _btn_w3 - 1, _bk0_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_set(1, 1, 1, 0.15); gfx_rect(_bk2_x + _btn_corner, _bk0_y, _btn_w3 - _btn_corner * 2, 1);
+  gfx_rect(_bk2_x, _bk0_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_set(0, 0, 0, 0.20);
+  gfx_rect(_bk2_x + _btn_corner, _bk0_y + _btn_h - 1, _btn_w3 - _btn_corner * 2, 1);
+  gfx_rect(_bk2_x + _btn_w3 - 1, _bk0_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  _kit_lod_active ? (
+    gfx_set(1, 1, 1, 0.10);
+    gfx_rect(_bk2_x + 1, _bk0_y + 1, _btn_w3 - 2, 1);
+  );
+  gfx_setfont(1, "Arial", 9, 'b');
+  _kit_lod_active ? gfx_set(1, 1, 1, 1) : gfx_set(0.70, 0.68, 0.65, 1);
+  gfx_measurestr("LOAD", tw, th);
+  gfx_x = _bk2_x + (_btn_w3 - tw) / 2; gfx_y = _bk0_y + (_btn_h - th) / 2; gfx_drawstr("LOAD");
+  _in_load = !kit_busy && mx >= _bk2_x && mx <= _bk2_x+_btn_w3 && my >= _bk0_y && my <= _bk0_y+_btn_h;
+  _in_load ? swing_tooltip_check(11, "Load a kit. Left-click opens the kits view (filter by sample/synth/hybrid, folders = Data/Swing_Kits subfolders); right-click for Browse PC / Import SFZ / Batch Import Folder / Chop Selection to Pads.");
+  // Kits view replaces the native OS kit menu (Spec_Swing_Kits_View.md).
+  // No CMD-2 arming here anymore — the view's pick path (CMD 24) re-enters
+  // the browser-load funnel and the @block arm gate raises kit_busy when
+  // staging is real. CMD 2 itself stays live for Lite/companion/dev probes.
+  _in_load && lmb_down ? (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      swing_kitsview_open();
+    ) : (
+      kit_bridge_warn = 1;
+    );
+  );
+  // Right-click LOAD → import / utility menu (migrated to Swing popup).
+  // Indices 1=Browse PC, 2=Import SFZ, 3=Batch, 4=Chop — the old item 1
+  // "Load Kit (.swing)" (native OS menu, CMD 2) is RETIRED from the Pro UI:
+  // left-click's kits view replaced it (CMD 2 stays bridge-side for
+  // Lite/companion/dev-probe consumers). Separator '||' between SFZ and
+  // Batch is NOT counted in result space.
+  _in_load && rmb_down ? (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      swing_popup_open(mx, my,
+        "Load Kit From... (Browse PC)|Import SFZ Kit...||Batch Import Folder|Chop Selection to Pads",
+        SP_POPUP_CALLER_LOAD_KIT);
+    ) : (
+      kit_bridge_warn = 1;
+    );
+  );
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_LOAD_KIT ? (
+    resp = swing_popup_result;
+    swing_popup_result = 0;
+    resp == 1 ? ( gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_CMD] = 16; kit_import_state = 1; kit_busy = 1; );
+    resp == 2 ? ( gmem[KIT_GMEM_CMD] = 17; );  // file dialog → import_start (handled async by browser, no kit_busy)
+    resp == 3 ? ( gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_CMD] = 20; kit_import_state = 1; kit_busy = 1; );
+    resp == 4 ? ( gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_CMD] = 30; kit_import_state = 1; kit_busy = 1; );
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_LOAD_KIT ? (
+    swing_popup_result = 0;
+  );
+
+  // ── NEW KIT button ── (coral/red)
+  gfx_set(0.42, 0.20, 0.18, 1);
+  gfx_rect(_bk3_x, _bk0_y, _btn_w3, _btn_h);
+  gfx_set(pad_well_r, pad_well_g, pad_well_b, 1);
+  gfx_rect(_bk3_x, _bk0_y, _btn_corner, 1); gfx_rect(_bk3_x, _bk0_y, 1, _btn_corner);
+  gfx_rect(_bk3_x + _btn_w3 - _btn_corner, _bk0_y, _btn_corner, 1); gfx_rect(_bk3_x + _btn_w3 - 1, _bk0_y, 1, _btn_corner);
+  gfx_rect(_bk3_x, _bk0_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_bk3_x, _bk0_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_rect(_bk3_x + _btn_w3 - _btn_corner, _bk0_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_bk3_x + _btn_w3 - 1, _bk0_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_set(1, 1, 1, 0.15); gfx_rect(_bk3_x + _btn_corner, _bk0_y, _btn_w3 - _btn_corner * 2, 1);
+  gfx_rect(_bk3_x, _bk0_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_set(0, 0, 0, 0.20);
+  gfx_rect(_bk3_x + _btn_corner, _bk0_y + _btn_h - 1, _btn_w3 - _btn_corner * 2, 1);
+  gfx_rect(_bk3_x + _btn_w3 - 1, _bk0_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_set(0.70, 0.68, 0.65, 1);
+  gfx_measurestr("NEW", tw, th);
+  gfx_x = _bk3_x + (_btn_w3 - tw) / 2; gfx_y = _bk0_y + (_btn_h - th) / 2; gfx_drawstr("NEW");
+  _in_new = !kit_busy && mx >= _bk3_x && mx <= _bk3_x+_btn_w3 && my >= _bk0_y && my <= _bk0_y+_btn_h;
+  _in_new ? swing_tooltip_check(12, "New kit — empty (clears pads, FX, name) or 16 random drum-synth pads.");
+  _in_new && lmb_down ? (
+    swing_popup_open(mx, my, "New Empty Kit|New Random SYNTH Kit", SP_POPUP_CALLER_NEW_KIT);
+  );
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_NEW_KIT ? (
+    // Item 2 = random synth kit: same full reset, then the main @gfx
+    // populates all 16 SYN slots once the reset lands (_syn_newkit_req —
+    // consumer lives in Swing_ReaKit; overlay_syn helpers import after us).
+    _syn_newkit_req = swing_popup_result == 2;
+    swing_popup_result = 0;
+    // Full reset (pads + name + FX) via deferred undo path.
+    // (CLEAR button is the "pads only, keep name + FX" sibling action.)
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 ? (
+      gmem[KIT_GMEM_UNDO_DESC] = 6;
+      gmem[KIT_GMEM_CMD] = 46;
+      _undo_pending = 6;
+    ) : (
+      // Bridge not alive — execute immediately (no undo)
+      swing_new_kit_full_reset();
+    );
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_NEW_KIT ? (
+    swing_popup_result = 0;
+  );
+
+  // SOUND row 1: COLORS | STEREO/MULTI  (_btn1_y from the section layout)
+  _btn1_x = 4;
+  _btn2_x = _btn1_x + _btn_w + _btn_gap; _btn2_y = _btn1_y;
+
+  // COLORS button — left-click toggles inline Color Panel; right-click
+  // reveals a small menu (currently: "Reset all pad colors to default").
+  // The palette/theme menu was removed in v43 when the color system
+  // simplified to auto-color modes + Mono + intensity.
+  gfx_set(_btn_cream_r, _btn_cream_g, _btn_cream_b, 1);
+  gfx_rect(_btn1_x, _btn1_y, _btn_w, _btn_h);
+  gfx_set(_btn_cream_r * 0.6, _btn_cream_g * 0.55, _btn_cream_b * 0.50, 0.25);
+  gfx_rect(_btn1_x, _btn1_y + _btn_h, _btn_w, 1);
+  gfx_set(pad_well_r, pad_well_g, pad_well_b, 1);
+  gfx_rect(_btn1_x, _btn1_y, _btn_corner, 1); gfx_rect(_btn1_x, _btn1_y, 1, _btn_corner);
+  gfx_rect(_btn1_x + _btn_w - _btn_corner, _btn1_y, _btn_corner, 1); gfx_rect(_btn1_x + _btn_w - 1, _btn1_y, 1, _btn_corner);
+  gfx_rect(_btn1_x, _btn1_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn1_x, _btn1_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_rect(_btn1_x + _btn_w - _btn_corner, _btn1_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn1_x + _btn_w - 1, _btn1_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_set(1, 1, 1, 0.15); gfx_rect(_btn1_x + _btn_corner, _btn1_y, _btn_w - _btn_corner * 2, 1);
+  gfx_rect(_btn1_x, _btn1_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_set(0, 0, 0, 0.20);
+  gfx_rect(_btn1_x + _btn_corner, _btn1_y + _btn_h - 1, _btn_w - _btn_corner * 2, 1);
+  gfx_rect(_btn1_x + _btn_w - 1, _btn1_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_set(0.20, 0.20, 0.22, 1);
+  gfx_measurestr("COLORS", tw, th);
+  gfx_x = _btn1_x + (_btn_w - tw) / 2; gfx_y = _btn1_y + (_btn_h - th) / 2; gfx_drawstr("COLORS");
+  _in_colors = mx >= _btn1_x && mx <= _btn1_x+_btn_w && my >= _btn1_y && my <= _btn1_y+_btn_h;
+  _in_colors ? swing_tooltip_check(13, "Open Color Panel — auto-color modes, Mono toggle, intensity. Shift+click opens the full-size Colors board over the pad grid; right-click resets all pad colors.");
+  // Click toggles the Color Panel inline (auto-color mode, Mono, intensity).
+  // Themes + palettes + Auto-Color-by-name bulk action were removed in v43
+  // (the color system simplified to: auto-color modes + Mono + intensity).
+  // Shift+click opens the full-size COLORS big view over the pad grid.
+  _in_colors && lmb_down && SHIFT ? (
+    swing_bigview_open(VIEW_COLORS);
+  );
+  _in_colors && lmb_down && !SHIFT ? (
+    col_panel_open = !col_panel_open;
+  );
+  // Right-click: reset all pad colors to the evenly-spaced rainbow default
+  // (i / 16.0 for pad i). Clears any manual overrides, black/white markers,
+  // and lets the auto-color mode (if active) re-derive col_auto_hue on the
+  // next sample/output/folder change. Menu confirmation prevents accidental
+  // nuking of carefully-tuned hues.
+  _in_colors && rmb_down ? (
+    swing_popup_open(mx, my, "Reset all pad colors to default", SP_POPUP_CALLER_RESET_COLORS);
+  );
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_RESET_COLORS ? (
+    swing_popup_result = 0;
+    gi = 0;
+    loop(NUM_PADS,
+      p_color[gi] = gi / 16.0;
+      gi += 1;
+    );
+    col_dirty = 1;
+    mark_dirty_kit();
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_RESET_COLORS ? (
+    swing_popup_result = 0;
+  );
+
+  // Color panel (inline, below COLORS button when open)
+  col_panel_open ? (
+    col_panel_h = swing_color_draw_panel(_btn1_x, _btn1_y + _btn_h + 2, left_w - 8);
+  ) : (
+    col_panel_h = 0;
+  );
+
+  // STEREO / MULTI toggle button — hidden when color panel open
+  _btn2_y = _btn1_y;
+  !col_panel_open ? (
+  multi_out ? gfx_set(btn_blue_r, btn_blue_g, btn_blue_b, 0.9) : gfx_set(btn_red_r, btn_red_g, btn_red_b, 0.9);
+  gfx_rect(_btn2_x, _btn2_y, _btn_w, _btn_h);
+  gfx_set(pad_well_r, pad_well_g, pad_well_b, 1);
+  gfx_rect(_btn2_x, _btn2_y, _btn_corner, 1); gfx_rect(_btn2_x, _btn2_y, 1, _btn_corner);
+  gfx_rect(_btn2_x + _btn_w - _btn_corner, _btn2_y, _btn_corner, 1); gfx_rect(_btn2_x + _btn_w - 1, _btn2_y, 1, _btn_corner);
+  gfx_rect(_btn2_x, _btn2_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn2_x, _btn2_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_rect(_btn2_x + _btn_w - _btn_corner, _btn2_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn2_x + _btn_w - 1, _btn2_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_set(1, 1, 1, 0.15); gfx_rect(_btn2_x + _btn_corner, _btn2_y, _btn_w - _btn_corner * 2, 1);
+  gfx_rect(_btn2_x, _btn2_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_set(0, 0, 0, 0.20);
+  gfx_rect(_btn2_x + _btn_corner, _btn2_y + _btn_h - 1, _btn_w - _btn_corner * 2, 1);
+  gfx_rect(_btn2_x + _btn_w - 1, _btn2_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_set(1, 1, 1, 0.10);
+  gfx_rect(_btn2_x + 1, _btn2_y + 1, _btn_w - 2, 1);
+  gfx_setfont(1, "Arial", 8, 'b');
+  gfx_set(1, 1, 1, 1);
+  multi_out ? strcpy(#_mo_lbl, "MULTI") : strcpy(#_mo_lbl, "STEREO");
+  gfx_measurestr(#_mo_lbl, tw, th);
+  gfx_x = _btn2_x + (_btn_w - tw) / 2; gfx_y = _btn2_y + (_btn_h - th) / 2; gfx_drawstr(#_mo_lbl);
+  _in_multi = mx >= _btn2_x && mx <= _btn2_x+_btn_w && my >= _btn2_y && my <= _btn2_y+_btn_h;
+  _in_multi ? swing_tooltip_check(14, "Toggle output routing. STEREO = all pads to channels 1-2; MULTI = each pad to its own stereo pair (1-2, 3-4, ... 31-32) for per-pad track mixing. Use the MULTI builder via LOAD right-click to create child tracks.");
+  // Shift+click opens the full-size OUTPUTS routing matrix over the pad grid.
+  _in_multi && lmb_down && SHIFT ? (
+    swing_bigview_open(VIEW_OUTPUTS);
+  );
+  // Left-click: toggle — immediately enforce outputs on all pads
+  _in_multi && lmb_down && !SHIFT ? (
+    multi_out = !multi_out;
+    multi_out ? (
+      // Switching to MULTI: auto-assign 1 per pad
+      gi = 0; loop(NUM_PADS, p_output[gi] = gi; gi += 1;);
+    ) : (
+      // Switching to STEREO: reset all to Out 1
+      gi = 0; loop(NUM_PADS, p_output[gi] = 0; gi += 1;);
+    );
+    mark_dirty_kit();
+  );
+  // Right-click: output & routing options (migrated to Swing popup).
+  // Indices: 1=Auto Assign, 2=Reset All, 3=Build Multi-Out (separator '||'
+  // between Reset and Build is NOT counted in result).
+  _in_multi && rmb_down ? (
+    swing_popup_open(mx, my,
+      "Auto Assign (1 per pad)|Reset All to Out 1||Build Multi-Out Tracks",
+      SP_POPUP_CALLER_MULTIOUT);
+  );
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_MULTIOUT ? (
+    resp = swing_popup_result;
+    swing_popup_result = 0;
+    resp == 1 ? (
+      gi = 0; loop(NUM_PADS, p_output[gi] = gi; gi += 1;);
+      multi_out = 1; mark_dirty_kit();
+    );
+    resp == 2 ? (
+      gi = 0; loop(NUM_PADS, p_output[gi] = 0; gi += 1;);
+      multi_out = 0; mark_dirty_kit();
+    );
+    resp == 3 ? (
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+        // Acquire lock + sync pad data for multi-out builder. multiout_prep
+        // switches to MULTI routing + auto-assigns one channel per pad up
+        // front so the JSFX is already in multi-out mode by the time the bridge
+        // finishes creating the destination tracks (otherwise the user sees 16
+        // tracks created but Swing still summing to stereo Out 1).
+        gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id ? (
+          swing_panels_multiout_prep();
+          gmem[KIT_GMEM_CMD] = 40; kit_import_state = 1; kit_busy = 1;
+        ) : (
+          kit_bridge_warn = 2; // 2 = bridge busy
+        );
+      ) : (
+        kit_bridge_warn = 1;
+      );
+    );
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_MULTIOUT ? (
+    swing_popup_result = 0;
+  );
+  ); // end !col_panel_open
+
+  // SOUND row 2: VEL curve | MAP  (_btn3_y from the section layout; VEL keeps
+  // its per-curve state colour, MAP keeps its cream identity colour.)
+
+  // VEL curve button — color-coded per mode, left-click cycles, right-click menu, scroll
+  // Colors: LIN=green, SOFT=yellow, HARD=orange, FIX=red
+  vel_curve == 0 ? gfx_set(0.30, 0.65, 0.35, 1) :  // green
+  vel_curve == 1 ? gfx_set(0.78, 0.72, 0.30, 1) :  // yellow
+  vel_curve == 2 ? gfx_set(0.82, 0.50, 0.22, 1) :  // orange
+                   gfx_set(btn_red_r, btn_red_g, btn_red_b, 0.9);  // red
+  gfx_rect(_btn1_x, _btn3_y, _btn_w, _btn_h);
+  gfx_set(pad_well_r, pad_well_g, pad_well_b, 1);
+  gfx_rect(_btn1_x, _btn3_y, _btn_corner, 1); gfx_rect(_btn1_x, _btn3_y, 1, _btn_corner);
+  gfx_rect(_btn1_x + _btn_w - _btn_corner, _btn3_y, _btn_corner, 1); gfx_rect(_btn1_x + _btn_w - 1, _btn3_y, 1, _btn_corner);
+  gfx_rect(_btn1_x, _btn3_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn1_x, _btn3_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_rect(_btn1_x + _btn_w - _btn_corner, _btn3_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn1_x + _btn_w - 1, _btn3_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_set(1, 1, 1, 0.15); gfx_rect(_btn1_x + _btn_corner, _btn3_y, _btn_w - _btn_corner * 2, 1);
+  gfx_rect(_btn1_x, _btn3_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_set(0, 0, 0, 0.20);
+  gfx_rect(_btn1_x + _btn_corner, _btn3_y + _btn_h - 1, _btn_w - _btn_corner * 2, 1);
+  gfx_rect(_btn1_x + _btn_w - 1, _btn3_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_setfont(1, "Arial", 8, 'b');
+  gfx_set(1, 1, 1, 1);
+  vel_curve == 0 ? strcpy(#_vc, "VEL: LIN") :
+  vel_curve == 1 ? strcpy(#_vc, "VEL: SOFT") :
+  vel_curve == 2 ? strcpy(#_vc, "VEL: HARD") :
+                   strcpy(#_vc, "VEL: FIX");
+  gfx_measurestr(#_vc, tw, th);
+  gfx_x = _btn1_x + (_btn_w - tw) / 2; gfx_y = _btn3_y + (_btn_h - th) / 2; gfx_drawstr(#_vc);
+  _in_vel = mx >= _btn1_x && mx <= _btn1_x+_btn_w && my >= _btn3_y && my <= _btn3_y+_btn_h;
+  _in_vel ? swing_tooltip_check(2, "Velocity response curve — Linear / Soft / Hard / Fixed. Left-click cycles; right-click menu; scroll wheel also cycles.");
+  _in_vel && lmb_down ? (
+    vel_curve = (vel_curve + 1) % 4; mark_dirty_kit();
+  );
+  // Right-click: velocity-curve picker (migrated to Swing-styled popup).
+  // Result indices 1..4 → vel_curve 0..3 (Linear/Soft/Hard/Fixed).
+  _in_vel && rmb_down ? (
+    // Build with the active curve marked green so hover-scroll shows the current
+    // pick inside the open menu (the parent button is hidden behind it).
+    sprintf(#_vel_menu, "%s|%s|%s|%s",
+      vel_curve == 0 ? "^G Linear" : "Linear",
+      vel_curve == 1 ? "^G Soft"   : "Soft",
+      vel_curve == 2 ? "^G Hard"   : "Hard",
+      vel_curve == 3 ? "^G Fixed"  : "Fixed");
+    swing_popup_open(mx, my, #_vel_menu, SP_POPUP_CALLER_VEL_CURVE);
+  );
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_VEL_CURVE ? (
+    vel_curve = swing_popup_result - 1;
+    swing_popup_result = 0;
+    mark_dirty_kit();
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_VEL_CURVE ? (
+    swing_popup_result = 0;
+  );
+  // Hover-scroll: wheel over the open menu cycles the curve live; menu stays
+  // open and re-marks the active item. Wheel up = toward the top (Linear).
+  swing_popup_wheel != 0 && swing_popup_caller_id == SP_POPUP_CALLER_VEL_CURVE ? (
+    vel_curve = (vel_curve + (swing_popup_wheel > 0 ? -1 : 1) + 4) % 4;
+    mark_dirty_kit();
+    sprintf(#_vel_menu, "%s|%s|%s|%s",
+      vel_curve == 0 ? "^G Linear" : "Linear",
+      vel_curve == 1 ? "^G Soft"   : "Soft",
+      vel_curve == 2 ? "^G Hard"   : "Hard",
+      vel_curve == 3 ? "^G Fixed"  : "Fixed");
+    swing_popup_refresh_items(#_vel_menu);
+    swing_popup_wheel = 0;
+  );
+  // Scroll wheel: cycle vel curves
+  _in_vel && frame_wheel != 0 ? (
+    vel_curve = vel_curve + sign_of(frame_wheel);
+    vel_curve < 0 ? vel_curve = 3;
+    vel_curve > 3 ? vel_curve = 0;
+    mark_dirty_kit();
+  );
+
+  // MAPPING button — cream background, cycles note map presets
+  gfx_set(_btn_cream_r, _btn_cream_g, _btn_cream_b, 1);
+  gfx_rect(_btn2_x, _btn3_y, _btn_w, _btn_h);
+  gfx_set(_btn_cream_r * 0.6, _btn_cream_g * 0.55, _btn_cream_b * 0.50, 0.25);
+  gfx_rect(_btn2_x, _btn3_y + _btn_h, _btn_w, 1);
+  gfx_set(pad_well_r, pad_well_g, pad_well_b, 1);
+  gfx_rect(_btn2_x, _btn3_y, _btn_corner, 1); gfx_rect(_btn2_x, _btn3_y, 1, _btn_corner);
+  gfx_rect(_btn2_x + _btn_w - _btn_corner, _btn3_y, _btn_corner, 1); gfx_rect(_btn2_x + _btn_w - 1, _btn3_y, 1, _btn_corner);
+  gfx_rect(_btn2_x, _btn3_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn2_x, _btn3_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_rect(_btn2_x + _btn_w - _btn_corner, _btn3_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn2_x + _btn_w - 1, _btn3_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_set(1, 1, 1, 0.15); gfx_rect(_btn2_x + _btn_corner, _btn3_y, _btn_w - _btn_corner * 2, 1);
+  gfx_rect(_btn2_x, _btn3_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_set(0, 0, 0, 0.20);
+  gfx_rect(_btn2_x + _btn_corner, _btn3_y + _btn_h - 1, _btn_w - _btn_corner * 2, 1);
+  gfx_rect(_btn2_x + _btn_w - 1, _btn3_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_set(0.20, 0.20, 0.22, 1);
+  note_map == 0 ? strcpy(#_map_lbl, "MAP:CHROM") :
+  note_map == 1 ? strcpy(#_map_lbl, "MAP:WHITE") :
+  note_map == 2 ? strcpy(#_map_lbl, "MAP:GM") :
+  note_map == 3 ? strcpy(#_map_lbl, "MAP:BLACK") :
+  note_map == 4 ? strcpy(#_map_lbl, "MAP:MPC") :
+  note_map == 5 ? strcpy(#_map_lbl, "MAP:MSCHNE") :
+  note_map == 6 ? strcpy(#_map_lbl, "MAP:LNCHPD") :
+  note_map == 7 ? strcpy(#_map_lbl, "MAP:PUSH") :
+                  strcpy(#_map_lbl, "MAP:MPCCL");
+  gfx_measurestr(#_map_lbl, tw, th);
+  gfx_x = _btn2_x + (_btn_w - tw) / 2; gfx_y = _btn3_y + (_btn_h - th) / 2; gfx_drawstr(#_map_lbl);
+  _in_map = mx >= _btn2_x && mx <= _btn2_x+_btn_w && my >= _btn3_y && my <= _btn3_y+_btn_h;
+  _in_map ? swing_tooltip_check(15, "MIDI note mapping — left-click cycles common scales/banks; right-click for full preset menu; Shift+click opens the Mapping editor (pins, choke lane).");
+  // Shift+left-click: open the full Mapping big view over the pad grid.
+  _in_map && lmb_down && SHIFT ? (
+    swing_bigview_open(VIEW_MAPPING);
+  );
+  // Left-click (no Shift): cycle mapping presets and apply
+  _in_map && lmb_down && !SHIFT ? (
+    note_map = (note_map + 1) % 9;
+    // Apply mapping preset to all unlocked pads
+    note_map == 0 ? (
+      // Chromatic from C2 (36)
+      root_note = 36; slider1 = root_note; slider_automate(slider1);
+      gi = 0; loop(NUM_PADS, swing_map_unlocked(gi) ? (p_note[gi] = 36 + gi;); gi += 1;);
+    ) : note_map == 1 ? (
+      // White keys from C2: C D E F G A B C D E F G A B C D
+      root_note = 36; slider1 = root_note; slider_automate(slider1);
+      swing_map_unlocked(0)  ? p_note[0]  = 36;
+      swing_map_unlocked(1)  ? p_note[1]  = 38;
+      swing_map_unlocked(2)  ? p_note[2]  = 40;
+      swing_map_unlocked(3)  ? p_note[3]  = 41;
+      swing_map_unlocked(4)  ? p_note[4]  = 43;
+      swing_map_unlocked(5)  ? p_note[5]  = 45;
+      swing_map_unlocked(6)  ? p_note[6]  = 47;
+      swing_map_unlocked(7)  ? p_note[7]  = 48;
+      swing_map_unlocked(8)  ? p_note[8]  = 50;
+      swing_map_unlocked(9)  ? p_note[9]  = 52;
+      swing_map_unlocked(10) ? p_note[10] = 53;
+      swing_map_unlocked(11) ? p_note[11] = 55;
+      swing_map_unlocked(12) ? p_note[12] = 57;
+      swing_map_unlocked(13) ? p_note[13] = 59;
+      swing_map_unlocked(14) ? p_note[14] = 60;
+      swing_map_unlocked(15) ? p_note[15] = 62;
+    ) : note_map == 2 ? (
+      // General MIDI Drum Map
+      root_note = 36; slider1 = root_note; slider_automate(slider1);
+      swing_map_unlocked(0)  ? p_note[0]  = 36;  // Kick
+      swing_map_unlocked(1)  ? p_note[1]  = 38;  // Snare
+      swing_map_unlocked(2)  ? p_note[2]  = 37;  // Side Stick
+      swing_map_unlocked(3)  ? p_note[3]  = 39;  // Clap
+      swing_map_unlocked(4)  ? p_note[4]  = 42;  // HH Closed
+      swing_map_unlocked(5)  ? p_note[5]  = 44;  // HH Pedal
+      swing_map_unlocked(6)  ? p_note[6]  = 46;  // HH Open
+      swing_map_unlocked(7)  ? p_note[7]  = 41;  // Tom Low
+      swing_map_unlocked(8)  ? p_note[8]  = 47;  // Tom Mid
+      swing_map_unlocked(9)  ? p_note[9]  = 50;  // Tom Hi
+      swing_map_unlocked(10) ? p_note[10] = 49;  // Crash 1
+      swing_map_unlocked(11) ? p_note[11] = 51;  // Ride
+      swing_map_unlocked(12) ? p_note[12] = 57;  // Crash 2
+      swing_map_unlocked(13) ? p_note[13] = 54;  // Tambourine
+      swing_map_unlocked(14) ? p_note[14] = 56;  // Cowbell
+      swing_map_unlocked(15) ? p_note[15] = 75;  // Claves
+    ) : note_map == 3 ? (
+      // Black keys (sharps/flats) from C#2 spanning 3 octaves
+      root_note = 37; slider1 = root_note; slider_automate(slider1);
+      swing_map_unlocked(0)  ? p_note[0]  = 37;  // C#2
+      swing_map_unlocked(1)  ? p_note[1]  = 39;  // D#2
+      swing_map_unlocked(2)  ? p_note[2]  = 42;  // F#2
+      swing_map_unlocked(3)  ? p_note[3]  = 44;  // G#2
+      swing_map_unlocked(4)  ? p_note[4]  = 46;  // A#2
+      swing_map_unlocked(5)  ? p_note[5]  = 49;  // C#3
+      swing_map_unlocked(6)  ? p_note[6]  = 51;  // D#3
+      swing_map_unlocked(7)  ? p_note[7]  = 54;  // F#3
+      swing_map_unlocked(8)  ? p_note[8]  = 56;  // G#3
+      swing_map_unlocked(9)  ? p_note[9]  = 58;  // A#3
+      swing_map_unlocked(10) ? p_note[10] = 61;  // C#4
+      swing_map_unlocked(11) ? p_note[11] = 63;  // D#4
+      swing_map_unlocked(12) ? p_note[12] = 66;  // F#4
+      swing_map_unlocked(13) ? p_note[13] = 68;  // G#4
+      swing_map_unlocked(14) ? p_note[14] = 70;  // A#4
+      swing_map_unlocked(15) ? p_note[15] = 73;  // C#5
+    ) : note_map == 4 ? (
+      // Akai MPC (Bank A) — C#1 sequential
+      root_note = 37; slider1 = root_note; slider_automate(slider1);
+      gi = 0; loop(NUM_PADS, swing_map_unlocked(gi) ? (p_note[gi] = 37 + gi;); gi += 1;);
+    ) : note_map == 5 ? (
+      // NI Maschine (Group A) — C1 sequential
+      root_note = 36; slider1 = root_note; slider_automate(slider1);
+      gi = 0; loop(NUM_PADS, swing_map_unlocked(gi) ? (p_note[gi] = 36 + gi;); gi += 1;);
+    ) : note_map == 6 ? (
+      // Novation Launchpad (Drum Rack 4x4) — rows spaced 8 apart
+      root_note = 36; slider1 = root_note; slider_automate(slider1);
+      swing_map_unlocked(0)  ? p_note[0]  = 36;
+      swing_map_unlocked(1)  ? p_note[1]  = 37;
+      swing_map_unlocked(2)  ? p_note[2]  = 38;
+      swing_map_unlocked(3)  ? p_note[3]  = 39;
+      swing_map_unlocked(4)  ? p_note[4]  = 44;
+      swing_map_unlocked(5)  ? p_note[5]  = 45;
+      swing_map_unlocked(6)  ? p_note[6]  = 46;
+      swing_map_unlocked(7)  ? p_note[7]  = 47;
+      swing_map_unlocked(8)  ? p_note[8]  = 52;
+      swing_map_unlocked(9)  ? p_note[9]  = 53;
+      swing_map_unlocked(10) ? p_note[10] = 54;
+      swing_map_unlocked(11) ? p_note[11] = 55;
+      swing_map_unlocked(12) ? p_note[12] = 60;
+      swing_map_unlocked(13) ? p_note[13] = 61;
+      swing_map_unlocked(14) ? p_note[14] = 62;
+      swing_map_unlocked(15) ? p_note[15] = 63;
+    ) : note_map == 7 ? (
+      // Ableton Push (Drum Rack 4x4) — same grid layout as Launchpad
+      root_note = 36; slider1 = root_note; slider_automate(slider1);
+      swing_map_unlocked(0)  ? p_note[0]  = 36;
+      swing_map_unlocked(1)  ? p_note[1]  = 37;
+      swing_map_unlocked(2)  ? p_note[2]  = 38;
+      swing_map_unlocked(3)  ? p_note[3]  = 39;
+      swing_map_unlocked(4)  ? p_note[4]  = 44;
+      swing_map_unlocked(5)  ? p_note[5]  = 45;
+      swing_map_unlocked(6)  ? p_note[6]  = 46;
+      swing_map_unlocked(7)  ? p_note[7]  = 47;
+      swing_map_unlocked(8)  ? p_note[8]  = 52;
+      swing_map_unlocked(9)  ? p_note[9]  = 53;
+      swing_map_unlocked(10) ? p_note[10] = 54;
+      swing_map_unlocked(11) ? p_note[11] = 55;
+      swing_map_unlocked(12) ? p_note[12] = 60;
+      swing_map_unlocked(13) ? p_note[13] = 61;
+      swing_map_unlocked(14) ? p_note[14] = 62;
+      swing_map_unlocked(15) ? p_note[15] = 63;
+    ) : (
+      // MPC Classic — scattered legacy MPC drum note map. A01-A03 (37/36/42)
+      // vendor-confirmed; pads 4-16 blog-derived (medium confidence).
+      root_note = 36; slider1 = root_note; slider_automate(slider1);
+      swing_map_unlocked(0)  ? p_note[0]  = 37;
+      swing_map_unlocked(1)  ? p_note[1]  = 36;
+      swing_map_unlocked(2)  ? p_note[2]  = 42;
+      swing_map_unlocked(3)  ? p_note[3]  = 82;
+      swing_map_unlocked(4)  ? p_note[4]  = 40;
+      swing_map_unlocked(5)  ? p_note[5]  = 38;
+      swing_map_unlocked(6)  ? p_note[6]  = 46;
+      swing_map_unlocked(7)  ? p_note[7]  = 44;
+      swing_map_unlocked(8)  ? p_note[8]  = 48;
+      swing_map_unlocked(9)  ? p_note[9]  = 47;
+      swing_map_unlocked(10) ? p_note[10] = 45;
+      swing_map_unlocked(11) ? p_note[11] = 43;
+      swing_map_unlocked(12) ? p_note[12] = 49;
+      swing_map_unlocked(13) ? p_note[13] = 55;
+      swing_map_unlocked(14) ? p_note[14] = 51;
+      swing_map_unlocked(15) ? p_note[15] = 53;
+    );
+    mark_dirty_kit();
+  );
+  // Right-click: full mapping menu with controller banks (migrated to
+  // Swing popup). Flat menu: 1-4 scale presets, 5-8 MPC banks,
+  // 9-12 Maschine groups, 13-14 LP/Push, 15 MPC Classic, 16 custom.
+  // Separators '||' between groups are NOT counted in the result index
+  // (matches gfx_showmenu and the dispatch indices below).
+  _in_map && rmb_down ? (
+    // Item 17 = the MAP-override toggle (separators '||' are not counted in
+    // the result index, so the 16 presets keep their resp 1..16). Label
+    // carries the current state so no checkmark support is needed.
+    swing_panels_mapmenu_open(mx, my);
+  );
+  // Hover-scroll: wheel over the open MAP menu cycles through the 8 main note
+  // maps and applies each live (the menu stays open). It REUSES the dispatch
+  // below by setting swing_popup_result to the menu index that applies that map
+  // (0..7 → Chromatic/White/GM/Black/MPC-A/Maschine-A/Launchpad/Push). Wheel up
+  // = toward the top of the list.
+  swing_popup_wheel != 0 && swing_popup_caller_id == SP_POPUP_CALLER_MAP_PRESET ? (
+    _nm = (note_map + (swing_popup_wheel > 0 ? -1 : 1) + 9) % 9;
+    _nm == 0 ? swing_popup_result = 1  :
+    _nm == 1 ? swing_popup_result = 2  :
+    _nm == 2 ? swing_popup_result = 3  :
+    _nm == 3 ? swing_popup_result = 4  :
+    _nm == 4 ? swing_popup_result = 5  :
+    _nm == 5 ? swing_popup_result = 9  :
+    _nm == 6 ? swing_popup_result = 13 :
+    _nm == 7 ? swing_popup_result = 14 :
+               swing_popup_result = 15;
+    swing_popup_wheel = 0;
+  );
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_MAP_PRESET ? (
+    resp = swing_popup_result;
+    swing_popup_result = 0;
+    // --- Scale presets (resp 1-4) ---
+    resp == 1 ? (
+      note_map = 0; root_note = 36; slider1 = root_note;
+      gi = 0; loop(NUM_PADS, swing_map_unlocked(gi) ? (p_note[gi] = 36 + gi;); gi += 1;);
+    ) : resp == 2 ? (
+      note_map = 1; root_note = 36; slider1 = root_note;
+      swing_map_unlocked(0) ? p_note[0] = 36; swing_map_unlocked(1) ? p_note[1] = 38;
+      swing_map_unlocked(2) ? p_note[2] = 40; swing_map_unlocked(3) ? p_note[3] = 41;
+      swing_map_unlocked(4) ? p_note[4] = 43; swing_map_unlocked(5) ? p_note[5] = 45;
+      swing_map_unlocked(6) ? p_note[6] = 47; swing_map_unlocked(7) ? p_note[7] = 48;
+      swing_map_unlocked(8) ? p_note[8] = 50; swing_map_unlocked(9) ? p_note[9] = 52;
+      swing_map_unlocked(10) ? p_note[10] = 53; swing_map_unlocked(11) ? p_note[11] = 55;
+      swing_map_unlocked(12) ? p_note[12] = 57; swing_map_unlocked(13) ? p_note[13] = 59;
+      swing_map_unlocked(14) ? p_note[14] = 60; swing_map_unlocked(15) ? p_note[15] = 62;
+    ) : resp == 3 ? (
+      note_map = 2; root_note = 36; slider1 = root_note;
+      swing_map_unlocked(0) ? p_note[0] = 36; swing_map_unlocked(1) ? p_note[1] = 38;
+      swing_map_unlocked(2) ? p_note[2] = 37; swing_map_unlocked(3) ? p_note[3] = 39;
+      swing_map_unlocked(4) ? p_note[4] = 42; swing_map_unlocked(5) ? p_note[5] = 44;
+      swing_map_unlocked(6) ? p_note[6] = 46; swing_map_unlocked(7) ? p_note[7] = 41;
+      swing_map_unlocked(8) ? p_note[8] = 47; swing_map_unlocked(9) ? p_note[9] = 50;
+      swing_map_unlocked(10) ? p_note[10] = 49; swing_map_unlocked(11) ? p_note[11] = 51;
+      swing_map_unlocked(12) ? p_note[12] = 57; swing_map_unlocked(13) ? p_note[13] = 54;
+      swing_map_unlocked(14) ? p_note[14] = 56; swing_map_unlocked(15) ? p_note[15] = 75;
+    ) : resp == 4 ? (
+      note_map = 3; root_note = 37; slider1 = root_note;
+      swing_map_unlocked(0) ? p_note[0] = 37; swing_map_unlocked(1) ? p_note[1] = 39;
+      swing_map_unlocked(2) ? p_note[2] = 42; swing_map_unlocked(3) ? p_note[3] = 44;
+      swing_map_unlocked(4) ? p_note[4] = 46; swing_map_unlocked(5) ? p_note[5] = 49;
+      swing_map_unlocked(6) ? p_note[6] = 51; swing_map_unlocked(7) ? p_note[7] = 54;
+      swing_map_unlocked(8) ? p_note[8] = 56; swing_map_unlocked(9) ? p_note[9] = 58;
+      swing_map_unlocked(10) ? p_note[10] = 61; swing_map_unlocked(11) ? p_note[11] = 63;
+      swing_map_unlocked(12) ? p_note[12] = 66; swing_map_unlocked(13) ? p_note[13] = 68;
+      swing_map_unlocked(14) ? p_note[14] = 70; swing_map_unlocked(15) ? p_note[15] = 73;
+    );
+    // --- MPC Banks A-D (resp 5-8): sequential from root ---
+    resp >= 5 && resp <= 8 ? (
+      note_map = 4;
+      _bank_root = 37 + (resp - 5) * 16;  // A=37, B=53, C=69, D=85
+      root_note = _bank_root; slider1 = root_note;
+      gi = 0; loop(NUM_PADS, swing_map_unlocked(gi) ? (p_note[gi] = _bank_root + gi;); gi += 1;);
+    );
+    // --- Maschine Groups A-D (resp 9-12): sequential from root ---
+    resp >= 9 && resp <= 12 ? (
+      note_map = 5;
+      _bank_root = 36 + (resp - 9) * 16;  // A=36, B=52, C=68, D=84
+      root_note = _bank_root; slider1 = root_note;
+      gi = 0; loop(NUM_PADS, swing_map_unlocked(gi) ? (p_note[gi] = _bank_root + gi;); gi += 1;);
+    );
+    // --- Launchpad / Push drum rack (resp 13-14) ---
+    resp == 13 || resp == 14 ? (
+      note_map = resp == 13 ? 6 : 7;
+      root_note = 36; slider1 = root_note;
+      swing_map_unlocked(0) ? p_note[0] = 36; swing_map_unlocked(1) ? p_note[1] = 37;
+      swing_map_unlocked(2) ? p_note[2] = 38; swing_map_unlocked(3) ? p_note[3] = 39;
+      swing_map_unlocked(4) ? p_note[4] = 44; swing_map_unlocked(5) ? p_note[5] = 45;
+      swing_map_unlocked(6) ? p_note[6] = 46; swing_map_unlocked(7) ? p_note[7] = 47;
+      swing_map_unlocked(8) ? p_note[8] = 52; swing_map_unlocked(9) ? p_note[9] = 53;
+      swing_map_unlocked(10) ? p_note[10] = 54; swing_map_unlocked(11) ? p_note[11] = 55;
+      swing_map_unlocked(12) ? p_note[12] = 60; swing_map_unlocked(13) ? p_note[13] = 61;
+      swing_map_unlocked(14) ? p_note[14] = 62; swing_map_unlocked(15) ? p_note[15] = 63;
+    );
+    // --- MPC Classic (resp 15): scattered legacy MPC drum note map ---
+    resp == 15 ? (
+      note_map = 8; root_note = 36; slider1 = root_note;
+      swing_map_unlocked(0) ? p_note[0] = 37; swing_map_unlocked(1) ? p_note[1] = 36;
+      swing_map_unlocked(2) ? p_note[2] = 42; swing_map_unlocked(3) ? p_note[3] = 82;
+      swing_map_unlocked(4) ? p_note[4] = 40; swing_map_unlocked(5) ? p_note[5] = 38;
+      swing_map_unlocked(6) ? p_note[6] = 46; swing_map_unlocked(7) ? p_note[7] = 44;
+      swing_map_unlocked(8) ? p_note[8] = 48; swing_map_unlocked(9) ? p_note[9] = 47;
+      swing_map_unlocked(10) ? p_note[10] = 45; swing_map_unlocked(11) ? p_note[11] = 43;
+      swing_map_unlocked(12) ? p_note[12] = 49; swing_map_unlocked(13) ? p_note[13] = 55;
+      swing_map_unlocked(14) ? p_note[14] = 51; swing_map_unlocked(15) ? p_note[15] = 53;
+    );
+    // Apply slider changes for all preset selections
+    resp >= 1 && resp <= 15 ? (
+      slider_automate(slider1); mark_dirty_kit();
+    );
+    // --- Custom root (resp 15) — chains to a second popup ---
+    // gfx_showmenu was synchronous so the original code opened the sub-menu
+    // inline. Our popup is async — chain by opening a second popup with
+    // a different caller ID; the MAP_ROOT poll block (below) applies the
+    // result when the user picks a note.
+    resp == 16 ? (
+      swing_popup_open(mx, my,
+        "C1 (24)|C#1 (25)|D1 (26)|D#1 (27)|E1 (28)|F1 (29)|F#1 (30)|G1 (31)|G#1 (32)|A1 (33)|A#1 (34)|B1 (35)|C2 (36)|C#2 (37)|D2 (38)|D#2 (39)|E2 (40)|F2 (41)|F#2 (42)|G2 (43)|G#2 (44)|A2 (45)|A#2 (46)|B2 (47)|C3 (48)",
+        SP_POPUP_CALLER_MAP_ROOT);
+    );
+    // --- Override-locked-pads toggle (resp 17) — no preset apply ---
+    resp == 17 ? (
+      map_override_locked = !map_override_locked;
+      mark_dirty();
+    );
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_MAP_PRESET ? (
+    swing_popup_result = 0;
+  );
+  // Chained sub-menu: custom root pick. _rsp2 is the 1-based index, root
+  // is _rsp2 + 23 (C1=24, C#1=25, ... C3=48).
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_MAP_ROOT ? (
+    _rsp2 = swing_popup_result;
+    swing_popup_result = 0;
+    root_note = _rsp2 + 23; note_map = 0;
+    slider1 = root_note; slider_automate(slider1);
+    gi = 0; loop(NUM_PADS, swing_map_unlocked(gi) ? (p_note[gi] = root_note + gi;); gi += 1;);
+    mark_dirty_kit();
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_MAP_ROOT ? (
+    swing_popup_result = 0;
+  );
+
+  // PLAY: MODE toggle (1-Shot / Gate) — single button on the right, beside RPT.
+  // oneshot_global is already a single boolean; this one button flips it and
+  // shows the active mode's colour: gold = 1-Shot, blue = Gate. (_play_y layout.)
+  oneshot_global ? gfx_set(0.85, 0.65, 0.10, 0.9) : gfx_set(0.20, 0.55, 0.85, 0.9);
+  gfx_rect(_btn2_x, _play_y, _btn_w, _btn_h);
+  gfx_set(pad_well_r, pad_well_g, pad_well_b, 1);
+  gfx_rect(_btn2_x, _play_y, _btn_corner, 1); gfx_rect(_btn2_x, _play_y, 1, _btn_corner);
+  gfx_rect(_btn2_x + _btn_w - _btn_corner, _play_y, _btn_corner, 1); gfx_rect(_btn2_x + _btn_w - 1, _play_y, 1, _btn_corner);
+  gfx_rect(_btn2_x, _play_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn2_x, _play_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_rect(_btn2_x + _btn_w - _btn_corner, _play_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn2_x + _btn_w - 1, _play_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_set(1, 1, 1, 0.15); gfx_rect(_btn2_x + _btn_corner, _play_y, _btn_w - _btn_corner * 2, 1);
+  gfx_rect(_btn2_x, _play_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_set(0, 0, 0, 0.20);
+  gfx_rect(_btn2_x + _btn_corner, _play_y + _btn_h - 1, _btn_w - _btn_corner * 2, 1);
+  gfx_rect(_btn2_x + _btn_w - 1, _play_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_set(1, 1, 1, 0.10); gfx_rect(_btn2_x + 1, _play_y + 1, _btn_w - 2, 1);
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_set(0, 0, 0, 1);
+  strcpy(#_mode_lbl, oneshot_global ? "1SHOT" : "GATE");
+  gfx_measurestr(#_mode_lbl, tw, th);
+  gfx_x = _btn2_x + (_btn_w - tw) / 2; gfx_y = _play_y + (_btn_h - th) / 2; gfx_drawstr(#_mode_lbl);
+  _in_mode = mx >= _btn2_x && mx <= _btn2_x+_btn_w && my >= _play_y && my <= _play_y+_btn_h;
+  _in_mode ? swing_tooltip_check(16, "Trigger mode — click to toggle. 1-Shot: pads play to the end on a single hit (ignores note-off). Gate: pads play only while the MIDI note is held. Per-pad override via the right-click overlay.");
+  _in_mode && lmb_down ? ( oneshot_global = !oneshot_global; mark_dirty_kit(); );
+
+  // PLAY: RPT (left, half width) — beside the MODE toggle. (_play_y from the
+  // layout; RPT keeps its own red-active / blue-off state colour.)
+  _btn5_y = _play_y;
+
+  // RPT button — colored by the current division's FEEL, matching the menu rows:
+  // OFF = grey · straight = blue · triplet = green · dotted = amber.
+  _rpt_feel = repeat_div == 0 ? -1 : (repeat_div - 1) % 3;
+  _rpt_feel == -1 ? gfx_set(0.38, 0.40, 0.43, 0.9) :
+  _rpt_feel == 0  ? gfx_set(0.30, 0.55, 0.90, 0.9) :   // straight (blue)
+  _rpt_feel == 1  ? gfx_set(0.30, 0.75, 0.40, 0.9) :   // triplet (green)
+                    gfx_set(0.95, 0.65, 0.20, 0.9);     // dotted (amber)
+  gfx_rect(_btn1_x, _btn5_y, _btn_w, _btn_h);
+  // Round corners
+  gfx_set(pad_well_r, pad_well_g, pad_well_b, 1);
+  gfx_rect(_btn1_x, _btn5_y, _btn_corner, 1); gfx_rect(_btn1_x, _btn5_y, 1, _btn_corner);
+  gfx_rect(_btn1_x + _btn_w - _btn_corner, _btn5_y, _btn_corner, 1); gfx_rect(_btn1_x + _btn_w - 1, _btn5_y, 1, _btn_corner);
+  gfx_rect(_btn1_x, _btn5_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn1_x, _btn5_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_rect(_btn1_x + _btn_w - _btn_corner, _btn5_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn1_x + _btn_w - 1, _btn5_y + _btn_h - _btn_corner, 1, _btn_corner);
+  // Enhanced 3D bevel
+  gfx_set(1, 1, 1, 0.15); gfx_rect(_btn1_x + _btn_corner, _btn5_y, _btn_w - _btn_corner * 2, 1);
+  gfx_rect(_btn1_x, _btn5_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_set(0, 0, 0, 0.20);
+  gfx_rect(_btn1_x + _btn_corner, _btn5_y + _btn_h - 1, _btn_w - _btn_corner * 2, 1);
+  gfx_rect(_btn1_x + _btn_w - 1, _btn5_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  // Inner glow for active state
+  repeat_div > 0 ? (
+    gfx_set(1, 1, 1, 0.10);
+    gfx_rect(_btn1_x + 1, _btn5_y + 1, _btn_w - 2, 1);
+  );
+  gfx_setfont(1, "Arial", 8, 'b');
+  gfx_set(1, 1, 1, 1);
+  repeat_div == 0 ? strcpy(#_rpt_lbl, "RPT OFF") : (
+    get_rpt_div_name(repeat_div); strcpy(#_rpt_lbl, #_rpt_name);
+  );
+  gfx_measurestr(#_rpt_lbl, tw, th);
+  gfx_x = _btn1_x + (_btn_w - tw) / 2; gfx_y = _btn5_y + (_btn_h - th) / 2; gfx_drawstr(#_rpt_lbl);
+  _in_rpt = mx >= _btn1_x && mx <= _btn1_x+_btn_w && my >= _btn5_y && my <= _btn5_y+_btn_h;
+  _in_rpt ? swing_tooltip_check(1, "Repeat division for held notes — left-click cycles OFF/1/4/1/8/1/16/1/32/1/64; right-click for full menu (straight/triplet/dotted)");
+  // Left-click: cycle straight divisions (OFF→1/4→1/8→1/16→1/32→1/64→OFF)
+  _in_rpt && lmb_down ? (
+    repeat_div == 0  ? repeat_div = 1  :  // OFF → 1/4
+    repeat_div == 1  ? repeat_div = 4  :  // 1/4 → 1/8
+    repeat_div == 4  ? repeat_div = 7  :  // 1/8 → 1/16
+    repeat_div == 7  ? repeat_div = 10 :  // 1/16 → 1/32
+    repeat_div == 10 ? repeat_div = 13 :  // 1/32 → 1/64
+    repeat_div = 0;                        // anything else → OFF
+    rpt_counter = 0; mark_dirty_kit();
+  );
+  // Right-click: full menu with all divisions
+  // Right-click: repeat-division picker (migrated to popup). Separators
+  // don't consume an index — 1=OFF, 2=1/4, ..., 5=1/8, ..., matching the
+  // repeat_div lookup table in rk_delay.jsfx-inc.
+  _in_rpt && rmb_down ? (
+    swing_panels_build_rpt_menu();
+    swing_popup_open(mx, my, #_rpt_menu, SP_POPUP_CALLER_RPT_DIV);
+  );
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_RPT_DIV ? (
+    repeat_div = swing_panels_rpt_pos2div(swing_popup_result);  // feel-first menu order -> enum
+    swing_popup_result = 0;
+    rpt_counter = 0; mark_dirty_kit();
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_RPT_DIV ? (
+    swing_popup_result = 0;
+  );
+  // Hover-scroll: wheel over the open RPT menu cycles through all divisions
+  // (OFF + straight/triplet/dotted × 5) live; menu stays open and re-marks the
+  // active one. Wheel up = toward the top (OFF).
+  swing_popup_wheel != 0 && swing_popup_caller_id == SP_POPUP_CALLER_RPT_DIV ? (
+    repeat_div = swing_panels_rpt_wheel(repeat_div, swing_popup_wheel > 0 ? -1 : 1);  // wheel up = toward top (OFF)
+    rpt_counter = 0; mark_dirty_kit();
+    swing_panels_build_rpt_menu();
+    swing_popup_refresh_items(#_rpt_menu);
+    swing_popup_wheel = 0;
+  );
+  // Scroll wheel over the button: step through the menu order (straights, then T, then D)
+  _in_rpt && frame_wheel != 0 ? (
+    repeat_div = swing_panels_rpt_wheel(repeat_div, sign_of(frame_wheel));
+    rpt_counter = 0; mark_dirty_kit();
+  );
+
+  // SAMPLES row: EXPLORE (right) — moved here to sit beside BROWSE (both are
+  // sample-source access). Blue, teal when REAPER's Media Explorer is open.
+  media_explorer_running ? gfx_set(0.20, 0.65, 0.55, 0.9) : gfx_set(btn_blue_r, btn_blue_g, btn_blue_b, 0.9);
+  gfx_rect(_btn2_x, _smp_y, _btn_w, _btn_h);
+  gfx_set(pad_well_r, pad_well_g, pad_well_b, 1);
+  gfx_rect(_btn2_x, _smp_y, _btn_corner, 1); gfx_rect(_btn2_x, _smp_y, 1, _btn_corner);
+  gfx_rect(_btn2_x + _btn_w - _btn_corner, _smp_y, _btn_corner, 1); gfx_rect(_btn2_x + _btn_w - 1, _smp_y, 1, _btn_corner);
+  gfx_rect(_btn2_x, _smp_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn2_x, _smp_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_rect(_btn2_x + _btn_w - _btn_corner, _smp_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn2_x + _btn_w - 1, _smp_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_set(1, 1, 1, 0.15); gfx_rect(_btn2_x + _btn_corner, _smp_y, _btn_w - _btn_corner * 2, 1);
+  gfx_rect(_btn2_x, _smp_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_set(0, 0, 0, 0.20);
+  gfx_rect(_btn2_x + _btn_corner, _smp_y + _btn_h - 1, _btn_w - _btn_corner * 2, 1);
+  gfx_rect(_btn2_x + _btn_w - 1, _smp_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  media_explorer_running ? (
+    gfx_set(1, 1, 1, 0.10);
+    gfx_rect(_btn2_x + 1, _smp_y + 1, _btn_w - 2, 1);
+  );
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_set(1, 1, 1, 1);
+  gfx_measurestr("EXPLORE", tw, th);
+  gfx_x = _btn2_x + (_btn_w - tw) / 2; gfx_y = _smp_y + (_btn_h - th) / 2; gfx_drawstr("EXPLORE");
+  mx >= _btn2_x && mx <= _btn2_x+_btn_w && my >= _smp_y && my <= _smp_y+_btn_h ? swing_tooltip_check(18, "Toggle REAPER's Media Explorer. Drag samples directly from it onto pads.");
+  mx >= _btn2_x && mx <= _btn2_x+_btn_w && my >= _smp_y && my <= _smp_y+_btn_h && lmb_down ? (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      gmem[KIT_GMEM_CMD] == 0 ? gmem[KIT_GMEM_CMD] = 45;
+    ) : (
+      kit_bridge_warn = 1;
+    );
+  );
+
+  // SAMPLES row: BROWSE (left) — half width now, paired with EXPLORE. Opens the
+  // EON Sample Browser via CMD 60. (_smp_y from the section layout.)
+  _btn6_y = _smp_y;
+  _btn6_w = _btn_w;
+  browser_running ? gfx_set(0.20, 0.65, 0.55, 0.9) : gfx_set(btn_blue_r, btn_blue_g, btn_blue_b, 0.9);
+  gfx_rect(_btn1_x, _btn6_y, _btn6_w, _btn_h);
+  gfx_set(pad_well_r, pad_well_g, pad_well_b, 1);
+  gfx_rect(_btn1_x, _btn6_y, _btn_corner, 1); gfx_rect(_btn1_x, _btn6_y, 1, _btn_corner);
+  gfx_rect(_btn1_x + _btn6_w - _btn_corner, _btn6_y, _btn_corner, 1); gfx_rect(_btn1_x + _btn6_w - 1, _btn6_y, 1, _btn_corner);
+  gfx_rect(_btn1_x, _btn6_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn1_x, _btn6_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_rect(_btn1_x + _btn6_w - _btn_corner, _btn6_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn1_x + _btn6_w - 1, _btn6_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_set(1, 1, 1, 0.15); gfx_rect(_btn1_x + _btn_corner, _btn6_y, _btn6_w - _btn_corner * 2, 1);
+  gfx_rect(_btn1_x, _btn6_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_set(0, 0, 0, 0.20);
+  gfx_rect(_btn1_x + _btn_corner, _btn6_y + _btn_h - 1, _btn6_w - _btn_corner * 2, 1);
+  gfx_rect(_btn1_x + _btn6_w - 1, _btn6_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  browser_running ? (
+    gfx_set(1, 1, 1, 0.10);
+    gfx_rect(_btn1_x + 1, _btn6_y + 1, _btn6_w - 2, 1);
+  );
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_set(1, 1, 1, 1);
+  gfx_measurestr("BROWSE", tw, th);
+  gfx_x = _btn1_x + (_btn6_w - tw) / 2; gfx_y = _btn6_y + (_btn_h - th) / 2; gfx_drawstr("BROWSE");
+  mx >= _btn1_x && mx <= _btn1_x+_btn6_w && my >= _btn6_y && my <= _btn6_y+_btn_h ? swing_tooltip_check(19, "Open the Swing sample browser (categorized file list, audio preview, drag-to-pad). Requires ReaImGui — see banner if not installed.");
+  mx >= _btn1_x && mx <= _btn1_x+_btn6_w && my >= _btn6_y && my <= _btn6_y+_btn_h && lmb_down ? (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      gmem[KIT_GMEM_CMD] == 0 ? (
+        gmem[KIT_GMEM_PARAM1] = sel_pad;  // target pad for browser-driven action
+        // Claim browser routing: subsequent CMD 63/64 sample loads + the
+        // browser's window-size and pad-select sync land on this instance,
+        // not on whatever other Swing instance happens to also be running.
+        gmem[KIT_GMEM_INSTANCE] = instance_id;
+        gmem[KIT_GMEM_CMD] = 60;    // CMD 60 = open browser
+      );
+    ) : (
+      kit_bridge_warn = 1;
+    );
+  );
+
+  // (PREFS — SEL TRK / TIPS — moved to the header gear menu. The underlying
+  //  vars pad_click_selects_track / tooltips_enabled are now toggled there.)
+
+  // KIT row 2: CLEAR — full width, moved up under SAVE/LOAD/NEW (it's a kit-file
+  // action). Stays red (destructive). REAPER's Ctrl+Z handles undo for
+  // clear/swap/load via the deferred CMD 46/48 system. (_clr_y from the layout.)
+  _btn_full_w = _full_w;
+
+  // CLEAR ALL button — red, clears all 16 pads (with confirmation)
+  gfx_set(btn_red_r, btn_red_g, btn_red_b, 0.9);
+  gfx_rect(_btn1_x, _clr_y, _btn_full_w, _btn_h);
+  gfx_set(pad_well_r, pad_well_g, pad_well_b, 1);
+  gfx_rect(_btn1_x, _clr_y, _btn_corner, 1); gfx_rect(_btn1_x, _clr_y, 1, _btn_corner);
+  gfx_rect(_btn1_x + _btn_full_w - _btn_corner, _clr_y, _btn_corner, 1); gfx_rect(_btn1_x + _btn_full_w - 1, _clr_y, 1, _btn_corner);
+  gfx_rect(_btn1_x, _clr_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn1_x, _clr_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_rect(_btn1_x + _btn_full_w - _btn_corner, _clr_y + _btn_h - 1, _btn_corner, 1); gfx_rect(_btn1_x + _btn_full_w - 1, _clr_y + _btn_h - _btn_corner, 1, _btn_corner);
+  gfx_set(1, 1, 1, 0.15); gfx_rect(_btn1_x + _btn_corner, _clr_y, _btn_full_w - _btn_corner * 2, 1);
+  gfx_rect(_btn1_x, _clr_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_set(0, 0, 0, 0.20);
+  gfx_rect(_btn1_x + _btn_corner, _clr_y + _btn_h - 1, _btn_full_w - _btn_corner * 2, 1);
+  gfx_rect(_btn1_x + _btn_full_w - 1, _clr_y + _btn_corner, 1, _btn_h - _btn_corner * 2);
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_set(1, 1, 1, 1);
+  gfx_measurestr("CLEAR", tw, th);
+  gfx_x = _btn1_x + (_btn_full_w - tw) / 2; gfx_y = _clr_y + (_btn_h - th) / 2; gfx_drawstr("CLEAR");
+  mx >= _btn1_x && mx <= _btn1_x+_btn_full_w && my >= _clr_y && my <= _clr_y+_btn_h ? swing_tooltip_check(20, "Clear all 16 pads (audio + names + per-pad FX). Asks for confirmation. Ctrl+Z restores everything via REAPER's undo.");
+  // CLEAR confirmation menu (migrated). The original menu had "---" + " "
+  // dummy entries after the confirm item as visual padding; we just keep
+  // the confirm option since the Strip popup needs no padding.
+  mx >= _btn1_x && mx <= _btn1_x+_btn_full_w && my >= _clr_y && my <= _clr_y+_btn_h && lmb_down ? (
+    swing_popup_open(mx, my, "Clear all pads (keep kit name + FX)?", SP_POPUP_CALLER_CLEAR_PADS);
+  );
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_CLEAR_PADS ? (
+    swing_popup_result = 0;
+    // Queue clear all — deferred until bridge opens undo block
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 ? (
+      gmem[KIT_GMEM_UNDO_DESC] = 1;
+      gmem[KIT_GMEM_CMD] = 46;
+      _undo_pending = 1;
+    ) : (
+      // Bridge not alive — execute immediately (no undo)
+      gi = 0; loop(NUM_PADS, clear_pad(gi); clear_pad_syn(gi); gi += 1;);
+    );
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_CLEAR_PADS ? (
+    swing_popup_result = 0;
+  );
+
+  // ── TOOLS: STEP SEQ | PAD FX (row A) · MATRIX | PAINT (row B) · DM GRID (row C) ──
+  // The launchers route through the bridge CMD protocol (JSFX can't insert FX or
+  // run scripts). _tool_a_y / _tool_b_y / _tool_c_y come from the section layout.
+
+  // STEP SEQ (left) — opens the Step Sequencer in this track's MAIN FX chain.
+  // Lit green while this track's StepSeq float window is OPEN (bridge publishes
+  // per registry slot into the courier band; see GS_SSWIN_* in Swing_ReaKit).
+  // Dramatic open/closed contrast (user 2026-07-03): closed = neutral dark
+  // grey (same idle chrome as PAINT/GRID), open = vivid bright green.
+  _seq_open = _reg_my_slot >= 0 && gmem[GS_SSWIN_BASE + _reg_my_slot*GS_SSWIN_STRIDE + GS_SSWIN_OPEN] > 0.5;
+  _seq_open ? swing_panels_toolbtn_chrome(_btn1_x, _tool_a_y, _btn_w, _btn_h, 0.16, 0.92, 0.45, 1)
+            : swing_panels_toolbtn_chrome(_btn1_x, _tool_a_y, _btn_w, _btn_h, 0.30, 0.32, 0.36, 0);
+  gfx_setfont(1, "Arial", 8, 'b');
+  gfx_set(1, 1, 1, 1);
+  gfx_measurestr("STEP SEQ", tw, th);
+  gfx_x = _btn1_x + (_btn_w - tw) / 2; gfx_y = _tool_a_y + (_btn_h - th) / 2; gfx_drawstr("STEP SEQ");
+  _in_seq = mx >= _btn1_x && mx <= _btn1_x+_btn_w && my >= _tool_a_y && my <= _tool_a_y+_btn_h;
+  _in_seq ? swing_tooltip_check(25, "Open EON Steppa (step sequencer) in this track's FX chain (creates it if needed; click again to hide). Auto-pairs to this Swing. Lit = window open.");
+  _in_seq && lmb_down ? (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      gmem[KIT_GMEM_CMD] == 0 ? (
+        gmem[KIT_GMEM_LOCK] = instance_id;  // so find_swing_track() resolves THIS instance's track
+        gmem[KIT_GMEM_CMD]  = 70;
+      );
+    ) : ( kit_bridge_warn = 1; );
+  );
+
+  // PAD FX (right) — toggles the Swing Pad FX panel
+  swing_panels_toolbtn_chrome(_btn2_x, _tool_a_y, _btn_w, _btn_h, 0.35, 0.65, 0.85, 0);
+  gfx_set(1, 1, 1, 1);
+  gfx_measurestr("PAD FX", tw, th);
+  gfx_x = _btn2_x + (_btn_w - tw) / 2; gfx_y = _tool_a_y + (_btn_h - th) / 2; gfx_drawstr("PAD FX");
+  _in_padfx = mx >= _btn2_x && mx <= _btn2_x+_btn_w && my >= _tool_a_y && my <= _tool_a_y+_btn_h;
+  _in_padfx ? swing_tooltip_check(26, "Toggle the Swing Pad FX panel (per-pad insert-FX rack). Requires ReaImGui.");
+  _in_padfx && lmb_down ? (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_CMD] = 71; );
+    ) : ( kit_bridge_warn = 1; );
+  );
+
+  // STEREO | MULTI (left cell, row B, split half-width) — the two drum-grid
+  // builders side by side. STEREO (CMD 77): one click to the stereo grid —
+  // the bridge builds the setup if the track isn't tagged, else opens the DM
+  // overlay. MULTI (CMD 73): build/refresh the classic 16-lane Drum Matrix
+  // (its own replace/parallel dialog handles rebuilds). Right-click on either
+  // half = the full build menu (Stereo / Lanes / Multi-Out / Both).
+  _btn_hw = ((_btn_w - 2) * 0.5)|0;
+  swing_panels_toolbtn_chrome(_btn1_x, _tool_b_y, _btn_hw, _btn_h, 0.55, 0.40, 0.85, 0);
+  swing_panels_toolbtn_chrome(_btn1_x + _btn_hw + 2, _tool_b_y, _btn_w - _btn_hw - 2, _btn_h, 0.38, 0.48, 0.85, 0);
+  gfx_setfont(1, "Arial", 8, 'b');
+  gfx_set(1, 1, 1, 1);
+  gfx_measurestr("STEREO", tw, th);
+  gfx_x = _btn1_x + (_btn_hw - tw) / 2; gfx_y = _tool_b_y + (_btn_h - th) / 2; gfx_drawstr("STEREO");
+  gfx_measurestr("MULTI", tw, th);
+  gfx_x = _btn1_x + _btn_hw + 2 + (_btn_w - _btn_hw - 2 - tw) / 2; gfx_y = _tool_b_y + (_btn_h - th) / 2; gfx_drawstr("MULTI");
+  _in_dmst = mx >= _btn1_x && mx < _btn1_x+_btn_hw && my >= _tool_b_y && my <= _tool_b_y+_btn_h;
+  _in_dmmu = mx >= _btn1_x+_btn_hw+2 && mx <= _btn1_x+_btn_w && my >= _tool_b_y && my <= _tool_b_y+_btn_h;
+  _in_dm = _in_dmst || _in_dmmu;   // union rect keeps the shared right-click menu
+  _in_dmst ? swing_tooltip_check(27, "Stereo drum grid: builds the one-track grid setup if missing, then opens the Drum Matrix overlay on it. Right-click: full build menu.");
+  _in_dmmu ? swing_tooltip_check(28, "Multi-lane Drum Matrix: builds the 16 MIDI lane tracks (rebuild/parallel via its dialog). Right-click: full build menu incl. Multi-Out audio.");
+  _in_dmst && lmb_down ? (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      gmem[KIT_GMEM_CMD] == 0 ? (
+        gmem[KIT_GMEM_LOCK] = instance_id;
+        gmem[KIT_GMEM_CMD]  = 77;
+      );
+    ) : ( kit_bridge_warn = 1; );
+  );
+  _in_dmmu && lmb_down ? (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      gmem[KIT_GMEM_CMD] == 0 ? (
+        gmem[KIT_GMEM_LOCK] = instance_id;
+        gmem[KIT_GMEM_CMD]  = 73;
+      );
+    ) : ( kit_bridge_warn = 1; );
+  );
+  // Right-click → build menu, stereo-first: Stereo Grid / MIDI lanes /
+  // Multi-Out / Both (matches the left-click's stereo-first default).
+  _in_dm && rmb_down ? (
+    swing_popup_open(mx, my,
+      "Build Stereo Grid (this track)|Build Drum Matrix (MIDI lanes)|Build Multi-Out (Audio)|Build Both (Audio + MIDI)",
+      SP_POPUP_CALLER_DM_BUILD);
+  );
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_DM_BUILD ? (
+    resp = swing_popup_result;
+    swing_popup_result = 0;
+    // 1 = Stereo Grid — tag THIS track as a one-lane multi-pitch grid (no child
+    // tracks; bridge runs EON_DM_BuildStereo.lua, same launch path as CMD 73)
+    resp == 1 ? (
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+        gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_CMD] = 77; );
+      ) : ( kit_bridge_warn = 1; );
+    );
+    // 2 = Matrix (16 MIDI lane tracks; explicit — left-click only routes here
+    // when lanes already exist)
+    resp == 2 ? (
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+        gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_CMD] = 73; );
+      ) : ( kit_bridge_warn = 1; );
+    );
+    // 3 = Multi-Out (audio returns only — same path as the STEREO/MULTI builder)
+    resp == 3 ? (
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+        gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id ? (
+          swing_panels_multiout_prep();
+          gmem[KIT_GMEM_CMD] = 40; kit_import_state = 1; kit_busy = 1;
+        ) : ( kit_bridge_warn = 2; );
+      ) : ( kit_bridge_warn = 1; );
+    );
+    // 4 = Both — multi-out prep, then combined CMD 74 (bridge builds audio, then MIDI)
+    resp == 4 ? (
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+        gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id ? (
+          swing_panels_multiout_prep();
+          gmem[KIT_GMEM_CMD] = 74; kit_import_state = 1; kit_busy = 1;
+        ) : ( kit_bridge_warn = 2; );
+      ) : ( kit_bridge_warn = 1; );
+    );
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_DM_BUILD ? (
+    swing_popup_result = 0;
+  );
+
+  // PAINT (right, row B) — toggles Drum Matrix paint mode (lit green when ON).
+  // The bridge publishes the live paint state to GS_DM_PAINT each poll (so an
+  // external key-toggle reflects here too); the click fires CMD 75 to flip it.
+  _dm_paint = gmem[GS_DM_PAINT] > 0.5;
+  _dm_paint ? swing_panels_toolbtn_chrome(_btn2_x, _tool_b_y, _btn_w, _btn_h, 0.30, 0.75, 0.45, 1)
+            : swing_panels_toolbtn_chrome(_btn2_x, _tool_b_y, _btn_w, _btn_h, 0.30, 0.32, 0.36, 0);
+  gfx_setfont(1, "Arial", 8, 'b');
+  gfx_set(1, 1, 1, 1);
+  gfx_measurestr("PAINT", tw, th);
+  gfx_x = _btn2_x + (_btn_w - tw) / 2; gfx_y = _tool_b_y + (_btn_h - th) / 2; gfx_drawstr("PAINT");
+  _in_paint = mx >= _btn2_x && mx <= _btn2_x+_btn_w && my >= _tool_b_y && my <= _tool_b_y+_btn_h;
+  _in_paint ? swing_tooltip_check(29, "Drum Matrix paint — opens the grid overlay if it isn't running, then toggles click/drag note painting on the lanes. Lit green = painting. Close the grid from its own X.");
+  _in_paint && lmb_down ? (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_CMD] = 75; );
+    ) : ( kit_bridge_warn = 1; );
+  );
+
+  // GRID (full width, row C) — toggles the Drum Matrix grid overlay on/off.
+  // Lit when the overlay is running (GS_DM_OVERLAY, published by the bridge from
+  // the overlay's singleton lock). Click fires CMD 76 (open if closed / close if
+  // open). MATRIX builds the lanes; PAINT paints once the grid is up.
+  _tool_full_w = _full_w;
+  _dm_grid = gmem[GS_DM_OVERLAY] > 0.5;
+  _dm_grid ? swing_panels_toolbtn_chrome(_btn1_x, _tool_c_y, _tool_full_w, _btn_h, 0.55, 0.40, 0.85, 1)
+           : swing_panels_toolbtn_chrome(_btn1_x, _tool_c_y, _tool_full_w, _btn_h, 0.30, 0.32, 0.36, 0);
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_set(1, 1, 1, 1);
+  strcpy(#_grid_lbl, _dm_grid ? "DM GRID — ON" : "DM GRID — OFF");
+  gfx_measurestr(#_grid_lbl, tw, th);
+  gfx_x = _btn1_x + (_tool_full_w - tw) / 2; gfx_y = _tool_c_y + (_btn_h - th) / 2; gfx_drawstr(#_grid_lbl);
+  _in_grid = mx >= _btn1_x && mx <= _btn1_x+_tool_full_w && my >= _tool_c_y && my <= _tool_c_y+_btn_h;
+  _in_grid ? swing_tooltip_check(30, "Drum Matrix grid overlay on/off — opens the ReaImGui grid over the arrange view, or closes it. Lit = overlay running. (Build lanes with MATRIX, paint with PAINT.)");
+  _in_grid && lmb_down ? (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_CMD] = 76; );
+    ) : ( kit_bridge_warn = 1; );
+  );
+
+  // (Master anchor _btn7_y is set in the section layout preamble = _tool_c_y, so
+  // swing_panels_draw_master() flows below the PREFS row.)
+
+);
+
+function swing_panels_draw_master() (
+  // Available area below last button row
+  _ctrl_area_y = _btn7_y + _btn_h + 8;
+  _ctrl_area_h = gfx_h - _ctrl_area_y - 6;
+
+  // Side-by-side layout: DRIVE on left, VOL on right
+  _drv_zone_w = (left_w * 0.28)|0;
+  _knob_zone_w = left_w - _drv_zone_w;
+
+  // Master VOL knob sizing. Scales with the panel (height + knob-zone width) but
+  // capped at 75 so it doesn't balloon to fill the whole left panel on a big
+  // window. (Was 88 — trimmed so the knob reads smaller in the master section.)
+  _mvol_r = min(75, (_ctrl_area_h - 16) / 2);
+  _mvol_r = min(_mvol_r, (_knob_zone_w / 2 - 8));
+  _mvol_r = max(26, _mvol_r);
+
+  // DRIVE fader (left side, vertically centered in zone). Scales with the panel
+  // height, capped at 150 (was 220) so the slider reads shorter; it still
+  // centers in the available zone via _drv_y below.
+  _drv_h = min(150, _ctrl_area_h - 18);
+  _drv_cx = 4 + _drv_zone_w / 2;
+  _drv_y = _ctrl_area_y + ((_ctrl_area_h - _drv_h - 14) / 2)|0;
+  _drv_track_w = 6;       // wider track
+  _drv_thumb_w = 28;      // wider thumb
+  _drv_thumb_h = 12;
+
+  // Master drive character color (matches the per-pad drive palette in
+  // rk_swing_ui_grid_overlay_fx.jsfx-inc). The fader fill, thumb line and
+  // mode pill all key off gfx_drv_mode so the DRIVE control recolors per type.
+  _mdm = gfx_drv_mode | 0;
+  _mdm == 0 ? ( _mdrv_r=0.85; _mdrv_g=0.25; _mdrv_b=0.25; ) :  // SOFT
+  _mdm == 1 ? ( _mdrv_r=0.90; _mdrv_g=0.60; _mdrv_b=0.15; ) :  // TUBE
+  _mdm == 2 ? ( _mdrv_r=0.70; _mdrv_g=0.55; _mdrv_b=0.30; ) :  // TAPE
+  _mdm == 3 ? ( _mdrv_r=0.90; _mdrv_g=0.20; _mdrv_b=0.55; ) :  // FUZZ
+             ( _mdrv_r=0.50; _mdrv_g=0.75; _mdrv_b=0.90; );     // CLIP
+
+  // Track (wider dark groove)
+  _drv_track_x = _drv_cx - (_drv_track_w / 2)|0;
+  gfx_set(0.06, 0.06, 0.08, 1);
+  gfx_rect(_drv_track_x, _drv_y, _drv_track_w, _drv_h);
+  // Track inset bevel
+  gfx_set(0.03, 0.03, 0.05, 0.8);
+  gfx_rect(_drv_track_x, _drv_y, _drv_track_w, 1);
+  gfx_rect(_drv_track_x, _drv_y, 1, _drv_h);
+  gfx_set(0.20, 0.20, 0.22, 0.4);
+  gfx_rect(_drv_track_x, _drv_y + _drv_h - 1, _drv_track_w, 1);
+
+  // Drive-type colored fill (shows current drive level in the track)
+  _drv_fill_h = (gfx_sat_drv * _drv_h)|0;
+  _drv_fill_h > 0 ? (
+    gfx_set(_mdrv_r, _mdrv_g, _mdrv_b, 0.85);
+    gfx_rect(_drv_track_x + 1, _drv_y + _drv_h - _drv_fill_h, _drv_track_w - 2, _drv_fill_h);
+  );
+
+  // Tick marks (5 ticks on left side)
+  gfx_set(0.50, 0.48, 0.45, 0.5);
+  _ti = 0; loop(5,
+    _tick_y = (_drv_y + (_ti / 4.0) * _drv_h)|0;
+    gfx_line(_drv_track_x - 4, _tick_y, _drv_track_x - 1, _tick_y);
+    _ti += 1;
+  );
+
+  // Thumb position
+  _drv_thumb_y = _drv_y + (1.0 - gfx_sat_drv) * (_drv_h - _drv_thumb_h);
+  _drv_thumb_x = _drv_cx - (_drv_thumb_w / 2)|0;
+
+  // Thumb cap (metallic silver)
+  gfx_set(0.62, 0.60, 0.57, 1);
+  gfx_rect(_drv_thumb_x, _drv_thumb_y, _drv_thumb_w, _drv_thumb_h);
+  // Top highlight
+  gfx_set(0.82, 0.80, 0.77, 0.7);
+  gfx_rect(_drv_thumb_x, _drv_thumb_y, _drv_thumb_w, 1);
+  gfx_rect(_drv_thumb_x, _drv_thumb_y, 1, _drv_thumb_h);
+  // Bottom/right shadow
+  gfx_set(0.28, 0.26, 0.23, 0.7);
+  gfx_rect(_drv_thumb_x, _drv_thumb_y + _drv_thumb_h - 1, _drv_thumb_w, 1);
+  gfx_rect(_drv_thumb_x + _drv_thumb_w - 1, _drv_thumb_y, 1, _drv_thumb_h);
+  // Drive-type colored center line on thumb (slightly darker than the fill)
+  gfx_set(_mdrv_r * 0.8, _mdrv_g * 0.8, _mdrv_b * 0.8, 0.85);
+  gfx_rect(_drv_thumb_x + 4, _drv_thumb_y + (_drv_thumb_h / 2)|0, _drv_thumb_w - 8, 2);
+
+  // Drive interaction (vertical drag, ID 270)
+  active_id == 270 ? ( LMB ? (
+    gfx_sat_drv = max(0, min(1.0, 1.0 - (my - _drv_y) / _drv_h));
+    mark_dirty_kit();
+  ) : active_id = -1; );
+
+  active_id == -1 && mx >= _drv_thumb_x - 4 && mx <= _drv_thumb_x + _drv_thumb_w + 4 && my >= _drv_y && my <= _drv_y + _drv_h && lmb_down ? (
+    active_id = 270;
+  );
+
+  // Tooltip: zone 3 = master DRIVE fader. Hover zone uses the same
+  // hitbox as the click + scroll detectors above.
+  mx >= _drv_thumb_x - 6 && mx <= _drv_thumb_x + _drv_thumb_w + 6 && my >= _drv_y && my <= _drv_y + _drv_h ?
+    swing_tooltip_check(3, "Master DRIVE — saturation amount applied at the final stage. 0 = clean, 1 = fully saturated. Drag thumb, scroll wheel, or double-click to reset.");
+
+  // Drive scroll wheel — anywhere over the fader column adjusts the
+  // drive amount. Matches the wheel sensitivity of the LCD 0..1 knobs
+  // (delay feedback / mix etc., 0.02 per tick = 50 ticks full range).
+  // Hitbox uses the thumb width plus a 6px gutter so the user can land
+  // the scroll without aiming exactly at the moving thumb.
+  mx >= _drv_thumb_x - 6 && mx <= _drv_thumb_x + _drv_thumb_w + 6 && my >= _drv_y && my <= _drv_y + _drv_h && frame_wheel != 0 ? (
+    gfx_sat_drv = max(0, min(1.0, gfx_sat_drv + frame_wheel * 0.02));
+    mark_dirty_kit();
+  );
+
+  // Drive label — themed TEXT slot (follows the active theme's text colour);
+  // falls back to the cream-panel dark ink when the bridge isn't publishing.
+  gfx_setfont(1, "Arial", 10, 'b');
+  rkth_setcol(2, 0.18, 0.16, 0.14, 1.0);
+  gfx_measurestr("DRIVE", tw, th);
+  gfx_x = _drv_cx - tw / 2; gfx_y = _drv_y + _drv_h + 4; gfx_drawstr("DRIVE");
+
+  // ── Drive-type pill (click cycles, wheel scrolls) — colored per type ──
+  // Mirrors the per-pad drive pill idiom (dark-tinted rect + full-color text).
+  gfx_setfont(1, "Arial", 8, 'b');
+  _mdm == 0 ? strcpy(#mdrv_lbl, "SOFT") :
+  _mdm == 1 ? strcpy(#mdrv_lbl, "TUBE") :
+  _mdm == 2 ? strcpy(#mdrv_lbl, "TAPE") :
+  _mdm == 3 ? strcpy(#mdrv_lbl, "FUZZ") :
+              strcpy(#mdrv_lbl, "CLIP");
+  gfx_measurestr(#mdrv_lbl, tw, th);
+  _mpill_x = _drv_cx - tw/2 - 4; _mpill_y = _drv_y + _drv_h + 17;
+  _mpill_w = tw + 8; _mpill_h = th + 3;
+  gfx_set(_mdrv_r * 0.3, _mdrv_g * 0.3, _mdrv_b * 0.3, 0.85);
+  gfx_rect(_mpill_x, _mpill_y, _mpill_w, _mpill_h);
+  gfx_set(_mdrv_r, _mdrv_g, _mdrv_b, 1);
+  gfx_x = _drv_cx - tw/2; gfx_y = _mpill_y + 1; gfx_drawstr(#mdrv_lbl);
+
+  // Pill hover/interact zone (distinct from the fader amount zones above).
+  _mpill_hit = mx >= _mpill_x && mx <= _mpill_x + _mpill_w && my >= _mpill_y && my <= _mpill_y + _mpill_h;
+  _mpill_hit ?
+    swing_tooltip_check(24, "Master DRIVE type — SOFT/TUBE/TAPE/FUZZ/CLIP saturation character. Click to cycle, scroll to change.");
+  // Click cycles forward through the 5 types.
+  _mpill_hit && lmb_down ? (
+    gfx_drv_mode = (_mdm + 1) % 5;
+    mark_dirty();
+  );
+  // Wheel scrolls type (up = next, down = previous).
+  _mpill_hit && frame_wheel != 0 ? (
+    gfx_drv_mode = (_mdm + (frame_wheel > 0 ? 1 : 4)) % 5;
+    mark_dirty();
+  );
+
+  // ── Master VOL jog wheel knob (centered in knob zone) ──
+  _mvol_cx = _drv_zone_w + _knob_zone_w / 2;
+  _mvol_cy = _ctrl_area_y + (_ctrl_area_h / 2)|0;
+
+  // Master vol is now logged as dB (ver 40+). Knob reads -60..+12 dB,
+  // default 0 dB = unity gain. Conversion to linear amplitude happens
+  // in Swing_ReaKit.jsfx @slider where it sets global_vol from master_db.
+  // Tooltip: zone 21 = master VOL knob. Hitbox matches the interact zone.
+  _mvol_dx = mx - _mvol_cx; _mvol_dy = my - _mvol_cy;
+  _mvol_dx*_mvol_dx + _mvol_dy*_mvol_dy <= (_mvol_r+6)*(_mvol_r+6) ?
+    swing_tooltip_check(21, "Master output volume (-48 dB silence to +6 dB). Drag, scroll, or double-click to reset to 0 dB (unity).");
+  jog_knob_draw(_mvol_cx, _mvol_cy, _mvol_r, master_db, -48, 6, km_master_vol[0],
+                0.15, 0.55, 1.0);
+
+  // Interact: drag, scroll, double-click reset to 0 dB (unity)
+  nv = jog_knob_interact(km_master_vol, _mvol_cx, _mvol_cy, _mvol_r + 6, master_db, -48, 6, 0, 0);
+  nv != master_db ? (
+    master_db = nv;
+    slider2 = master_db;
+    slider_automate(slider2);
+    // Recompute global_vol immediately so the next @sample uses the new amp
+    // (don't wait for @slider — it fires on the NEXT block boundary).
+    global_vol = master_db <= -48 ? 0 : exp(master_db * 0.11512925465);
+  );
+
+  // Label: MASTER VOL (bold) — themed TEXT slot (follows the active theme's text
+  // colour); falls back to the cream-panel dark ink when the bridge isn't publishing.
+  gfx_setfont(1, "Arial", 10, 'b');
+  rkth_setcol(2, 0.18, 0.16, 0.14, 1.0);
+  gfx_measurestr("MASTER VOL", tw, th);
+  gfx_x = _mvol_cx - tw / 2; gfx_y = _mvol_cy + _mvol_r + 10; gfx_drawstr("MASTER VOL");
+
+  // Tooltip rendering happens once at end of @gfx via swing_tooltip_draw()
+  // in Swing_ReaKit.jsfx. Hover-site swing_tooltip_check() calls above
+  // have already set the render text + zone-tracking state.
+);

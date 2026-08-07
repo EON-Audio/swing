@@ -1,0 +1,453 @@
+// rk_svf.jsfx-inc — Cytomic/Simper trapezoidal SVF filter library for Swing
+// (c) EON Studios — All Rights Reserved
+//
+// State variable filter per Andy Simper's (Cytomic) "SvfLinearTrapOptimised2"
+// paper: https://cytomic.com/files/dsp/SvfLinearTrapOptimised2.pdf
+// Smoothing scheme and magnitude closed form after ReEQ by Justin Johnson:
+//
+//   Portions derived from ReEQ (https://github.com/Justin-Johnson/ReJJ)
+//   Copyright (c) Justin Johnson — MIT License. Permission is hereby granted,
+//   free of charge, to any person obtaining a copy of this software and
+//   associated documentation files (the "Software"), to deal in the Software
+//   without restriction. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY
+//   OF ANY KIND, EXPRESS OR IMPLIED.
+//
+// Replaces the RBJ biquads (rk_biquad.jsfx-inc) for the per-pad EQ chain.
+// Same bilinear-transform magnitude as the RBJ cookbook at matching knob
+// values (bell is derived from RBJ's own continuous prototype; shelves use
+// the RBJ S→Q relation), but stable under per-sample coefficient glides:
+// every parameter change one-pole-chases its target instead of snapping,
+// which removes zipper noise from knob drags and automation.
+//
+// Smoothing design (deep-research 2026-06-10, _refs/svf_eq_research_2026-06-10.md):
+// glide the parameters (g, k, m0, m1, m2) per sample and recompute a1/a2/a3
+// from the glided g,k each tick (one divide). Interpolating the parameters —
+// rather than the precomputed a-coefficients like ReEQ — stays inside the
+// family Wishnick (DAFx-14) proved BIBO-stable for time-varying g,k.
+// m0/m1/m2 changes matter most: zero-changes are the dominant audible artifact.
+// 2026-06-17: switched from a fixed-duration linear ramp to a one-pole chase.
+// The linear ramp completed in SVF_SMOOTH_MS (30) and then HELD, so at the
+// ~30 fps rate @gfx pushes drag targets the glide finished between frames and
+// the trajectory became frame-rate-quantized linear segments — slope corners
+// that splatter as residual zipper. The one-pole has no corners and never
+// holds, so it blends consecutive frame targets at any GUI refresh rate.
+//
+// Memory layout per stereo filter (caller allocates, like rk_biquad):
+//   current (glided) g,k,m0,m1,m2 · target ×5 · (vestigial ×5, was ramp-start) ·
+//   settled flag · derived a1,a2,a3 · integrator state ic1/ic2 L+R  = 23 slots
+//   (the ×5 start slots are unused since the one-pole switch but kept so the
+//    layout/size and all callers' allocations stay byte-identical.)
+//
+// Usage:
+//   svf_mem = freemem; freemem += SVF_STEREO_SIZE;   // allocate per filter
+//   svf_init(svf_mem);                                // unity, resting
+//   svf_set_bell(svf_mem, freq, gain_db, q);          // retarget (ramps)
+//   svf_snap(svf_mem);                                // jump to target now
+//   // per sample:
+//   svf_tick(svf_mem);                                // advance ramp (once!)
+//   outL = svf_process_L(svf_mem, inL);
+//   outR = svf_process_R(svf_mem, inR);
+//
+// No transcendentals in the per-sample path (tick = 5 lerps + 1 divide;
+// they live in the svf_set_* functions, which run at @init/@block/@gfx rate).
+
+@init
+
+// ─── Memory layout offsets ───────────────────────────────────────────────
+SVF_G    = 0;  // current g = tan(pi*fc/sr) (warped by sqrt(A) for shelves)
+SVF_K    = 1;  // current k = 1/Q (bell: 1/(Q*A))
+SVF_M0   = 2;  // output mix: dry
+SVF_M1   = 3;  // output mix: bandpass (v1)
+SVF_M2   = 4;  // output mix: lowpass (v2)
+SVF_TG   = 5;  // ── target coefficients ──
+SVF_TK   = 6;
+SVF_TM0  = 7;
+SVF_TM1  = 8;
+SVF_TM2  = 9;
+SVF_SG   = 10; // ── 2-pole smoother intermediate stage (svf_ramp_mode=1; ignored by one-pole) ──
+SVF_SK   = 11;
+SVF_SM0  = 12;
+SVF_SM1  = 13;
+SVF_SM2  = 14;
+SVF_T    = 15; // settled flag: 1 = resting on target, 0 = gliding
+SVF_A1   = 16; // derived: 1/(1+g*(g+k))
+SVF_A2   = 17; // derived: g*a1
+SVF_A3   = 18; // derived: g*a2
+SVF_IC1L = 19; // integrator state, left
+SVF_IC2L = 20;
+SVF_IC1R = 21; // integrator state, right
+SVF_IC2R = 22;
+SVF_STEREO_SIZE = 23;
+
+// Coefficient glide: one-pole exponential chase toward the target each
+// sample. SVF_SMOOTH_MS is the time constant (63% in one tau; ~95% in 3).
+// A one-pole has NO corners — unlike a fixed-duration linear ramp it never
+// "completes and holds", so it does not imprint the @gfx frame rate (knob
+// targets arrive ~30 fps) onto the audio as slope-discontinuity zipper.
+// svf_update_srate() must be called again whenever srate changes.
+SVF_SMOOTH_MS = 12;
+function svf_update_srate() (
+  svf_glide_coeff = 1.0 - exp(-1.0 / max(1, SVF_SMOOTH_MS * 0.001 * srate));
+);
+svf_update_srate();
+
+// ─── Coefficient smoothing mode (per-instance) ───────────────────────────
+// Default 0 = the single one-pole exponential chase documented above. Mode 1 =
+// a 2nd-order CRITICALLY-DAMPED smoother (two cascaded one-poles, each at
+// svf_smooth2_c). WHY: a single one-pole's velocity is highest right after every
+// retarget, so re-aiming at a slow FIXED rate (a ~23 Hz cross-track courier)
+// makes those per-update velocity spikes read as a low-rate "wobble". A linear
+// ramp removes the spike but introduces a slope CORNER at every retarget — under
+// fast GUI-drag retargeting those corners splatter as high-freq "bursts"/zipper
+// (the reason we dropped ReEQ's ramp originally). The 2-pole cascade is the way
+// out: its output is continuous in BOTH position AND velocity (C¹) — it leaves
+// each retarget at ZERO velocity (an S-curve), so there is no spike (no wobble)
+// and no corner (no burst). The intermediate stage is kept in the SVF_S* slots.
+// Callers driven at a slow/unknown rate opt into mode 1; GUI-only callers (Swing
+// pads) leave the default and stay byte-identical (mode-0 path is unchanged).
+svf_ramp_mode = 0;
+svf_smooth2_c  = 1;
+// ms = per-pole one-pole time constant; the cascade's effective settle is ~2x.
+function svf_set_smooth2_ms(ms) ( svf_ramp_mode = 1; svf_smooth2_c = 1.0 - exp(-1.0 / max(1, ms * 0.001 * srate)); );
+function svf_set_onepole()      ( svf_ramp_mode = 0; );
+
+// ─── Internal: recompute a1/a2/a3 from current g,k ──────────────────────
+// Denominator 1+g*(g+k) >= 1 for g,k >= 0, so the divide is always safe.
+//
+// ⚠️ a1/a2/a3 must stay MUTUALLY CONSISTENT. They are not three independent
+// numbers — they are (1, g, g^2)/D for one single g. The state matrix with
+// x = 0 is [[2a1-1, -2a2], [2a2, 1-2a3]]; for a consistent triple with
+// g,k >= 0 its eigenvalues are inside the unit circle, but for a MIXED triple
+// (a1 derived from one g, a2/a3 from another) |eig| reaches ~25, which
+// multiplies the integrator state by 25 EVERY SAMPLE — the double-precision
+// ceiling in ~9 ms, from silence, heard as a full-scale distorted blast.
+//
+// EEL2 function locals are static per-function, NOT per-call, so `_g` is shared
+// by every concurrent invocation. svf_calc_a runs on the audio thread (via
+// svf_tick) and can also be reached from @gfx (via svf_snap) — a concurrent
+// call clobbers `_g` between the three stores and builds exactly that mixed
+// triple. See svf_tick's blow-up guard, which detects and repairs the result.
+function svf_calc_a(p) local(_g, _a1, _a2) (
+  _g  = p[SVF_G];
+  _a1 = 1.0 / (1.0 + _g * (_g + p[SVF_K]));
+  _a2 = _g * _a1;
+  // Publish only after all three are derived from the SAME _g, so a reader can
+  // never observe a1 from one generation next to a2/a3 from another.
+  p[SVF_A1] = _a1;
+  p[SVF_A2] = _a2;
+  p[SVF_A3] = _g * _a2;
+);
+
+// Blow-up guard threshold. Musical peaks through these filters stay under ~10
+// even at Q=6 on full-scale input; 1000 is far above anything legitimate and
+// far below the runaway. svf_blowups counts repairs (diagnostic; harmless).
+SVF_STATE_MAX = 1000;
+svf_blowups = 0;
+svf_negclamps = 0;
+
+// ─── Internal: retarget with dedup ───────────────────────────────────────
+// recalc_fx() re-sets every filter of a pad whenever any one knob moves;
+// the unchanged filters must NOT restart their ramps (or rest → ramp churn).
+// SVF_T is now a settled flag (1 = resting on target, 0 = gliding). The
+// one-pole chases from wherever SVF_G/K/M* currently sit, so no ramp-start
+// snapshot is needed — a retarget mid-glide simply re-aims the chase.
+function svf_set_target(p, g, k, m0, m1, m2) (
+  (p[SVF_TG] != g || p[SVF_TK] != k ||
+   p[SVF_TM0] != m0 || p[SVF_TM1] != m1 || p[SVF_TM2] != m2) ? (
+    // SVF_T = 0 is published FIRST, not last. These six stores are not atomic
+    // with respect to the audio thread; if the "start gliding" flag were written
+    // last and that one store were the one lost, the filter would be left marked
+    // SETTLED while holding the NEW targets — and the 5-term dedup above would
+    // then see "no change" on every subsequent call, so it would never glide to
+    // them again. Stuck filter, permanently. Flag-first degrades to at worst one
+    // extra (harmless) glide instead.
+    p[SVF_T]   = 0;   // gliding; the 2-pole intermediate (SVF_S*) carries over
+    p[SVF_TG]  = g;
+    p[SVF_TK]  = k;
+    p[SVF_TM0] = m0;
+    p[SVF_TM1] = m1;
+    p[SVF_TM2] = m2;
+  );
+);
+
+// ─── Jump to target instantly (project load, srate change) ──────────────
+// Without this, filters would glide up from whatever stale/zeroed
+// coefficients were in memory — an audible SVF_SMOOTH_MS-scale stretch of
+// wrong (or silent) EQ on load.
+function svf_snap(p) (
+  p[SVF_G]  = p[SVF_TG];
+  p[SVF_K]  = p[SVF_TK];
+  p[SVF_M0] = p[SVF_TM0];
+  p[SVF_M1] = p[SVF_TM1];
+  p[SVF_M2] = p[SVF_TM2];
+  p[SVF_SG] = p[SVF_TG];  p[SVF_SK] = p[SVF_TK];      // seed 2-pole intermediate = target
+  p[SVF_SM0] = p[SVF_TM0]; p[SVF_SM1] = p[SVF_TM1]; p[SVF_SM2] = p[SVF_TM2];
+  p[SVF_T]  = 1;
+  svf_calc_a(p);
+);
+
+// ─── Init: unity passthrough, resting, cleared state ─────────────────────
+// k rests at Butterworth (1/Q = sqrt(2)), NOT 0. A filter at k=0 is an
+// undamped resonator (infinite Q); its output is silent only because the
+// mix is unity-dry (m1=m2=0). But svf_set_bypass PRESERVES k, so a filter
+// that starts off (HPF/LPF default) keeps k=0 — and the first time it is
+// engaged, svf_tick glides k UP from 0, passing through the near-undamped
+// region while signal flows → self-resonance that blows the level up
+// (audible track overload on the first HPF/LPF move). Resting at sqrt(2)
+// keeps the rest state bit-identical (g=0 ⇒ a1=1/(1+0)=1 regardless of k)
+// but means the first engage glides from a well-damped pole, never through
+// infinite Q.
+function svf_init(p) (
+  memset(p, 0, SVF_STEREO_SIZE);
+  p[SVF_M0] = 1; p[SVF_TM0] = 1; p[SVF_SM0] = 1;
+  p[SVF_K] = 1.41421356237; p[SVF_TK] = 1.41421356237; p[SVF_SK] = 1.41421356237;
+  p[SVF_T] = 1;
+  svf_calc_a(p);
+);
+
+// ─── Flush integrator state only (engine-gap recovery) ──────────────────
+function svf_flush_state(p) (
+  p[SVF_IC1L] = 0; p[SVF_IC2L] = 0;
+  p[SVF_IC1R] = 0; p[SVF_IC2R] = 0;
+);
+
+// ─── Configure: bell / peaking ───────────────────────────────────────────
+// Gain-loaded k = 1/(Q*A) per Simper — derived by matching RBJ's continuous
+// bell prototype, so same freq/gain/Q gives the same curve as bq_set_peaking.
+function svf_set_bell(p, freq, gain_db, Q) local(_A, _g, _k) (
+  _A = pow(10, gain_db * 0.025);                       // 10^(dB/40)
+  _g = tan($pi * min(freq, srate * 0.49) / srate);
+  _k = 1.0 / (max(Q, 0.01) * _A);
+  svf_set_target(p, _g, _k, 1, _k * (_A * _A - 1), 0);
+);
+
+// ─── Configure: low shelf ────────────────────────────────────────────────
+// S = RBJ shelf slope (Swing uses 1.0). Converted to Q via the RBJ
+// cookbook's own relation so curves match bq_set_lowshelf; gain loads the
+// frequency warp (g/sqrt(A)) per Simper, keeping the dB-midpoint corner.
+function svf_set_lowshelf(p, freq, gain_db, S) local(_A, _g, _k) (
+  _A = pow(10, gain_db * 0.025);
+  _k = sqrt((_A + 1.0 / _A) * (1.0 / max(S, 0.1) - 1.0) + 2.0);  // = 1/Q
+  _g = tan($pi * min(freq, srate * 0.49) / srate) / sqrt(_A);
+  svf_set_target(p, _g, _k, 1, _k * (_A - 1), _A * _A - 1);
+);
+
+// ─── Configure: high shelf ───────────────────────────────────────────────
+function svf_set_highshelf(p, freq, gain_db, S) local(_A, _g, _k) (
+  _A = pow(10, gain_db * 0.025);
+  _k = sqrt((_A + 1.0 / _A) * (1.0 / max(S, 0.1) - 1.0) + 2.0);  // = 1/Q
+  _g = tan($pi * min(freq, srate * 0.49) / srate) * sqrt(_A);
+  svf_set_target(p, _g, _k, _A * _A, _k * (1 - _A) * _A, 1 - _A * _A);
+);
+
+// ─── Configure: shelves with DIRECT Q (v48 per-band shelf Q) ─────────────
+// Same Simper shelf as above but k = 1/Q with no S conversion — this is
+// exactly ReEQ's parametrization (_svf_ls / _svf_hs in its
+// svf_filter.jsfx-inc: k = 1/q, g warped by sqrt(A)). Q = 0.7071 is exactly
+// equivalent to the S = 1.0 the fixed-slope setters used (the RBJ relation
+// gives 1/Q = sqrt(2) at S = 1), so defaults are bit-identical; verified
+// against RBJ shelf-with-Q to <1e-9 dB across the knob grid.
+function svf_set_lowshelf_q(p, freq, gain_db, Q) local(_A, _g, _k) (
+  _A = pow(10, gain_db * 0.025);
+  _k = 1.0 / max(Q, 0.01);
+  _g = tan($pi * min(freq, srate * 0.49) / srate) / sqrt(_A);
+  svf_set_target(p, _g, _k, 1, _k * (_A - 1), _A * _A - 1);
+);
+
+function svf_set_highshelf_q(p, freq, gain_db, Q) local(_A, _g, _k) (
+  _A = pow(10, gain_db * 0.025);
+  _k = 1.0 / max(Q, 0.01);
+  _g = tan($pi * min(freq, srate * 0.49) / srate) * sqrt(_A);
+  svf_set_target(p, _g, _k, _A * _A, _k * (1 - _A) * _A, 1 - _A * _A);
+);
+
+// ─── Configure: highpass (2nd order, resonant) ──────────────────────────
+function svf_set_highpass(p, freq, Q) local(_g, _k) (
+  _g = tan($pi * min(freq, srate * 0.49) / srate);
+  _k = 1.0 / max(Q, 0.01);
+  svf_set_target(p, _g, _k, 1, -_k, -1);
+);
+
+// ─── Configure: lowpass (2nd order, resonant) ───────────────────────────
+function svf_set_lowpass(p, freq, Q) local(_g, _k) (
+  _g = tan($pi * min(freq, srate * 0.49) / srate);
+  _k = 1.0 / max(Q, 0.01);
+  svf_set_target(p, _g, _k, 0, 0, 1);
+);
+
+// ─── Configure: unity bypass (ramped) ────────────────────────────────────
+// Keeps g/k where they are (denominator stays valid) and fades the output
+// mix to dry. Used where the old code wrote passthrough biquad coeffs.
+function svf_set_bypass(p) (
+  svf_set_target(p, p[SVF_TG], p[SVF_TK], 1, 0, 0);
+);
+
+// ─── Per-sample: glide the coefficients toward target (call ONCE per filter) ─
+// One-pole exponential chase. Resting cost: one load + compare. Gliding:
+// 5 one-pole steps + the a-coeff divide, no transcendentals (@sample-safe
+// per the ReaKit audit rules — the exp() lives in svf_update_srate).
+// When every parameter has converged to within an inaudible epsilon the
+// filter snaps exactly onto target and marks itself settled (SVF_T = 1) so
+// it stops paying the glide cost and the magnitude/state stay bit-stable.
+function svf_tick(p) local(_c, _t) (
+  // ── Blow-up guard (see svf_calc_a) ────────────────────────────────────
+  // A mixed a1/a2/a3 triple gives the state matrix |eig| up to ~25, so the
+  // integrators run away to the double ceiling in ~9 ms even on silence and
+  // the output becomes a full-scale distorted blast. The trapezoidal SVF is
+  // BIBO-stable for any consistent triple with g,k >= 0, so a state this large
+  // is proof of corruption, never of loud material. Clear the runaway and
+  // re-derive a consistent triple from the live g,k — the filter recovers
+  // silently instead of screaming. Four compares per filter per sample, no
+  // transcendentals (@sample-safe).
+  // ⚠️ Written as !(x <= MAX), NOT (x > MAX). abs(NaN) > 1000 is FALSE in IEEE
+  // 754, so the natural form is NaN-BLIND: a non-finite state would be invisible
+  // to the guard AND permanent (NaN is absorbing through the whole recursion,
+  // and the settle epsilon below is equally NaN-blind so SVF_T never returns to
+  // 1). The negated form is TRUE for NaN, so the repair catches it.
+  (!(abs(p[SVF_IC1L]) <= SVF_STATE_MAX) || !(abs(p[SVF_IC2L]) <= SVF_STATE_MAX) ||
+   !(abs(p[SVF_IC1R]) <= SVF_STATE_MAX) || !(abs(p[SVF_IC2R]) <= SVF_STATE_MAX)) ? (
+    p[SVF_IC1L] = 0; p[SVF_IC2L] = 0; p[SVF_IC1R] = 0; p[SVF_IC2R] = 0;
+    svf_blowups += 1;
+  );
+  p[SVF_T] < 1 ? (
+    svf_ramp_mode ? (
+      // ── 2nd-order critically-damped smoother (two cascaded one-poles) ──
+      // SVF_S* = intermediate (1st pole chases target); SVF_G/K/M* = output
+      // (2nd pole chases intermediate). The output is C¹ — it leaves every
+      // retarget at zero velocity (S-curve), so NO velocity spike (no wobble at
+      // slow retarget) and NO slope corner (no burst at fast GUI-drag retarget).
+      _c = svf_smooth2_c;
+      p[SVF_SG]  += (p[SVF_TG]  - p[SVF_SG])  * _c;
+      p[SVF_SK]  += (p[SVF_TK]  - p[SVF_SK])  * _c;
+      p[SVF_SM0] += (p[SVF_TM0] - p[SVF_SM0]) * _c;
+      p[SVF_SM1] += (p[SVF_TM1] - p[SVF_SM1]) * _c;
+      p[SVF_SM2] += (p[SVF_TM2] - p[SVF_SM2]) * _c;
+      p[SVF_G]  += (p[SVF_SG]  - p[SVF_G])  * _c;
+      p[SVF_K]  += (p[SVF_SK]  - p[SVF_K])  * _c;
+      p[SVF_M0] += (p[SVF_SM0] - p[SVF_M0]) * _c;
+      p[SVF_M1] += (p[SVF_SM1] - p[SVF_M1]) * _c;
+      p[SVF_M2] += (p[SVF_SM2] - p[SVF_M2]) * _c;
+      (abs(p[SVF_TG]  - p[SVF_G])  < 0.000001 &&
+       abs(p[SVF_TK]  - p[SVF_K])  < 0.000001 &&
+       abs(p[SVF_TM0] - p[SVF_M0]) < 0.000001 &&
+       abs(p[SVF_TM1] - p[SVF_M1]) < 0.000001 &&
+       abs(p[SVF_TM2] - p[SVF_M2]) < 0.000001) ? (
+        p[SVF_G]  = p[SVF_TG];  p[SVF_K]  = p[SVF_TK];
+        p[SVF_M0] = p[SVF_TM0]; p[SVF_M1] = p[SVF_TM1]; p[SVF_M2] = p[SVF_TM2];
+        p[SVF_SG] = p[SVF_TG];  p[SVF_SK] = p[SVF_TK];
+        p[SVF_SM0] = p[SVF_TM0]; p[SVF_SM1] = p[SVF_TM1]; p[SVF_SM2] = p[SVF_TM2];
+        p[SVF_T]  = 1;
+      );
+    ) : (
+      _c = svf_glide_coeff;
+      p[SVF_G]  += (p[SVF_TG]  - p[SVF_G])  * _c;
+      p[SVF_K]  += (p[SVF_TK]  - p[SVF_K])  * _c;
+      p[SVF_M0] += (p[SVF_TM0] - p[SVF_M0]) * _c;
+      p[SVF_M1] += (p[SVF_TM1] - p[SVF_M1]) * _c;
+      p[SVF_M2] += (p[SVF_TM2] - p[SVF_M2]) * _c;
+      (abs(p[SVF_TG]  - p[SVF_G])  < 0.000001 &&
+       abs(p[SVF_TK]  - p[SVF_K])  < 0.000001 &&
+       abs(p[SVF_TM0] - p[SVF_M0]) < 0.000001 &&
+       abs(p[SVF_TM1] - p[SVF_M1]) < 0.000001 &&
+       abs(p[SVF_TM2] - p[SVF_M2]) < 0.000001) ? (
+        p[SVF_G]  = p[SVF_TG];  p[SVF_K]  = p[SVF_TK];
+        p[SVF_M0] = p[SVF_TM0]; p[SVF_M1] = p[SVF_TM1]; p[SVF_M2] = p[SVF_TM2];
+        p[SVF_T]  = 1;
+      );
+    );
+  );
+  // ── Re-derive a1/a2/a3 UNCONDITIONALLY, not only while gliding ────────────
+  // This call used to live inside BOTH ramp branches, i.e. inside the
+  // `p[SVF_T] < 1` gate. A SETTLED filter therefore kept whatever was in
+  // A1/A2/A3 forever. That let a corrupt or mixed triple sit DORMANT in a
+  // bypassed filter — invisible, because bypass holds m1 = m2 = 0 so nothing
+  // reaches the output and the state never grows enough to trip the guard above
+  // — and then detonate the instant the filter is engaged and the mix opens.
+  // Recomputing every sample bounds the lifetime of any corrupt triple to ONE
+  // sample, on every filter, settled or not, reachable state or not.
+  // Cost: one divide + three multiplies per filter per sample. No
+  // transcendentals (@sample-safe). When settled, g and k already equal their
+  // targets, so the recomputed values are BIT-IDENTICAL to what the glide path
+  // last wrote — the ReEQ magnitude parity is untouched.
+
+  // ── INVARIANT CLAMP: g >= 0 and k >= 0 ────────────────────────────────────
+  // EVERY setter in this library produces g = tan(pi*f/sr) with 0 < f < sr/2,
+  // hence g >= 0; and k = 1/max(Q,0.01) or sqrt(...), hence k > 0. The glide is
+  // a convex combination of such values, so a negative g or k is NOT a reachable
+  // state — it is proof of corruption. It also happens to be the ONLY way this
+  // filter can go unstable: det = (1+g^2-g*k)/(1+g^2+g*k) leaves the unit circle
+  // exactly when g*k < 0. A live capture caught g = -0.0733 against a target of
+  // +0.00205 (det = 1.038) mid-glide, which is what detonates the filter.
+  // Clamping here cannot change any CORRECT behaviour — correct values are
+  // already non-negative — but it converts the corrupt case from a full-scale
+  // runaway into a momentary, inaudible g = 0 (a pass-through pole). Two max()
+  // per filter per sample, no transcendentals. Counted so it stays visible.
+  (p[SVF_G] < 0 || p[SVF_K] < 0) ? (
+    svf_negclamps += 1;
+    p[SVF_G] < 0 ? ( p[SVF_G] = 0; p[SVF_SG] = max(p[SVF_SG], 0); );
+    p[SVF_K] < 0 ? ( p[SVF_K] = 0; p[SVF_SK] = max(p[SVF_SK], 0); );
+  );
+  svf_calc_a(p);
+);
+
+// ─── Per-sample: process one channel ─────────────────────────────────────
+// Simper's optimised tick: v3 = in - ic2; v1/v2 from the a-coefficients;
+// trapezoidal state update; output = m0*in + m1*v1 + m2*v2.
+function svf_process_L(p, x) local(_v1, _v2, _v3, _ic1, _ic2) (
+  _ic1 = p[SVF_IC1L]; _ic2 = p[SVF_IC2L];
+  _v3 = x - _ic2;
+  _v1 = p[SVF_A1] * _ic1 + p[SVF_A2] * _v3;
+  _v2 = _ic2 + p[SVF_A2] * _ic1 + p[SVF_A3] * _v3;
+  p[SVF_IC1L] = 2 * _v1 - _ic1;
+  p[SVF_IC2L] = 2 * _v2 - _ic2;
+  p[SVF_M0] * x + p[SVF_M1] * _v1 + p[SVF_M2] * _v2;
+);
+
+function svf_process_R(p, x) local(_v1, _v2, _v3, _ic1, _ic2) (
+  _ic1 = p[SVF_IC1R]; _ic2 = p[SVF_IC2R];
+  _v3 = x - _ic2;
+  _v1 = p[SVF_A1] * _ic1 + p[SVF_A2] * _v3;
+  _v2 = _ic2 + p[SVF_A2] * _ic1 + p[SVF_A3] * _v3;
+  p[SVF_IC1R] = 2 * _v1 - _ic1;
+  p[SVF_IC2R] = 2 * _v2 - _ic2;
+  p[SVF_M0] * x + p[SVF_M1] * _v1 + p[SVF_M2] * _v2;
+);
+
+// ─── Magnitude response at freq (GUI curves; @gfx only) ──────────────────
+// Closed-form |H(z)| at z = e^(-j*2*pi*f/sr) from (g, k, m0, m1, m2) —
+// the a-coefficients are not needed. Transcription of ReEQ's svf_mag.
+// Uses the TARGET coefficients so the drawn curve shows where the knobs
+// are, not a mid-ramp snapshot.
+function svf_mag_at(p, freq)
+local(_g, _k, _m0, _m1, _m2, _w, _zr, _zi, _gsq, _gm1, _gk,
+      _z2r, _z2i, _nr, _ni, _dr, _di, _norm, _hr, _hi)
+(
+  _g = p[SVF_TG]; _k = p[SVF_TK];
+  _m0 = p[SVF_TM0]; _m1 = p[SVF_TM1]; _m2 = p[SVF_TM2];
+
+  _w  = -2.0 * $pi * freq / srate;
+  _zr = cos(_w);
+  _zi = sin(_w);
+
+  _gsq = _g * _g;
+  _gm1 = _g * _m1;
+  _gk  = _g * _k;
+
+  // z^2
+  _z2r = _zr * _zr - _zi * _zi;
+  _z2i = 2 * _zr * _zi;
+
+  // N(z) = g^2*m2*(z^2 + 2z + 1) - g*m1*(z^2 - 1)
+  _nr = _gsq * _m2 * (_z2r + 2 * _zr + 1.0) - _gm1 * (_z2r - 1.0);
+  _ni = _gsq * _m2 * (_z2i + 2 * _zi)       - _gm1 * _z2i;
+
+  // D(z) = (g^2 - gk + 1)*z^2 + (2g^2 - 2)*z + (g^2 + gk + 1)
+  _dr = _gsq + _gk + _z2r * (_gsq - _gk + 1.0) + _zr * (2 * _gsq - 2.0) + 1.0;
+  _di = _z2i * (_gsq - _gk + 1.0) + _zi * (2 * _gsq - 2.0);
+
+  // |m0 + N/D|
+  _norm = _dr * _dr + _di * _di;
+  _hr = _m0 + (_nr * _dr + _ni * _di) / _norm;
+  _hi = (_ni * _dr - _nr * _di) / _norm;
+  sqrt(_hr * _hr + _hi * _hi);
+);

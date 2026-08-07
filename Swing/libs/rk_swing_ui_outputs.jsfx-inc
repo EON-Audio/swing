@@ -1,0 +1,124 @@
+// rk_swing_ui_outputs.jsfx-inc — Big View: OUTPUTS (pad → bus routing matrix)
+// Third registry-only view on the Big View framework (VIEW_OUTPUTS). Stage 1:
+// a 16-pad x 16-bus matrix over p_output (one bus per pad). Click a cell to
+// route that pad to that bus. Instance-local — no bridge dependency. Routing
+// only takes audible effect when multi_out is on (shown in the header); the
+// STEREO/MULTI button + its builder still own enabling it / making tracks.
+// Stage 2 (child-track NAME column labels via a gmem name band) is deferred.
+//
+// Opens via Shift+click the STEREO/MULTI button. Covers the pad-grid rect and
+// does its own hit-testing on the restored _ov_* mouse. Uses _og_* scratch so
+// it never touches the modal gate's _ov_* saves.
+
+@init
+
+function swing_ui_outputs_draw()
+local(lx, lw, mx0, mw, hh, ty, rh, cw, i, b, cx, cy, hov, cb, has, nm, cnt, j) (
+  lmb_down = _ov_lmb_down; rmb_down = _ov_rmb_down;
+  LMB = _ov_LMB; RMB = _ov_RMB; frame_wheel = _ov_wheel;
+
+  // ── Backdrop + panel (teal routing identity) ─────────────────────
+  gfx_set(0, 0, 0, 0.45);
+  gfx_rect(0, 28, gfx_w, gfx_h - 28);
+  gfx_set(0.045, 0.065, 0.08, 0.98);
+  gfx_rect(grid_x, grid_y, grid_w, grid_h);
+  gfx_set(0.35, 0.70, 0.80, 0.55);
+  gfx_rect(grid_x, grid_y, grid_w, 1);
+  gfx_rect(grid_x, grid_y + grid_h - 1, grid_w, 1);
+  gfx_rect(grid_x, grid_y, 1, grid_h);
+  gfx_rect(grid_x + grid_w - 1, grid_y, 1, grid_h);
+
+  // ── Title + multi-out status + close X ───────────────────────────
+  gfx_setfont(1, "Arial", 12, 'b');
+  gfx_set(0.55, 0.85, 0.92, 0.95);
+  gfx_x = grid_x + 8; gfx_y = grid_y + 4; gfx_drawstr("OUTPUTS");
+  gfx_setfont(1, "Arial", 9, 'b');
+  multi_out ? gfx_set(0.4, 0.85, 0.5, 0.95) : gfx_set(0.9, 0.6, 0.3, 0.95);
+  gfx_x = grid_x + 82; gfx_y = grid_y + 6;
+  gfx_drawstr(multi_out ? "MULTI-OUT ON" : "MULTI-OUT OFF — routing set but inactive");
+  _og_cxb = grid_x + grid_w - 20; _og_cyb = grid_y + 3;
+  _og_chov = mx >= _og_cxb - 3 && mx <= _og_cxb + 17 && my >= _og_cyb - 2 && my <= _og_cyb + 15;
+  gfx_setfont(1, "Arial", 13, 'b');
+  gfx_set(1, 1, 1, _og_chov ? 0.95 : 0.55);
+  gfx_x = _og_cxb + 3; gfx_y = _og_cyb; gfx_drawstr("X");
+
+  // ── Layout ───────────────────────────────────────────────────────
+  lx = grid_x + 8; lw = 104;
+  mx0 = lx + lw + 4;
+  mw = grid_x + grid_w - 8 - mx0;
+  hh = 20;                                   // column header band
+  ty = grid_y + 28 + hh;
+  rh = (grid_y + grid_h - 10 - ty) / 16;
+  cw = mw / 16;
+
+  // ── Column headers: bus number + pad-count (mixed-lane visibility) ──
+  gfx_setfont(1, "Arial", 8, 'b');
+  b = 0; loop(16,
+    cx = mx0 + b * cw;
+    cnt = 0; j = 0; loop(16, p_output[j] == b ? cnt += 1; j += 1;);
+    gfx_set(cnt > 0 ? 0.6 : 0.3, cnt > 0 ? 0.75 : 0.32, cnt > 0 ? 0.85 : 0.38, 0.95);
+    sprintf(#_og_l, "%d", b + 1);
+    gfx_measurestr(#_og_l, _og_tw, _og_th);
+    gfx_x = cx + (cw - _og_tw) * 0.5; gfx_y = grid_y + 28 + 2; gfx_drawstr(#_og_l);
+    cnt > 0 ? (
+      gfx_set(0.35, 0.60, 0.70, 0.8);
+      sprintf(#_og_l, "%d", cnt);
+      gfx_setfont(1, "Arial", 7, 0);
+      gfx_measurestr(#_og_l, _og_tw, _og_th);
+      gfx_x = cx + (cw - _og_tw) * 0.5; gfx_y = grid_y + 28 + 11; gfx_drawstr(#_og_l);
+      gfx_setfont(1, "Arial", 8, 'b');
+    );
+    b += 1;
+  );
+
+  // ── Pad rows × bus cells ─────────────────────────────────────────
+  i = 0; loop(16,
+    cy = ty + i * rh;
+    has = pad_is_playable(i);
+    cb = i * 3;
+    // row label: color swatch + number + name
+    gfx_set(col_rgba[cb], col_rgba[cb + 1], col_rgba[cb + 2], has ? 1.0 : 0.4);
+    gfx_rect(lx, cy + 2, 12, rh - 4);
+    gfx_setfont(1, "Arial", 8, 'b');
+    gfx_set(0.82, 0.82, 0.88, has ? 0.95 : 0.5);
+    sprintf(#_og_l, "%d", i + 1);
+    gfx_x = lx + 16; gfx_y = cy + (rh - 8) * 0.5; gfx_drawstr(#_og_l);
+    nm = get_cname_slot(i);
+    strlen(nm) == 0 ? nm = get_name_slot(i);
+    strlen(nm) > 0 ? (
+      gfx_setfont(1, "Arial", 8, 0);
+      gfx_measurestr(nm, _og_tw, _og_th);
+      _og_tw <= lw - 32 ? ( gfx_x = lx + 32; gfx_y = cy + (rh - _og_th) * 0.5; gfx_drawstr(nm); );
+    );
+    // cells
+    b = 0; loop(16,
+      cx = mx0 + b * cw;
+      hov = mx >= cx && mx < cx + cw && my >= cy && my < cy + rh;
+      p_output[i] == b ? (
+        gfx_set(col_rgba[cb], col_rgba[cb + 1], col_rgba[cb + 2], has ? 0.95 : 0.5);
+      ) : (
+        gfx_set(0.13, 0.13, 0.16, hov ? 0.95 : 0.6);
+      );
+      gfx_rect(cx + 1, cy + 1, cw - 2, rh - 2);
+      hov && p_output[i] != b ? ( gfx_set(1, 1, 1, 0.18); gfx_rect(cx + 1, cy + 1, cw - 2, rh - 2); );
+      // click → reroute this pad to bus b
+      hov && lmb_down ? (
+        p_output[i] = b;
+        sel_pad = i;
+        mark_dirty_pad(i);
+        col_dirty = 1;   // OUTPUT auto-color mode derives hue from p_output
+      );
+      b += 1;
+    );
+    i += 1;
+  );
+
+  // ── Close: X or click outside ────────────────────────────────────
+  _og_out = mx < grid_x || mx > grid_x + grid_w || my < grid_y || my > grid_y + grid_h;
+  lmb_down && (_og_chov || (_og_out && active_id == -1)) ? (
+    swing_bigview_close();
+    active_id = -1;
+  );
+
+  lmb_down = 0; rmb_down = 0; LMB = 0; RMB = 0; frame_wheel = 0;
+);

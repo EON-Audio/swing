@@ -1,0 +1,172 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// rk_swing_ui_notepick.jsfx-inc — per-pad NOTE picker (3.0 additions item F)
+//
+// "The notemap view but in a mini per-pad POV" (user design v6, 2026-08-05):
+// this file is ONLY an overlay shell — the content is the REAL Big View
+// renderers, swing_mapping_draw_vpiano + swing_mapping_draw_notemap, drawn in
+// a smaller rectangle. Every notemap behavior is inherited, not cloned: cell
+// grid with named notes, pad tiles, drag-any-tile-to-any-cell reassignment,
+// range-coverage tints, covered-cell audition at the clicked pitch, hover
+// readout, and right-click → range editor (the rng overlay outranks this one
+// in the main dispatch chain, so it stacks correctly and returns here).
+//
+// Opens from the LCD NOTE pill (left-click; the pill's wheel ±1 nudge is
+// unchanged). Open window = the KIT framed with one empty row of context
+// below and above (computed at the pill — see rk_swing_lcd); wheel scrolls
+// by octave, FIT refocuses on THIS pad. Closes on the X or click outside.
+//
+// State contract with the mapping lib: _mv_lo/_mv_hi/_mv_cnt are PER-FRAME
+// working values (the big view recomputes them from _mv_nav_* each frame), so
+// setting them here stomps nothing. The note->pad lookups are rebuilt via the
+// shared swing_mapping_build_lookups(). _mv_drag_pad is cleared on close so a
+// mid-drag dismiss can never strand a drag into the big view.
+//
+// pk_ov_pad: -1 = closed, else the pad whose picker is open. Session-volatile,
+// initialised in the main @init next to rng_ov_pad. The modal gate lists it
+// (rk_swing_ui_state pad_input_allowed + the _ov_* stash block), which is why
+// this draw restores the stashed mouse state first — same as the big view.
+// ═══════════════════════════════════════════════════════════════════════════
+
+@init
+// ⚠️ This @init line is LOAD-BEARING: a .jsfx-inc with no @init section
+// registers ZERO functions — the importer then dies with unknown_function
+// (feedback_jsfx_inc_needs_init_section, and exactly what happened on this
+// file's first cut).
+
+function swing_notepick_draw()
+local(px, py, pw, ph, _pk_mdn, _pk_xhov, _pk_cbx, _pk_cby, _pk_gy, _pk_gh,
+      _pk_omin, _pk_omax, _pk_oi)
+(
+  // ── Open framing, claimed from a flag rather than done by the opener ──
+  // Default window = the KIT framed with ONE empty 4-note row below its lowest
+  // note and one above its highest (user 2026-08-06: the empty context rows are
+  // how you know where you are). Base is row-aligned (multiples of 4 = the
+  // notemap's row width); span = tightest zoom on the 24..60 rail that still
+  // shows the top context row. FIT inside the picker stays PER-PAD for chasing
+  // one pad; this open framing is per-KIT.
+  //
+  // ⭐It lives HERE, not at the opener, because there are now TWO openers — the
+  // NOTE pill (rk_swing_lcd) and the capture mailbox (EON_POPUP_REQ kind 13) —
+  // and rk_swing_lcd imports BEFORE this file, so it cannot call a function
+  // defined here (feedback_jsfx_import_order: a def-time forward ref silently
+  // kills the whole importing file). A flag both sides can WRITE keeps one copy
+  // of the logic instead of one per opener. Openers set pk_ov_pad + pk_reframe;
+  // this claims it on the next draw, which is the same frame or the one after.
+  pk_reframe ? (
+    pk_reframe = 0;
+    _pk_omin = 127; _pk_omax = 0; _pk_oi = 0;
+    loop(NUM_PADS,
+      p_note[_pk_oi] < _pk_omin ? _pk_omin = p_note[_pk_oi];
+      p_note[_pk_oi] > _pk_omax ? _pk_omax = p_note[_pk_oi];
+      _pk_oi += 1;
+    );
+    pk_base = max(0, min(108, floor(_pk_omin / 4) * 4 - 4));
+    pk_span = max(24, min(60, ceil((_pk_omax + 4 - pk_base + 1) / 12) * 12));
+  );
+  (pk_ov_pad < 0 || pk_ov_pad >= NUM_PADS) ? ( pk_ov_pad = -1 ) : (
+    // Restore the mouse state the modal gate suppressed this frame.
+    lmb_down = _ov_lmb_down; rmb_down = _ov_rmb_down;
+    LMB = _ov_LMB; RMB = _ov_RMB; frame_wheel = _ov_wheel;
+    _pk_mdn = lmb_down;
+
+    // ── panel + dim backdrop (rng-overlay idiom) ──
+    pw = min(560, gfx_w - 60); ph = min(430, gfx_h - 70);
+    px = ((gfx_w - pw) / 2) | 0; py = (28 + (gfx_h - 28 - ph) / 2) | 0;
+    gfx_set(0, 0, 0, 0.45); gfx_rect(0, 28, gfx_w, gfx_h - 28);
+    gfx_set(0.10, 0.11, 0.14, 1); gfx_rect(px, py, pw, ph);
+    hsl_to_rgb(p_color[pk_ov_pad], 0.70, 0.55);
+    gfx_set(_hsl_r, _hsl_g, _hsl_b, 1);
+    gfx_rect(px, py, pw, ph, 0); gfx_rect(px + 1, py + 1, pw - 2, ph - 2, 0);
+
+    // Zoom state: how many notes the window shows. 0 = first use ⇒ 3 octaves.
+    // Session-volatile and deliberately KEPT across opens (a zoom you chose is
+    // a preference, not per-pad state). 24..60 in octave steps.
+    pk_span <= 0 ? pk_span = 36;
+
+    // ── header: pad id + name + current note · nav buttons · close X ──
+    // Buttons use the big view's exact vocabulary (FIT OCT- OCT+ ZM- ZM+) so
+    // there is nothing new to learn (user 2026-08-05: "add the zoom, fit and
+    // octave controls"). Geometry computed FIRST so the title truncates
+    // against the row instead of running under it.
+    gfx_set(_hsl_r * 0.4, _hsl_g * 0.4, _hsl_b * 0.4, 1); gfx_rect(px, py, pw, 26);
+    _pk_cbx = px + pw - 22; _pk_cby = py + 5;
+    _pk_bx = _pk_cbx - 5 * 33 - 6;   // 5 buttons × (30w + 3gap), gap to the X
+    swing_mapping_btn(_pk_bx,       py + 5, 30, 16, "FIT") ? (
+      // FIT = the BIG VIEW's meaning: position AND zoom so the pad's whole
+      // playable span is in view (the first cut moved the window but never
+      // touched the zoom — same label, different behavior, and a range wider
+      // than the current zoom stayed clipped, which read as "FIT doesn't
+      // fit"). Base = octave floor of the range's low edge (root-only pads:
+      // one octave below the root); span = smallest octave multiple covering
+      // through the range's high edge, clamped to the 24..60 zoom rail.
+      pk_base = max(0, min(108, (floor(max(0, p_note[pk_ov_pad] - p_rng_lo[pk_ov_pad]) / 12)
+                                 - (p_rng_lo[pk_ov_pad] + p_rng_hi[pk_ov_pad] > 0 ? 0 : 1)) * 12));
+      pk_span = max(24, min(60,
+        ceil((min(127, p_note[pk_ov_pad] + p_rng_hi[pk_ov_pad]) - pk_base + 1) / 12) * 12));
+      lmb_down = 0;
+    );
+    swing_mapping_btn(_pk_bx + 33,  py + 5, 30, 16, "OCT-") ? ( pk_base = max(0, pk_base - 12); lmb_down = 0; );
+    swing_mapping_btn(_pk_bx + 66,  py + 5, 30, 16, "OCT+") ? ( pk_base = min(108, pk_base + 12); lmb_down = 0; );
+    swing_mapping_btn(_pk_bx + 99,  py + 5, 30, 16, "ZM-")  ? ( pk_span = min(60, pk_span + 12); lmb_down = 0; );
+    swing_mapping_btn(_pk_bx + 132, py + 5, 30, 16, "ZM+")  ? ( pk_span = max(24, pk_span - 12); lmb_down = 0; );
+    swing_mapping_note_lbl(p_note[pk_ov_pad], #_mv_rl);
+    strcpy(#_mv_rl2, get_cname_slot(pk_ov_pad));
+    strlen(#_mv_rl2) == 0 ? strcpy(#_mv_rl2, get_name_slot(pk_ov_pad));
+    gfx_setfont(1, "Arial", 11, 'b'); gfx_set(1, 1, 1, 0.9);
+    sprintf(#_mv_hovinfo, "PAD %d %s — NOTE  %s · %d", pk_ov_pad + 1, #_mv_rl2, #_mv_rl, p_note[pk_ov_pad]);
+    gfx_measurestr(#_mv_hovinfo, _mv_tw, _mv_th);
+    // Truncate the title against the button row (the pad-name pill's ".."
+    // idiom) — long sample names must never run under the buttons.
+    _mv_tw > _pk_bx - px - 16 ? (
+      while(_mv_tw > _pk_bx - px - 26 && strlen(#_mv_hovinfo) > 1) (
+        str_setlen(#_mv_hovinfo, strlen(#_mv_hovinfo) - 1);
+        gfx_measurestr(#_mv_hovinfo, _mv_tw, _mv_th);
+      );
+      strcat(#_mv_hovinfo, "..");
+    );
+    gfx_x = px + 10; gfx_y = py + 7; gfx_drawstr(#_mv_hovinfo);
+    _pk_xhov = mx >= _pk_cbx && mx <= _pk_cbx + 16 && my >= _pk_cby && my <= _pk_cby + 16;
+    gfx_setfont(1, "Arial", 15, 'b'); gfx_set(1, 1, 1, _pk_xhov ? 1.0 : 0.6);
+    gfx_x = _pk_cbx + 3; gfx_y = _pk_cby - 1; gfx_drawstr("x");
+
+    // ── wheel anywhere over the panel = octave scroll ──
+    (frame_wheel != 0 && mx >= px && mx <= px + pw && my >= py && my <= py + ph) ? (
+      // 108 not 96: 96 made C9..G9 unreachable at tighter zooms (the top
+      // window renders partial past 127, which the _mv_hi clamp handles).
+      pk_base = max(0, min(108, pk_base - sign_of(frame_wheel) * 12));
+      frame_wheel = 0;   // consumed — keep it away from the hosted renderers
+    );
+
+    // ── the REAL renderers, windowed to pk_span notes at pk_base ──
+    _mv_lo = pk_base; _mv_hi = min(127, pk_base + pk_span - 1); _mv_cnt = _mv_hi - _mv_lo + 1;
+    swing_mapping_build_lookups();
+    strcpy(#_mv_hovinfo, "");
+    // swing_mapping_draw_notemap draws its OWN 40px vpiano at its left edge —
+    // do NOT also call swing_mapping_draw_vpiano here (first cut did: two
+    // keyboards side by side, caught by the user's screenshot).
+    _pk_gy = py + 32; _pk_gh = ph - 56;
+    swing_mapping_draw_notemap(px + 8, _pk_gy, pw - 16, _pk_gh);
+
+    // ── footer: the hover readout the renderers populate (pad · range · edit
+    // hint), left-aligned; octave hint right. Empty readout = just the hint.
+    gfx_setfont(1, "Arial", 9, 'b');
+    strlen(#_mv_hovinfo) > 0 ? (
+      gfx_set(0.82, 0.84, 0.90, 0.92);
+      gfx_x = px + 10; gfx_y = py + ph - 17; gfx_drawstr(#_mv_hovinfo);
+    );
+    gfx_setfont(1, "Arial", 9, 0); gfx_set(0.50, 0.52, 0.58, 0.8);
+    gfx_measurestr("wheel scrolls octaves", _mv_tw, _mv_th);
+    gfx_x = px + pw - _mv_tw - 10; gfx_y = py + ph - 17; gfx_drawstr("wheel scrolls octaves");
+
+    // ── close: X, or a click on the backdrop outside the panel (never while
+    // a tile drag is in flight — releasing outside must not eat the drop) ──
+    (_pk_xhov && _pk_mdn) ? ( pk_ov_pad = -1; _mv_drag_pad = -1; );
+    (_pk_mdn && _mv_drag_pad < 0 &&
+      (mx < px || mx > px + pw || my < py || my > py + ph)) ? ( pk_ov_pad = -1; );
+
+    // Re-zero the mouse globals on the way out — the modal contract every
+    // global-restoring overlay follows (swing_mapping_draw does the same):
+    // nothing drawn after this in the frame may see live input (audit R3).
+    lmb_down = 0; rmb_down = 0; LMB = 0; RMB = 0; frame_wheel = 0;
+  );
+);

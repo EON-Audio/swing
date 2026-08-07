@@ -1,0 +1,630 @@
+// rk_swing_block_pitch.jsfx-inc
+// Swing Pitch (Part B) protocol — Repitch / Tuned / Stretch.
+// (c) EON Studios — All Rights Reserved
+//
+// Three pad pitch modes (per-pad):
+//   0 = Repitch  — local SincResampler (today's path), zero latency,
+//                  duration shortens with pitch (Battery default behavior)
+//   1 = Tuned    — Signalsmith BakeEngine pre-render on tune-change, zero
+//                  latency at trigger, duration preserved (the 90% case)
+//   2 = Stretch  — realtime ElastiqueVoice via audio_hook, PDC-declared
+//                  latency, duration preserved, supports live tune modulation
+//
+// All slot constants MIRROR rk_lua_core.lua → core.GMEM SP_PITCH_* block.
+// Single source of truth is rk_lua_core.lua.
+//
+// Per-pad freemem arrays (sp_pitch_mode, sp_pitch_algo) stay in the main
+// Swing_ReaKit.jsfx @init because they need NUM_PADS defined first. (The
+// former sp_pitch_*_shadow arrays are GONE — the v3 stateless protocol has
+// no JSFX-side shadows; the Extension owns the diff/debounce.) Everything else lives here.
+
+@init
+
+// ─── SP_PITCH gmem slot map (MIRROR of rk_lua_core.lua SP_PITCH_* block) ──
+// Single-pad-request channel — slots 1445..1449 in Swing_Media_Transfer.
+// History: original per-pad-per-instance design (1024 slots @ 70 M base)
+// hit the NSEEL named-segment ceiling (32 M hard) and silently dropped
+// writes. Embedding in the META block was blocked (offsets 0..79 fully
+// claimed by @serialize). Settled on 5 free slots and a single pending
+// request at a time. Real per-pad state stays in JSFX freemem
+// (sp_pitch_mode[], sp_pitch_algo[]) — gmem only carries the "bake this
+// pad now" wire.
+SP_PITCH_PROTOCOL_VER       = 1445;   // JSFX writes value on first @block
+SP_PITCH_HEARTBEAT          = 1446;   // Extension writes counter
+SP_PITCH_REQ_PAD            = 1447;   // RESERVED (legacy v2 single-pad-request) — unused in v3
+SP_PITCH_REQ_SHIFT_ST       = 1448;   // RESERVED (legacy v2) — unused in v3
+SP_PITCH_REQ_ALGO           = 1449;   // RESERVED (legacy v2) — unused in v3
+SP_PITCH_MODE_REVERT_PAD    = 2272;   // Extension 0..15 = pad flipped OUT of Tuned (v3:
+                                       // Extension owns this write); bridge re-injects
+                                       // original audio + writes -1 to ack
+SP_PITCH_PDC_BUDGET         = 2273;   // Extension: worst-case Stretch latency
+                                       // samples; JSFX assigns to pdc_delay when
+                                       // changed. 0 = no Stretch pads / Extension dead.
+// ─── Diagnostic counters REMOVED 2026-07-08 ─────────────────────────────
+// SP_PITCH_DIAG_TICK_COUNT lived at 2274 — the SAME cell rk_lua_core/
+// Swing_ReaKit later claimed for GS_KIT_PRESERVE_LIVE ("free gap between
+// 2273 and 2276"). The tick counter incremented every @block, so
+// GS_KIT_PRESERVE_LIVE was PERMANENTLY nonzero on any machine running the
+// pitch tick: every kit load on a deserialized instance silently became a
+// preserve-live reload — state 4 restored the pre-load (project-chunk)
+// params over the freshly imported kit. That is how stale/poisoned pad
+// state (mute=1/out=52, vel_hi=0.25, garbage names) survived every clean
+// kit load (bug B persistence, project_strip_sync_pad0_stomp).
+// All three counters were write-only (no readers anywhere in the tree).
+// ⚠️ 2274/2275 are GS-range cells owned by rk_lua_core's GMEM map — never
+// claim "free gap" cells from this file; check rk_lua_core.lua first.
+
+// Step 3a — per-pad MODE band in the high end of the segment. JSFX writes
+// each pad's current sp_pitch_mode value here whenever it changes; the
+// Extension audio_hook reads in its isPost callback to decide which pads
+// need Stretch-mode processing. 16 contiguous slots, pad N at base + N.
+// See EON Extension src/gmem/swing_pitch_slots.h kStretchPerPadModeBase.
+STRETCH_PER_PAD_MODE_BASE       = 32524288;
+
+// Step 3b — per-pad TRIGGER counter and PITCH_ST bands. JSFX publishes a
+// monotonic counter on each note-on for a Stretch-mode pad, and the
+// pad's current p_tune value, so the Extension audio_hook can voice-
+// trigger élastique with the correct pitch ratio.
+STRETCH_PER_PAD_TRIGGER_BASE    = 32524304;
+STRETCH_PER_PAD_PITCH_ST_BASE   = 32524320;
+// Step 5a: per-pad algo selector. JSFX writes sp_pitch_algo[pad] here
+// on every change; Extension main thread reads, looks up the élastique
+// (mode<<16)|submode quality_param via the runtime-discovered table,
+// and applies it to the voice via swing_stretch_hook_set_pad_quality.
+STRETCH_PER_PAD_ALGO_BASE       = 32524336;
+
+// Phase 1 (Refined Option B): per-pad p_tune MIRROR band. JSFX blast-
+// writes p_tune[i] into mirror[i] from @slider AND @block AND @gfx (with
+// options:gfx_idle in the main JSFX) so the Extension's main-thread
+// TimeSlice can see current tune state regardless of transport / FX-
+// window state. C++ owns the diff/debounce — JSFX-side shadow is NOT
+// used for this wire. This REPLACES the SP_PITCH_REQ_PAD channel as the
+// canonical Tuned-bake trigger, addressing the chronic "kinda works /
+// sometimes doesn't" symptom of the @block-only publish that depended
+// on REAPER's audio engine being live.
+//
+// Mirror block address mirrors C++ src/gmem/swing_pitch_slots.h
+// kStretchPerPadTuneMirrorBase (= kStretchControlBase + 64 = 32524352).
+STRETCH_PER_PAD_TUNE_MIRROR_BASE = 32524352;
+
+// B1 multi-instance: the control band is strided per registry slot. One
+// instance's region = 5 fields × 16 pads = 80 slots (MODE/TRIGGER/PITCH_ST/
+// ALGO/TUNE_MIRROR at +0/+16/+32/+48/+64). This instance writes only its own
+// slot's region at base_field + _reg_my_slot*STRETCH_CONTROL_INSTANCE_STRIDE.
+// 16 instances top out at 32524288 + 15*80 + 64 + 15 = 32525567 — still inside
+// NSEEL block 496 (32524288>>16 == 32525567>>16 == 496), so the single
+// allocation write below covers the whole 16-instance region. Mirrors C++
+// kStretchControlInstanceStride in src/gmem/swing_pitch_slots.h.
+STRETCH_CONTROL_INSTANCE_STRIDE = 80;
+
+// Per-pad SOURCE GENERATION band. NOT part of the Extension's control protocol
+// (the C++ side never reads it) — it's a JSFX→Kit-Bridge wire so the bridge can
+// detect a pad whose audio was swapped (drag-drop/browser/clear) and invalidate
+// the Extension's cached Tuned-bake / Stretch-preload source for it. Placed just
+// ABOVE the 16-instance control region (top = base + 15*80 + 79 = 32525567), in
+// the SAME NSEEL block 496 (32524288>>16 == 32525567>>16 == 32526783>>16), so the
+// existing block-496 allocation covers it. Strided per registry slot exactly like
+// the control bands: gmem[SRCGEN_BASE + slot*STRETCH_CONTROL_INSTANCE_STRIDE + pad].
+STRETCH_PER_PAD_SRCGEN_BASE     = 32525568;
+
+// Step 3b — per-pad audio ring buffer (SPSC). Extension audio_hook writes
+// stereo interleaved samples; JSFX @sample reads them and routes to the
+// pad's output. Layout (per pad, stride 32768 slots = 16382 stereo frames):
+//   ring_base + STRETCH_OFF_WRITE_POS  Extension writes (frame index)
+//   ring_base + STRETCH_OFF_READ_POS   JSFX writes      (frame index)
+//   ring_base + STRETCH_OFF_CAPACITY   constant = STRETCH_PAD_DATA_FRAMES
+//   ring_base + STRETCH_OFF_RESERVED   reserved
+//   ring_base + STRETCH_HEADER_SLOTS+frame*2..+1  L,R interleaved
+STRETCH_AUDIO_BASE              = 16777216;   // B1c: 256 × 65536, block-aligned
+STRETCH_PAD_STRIDE              = 32768;
+STRETCH_INST_AUDIO_STRIDE       = 524288;     // B1c: 16 pads × 32768 = one instance block
+STRETCH_HEADER_SLOTS            = 4;
+STRETCH_PAD_DATA_FRAMES         = 16382;
+STRETCH_OFF_WRITE_POS           = 0;
+STRETCH_OFF_READ_POS            = 1;
+
+SP_PITCH_PROTOCOL_VER_VALUE = 4;      // v4 = B1 per-slot-strided control bands
+SP_PITCH_REQ_PAD_IDLE       = -1;     // sentinel for "no pending request"
+
+// Mode enum
+SP_PITCH_MODE_REPITCH       = 0;
+SP_PITCH_MODE_TUNED         = 1;
+SP_PITCH_MODE_STRETCH       = 2;
+
+// Algo enum (Distinct-4 mapping, 2026-06-03 — Pro has no Monophonic submode
+// at runtime, so Drum uses Soloist and Tonal uses Pro+Preserve-Formants;
+// resolved at runtime in elastique_mode_table.cpp, never hardcoded)
+SP_PITCH_ALGO_DRUM          = 0;      // Elastique Soloist + Monophonic
+SP_PITCH_ALGO_TONAL         = 1;      // Elastique Pro     + Preserve Formants
+SP_PITCH_ALGO_TEXTURE       = 2;      // Elastique Pro     + Normal
+SP_PITCH_ALGO_VOICE         = 3;      // Elastique Soloist + Speech
+
+// ─── Protocol-version handshake (JSFX-owned write) ──────────────────────
+// JSFX writes SP_PITCH_PROTOCOL_VER every tick (idempotent — see
+// swing_block_pitch_tick). The Extension only READS this slot. v3 dropped
+// the first-tick latch because @init named-pool writes can be unreliable.
+
+// ─── Heartbeat / Extension-alive watchdog ────────────────────────────────
+// The Extension writes SP_PITCH_HEARTBEAT every tick. If it hasn't advanced
+// within sp_pitch_ext_grace_blocks audio blocks, we declare the Extension
+// absent and force-fall-back every pad's effective mode to Repitch (0)
+// wherever it's consumed. Keeps Tuned and Stretch modes non-load-bearing.
+sp_pitch_ext_last_hb       = 0;
+sp_pitch_ext_last_seen_blk = 0;
+sp_pitch_ext_alive         = 0;
+sp_pitch_block_counter     = 0;
+sp_pitch_ext_grace_blocks  = 64;       // ~1.4 s @ 48 kHz / 1024-frame blocks
+// Set per block beside sp_pitch_any_stretch: 1 when any pad is in Tuned or
+// Stretch, i.e. when the Extension's absence is actually AUDIBLE. Read by the
+// LCD mode stepper and the warning banner. Declared here so it is defined on
+// the very first @gfx frame, which can run before @block has.
+sp_pitch_any_ext_mode      = 0;
+
+// ─── Step 3b/4: Force NSEEL block allocation for the high-slot bands ─────
+// REAPER's named-gmem manager (NSEEL) lazily allocates 65536-slot blocks
+// only when a slot in the block is WRITTEN. Reads of unallocated blocks
+// return 0 and writes from the Extension's audio_hook silently no-op.
+//
+// B1c re-base: the Stretch audio band now lives at 16_777_216..25_165_823
+// (blocks 256..383, 16 instances × 524288 slots each). The control band
+// stays at 32_524_288 (block 496). Without proactive allocation, the
+// Extension's audio_hook writes to the per-pad ring drop on the floor →
+// JSFX @sample reads silence even with élastique rendering correctly.
+//
+// Fix: write a 0 to one slot per block. Each write forces NSEEL to allocate
+// the block; subsequent reads/writes from either side see live memory.
+//
+// The ring blocks (8 per instance) can't be allocated here because this
+// instance's registry slot isn't claimed until @block — so ring allocation
+// is LAZY: swing_stretch_alloc_ring(_slot) runs in @block once _reg_my_slot
+// settles (latched by sp_ring_alloc_slot). @init only touches the control
+// band block, which is shared and slot-independent.
+sp_ring_alloc_slot = -1;               // latch: which slot's rings are allocated
+gmem[STRETCH_PER_PAD_MODE_BASE] = 0;   // block 496 (control band)
+
+// ─── B1c lazy ring allocation (per registry slot) ───────────────────────
+// Forces NSEEL to allocate this instance's 8 ring blocks at
+// STRETCH_AUDIO_BASE + _slot*STRETCH_INST_AUDIO_STRIDE. Called from @block
+// once _reg_my_slot settles, latched by sp_ring_alloc_slot so it runs once
+// per slot value (re-runs if the instance re-claims a different slot after a
+// collision). Pure zeros — allocation only, no protocol effect.
+function swing_stretch_alloc_ring(_slot)
+local(_ar_base _ar_i)
+(
+  _slot >= 0 ? (
+    _ar_base = STRETCH_AUDIO_BASE + _slot * STRETCH_INST_AUDIO_STRIDE;
+    _ar_i = 0;
+    loop(8,
+      gmem[_ar_base + _ar_i * 65536] = 0;
+      _ar_i += 1;
+    );
+  );
+);
+
+// ─── CMD 65 — single-pad audio swap (Tuned-mode bake injection) ─────────
+// The Lua bridge's poll_pitch_bake_results fires this CMD after writing
+// a freshly baked WAV's audio to gmem (via load_audio_to_pad). Unlike the
+// full kit-import state machine (states 1→2→3→4→0 — triggered by CMD 3 +
+// GS_KIT_LOAD_REQ=2), this just copies ONE pad's audio from gmem into
+// JSFX freemem. No clear_pad, no per-pad meta touch, no kit_busy gate —
+// the pad's mode/algo/tune/gain/etc. all stay exactly as the user has
+// them. Only s_len + the audio buffer change.
+//
+// Wire protocol:
+//   gmem[KIT_GMEM_PARAM1] = pad_idx     (0..15)
+//   gmem[KIT_GMEM_CMD]    = 65
+// JSFX reads PARAM1, computes audio_off by summing prior pads' AUDIOLEN
+// (mirrors the bridge's pack-by-prior-lengths layout in load_audio_to_pad),
+// copies gmem[AUDIO_BASE + audio_off ..] into s_audio_start[pad*SLOT_SIZE],
+// updates s_len, clears CMD.
+//
+// Length safety: AUDIOLEN written by the bridge during the load is taken
+// as truth (matches the actual gmem-written sample count). For Tuned-mode
+// bakes the length equals the source length (Signalsmith preserves
+// duration at rate_ratio=1.0), so audio_off for other pads doesn't shift.
+function swing_pad_audio_swap()
+local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j)
+(
+  _bl_inflight = 1;   // double-dispatch latch (2026-07-27; see rk_swing_browser_load)
+  _sp_pad = gmem[KIT_GMEM_PARAM1] | 0;
+  _sp_pad >= 0 && _sp_pad < NUM_PADS ? (
+    // Length via PARAM3 + payload at AUDIO+0 — the CMD-67 protocol (fix
+    // 2026-07-16). The old scheme read length AND offset from the AUDIOLEN
+    // band, which the browser mirror blast-rewrites every @block with
+    // has-audio FLAGS (1/0 for layered pads) — bridge and JSFX resolved
+    // different offsets and this swap injected staged path strings / zeros
+    // into pad buffers (white-stripe / blank waveforms after kit loads).
+    _sp_len = gmem[KIT_GMEM_NAMELEN] | 0;
+    _sp_len > 0 && _sp_len <= SLOT_SIZE ? (
+      // Arm anti-click crossfade BEFORE killing voices. Mirrors the CMD 63
+      // single-pad-load pattern: if the last block had audible output on
+      // this instance's bus, we want a short ramp from the previous output
+      // tail to silence rather than a hard step. -40 dB threshold matches
+      // CMD 63's heuristic — below that the noise floor masks the cut.
+      !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
+        _xf_pos    = 0;
+        _xf_len    = max(1, (0.010 * srate)|0);  // 10 ms crossfade
+        _xf_active = 1;
+      );
+      // Payload staged at AUDIO+0 (single transient staging, one swap per
+      // bridge tick — same as CMD 67).
+      _sp_dst = s_audio_start + _sp_pad * SLOT_SIZE;
+      _sp_j = 0;
+      loop(_sp_len,
+        _sp_dst[_sp_j] = gmem[KIT_GMEM_AUDIO + _sp_j];
+        _sp_j += 1;
+      );
+      s_len[_sp_pad] = _sp_len;
+      // Post-v201 kits deliver every pad as LAYERED (layer_cnt 1) — playback
+      // reads l_len[0], not s_len. The swap writes the layer-0 region, so
+      // keep l_len[0] in step (bakes are duration-preserving, but don't
+      // assume): stale l_len vs new buffer misreads the tail.
+      p_layer_cnt[_sp_pad] > 0 ? (
+        l_len[_sp_pad * MAX_LAYERS] = min(_sp_len, LAYER_SIZE);
+      );
+      // The arriving buffer is baked at the current tune → the voice residual
+      // (p_tune - sp_baked_tune) returns to 0, so it plays duration-preserved.
+      // Until the next knob move it stays here; a move then shows up instantly
+      // as a varispeed residual (see the Tuned branch in launch_voices_for_pad).
+      // CMD 65 only ever delivers the pad MAIN buffer (= layer 0 region), so it
+      // anchors layer 0; layers 1+ are anchored by CMD 67 (per-layer swap).
+      sp_baked_tune[_sp_pad * MAX_LAYERS + 0] = p_tune[_sp_pad];
+      // Kill active voices reading the buffer we just changed — but ONLY layer-0
+      // voices. CMD 65 overwrites only the layer-0 region (offset 0); voices on
+      // layers 1+ read their own untouched sub-buffers, so killing them here just
+      // chops the pattern needlessly during the per-layer bake catch-up (CMD 67
+      // kills each higher layer's voices when ITS buffer swaps). Non-layered pads
+      // have all voices at v_layer 0, so this still kills them all. The crossfade
+      // armed above masks the cut.
+      _sp_j = 0;
+      loop(MAX_VOICES + 1,
+        (v_slot[_sp_j] == _sp_pad && v_layer[_sp_j] == 0) ? ( v_pos[_sp_j] = -1; v_env[_sp_j] = 0; v_stage[_sp_j] = 0; );
+        _sp_j += 1;
+      );
+    );
+  );
+  gmem[KIT_GMEM_CMD] = 0;   // consume — bridge gates next send on CMD==0
+  _bl_inflight = 0;
+);
+
+// ─── CMD 66 — single-pad audio EXPORT (auto-source for source-less Stretch) ──
+// The REVERSE of swing_pad_audio_swap. The Lua bridge fires this when a live
+// Stretch-mode pad has NO retained source on the bridge side — audio that
+// arrived via @serialize restore (preset/shortcut insert) or an FX duplicate,
+// never a kit-load. Stretch streams realtime from an Extension-side preload of
+// the source WAV; with no source path the StretchPreloadWorker has nothing to
+// load and the pad is silent (Tuned, by contrast, just plays the original
+// buffer — see Swing_Kit_Bridge.lua). We copy this pad's ORIGINAL local buffer
+// (Stretch never overwrites s_audio_start — its output returns via the
+// STRETCH_AUDIO ring) out to the shared AUDIO staging band at offset 0, and
+// report the interleaved length + source SR in the polymorphic header slots
+// KIT_GMEM_NPADS / KIT_GMEM_NAMELEN. These are ROUTED return slots, used
+// deliberately instead of the KIT_GMEM_AUDIOLEN band: that band is blast-
+// written ungated every @block by EVERY instance, so a sibling with audio on
+// the same pad index would clobber the length before the bridge reads it.
+//
+// Tuned is intentionally NOT auto-exported: after a bake its buffer holds the
+// already-pitched audio, so re-publishing that as a "source" would make the
+// Extension bake pitch on top of pitch (double-pitch on the next tune change).
+//
+// Wire protocol:
+//   gmem[KIT_GMEM_PARAM1]        = pad_idx   (0..15)
+//   gmem[GS_PENDING_PITCH_INST]  = slot      (route — only that instance acts)
+//   gmem[KIT_GMEM_CMD]           = 66
+// JSFX returns:
+//   gmem[KIT_GMEM_NPADS]   = interleaved sample count exported (0 = nothing)
+//   gmem[KIT_GMEM_NAMELEN] = source sample rate (s_sr, else project srate)
+//   gmem[KIT_GMEM_AUDIO + 0..len-1] = the pad's stereo-interleaved samples
+// then clears CMD. The bridge reads NPADS/NAMELEN + the band on the next tick
+// (it owns the CMD channel until then), writes a temp WAV, and publishes it.
+// PARAM1 encodes BOTH pad and layer as combined = layer*NUM_PADS + pad:
+//   _ep_pad   = combined % NUM_PADS    (0..15)
+//   _ep_layer = (combined / NUM_PADS)  (0..MAX_LAYERS-1)
+// Layer 0 → combined == pad, so the legacy Stretch auto-export (writes PARAM1
+// = pad) is byte-compatible. Layer 0 exports the pad MAIN buffer (s_len), as
+// before. Layer L>0 exports that layer's sub-buffer (l_len) — but ONLY while
+// the layer is still ORIGINAL (sp_baked_tune anchor == 0). Once a layer has
+// been baked its buffer holds pitched audio, which must NEVER be re-exported as
+// a source (the Extension would bake pitch-on-pitch). The per-layer source
+// auto-capture (Swing_Kit_Bridge poll_layer_export) reads this during the
+// bake-settle window, before any layer bake lands, so it always sees original.
+function swing_pad_audio_export()
+local(_ep_comb _ep_pad _ep_layer _ep_lidx _ep_len _ep_src _ep_sr _ep_j _ep_ok)
+(
+  _bl_inflight = 1;   // double-dispatch latch (2026-07-27; see rk_swing_browser_load)
+  _ep_comb  = gmem[KIT_GMEM_PARAM1] | 0;
+  _ep_pad   = _ep_comb % NUM_PADS;
+  _ep_layer = (_ep_comb / NUM_PADS) | 0;
+  _ep_len = 0;
+  _ep_sr  = srate;
+  _ep_ok  = _ep_pad >= 0 && _ep_pad < NUM_PADS && _ep_layer >= 0 && _ep_layer < MAX_LAYERS;
+  _ep_ok ? (
+    _ep_layer == 0 ? (
+      // Main / layer-0 buffer (Stretch auto-export path — unchanged).
+      _ep_len = s_len[_ep_pad] | 0;
+      _ep_src = s_audio_start + _ep_pad * SLOT_SIZE;
+      s_sr[_ep_pad] > 0 ? _ep_sr = s_sr[_ep_pad];
+      // Promoted-single fallback: the modern load routes (CMD 63 / VER-200/201)
+      // leave p_layer_cnt=1 with the audio in layer 0 and s_len=0, so the
+      // pad-main read above exports nothing — the bridge rejects the empty
+      // capture forever and Stretch/Tuned pads never get an Extension source.
+      // Mirror the P4 no-embed save-side fallback: read the layer-0 buffer
+      // (same base address, length/SR from the layer arrays). Same
+      // already-baked refusal as the L>0 branch so a baked layer-0 buffer is
+      // never published as an original source.
+      _ep_len == 0 && p_layer_cnt[_ep_pad] > 0 ? (
+        _ep_lidx = _ep_pad * MAX_LAYERS;
+        sp_baked_tune[_ep_lidx] == 0 ? (
+          _ep_len = l_len[_ep_lidx] | 0;
+          l_sr[_ep_lidx] > 0 ? _ep_sr = l_sr[_ep_lidx];
+        );
+      );
+      _ep_len > 0 && _ep_len <= SLOT_SIZE ? 0 : ( _ep_len = 0; );
+    ) : (
+      // Layer L>0: capture the ORIGINAL layer buffer for the per-layer Tuned
+      // bake. Refuse if the layer has already been baked (anchor != 0) so we
+      // never publish pitched audio as a source.
+      _ep_lidx = _ep_pad * MAX_LAYERS + _ep_layer;
+      sp_baked_tune[_ep_lidx] == 0 ? (
+        _ep_len = l_len[_ep_lidx] | 0;
+        _ep_src = s_audio_start + _ep_pad * SLOT_SIZE + _ep_layer * LAYER_SIZE;
+        l_sr[_ep_lidx] > 0 ? _ep_sr = l_sr[_ep_lidx];
+        _ep_len > 0 && _ep_len <= LAYER_SIZE ? 0 : ( _ep_len = 0; );
+      );
+    );
+    _ep_len > 0 ? (
+      _ep_j = 0;
+      loop(_ep_len,
+        gmem[KIT_GMEM_AUDIO + _ep_j] = _ep_src[_ep_j];
+        _ep_j += 1;
+      );
+    );
+  );
+  gmem[KIT_GMEM_NPADS]   = _ep_len;
+  gmem[KIT_GMEM_NAMELEN] = _ep_sr;
+  gmem[KIT_GMEM_CMD] = 0;   // consume — bridge gates next send on CMD==0
+  _bl_inflight = 0;
+);
+
+// ─── CMD 67 — single (pad,layer) audio swap (per-layer Tuned bake injection) ──
+// The per-layer sibling of CMD 65 (swing_pad_audio_swap). Velocity-layered pads
+// (Sum / VelSplit / RR) sound layers 1+ as well as layer 0, so each non-empty
+// layer is baked to pitch independently. CMD 65 still delivers layer 0 (the pad
+// main buffer); this delivers layers 1..MAX_LAYERS-1 into their sub-buffers.
+//
+// Wire protocol (the bridge stages the baked layer audio at KIT_GMEM_AUDIO+0 —
+// a single transient staging, one swap per bridge tick — and passes):
+//   gmem[KIT_GMEM_PARAM1]        = pad_idx   (0..15)
+//   gmem[KIT_GMEM_NPADS]         = layer_idx (1..MAX_LAYERS-1)   (slot 2 reused)
+//   gmem[KIT_GMEM_NAMELEN]       = interleaved sample count       (slot 3 reused)
+//   gmem[GS_PENDING_PITCH_INST]  = slot      (route — only that instance acts)
+//   gmem[KIT_GMEM_CMD]           = 67
+// Copies AUDIO+0..len-1 into the layer sub-buffer, sets l_len + the per-layer
+// baked-tune anchor (residual -> 0 for that layer), kills the pad's voices on
+// THIS layer (masked by the same anti-click crossfade as CMD 65), clears CMD.
+function swing_pad_layer_audio_swap()
+local(_lp_pad _lp_layer _lp_len _lp_lidx _lp_dst _lp_j)
+(
+  _bl_inflight = 1;   // double-dispatch latch (2026-07-27; see rk_swing_browser_load)
+  _lp_pad   = gmem[KIT_GMEM_PARAM1] | 0;
+  _lp_layer = gmem[KIT_GMEM_NPADS]  | 0;
+  _lp_len   = gmem[KIT_GMEM_NAMELEN]| 0;
+  (_lp_pad >= 0 && _lp_pad < NUM_PADS &&
+   _lp_layer >= 0 && _lp_layer < MAX_LAYERS &&
+   _lp_len > 0 && _lp_len <= LAYER_SIZE) ? (
+    // Arm anti-click crossfade BEFORE killing voices (mirrors CMD 65/63).
+    !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
+      _xf_pos    = 0;
+      _xf_len    = max(1, (0.010 * srate)|0);  // 10 ms crossfade
+      _xf_active = 1;
+    );
+    _lp_lidx = _lp_pad * MAX_LAYERS + _lp_layer;
+    _lp_dst  = s_audio_start + _lp_pad * SLOT_SIZE + _lp_layer * LAYER_SIZE;
+    _lp_j = 0;
+    loop(_lp_len,
+      _lp_dst[_lp_j] = gmem[KIT_GMEM_AUDIO + _lp_j];
+      _lp_j += 1;
+    );
+    l_len[_lp_lidx]        = _lp_len;
+    sp_baked_tune[_lp_lidx] = p_tune[_lp_pad];
+    // NOTE: do NOT set s_dirty here. Matching CMD 65 (the layer-0/single-layer
+    // swap), a Tuned bake must NOT rebuild the waveform cache — the displayed
+    // waveform stays the pre-bake (original) sample shape (the tune is a knob,
+    // not a re-sample). Forcing a rebuild re-rendered the pad against the baked
+    // buffer and visibly shifted the waveform (cosmetic only; audio was correct).
+    // The cache still rebuilds on a real sample/layer (re)load via s_dirty there.
+    // Kill active voices on this pad+layer — their buffer changed underneath.
+    _lp_j = 0;
+    loop(MAX_VOICES + 1,
+      (v_slot[_lp_j] == _lp_pad && v_layer[_lp_j] == _lp_layer) ? (
+        v_pos[_lp_j] = -1; v_env[_lp_j] = 0; v_stage[_lp_j] = 0;
+      );
+      _lp_j += 1;
+    );
+  );
+  gmem[KIT_GMEM_CMD] = 0;   // consume — bridge gates next send on CMD==0
+  _bl_inflight = 0;
+);
+
+// NOTE: the former standalone `swing_publish_tune_mirror()` (Refined Option
+// B) is gone — its idempotent all-pad blast is now folded into
+// swing_block_pitch_tick() below, alongside the MODE and ALGO bands, so a
+// single publisher declares the full per-pad state in one place.
+
+// ─── Declarative state publisher (stateless "anchor" protocol v3) ─────────
+// Called from @init, @slider, @block, and @gfx (options:gfx_idle), gated to
+// the LOCK-owning instance. This function does NOT diff, queue, or keep any
+// shadow. Every call it idempotently blast-writes the current desired
+// per-pad state (MODE / TUNE / ALGO) for all 16 pads into the named-segment
+// bands, and republishes the protocol version. The Extension's 30 Hz
+// reconcile (SwingPitchHost::reconcile_tuned_pads) owns ALL diff state and
+// decides when to bake. No JSFX shadows, no single-pad request channel, no
+// callback-timing dependence — Tuned is correct on cold start / reopen by
+// construction, because the desired state is always present in gmem for the
+// reconciler to act on whenever it runs.
+//
+// Requires from caller (main jsfx) at @init:
+//   * NUM_PADS       — pad count (16)
+//   * sp_pitch_mode[]/sp_pitch_algo[]/p_tune[] — current per-pad state
+// (No registry-slot dependency — publishes unconditionally; see the blast
+//  block below for why the old _reg_my_slot==0 gate was removed.)
+
+// ─── Registry slot claim (single-pass) ───────────────────────────────────
+// Shared by the main jsfx @init (first claim) and @block (re-claim after a
+// collision vacate). Writes our instance_id + heartbeat in the SAME scan
+// iteration as the slot pick — so a peer instance sees the slot taken on its
+// next gmem read, not after a deferred @block write. Previously @init only
+// set _reg_my_slot and the id/heartbeat were written later in @block — a
+// wide TOCTOU window that let 2+ instances opening together (project-open)
+// claim the SAME slot, sharing one strided band region → the multi-instance
+// Tuned bake thrash (algo/PDC flicker + inst_N source cross-wiring).
+// 2026-06-04.
+//
+// Not truly atomic — JSFX gmem has no CAS, and the two gmem writes below
+// happen in sequence with a peer potentially scanning between them. The
+// existing check below ALSO treats `_id == 0 OR _hb == 0` as free, so a
+// peer reading mid-write could in principle see a half-claimed slot and
+// double-claim. Safe in practice because REAPER serializes FX @init on the
+// project-load thread (and on runtime drag-and-drop, the UI thread) — claims
+// don't actually interleave. The dup-slot reconciler in Swing_ReaKit.jsfx
+// (the loser-vacates-if-other-slot-holds-same-id pass) is belt-and-suspenders
+// for any residual case.
+//
+// Globals (resolved at call time; all assigned before this is ever called):
+//   instance_id, _reg_my_slot, GS_INST_REG_{BASE,STRIDE,MAX,TIMEOUT}.
+function swing_registry_claim()
+local(_si _base _id _hb _now _zj)
+(
+  _reg_my_slot < 0 ? (
+    _now = time_precise();
+    // Pass A — re-adopt our own previous slot. A slot already holding OUR
+    // instance_id with a zero/stale heartbeat is this instance's previous
+    // incarnation (reload/recompile — registry cells persist in gmem).
+    // Re-adopting keeps the slot number stable, so slot-keyed consumers
+    // (strip band, StepSeq pairing, IDENT band readers) see no band change.
+    // A FRESH heartbeat with our id is either a live duplicate or a
+    // <TIMEOUT-old ghost — never adopt those here; the @block reconciler's
+    // heartbeat-advance test tells them apart and cleans up.
+    _si = 0;
+    loop(GS_INST_REG_MAX,
+      _base = GS_INST_REG_BASE + _si * GS_INST_REG_STRIDE;
+      (_reg_my_slot < 0 && gmem[_base] == instance_id &&
+       (gmem[_base + 1] == 0 || (_now - gmem[_base + 1]) > GS_INST_REG_TIMEOUT)) ? (
+        _reg_my_slot = _si;
+      );
+      _si += 1;
+    );
+    // Pass B — first free/stale slot (original behavior).
+    _si = 0;
+    _reg_my_slot < 0 ? loop(GS_INST_REG_MAX,
+      _base = GS_INST_REG_BASE + _si * GS_INST_REG_STRIDE;
+      _id = gmem[_base];
+      _hb = gmem[_base + 1];
+      (_reg_my_slot < 0 &&
+       (_id == 0 || _hb == 0 || (_now - _hb) > GS_INST_REG_TIMEOUT)) ? (
+        _reg_my_slot = _si;
+      );
+      _si += 1;
+    );
+    _reg_my_slot >= 0 ? (
+      _base = GS_INST_REG_BASE + _reg_my_slot * GS_INST_REG_STRIDE;
+      gmem[_base + 0] = instance_id;   // single-pass claim: register on the spot
+      gmem[_base + 1] = _now;
+      // Zero this slot's inbound-command mailboxes (IN direction): a recycled
+      // slot may carry stale commands from a previous session/project — and a
+      // re-adopted own slot may carry commands addressed to the PREVIOUS
+      // incarnation. Neither must ever be adopted by the new owner. Covers
+      // both call sites (@init claim and @block reclaim).
+      _zj = 0;
+      loop(INST_INCMD_STRIDE,
+        gmem[INST_INCMD_BASE + _reg_my_slot * INST_INCMD_STRIDE + _zj] = 0;
+        _zj += 1;
+      );
+    );
+  );
+);
+
+function swing_block_pitch_tick()
+local(_pi _base)
+(
+  // (Tick-counter diagnostic removed 2026-07-08 — its cell 2274 collided
+  // with GS_KIT_PRESERVE_LIVE; see the note at the top of this file.)
+
+  // Protocol version — republished EVERY tick (idempotent), NOT latched at
+  // @init. Named-pool writes from @init can be unreliable (the segment may
+  // not be attached that early in the instance lifecycle); republishing from
+  // every context removes any dependence on an @init write landing. The
+  // Extension gates its reconcile on seeing this value (== v3).
+  atomic_set(gmem[SP_PITCH_PROTOCOL_VER], SP_PITCH_PROTOCOL_VER_VALUE);
+
+  // Heartbeat watchdog — read-only snapshot of the Extension's counter.
+  sp_pitch_block_counter += 1;
+  sp_pitch_cur_hb = atomic_get(gmem[SP_PITCH_HEARTBEAT]);
+  sp_pitch_cur_hb != sp_pitch_ext_last_hb ? (
+    sp_pitch_ext_last_hb       = sp_pitch_cur_hb;
+    sp_pitch_ext_last_seen_blk = sp_pitch_block_counter;
+  );
+  sp_pitch_ext_alive =
+    (sp_pitch_block_counter - sp_pitch_ext_last_seen_blk) < sp_pitch_ext_grace_blocks;
+
+  // B1 multi-instance publish — each instance writes ONLY its own band region,
+  // strided by its registry slot. Because every live instance owns a distinct
+  // 80-slot block there is no cross-instance contention, so the old flicker
+  // (all instances blasting one singleton) is gone BY CONSTRUCTION and the
+  // single-owner election it required is removed. The Extension reconciles all
+  // live slots independently (each baking/rendering its own pads).
+  //   Skip when we have not claimed a slot yet (_reg_my_slot < 0 — a brief
+  // pre-claim / collision-vacate window): a negative base would underflow, and
+  // another instance may legitimately own slot 0, so writing there would
+  // corrupt its band. The slot is claimed at the END of @init (before the seed
+  // publish call) and re-claimed in @block, so the gap is at most ~one tick; the
+  // Extension reconcile holds last state across it (no audible effect).
+  _reg_my_slot >= 0 ? (
+    _base = _reg_my_slot * STRETCH_CONTROL_INSTANCE_STRIDE;
+    _pi = 0;
+    loop(NUM_PADS,
+      // Idempotent declarative blast — every pad, every tick. Each band slot is
+      // a single aligned double (naturally atomic), so atomic_set alone is
+      // sufficient; no shadows, no seqlock. The Extension reconciles: it bakes
+      // any Tuned pad whose published (TUNE, ALGO) differs from what it last
+      // baked for THIS slot, and detects Tuned->non-Tuned via the MODE band.
+      atomic_set(gmem[STRETCH_PER_PAD_MODE_BASE        + _base + _pi], sp_pitch_mode[_pi]);
+      atomic_set(gmem[STRETCH_PER_PAD_TUNE_MIRROR_BASE + _base + _pi], p_tune[_pi]);
+      atomic_set(gmem[STRETCH_PER_PAD_ALGO_BASE        + _base + _pi], sp_pitch_algo[_pi]);
+      atomic_set(gmem[STRETCH_PER_PAD_SRCGEN_BASE      + _base + _pi], sp_src_gen[_pi]);
+      _pi += 1;
+    );
+  );
+
+  // Step 4: PDC target snapshot. The actual pdc_delay assignment lives
+  // in the main JSFX @block — REAPER's audit-jsfx rule requires pdc_*
+  // writes to appear textually inside an @block section, and this
+  // .jsfx-inc file's contents are treated as @init by the validator
+  // even though the function is CALLED from @block. So we just publish
+  // the target into a global here; the caller applies it.
+  //
+  // Logic (B1c multi-instance): SP_PITCH_PDC_BUDGET carries the worst-case
+  // élastique latency VALUE (samples at project SR), identical for every
+  // instance — the Extension writes it whenever ANY live instance uses
+  // Stretch. Each instance gates PDC application on ITS OWN local Stretch
+  // state so a track with no Stretch pads declares 0 latency even when a
+  // sibling instance is stretching. Compute this instance's any-stretch flag
+  // from the local mode array (slot-independent — valid even during the brief
+  // pre-claim window). When the heartbeat watchdog flips ext_alive to 0 we
+  // force the target to 0 so a dead Extension doesn't leave stale latency.
+  _pi = 0; sp_pitch_any_stretch = 0; sp_pitch_any_ext_mode = 0;
+  loop(NUM_PADS,
+    sp_pitch_mode[_pi] == SP_PITCH_MODE_STRETCH ? sp_pitch_any_stretch = 1;
+    // Does ANY pad currently ask for a mode the Extension provides? Tuned and
+    // Stretch both degrade to plain varispeed repitch without it (see
+    // rk_swing_core select-layer), which sounds like a bug rather than a tier.
+    // The UI gates its "engine not installed" notice on this so a user who
+    // never touches those modes is never nagged about something they did not
+    // buy. Free to compute — this loop already runs every block.
+    sp_pitch_mode[_pi] != SP_PITCH_MODE_REPITCH ? sp_pitch_any_ext_mode = 1;
+    _pi += 1;
+  );
+  sp_pitch_pdc_target = (sp_pitch_ext_alive && sp_pitch_any_stretch)
+                        ? atomic_get(gmem[SP_PITCH_PDC_BUDGET])|0
+                        : 0;
+);

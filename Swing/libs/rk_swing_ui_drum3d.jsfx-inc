@@ -1,0 +1,729 @@
+@init
+// ═══════════════════════════════════════════════════════════════════════════
+// rk_swing_ui_drum3d.jsfx-inc — software 3D drum renderer for the SYN panel.
+//
+// One low-poly mesh per synth FAMILY (ps_engine % 10), drawn with gfx_triangle.
+// No image assets: no filename: slots, no img/ folder, nothing for the
+// installer to ship, and the shells take their colour straight from
+// _syn_engine_col so the drum always matches its family pill.
+//
+// Memory is caller-owned, allocated once via:
+//     freemem = swing_drum3d_init(freemem);      // Swing_ReaKit.jsfx @init
+// (an inc CANNOT grab freemem at its own @init: imported @init runs BEFORE the
+// main file's `freemem = 0`, so the allocation would be trampled.)
+//
+// WINDING CONTRACT (get this wrong and everything renders inside-out):
+//   normal = w x u — NOT u x w.
+//   tube(b0,b1) vertical shell, b0 LOWER  => outward
+//   tube(b0,b1) flat annulus,  b0 OUTER   => upward
+//   cap(..,flip=0) => faces up      cap(..,flip=1) => faces down
+//   A negative scale REVERSES winding — call _d3_rev_faces() after mirroring.
+//
+// ⚠️ Every function is defined at @init. EEL2 cannot define functions inside
+// @gfx (silent whole-file compile death) — @gfx only CALLS them.
+// ⚠️ The mesh is rebuilt from swing_drum3d_draw(), i.e. on the @gfx thread.
+// Never rebuild from @slider/@block: @gfx reads these arrays concurrently and
+// would render a half-built mesh. gfx_race_audit.py does NOT catch that
+// direction (it checks gfx-written/audio-read).
+// ═══════════════════════════════════════════════════════════════════════════
+
+DRUM3D_MAXV = 1024;    // worst family (KICK @28 seg) is 394v / 330f
+DRUM3D_MAXF = 768;
+DRUM3D_SEG  = 28;      // radial segments; the SYNTH view draws at ~340px
+DRUM3D_IN   = 0.0909;  // one inch, with a 22" kick = 2.0 units diameter
+
+function swing_drum3d_init(fm)
+global(d3_vx, d3_vy, d3_vz, d3_rx, d3_ry, d3_rz, d3_px, d3_py,
+       d3_fa, d3_fb, d3_fc, d3_fd, d3_fm, d3_fz, d3_fo,
+       d3_mr, d3_mg, d3_mb, d3_nv, d3_nf, d3_fam, DRUM3D_MAXV, DRUM3D_MAXF,
+       d3_morph, d3_oy, d3_ox, d3_drag, d3_lmx, d3_lmy)
+(
+  d3_vx = fm; fm += DRUM3D_MAXV + 4;
+  d3_vy = fm; fm += DRUM3D_MAXV + 4;
+  d3_vz = fm; fm += DRUM3D_MAXV + 4;
+  d3_rx = fm; fm += DRUM3D_MAXV + 4;
+  d3_ry = fm; fm += DRUM3D_MAXV + 4;
+  d3_rz = fm; fm += DRUM3D_MAXV + 4;
+  d3_px = fm; fm += DRUM3D_MAXV + 4;
+  d3_py = fm; fm += DRUM3D_MAXV + 4;
+  d3_fa = fm; fm += DRUM3D_MAXF + 4;
+  d3_fb = fm; fm += DRUM3D_MAXF + 4;
+  d3_fc = fm; fm += DRUM3D_MAXF + 4;
+  d3_fd = fm; fm += DRUM3D_MAXF + 4;
+  d3_fm = fm; fm += DRUM3D_MAXF + 4;
+  d3_fz = fm; fm += DRUM3D_MAXF + 4;
+  d3_fo = fm; fm += DRUM3D_MAXF + 4;
+  d3_mr = fm; fm += 16;
+  d3_mg = fm; fm += 16;
+  d3_mb = fm; fm += 16;
+  d3_nv = 0; d3_nf = 0;
+  d3_fam = -1;          // nothing built yet
+  d3_morph = -1;
+  d3_oy = 0; d3_ox = 0; d3_drag = 0; d3_lmx = 0; d3_lmy = 0;
+  fm;
+);
+
+// Drag-to-orbit. Call BEFORE swing_drum3d_draw with the same rect. Mouse state
+// is PASSED IN (mx, my, held) rather than read from mouse_*: a function with a
+// global() clause cannot reach mouse_cap/mouse_x, and Swing already exposes
+// them as mx / my / LMB at the top of @gfx. Returns 1 while dragging so the
+// caller can suppress its own click handling.
+// State is plain globals, never sliders: a slider write from @gfx would need
+// slider_automate() and would spam undo/automation on every mouse move.
+function swing_drum3d_orbit(x, y, w, h, mxx, myy, held)
+local(inside)
+global(d3_oy, d3_ox, d3_drag, d3_lmx, d3_lmy)
+(
+  inside = mxx >= x && mxx <= x + w && myy >= y && myy <= y + h;
+  held ? (
+    d3_drag ? (
+      d3_oy += (mxx - d3_lmx) * 0.012;
+      d3_ox += (myy - d3_lmy) * 0.012;
+      d3_ox = max(-1.30, min(1.30, d3_ox));
+    ) : ( inside ? d3_drag = 1; );
+  ) : d3_drag = 0;
+  d3_lmx = mxx; d3_lmy = myy;
+  d3_drag;
+);
+
+// Which macro index (if any) drives this family's GEOMETRY, or -1 for none.
+// The caller resolves the value, because _syn_mac_get() lives in
+// rk_swing_ui_overlay_syn, which imports AFTER this file.
+//   HAT macro 4 = OPEN  — the pedal position, so the mesh opens as the sound does.
+//   TOM macro 2 = WHICH — picks hi/mid/low, which are three genuinely different
+//                         drums in the DD-101, so the shell changes size.
+// Deliberately NOT mapped: TUNE (six families have it). Tuning changes head
+// tension, not diameter — a drum that visibly grows as you tune it up would
+// undercut the whole reason these are modelled as real instruments.
+//   CLAP macro 0 = ATTACK — spreads the hands. A metaphor, not physics; see
+//                           _d3_clap.
+function swing_drum3d_morph_macro(fam)
+( fam = fam | 0; fam == 2 ? 0 : fam == 3 ? 4 : fam == 5 ? 2 : -1; );
+
+// Return the view to the family's default angle.
+function swing_drum3d_reset()
+global(d3_oy, d3_ox)
+( d3_oy = 0; d3_ox = 0; );
+
+// ── primitives ────────────────────────────────────────────────────────────
+function _d3_v(x, y, z)
+global(d3_vx, d3_vy, d3_vz, d3_nv, DRUM3D_MAXV)
+(
+  d3_nv < DRUM3D_MAXV ? (
+    d3_vx[d3_nv] = x; d3_vy[d3_nv] = y; d3_vz[d3_nv] = z; d3_nv += 1;
+  );
+  d3_nv - 1;
+);
+
+function _d3_f(a, b, c, d, mat)
+global(d3_fa, d3_fb, d3_fc, d3_fd, d3_fm, d3_nf, DRUM3D_MAXF)
+(
+  d3_nf < DRUM3D_MAXF ? (
+    d3_fa[d3_nf] = a; d3_fb[d3_nf] = b; d3_fc[d3_nf] = c;
+    d3_fd[d3_nf] = d; d3_fm[d3_nf] = mat; d3_nf += 1;
+  );
+);
+
+function _d3_ring(r, y, S, ph)
+local(i, a)
+global(d3_nv)
+(
+  i = 0;
+  while (i < S) (
+    a = i * 2 * $pi / S + ph;
+    _d3_v(cos(a) * r, y, sin(a) * r);
+    i += 1;
+  );
+  d3_nv - S;
+);
+
+function _d3_tube(b0, b1, S, mat)
+local(i, j)
+(
+  i = 0;
+  while (i < S) ( j = (i + 1) % S; _d3_f(b0 + i, b0 + j, b1 + j, b1 + i, mat); i += 1; );
+);
+
+function _d3_cap(base, S, ay, mat, flip)
+local(i, j, c)
+(
+  c = _d3_v(0, ay, 0);
+  i = 0;
+  while (i < S) (
+    j = (i + 1) % S;
+    flip ? _d3_f(c, base + j, base + i, -1, mat)
+         : _d3_f(c, base + i, base + j, -1, mat);
+    i += 1;
+  );
+);
+
+function _d3_box(cx, cy, cz, hx, hy, hz, mat)
+local(i, b)
+global(d3_nv)
+(
+  b = d3_nv;
+  i = 0;
+  while (i < 8) (
+    _d3_v(cx + ((i & 1) ? hx : -hx), cy + ((i & 2) ? hy : -hy),
+          cz + ((i & 4) ? hz : -hz));
+    i += 1;
+  );
+  _d3_f(b+4, b+5, b+7, b+6, mat);  _d3_f(b+1, b+0, b+2, b+3, mat);
+  _d3_f(b+5, b+1, b+3, b+7, mat);  _d3_f(b+0, b+4, b+6, b+2, mat);
+  _d3_f(b+6, b+7, b+3, b+2, mat);  _d3_f(b+0, b+1, b+5, b+4, mat);
+);
+
+function _d3_lug(ang, rad, yy, hw, hh, hd, mat)
+local(sa, ca, i, b, lx, ly, lz)
+global(d3_nv)
+(
+  sa = sin(ang); ca = cos(ang);
+  b = d3_nv;
+  i = 0;
+  while (i < 8) (
+    lx = (i & 1) ? hw : -hw; ly = (i & 2) ? hh : -hh; lz = (i & 4) ? hd : -hd;
+    _d3_v((rad + lz) * ca - lx * sa, yy + ly, (rad + lz) * sa + lx * ca);
+    i += 1;
+  );
+  _d3_f(b+4, b+5, b+7, b+6, mat);  _d3_f(b+1, b+0, b+2, b+3, mat);
+  _d3_f(b+5, b+1, b+3, b+7, mat);  _d3_f(b+0, b+4, b+6, b+2, mat);
+  _d3_f(b+6, b+7, b+3, b+2, mat);  _d3_f(b+0, b+1, b+5, b+4, mat);
+);
+
+// cylinder between two arbitrary points; (u,v,d) frame matches _d3_ring()'s
+// handedness (v = u x d) so _d3_tube() winding still comes out outward
+function _d3_rod(x0, y0, z0, x1, y1, z1, r, S, mat, capends)
+local(dx, dy, dz, dl, ux, uy, uz, vx, vy, vz, ul, i, a, ca_, sa_, b0, b1, c,
+      ns, k, tt)
+global(d3_nv)
+(
+  dx = x1 - x0; dy = y1 - y0; dz = z1 - z0;
+  dl = sqrt(dx*dx + dy*dy + dz*dz); dl < 0.000001 ? dl = 0.000001;
+  dx /= dl; dy /= dl; dz /= dl;
+  abs(dy) < 0.9 ? ( ux = -dz; uy = 0; uz = dx; ) : ( ux = 1; uy = 0; uz = 0; );
+  ul = sqrt(ux*ux + uy*uy + uz*uz); ul < 0.000001 ? ul = 0.000001;
+  ux /= ul; uy /= ul; uz /= ul;
+  vx = uy*dz - uz*dy; vy = uz*dx - ux*dz; vz = ux*dy - uy*dx;
+
+  // Subdivide ALONG the axis. One long band of quads would share a single
+  // centroid depth — the rod's midpoint — so a rod crossing anything (the RIM
+  // stick over the head, a stand behind a cymbal) sorts wholly in front or
+  // wholly behind. Short segments each sort on their own depth instead.
+  ns = min(6, max(1, (dl / 0.45)|0 + 1));
+  b1 = d3_nv;
+  k = 0;
+  while (k <= ns) (
+    tt = k / ns;
+    b0 = b1;
+    b1 = d3_nv;
+    i = 0;
+    while (i < S) (
+      a = i * 2 * $pi / S; ca_ = cos(a); sa_ = sin(a);
+      _d3_v(x0 + (x1 - x0) * tt + (ux*ca_ + vx*sa_) * r,
+            y0 + (y1 - y0) * tt + (uy*ca_ + vy*sa_) * r,
+            z0 + (z1 - z0) * tt + (uz*ca_ + vz*sa_) * r);
+      i += 1;
+    );
+    k > 0 ? _d3_tube(b0, b1, S, mat);
+    k += 1;
+  );
+  b0 = b1 - ns * S;      // first ring, for the start cap
+  capends ? (
+    c = _d3_v(x0, y0, z0);
+    i = 0;
+    while (i < S) ( _d3_f(c, b0 + ((i+1) % S), b0 + i, -1, mat); i += 1; );
+    c = _d3_v(x1, y1, z1);
+    i = 0;
+    while (i < S) ( _d3_f(c, b1 + i, b1 + ((i+1) % S), -1, mat); i += 1; );
+  );
+);
+
+function _d3_cymbal(R, yy, drop, thick, S, mat)
+local(rb, o_t, i_t, o_b, i_b)
+(
+  rb = R * 0.26;
+  o_t = _d3_ring(R,  yy, S, 0);
+  i_t = _d3_ring(rb, yy + drop * 0.62, S, 0);
+  o_b = _d3_ring(R,  yy - thick, S, 0);
+  i_b = _d3_ring(rb, yy + drop * 0.62 - thick, S, 0);
+  _d3_tube(o_t, i_t, S, mat);
+  _d3_tube(i_b, o_b, S, mat);
+  _d3_tube(o_b, o_t, S, mat);
+  _d3_cap(i_t, S, yy + drop, mat, 0);
+  _d3_cap(i_b, S, yy + drop - thick, mat, 1);
+);
+
+// ── transforms over a vertex range (rigid => winding stays valid) ─────────
+function _d3_rotx(i0, ang)
+local(i, c, s, y, z)
+global(d3_vy, d3_vz, d3_nv)
+(
+  c = cos(ang); s = sin(ang);
+  i = i0;
+  while (i < d3_nv) (
+    y = d3_vy[i]; z = d3_vz[i];
+    d3_vy[i] = y * c - z * s; d3_vz[i] = y * s + z * c;
+    i += 1;
+  );
+);
+
+function _d3_rotz(i0, ang)
+local(i, c, s, x, y)
+global(d3_vx, d3_vy, d3_nv)
+(
+  c = cos(ang); s = sin(ang);
+  i = i0;
+  while (i < d3_nv) (
+    x = d3_vx[i]; y = d3_vy[i];
+    d3_vx[i] = x * c - y * s; d3_vy[i] = x * s + y * c;
+    i += 1;
+  );
+);
+
+function _d3_scale(i0, sx, sy, sz)
+local(i)
+global(d3_vx, d3_vy, d3_vz, d3_nv)
+(
+  i = i0;
+  while (i < d3_nv) ( d3_vx[i] *= sx; d3_vy[i] *= sy; d3_vz[i] *= sz; i += 1; );
+);
+
+function _d3_move(i0, dx, dy, dz)
+local(i)
+global(d3_vx, d3_vy, d3_vz, d3_nv)
+(
+  i = i0;
+  while (i < d3_nv) ( d3_vx[i] += dx; d3_vy[i] += dy; d3_vz[i] += dz; i += 1; );
+);
+
+// REQUIRED after a negative scale — mirroring reverses winding
+function _d3_rev_faces(fi0)
+local(i, a, b, c, d)
+global(d3_fa, d3_fb, d3_fc, d3_fd, d3_nf)
+(
+  i = fi0;
+  while (i < d3_nf) (
+    a = d3_fa[i]; b = d3_fb[i]; c = d3_fc[i]; d = d3_fd[i];
+    d < 0 ? ( d3_fa[i] = c; d3_fc[i] = a; )
+          : ( d3_fa[i] = d; d3_fb[i] = c; d3_fc[i] = b; d3_fd[i] = a; );
+    i += 1;
+  );
+);
+
+// shell + 2 heads + 2 hoops + lugs
+function _d3_shell(R, H, S, nlug, smat, hmat, luglen, hoopr, botheadmat)
+local(i, lo, hi, a, b, sgn)
+(
+  lo = _d3_ring(R, -H / 2, S, 0); hi = _d3_ring(R, H / 2, S, 0);
+  _d3_tube(lo, hi, S, smat);
+  _d3_cap(hi, S,  H / 2 + R * 0.07, 1, 0);
+  _d3_cap(lo, S, -H / 2 - R * 0.05, botheadmat, 1);
+  sgn = 1;
+  loop(2,
+    a = _d3_ring(hoopr, sgn * (H / 2) - 0.03, S, 0);
+    b = _d3_ring(hoopr, sgn * (H / 2) + 0.03, S, 0);
+    _d3_tube(a, b, S, hmat);
+    sgn = -1;
+  );
+  i = 0;
+  while (i < nlug) (
+    _d3_lug(i * 2 * $pi / nlug, R + 0.02, 0, R * 0.055, luglen, R * 0.045, 2);
+    i += 1;
+  );
+);
+
+// ── the nine families ─────────────────────────────────────────────────────
+// 22x16, laid FLAT so the front head faces the lens — that head is the only
+// feature that says "kick". No backward tilt (reads as a barrel rolling); the
+// camera is moved instead, via _d3_bias_*.
+function _d3_kick(S)
+local(R, D, i0, sgn, lo, hi, a, b, i, es, tx, ty, tz)
+global(DRUM3D_IN, d3_nv)
+(
+  R = 11 * DRUM3D_IN; D = 16 * DRUM3D_IN;
+  S = max(S, 26);                        // facets show badly on something big
+  i0 = d3_nv;
+  lo = _d3_ring(R, -D / 2, S, 0); hi = _d3_ring(R, D / 2, S, 0);
+  _d3_tube(lo, hi, S, 9);
+  _d3_cap(hi, S,  D / 2 + 0.05, 1, 0);
+  _d3_cap(lo, S, -D / 2 - 0.05, 1, 1);
+  sgn = 1;
+  loop(2,
+    a = _d3_ring(R * 1.09, sgn * (D / 2) - 0.085, S, 0);
+    b = _d3_ring(R * 1.09, sgn * (D / 2) + 0.085, S, 0);
+    _d3_tube(a, b, S, 3);
+    sgn = -1;
+  );
+  es = 1;
+  loop(2,
+    i = 0;
+    while (i < 10) (
+      _d3_lug(i * 2 * $pi / 10, R + 0.015, es * (D / 2 - 0.26),
+              R * 0.05, 0.075, R * 0.04, 2);
+      i += 1;
+    );
+    es = -1;
+  );
+  _d3_rotx(i0, $pi / 2);
+  sgn = 1;
+  loop(2,
+    tx = sgn * (R + 0.20); ty = -R * 0.97; tz = 0.46;
+    _d3_rod(sgn * R * 0.78, -R * 0.30, 0.10, tx, ty, tz, 0.030, 8, 2, 1);
+    _d3_box(tx, ty - 0.02, tz, 0.055, 0.035, 0.055, 3);
+    sgn = -1;
+  );
+);
+
+function _d3_snare(S)
+local(R, H, i)
+global(DRUM3D_IN)
+(
+  R = 7 * DRUM3D_IN; H = 5.5 * DRUM3D_IN;
+  _d3_shell(R, H, S, 10, 9, 2, 0.085, R * 1.05, 10);
+  _d3_lug(0, R + 0.05, 0, 0.05, 0.10, 0.05, 2);          // throw-off
+  i = -4;
+  while (i <= 4) (                                        // snare wires
+    _d3_rod(-R * 0.92, -H / 2 - 0.035, i * R * 0.135,
+             R * 0.92, -H / 2 - 0.035, i * R * 0.135, 0.006, 4, 2, 0);
+    i += 1;
+  );
+);
+
+// `spread` 0..1 comes from the CLAP family's ATTACK macro (index 0). Unlike
+// HAT/OPEN and TOM/WHICH this one is a METAPHOR, not physics: attack widens
+// the multi-impulse burst in time, and the hands widen in space to match.
+// Honest about what it is — but it is the only clap parameter with any
+// visual analogue at all, and it moves in the direction people expect.
+function _d3_clap(S, spread)
+local(i0, fi0, k, z, sgn, off, tilt)
+global(d3_nv, d3_nf)
+(
+  // Minimum separation is 0.105, not 0, so the two hands never interpenetrate
+  // at ATTACK 0. Painter's algorithm has no depth buffer, so overlapping
+  // fingers sort inconsistently and flicker as the view moves.
+  off  = 0.105 + spread * 0.185;
+  tilt = 0.18  + spread * 0.30;
+  sgn = 1;
+  loop(2,
+    i0 = d3_nv; fi0 = d3_nf;
+    _d3_box(0, 0, 0, 0.055, 0.24, 0.19, 9);               // palm
+    k = 0;
+    while (k < 4) (                                        // fingers
+      z = -0.135 + k * 0.09;
+      _d3_rod(0, 0.20, z, 0.02, 0.50 - abs(k - 1.5) * 0.045,
+              z + (k - 1.5) * 0.035, 0.040, 6, 9, 1);
+      k += 1;
+    );
+    _d3_rod(0, -0.06, -0.17, 0.02, 0.16, -0.34, 0.048, 6, 9, 1);   // thumb
+    _d3_rotz(i0, tilt);
+    _d3_move(i0, off, 0, 0);
+    sgn < 0 ? ( _d3_scale(i0, -1, 1, 1); _d3_rev_faces(fi0); );
+    sgn = -1;
+  );
+);
+
+// `open` 0..1 comes from the HAT family's OPEN macro (index 4) — the pedal
+// position, so the mesh opens exactly as the sound does.
+//
+// Both cymbals sit bell-UP. The top used to be inverted (bell down), which
+// looks fine half-open but can never CLOSE: the two bells collide long before
+// the rims meet. Bell-up they are parallel cones, so the top nests onto the
+// bottom at 0.636 — closed on both the bell and the rim at the same time.
+function _d3_hat(S, open)
+local(R, i0, m)
+global(DRUM3D_IN, d3_nv)
+(
+  R = 7 * DRUM3D_IN;
+  m = 0.636 + open * 0.30;
+  _d3_cymbal(R, 0.62, 0.07, 0.016, S, 9);                // bottom, fixed
+  i0 = d3_nv;
+  _d3_cymbal(R, 0.0,  0.07, 0.016, S, 9);                // top, rides the rod
+  _d3_move(i0, 0, m, 0);
+  // Stub rod, no tripod. fit_scale frames the WHOLE mesh, so a full stand
+  // shrinks the cymbals — the one part that has to read — to roughly half.
+  //
+  // The rod is material 11 (accent) rather than chrome, but be aware that
+  // buys almost nothing: at this angle the cymbal bells hide the rod, and
+  // only a sliver shows above the clutch. HAT and RIDE therefore have no real
+  // family-colour cue of their own — their bodies stay pure brass because
+  // accent-in-brass reads as olive. The family pill above the drum carries
+  // the colour instead. If that ever needs fixing, put the accent on the
+  // CLUTCH here (and a wing nut on the ride); those sit on top and do read.
+  _d3_rod(0, 0.42, 0, 0, m + 0.24, 0, 0.020, 8, 11, 1);    // pull rod
+  _d3_rod(0, m + 0.09, 0, 0, m + 0.19, 0, 0.055, 8, 3, 1); // clutch, rides too
+);
+
+function _d3_ride(S)
+local(R, i0)
+global(DRUM3D_IN, d3_nv)
+(
+  R = 10 * DRUM3D_IN;
+  i0 = d3_nv;
+  _d3_cymbal(R, 0.0, 0.09, 0.016, S, 9);
+  _d3_rotx(i0, 0.20);
+  _d3_move(i0, 0, 0.86, 0);
+  _d3_rod(0, 0.60, 0, 0, 0.90, 0, 0.022, 8, 11, 1);   // stub rod, accent
+);
+
+// `which` 0..1 comes from the TOM family's WHICH macro (index 2). The engine
+// quantises it as min((mac*3)|0, 2) -> 0 hi / 1 mid / 2 low, and those are
+// three SEPARATE voicings, not one drum transposed. So the mesh steps in three
+// discrete sizes at exactly the same thresholds rather than blending: the drum
+// you see changes at the moment the drum you hear does.
+function _d3_tom(S, which)
+local(R, H, w)
+global(DRUM3D_IN)
+(
+  w = min((which * 3) | 0, 2);
+  R = (w == 0 ? 5 : w == 1 ? 6 : 7) * DRUM3D_IN;    // 10" / 12" / 14"
+  H = (w == 0 ? 8 : w == 1 ? 9 : 12) * DRUM3D_IN;
+  _d3_shell(R, H, S, w == 2 ? 8 : 6, 9, 2, H * 0.30, R * 1.05, 10);
+);
+
+function _d3_rim(S)
+local(R, H)
+global(DRUM3D_IN)
+(
+  R = 7 * DRUM3D_IN; H = 4 * DRUM3D_IN;
+  _d3_shell(R, H, S, 8, 9, 2, 0.06, R * 1.10, 10);
+  // The stick must clear the domed head along its WHOLE length. The head rises
+  // to H/2 + R*0.07 at the centre, so the old end point (H/2 + 0.05) sank into
+  // it. Both ends now sit well above the dome and the butt overhangs the rim.
+  _d3_rod(-R * 1.65, H / 2 + 0.20, -R * 0.16, R * 0.72, H / 2 + 0.11, R * 0.72,
+          0.030, 8, 7, 1);
+);
+
+function _d3_cowbell(S)
+local(i0, ph, lo, hi, lo2, hi2)
+global(d3_nv)
+(
+  i0 = d3_nv;
+  ph = $pi / 4;                                          // flat faces front
+  lo = _d3_ring(0.46, -0.40, 4, ph);
+  hi = _d3_ring(0.24,  0.40, 4, ph);
+  _d3_tube(lo, hi, 4, 9);
+  _d3_cap(hi, 4, 0.47, 9, 0);
+  // Interior: a second, inset tube wound the other way. Without it the open
+  // mouth is backface-culled and the bell reads as a solid wedge.
+  lo2 = _d3_ring(0.42, -0.38, 4, ph);
+  hi2 = _d3_ring(0.21,  0.36, 4, ph);
+  _d3_tube(hi2, lo2, 4, 3);
+  _d3_scale(i0, 1.0, 1.0, 0.58);
+  _d3_rotx(i0, 0.22);
+  _d3_move(i0, 0, 0.50, 0);
+  _d3_box(0, 0.94, 0.02, 0.10, 0.05, 0.10, 2);           // chrome bracket
+  _d3_rod(0, 0.02, 0, 0, 0.30, 0, 0.045, 8, 3, 1);
+);
+
+function _d3_shaker(S)
+local(i0, R, H, lo, hi, a, b, c, d)
+global(d3_nv)
+(
+  i0 = d3_nv;
+  R = 0.26; H = 0.52;
+  lo = _d3_ring(R, -H, S, 0); hi = _d3_ring(R, H, S, 0);
+  _d3_tube(lo, hi, S, 9);
+  a = _d3_ring(R * 0.72,  H + 0.10, S, 0);
+  _d3_tube(hi, a, S, 9); _d3_cap(a, S,  H + 0.17, 9, 0);
+  b = _d3_ring(R * 0.72, -H - 0.10, S, 0);
+  _d3_tube(b, lo, S, 9); _d3_cap(b, S, -H - 0.17, 9, 1);
+  c = _d3_ring(R * 1.04, -0.225, S, 0); d = _d3_ring(R * 1.04, -0.135, S, 0);
+  _d3_tube(c, d, S, 2);
+  c = _d3_ring(R * 1.04,  0.135, S, 0); d = _d3_ring(R * 1.04,  0.225, S, 0);
+  _d3_tube(c, d, S, 2);
+  _d3_rotz(i0, 0.26);
+);
+
+// ── per-family finish ─────────────────────────────────────────────────────
+// The body's real material, and how far to pull it toward the family accent
+// (which comes from _syn_engine_col, so drum and pill always agree).
+// ⚠️ CYMBALS STAY AT ZERO MIX: saturating brass toward teal or blue kills the
+// metal — it reads as olive or pale beige, not a cymbal. HAT and RIDE carry
+// their family colour on the STAND instead (material 11).
+function _d3_base(fam)
+global(_d3_br, _d3_bg, _d3_bb, _d3_bmix)
+(
+  fam == 0 ? ( _d3_br=0.48; _d3_bg=0.28; _d3_bb=0.18; _d3_bmix=0.80; ) :
+  fam == 1 ? ( _d3_br=0.78; _d3_bg=0.52; _d3_bb=0.20; _d3_bmix=0.75; ) :
+  fam == 2 ? ( _d3_br=0.74; _d3_bg=0.55; _d3_bb=0.42; _d3_bmix=0.45; ) :
+  fam == 3 ? ( _d3_br=0.86; _d3_bg=0.68; _d3_bb=0.32; _d3_bmix=0.00; ) :
+  fam == 4 ? ( _d3_br=0.86; _d3_bg=0.68; _d3_bb=0.32; _d3_bmix=0.00; ) :
+  fam == 5 ? ( _d3_br=0.48; _d3_bg=0.28; _d3_bb=0.18; _d3_bmix=0.80; ) :
+  fam == 6 ? ( _d3_br=0.80; _d3_bg=0.82; _d3_bb=0.86; _d3_bmix=0.75; ) :
+  fam == 7 ? ( _d3_br=0.74; _d3_bg=0.68; _d3_bb=0.48; _d3_bmix=0.55; ) :
+             ( _d3_br=0.66; _d3_bg=0.45; _d3_bb=0.24; _d3_bmix=0.70; );
+);
+
+// Camera offsets per family — a product photographer moves the camera per
+// subject. The kick gets turned toward the lens and shot nearer eye level.
+// KICK only turns PART of the way toward the lens. Swinging it fully face-on
+// lights the head properly but flattens the drum into a pale disc — the shell
+// and hoop stop reading, which is most of what says "bass drum". Keep enough
+// yaw that the shell still wraps away to one side.
+function _d3_bias_y(fam) ( fam == 0 ? -0.06 : 0; );
+function _d3_bias_x(fam) (
+  fam == 0 ? -0.20 : fam == 2 ? -0.14 : fam == 7 ? -0.10 : fam == 8 ? -0.10 : 0;
+);
+
+// The accent is PASSED IN, not fetched. _syn_engine_col() lives in
+// rk_swing_ui_overlay_syn, which imports after this file and also calls
+// swing_drum3d_draw() — reaching for it here would be a circular dependency,
+// and EEL2 resolves function refs at definition time, so it simply fails.
+function _d3_build(fam, ar, ag, ab, morph)
+local(i, x0, x1, y0, y1, z0, z1, S)
+global(d3_nv, d3_nf, d3_vx, d3_vy, d3_vz, d3_mr, d3_mg, d3_mb, d3_fam,
+       d3_morph, DRUM3D_SEG, _d3_br, _d3_bg, _d3_bb, _d3_bmix)
+(
+  d3_nv = 0; d3_nf = 0;
+  S = DRUM3D_SEG;
+
+  d3_mr[1] = 0.94; d3_mg[1] = 0.92; d3_mb[1] = 0.86;   // 1 coated head
+  d3_mr[2] = 0.80; d3_mg[2] = 0.82; d3_mb[2] = 0.86;   // 2 chrome
+  d3_mr[3] = 0.11; d3_mg[3] = 0.11; d3_mb[3] = 0.13;   // 3 black hardware
+  d3_mr[7] = 0.66; d3_mg[7] = 0.45; d3_mb[7] = 0.24;   // 7 light wood
+
+  _d3_base(fam);
+  d3_mr[9] = _d3_br * (1 - _d3_bmix) + ar * _d3_bmix;         // 9 body
+  d3_mg[9] = _d3_bg * (1 - _d3_bmix) + ag * _d3_bmix;
+  d3_mb[9] = _d3_bb * (1 - _d3_bmix) + ab * _d3_bmix;
+  d3_mr[10] = 0.62 + ar * 0.38;                               // 10 reso head
+  d3_mg[10] = 0.62 + ag * 0.38;
+  d3_mb[10] = 0.62 + ab * 0.38;
+  d3_mr[11] = 0.369 + ar * 0.55;                              // 11 accent metal
+  d3_mg[11] = 0.369 + ag * 0.55;
+  d3_mb[11] = 0.369 + ab * 0.55;
+
+  fam == 0 ? _d3_kick(S)      : fam == 1 ? _d3_snare(S) : fam == 2 ? _d3_clap(S, morph) :
+  fam == 3 ? _d3_hat(S, morph): fam == 4 ? _d3_ride(S)  : fam == 5 ? _d3_tom(S, morph) :
+  fam == 6 ? _d3_rim(S)       : fam == 7 ? _d3_cowbell(S) : _d3_shaker(S);
+
+  // centre on the origin so framing is symmetric
+  d3_nv > 0 ? (
+    x0 = x1 = d3_vx[0]; y0 = y1 = d3_vy[0]; z0 = z1 = d3_vz[0];
+    i = 1;
+    while (i < d3_nv) (
+      x0 = min(x0, d3_vx[i]); x1 = max(x1, d3_vx[i]);
+      y0 = min(y0, d3_vy[i]); y1 = max(y1, d3_vy[i]);
+      z0 = min(z0, d3_vz[i]); z1 = max(z1, d3_vz[i]);
+      i += 1;
+    );
+    _d3_move(0, -(x0 + x1) / 2, -(y0 + y1) / 2, -(z0 + z1) / 2);
+  );
+  d3_fam = fam;
+  d3_morph = morph;
+);
+
+// ── draw ──────────────────────────────────────────────────────────────────
+// Renders the family's drum to fit (x,y,w,h). `lit` lights the batter head in
+// EON teal; `dim` fades the whole thing for a disabled pad. (ar,ag,ab) is the
+// family accent — the caller supplies it from _syn_engine_col (see _d3_build).
+// `vel` 0..1 squashes the drum vertically on a strike. Applied at RENDER time,
+// not build time: it costs one multiply in the transform loop already running,
+// and it never invalidates the mesh cache — which matters, because velocity
+// changes on every hit whereas the morph changes only when a knob moves.
+function swing_drum3d_draw(x, y, w, h, fam, lit, dim, ar, ag, ab, morph, vel)
+local(i, j, ry, rx, sa, ca, sb, cb, vx, vy, vz, t, zz, dd, sc,
+      ia, ib, ic, id, ux, uy, uz, wx, wy, wz, nx, ny, nz, nl,
+      dif, front, sh, mm, cnt, key, kz, r_, g_, b_,
+      px0, px1, py0, py1, ox, oy, sq)
+global(d3_nv, d3_nf, d3_vx, d3_vy, d3_vz, d3_rx, d3_ry, d3_rz, d3_px, d3_py,
+       d3_fa, d3_fb, d3_fc, d3_fd, d3_fm, d3_fz, d3_fo,
+       d3_mr, d3_mg, d3_mb, d3_fam, d3_morph, d3_oy, d3_ox)
+(
+  fam = fam | 0;
+  // Rebuild only on a family change, and ONLY here — this runs on the @gfx
+  // thread, which is the same thread that reads the arrays below.
+  // Also rebuild on a meaningful morph move. The epsilon stops a rebuild every
+  // frame on float noise; a rebuild costs about as much as one render, so
+  // dragging the knob stays cheap.
+  (fam != d3_fam || abs(morph - d3_morph) > 0.004) ?
+    _d3_build(fam, ar, ag, ab, morph);
+
+  ry = 0.60 + _d3_bias_y(fam) + d3_oy;
+  rx = 0.58 + _d3_bias_x(fam) + d3_ox;
+  sa = sin(ry); ca = cos(ry); sb = sin(rx); cb = cos(rx);
+
+  // Strike squash, applied in model space BEFORE rotation so the drum
+  // compresses along its own axis rather than toward the screen.
+  sq = 1 - 0.045 * max(0, min(1, vel));
+
+  // pass 1: rotate into view space at unit scale, and measure
+  px0 = 100000; px1 = -100000; py0 = 100000; py1 = -100000;
+  i = 0;
+  while (i < d3_nv) (
+    vx = d3_vx[i]; vy = d3_vy[i] * sq; vz = d3_vz[i];
+    t = vx * ca + vz * sa; zz = vz * ca - vx * sa; vx = t; vz = zz;
+    t = vy * cb - vz * sb; zz = vy * sb + vz * cb; vy = t; vz = zz;
+    d3_rx[i] = vx; d3_ry[i] = vy; d3_rz[i] = vz;
+    dd = 6.0 - vz; dd < 0.05 ? dd = 0.05;
+    d3_px[i] = vx * 3.2 / dd; d3_py[i] = -vy * 3.2 / dd;
+    px0 = min(px0, d3_px[i]); px1 = max(px1, d3_px[i]);
+    py0 = min(py0, d3_py[i]); py1 = max(py1, d3_py[i]);
+    i += 1;
+  );
+  sc = min(w * 0.92 / max(px1 - px0, 0.001), h * 0.92 / max(py1 - py0, 0.001));
+  ox = x + w / 2 - (px0 + px1) / 2 * sc;
+  oy = y + h / 2 - (py0 + py1) / 2 * sc;
+  i = 0;
+  while (i < d3_nv) (
+    d3_px[i] = ox + d3_px[i] * sc; d3_py[i] = oy + d3_py[i] * sc;
+    i += 1;
+  );
+
+  // pass 2: outward normal, backface cull, centroid depth
+  cnt = 0;
+  i = 0;
+  while (i < d3_nf) (
+    ia = d3_fa[i]; ib = d3_fb[i]; ic = d3_fc[i]; id = d3_fd[i];
+    ux = d3_rx[ib] - d3_rx[ia]; uy = d3_ry[ib] - d3_ry[ia];
+    wx = d3_rx[ic] - d3_rx[ia]; wy = d3_ry[ic] - d3_ry[ia];
+    (wx * uy - wy * ux) > 0 ? (       // w x u — see WINDING CONTRACT
+      zz = (d3_rz[ia] + d3_rz[ib] + d3_rz[ic]) / 3;
+      id >= 0 ? zz = (zz * 3 + d3_rz[id]) / 4;
+      d3_fz[i] = zz; d3_fo[cnt] = i; cnt += 1;
+    );
+    i += 1;
+  );
+
+  // painter's algorithm: insertion sort, farthest (smallest z) first
+  i = 1;
+  while (i < cnt) (
+    key = d3_fo[i]; kz = d3_fz[key];
+    j = i - 1;
+    while (j >= 0 && d3_fz[d3_fo[j]] > kz) ( d3_fo[j + 1] = d3_fo[j]; j -= 1; );
+    d3_fo[j + 1] = key;
+    i += 1;
+  );
+
+  i = 0;
+  while (i < cnt) (
+    key = d3_fo[i];
+    ia = d3_fa[key]; ib = d3_fb[key]; ic = d3_fc[key]; id = d3_fd[key];
+    ux = d3_rx[ib] - d3_rx[ia]; uy = d3_ry[ib] - d3_ry[ia]; uz = d3_rz[ib] - d3_rz[ia];
+    wx = d3_rx[ic] - d3_rx[ia]; wy = d3_ry[ic] - d3_ry[ia]; wz = d3_rz[ic] - d3_rz[ia];
+    nx = wy * uz - wz * uy; ny = wz * ux - wx * uz; nz = wx * uy - wy * ux;
+    nl = sqrt(nx*nx + ny*ny + nz*nz); nl < 0.000001 ? nl = 0.000001;
+    nx /= nl; ny /= nl; nz /= nl;
+    // Key carries real +Z: a purely overhead key leaves anything facing the
+    // CAMERA unlit, and the kick's front head renders grey instead of cream.
+    dif = nx * -0.30 + ny * 0.52 + nz * 0.80; dif < 0 ? dif = 0;
+    front = nz; front < 0 ? front = 0;
+    sh = 0.26 + 0.55 * dif + 0.30 * front + 0.22 * front * front * front * front;
+
+    mm = d3_fm[key];
+    r_ = d3_mr[mm] * sh; g_ = d3_mg[mm] * sh; b_ = d3_mb[mm] * sh;
+    // Hit: batter head lights EON teal. REPLACE the colour rather than add —
+    // the head base is near-white, so an additive tint saturates to flat white.
+    (lit && mm == 1) ? (
+      r_ = 0.10 * sh + 0.05; g_ = 0.78 * sh + 0.15; b_ = 0.94 * sh + 0.19;
+    );
+    gfx_set(min(r_, 1) * dim, min(g_, 1) * dim, min(b_, 1) * dim, 1);
+    id >= 0 ?
+      gfx_triangle(d3_px[ia], d3_py[ia], d3_px[ib], d3_py[ib],
+                   d3_px[ic], d3_py[ic], d3_px[id], d3_py[id]) :
+      gfx_triangle(d3_px[ia], d3_py[ia], d3_px[ib], d3_py[ib],
+                   d3_px[ic], d3_py[ic]);
+    i += 1;
+  );
+);
+

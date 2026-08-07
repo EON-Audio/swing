@@ -1,0 +1,3030 @@
+desc:rk_synthdrums — Swing synth-layer engine library (shared, rk_syn_*)
+// ============================================================================
+// rk_synthdrums.jsfx-inc — per-pad drum-synth engines for the Swing SYN slot.
+// Spec: .docs/specs/Spec_Swing_Synth_Layer.md (§2.4 API, §3 engine lineup).
+// Probe-proven foundations (.dev_tests/synthlayer_probe.jsfx, all gates PASS
+// 2026-07-29): LUT sine −130 dB / LUT exp −84 dB / LUT tanh −92 dB nulls vs
+// transcendentals; Simper SVF −160 dB vs DD-101 lineage; Park-Miller ≡ rand()
+// statistically; control-rate-16 swept coefficients −111 dB vs per-sample tan.
+// Ear rulings baked in: CYM = 2-op FM + noise; SNARE pitch curve = original
+// double-exp via LUT-exp; HAT = 2-op PM (over the 6-square stack, 4.6× CPU).
+//
+// LICENSES (ship these notices): engine voicings adapted from Saike DD-101
+// "Dum Drums" (c) 2022 Joep Vanlier, MIT (github.com/JoepVanlier/JSFX,
+// saikedrums v0.18 — ported from upstream, never Tukan's renamed copy).
+// 2-op PM lineage: TiaR / T.Rochebois (BSD, ReaTeam). Quality references:
+// Mutable Plaits drums (c) Emilie Gillet, MIT.
+// One-pole RC block (rk_syn_rc_*): cheap-coefficient form and the set-by-time-
+// constant API follow Tale's rc_filter.jsfx-inc (c) Theo Niessink, WTFPL
+// (github.com/TaleTN/JSFX). NB Tale's LIBRARIES are WTFPL but his PLUG-INS
+// (incl. drum_synth) are LGPL — never port voicings from those.
+//
+// HOUSE RULES (audit-jsfx enforced): no transcendentals in @sample-rate code —
+// all tan()/exp()/pow() happen in rk_syn_*_set/reset (trigger rate) or the
+// @init LUT build. State is FLAT MEMORY (caller-owned freemem blocks), not EEL
+// instances — Swing voices are memory slots.
+//
+// API (spec §2.4):
+//   freemem = rk_syn_init(freemem);                     // @init once: LUTs
+//   rk_syn_reset(engine, st, mac, tune, vel);           // trigger rate
+//   out = rk_syn_tick(st);                              // per sample
+// st  = RK_SYN_STATE_SIZE-cell voice state block (caller zeroes on steal)
+// mac = RK_SYN_MACROS-cell macro block, each 0..1 (engine-interpreted, §3)
+// tune = pad tune in semitones (0 = engine default pitch); vel = 0..1
+// ============================================================================
+
+@init
+
+RK_SYN_VER = 1;
+
+// engine ids (spec §3 rows)
+RK_SYN_KICK  = 0;
+RK_SYN_SNARE = 1;
+RK_SYN_CLAP  = 2;
+RK_SYN_HAT   = 3;
+RK_SYN_CYM   = 4;
+RK_SYN_TOM   = 5;
+
+RK_SYN_MACROS     = 8;
+RK_SYN_STATE_SIZE = 256;  // Spec_Synthdrums_Parity §5.3. Sized ONCE for the
+                          // worst DD-101 family with a NON-OVERLAPPING layout,
+                          // so no family ever needs a second bump and no engine
+                          // has to union regions (union layouts are exactly how
+                          // one-past-end aliasing bugs happen).
+                          // measured: dd_kick 92, dd_snare 171 (63 of them the
+                          // type-0 9-bandpass bank, 46 the freq shifter); his
+                          // hat projects to ~120. Cost = 17*256 = 4352 cells,
+                          // ~34 KB - negligible.
+                          // (legacy engines: CYM fattest at 36, CLAP 35)
+
+// ── DD-101 parity: his global scaling terms (saikedrums.jsfx:663-664) ──────
+rk_dd_sample_ratio = 48000 / srate;
+rk_dd_time_factor  = 2302.58509299 / srate;  // his comment: -ln(0.1)*1000,
+                                             // because he works in ms
+
+// LUT geometry (probe-proven accuracies at these sizes)
+RK_SYN_LUTN   = 4096;     // sine, extended +quarter for cos
+RK_SYN_LUTQ   = 1024;
+RK_SYN_EXPN   = 2048;     // exp over [RK_SYN_EXPMIN, 0]
+RK_SYN_EXPMIN = -8;
+RK_SYN_TANHN  = 1024;     // tanh over [-RK_SYN_TANHR, RK_SYN_TANHR]
+RK_SYN_TANHR  = 8;
+
+// flat-block layouts
+RK_SYN_SVF_CELLS  = 7;    // g k a1 a2 a3 ic1 ic2
+RK_SYN_BELL_CELLS = 8;    // g k a1 a2 a3 m1 ic1 ic2
+RK_SYN_RC_CELLS   = 2;    // a z
+
+// ── one-time LUT construction: freemem = rk_syn_init(freemem) ──────────────
+function rk_syn_init(mem)
+local(i, x)
+global(rk_syn_sinlut, rk_syn_explut, rk_syn_tanhlut,
+       RK_SYN_LUTN, RK_SYN_LUTQ, RK_SYN_EXPN, RK_SYN_EXPMIN,
+       RK_SYN_TANHN, RK_SYN_TANHR)
+(
+  rk_syn_sinlut = mem; mem += RK_SYN_LUTN + RK_SYN_LUTQ + 2;
+  i = 0;
+  loop(RK_SYN_LUTN + RK_SYN_LUTQ + 2,
+    rk_syn_sinlut[i] = sin(2 * $pi * i / RK_SYN_LUTN);
+    i += 1;
+  );
+  rk_syn_explut = mem; mem += RK_SYN_EXPN + 2;
+  i = 0;
+  loop(RK_SYN_EXPN + 2,
+    rk_syn_explut[i] = exp(RK_SYN_EXPMIN + (-RK_SYN_EXPMIN) * i / RK_SYN_EXPN);
+    i += 1;
+  );
+  rk_syn_tanhlut = mem; mem += RK_SYN_TANHN + 2;
+  i = 0;
+  loop(RK_SYN_TANHN + 2,
+    x = (i / RK_SYN_TANHN) * 2 * RK_SYN_TANHR - RK_SYN_TANHR;
+    rk_syn_tanhlut[i] = 2 / (1 + exp(-2 * x)) - 1;
+    i += 1;
+  );
+  mem;
+);
+
+// ── sample-rate-safe primitives (no transcendentals) ───────────────────────
+function rk_syn_lut_sin(ph)
+local(f, fi, i0)
+global(rk_syn_sinlut, RK_SYN_LUTN)
+(
+  f = ph - floor(ph);
+  fi = f * RK_SYN_LUTN;
+  i0 = fi|0;
+  fi -= i0;
+  rk_syn_sinlut[i0] * (1 - fi) + rk_syn_sinlut[i0 + 1] * fi;
+);
+
+function rk_syn_lut_cos(ph)
+local(f, fi, i0)
+global(rk_syn_sinlut, RK_SYN_LUTN, RK_SYN_LUTQ)
+(
+  f = ph - floor(ph);
+  fi = f * RK_SYN_LUTN;
+  i0 = (fi|0) + RK_SYN_LUTQ;
+  fi -= fi|0;
+  rk_syn_sinlut[i0] * (1 - fi) + rk_syn_sinlut[i0 + 1] * fi;
+);
+
+function rk_syn_lut_exp(x)
+local(fi, i0)
+global(rk_syn_explut, RK_SYN_EXPN, RK_SYN_EXPMIN)
+(
+  x <= RK_SYN_EXPMIN ? rk_syn_explut[0] :
+  x >= 0 ? 1 : (
+    fi = (x - RK_SYN_EXPMIN) * (RK_SYN_EXPN / (-RK_SYN_EXPMIN));
+    i0 = fi|0;
+    fi -= i0;
+    rk_syn_explut[i0] * (1 - fi) + rk_syn_explut[i0 + 1] * fi;
+  );
+);
+
+function rk_syn_lut_tanh(x)
+local(fi, i0)
+global(rk_syn_tanhlut, RK_SYN_TANHN, RK_SYN_TANHR)
+(
+  x >  RK_SYN_TANHR ? 1 :
+  x < -RK_SYN_TANHR ? -1 : (
+    fi = (x + RK_SYN_TANHR) * (RK_SYN_TANHN / (2 * RK_SYN_TANHR));
+    i0 = fi|0;
+    fi -= i0;
+    rk_syn_tanhlut[i0] * (1 - fi) + rk_syn_tanhlut[i0 + 1] * fi;
+  );
+);
+
+// Park-Miller PRNG on a caller-owned seed cell (per-voice determinism).
+// sp[0] must be seeded nonzero at reset. Returns uniform (-1, 1).
+function rk_syn_prng(sp)
+global()
+(
+  sp[0] = (sp[0] * 16807) % 2147483647;
+  sp[0] * (2 / 2147483647) - 1;
+);
+
+// ── flat Simper SVF: b[0..6] = g k a1 a2 a3 ic1 ic2 ────────────────────────
+// _set variants use tan(): TRIGGER RATE ONLY (or control-rate ≥16-sample
+// steps with linear g interp — probe-proven transparent at −111 dB).
+function rk_syn_svf_set(b, fc, invq)
+local(g)
+global(srate)
+(
+  fc = min(fc, srate * 0.49);
+  g = tan($pi * fc / srate);
+  b[0] = g;
+  b[1] = invq;
+  b[2] = 1 / (1 + g * (g + invq));
+  b[3] = g * b[2];
+  b[4] = g * b[3];
+  b[5] = b[6] = 0;
+);
+
+// reserved for direct DD-101 normalized-map voicing ports (unused by v1 engines,
+// as is rk_syn_lut_cos — kept for future engines)
+function rk_syn_svf_set_norm(b, freq, res)
+local(f0, g, k)
+global()
+(
+  f0 = exp((1 - freq) * log(20 / 22050));
+  f0 = min(f0, 0.98);   // below 1.0: tan(pi/2) at f0=1 would blow up the coefficients
+  g = tan(0.5 * $pi * f0);
+  k = 2 - 2 * res;
+  b[0] = g;
+  b[1] = k;
+  b[2] = 1 / (1 + g * (g + k));
+  b[3] = g * b[2];
+  b[4] = g * b[3];
+  b[5] = b[6] = 0;
+);
+
+function rk_syn_svf_bp(b, v0)
+local(v1, v2, v3)
+global()
+(
+  v3 = v0 - b[6];
+  v1 = b[2] * b[5] + b[3] * v3;
+  v2 = b[6] + b[3] * b[5] + b[4] * v3;
+  b[5] = 2 * v1 - b[5];
+  b[6] = 2 * v2 - b[6];
+  v1;
+);
+
+function rk_syn_svf_lp(b, v0)
+local(v1, v2, v3)
+global()
+(
+  v3 = v0 - b[6];
+  v1 = b[2] * b[5] + b[3] * v3;
+  v2 = b[6] + b[3] * b[5] + b[4] * v3;
+  b[5] = 2 * v1 - b[5];
+  b[6] = 2 * v2 - b[6];
+  v2;
+);
+
+function rk_syn_svf_hp(b, v0)
+local(v1, v2, v3)
+global()
+(
+  v3 = v0 - b[6];
+  v1 = b[2] * b[5] + b[3] * v3;
+  v2 = b[6] + b[3] * b[5] + b[4] * v3;
+  b[5] = 2 * v1 - b[5];
+  b[6] = 2 * v2 - b[6];
+  v0 - b[1] * v1 - v2;
+);
+
+// ── flat bell: b[0..7] = g k a1 a2 a3 m1 ic1 ic2 ───────────────────────────
+function rk_syn_bell_set(b, fc, q, gain)
+local(a, g, k)
+global(srate)
+(
+  a = pow(10, gain / 40);
+  g = tan($pi * fc / srate);
+  k = 1.0 / (q * a);
+  b[0] = g;
+  b[1] = k;
+  b[2] = 1.0 / (1.0 + g * (g + k));
+  b[3] = g * b[2];
+  b[4] = g * b[3];
+  b[5] = k * (a * a - 1.0);
+  b[6] = b[7] = 0;
+);
+
+function rk_syn_bell(b, v0)
+local(v1, v2, v3)
+global()
+(
+  v3 = v0 - b[7];
+  v1 = b[2] * b[6] + b[3] * v3;
+  v2 = b[7] + b[3] * b[6] + b[4] * v3;
+  b[6] = 2.0 * v1 - b[6];
+  b[7] = 2.0 * v2 - b[7];
+  v0 + b[5] * v1;
+);
+
+// ── flat one-pole RC: b[0..1] = a z ────────────────────────────────────────
+// 1st-order companion to the SVF above. The SVF is 2nd-order and CANNOT make a
+// 6 dB/oct slope, which DD-101-lineage voices lean on (Tale's drum voices run
+// noise through cascaded rc_lp/rc_hp for exactly this).
+// All _set variants are transcendental-FREE (a = 1/(rc*srate+1) is the cheap
+// one-pole approximation, not the exact exp form), so unlike rk_syn_svf_set
+// these are legal at ANY rate — trigger, control, or per-sample.
+function rk_syn_rc_set(b, rc)
+global(srate)
+(
+  b[0] = 1 / (max(rc, 0) * srate + 1);
+);
+
+// by cutoff frequency (rc = 1/(2*pi*fc); $pi folds at compile time)
+function rk_syn_rc_setf(b, fc)
+global(srate)
+(
+  b[0] = 1 / (srate / (2 * $pi * max(fc, 0.0001)) + 1);
+);
+
+// by time constant in seconds (time to reach ~63%) — the knob the transient
+// shaper wants; matches rk_syn_env_k's max() guard idiom.
+function rk_syn_rc_sett(b, sec)
+global(srate)
+(
+  b[0] = 1 / (max(sec, 0.0001) * srate + 1);
+);
+
+function rk_syn_rc_lp(b, v0)
+global()
+(
+  b[1] += b[0] * (v0 - b[1]);
+);
+
+function rk_syn_rc_hp(b, v0)
+global()
+(
+  b[1] += b[0] * (v0 - b[1]);
+  v0 - b[1];
+);
+
+// zero the memory only — leaves the coefficient intact (voice steal / retrigger)
+function rk_syn_rc_reset(b)
+global()
+(
+  b[1] = 0;
+);
+
+// one-multiply envelope coefficient from seconds (trigger rate: uses exp)
+function rk_syn_env_k(sec)
+global(srate)
+(
+  1 - exp(-1 / (max(sec, 0.0001) * srate));
+);
+
+// ============================================================================
+// ENGINE 0 — KICK (spec §3 row 0): sine-drop core (DD-101 t3 lineage, probe
+// K_EXP/K_OSC proven), OT-style TONE harmonics macro (808↔909), click bell
+// (DD-101 3413 Hz), noise layer, LUT-tanh drive.
+// macros: 0 TUNE  1 DROP  2 DECAY  3 PUNCH  4 CLICK  5 DRIVE  6 TONE  7 NOISE
+// velocity-designated macro: DROP (harder hit -> deeper drop)
+// state: 2 ph, 3 pitch env, 4 amp, 5 punch, 6 click env, 7-13 noise BP svf,
+//        14-21 click bell, 22-31 trigger-rate constants
+// ============================================================================
+function rk_syn_kick_reset(st, mac, tune, vel)
+local(f_end, ratio, dec_s)
+global(srate)
+(
+  f_end = 35 * pow(2, (mac[0] - 0.5) * 1.5 + tune / 12);       // ~25..90 Hz
+  ratio = 1 + (1 + 8 * mac[1]) * (0.5 + 0.5 * vel);            // drop depth, vel-modded
+  st[22] = f_end * ratio / srate;                              // f_start cycles/sample
+  st[23] = -log(ratio);                                        // L: freq = f_start*exp(L*(1-e))
+  st[24] = rk_syn_env_k(0.012 + 0.05 * mac[2]);                // pitch env decay
+  dec_s = 0.12 + 1.5 * mac[2];
+  st[25] = rk_syn_env_k(dec_s);                                // amp decay
+  st[26] = rk_syn_env_k(0.02);                                 // punch transient decay
+  st[27] = rk_syn_env_k(0.003);                                // click noise burst decay
+  st[28] = mac[6];                                             // TONE harmonics mix
+  st[29] = 1 + 7 * mac[5];                                     // drive gain
+  st[30] = 0.6 * mac[7];                                       // noise layer gain
+  st[31] = 1.2 * mac[4];                                       // click noise gain
+  st[2] = 0;                                                   // phase
+  st[3] = 1;                                                   // pitch env
+  st[4] = 1;                                                   // amp env
+  st[5] = 0.4 + 1.2 * mac[3];                                  // punch env start
+  st[6] = 1;                                                   // click env
+  rk_syn_svf_set(st + 7, 300 + 500 * mac[6], 0.8);             // noise BP
+  rk_syn_bell_set(st + 14, 3413.3, 0.5, 2 + 7 * mac[4]);       // DD-101 click bell
+  st[1] <= 0 ? st[1] = 77777;                                  // seed if unseeded
+);
+
+function rk_syn_kick_tick(st)
+local(e, inc, body, shaped, nz, out)
+global()
+(
+  e = st[3];
+  st[3] -= st[24] * st[3];
+  inc = st[22] * rk_syn_lut_exp(st[23] * (1 - e));
+  st[2] += inc;
+  body = rk_syn_lut_sin(st[2]);
+
+  st[4] -= st[25] * st[4];
+  st[5] -= st[26] * st[5];
+  st[6] -= st[27] * st[6];
+
+  shaped = rk_syn_lut_tanh(body * (1 + 4 * st[28])) * 0.85;    // OT harmonics
+  body += st[28] * (shaped - body);
+  body = rk_syn_bell(st + 14, body);                           // click boost
+
+  nz = rk_syn_prng(st + 1);
+  out = body * (st[4] + 0.8 * st[5])
+      + rk_syn_svf_bp(st + 7, nz) * st[30] * st[4]
+      + nz * st[31] * st[6];
+  rk_syn_lut_tanh(out * st[29]) * (1 / (0.4 + 0.6 * st[29]));
+);
+
+// ============================================================================
+// ENGINE 1 — SNARE (spec §3 row 1): 2 shell modes (phase-acc + LUT sine,
+// swept by the RULED original double-exp curve via LUT-exp) + BP noise with
+// independent wire decay + snap transient. 909 topology.
+// macros: 0 TUNE  1 TONE(shell/noise)  2 SNAP  3 DECAY  4 WIRES  5 PITCH-DROP
+//         6 DRIVE  7 COLOR(noise BP)
+// velocity-designated macro: noise level (harder hit -> more crack)
+// state: 2 ph1, 3 ph2, 4 pitch env, 5 amp, 6 wire env, 7 snap env,
+//        8-14 noise BP svf, 15-25 constants
+// ============================================================================
+function rk_syn_snare_reset(st, mac, tune, vel)
+local(f0)
+global(srate)
+(
+  f0 = 165 * pow(2, (mac[0] - 0.5) * 1.2 + tune / 12);         // shell fundamental
+  // shells START high (f0 * drop ratio) and settle to f0 via the ruled
+  // exp curve: inc = start_cps * lut_exp(L*(1-e)), L = -ln(ratio)
+  st[15] = f0 * (1 + 3 * mac[5]) / srate;                      // shell 1 START cps
+  st[16] = f0 * 1.63 * (1 + 3 * mac[5]) / srate;               // shell 2 START cps
+  st[17] = -log(1 + 3 * mac[5]);                               // pitch-drop L (<=0)
+  st[18] = rk_syn_env_k(0.02 + 0.03 * mac[3]);                 // pitch env decay
+  st[19] = rk_syn_env_k(0.08 + 0.5 * mac[3]);                  // shell amp decay
+  st[20] = rk_syn_env_k(0.06 + 0.5 * mac[4]);                  // wire decay
+  st[21] = rk_syn_env_k(0.004);                                // snap burst decay
+  st[22] = mac[1];                                             // TONE shell<->noise
+  st[23] = 1 + 6 * mac[6];                                     // drive gain
+  st[24] = (0.5 + 1.4 * mac[2]);                               // snap gain
+  st[25] = 0.5 + 0.5 * vel;                                    // vel -> noise level
+  st[2] = 0; st[3] = 0;
+  st[4] = 1; st[5] = 1; st[6] = 1; st[7] = 1;
+  rk_syn_svf_set(st + 8, 900 * pow(2, 2.5 * (mac[7] - 0.3)), 0.7);  // COLOR BP
+  st[1] <= 0 ? st[1] = 88888;
+);
+
+function rk_syn_snare_tick(st)
+local(e, sweep, shells, nz, wires, out)
+global()
+(
+  e = st[4];
+  st[4] -= st[18] * st[4];
+  sweep = rk_syn_lut_exp(st[17] * (1 - e));   // 1 at trigger -> 1/ratio settled
+  st[2] += st[15] * sweep;
+  st[3] += st[16] * sweep;
+  shells = rk_syn_lut_sin(st[2]) + 0.8 * rk_syn_lut_sin(st[3]);
+
+  st[5] -= st[19] * st[5];
+  st[6] -= st[20] * st[6];
+  st[7] -= st[21] * st[7];
+
+  nz = rk_syn_prng(st + 1);
+  wires = rk_syn_svf_bp(st + 8, nz) * (st[6] + st[24] * st[7]) * st[25];
+
+  out = shells * st[5] * (1 - st[22]) * 0.6 + wires * st[22] * 1.6;
+  rk_syn_lut_tanh(out * st[23]) * (1 / (0.4 + 0.6 * st[23]));
+);
+
+// ============================================================================
+// ENGINE 2 — CLAP (spec §3 row 2): DD-101 type-0 multi-impulse machine (the
+// probe-verified keeper), macros on stage times. −24 dB retrigger threshold.
+// macros: 0 SPREAD  1 BURSTS  2 DECAY  3 TAIL  4 TONE  5 COLOR  6 DRIVE
+//         7 HUMANIZE (per-hit stage-time jitter via PRNG at trigger)
+// state: 2 a_state, 3 a_kcur, 4 snap, 5 wash_state, 6 snap_max,
+//        7-13 hp, 14-20 bp, 21-27 wash bp, 28-34 constants
+// ============================================================================
+RK_SYN_CLAP_THRESH = 0.06309573444801933;   // 10^(-24/20)
+
+function rk_syn_clap_reset(st, mac, tune, vel)
+local(t_s, t2_s, t3_s, t_wash, j1, j2)
+global(srate)
+(
+  st[1] <= 0 ? st[1] = 99999;
+  j1 = 1 + mac[7] * 0.3 * rk_syn_prng(st + 1);                 // HUMANIZE jitter
+  j2 = 1 + mac[7] * 0.3 * rk_syn_prng(st + 1);
+  t_s  = 0.010 * (0.5 + mac[0]) * j1;
+  t2_s = 0.014 * (0.5 + mac[0]) * j2;
+  t3_s = 0.210 * (0.5 + mac[0] + max(0, mac[2] - 0.25));
+  t_wash = t3_s + 0.240 * (0.5 + 2 * mac[2]);
+
+  st[28] = pow(10, -24 / (20 * t_s * srate));                  // k1
+  st[29] = pow(10, -24 / (20 * t2_s * srate));                 // k2
+  st[30] = pow(10, -100 / (20 * t3_s * srate));                // k3
+  st[31] = pow(10, -40 / (20 * t_wash * srate));               // wash rate
+  st[32] = 5.25;                                               // attack level (DD-101)
+  st[33] = 0.5888 * (0.3 + 1.4 * mac[3]);                      // TAIL wash level
+  st[34] = 1 + 6 * mac[6];                                     // drive gain
+
+  st[2] = 1;                                                   // attack state
+  st[3] = st[28];                                              // k_current
+  st[4] = 0;                                                   // snap counter
+  st[5] = 1;                                                   // wash state
+  st[6] = max(1, min(4, (1 + 3 * mac[1] + 0.5)|0));            // BURSTS retriggers
+
+  rk_syn_svf_set(st + 7, 550 * pow(2, mac[5] - 0.3), 2.0);     // COLOR HP
+  rk_syn_svf_set(st + 14, 908 * pow(2, 0.8 * (mac[4] - 0.5)), 1.0);   // TONE BP
+  rk_syn_svf_set(st + 21, 880 * pow(2, 0.8 * (mac[4] - 0.5)), 0.72);  // wash BP
+);
+
+function rk_syn_clap_tick(st)
+local(atk, wash, out)
+global(RK_SYN_CLAP_THRESH)
+(
+  st[2] *= st[3];
+  (st[2] < RK_SYN_CLAP_THRESH) && (st[4] < st[6]) ? (
+    st[2] = 1;
+    st[4] += 1;
+    st[3] = st[4] == 1 ? st[28] : st[4] == 2 ? st[29] : st[30];
+  );
+
+  atk = rk_syn_svf_hp(st + 7, rk_syn_svf_bp(st + 14, st[2] * rk_syn_prng(st + 1) * 0.5));
+  st[5] *= st[31];
+  wash = rk_syn_svf_bp(st + 21, st[5] * rk_syn_prng(st + 1) * 0.5);
+
+  out = st[32] * atk + st[33] * wash;
+  rk_syn_lut_tanh(out * st[34]) * (1 / (0.4 + 0.6 * st[34]));
+);
+
+// ============================================================================
+// ENGINE 3 — HAT (spec §3 row 3, RULED 2-op PM over the 6-square stack):
+// mod->carrier PM pair through an HPF, noise blend, closed/open via OPEN.
+// macros: 0 TUNE  1 METAL(ratio)  2 BITE(index)  3 DECAY  4 OPEN  5 TONE(HPF)
+//         6 NOISE  7 ACCENT (velocity->level+decay)
+// state: 2 mph, 3 cph, 4 minc, 5 cinc, 6 idx, 7 env, 8 env_n, 9 atk,
+//        10-16 tone HPF, 17-21 constants
+// ============================================================================
+function rk_syn_hat_reset(st, mac, tune, vel)
+local(fc, dec_s)
+global(srate)
+(
+  fc = 3000 * pow(2, 1.6 * mac[0] + tune / 12);
+  st[5] = fc / srate;                                          // carrier cps
+  st[4] = fc * (1.2 + 1.8 * mac[1]) / srate;                   // mod cps (METAL)
+  st[6] = 0.2 + 1.6 * mac[2];                                  // PM index (BITE)
+  dec_s = (0.03 + 0.12 * mac[3]) * (1 + 5 * mac[4]);           // OPEN extends decay
+  dec_s *= 1 + 0.5 * vel * mac[7];                             // ACCENT: harder = longer
+  st[17] = rk_syn_env_k(dec_s);                                // k_env
+  st[18] = rk_syn_env_k(0.6 * dec_s);                          // k_noise
+  st[19] = rk_syn_env_k(0.0005);                               // k_atk
+  st[20] = mac[6];                                             // noise gain
+  st[21] = (1 - 0.6 * mac[7]) + 0.9 * mac[7] * vel;            // ACCENT output gain
+  st[2] = 0; st[3] = 0;
+  st[7] = 1; st[8] = 1; st[9] = 0;
+  rk_syn_svf_set(st + 10, 3000 * pow(2, 1.8 * mac[5]), 0.8);   // TONE HPF
+  st[1] <= 0 ? st[1] = 66666;
+);
+
+function rk_syn_hat_tick(st)
+local(y, nz)
+global()
+(
+  st[2] += st[4]; st[2] >= 1 ? st[2] -= 1;
+  st[3] += st[5]; st[3] >= 1 ? st[3] -= 1;
+  y = rk_syn_lut_sin(st[3] + st[6] * rk_syn_lut_sin(st[2]));
+
+  st[9] += st[19] * (1 - st[9]);
+  st[7] -= st[17] * st[7];
+  st[8] -= st[18] * st[8];
+
+  nz = rk_syn_prng(st + 1) * st[20] * st[8];
+  0.5 * st[21] * st[9] * rk_syn_svf_hp(st + 10, y * st[7] + nz);
+);
+
+// ============================================================================
+// ENGINE 4 — CYM (spec §3 row 4, RULED 2-op FM + noise over the loopback
+// port): one mod driving two carriers (body + shimmer ratio 1.9265), noise
+// wash, TONE HPF, LUT-tanh drive. Probe cymB lineage.
+// macros: 0 TUNE  1 CHAOS(PM index)  2 DECAY  3 BODY  4 SHIMMER  5 TONE
+//         6 NOISE  7 DRIVE
+// state: 2 mph, 3 cph1, 4 cph2, 5 minc, 6 cinc1, 7 cinc2, 8 idx, 9 atk,
+//        10 env_body, 11 env_shim, 12 env_noise, 13-19 tone HPF,
+//        20-26 noise HPF, 27-35 constants
+// ============================================================================
+function rk_syn_cym_reset(st, mac, tune, vel)
+local(fc, dec_s)
+global(srate)
+(
+  fc = 2000 * pow(2, 2 * mac[0] + tune / 12);
+  st[5] = fc * 1.4471 / srate;                                 // mod cps
+  st[6] = fc / srate;                                          // carrier 1 (body)
+  st[7] = fc * 1.9265 / srate;                                 // carrier 2 (shimmer)
+  st[8] = 0.15 + 1.1 * mac[1];                                 // CHAOS -> PM index
+  dec_s = 0.12 * (0.3 + 1.4 * mac[2]);
+  st[27] = rk_syn_env_k(0.0015);                               // k_atk
+  st[28] = rk_syn_env_k(dec_s);                                // k_body
+  st[29] = rk_syn_env_k(0.9 * (0.25 + 1.5 * mac[2]));          // k_shim
+  st[30] = rk_syn_env_k(0.05);                                 // k_noise
+  st[31] = 0.5 + 0.9 * mac[3];                                 // g_body
+  st[32] = 0.25 + 1.1 * mac[4];                                // g_shim
+  st[33] = 0.35 + 0.9 * mac[6];                                // g_noise
+  st[34] = 1 + 6 * mac[7];                                     // g_drive
+  st[35] = 1 / (0.35 + 0.65 * st[34]);                         // makeup
+  st[2] = st[3] = st[4] = 0;
+  st[9] = 0;
+  st[10] = st[11] = st[12] = 1;
+  rk_syn_svf_set(st + 13, 400 * pow(2, 4 * mac[5]), 0.9);      // TONE HPF
+  rk_syn_svf_set(st + 20, 6000, 0.8);                          // noise HPF
+  st[1] <= 0 ? st[1] = 55555;
+);
+
+function rk_syn_cym_tick(st)
+local(m, y1, y2, nz, mix, e2)
+global()
+(
+  st[2] += st[5]; st[2] >= 1 ? st[2] -= 1;
+  st[3] += st[6]; st[3] >= 1 ? st[3] -= 1;
+  st[4] += st[7]; st[4] >= 1 ? st[4] -= 1;
+
+  m = rk_syn_lut_sin(st[2]);
+  y1 = rk_syn_lut_sin(st[3] + st[8] * m);
+  y2 = rk_syn_lut_sin(st[4] + st[8] * 1.3 * m);
+
+  st[9]  += st[27] * (1 - st[9]);
+  st[10] -= st[28] * st[10];
+  st[11] -= st[29] * st[11];
+  st[12] -= st[30] * st[12];
+
+  nz = rk_syn_svf_hp(st + 20, rk_syn_prng(st + 1)) * st[33] * (st[12] + 0.4 * st[11]);
+  mix = 0.45 * (y1 * st[10] * st[31] + y2 * st[11] * st[32]) + nz;
+  e2 = st[9] * rk_syn_svf_hp(st + 13, mix);
+  rk_syn_lut_tanh(e2 * st[34]) * st[35];
+);
+
+// ============================================================================
+// ENGINE 5 — TOM (spec §3 row 5): swept resonator (phase-acc + LUT sine,
+// LUT-exp sweep) + optional detuned 2nd inharmonic mode (BODY/SPREAD reach
+// cowbell/rim territory), noise blend, TONE LP, drive. DD-101 tom lineage.
+// macros: 0 TUNE  1 SWEEP  2 DECAY  3 BODY(2nd mode)  4 SPREAD(detune)
+//         5 TONE(LP)  6 NOISE  7 DRIVE
+// state: 2 ph1, 3 ph2, 4 pitch env, 5 amp, 6 atk, 7-13 noise BP,
+//        14-20 tone LP, 21-29 constants
+// ============================================================================
+function rk_syn_tom_reset(st, mac, tune, vel)
+local(f0, ratio)
+global(srate)
+(
+  f0 = 95 * pow(2, (mac[0] - 0.5) * 1.5 + tune / 12);
+  ratio = 1 + 2.5 * mac[1];                                    // SWEEP depth
+  st[21] = f0 * ratio / srate;                                 // mode 1 START cps
+  st[22] = f0 * (1.5 + 1.3 * mac[4]) * ratio / srate;          // mode 2 START (SPREAD)
+  st[23] = -log(ratio);                                        // sweep L
+  st[24] = rk_syn_env_k(0.03 + 0.09 * mac[1]);                 // pitch env decay
+  st[25] = rk_syn_env_k(0.15 + 0.9 * mac[2]);                  // amp decay
+  st[26] = rk_syn_env_k(0.0005);                               // atk
+  st[27] = 0.9 * mac[3];                                       // g 2nd mode (BODY)
+  st[28] = 0.5 * mac[6];                                       // g_noise
+  st[29] = 1 + 6 * mac[7];                                     // g_drive
+  st[2] = st[3] = 0;
+  st[4] = 1; st[5] = 1; st[6] = 0;
+  rk_syn_svf_set(st + 7, f0 * 4, 0.8);                         // noise BP
+  rk_syn_svf_set(st + 14, 700 * pow(2, 2.2 * mac[5]), 0.9);    // TONE LP
+  st[1] <= 0 ? st[1] = 44444;
+);
+
+function rk_syn_tom_tick(st)
+local(e, sweep, body, nz, out)
+global()
+(
+  e = st[4];
+  st[4] -= st[24] * st[4];
+  sweep = rk_syn_lut_exp(st[23] * (1 - e));
+  st[2] += st[21] * sweep;
+  st[3] += st[22] * sweep;
+  body = rk_syn_lut_sin(st[2]) + st[27] * rk_syn_lut_sin(st[3]);
+
+  st[5] -= st[25] * st[5];
+  st[6] += st[26] * (1 - st[6]);
+
+  nz = rk_syn_svf_bp(st + 7, rk_syn_prng(st + 1)) * st[28] * st[5];
+  out = rk_syn_svf_lp(st + 14, body * st[5] * 0.7 + nz) * st[6];
+  rk_syn_lut_tanh(out * st[29]) * (1 / (0.4 + 0.6 * st[29]));
+);
+
+// ============================================================================
+// ██ PARITY PORT LAYER (Spec_Synthdrums_Parity.md) ██
+// Faithful 1:1 ports of DD-101 families. Named rk_syn_dd_* and dispatched
+// separately from the legacy rk_syn_<family>_* engines above, so the parity
+// harness can prove them before the legacy engines are retired (spec §9.5).
+//
+// Adaptations vs his source, all justified in spec §7:
+//   * LUT sin/exp/tanh instead of transcendentals (probe: -130/-84/-92 dB)
+//   * flat memory instead of EEL instances (Swing voices are memory slots)
+//   * Park-Miller instead of rand()  -> NOISE PATH CANNOT NULL SAMPLE-EXACT.
+//     The gate runs a silent-noise arm for exact parity plus a separate
+//     statistical arm (spec §6.4). Harness zeroes the noise gain on both sides.
+//   * per-voice prev-output cell: his `local y` is shared across instances
+//     (latent polyphony bug in his source); identical for a single voice.
+//   * per-voice shifter init: his runs continuous phase across hits because
+//     init_cheapest_freq_shifter is called once in reinit(); identical from a
+//     fresh state, which is the null-test condition.
+// ============================================================================
+
+// ── his env_tick: one-multiply attack-then-decay ───────────────────────────
+// e[0]=t  e[1]=k_rise  e[2]=k_decay  e[3]=attack_samples  e[4]=val
+RK_DD_ENV_CELLS = 5;
+
+function rk_syn_dd_env_set(e, k_rise, k_decay, attack_samples)
+global()
+(
+  e[0] = 0;
+  e[1] = k_rise;
+  e[2] = k_decay;
+  e[3] = attack_samples;
+  e[4] = 0;
+);
+
+function rk_syn_dd_env_tick(e)
+global()
+(
+  e[0] < e[3] ? (
+    e[4] += e[1] * (1.0 - e[4]);
+    e[0] += 1;
+  ) : (
+    e[4] -= e[2] * e[4];
+  );
+  e[4];
+);
+
+// ── his naiveTri (aliased by design - ported as-is for parity) ─────────────
+function rk_syn_dd_naive_tri(t)
+local(f)
+global()
+(
+  f = t - floor(t);
+  f <= 0.5 ? (4.0 * f - 1.0) : (3.0 - 4.0 * f);
+);
+
+// ── coefficient setters that PRESERVE filter state ─────────────────────────
+// His init_linearSVF* / set_bell never touch ic1eq/ic2eq, and his kick filters
+// are initialised once in reinit() rather than per trigger. Our rk_syn_svf_set
+// zeroes state, which would be a deviation. These variants do not.
+function rk_syn_dd_svf_set_norm_keep(b, freq, res)
+local(f0, g, k)
+global()
+(
+  f0 = min(exp((1 - freq) * log(20 / 22050)), 0.98);
+  g = tan(0.5 * $pi * f0);
+  k = 2 - 2 * res;
+  b[0] = g;
+  b[1] = k;
+  b[2] = 1 / (1 + g * (g + k));
+  b[3] = g * b[2];
+  b[4] = g * b[3];
+);
+
+// his init_linearSVF_invq(raw_freq, invq): raw Hz, k = invq directly, and it
+// clamps at hsrate (srate/2) - NOT our house 0.49*srate. Matched exactly.
+function rk_syn_dd_svf_set_keep(b, fc, invq)
+local(g)
+global(srate)
+(
+  fc = min(fc, 0.5 * srate);
+  g = tan($pi * fc / srate);
+  b[0] = g;
+  b[1] = invq;
+  b[2] = 1 / (1 + g * (g + invq));
+  b[3] = g * b[2];
+  b[4] = g * b[3];
+);
+
+function rk_syn_dd_bell_set_keep(b, fc, q, gain)
+local(a, g, k)
+global(srate)
+(
+  a = pow(10, gain / 40);
+  g = tan($pi * fc / srate);
+  k = 1.0 / (q * a);
+  b[0] = g;
+  b[1] = k;
+  b[2] = 1.0 / (1.0 + g * (g + k));
+  b[3] = g * b[2];
+  b[4] = g * b[3];
+  b[5] = k * (a * a - 1.0);
+);
+
+// ── his cheapest freq shifter (saikedrums_freq_shift.jsfx-inc) ─────────────
+// s[0..13] = osc_coeff_t1 osc_coeff_t2 cos_t1_1 cos_t1_2 sin_t1_1 sin_t1_2
+//            cos_t2_1 cos_t2_2 sin_t2_1 sin_t2_2 t1 t2 dt1 dt2
+// s[14..29] = elliptical filter 1 state (16)   s[30..45] = filter 2 state (16)
+RK_DD_SHIFT_CELLS = 46;
+
+function rk_syn_dd_shift_set(s, shift)
+local(w)
+global(srate, rk_dd_sample_ratio)
+(
+  // The +0.001 term is his, comment: "because of mistakes of the past"
+  s[12] = 2.0 * $pi * (0.250 + 0.001 * rk_dd_sample_ratio);
+  s[13] = s[12] + 2.0 * $pi * shift / srate;
+  s[10] = 0; s[11] = 0;
+
+  w = s[12];
+  s[0] = 2.0 * cos(w);
+  s[10] += w;
+  s[2] = sin(-w + s[10]);
+  s[3] = sin(-2.0 * w + s[10]);
+  s[4] = -cos(-w + s[10]);
+  s[5] = -cos(-2.0 * w + s[10]);
+  s[10] -= w;
+
+  w = s[13];
+  s[1] = 2.0 * cos(w);
+  s[11] += w;
+  s[6] = sin(-w + s[11]);
+  s[7] = sin(-2.0 * w + s[11]);
+  s[8] = -cos(-w + s[11]);
+  s[9] = -cos(-2.0 * w + s[11]);
+  s[11] -= w;
+);
+
+// 16th-order elliptical at 0.25 - his quick_ellip, transposed direct form II.
+// e = 16-cell state block.
+function rk_syn_dd_ellip(e, x)
+local(y)
+global()
+(
+  y     = 0.03974403712835188 * x + e[0];
+  e[0]  = 0.11443117839583584 * x - -1.2209793606380654  * y + e[1];
+  e[1]  = 0.4102732984609602  * x -  6.918940386446262   * y + e[2];
+  e[2]  = 0.8255281436307241  * x - -7.438409047076798   * y + e[3];
+  e[3]  = 1.6689828207164152  * x -  20.47654014058037   * y + e[4];
+  e[4]  = 2.5256753272317622  * x - -19.21733444638215   * y + e[5];
+  e[5]  = 3.6193770241123127  * x -  33.69411950162771   * y + e[6];
+  e[6]  = 4.250403515943048   * x - -27.235417392156258  * y + e[7];
+  e[7]  = 4.641846929462009   * x -  33.46680351213294   * y + e[8];
+  e[8]  = 4.25040351594302    * x - -22.8021725145997    * y + e[9];
+  e[9]  = 3.6193770241123016  * x -  20.29444701618275   * y + e[10];
+  e[10] = 2.525675327231766   * x - -11.231790923026374  * y + e[11];
+  e[11] = 1.6689828207164181  * x -  7.173357397659418   * y + e[12];
+  e[12] = 0.8255281436307251  * x - -2.9956603900306376  * y + e[13];
+  e[13] = 0.41027329846095995 * x -  1.2866484319363045  * y + e[14];
+  e[14] = 0.11443117839583594 * x - -0.3305293493933626  * y + e[15];
+  e[15] = 0.0397440371283519  * x -  0.07745428581611816 * y;
+  y;
+);
+
+function rk_syn_dd_shift_tick(s, x)
+local(ct1, st1, ct2, st2)
+global()
+(
+  s[10] += s[12];
+  s[11] += s[13];
+
+  ct1 = s[0] * s[2] - s[3];  s[3] = s[2];  s[2] = ct1;
+  ct2 = s[1] * s[6] - s[7];  s[7] = s[6];  s[6] = ct2;
+  st1 = s[0] * s[4] - s[5];  s[5] = s[4];  s[4] = st1;
+  st2 = s[1] * s[8] - s[9];  s[9] = s[8];  s[8] = st2;
+
+  2 * (rk_syn_dd_ellip(s + 14, x * ct1) * ct2
+     + rk_syn_dd_ellip(s + 30, x * st1) * st2);
+);
+
+// ============================================================================
+// DD-101 KICK — all 4 types. Ported from kick_reset (line 75) / kick_tick
+// (line 2213) of saikedrums_drum_elements.jsfx-inc v0.18.
+//
+// Reset takes HIS RAW PARAMS, not macros - the macro layer wraps this once
+// parity is proven (spec §4.1). Caller supplies:
+//   ktype   = kick_type 0..3
+//   kpdec   = kick_pitch_decay     0..1
+//   kadec   = kick_amp_decay       0..1
+//   knenv   = kick_noise_envelope  0..1
+//   kenv    = kick_envelope        0..0.5   (his slider caps at 0.5)
+//   kbottom = log((20 + 80*kick_tune) / 22050)    <- caller computes, as he does
+//   fshift  = freq_shift 0|1
+//
+// state: 92 cells (top index 91). Layout in the RK_DDK_* constants below.
+// ============================================================================
+RK_DDK_PREVY  = 0;    // his shared `local y` -> per-voice here
+RK_DDK_SEED   = 1;
+RK_DDK_TOSC   = 2;
+RK_DDK_TOSC2  = 3;
+RK_DDK_SMOOTH = 4;
+RK_DDK_NLEVEL = 5;
+RK_DDK_NDECAY = 6;
+RK_DDK_TYPE   = 7;
+RK_DDK_ENV    = 8;    // kick_envelope latched
+RK_DDK_BOTTOM = 9;    // kick_bottom latched
+RK_DDK_SRATIO = 10;   // sample_ratio latched
+RK_DDK_FSHIFT = 11;
+RK_DDK_PENV   = 12;   // pitch env   5 cells -> 12..16
+RK_DDK_AENV   = 17;   // amp env     5 cells -> 17..21
+RK_DDK_AHIGH  = 22;   // amp k_high_decay (his kick_stop / choke)
+RK_DDK_NBP    = 23;   // noise BP svf     7 -> 23..29
+RK_DDK_MUD    = 30;   // mud_dip bell     8 -> 30..37
+RK_DDK_CLICK  = 38;   // click_boost bell 8 -> 38..45
+RK_DDK_SHIFT  = 46;   // freq shifter    46 -> 46..91
+RK_DDK_CELLS  = 92;
+
+function rk_syn_dd_kick_reset(st, ktype, kpdec, kadec, knenv, kenv, kbottom, fshift)
+global(srate, rk_dd_time_factor, rk_dd_sample_ratio,
+       RK_DDK_PREVY, RK_DDK_SEED, RK_DDK_TOSC, RK_DDK_TOSC2, RK_DDK_SMOOTH,
+       RK_DDK_NLEVEL, RK_DDK_NDECAY, RK_DDK_TYPE, RK_DDK_ENV, RK_DDK_BOTTOM,
+       RK_DDK_SRATIO, RK_DDK_FSHIFT, RK_DDK_PENV, RK_DDK_AENV, RK_DDK_AHIGH,
+       RK_DDK_NBP, RK_DDK_MUD, RK_DDK_CLICK, RK_DDK_SHIFT)
+(
+  st[RK_DDK_TYPE]   = ktype;
+  st[RK_DDK_ENV]    = kenv;
+  st[RK_DDK_BOTTOM] = kbottom;
+  st[RK_DDK_SRATIO] = rk_dd_sample_ratio;
+  st[RK_DDK_FSHIFT] = fshift;
+
+  // his: pitch.k_rise = time_factor * 0.5   ("2 ms rise time (1/3)")
+  //      pitch.k_decay = time_factor * 0.33 * exp(-4.605170185988092 * kpdec)
+  //      -4.605170185988092 == ln(0.01), so the exp term is 0.01^kpdec
+  //      pitch.attack_samples = 0.01 * srate
+  rk_syn_dd_env_set(st + RK_DDK_PENV,
+    rk_dd_time_factor * 0.5,
+    rk_dd_time_factor * 0.33 * exp(-4.605170185988092 * kpdec),
+    0.01 * srate);
+
+  // his: amp.k_rise = time_factor  ("1 ms rise time (1/3)")
+  //      amp.k_decay = time_factor * 0.033 * 0.01^kadec
+  //      amp.attack_samples = 0.04 * srate
+  //      (his comment says "100 ms"; the code is 40 ms - the CODE is ported)
+  rk_syn_dd_env_set(st + RK_DDK_AENV,
+    rk_dd_time_factor,
+    rk_dd_time_factor * 0.033 * exp(-4.605170185988092 * kadec),
+    0.04 * srate);
+  st[RK_DDK_AHIGH] = 4 * st[RK_DDK_AENV + 2];
+
+  st[RK_DDK_NLEVEL] = 2;
+  st[RK_DDK_NDECAY] = rk_dd_time_factor * 13 * exp(-4.605170185988092 * knenv);
+
+  st[RK_DDK_TOSC]   = 0;
+  st[RK_DDK_TOSC2]  = 0;
+  st[RK_DDK_SMOOTH] = 5;
+  st[RK_DDK_PREVY]  = 0;
+  st[RK_DDK_SEED] <= 0 ? st[RK_DDK_SEED] = 77777;
+
+  // his reinit(): coefficients only, state preserved (see spec §7)
+  rk_syn_dd_svf_set_norm_keep(st + RK_DDK_NBP,   0.65, 0.75);
+  rk_syn_dd_bell_set_keep    (st + RK_DDK_MUD,   480,  12.0, -50);
+  rk_syn_dd_bell_set_keep    (st + RK_DDK_CLICK, 3413.3, 0.5, 6.3);
+  fshift ? rk_syn_dd_shift_set(st + RK_DDK_SHIFT, 7);
+);
+
+// his kick_stop() - choke: amp.k_decay = amp.k_high_decay
+function rk_syn_dd_kick_stop(st)
+global(RK_DDK_AENV, RK_DDK_AHIGH)
+(
+  st[RK_DDK_AENV + 2] = st[RK_DDK_AHIGH];
+);
+
+function rk_syn_dd_kick_tick(st)
+local(y, ly, e, tstep, nz)
+global(RK_DDK_PREVY, RK_DDK_SEED, RK_DDK_TOSC, RK_DDK_TOSC2, RK_DDK_SMOOTH,
+       RK_DDK_NLEVEL, RK_DDK_NDECAY, RK_DDK_TYPE, RK_DDK_ENV, RK_DDK_BOTTOM,
+       RK_DDK_SRATIO, RK_DDK_FSHIFT, RK_DDK_PENV, RK_DDK_AENV,
+       RK_DDK_NBP, RK_DDK_MUD, RK_DDK_CLICK, RK_DDK_SHIFT)
+(
+  ly = st[RK_DDK_PREVY];
+  y  = 0;
+
+  st[RK_DDK_TYPE] == 0 ? (
+    tstep = 0.5 * rk_syn_lut_exp(
+      (1 - st[RK_DDK_ENV] * rk_syn_dd_env_tick(st + RK_DDK_PENV)) * st[RK_DDK_BOTTOM]
+    ) * st[RK_DDK_SRATIO];
+    st[RK_DDK_TOSC] += tstep;
+    y = rk_syn_dd_naive_tri(st[RK_DDK_TOSC]);
+    y = 0.91 * (rk_syn_lut_tanh(2 * y + 0.1) - 0.1) + 0.1 * y;
+    y *= rk_syn_dd_env_tick(st + RK_DDK_AENV);
+    y = rk_syn_bell(st + RK_DDK_MUD, y);
+    st[RK_DDK_FSHIFT] ? y = rk_syn_dd_shift_tick(st + RK_DDK_SHIFT, y);
+  ) : st[RK_DDK_TYPE] == 1 ? (
+    tstep = 0.5 * rk_syn_lut_exp(
+      (1 - st[RK_DDK_ENV] * rk_syn_dd_env_tick(st + RK_DDK_PENV)) * st[RK_DDK_BOTTOM]
+    ) * st[RK_DDK_SRATIO];
+    st[RK_DDK_TOSC] += tstep;
+    y = rk_syn_dd_naive_tri(st[RK_DDK_TOSC]) * rk_syn_dd_env_tick(st + RK_DDK_AENV);
+    y = 0.91 * (rk_syn_lut_tanh(2 * y + 0.1) - 0.1) + 0.1 * y;
+    y = rk_syn_bell(st + RK_DDK_MUD, y);
+    st[RK_DDK_FSHIFT] ? y = rk_syn_dd_shift_tick(st + RK_DDK_SHIFT, y);
+  ) : st[RK_DDK_TYPE] == 2 ? (
+    tstep = 0.5 * rk_syn_lut_exp(
+      (1 - st[RK_DDK_ENV] * rk_syn_dd_env_tick(st + RK_DDK_PENV)) * st[RK_DDK_BOTTOM]
+    ) * st[RK_DDK_SRATIO];
+    st[RK_DDK_TOSC] += tstep;
+    y = rk_syn_dd_naive_tri(st[RK_DDK_TOSC]);
+    y = rk_syn_lut_tanh(2 * y) * rk_syn_dd_env_tick(st + RK_DDK_AENV);
+    st[RK_DDK_FSHIFT] ? y = rk_syn_dd_shift_tick(st + RK_DDK_SHIFT, y);
+    y = rk_syn_bell(st + RK_DDK_MUD, y);
+    y = rk_syn_bell(st + RK_DDK_CLICK, y);
+  ) : st[RK_DDK_TYPE] == 3 ? (
+    e = rk_syn_dd_env_tick(st + RK_DDK_PENV);
+    tstep = 0.5 * rk_syn_lut_exp((1 - st[RK_DDK_ENV] * e) * st[RK_DDK_BOTTOM])
+          * st[RK_DDK_SRATIO];
+    y = rk_syn_lut_sin(st[RK_DDK_TOSC]) * rk_syn_dd_env_tick(st + RK_DDK_AENV);
+
+    st[RK_DDK_TOSC2] += 8 * tstep;
+    st[RK_DDK_TOSC]  += tstep
+      + 0.001 * e * rk_syn_lut_sin(st[RK_DDK_TOSC2]) * st[RK_DDK_SRATIO];
+    st[RK_DDK_FSHIFT] ? y = y + rk_syn_dd_shift_tick(st + RK_DDK_SHIFT,
+                                  (rk_syn_lut_tanh(2 * y) - y) * 0.5);
+    y = rk_syn_bell(st + RK_DDK_CLICK, y);
+  );
+
+  // noise layer - his: noise_level -= noise_decay*noise_level;
+  //                    y += eval_linearSVF_BP(noise_level * (rand() - 0.5))
+  // ours: Park-Miller returns (-1,1), so *0.5 matches his (rand()-0.5) range
+  st[RK_DDK_NLEVEL] -= st[RK_DDK_NDECAY] * st[RK_DDK_NLEVEL];
+  nz = rk_syn_prng(st + RK_DDK_SEED) * 0.5;
+  y += rk_syn_svf_bp(st + RK_DDK_NBP, st[RK_DDK_NLEVEL] * nz);
+
+  // his 5-sample soft start
+  st[RK_DDK_SMOOTH] > 0 ? (
+    st[RK_DDK_SMOOTH] -= 1;
+    y = 0.9 * ly + 0.1 * y;
+  );
+
+  st[RK_DDK_PREVY] = y;
+  y;
+);
+
+// uniform [0,1) from a caller-owned Park-Miller seed - his rand() equivalent
+function rk_syn_dd_rand01(sp)
+global()
+(
+  (rk_syn_prng(sp) + 1) * 0.5;
+);
+
+// ============================================================================
+// DD-101 SNARE — all 4 types. Ported from snare1_reset (130) / snare1_tick
+// (174) / snare_reset (205) / snare_tick (257) of drum_elements v0.18.
+//
+// ⚠️ TYPE 0 IS A DIFFERENT ENGINE (his snare1_*): a 9-bandpass resonant model
+// whose rand() calls are EMBEDDED INLINE in six separate expressions, summed
+// with the deterministic excitation *before* the filters. There is no single
+// noise gain to silence, so type 0 CANNOT be exact-nulled. It is verified by
+// coefficient-level comparison (every envelope constant + all 9 filter
+// coefficient sets) plus a statistical arm. Types 1-3 gate the normal way:
+// their noise passes through one env, so zeroing that env's k_rise and val
+// silences it on both sides.
+//
+// ⚠️ `snare_bottom` is TWO different quantities in his source. Global (types
+// 1-3) = log((170+230*snare_tune)/22050), used in the pitch envelope. The
+// LOCAL in snare1_reset = 170+230*snare_tune, raw Hz, used for filter
+// frequencies, and it SHADOWS the global. Ported as two separate arguments.
+//
+// ⚠️ His slider is snare_type=1<0,4,1> - five positions - but reset, the stop
+// dispatch and tick all branch only on 0..3. Position 4 is a DEAD slider
+// position in DD-101; deliberately not replicated (spec §3.1).
+//
+// state: 171 cells.
+// ============================================================================
+RK_DDS_PREVY  = 0;
+RK_DDS_SEED   = 1;
+RK_DDS_TYPE   = 2;
+RK_DDS_ENVEL  = 3;    // snare_envelope latched
+RK_DDS_BOTTOM = 4;    // global snare_bottom (log form) latched
+RK_DDS_SRATIO = 5;
+RK_DDS_FSHIFT = 6;
+RK_DDS_TOSC   = 7;
+RK_DDS_TOSC2  = 8;
+RK_DDS_SMOOTH = 9;
+RK_DDS_PENV   = 10;   // pitch env   5 -> 10..14
+RK_DDS_NENV   = 15;   // noise env   5 -> 15..19
+RK_DDS_AENV   = 20;   // amp env     5 -> 20..24
+RK_DDS_NFAST  = 25;   // noise.fast_decay
+RK_DDS_NVOL   = 26;   // noise.vol (type 0)
+// -- type 0 punch system --
+RK_DDS_PST    = 27;   // punch.state
+RK_DDS_PST2   = 28;
+RK_DDS_PST3   = 29;
+RK_DDS_PAFAST = 30;   // punch.attack_fast
+RK_DDS_PTWACK = 31;
+RK_DDS_PATK   = 32;
+RK_DDS_PK     = 33;
+RK_DDS_PK2    = 34;
+RK_DDS_PK3    = 35;
+RK_DDS_PKATK  = 36;
+RK_DDS_PKATKF = 37;   // punch.k_atk_fast
+RK_DDS_PPDEC  = 38;   // punch.pitch_decay (his reset sets it; tick never reads)
+// -- type 0 filter bank, in his declaration order: bp bp8 bp2 bp3 bp4 bp5
+//    bp6 bp7 bp9. 9 x RK_SYN_SVF_CELLS = 63 -> 39..101
+RK_DDS_BP     = 39;
+RK_DDS_BP8    = 46;
+RK_DDS_BP2    = 53;
+RK_DDS_BP3    = 60;
+RK_DDS_BP4    = 67;
+RK_DDS_BP5    = 74;
+RK_DDS_BP6    = 81;
+RK_DDS_BP7    = 88;
+RK_DDS_BP9    = 95;
+// -- types 1/2/3 --
+RK_DDS_THIS   = 102;  // the snare instance's own SVF (noise BP)  102..108
+RK_DDS_MUD    = 109;  // mud_dip bell                            109..116
+RK_DDS_CLAP   = 117;  // his snare.clap SVF                      117..123
+RK_DDS_SHIFT  = 124;  // freq shifter (12.5 Hz)                  124..169
+RK_DDS_CELLS  = 170;
+
+function rk_syn_dd_snare_reset(st, stype, sdecay, sadec, sndec, senv, sbottom,
+                               stune, fshift)
+local(t_s, sb, nd)
+global(srate, rk_dd_time_factor, rk_dd_sample_ratio,
+       RK_DDS_PREVY, RK_DDS_SEED, RK_DDS_TYPE, RK_DDS_ENVEL, RK_DDS_BOTTOM,
+       RK_DDS_SRATIO, RK_DDS_FSHIFT, RK_DDS_TOSC, RK_DDS_TOSC2, RK_DDS_SMOOTH,
+       RK_DDS_PENV, RK_DDS_NENV, RK_DDS_AENV, RK_DDS_NFAST, RK_DDS_NVOL,
+       RK_DDS_PST, RK_DDS_PST2, RK_DDS_PST3, RK_DDS_PAFAST, RK_DDS_PTWACK,
+       RK_DDS_PATK, RK_DDS_PK, RK_DDS_PK2, RK_DDS_PK3, RK_DDS_PKATK,
+       RK_DDS_PKATKF, RK_DDS_PPDEC,
+       RK_DDS_BP, RK_DDS_BP8, RK_DDS_BP2, RK_DDS_BP3, RK_DDS_BP4, RK_DDS_BP5,
+       RK_DDS_BP6, RK_DDS_BP7, RK_DDS_BP9,
+       RK_DDS_THIS, RK_DDS_MUD, RK_DDS_CLAP, RK_DDS_SHIFT)
+(
+  st[RK_DDS_TYPE]   = stype;
+  st[RK_DDS_ENVEL]  = senv;
+  st[RK_DDS_BOTTOM] = sbottom;
+  st[RK_DDS_SRATIO] = rk_dd_sample_ratio;
+  st[RK_DDS_FSHIFT] = fshift;
+  st[RK_DDS_PREVY]  = 0;
+  st[RK_DDS_SEED] <= 0 ? st[RK_DDS_SEED] = 88888;
+
+  // his reinit(): coefficients only, filter state preserved
+  rk_syn_dd_svf_set_norm_keep(st + RK_DDS_THIS, 0.66, 0.2);
+  rk_syn_dd_svf_set_norm_keep(st + RK_DDS_CLAP, 0.65, 0.432);
+  rk_syn_dd_bell_set_keep(st + RK_DDS_MUD, 480, 12.0, -50);
+  fshift ? rk_syn_dd_shift_set(st + RK_DDS_SHIFT, 12.5);
+
+  stype == 0 ? (
+    // ── his snare1_reset ──
+    t_s = 0.015 * (0.2 + 1.3 * sdecay);
+
+    st[RK_DDS_PST]    = 1;
+    st[RK_DDS_PST2]   = 1;
+    st[RK_DDS_PST3]   = 1;
+    st[RK_DDS_PAFAST] = 1;
+    st[RK_DDS_PTWACK] = 66.6666 * senv;
+    st[RK_DDS_PATK]   = 1;
+
+    st[RK_DDS_PK]     = pow(10, -24 / (20 * t_s * srate));
+    st[RK_DDS_PK2]    = pow(10, -24 / (30 * t_s * srate));
+    st[RK_DDS_PK3]    = pow(10, -24 / (30 * 5 * t_s * srate));
+    st[RK_DDS_PKATK]  = pow(10, -24 / (20 * 0.015 * 0.5 * srate));
+    // ⚠️ his division by (1 - snare_amp_decay) blows up at sadec == 1.
+    // Ported verbatim; the harness never drives sadec to 1.
+    st[RK_DDS_PKATKF] = pow(10, -24 / (20 * t_s * srate * (1.0 - sadec)));
+    st[RK_DDS_PPDEC]  = pow(10, -24 / (20 * 0.5 * srate));
+
+    nd = sndec + 0.8;                       // his in-place param mutation
+    st[RK_DDS_NVOL]  = 0.4 + 0.6 * sdecay;
+    st[RK_DDS_NFAST] = rk_dd_time_factor * 0.4
+                     * exp(-4.605170185988092 * (0.5 + sdecay * 0.4)) * 2;
+    rk_syn_dd_env_set(st + RK_DDS_NENV,
+      rk_dd_time_factor * 0.006,
+      rk_dd_time_factor * 0.4 * exp(-4.605170185988092 * (0.5 + sdecay * 0.4)),
+      0.07 * nd * srate);
+
+    sb = 170 + 230 * stune;                 // raw Hz - the LOCAL snare_bottom
+    rk_syn_dd_svf_set_keep(st + RK_DDS_BP,  sb,          0.03 + (1 - sdecay));
+    rk_syn_dd_svf_set_keep(st + RK_DDS_BP8, sb * 1.05,   0.03);
+    rk_syn_dd_svf_set_keep(st + RK_DDS_BP2, 1.25 * sb,   0.05 + 0.02 * (1 - sdecay));
+    rk_syn_dd_svf_set_keep(st + RK_DDS_BP3, 1.4 * sb,    0.04);
+    rk_syn_dd_svf_set_keep(st + RK_DDS_BP4, 1.575 * sb,  0.04 + 0.02 * (1 - sdecay));
+    rk_syn_dd_svf_set_keep(st + RK_DDS_BP5, 2.15 * sb,   0.03 + 0.02 * (1 - sdecay));
+    rk_syn_dd_svf_set_keep(st + RK_DDS_BP6, 7000,        1.4);
+    rk_syn_dd_svf_set_keep(st + RK_DDS_BP7, 4000,        0.8);
+    rk_syn_dd_svf_set_keep(st + RK_DDS_BP9, 700,         0.8);
+  ) : (
+    // ── his snare_reset, types 1/2/3 ──
+    rk_syn_dd_env_set(st + RK_DDS_PENV,
+      rk_dd_time_factor * (1/2),
+      rk_dd_time_factor * 0.933 * exp(-4.605170185988092 * sdecay),
+      0.01 * srate);
+
+    st[RK_DDS_NFAST] = 2 * rk_dd_time_factor * 0.4
+                     * exp(-4.605170185988092 * (0.6 + sndec * 0.3));
+    rk_syn_dd_env_set(st + RK_DDS_NENV,
+      rk_dd_time_factor * (1/1),
+      rk_dd_time_factor * 0.4 * exp(-4.605170185988092 * (0.6 + sndec * 0.3)),
+      0.08 * sndec * srate);
+
+    rk_syn_dd_env_set(st + RK_DDS_AENV,
+      rk_dd_time_factor * (1/1),
+      rk_dd_time_factor * 0.33 * exp(-4.605170185988092 * sadec),
+      0.04 * srate);        // his comment says 100 ms; the CODE is 40 ms
+
+    st[RK_DDS_TOSC]   = 0;
+    st[RK_DDS_TOSC2]  = 0;
+    st[RK_DDS_SMOOTH] = 5;
+  );
+);
+
+// his snare1_tick - type 0 only
+function rk_syn_dd_snare1_tick(st)
+local(y, ne, af, s3)
+global(RK_DDS_SEED, RK_DDS_NENV, RK_DDS_NVOL,
+       RK_DDS_PST, RK_DDS_PST2, RK_DDS_PST3, RK_DDS_PAFAST, RK_DDS_PTWACK,
+       RK_DDS_PATK, RK_DDS_PK, RK_DDS_PK2, RK_DDS_PK3, RK_DDS_PKATK,
+       RK_DDS_PKATKF,
+       RK_DDS_BP, RK_DDS_BP8, RK_DDS_BP2, RK_DDS_BP3, RK_DDS_BP4, RK_DDS_BP5,
+       RK_DDS_BP6, RK_DDS_BP7, RK_DDS_BP9)
+(
+  s3 = st[RK_DDS_PST3];
+  y = 0.7 * (1.0 - st[RK_DDS_PAFAST]) * (
+    0.27 * rk_syn_svf_bp(st + RK_DDS_BP,  s3) +
+    0.60 * rk_syn_svf_bp(st + RK_DDS_BP8, s3 + rk_syn_dd_rand01(st + RK_DDS_SEED) - 0.5) * s3 +
+    0.11 * rk_syn_svf_bp(st + RK_DDS_BP2, s3) +
+    0.15 * rk_syn_svf_bp(st + RK_DDS_BP3, st[RK_DDS_PST2] + rk_syn_dd_rand01(st + RK_DDS_SEED) - 0.5) * s3 +
+    0.14 * rk_syn_svf_bp(st + RK_DDS_BP4, s3) +
+    0.12 * rk_syn_svf_bp(st + RK_DDS_BP5, s3)
+  );
+
+  st[RK_DDS_PTWACK] *= st[RK_DDS_PKATK];
+  st[RK_DDS_PATK]   *= st[RK_DDS_PKATK];
+  st[RK_DDS_PAFAST] *= st[RK_DDS_PKATKF];
+  st[RK_DDS_PST]    *= st[RK_DDS_PK];
+  st[RK_DDS_PST2]   *= st[RK_DDS_PK2];
+  st[RK_DDS_PST3]   *= st[RK_DDS_PK3];
+
+  ne = rk_syn_dd_env_tick(st + RK_DDS_NENV);
+  af = st[RK_DDS_PAFAST];
+  s3 = st[RK_DDS_PST3];
+
+  // ⚠️ (0.3 + rand() > 0.85) is ((0.3 + rand()) > 0.85) - EEL2 binds + above >.
+  // A gated noise burst, not an offset. Ported with explicit parens.
+  y += 0.5 * st[RK_DDS_NVOL] * ne * rk_syn_svf_bp(st + RK_DDS_BP6,
+        (rk_syn_dd_rand01(st + RK_DDS_SEED) - 0.5)
+        * ((0.3 + rk_syn_dd_rand01(st + RK_DDS_SEED)) > 0.85));
+
+  y += 1.4 * ne * st[RK_DDS_NVOL] * rk_syn_svf_bp(st + RK_DDS_BP9,
+        (rk_syn_dd_rand01(st + RK_DDS_SEED) - 0.5)
+        * ((0.3 + rk_syn_dd_rand01(st + RK_DDS_SEED)) > 0.85)) * (s3 * s3);
+
+  y += 2 * min(1.0, st[RK_DDS_PTWACK]) * st[RK_DDS_NVOL] * (1.0 - af)
+     * (rk_syn_svf_lp(st + RK_DDS_BP7, rk_syn_dd_rand01(st + RK_DDS_SEED) * 2 - 1)
+        + 0.3 * (rk_syn_dd_rand01(st + RK_DDS_SEED) * 2 - 1)) * st[RK_DDS_PATK];
+
+  (4 * y) / (1 + abs(y + y));
+);
+
+function rk_syn_dd_snare_tick(st)
+local(y, ly, tstep, ae, ne)
+global(RK_DDS_PREVY, RK_DDS_SEED, RK_DDS_TYPE, RK_DDS_ENVEL, RK_DDS_BOTTOM,
+       RK_DDS_SRATIO, RK_DDS_FSHIFT, RK_DDS_TOSC, RK_DDS_SMOOTH,
+       RK_DDS_PENV, RK_DDS_NENV, RK_DDS_AENV,
+       RK_DDS_THIS, RK_DDS_MUD, RK_DDS_CLAP, RK_DDS_SHIFT)
+(
+  ly = st[RK_DDS_PREVY];
+  y  = 0;
+
+  st[RK_DDS_TYPE] == 0 ? (
+    y = rk_syn_dd_snare1_tick(st);
+  ) : st[RK_DDS_TYPE] == 3 ? (
+    tstep = 0.5 * rk_syn_lut_exp((1 - 0.4 * st[RK_DDS_ENVEL]
+              * rk_syn_dd_env_tick(st + RK_DDS_PENV)) * st[RK_DDS_BOTTOM])
+          * st[RK_DDS_SRATIO];
+    st[RK_DDS_TOSC] += tstep;
+    y = rk_syn_dd_naive_tri(st[RK_DDS_TOSC]);
+    y *= 0.3 * rk_syn_dd_env_tick(st + RK_DDS_AENV);
+    y += rk_syn_svf_bp(st + RK_DDS_THIS,
+           rk_syn_dd_env_tick(st + RK_DDS_NENV)
+           * (rk_syn_dd_rand01(st + RK_DDS_SEED) - 0.5));
+    st[RK_DDS_SMOOTH] > 0 ? (st[RK_DDS_SMOOTH] -= 1; y = 0.9 * ly + 0.1 * y;);
+    y = 2 * rk_syn_bell(st + RK_DDS_MUD, y);
+  ) : st[RK_DDS_TYPE] == 1 ? (
+    tstep = 0.5 * rk_syn_lut_exp((1 - 0.4 * st[RK_DDS_ENVEL]
+              * rk_syn_dd_env_tick(st + RK_DDS_PENV)) * st[RK_DDS_BOTTOM])
+          * st[RK_DDS_SRATIO];
+    st[RK_DDS_TOSC] += tstep;
+    y = rk_syn_dd_naive_tri(st[RK_DDS_TOSC]);
+    y = 0.91 * (rk_syn_lut_tanh(2 * y + 0.1) - 0.1) + 0.1 * y;
+    // his noise-retrigger jitter: noise.val < 0.4*rand() ? noise.t = 0
+    st[RK_DDS_NENV + 4] < 0.4 * rk_syn_dd_rand01(st + RK_DDS_SEED) ?
+      st[RK_DDS_NENV + 0] = 0;
+    ae = rk_syn_dd_env_tick(st + RK_DDS_AENV);
+    y += 2 * rk_syn_dd_env_tick(st + RK_DDS_NENV)
+           * (rk_syn_dd_rand01(st + RK_DDS_SEED) - 0.5);
+    st[RK_DDS_SMOOTH] > 0 ? (st[RK_DDS_SMOOTH] -= 1; y = 0.9 * ly + 0.1 * y;);
+    y = rk_syn_bell(st + RK_DDS_MUD, rk_syn_svf_bp(st + RK_DDS_CLAP, y)) * ae;
+  ) : st[RK_DDS_TYPE] == 2 ? (
+    tstep = 0.5 * rk_syn_lut_exp((1 - 0.4 * st[RK_DDS_ENVEL]
+              * rk_syn_dd_env_tick(st + RK_DDS_PENV)) * st[RK_DDS_BOTTOM])
+          * st[RK_DDS_SRATIO];
+    st[RK_DDS_TOSC] += tstep;
+    y = rk_syn_dd_naive_tri(st[RK_DDS_TOSC]);
+    y = 0.91 * (rk_syn_lut_tanh(2 * y + 0.1) - 0.1) + 0.1 * y;
+    ne = rk_syn_dd_env_tick(st + RK_DDS_NENV);
+    ae = rk_syn_dd_env_tick(st + RK_DDS_AENV);
+    y *= 0.5 * ae * ne;
+    // his nonlinear cross-coupling: noise scaled by (1 - amp_env*y*y)
+    y += rk_syn_svf_bp(st + RK_DDS_THIS,
+           ne * ne * (rk_syn_dd_rand01(st + RK_DDS_SEED) - 0.5))
+         * (1 - ae * y * y);
+    st[RK_DDS_SMOOTH] > 0 ? (st[RK_DDS_SMOOTH] -= 1; y = 0.9 * ly + 0.1 * y;);
+    y = rk_syn_bell(st + RK_DDS_MUD, y);
+    st[RK_DDS_FSHIFT] ? y = rk_syn_dd_shift_tick(st + RK_DDS_SHIFT, y);
+  );
+
+  st[RK_DDS_PREVY] = y;
+  y;
+);
+
+// ── his band-limited square family (drum_elements 34-71) ──────────────────
+function rk_syn_dd_poly_aa_sq(t, dt)
+global()
+(
+  t < dt ? ( t /= dt; t + t - t * t - 1.0 ) :
+  t > 1.0 - dt ? ( t = (t - 1.0) / dt; t * t + t + t + 1.0 ) : 0;
+);
+
+function rk_syn_dd_sqs(t)
+global()
+(
+  2.0 * (t - floor(t) > 0.5) - 1.0;
+);
+
+function rk_syn_dd_sq(t, dt, duty)
+local(phase, y)
+global()
+(
+  phase = t - floor(t);
+  y = 2.0 * (phase > duty) - 1.0;
+  y - rk_syn_dd_poly_aa_sq(phase, dt)
+    + rk_syn_dd_poly_aa_sq(phase + (1.0 - duty) - floor(phase + (1.0 - duty)), dt);
+);
+
+// ============================================================================
+// DD-101 HAT — synth types 0, 1, 2. Ported from hat_reset (948) / hat_tick
+// (1155) of drum_elements v0.18.
+//
+// ⚠️ TYPE 3 IS NOT A SYNTH ENGINE - it is `chan.start_sample()` /
+// `chan.play_channel()`, his v0.18 custom-sample feature. Out of scope: Swing
+// already has sample layers. Same applies to clap/ride/rim/shaker type 3.
+//
+// ⭐ TYPE 1 IS THE HARDWARE-MEASURED 808. His comments give the measured duty
+// cycle (D = 47.98%) and oscillator frequencies (205.3 / 369.6 / 304.4 /
+// 522.7 Hz). His slider is hat_type=0<0,1,1> - it DEFAULTS TO 0 and caps at 1,
+// so type 2 is unreachable in his UI and the 808 was never the default sound.
+//
+// ⚠️ `k1_3_rel` divides by `israte` in types 0 and 2 but by `israte_with_decay`
+// in type 1. Not a typo on our part - his source genuinely differs. Exactly the
+// asymmetry a re-derivation would smooth away.
+//
+// ⚠️ OSCILLATOR PHASES t1..t13 ARE FREE-RUNNING - hat_reset never zeroes them,
+// only the sample counter `t`. Each hit catches the bank at a different phase.
+// Our reset preserves them identically. (Swing's memset-on-voice-steal is a
+// separate scenario and does zero them; noted, not a parity concern.)
+//
+// ⚠️ `a1_2` carries a per-hit `(0.95 + 0.1*rand())` randomisation, so no two
+// triggers are identical even in his engine. The harness pins it on both sides.
+//
+// NOISE: all three types use rand() inline.
+//   type 1 - noise term is gated by `current_hat_body`; body=0 => exact null.
+//   type 2 - every rand term carries sqr(s2); a2=0 => s2 stays 0 => exact null.
+//   type 0 - metal2 adds a bare `0.0044*(rand()-0.5)` that nothing gates.
+//            NO exact null possible; coefficient-level parity only (spec §6.4).
+//
+// state: 117 cells.
+// ============================================================================
+RK_DDH_T     = 0;    // sample counter (his `t`), reset per trigger
+RK_DDH_SEED  = 1;
+RK_DDH_TYPE  = 2;
+RK_DDH_BODY  = 3;    // current_hat_body
+RK_DDH_PH    = 4;    // t1..t13   -> 4..16   (FREE-RUNNING, never reset)
+RK_DDH_DT    = 17;   // dt1..dt13 -> 17..29
+// envelope blocks: [0]=s [1]=n [2]=k_atk [3]=k_rel [4]=a [5]=k_rel_fast
+RK_DDH_E12   = 30;   // his s1_2 / n1_2 / k1_2_atk / k1_2_rel / a1_2
+RK_DDH_E13   = 36;
+RK_DDH_E2    = 42;
+RK_DDH_E3    = 48;
+RK_DDH_BP    = 54;
+RK_DDH_BP2   = 61;
+RK_DDH_BPS1  = 68;
+RK_DDH_BPS2  = 75;
+RK_DDH_BPS3  = 82;
+RK_DDH_LP    = 89;
+RK_DDH_HP1   = 96;
+RK_DDH_HP2   = 103;
+RK_DDH_HP3   = 110;
+RK_DDH_CELLS = 117;
+
+function rk_syn_dd_hat_reset(st, htype, closed, hattack, hdecay, htone, hbody)
+local(af, df, idec, isr_dec, isr_tone, tc, open, d7)
+global(srate, RK_DDH_T, RK_DDH_SEED, RK_DDH_TYPE, RK_DDH_BODY, RK_DDH_DT,
+       RK_DDH_E12, RK_DDH_E13, RK_DDH_E2, RK_DDH_E3,
+       RK_DDH_BP, RK_DDH_BP2, RK_DDH_BPS1, RK_DDH_BPS2, RK_DDH_BPS3,
+       RK_DDH_LP, RK_DDH_HP1, RK_DDH_HP2, RK_DDH_HP3)
+(
+  st[RK_DDH_TYPE] = htype;
+  st[RK_DDH_BODY] = hbody;
+  st[RK_DDH_T]    = 0;                    // ⚠️ phases at RK_DDH_PH are NOT reset
+  st[RK_DDH_SEED] <= 0 ? st[RK_DDH_SEED] = 66666;
+
+  open     = 1 - closed;
+  tc       = 2 * htone - 1;               // his tone_ctrl
+  isr_tone = (1 / srate) * (0.8 + 0.4 * htone);
+
+  d7 = 3392.9200658769764 * isr_tone;     // shared metal base, all types
+  st[RK_DDH_DT + 6]  = d7;
+  st[RK_DDH_DT + 7]  = d7 * 1.4471;
+  st[RK_DDH_DT + 8]  = d7 * 1.6170;
+  st[RK_DDH_DT + 9]  = d7 * 1.9265;
+  st[RK_DDH_DT + 10] = d7 * 2.5028;
+  st[RK_DDH_DT + 11] = d7 * 2.6637;
+
+  htype == 1 ? (
+    // ── the 808. Measured: duty 47.98%, oscillators 205.3/369.6/304.4/522.7
+    rk_syn_dd_svf_set_keep(st + RK_DDH_BP,  3210,     0.17228);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_BP2, 6963.75,  0.21733);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_HP1, 2477.49,  1.04538744609);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_HP2, 8268.56,  1.16018963454 - 0.2 * hbody);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_HP3, 10433.49, 0.2170202297);
+    st[RK_DDH_DT + 0] = 205.3 * isr_tone;
+    st[RK_DDH_DT + 1] = 369.6 * isr_tone;
+    st[RK_DDH_DT + 2] = 304.4 * isr_tone;
+    st[RK_DDH_DT + 3] = 522.7 * isr_tone;
+  ) : htype == 0 ? (
+    rk_syn_dd_svf_set_keep(st + RK_DDH_BP,   6666,                  1/2);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_BPS1, 1529.49 + tc * 100,    0.04);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_BPS2, 988.49  + tc * 100,    0.05);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_BPS3, 3800.49 + tc * 1000,   0.05);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_BP2,  6963.75,               0.21733);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_LP,   3000.49,               1.14538744609);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_HP1,  2477.49,               1.04538744609);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_HP2,  8268.56,               1.16018963454);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_HP3,  10433.49,              0.2170202297);
+    st[RK_DDH_DT + 0] = 1014.3 * isr_tone;
+    st[RK_DDH_DT + 1] = 1529.6 * isr_tone;
+    st[RK_DDH_DT + 2] = 3737.4 * isr_tone;
+    st[RK_DDH_DT + 3] = 1491.7 * isr_tone;
+    st[RK_DDH_DT + 5]  = 0.825 * d7;
+    st[RK_DDH_DT + 4]  = 0.406 * d7;
+    st[RK_DDH_DT + 12] = 0.106 * d7;
+  ) : htype == 2 ? (
+    rk_syn_dd_svf_set_keep(st + RK_DDH_BP,   5666,                  1.5);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_BPS1, 8529.49 + tc * 100,    0.2 - 0.18 * open);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_BPS2, 8388.49 + tc * 100,    0.2);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_BPS3, 8120.49 + tc * 1000,   0.68);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_BP2,  1100.75,               0.51733);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_LP,   11100.49,              0.7538744609 + 0.5 * open);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_HP1,  377.49,                0.034538744609 + 0.5 * open);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_HP2,  770.56 + 4000 * (1 - closed) + 50 * tc,
+                                             0.056018963454 + 0.5 * open);
+    rk_syn_dd_svf_set_keep(st + RK_DDH_HP3,  664.49,                0.020202297 + 0.5 * open);
+    st[RK_DDH_DT + 0] = 5014.3 * isr_tone;
+    st[RK_DDH_DT + 1] = 4429.6 * isr_tone;
+    st[RK_DDH_DT + 2] = 5737.4 * isr_tone;
+    st[RK_DDH_DT + 3] = 6491.7 * isr_tone;
+    st[RK_DDH_DT + 5]  = 0.825 * d7;
+    st[RK_DDH_DT + 4]  = 0.406 * d7;
+    st[RK_DDH_DT + 12] = 0.106 * d7;
+  );
+
+  // ── the four fitted envelopes (his comment: "Best fit curves fitting to
+  //    squared exponential curves (amplitude, attack, release)") ──
+  af      = pow(10, hattack - 0.5);
+  df      = pow(10, -(hdecay - 0.5));
+  closed ? df = df * 2;                   // closed = same voice, double decay
+  idec    = 1.0 / df;
+  isr_dec = (1 / srate) * df;
+
+  st[RK_DDH_E12 + 4] = 5.886297285230614
+                     * (0.5 + (idec > 1.0 ? 1.0 : idec) * 0.5)
+                     * (0.95 + 0.1 * rk_syn_dd_rand01(st + RK_DDH_SEED));
+  st[RK_DDH_E12 + 1] = 0.13362501578292 * srate * af;
+  st[RK_DDH_E12 + 2] = 7.264430222920869 / st[RK_DDH_E12 + 1];
+  st[RK_DDH_E12 + 3] = 10 * 7.264430222920869 * isr_dec / 12.830314491926522;
+
+  st[RK_DDH_E13 + 4] = 2.446983835532773;
+  st[RK_DDH_E13 + 1] = 0.0013941882299170012 * srate * af;
+  st[RK_DDH_E13 + 2] = 7.264430222920869 / st[RK_DDH_E13 + 1];
+  // ⚠️ israte_with_decay for type 1, plain israte for types 0 and 2. His.
+  st[RK_DDH_E13 + 3] = 7.264430222920869
+                     * (htype == 1 ? isr_dec : (1 / srate))
+                     / 11.784588871968632;
+
+  st[RK_DDH_E2 + 4] = 5.112817165724925;
+  st[RK_DDH_E2 + 1] = 0.023312507777462504 * srate * af;
+  st[RK_DDH_E2 + 2] = 7.264430222920869 / st[RK_DDH_E2 + 1];
+  st[RK_DDH_E2 + 3] = 7.264430222920869 * isr_dec / 2.082148383059353;
+
+  st[RK_DDH_E3 + 4] = 13.459926564551697;
+  st[RK_DDH_E3 + 1] = 0.0014790265731799877 * srate * af;
+  st[RK_DDH_E3 + 2] = 7.264430222920869 / st[RK_DDH_E3 + 1];
+  st[RK_DDH_E3 + 3] = 7.264430222920869 * isr_dec / 0.21747253516471457;
+
+  st[RK_DDH_E12 + 5] = st[RK_DDH_E12 + 3] * 9;   // his *_rel_fast (hat_stop)
+  st[RK_DDH_E13 + 5] = st[RK_DDH_E13 + 3] * 2;
+  st[RK_DDH_E2  + 5] = st[RK_DDH_E2  + 3] * 2;
+  st[RK_DDH_E3  + 5] = st[RK_DDH_E3  + 3] * 2;
+);
+
+function rk_syn_dd_hat_tick(st)
+local(oscs, v1, v2, v3, metal2, metal3, nz, nz2, tt, s2s, out)
+global(RK_DDH_T, RK_DDH_SEED, RK_DDH_TYPE, RK_DDH_BODY, RK_DDH_PH, RK_DDH_DT,
+       RK_DDH_E12, RK_DDH_E13, RK_DDH_E2, RK_DDH_E3,
+       RK_DDH_BP, RK_DDH_BP2, RK_DDH_BPS1, RK_DDH_BPS2, RK_DDH_BPS3,
+       RK_DDH_LP, RK_DDH_HP1, RK_DDH_HP2, RK_DDH_HP3)
+(
+  out = 0;
+  tt  = st[RK_DDH_T];
+
+  st[RK_DDH_PH + 0] += st[RK_DDH_DT + 0];
+  st[RK_DDH_PH + 1] += st[RK_DDH_DT + 1];
+  st[RK_DDH_PH + 2] += st[RK_DDH_DT + 2];
+  st[RK_DDH_PH + 3] += st[RK_DDH_DT + 3];
+
+  st[RK_DDH_TYPE] == 2 ? (
+    oscs = 0.4 * (rk_syn_dd_sq(st[RK_DDH_PH + 0], st[RK_DDH_DT + 0], 0.5)
+                + rk_syn_dd_sq(st[RK_DDH_PH + 1], st[RK_DDH_DT + 1], 0.5))
+         + rk_syn_dd_sq(st[RK_DDH_PH + 2], st[RK_DDH_DT + 2], 0.5)
+         + rk_syn_dd_sq(st[RK_DDH_PH + 3], st[RK_DDH_DT + 3], 0.5);
+  ) : (
+    oscs = rk_syn_dd_sq(st[RK_DDH_PH + 0], st[RK_DDH_DT + 0], 0.5)
+         + rk_syn_dd_sq(st[RK_DDH_PH + 1], st[RK_DDH_DT + 1], 0.5)
+         + rk_syn_dd_sq(st[RK_DDH_PH + 2], st[RK_DDH_DT + 2], 0.5)
+         + rk_syn_dd_sq(st[RK_DDH_PH + 3], st[RK_DDH_DT + 3], 0.5);
+  );
+
+  st[RK_DDH_PH + 6]  += st[RK_DDH_DT + 6];
+  st[RK_DDH_PH + 7]  += st[RK_DDH_DT + 7];
+  st[RK_DDH_PH + 8]  += st[RK_DDH_DT + 8];
+  st[RK_DDH_PH + 9]  += st[RK_DDH_DT + 9];
+  st[RK_DDH_PH + 10] += st[RK_DDH_DT + 10];
+  st[RK_DDH_PH + 11] += st[RK_DDH_DT + 11];
+
+  st[RK_DDH_TYPE] == 1 ? (
+    metal2 = 0.0045 * (
+      rk_syn_dd_sq(st[RK_DDH_PH + 6],  st[RK_DDH_DT + 6],  0.5) +
+      rk_syn_dd_sq(st[RK_DDH_PH + 7],  st[RK_DDH_DT + 7],  0.5) +
+      rk_syn_dd_sq(st[RK_DDH_PH + 8],  st[RK_DDH_DT + 8],  0.5) +
+      rk_syn_dd_sq(st[RK_DDH_PH + 9],  st[RK_DDH_DT + 9],  0.5) +
+      rk_syn_dd_sq(st[RK_DDH_PH + 10], st[RK_DDH_DT + 10], 0.5) +
+      rk_syn_dd_sq(st[RK_DDH_PH + 11], st[RK_DDH_DT + 11], 0.5));
+    nz2 = rk_syn_dd_rand01(st + RK_DDH_SEED);
+    oscs += 0.1 * st[RK_DDH_BODY]
+          * ((nz2 * nz2 - 0.5) * st[RK_DDH_E2] * st[RK_DDH_E2]);
+  ) : st[RK_DDH_TYPE] == 0 ? (
+    st[RK_DDH_PH + 4]  += st[RK_DDH_DT + 4];
+    st[RK_DDH_PH + 5]  += st[RK_DDH_DT + 5];
+    st[RK_DDH_PH + 12] += st[RK_DDH_DT + 12];
+    metal2 = 0.003 * (
+      rk_syn_dd_sq(st[RK_DDH_PH + 6],  st[RK_DDH_DT + 6],  0.5) +
+      rk_syn_dd_sq(st[RK_DDH_PH + 7],  st[RK_DDH_DT + 7],  0.5) +
+      rk_syn_dd_sq(st[RK_DDH_PH + 8],  st[RK_DDH_DT + 8],  0.5) +
+      rk_syn_dd_sq(st[RK_DDH_PH + 9],  st[RK_DDH_DT + 9],  0.5) +
+      rk_syn_dd_sq(st[RK_DDH_PH + 10], st[RK_DDH_DT + 10], 0.5) +
+      rk_syn_dd_sq(st[RK_DDH_PH + 11], st[RK_DDH_DT + 11], 0.5) +
+      0.28 * rk_syn_dd_sq(st[RK_DDH_PH + 5],  st[RK_DDH_DT + 5],  0.5) +
+      0.06 * rk_syn_dd_sq(st[RK_DDH_PH + 12], st[RK_DDH_DT + 12], 0.5) +
+      0.20 * rk_syn_dd_sq(st[RK_DDH_PH + 4],  st[RK_DDH_DT + 4],  0.5))
+      + 0.0044 * (rk_syn_dd_rand01(st + RK_DDH_SEED) - 0.5);
+  ) : (
+    metal2 = 0.002 * (
+      0.85 * rk_syn_dd_sqs(st[RK_DDH_PH + 6])  +
+      0.90 * rk_syn_dd_sqs(st[RK_DDH_PH + 7])  +
+             rk_syn_dd_sqs(st[RK_DDH_PH + 8])  +
+      0.60 * rk_syn_dd_sqs(st[RK_DDH_PH + 9])  +
+      1.20 * rk_syn_dd_sqs(st[RK_DDH_PH + 10]) +
+      1.30 * rk_syn_dd_sqs(st[RK_DDH_PH + 11]));
+  );
+
+  st[RK_DDH_TYPE] == 1 ? (
+    v1 = 2.40728073 * rk_syn_svf_bp(st + RK_DDH_BP,  oscs);
+    v2 = v3 = 3.324654 * rk_syn_svf_bp(st + RK_DDH_BP2, oscs);
+  ) : st[RK_DDH_TYPE] == 0 ? (
+    v2 = v3 = 1.824654 * rk_syn_svf_bp(st + RK_DDH_BP2, oscs);
+  ) : (
+    v2 = 1.824654 * rk_syn_svf_bp(st + RK_DDH_BP2, oscs);
+  );
+
+  // the four envelopes: s += (t < n) ? k_atk*(a - s) : -k_rel*s
+  st[RK_DDH_E12] += tt < st[RK_DDH_E12 + 1] ?
+    st[RK_DDH_E12 + 2] * (st[RK_DDH_E12 + 4] - st[RK_DDH_E12]) :
+    -st[RK_DDH_E12 + 3] * st[RK_DDH_E12];
+  st[RK_DDH_E13] += tt < st[RK_DDH_E13 + 1] ?
+    st[RK_DDH_E13 + 2] * (st[RK_DDH_E13 + 4] - st[RK_DDH_E13]) :
+    -st[RK_DDH_E13 + 3] * st[RK_DDH_E13];
+  st[RK_DDH_E2] += tt < st[RK_DDH_E2 + 1] ?
+    st[RK_DDH_E2 + 2] * (st[RK_DDH_E2 + 4] - st[RK_DDH_E2]) :
+    -st[RK_DDH_E2 + 3] * st[RK_DDH_E2];
+  st[RK_DDH_E3] += tt < st[RK_DDH_E3 + 1] ?
+    st[RK_DDH_E3 + 2] * (st[RK_DDH_E3 + 4] - st[RK_DDH_E3]) :
+    -st[RK_DDH_E3 + 3] * st[RK_DDH_E3];
+
+  st[RK_DDH_T] = tt + 1;
+  s2s = st[RK_DDH_E2] * st[RK_DDH_E2];
+
+  st[RK_DDH_TYPE] == 1 ? (
+    out = 0.00012 * (
+        rk_syn_svf_hp(st + RK_DDH_HP1, v1) * st[RK_DDH_E12] * st[RK_DDH_E12]
+      + 2.1493863499171737 * s2s * st[RK_DDH_E13] * st[RK_DDH_E13]
+        * rk_syn_svf_hp(st + RK_DDH_HP2, v2)
+      + 3.1827788623083535 * st[RK_DDH_E3] * st[RK_DDH_E3]
+        * rk_syn_svf_hp(st + RK_DDH_HP3, v3))
+      + metal2 * st[RK_DDH_E3];
+  ) : st[RK_DDH_TYPE] == 0 ? (
+    nz  = (rk_syn_dd_rand01(st + RK_DDH_SEED) - 0.5) * s2s * st[RK_DDH_E12];
+    nz2 = 2 * ((rk_syn_dd_rand01(st + RK_DDH_SEED)
+              * rk_syn_dd_rand01(st + RK_DDH_SEED) - 0.5) * s2s);
+    out = 0.003 * (
+        0.70 * rk_syn_svf_bp(st + RK_DDH_BP,   nz)
+      + st[RK_DDH_BODY] * rk_syn_svf_bp(st + RK_DDH_LP, nz2)
+      + 0.05 * rk_syn_svf_bp(st + RK_DDH_BPS1, nz)
+      + 0.05 * rk_syn_svf_bp(st + RK_DDH_BPS2, nz)
+      + 0.06 * rk_syn_svf_bp(st + RK_DDH_BPS3, nz))
+      + 0.0001 * (
+        1.1493863499171737 * s2s * st[RK_DDH_E13] * st[RK_DDH_E13]
+        * rk_syn_svf_hp(st + RK_DDH_HP2, v2)
+      + 3.1827788623083535 * st[RK_DDH_E3] * st[RK_DDH_E3]
+        * rk_syn_svf_hp(st + RK_DDH_HP3, v3))
+      + metal2 * st[RK_DDH_E3] * st[RK_DDH_E13];
+  ) : (
+    nz  = (rk_syn_dd_rand01(st + RK_DDH_SEED) - 0.5) * s2s * st[RK_DDH_E12];
+    nz2 = 2 * ((rk_syn_dd_rand01(st + RK_DDH_SEED)
+              * rk_syn_dd_rand01(st + RK_DDH_SEED) - 0.5) * s2s);
+    // his noise3 is computed and never used - kept because it consumes a
+    // rand() call and therefore shifts his sequence. Dead in his source.
+    rk_syn_dd_rand01(st + RK_DDH_SEED);
+    metal3 = 0.003 * (
+        0.005 * rk_syn_svf_bp(st + RK_DDH_BP, nz) * s2s
+      + 0.04 * st[RK_DDH_E2] * st[RK_DDH_E13] * st[RK_DDH_E2]
+        * rk_syn_svf_bp(st + RK_DDH_LP, nz2)
+      + 0.05 * rk_syn_svf_bp(st + RK_DDH_BPS1, nz)
+      + 0.05 * rk_syn_svf_bp(st + RK_DDH_BPS2, nz))
+      + (metal2 + 0.00004 * (
+          rk_syn_svf_hp(st + RK_DDH_HP2, nz)
+        + rk_syn_svf_hp(st + RK_DDH_HP1, nz)
+        + rk_syn_svf_hp(st + RK_DDH_HP3, nz)))
+        * st[RK_DDH_E3] * st[RK_DDH_E13]
+      + 0.03 * v2 * st[RK_DDH_E3];
+    out = metal3;
+  );
+
+  out;
+);
+
+// ============================================================================
+// DD-101 CLAP — synth types 0, 1, 2. Ported from clap_reset (303) / clap_tick
+// (444). Type 3 is start_sample (sampler) — out of scope.
+//
+// ⚠️ THE CLAP HAS NO DETERMINISTIC AUDIO PATH. All three output terms —
+// attack, wash, attack_hf — are rand()-driven, and the level constants are
+// fixed. Silencing the noise leaves silence, so NO output null is possible for
+// any type. Verified instead by (a) nulling the ENVELOPE TRAJECTORY, which is
+// fully deterministic and is the multi-impulse retrigger machine that makes a
+// clap a clap, and (b) coefficient parity on the 5 filters + 3 levels.
+//
+// ⚠️ In his source `attack` is BOTH a bare scratch variable and a namespace
+// (`attack.state`, `attack.k1`, ...). EEL2 treats those as different
+// variables. Ported as separate cells + a local.
+//
+// state: 52 cells.
+// ============================================================================
+RK_DDC_SEED  = 0;
+RK_DDC_TYPE  = 1;
+RK_DDC_AST   = 2;    // attack.state
+RK_DDC_AKC   = 3;    // attack.k_current
+RK_DDC_AK1   = 4;
+RK_DDC_AK2   = 5;
+RK_DDC_AK3   = 6;
+RK_DDC_ATH   = 7;    // attack.thresh
+RK_DDC_ASN   = 8;    // attack.snap
+RK_DDC_WST   = 9;    // wash.state
+RK_DDC_WRT   = 10;   // wash.rate
+RK_DDC_ATL   = 11;   // atk_level
+RK_DDC_WSL   = 12;   // wash_level
+RK_DDC_HFL   = 13;   // hf_level
+RK_DDC_SR    = 14;   // type 2 oscillator rate
+RK_DDC_TS    = 15;
+RK_DDC_TS2   = 16;
+RK_DDC_HP    = 17;
+RK_DDC_BP    = 24;
+RK_DDC_HP2   = 31;
+RK_DDC_BP2   = 38;
+RK_DDC_BP3   = 45;
+RK_DDC_CELLS = 52;
+
+function rk_syn_dd_clap_reset(st, ctype, cattack, cdecay)
+local(t_s, t2_s, t3_s, t4_s, t_wash)
+global(srate, RK_DDC_SEED, RK_DDC_TYPE, RK_DDC_AST, RK_DDC_AKC, RK_DDC_AK1,
+       RK_DDC_AK2, RK_DDC_AK3, RK_DDC_ATH, RK_DDC_ASN, RK_DDC_WST, RK_DDC_WRT,
+       RK_DDC_ATL, RK_DDC_WSL, RK_DDC_HFL, RK_DDC_SR, RK_DDC_TS, RK_DDC_TS2,
+       RK_DDC_HP, RK_DDC_BP, RK_DDC_HP2, RK_DDC_BP2, RK_DDC_BP3)
+(
+  st[RK_DDC_TYPE] = ctype;
+  st[RK_DDC_SEED] <= 0 ? st[RK_DDC_SEED] = 99999;
+  st[RK_DDC_ATH]  = pow(10, -24 / 20);
+  st[RK_DDC_ASN]  = 0;
+  st[RK_DDC_AST]  = 1;
+
+  ctype == 0 ? (
+    // his: -24 dB at 9, 19, 33 and 240 ms via a simple multiplicative process
+    t_s    = 10  * 0.001 * (0.5 + cattack);
+    t2_s   = 14  * 0.001 * (0.5 + cattack);
+    t3_s   = 210 * 0.001 * (0.5 + cattack + max(0, cdecay - 0.25));
+    t_wash = t3_s + 240 * (0.5 + 2 * cdecay) * 0.001;
+
+    st[RK_DDC_AK1] = pow(10, -24  / (20 * t_s  * srate));
+    st[RK_DDC_AK2] = pow(10, -24  / (20 * t2_s * srate));
+    st[RK_DDC_AK3] = pow(10, -100 / (20 * t3_s * srate));
+    st[RK_DDC_WRT] = pow(10, -40  / (20 * t_wash * srate));
+    st[RK_DDC_WST] = 1;
+
+    rk_syn_dd_svf_set_keep(st + RK_DDC_HP,  550,  2.0);
+    rk_syn_dd_svf_set_keep(st + RK_DDC_BP,  908,  1.0);
+    rk_syn_dd_svf_set_keep(st + RK_DDC_HP2, 8000, 1.0);
+    rk_syn_dd_svf_set_keep(st + RK_DDC_BP2, 880,  0.72);
+    rk_syn_dd_svf_set_keep(st + RK_DDC_BP3, 850,  0.74);
+
+    st[RK_DDC_ATL] = 5.25;    // 14.4 dB
+    st[RK_DDC_WSL] = 0.5888;  // -11 + 6.4 dB
+    st[RK_DDC_HFL] = 0.305;   // -13.5 + 0.4 + 2.8 dB
+  ) : ctype == 1 ? (
+    t_s    = 12  * 0.001 * (0.5 + cattack);   // his: computed, then discarded
+    t2_s   = 13  * 0.001 * (0.5 + cattack);
+    t3_s   = 13  * 0.001 * (0.5 + cattack);
+    t4_s   = 350 * 0.001 * (0.5 + cattack);
+    t_wash = 500 * (0.5 + 2 * cdecay) * 0.001;
+
+    st[RK_DDC_AK1] = pow(10, -24  / (20 * t2_s * srate));
+    st[RK_DDC_AK2] = pow(10, -24  / (20 * t3_s * srate));
+    st[RK_DDC_AK3] = pow(10, -100 / (20 * t4_s * srate));
+    st[RK_DDC_WRT] = pow(10, -40  / (20 * t_wash * srate));
+    st[RK_DDC_WST] = 0;       // starts silent, armed at the 2nd snap
+
+    rk_syn_dd_svf_set_keep(st + RK_DDC_HP,  650, 2.38);
+    rk_syn_dd_svf_set_keep(st + RK_DDC_BP,  990, 0.5);
+    rk_syn_dd_svf_set_keep(st + RK_DDC_BP2, 990, 1.0);
+    rk_syn_dd_svf_set_keep(st + RK_DDC_BP3, 970, 1.0);
+
+    st[RK_DDC_ATL] = 4.36;    // 12.8 dB
+    st[RK_DDC_WSL] = 0.16;    // -16 dB
+    st[RK_DDC_HFL] = 0;
+  ) : ctype == 2 ? (
+    // ⚠️ type 2 drives its stage times from DECAY where 0/1 use ATTACK
+    t_s    = 12  * 0.001 * (0.5 + cdecay);
+    t2_s   = 13  * 0.001 * (0.5 + cdecay);
+    t3_s   = 13  * 0.001 * (0.5 + cdecay);
+    t4_s   = 350 * 0.001 * (0.5 + cdecay);
+    t_wash = 500 * (0.5 + 2 * cdecay) * 0.001;
+
+    st[RK_DDC_AK1] = pow(10, -24  / (20 * t2_s * srate));
+    st[RK_DDC_AK2] = pow(10, -24  / (20 * t3_s * srate));
+    st[RK_DDC_AK3] = pow(10, -100 / (20 * t4_s * srate));
+    st[RK_DDC_SR]  = 970 * (1 / srate) * (0.5 + cattack);
+    st[RK_DDC_WRT] = pow(10, -40 / (20 * t_wash * srate));
+    st[RK_DDC_WST] = 1;
+
+    rk_syn_dd_svf_set_keep(st + RK_DDC_HP,  650,  2.38);
+    rk_syn_dd_svf_set_keep(st + RK_DDC_HP2, 990,  0.4);
+    rk_syn_dd_svf_set_keep(st + RK_DDC_BP,  990,  1.25);
+    rk_syn_dd_svf_set_keep(st + RK_DDC_BP2, 990,  1.0);
+    rk_syn_dd_svf_set_keep(st + RK_DDC_BP3, 1970, 1.0);
+
+    st[RK_DDC_ATL] = 4.36;
+    st[RK_DDC_WSL] = 0.26;
+    st[RK_DDC_HFL] = 0.8;
+  );
+  st[RK_DDC_AKC] = st[RK_DDC_AK1];
+);
+
+// The deterministic half, split out so the harness can null it directly:
+// advances attack.state / wash.state one sample, running the 3-snap retrigger
+// machine. Returns nothing; read RK_DDC_AST / RK_DDC_WST.
+function rk_syn_dd_clap_env(st)
+global(RK_DDC_TYPE, RK_DDC_AST, RK_DDC_AKC, RK_DDC_AK1, RK_DDC_AK2, RK_DDC_AK3,
+       RK_DDC_ATH, RK_DDC_ASN, RK_DDC_WST, RK_DDC_WRT)
+(
+  st[RK_DDC_AST] *= st[RK_DDC_AKC];
+  st[RK_DDC_AST] < st[RK_DDC_ATH] && st[RK_DDC_ASN] < 3 ? (
+    st[RK_DDC_AST] = 1;
+    st[RK_DDC_ASN] += 1;
+    st[RK_DDC_ASN] == 1 ? st[RK_DDC_AKC] = st[RK_DDC_AK1] :
+    st[RK_DDC_ASN] == 2 ? (
+      st[RK_DDC_AKC] = st[RK_DDC_AK2];
+      st[RK_DDC_TYPE] == 1 ? st[RK_DDC_WST] = 1;
+    ) :
+    st[RK_DDC_ASN] == 3 ? st[RK_DDC_AKC] = st[RK_DDC_AK3];
+  );
+  st[RK_DDC_WST] *= st[RK_DDC_WRT];
+);
+
+function rk_syn_dd_clap_tick(st)
+local(atk, wsh, atk_hf, srt, srt2, yy)
+global(RK_DDC_SEED, RK_DDC_TYPE, RK_DDC_AST, RK_DDC_WST,
+       RK_DDC_ATL, RK_DDC_WSL, RK_DDC_HFL, RK_DDC_SR, RK_DDC_TS, RK_DDC_TS2,
+       RK_DDC_HP, RK_DDC_BP, RK_DDC_HP2, RK_DDC_BP2, RK_DDC_BP3)
+(
+  st[RK_DDC_TYPE] < 2 ? (
+    rk_syn_dd_clap_env(st);
+    atk = rk_syn_svf_hp(st + RK_DDC_HP,
+            rk_syn_svf_bp(st + RK_DDC_BP,
+              st[RK_DDC_AST] * (rk_syn_dd_rand01(st + RK_DDC_SEED) - 0.5)));
+    atk_hf = st[RK_DDC_TYPE] == 0 ?
+      rk_syn_svf_hp(st + RK_DDC_HP2,
+        st[RK_DDC_AST] * (rk_syn_dd_rand01(st + RK_DDC_SEED) - 0.5)) : 0;
+    wsh = rk_syn_svf_bp(st + RK_DDC_BP3,
+            rk_syn_svf_bp(st + RK_DDC_BP2,
+              st[RK_DDC_WST] * (rk_syn_dd_rand01(st + RK_DDC_SEED) - 0.5)));
+  ) : (
+    rk_syn_dd_clap_env(st);
+    srt = st[RK_DDC_SR] * (1.0 + 1.0 * st[RK_DDC_AST]);
+    st[RK_DDC_TS] += srt;
+    st[RK_DDC_TS] > 1 ? st[RK_DDC_TS] = 0;
+    srt2 = st[RK_DDC_SR] * (1.0 - 0.5 * st[RK_DDC_AST]);
+    st[RK_DDC_TS2] += srt2;
+    st[RK_DDC_TS2] > 1.0 ? st[RK_DDC_TS2] = 0;
+    yy = rk_syn_dd_poly_aa_sq(st[RK_DDC_TS], srt)
+       + rk_syn_dd_poly_aa_sq(st[RK_DDC_TS2], srt2);
+    atk = rk_syn_svf_hp(st + RK_DDC_HP,
+            rk_syn_svf_bp(st + RK_DDC_BP,
+              st[RK_DDC_AST]
+              * ((1.5 + 0.8 * rk_syn_dd_rand01(st + RK_DDC_SEED)) * yy)));
+    atk_hf = rk_syn_svf_hp(st + RK_DDC_HP2,
+               st[RK_DDC_AST] * (rk_syn_dd_rand01(st + RK_DDC_SEED) - 0.5));
+    wsh = rk_syn_svf_bp(st + RK_DDC_BP3,
+            rk_syn_svf_bp(st + RK_DDC_BP2,
+              st[RK_DDC_WST]
+              * (rk_syn_dd_rand01(st + RK_DDC_SEED) - 0.5 + 0.2 * yy)));
+  );
+
+  st[RK_DDC_ATL] * atk + st[RK_DDC_WSL] * wsh + st[RK_DDC_HFL] * atk_hf;
+);
+
+// ============================================================================
+// DD-101 TOM — types 0, 1, 2. Ported from tom_synth1/2/3 _reset+_eval
+// (1314-1513) and the hi/mid/low dispatch (1515-1606).
+//
+// ⚠️ TYPE -> ENGINE MAPPING IS NOT IN ORDER:
+//      tom_type 0 -> tom_synth2      1 -> tom_synth1      2 -> tom_synth3
+// ⚠️ `which` (0 hi / 1 mid / 2 low) changes core frequencies, gain and
+//    low_scale, not just tune - his three toms are separate voicings, not one
+//    engine transposed. Kept as a reset argument; the macro layer decides how
+//    to expose it (spec §3.2 collapses the three pads into one engine).
+// ⚠️ synth1's punch.dt is in RADIANS (2*pi*f*israte) for its sine recurrence;
+//    synth2/3 use normalised f*israte. Different conventions, both ported.
+// ⚠️ punch.t / punch.t3 are NOT reset per trigger - free-running, like the hat.
+// ⚠️ synth3 calls eval_linearSVF_LP on the filter it *named* `bp`. Not a typo.
+// ⚠️ synth2 and synth3 both init bp2 TWICE; the second call wins. Both kept.
+// ⚠️ synth3's output ternary has no else branch, so |sqp| <= 0.001 yields 0 -
+//    a gate, not a passthrough. And it quantises to 512 steps (a bitcrusher).
+//
+// All three types ARE exact-nullable: their rand() feeds dedicated filters
+// (synth1 bp, synth2/3 lp2+bp2) which the harness zeroes, leaving the
+// deterministic oscillator path intact.
+//
+// state: 49 cells.
+// ============================================================================
+RK_DDT_SEED  = 0;
+RK_DDT_TYPE  = 1;
+RK_DDT_PST   = 2;    // punch.state
+RK_DDT_PST2  = 3;
+RK_DDT_PST3  = 4;
+RK_DDT_PATK  = 5;
+RK_DDT_PK    = 6;
+RK_DDT_PK2   = 7;
+RK_DDT_PK3   = 8;
+RK_DDT_PKATK = 9;
+RK_DDT_PPDEC = 10;   // punch.pitch_decay
+RK_DDT_DT    = 11;
+RK_DDT_DT2   = 12;
+RK_DDT_DT3   = 13;
+RK_DDT_T     = 14;   // free-running
+RK_DDT_T3    = 15;   // free-running
+RK_DDT_SCOEF = 16;   // sine-recurrence coefficient (synth1)
+RK_DDT_SIN1  = 17;
+RK_DDT_SIN2  = 18;
+RK_DDT_LOWSC = 19;   // low_scale (synth2)
+RK_DDT_GAIN  = 20;
+RK_DDT_LP    = 21;
+RK_DDT_LP2   = 28;
+RK_DDT_BP    = 35;
+RK_DDT_BP2   = 42;
+RK_DDT_CELLS = 49;
+
+function rk_syn_dd_tom_reset(st, ttype, which, tune, decay)
+local(t_s, w, tuning, core_freq, shift)
+global(srate, RK_DDT_SEED, RK_DDT_TYPE, RK_DDT_PST, RK_DDT_PST2, RK_DDT_PST3,
+       RK_DDT_PATK, RK_DDT_PK, RK_DDT_PK2, RK_DDT_PK3, RK_DDT_PKATK,
+       RK_DDT_PPDEC, RK_DDT_DT, RK_DDT_DT2, RK_DDT_DT3, RK_DDT_T,
+       RK_DDT_SCOEF, RK_DDT_SIN1, RK_DDT_SIN2, RK_DDT_LOWSC, RK_DDT_GAIN,
+       RK_DDT_LP, RK_DDT_LP2, RK_DDT_BP, RK_DDT_BP2)
+(
+  st[RK_DDT_TYPE] = ttype;
+  st[RK_DDT_SEED] <= 0 ? st[RK_DDT_SEED] = 33333;
+  tuning = pow(2, tune - 0.5);
+
+  ttype == 1 ? (
+    // ── tom_synth1: sine recurrence + band-passed noise ──
+    t_s = 0.3 * (0.5 + decay + 0.2 * (which == 2));
+    st[RK_DDT_PST]   = 1 + 0.1 * (which == 2);
+    st[RK_DDT_PATK]  = 1;
+    st[RK_DDT_PK]    = pow(10, -24 / (20 * t_s * srate));
+    st[RK_DDT_PKATK] = pow(10, -24 / (20 * 0.00025 * srate));
+
+    core_freq = which == 0 ? 154 * tuning :
+                which == 1 ? 147 * tuning : 101 * tuning;
+    st[RK_DDT_DT] = 2.0 * $pi * core_freq / srate;   // RADIANS
+    w = st[RK_DDT_DT];
+    st[RK_DDT_SCOEF] = 2.0 * cos(w);
+    st[RK_DDT_T] += st[RK_DDT_DT];
+    st[RK_DDT_SIN1] = -cos(-w + st[RK_DDT_T]);
+    st[RK_DDT_SIN2] = -cos(-2.0 * w + st[RK_DDT_T]);
+    st[RK_DDT_T] -= st[RK_DDT_DT];
+
+    rk_syn_dd_svf_set_keep(st + RK_DDT_BP, core_freq, 0.5);
+    rk_syn_dd_svf_set_keep(st + RK_DDT_LP, 564, 1);
+  ) : ttype == 0 ? (
+    // ── tom_synth2: 5 naive triangles + cubic bend + 2 noise bands ──
+    t_s = 0.66 * (0.5 + decay + 0.2 * (which == 2));
+    st[RK_DDT_PST]   = 1 + 0.1 * (which == 2);
+    st[RK_DDT_PST2]  = 1;
+    st[RK_DDT_PST3]  = 1;
+    st[RK_DDT_PATK]  = 1;
+    st[RK_DDT_PK]    = pow(10, -24 / (20 * t_s * srate));
+    st[RK_DDT_PK2]   = pow(10, -64 / (20 * t_s * srate));
+    st[RK_DDT_PK3]   = pow(10, -64 / (1  * t_s * srate));
+    st[RK_DDT_PKATK] = pow(10, -24 / (20 * 0.005 * srate));
+    st[RK_DDT_PPDEC] = pow(10, -24 / (20 * 0.5 * srate));
+
+    which == 0 ? (
+      core_freq = 115 * tuning; shift = 30 * tuning;
+      st[RK_DDT_GAIN] = 1.0; st[RK_DDT_LOWSC] = 1.0;
+      st[RK_DDT_DT3] = 115 / srate;
+    ) : which == 1 ? (
+      core_freq = 90 * tuning; shift = 25 * tuning;
+      st[RK_DDT_GAIN] = 1.0; st[RK_DDT_LOWSC] = 1.1;
+      st[RK_DDT_DT3] = 105 / srate;
+    ) : (
+      core_freq = 81 * tuning; shift = 20 * tuning;
+      st[RK_DDT_GAIN] = 0.7; st[RK_DDT_LOWSC] = 1.1;
+      st[RK_DDT_DT3] = 88 / srate;
+    );
+    st[RK_DDT_DT]  = core_freq / srate;
+    st[RK_DDT_DT2] = shift / srate;
+
+    rk_syn_dd_svf_set_keep(st + RK_DDT_BP,  core_freq, 0.9);
+    rk_syn_dd_svf_set_keep(st + RK_DDT_BP2, core_freq, 0.5);   // his, overwritten
+    rk_syn_dd_svf_set_keep(st + RK_DDT_LP,  2564, 1);
+    rk_syn_dd_svf_set_keep(st + RK_DDT_LP2, 444 + core_freq, 0.2);
+    rk_syn_dd_svf_set_keep(st + RK_DDT_BP2, 600 + core_freq, 0.2);
+  ) : ttype == 2 ? (
+    // ── tom_synth3: two naive squares, 512-step quantiser ──
+    t_s = 0.42 * (0.5 + decay + 0.2 * (which == 2));
+    st[RK_DDT_PST]   = 1;
+    st[RK_DDT_PST2]  = 1;
+    st[RK_DDT_PST3]  = 1;
+    st[RK_DDT_PATK]  = 1;
+    st[RK_DDT_PK]    = pow(10, -24 / (20 * t_s * srate));
+    st[RK_DDT_PK2]   = pow(10, -24 / (20 * t_s * srate));
+    st[RK_DDT_PK3]   = pow(10, -60 / (20 * t_s * srate));
+    st[RK_DDT_PKATK] = pow(10, -24 / (20 * 0.005 * srate));
+    st[RK_DDT_PPDEC] = pow(10, -24 / (20 * 0.5 * srate));
+
+    which == 0 ? ( core_freq = 130 * tuning; shift = 140 * tuning; ) :
+    which == 1 ? ( core_freq = 120 * tuning; shift = 130 * tuning;
+                   st[RK_DDT_DT3] = 105 / srate; ) :
+                 ( core_freq = 80  * tuning; shift = 120 * tuning;
+                   st[RK_DDT_DT3] = 88 / srate; );
+    st[RK_DDT_DT]  = core_freq / srate;
+    st[RK_DDT_DT2] = shift / srate;
+
+    rk_syn_dd_svf_set_keep(st + RK_DDT_BP,  600, 2);
+    rk_syn_dd_svf_set_keep(st + RK_DDT_BP2, core_freq, 0.5);   // his, overwritten
+    rk_syn_dd_svf_set_keep(st + RK_DDT_LP,  364, 1);
+    rk_syn_dd_svf_set_keep(st + RK_DDT_LP2, 444 + core_freq, 0.6);
+    rk_syn_dd_svf_set_keep(st + RK_DDT_BP2, 600 + core_freq, 0.2);
+  );
+);
+
+function rk_syn_dd_tom_tick(st)
+local(s, y, nz, sqp)
+global(RK_DDT_SEED, RK_DDT_TYPE, RK_DDT_PST, RK_DDT_PST2, RK_DDT_PST3,
+       RK_DDT_PATK, RK_DDT_PK, RK_DDT_PK2, RK_DDT_PK3, RK_DDT_PKATK,
+       RK_DDT_PPDEC, RK_DDT_DT, RK_DDT_DT2, RK_DDT_DT3, RK_DDT_T, RK_DDT_T3,
+       RK_DDT_SCOEF, RK_DDT_SIN1, RK_DDT_SIN2, RK_DDT_LOWSC, RK_DDT_GAIN,
+       RK_DDT_LP, RK_DDT_LP2, RK_DDT_BP, RK_DDT_BP2)
+(
+  st[RK_DDT_TYPE] == 1 ? (
+    st[RK_DDT_T] += st[RK_DDT_DT];
+    s = st[RK_DDT_SCOEF] * st[RK_DDT_SIN1] - st[RK_DDT_SIN2];
+    st[RK_DDT_SIN2] = st[RK_DDT_SIN1];
+    st[RK_DDT_SIN1] = s;
+    st[RK_DDT_PST]  *= st[RK_DDT_PK];
+    st[RK_DDT_PATK] *= st[RK_DDT_PKATK];
+    y = (1.0 - st[RK_DDT_PATK]) * s * st[RK_DDT_PST] * st[RK_DDT_PST]
+      + 0.5 * rk_syn_svf_lp(st + RK_DDT_LP,
+                rk_syn_svf_bp(st + RK_DDT_BP,
+                  rk_syn_dd_rand01(st + RK_DDT_SEED) - 0.5)) * st[RK_DDT_PST];
+    y * 0.8;
+  ) : st[RK_DDT_TYPE] == 0 ? (
+    st[RK_DDT_T]  += st[RK_DDT_DT] + st[RK_DDT_DT2];
+    st[RK_DDT_T3] += st[RK_DDT_DT3] + st[RK_DDT_DT2];
+    st[RK_DDT_DT2] *= st[RK_DDT_PPDEC];
+
+    s = rk_syn_svf_bp(st + RK_DDT_BP,
+          rk_syn_svf_lp(st + RK_DDT_LP,
+            0.6   * rk_syn_dd_naive_tri(st[RK_DDT_LOWSC] * st[RK_DDT_T]) +
+            0.3   * st[RK_DDT_PST2] * rk_syn_dd_naive_tri(2.0 * st[RK_DDT_T3]) +
+            0.4   * st[RK_DDT_PST2] * rk_syn_dd_naive_tri(2.9 * st[RK_DDT_T3]) +
+            0.5   * rk_syn_dd_naive_tri(0.7 * st[RK_DDT_T]) +
+            0.023 * rk_syn_dd_naive_tri(1.4 * st[RK_DDT_T3])));
+    s += 0.31 * s * s * s * st[RK_DDT_PST2];
+
+    st[RK_DDT_PATK] *= st[RK_DDT_PKATK];
+    st[RK_DDT_PST]  *= st[RK_DDT_PK];
+    st[RK_DDT_PST2] *= st[RK_DDT_PK2];
+    st[RK_DDT_PST3] *= st[RK_DDT_PK3];
+
+    nz  = rk_syn_dd_rand01(st + RK_DDT_SEED) - 0.5;
+    sqp = 2.0 * st[RK_DDT_PST] * st[RK_DDT_PST] * st[RK_DDT_PST];
+    y = st[RK_DDT_GAIN] * ((1.0 - st[RK_DDT_PATK]) * s * sqp
+      + st[RK_DDT_GAIN] * 1.0 * rk_syn_svf_bp(st + RK_DDT_LP2, nz)
+        * st[RK_DDT_PST2] * st[RK_DDT_PST2] * st[RK_DDT_PST2] * st[RK_DDT_PST2]
+      + rk_syn_svf_bp(st + RK_DDT_BP2, nz) * st[RK_DDT_PST3] * st[RK_DDT_PST3]);
+    0.45 * y;
+  ) : (
+    st[RK_DDT_T] += st[RK_DDT_DT] + st[RK_DDT_DT2];
+    st[RK_DDT_DT2] *= st[RK_DDT_PPDEC];
+
+    // ⚠️ his `bp` filter, evaluated as a LOWPASS. Not a typo in the port.
+    s = rk_syn_svf_lp(st + RK_DDT_BP,
+          rk_syn_svf_lp(st + RK_DDT_LP,
+            0.6  * rk_syn_dd_sqs(st[RK_DDT_T]) +
+            0.12 * rk_syn_dd_sqs(2.0 * st[RK_DDT_T])));
+
+    st[RK_DDT_PATK] *= st[RK_DDT_PKATK];
+    st[RK_DDT_PST]  *= st[RK_DDT_PK];
+    st[RK_DDT_PST2] *= st[RK_DDT_PK2];
+    st[RK_DDT_PST3] *= st[RK_DDT_PK3];
+
+    nz  = rk_syn_dd_rand01(st + RK_DDT_SEED) - 0.5;
+    sqp = 2.0 * st[RK_DDT_PST];
+    sqp < 0.95 ? st[RK_DDT_PST] *= st[RK_DDT_PK] * st[RK_DDT_PK]
+                                 * st[RK_DDT_PK] * st[RK_DDT_PK];
+    nz = 2.0 * rk_syn_svf_bp(st + RK_DDT_LP2, nz)
+           * st[RK_DDT_PST2] * st[RK_DDT_PST2]
+       + rk_syn_svf_bp(st + RK_DDT_BP2, nz)
+           * st[RK_DDT_PST3] * st[RK_DDT_PST3];
+    sqp = (1.0 - st[RK_DDT_PATK]) * s * sqp + nz * st[RK_DDT_PST2];
+
+    // ⚠️ no else branch: |sqp| <= 0.001 yields 0. A gate, plus a 512-step
+    // quantiser. Both are his.
+    0.3 * (abs(sqp) > 0.001 ? floor(sqp * 512) / 512 : 0);
+  );
+);
+
+// his band-limited saw (drum_elements 48-56)
+function rk_syn_dd_saw(t, dt)
+local(phase, y)
+global()
+(
+  phase = t - floor(t);
+  y = 2.0 * phase - 1.0;
+  y - rk_syn_dd_poly_aa_sq(phase, dt);
+);
+
+// ============================================================================
+// DD-101 RIDE — synth types 0, 1, 2. Ported from ride_reset_1/2/3 (788/515/575)
+// and ride_tick_1/2/3 (888/736/666). Type 3 is start_sample — out of scope.
+// ⚠️ reset and tick variants are NOT co-located in his file; read by name.
+//
+// THREE DIFFERENT INSTRUMENTS under one name:
+//   t0  the hat-t1 core reused: 4 fixed + 2 tone-swept squares at ride_duty
+//   t1  saws + squares through TWO series freq shifters into 9 peak filters
+//   t2  hat-t0-shaped square bank, retuned, with asymmetric duty cycles
+//
+// ⚠️ ALL THREE ARE UN-NULLABLE (t0: `+ 0.1*rand()` in oscs; t1: noise-driven
+// throughout; t2: bare `0.0044*(rand()-0.5)` in metal2). Verified by
+// coefficient parity + the bit-exact sq()/saw() primitives + ear, the route
+// Checkpoint A validated on snare t0 / hat t0.
+//
+// ⚠️⚠️ PORTED BUG — DO NOT "FIX": in ride_reset_2 his e3.atk and e4.atk both
+// divide by **e1.n**, not their own e3.n / e4.n (and e1.n is 100x smaller).
+// Near-certainly copy-paste, but it defines the sound.
+//
+// ⚠️ DEAD CODE ported as the zeros it is: ride_tick_1's `metal2` is read but
+// never assigned; ride_tick_2's whole crash block sits behind a literal `0 ?`.
+//
+// ⚠️ Types SHARE the filter/envelope slots — a voice is exactly one type, same
+// as the hat. Do not lay them out non-overlapping; t1 alone is ~195 cells.
+//
+// state: 231 cells.
+// ============================================================================
+RK_DDR_SEED  = 0;
+RK_DDR_TYPE  = 1;
+RK_DDR_T     = 2;    // sample counter
+RK_DDR_DUTY  = 3;    // ride_duty latched
+RK_DDR_TONE  = 4;    // ride_tone latched (t0 recomputes dt5/dt6 per sample)
+RK_DDR_PH    = 5;    // t1..t13   -> 5..17
+RK_DDR_DT    = 18;   // dt1..dt13 -> 18..30
+// envelope set A (types 0 and 2): [0]=s [1]=n [2]=k_atk [3]=k_rel [4]=a
+RK_DDR_E12   = 31;
+RK_DDR_E13   = 36;
+RK_DDR_E2    = 41;
+RK_DDR_E3    = 46;
+// envelope set B (type 1): [0]=state [1]=amp [2]=n [3]=atk [4]=rel
+RK_DDR_B1    = 51;
+RK_DDR_B3    = 56;
+RK_DDR_B4    = 61;
+RK_DDR_B2S   = 66;   // e2.state (plain multiplicative decay)
+RK_DDR_B2K   = 67;   // e2.k
+RK_DDR_B4FR  = 68;   // e4.fast_release
+// ten filter slots, shared across types (7 cells each)
+//   slot:  t0/t2 role        t1 role
+RK_DDR_F1    = 69;   // bp              bp_wide
+RK_DDR_F2    = 76;   // bp2             peak1
+RK_DDR_F3    = 83;   // hp1             peak2
+RK_DDR_F4    = 90;   // hp2             peak3
+RK_DDR_F5    = 97;   // hp3             peak4
+RK_DDR_F6    = 104;  // bp3   (t2)      peak5
+RK_DDR_F7    = 111;  // bps1  (t2)      peak6
+RK_DDR_F8    = 118;  // bps2  (t2)      peak7
+RK_DDR_F9    = 125;  // bps3  (t2)      peak8
+RK_DDR_F10   = 132;  // lp    (t2)      peak9
+RK_DDR_SH1   = 139;  // t1 only: his ride.fshift,  110 Hz -> 139..184
+RK_DDR_SH2   = 185;  // t1 only: his fshift2,      0.4 Hz -> 185..230
+RK_DDR_CELLS = 231;
+
+function rk_syn_dd_ride_reset(st, rtype, rattack, rdecay, rtone, rduty)
+local(af, df, idec, isr_dec, isr_dec2, isr_tone, tc, d7, t_s, isr_decay)
+global(srate, RK_DDR_SEED, RK_DDR_TYPE, RK_DDR_T, RK_DDR_DUTY, RK_DDR_TONE,
+       RK_DDR_DT, RK_DDR_E12, RK_DDR_E13, RK_DDR_E2, RK_DDR_E3,
+       RK_DDR_B1, RK_DDR_B3, RK_DDR_B4, RK_DDR_B2S, RK_DDR_B2K, RK_DDR_B4FR,
+       RK_DDR_F1, RK_DDR_F2, RK_DDR_F3, RK_DDR_F4, RK_DDR_F5, RK_DDR_F6,
+       RK_DDR_F7, RK_DDR_F8, RK_DDR_F9, RK_DDR_F10, RK_DDR_SH1, RK_DDR_SH2)
+(
+  st[RK_DDR_TYPE] = rtype;
+  st[RK_DDR_T]    = 0;
+  st[RK_DDR_DUTY] = rduty;
+  st[RK_DDR_TONE] = rtone;
+  st[RK_DDR_SEED] <= 0 ? st[RK_DDR_SEED] = 22222;
+
+  af = pow(10, rattack - 0.5);
+  df = pow(10, -(rdecay - 0.5));
+  idec     = 1.0 / df;
+  isr_dec  = (1 / srate) * df;
+  isr_dec2 = (1 / srate) * df / 2;
+
+  rtype == 0 ? (
+    // ── ride_reset_1: the hat-t1 core, no metal stack ──
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F1, 3210,     0.17228);
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F2, 6963.75,  0.21733);
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F3, 2477.49,  1.04538744609);
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F4, 8268.56,  1.16018963454);
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F5, 10433.49, 0.2170202297);
+    st[RK_DDR_DT + 0] = 205.3 / srate;
+    st[RK_DDR_DT + 1] = 369.6 / srate;
+    st[RK_DDR_DT + 2] = 304.4 / srate;
+    st[RK_DDR_DT + 3] = 522.7 / srate;
+
+    st[RK_DDR_E12 + 4] = 5.886297285230614
+      * (0.5 + (idec > 1.0 ? 1.0 : idec) * 0.5)
+      * (0.95 + 0.1 * rk_syn_dd_rand01(st + RK_DDR_SEED));
+    st[RK_DDR_E12 + 1] = 0.13362501578292 * srate * af;
+    st[RK_DDR_E12 + 2] = 7.264430222920869 / st[RK_DDR_E12 + 1];
+    // ⚠️ NO 10* factor here - the hat's type 1 has one, his ride does not.
+    st[RK_DDR_E12 + 3] = 7.264430222920869 * isr_dec / 12.830314491926522;
+
+    st[RK_DDR_E13 + 4] = 2.446983835532773;
+    st[RK_DDR_E13 + 1] = 0.0013941882299170012 * srate * af;
+    st[RK_DDR_E13 + 2] = 7.264430222920869 / st[RK_DDR_E13 + 1];
+    st[RK_DDR_E13 + 3] = 7.264430222920869 * isr_dec / 11.784588871968632;
+
+    st[RK_DDR_E2 + 4] = 5.112817165724925;
+    st[RK_DDR_E2 + 1] = 0.023312507777462504 * srate * af;
+    st[RK_DDR_E2 + 2] = 7.264430222920869 / st[RK_DDR_E2 + 1];
+    st[RK_DDR_E2 + 3] = 7.264430222920869 * isr_dec / 2.082148383059353;
+
+    st[RK_DDR_E3 + 4] = 13.459926564551697;
+    st[RK_DDR_E3 + 1] = 0.0014790265731799877 * srate * af;
+    st[RK_DDR_E3 + 2] = 7.264430222920869 / st[RK_DDR_E3 + 1];
+    st[RK_DDR_E3 + 3] = 7.264430222920869 * isr_dec / 0.21747253516471457;
+  ) : rtype == 1 ? (
+    // ── ride_reset_2: peak bank + two series freq shifters ──
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F1,  6000,     0.5);    // bp_wide
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F2,  8200.75,  0.02);   // peak1
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F3,  5889,     0.02);   // peak2
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F4,  2456,     0.03);   // peak3
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F5,  3712.49,  0.02);   // peak4
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F6,  10012.49, 0.08);   // peak5
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F7,  12000.49, 0.1);    // peak6
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F8,  8200.49,  0.1);    // peak7
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F9,  6200.49,  1.0);    // peak8 (dead: crash)
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F10, 14200.49, 1.0);    // peak9 (dead: crash)
+    // his ride.fshift is set once in reinit(); we own per-voice state, so both
+    // shifters are initialised here.
+    rk_syn_dd_shift_set(st + RK_DDR_SH1, 110);
+    rk_syn_dd_shift_set(st + RK_DDR_SH2, 0.4);
+
+    st[RK_DDR_DT + 0] = 25.3  / srate;
+    st[RK_DDR_DT + 1] = 169.6 / srate * (0.5 + 0.4 * rtone);
+    st[RK_DDR_DT + 2] = 304.4 / srate;
+    st[RK_DDR_DT + 3] = 522.7 / srate * (0.5 + 0.6 * rtone);
+
+    isr_decay = 1.0 / (srate * (0.3 + rdecay));
+    st[RK_DDR_B1 + 1] = 0.05;                                  // e1.amp
+    st[RK_DDR_B1 + 2] = 0.01 * 0.13362501578292 * srate;       // e1.n
+    st[RK_DDR_B1 + 3] = 7.264430222920869 / st[RK_DDR_B1 + 2]; // e1.atk
+    st[RK_DDR_B1 + 4] = 7.264430222920869 * isr_decay;         // e1.rel
+
+    st[RK_DDR_B3 + 1] = 0.02;
+    st[RK_DDR_B3 + 2] = 0.13362501578292 * srate;
+    // ⚠️⚠️ HIS BUG, PORTED VERBATIM: divides by e1.n, not e3.n.
+    st[RK_DDR_B3 + 3] = 7.264430222920869 / st[RK_DDR_B1 + 2];
+    st[RK_DDR_B3 + 4] = 2 * 7.264430222920869 * isr_decay;
+
+    st[RK_DDR_B4 + 1] = 0.05;
+    st[RK_DDR_B4 + 2] = 0.13362501578292 * srate;
+    // ⚠️⚠️ HIS BUG, PORTED VERBATIM: divides by 500 * e1.n, not e4.n.
+    st[RK_DDR_B4 + 3] = 7.264430222920869 / (500 * st[RK_DDR_B1 + 2]);
+    st[RK_DDR_B4 + 4] = 7.264430222920869 * isr_decay;
+    st[RK_DDR_B4FR]   = 2 * st[RK_DDR_B4 + 4];
+
+    t_s = 0.03 * (0.2 + rdecay);
+    st[RK_DDR_B2S] = 0.014;
+    st[RK_DDR_B2K] = pow(10, -24 / (20 * t_s * srate));
+  ) : rtype == 2 ? (
+    // ── ride_reset_3: hat-t0 shape, retuned ──
+    tc = 2.1 * rtone - 1;
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F1,  4666,                   1.2);
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F7,  1529.49 + tc * 100,     0.08);
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F8,  988.49  + tc * 100,     0.13);
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F9,  3500.49 + tc * 1000,    0.04);
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F2,  3963.75 + tc * 400,     0.41733);
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F6,  6963.75 + tc * 400,     0.41733);
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F10, 3000.49,                1.14538744609);
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F3,  2477.49,                1.04538744609);
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F4,  8268.56,                1.16018963454);
+    rk_syn_dd_svf_set_keep(st + RK_DDR_F5,  6633.49,                1.2170202297);
+
+    isr_tone = (1 / srate) * (0.8 + 0.5 * rtone);
+    st[RK_DDR_DT + 0] = 205.3 * isr_tone;
+    st[RK_DDR_DT + 1] = 369.6 * isr_tone;
+    st[RK_DDR_DT + 2] = 304.4 * isr_tone;
+    st[RK_DDR_DT + 3] = 522.7 * isr_tone;
+    st[RK_DDR_DT + 4] = 443.0 * isr_tone;
+    st[RK_DDR_DT + 5] = 509.0 * isr_tone;
+    d7 = 3892.9200658769764 * isr_tone;   // his 3392.92 sits commented out
+    st[RK_DDR_DT + 6]  = d7;
+    st[RK_DDR_DT + 7]  = d7 * 1.4471;
+    st[RK_DDR_DT + 8]  = d7 * 1.6170;
+    st[RK_DDR_DT + 9]  = d7 * 1.9265;
+    st[RK_DDR_DT + 10] = d7 * 0.968;                      // NOT 2.5028
+    st[RK_DDR_DT + 12] = st[RK_DDR_DT + 10] * 1.001;      // ~1 Hz beat vs dt11
+    st[RK_DDR_DT + 11] = d7 * 2.6637;
+
+    st[RK_DDR_E12 + 4] = 5.886297285230614
+      * (0.5 + (idec > 1.0 ? 1.0 : idec) * 0.5)
+      * (0.95 + 0.1 * rk_syn_dd_rand01(st + RK_DDR_SEED));
+    st[RK_DDR_E12 + 1] = 0.13362501578292 * srate * af;
+    st[RK_DDR_E12 + 2] = 7.264430222920869 / st[RK_DDR_E12 + 1];
+    st[RK_DDR_E12 + 3] = 10 * 7.264430222920869 * isr_dec / 12.830314491926522;
+
+    st[RK_DDR_E13 + 4] = 2.446983835532773;
+    st[RK_DDR_E13 + 1] = 0.0013941882299170012 * srate * af;
+    st[RK_DDR_E13 + 2] = 7.264430222920869 / st[RK_DDR_E13 + 1];
+    st[RK_DDR_E13 + 3] = 7.264430222920869 * isr_dec2 / 11.784588871968632;
+
+    st[RK_DDR_E2 + 4] = 5.112817165724925;
+    st[RK_DDR_E2 + 1] = 0.023312507777462504 * srate * af;
+    st[RK_DDR_E2 + 2] = 7.264430222920869 / st[RK_DDR_E2 + 1];
+    st[RK_DDR_E2 + 3] = 7.264430222920869 * isr_dec2 / 2.082148383059353;
+
+    st[RK_DDR_E3 + 4] = 13.459926564551697;
+    st[RK_DDR_E3 + 1] = 0.0014790265731799877 * srate * af;
+    st[RK_DDR_E3 + 2] = 7.264430222920869 / st[RK_DDR_E3 + 1];
+    // ⚠️ 0.5417… here; the hat uses 0.2174…
+    st[RK_DDR_E3 + 3] = 7.264430222920869 * isr_dec / 0.541747253516471457;
+  );
+);
+
+function rk_syn_dd_ride_tick(st)
+local(oscs, oscs2, v1, v2, v3, metal2, nz, nz2, nz3, ss2, tt, d5, d6, tn)
+global(srate,
+       RK_DDR_SEED, RK_DDR_TYPE, RK_DDR_T, RK_DDR_DUTY, RK_DDR_TONE,
+       RK_DDR_PH, RK_DDR_DT, RK_DDR_E12, RK_DDR_E13, RK_DDR_E2, RK_DDR_E3,
+       RK_DDR_B1, RK_DDR_B3, RK_DDR_B4, RK_DDR_B2S, RK_DDR_B2K,
+       RK_DDR_F1, RK_DDR_F2, RK_DDR_F3, RK_DDR_F4, RK_DDR_F5, RK_DDR_F6,
+       RK_DDR_F7, RK_DDR_F8, RK_DDR_F9, RK_DDR_F10, RK_DDR_SH1, RK_DDR_SH2)
+(
+  tt = st[RK_DDR_T];
+
+  st[RK_DDR_TYPE] == 0 ? (
+    // ⚠️ dt5/dt6 are recomputed EVERY SAMPLE from tone, piecewise about 0.5
+    tn = st[RK_DDR_TONE];
+    d5 = (tn < 0.5 ? 359.4 + 881.2 * tn : 450.09 + 699.8 * tn);
+    d6 = (tn < 0.5 ? 254.3 + 571.4 * tn : 452.8 + 174.4 * tn);
+    d5 *= 1 / srate; d6 *= 1 / srate;
+    st[RK_DDR_DT + 4] = d5; st[RK_DDR_DT + 5] = d6;
+
+    st[RK_DDR_PH + 0] += st[RK_DDR_DT + 0];
+    st[RK_DDR_PH + 1] += st[RK_DDR_DT + 1];
+    st[RK_DDR_PH + 2] += st[RK_DDR_DT + 2];
+    st[RK_DDR_PH + 3] += st[RK_DDR_DT + 3];
+    st[RK_DDR_PH + 4] += d5;
+    st[RK_DDR_PH + 5] += d6;
+
+    oscs = rk_syn_dd_sq(st[RK_DDR_PH+0], st[RK_DDR_DT+0], st[RK_DDR_DUTY])
+         + rk_syn_dd_sq(st[RK_DDR_PH+1], st[RK_DDR_DT+1], st[RK_DDR_DUTY])
+         + rk_syn_dd_sq(st[RK_DDR_PH+2], st[RK_DDR_DT+2], st[RK_DDR_DUTY])
+         + rk_syn_dd_sq(st[RK_DDR_PH+3], st[RK_DDR_DT+3], st[RK_DDR_DUTY])
+         + rk_syn_dd_sq(st[RK_DDR_PH+4], d5, st[RK_DDR_DUTY])
+         + rk_syn_dd_sq(st[RK_DDR_PH+5], d6, st[RK_DDR_DUTY])
+         + 0.1 * rk_syn_dd_rand01(st + RK_DDR_SEED);
+
+    v1 = 2.40728073 * rk_syn_svf_bp(st + RK_DDR_F1, oscs);
+    v2 = v3 = 3.324654 * rk_syn_svf_bp(st + RK_DDR_F2, oscs);
+
+    st[RK_DDR_E12] += tt < st[RK_DDR_E12+1] ? st[RK_DDR_E12+2] * (st[RK_DDR_E12+4] - st[RK_DDR_E12]) : -st[RK_DDR_E12+3] * st[RK_DDR_E12];
+    st[RK_DDR_E13] += tt < st[RK_DDR_E13+1] ? st[RK_DDR_E13+2] * (st[RK_DDR_E13+4] - st[RK_DDR_E13]) : -st[RK_DDR_E13+3] * st[RK_DDR_E13];
+    st[RK_DDR_E2]  += tt < st[RK_DDR_E2+1]  ? st[RK_DDR_E2+2]  * (st[RK_DDR_E2+4]  - st[RK_DDR_E2])  : -st[RK_DDR_E2+3]  * st[RK_DDR_E2];
+    st[RK_DDR_E3]  += tt < st[RK_DDR_E3+1]  ? st[RK_DDR_E3+2]  * (st[RK_DDR_E3+4]  - st[RK_DDR_E3])  : -st[RK_DDR_E3+3]  * st[RK_DDR_E3];
+    st[RK_DDR_T] = tt + 1;
+
+    // ⚠️ his `+ metal2 * s3` is DEAD - metal2 is a local he never assigns in
+    // ride_tick_1. Ported as the 0 it always is.
+    0.00012 * (
+        rk_syn_svf_hp(st + RK_DDR_F3, v1) * st[RK_DDR_E12] * st[RK_DDR_E12]
+      + 2.1493863499171737 * st[RK_DDR_E2] * st[RK_DDR_E2]
+        * st[RK_DDR_E13] * st[RK_DDR_E13] * rk_syn_svf_hp(st + RK_DDR_F4, v2)
+      + 3.1827788623083535 * st[RK_DDR_E3] * st[RK_DDR_E3]
+        * rk_syn_svf_hp(st + RK_DDR_F5, v3));
+  ) : st[RK_DDR_TYPE] == 1 ? (
+    st[RK_DDR_PH + 0] += st[RK_DDR_DT + 0];
+    st[RK_DDR_PH + 1] += st[RK_DDR_DT + 1];
+    st[RK_DDR_PH + 2] += st[RK_DDR_DT + 2];
+    st[RK_DDR_PH + 3] += st[RK_DDR_DT + 3];
+
+    oscs = rk_syn_dd_saw(st[RK_DDR_PH+0], st[RK_DDR_DT+0])
+         + rk_syn_dd_sq(st[RK_DDR_PH+1], st[RK_DDR_DT+1], st[RK_DDR_DUTY]) * st[RK_DDR_B1]
+         + rk_syn_dd_saw(st[RK_DDR_PH+2], st[RK_DDR_DT+2])
+         + rk_syn_dd_sq(st[RK_DDR_PH+3], st[RK_DDR_DT+3], st[RK_DDR_DUTY]);
+    oscs  = rk_syn_dd_shift_tick(st + RK_DDR_SH1, oscs);
+    oscs2 = rk_syn_dd_shift_tick(st + RK_DDR_SH2, oscs);
+    // his crash block is behind a literal `0 ?` — dead, crash = crash_env = 0
+
+    st[RK_DDR_B1] += tt < st[RK_DDR_B1+2] ? st[RK_DDR_B1+3] * (st[RK_DDR_B1+1] - st[RK_DDR_B1]) : -st[RK_DDR_B1+4] * st[RK_DDR_B1];
+    st[RK_DDR_B3] += tt < st[RK_DDR_B3+2] ? st[RK_DDR_B3+3] * (st[RK_DDR_B3+1] - st[RK_DDR_B3]) : -st[RK_DDR_B3+4] * st[RK_DDR_B3];
+    st[RK_DDR_B2S] *= st[RK_DDR_B2K];
+    st[RK_DDR_B4] += tt < st[RK_DDR_B4+2] ? st[RK_DDR_B4+3] * (st[RK_DDR_B4+1] - st[RK_DDR_B4]) : -st[RK_DDR_B4+4] * st[RK_DDR_B4];
+    st[RK_DDR_T] = tt + 1;
+
+    v2 = (0.06 * st[RK_DDR_B1] + st[RK_DDR_B2S]) * (
+        rk_syn_svf_bp(st + RK_DDR_F2, rk_syn_dd_rand01(st + RK_DDR_SEED) * 2.0 - 1.0)
+      + rk_syn_svf_bp(st + RK_DDR_F3, rk_syn_dd_rand01(st + RK_DDR_SEED) * 2.0 - 1.0 + oscs)
+      + rk_syn_svf_bp(st + RK_DDR_F4, rk_syn_dd_rand01(st + RK_DDR_SEED) * 2.0 - 1.0)
+      + rk_syn_svf_bp(st + RK_DDR_F5, rk_syn_dd_rand01(st + RK_DDR_SEED) * 2.0 - 1.0)
+      + rk_syn_svf_bp(st + RK_DDR_F6, rk_syn_dd_rand01(st + RK_DDR_SEED) * 2.0 - 1.0 + oscs)
+      + rk_syn_svf_bp(st + RK_DDR_F7, rk_syn_dd_rand01(st + RK_DDR_SEED) * 2.0 - 1.0 + oscs));
+
+    v3 = 0.6 * (rk_syn_svf_hp(st + RK_DDR_F1, oscs) * st[RK_DDR_B1]
+              + rk_syn_svf_hp(st + RK_DDR_F8,
+                  rk_syn_dd_rand01(st + RK_DDR_SEED) * 0.5 - 0.25 + 0.4 * oscs2)
+                * st[RK_DDR_B3]);
+
+    v1 = v2 + v3;
+    v1 + v1;
+  ) : (
+    st[RK_DDR_PH + 0] += st[RK_DDR_DT + 0];
+    st[RK_DDR_PH + 1] += st[RK_DDR_DT + 1];
+    st[RK_DDR_PH + 2] += st[RK_DDR_DT + 2];
+    st[RK_DDR_PH + 3] += st[RK_DDR_DT + 3];
+    oscs = rk_syn_dd_sq(st[RK_DDR_PH+0], st[RK_DDR_DT+0], 0.5)
+         + rk_syn_dd_sq(st[RK_DDR_PH+1], st[RK_DDR_DT+1], 0.5)
+         + rk_syn_dd_sq(st[RK_DDR_PH+2], st[RK_DDR_DT+2], 0.5)
+         + rk_syn_dd_sq(st[RK_DDR_PH+3], st[RK_DDR_DT+3], 0.5);
+
+    st[RK_DDR_PH + 6]  += st[RK_DDR_DT + 6];
+    st[RK_DDR_PH + 7]  += st[RK_DDR_DT + 7];
+    st[RK_DDR_PH + 8]  += st[RK_DDR_DT + 8];
+    st[RK_DDR_PH + 9]  += st[RK_DDR_DT + 9];
+    st[RK_DDR_PH + 10] += st[RK_DDR_DT + 10];
+    st[RK_DDR_PH + 11] += st[RK_DDR_DT + 11];
+    st[RK_DDR_PH + 4]  += st[RK_DDR_DT + 4];
+    st[RK_DDR_PH + 5]  += st[RK_DDR_DT + 5];
+    st[RK_DDR_PH + 12] += st[RK_DDR_DT + 12];
+
+    // ⚠️ asymmetric duty cycles: 0.15 / 0.5 / 0.5 / 0.85 / 0.25
+    metal2 = 0.003 * (
+        rk_syn_dd_sq(st[RK_DDR_PH+6],  st[RK_DDR_DT+6],  0.15)
+      + rk_syn_dd_sq(st[RK_DDR_PH+7],  st[RK_DDR_DT+7],  0.5)
+      + rk_syn_dd_sq(st[RK_DDR_PH+8],  st[RK_DDR_DT+8],  0.5)
+      + rk_syn_dd_sq(st[RK_DDR_PH+9],  st[RK_DDR_DT+9],  0.85)
+      + rk_syn_dd_sq(st[RK_DDR_PH+11], st[RK_DDR_DT+11], 0.25)
+      + 0.009 * rk_syn_dd_sq(st[RK_DDR_PH+5], st[RK_DDR_DT+5], 0.5) * st[RK_DDR_E3]
+      + 0.906 * (rk_syn_dd_sq(st[RK_DDR_PH+12], st[RK_DDR_DT+12], 0.5)
+               + rk_syn_dd_sq(st[RK_DDR_PH+10], st[RK_DDR_DT+10], 0.5))
+      + 0.006 * rk_syn_dd_sq(st[RK_DDR_PH+4], st[RK_DDR_DT+4], 0.5) * st[RK_DDR_E3])
+      + 0.0044 * (rk_syn_dd_rand01(st + RK_DDR_SEED) - 0.5);
+
+    v3 = v2 = 25 * rk_syn_svf_bp(st + RK_DDR_F2, oscs);
+
+    st[RK_DDR_E12] += tt < st[RK_DDR_E12+1] ? st[RK_DDR_E12+2] * (st[RK_DDR_E12+4] - st[RK_DDR_E12]) : -st[RK_DDR_E12+3] * st[RK_DDR_E12];
+    st[RK_DDR_E13] += tt < st[RK_DDR_E13+1] ? st[RK_DDR_E13+2] * (st[RK_DDR_E13+4] - st[RK_DDR_E13]) : -st[RK_DDR_E13+3] * st[RK_DDR_E13];
+    st[RK_DDR_E2]  += tt < st[RK_DDR_E2+1]  ? st[RK_DDR_E2+2]  * (st[RK_DDR_E2+4]  - st[RK_DDR_E2])  : -st[RK_DDR_E2+3]  * st[RK_DDR_E2];
+    st[RK_DDR_E3]  += tt < st[RK_DDR_E3+1]  ? st[RK_DDR_E3+2]  * (st[RK_DDR_E3+4]  - st[RK_DDR_E3])  : -st[RK_DDR_E3+3]  * st[RK_DDR_E3];
+    st[RK_DDR_T] = tt + 1;
+
+    ss2 = st[RK_DDR_E2] * st[RK_DDR_E2];
+    nz  = (rk_syn_dd_rand01(st + RK_DDR_SEED) - 0.5) * ss2 * st[RK_DDR_E12];
+    nz2 = 2 * ((rk_syn_dd_rand01(st + RK_DDR_SEED)
+              * rk_syn_dd_rand01(st + RK_DDR_SEED) - 0.5) * ss2);
+    nz3 = (rk_syn_dd_rand01(st + RK_DDR_SEED) - 0.5) * ss2;
+
+    0.001 * (
+        1.7   * rk_syn_svf_bp(st + RK_DDR_F6, nz)
+      + 2.0   * rk_syn_svf_bp(st + RK_DDR_F1, nz3)
+      + 0.2   * rk_syn_svf_bp(st + RK_DDR_F7, nz)
+      + 0.35  * rk_syn_svf_bp(st + RK_DDR_F8, nz)
+      + 0.416 * rk_syn_svf_bp(st + RK_DDR_F9, nz2 + nz3))
+    + 0.00007 * (
+        1.0493863499171737 * ss2 * st[RK_DDR_E13] * st[RK_DDR_E13]
+          * rk_syn_svf_hp(st + RK_DDR_F4, v2 + 0.6 * nz2)
+      + 2.1827788623083535 * st[RK_DDR_E3] * st[RK_DDR_E3]
+          * rk_syn_svf_hp(st + RK_DDR_F5, v3))
+    + metal2 * st[RK_DDR_E3] * st[RK_DDR_E13];
+  );
+);
+
+// ── two more of his filter primitives (saikedrums_basic_filters 17-92) ─────
+// 1-pole: b[0]=coeff b[1]=s. init uses tan() - trigger rate only.
+function rk_syn_dd_lp1_set(b, freq)
+local(g)
+global(srate)
+(
+  g = tan($pi * freq / srate);
+  b[0] = g / (1 + g);
+);
+
+function rk_syn_dd_lp1_hp(b, x)
+local(v, y)
+global()
+(
+  v = b[0] * (x - b[1]);
+  y = v + b[1];
+  b[1] = y + v;
+  x - y;
+);
+
+// his init_linearSVF_bell(raw_freq, invq, gain_factor): k = invq/gain_factor,
+// m1 = k*(gain_factor^2 - 1). Same eval as our rk_syn_bell block layout.
+function rk_syn_dd_bell_set_invq_keep(b, fc, invq, gain_factor)
+local(g, k)
+global(srate)
+(
+  fc = min(fc, 0.5 * srate);
+  g = tan($pi * fc / srate);
+  k = invq / gain_factor;
+  b[0] = g;
+  b[1] = k;
+  b[2] = 1.0 / (1.0 + g * (g + k));
+  b[3] = g * b[2];
+  b[4] = g * b[3];
+  b[5] = k * (gain_factor * gain_factor - 1.0);
+);
+
+// ============================================================================
+// DD-101 RIM — types 0, 1, 2 (rim_synth1/2/3, drum_elements 1638-1784).
+// Type 3 is start_sample — out of scope. One shared skeleton: three decaying
+// states + fast attack + 4-5 resonant BPs + soft clip y/(1+|y|) (t2: 2x).
+// All three ARE exact-nullable: the rand-carrying filters are separable.
+// state: 46 cells.
+// ============================================================================
+RK_DDM_SEED  = 0;
+RK_DDM_TYPE  = 1;
+RK_DDM_PST   = 2;   // punch.state
+RK_DDM_PST2  = 3;
+RK_DDM_PST3  = 4;
+RK_DDM_PATK  = 5;
+RK_DDM_PK    = 6;
+RK_DDM_PK2   = 7;
+RK_DDM_PK3   = 8;
+RK_DDM_PKATK = 9;
+RK_DDM_BP    = 11;
+RK_DDM_BP2   = 18;
+RK_DDM_BP3   = 25;
+RK_DDM_BP4   = 32;
+RK_DDM_BP5   = 39;
+RK_DDM_CELLS = 46;
+
+function rk_syn_dd_rim_reset(st, mtype, tune, decay)
+local(t_s, tuning)
+global(srate, RK_DDM_SEED, RK_DDM_TYPE, RK_DDM_PST, RK_DDM_PST2, RK_DDM_PST3,
+       RK_DDM_PATK, RK_DDM_PK, RK_DDM_PK2, RK_DDM_PK3, RK_DDM_PKATK,
+       RK_DDM_BP, RK_DDM_BP2, RK_DDM_BP3, RK_DDM_BP4, RK_DDM_BP5)
+(
+  st[RK_DDM_TYPE] = mtype;
+  st[RK_DDM_SEED] <= 0 ? st[RK_DDM_SEED] = 11111;
+  t_s = 0.015 * (0.5 + decay);
+  tuning = pow(2, tune - 0.5);
+
+  st[RK_DDM_PST] = 1; st[RK_DDM_PST2] = 1; st[RK_DDM_PST3] = 1;
+  st[RK_DDM_PATK] = 1;
+  st[RK_DDM_PK]  = pow(10, -24 / (20 * t_s * srate));
+  st[RK_DDM_PK2] = pow(10, -24 / (30 * t_s * srate));
+  st[RK_DDM_PK3] = pow(10, -24 / (30 * t_s * srate));
+  // ⚠️ t0's attack is 0.0004 s; t1/t2 use 0.003 s
+  st[RK_DDM_PKATK] = pow(10, -24 / (20 * (mtype == 0 ? 0.0004 : 0.003) * srate));
+
+  mtype == 0 ? (
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP,  220 * tuning,  0.005);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP2, 511 * tuning,  0.01);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP3, 1000,          0.06);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP4, 2600 * tuning, 0.02);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP5, 737,           0.01);
+  ) : mtype == 1 ? (
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP,  1750 * tuning, 0.05);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP2, 511 * tuning,  0.01);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP3, 908,           0.06);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP4, 4600 * tuning, 1);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP5, 708,           0.01);
+  ) : (
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP,  413 * tuning,  0.002);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP2, 1040 * tuning, 0.01);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP3, 1887,          0.06);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP4, 1130 * tuning, 1);
+  );
+);
+
+function rk_syn_dd_rim_tick(st)
+local(y)
+global(RK_DDM_SEED, RK_DDM_TYPE, RK_DDM_PST, RK_DDM_PST2, RK_DDM_PST3,
+       RK_DDM_PATK, RK_DDM_PK, RK_DDM_PK2, RK_DDM_PK3, RK_DDM_PKATK,
+       RK_DDM_BP, RK_DDM_BP2, RK_DDM_BP3, RK_DDM_BP4, RK_DDM_BP5)
+(
+  st[RK_DDM_PATK] *= st[RK_DDM_PKATK];
+  st[RK_DDM_PST]  *= st[RK_DDM_PK];
+  st[RK_DDM_PST2] *= st[RK_DDM_PK2];
+  st[RK_DDM_PST3] *= st[RK_DDM_PK3];
+
+  st[RK_DDM_TYPE] == 0 ? (
+    y = (1 - st[RK_DDM_PATK]) * st[RK_DDM_PST3] * (
+      1.4 * rk_syn_svf_bp(st + RK_DDM_BP,  st[RK_DDM_PST2]) +
+      1.7 * rk_syn_svf_bp(st + RK_DDM_BP2, st[RK_DDM_PST3]) * st[RK_DDM_PST2] +
+      0.8 * rk_syn_svf_bp(st + RK_DDM_BP3, st[RK_DDM_PST] + rk_syn_dd_rand01(st + RK_DDM_SEED) - 0.5) * st[RK_DDM_PST3] +
+      0.2 * rk_syn_svf_bp(st + RK_DDM_BP4, st[RK_DDM_PST] + rk_syn_dd_rand01(st + RK_DDM_SEED) - 0.5) * st[RK_DDM_PST3] +
+      0.4 * rk_syn_svf_bp(st + RK_DDM_BP5, st[RK_DDM_PST] + rk_syn_dd_rand01(st + RK_DDM_SEED) - 0.5) * st[RK_DDM_PST3]);
+    y / (1 + abs(y));
+  ) : st[RK_DDM_TYPE] == 1 ? (
+    y = (1 - st[RK_DDM_PATK]) * st[RK_DDM_PST3] * (
+      1.4 * rk_syn_svf_bp(st + RK_DDM_BP,  st[RK_DDM_PST2]) +
+      1.7 * rk_syn_svf_bp(st + RK_DDM_BP2, st[RK_DDM_PST3]) * st[RK_DDM_PST2] +
+      0.8 * rk_syn_svf_bp(st + RK_DDM_BP3, st[RK_DDM_PST] + rk_syn_dd_rand01(st + RK_DDM_SEED) - 0.5) * st[RK_DDM_PST3] +
+      5   * rk_syn_svf_bp(st + RK_DDM_BP4, rk_syn_dd_rand01(st + RK_DDM_SEED) - 0.5) * st[RK_DDM_PST3] * st[RK_DDM_PST3] * st[RK_DDM_PST3] +
+      0.1 * rk_syn_svf_bp(st + RK_DDM_BP5, st[RK_DDM_PST]) * st[RK_DDM_PST3]);
+    y / (1 + abs(y));
+  ) : (
+    y = (1 - st[RK_DDM_PATK]) * (
+      0.4 * st[RK_DDM_PST3] * rk_syn_svf_bp(st + RK_DDM_BP, st[RK_DDM_PST2]) +
+      0.3 * rk_syn_svf_bp(st + RK_DDM_BP2, rk_syn_dd_rand01(st + RK_DDM_SEED) - 0.5) * st[RK_DDM_PST2] +
+      0.1 * rk_syn_svf_bp(st + RK_DDM_BP3, st[RK_DDM_PST3]) * st[RK_DDM_PST] +
+      0.5 * rk_syn_svf_bp(st + RK_DDM_BP4, rk_syn_dd_rand01(st + RK_DDM_SEED) - 0.5) * st[RK_DDM_PST3] * st[RK_DDM_PST3]);
+    2.0 * y / (1 + abs(y));
+  );
+);
+
+// ============================================================================
+// DD-101 COWBELL — all 4 types are synths (cowbell_synth1/2/3/4, 1829-2059).
+// ⚠️ t1 (synth2) contains NO rand() at all — his rand is commented out — so it
+// is FULLY exact-nullable with nothing silenced. Its reset assigns dt/dt2
+// THREE times (823→823.3→848.3); only the LAST pair is live, ported as such.
+// Its phases start at 0.5, not 0.
+// ⚠️ t3 (synth4) runs sin() per sample → LUT sine, phases kept in CYCLES
+// (increments divided by 2π at reset). Un-nullable ((1+0.2*rand()) multiplies
+// the tone) → coefficient parity.
+// ⚠️ t0/t2 excite a BP with the boolean (pulse > 0) — a timed square gate.
+// state: 79 cells.
+// ============================================================================
+RK_DDW_SEED   = 0;
+RK_DDW_TYPE   = 1;
+RK_DDW_PST    = 2;
+RK_DDW_PST2   = 3;
+RK_DDW_PST3   = 4;
+RK_DDW_PATK   = 5;
+RK_DDW_PK     = 6;
+RK_DDW_PK2    = 7;
+RK_DDW_PK3    = 8;
+RK_DDW_PKATK  = 9;
+RK_DDW_PULSE  = 10;
+RK_DDW_PULSE2 = 11;
+RK_DDW_DT     = 12;  // synth2 dt / synth4 sr   (cycles per sample)
+RK_DDW_DT2    = 13;  // synth2 dt2 / synth4 sr2 (cycles per sample)
+RK_DDW_T      = 14;  // synth2 t  / synth4 tc   (cycles)
+RK_DDW_T2     = 15;  // synth2 t2 / synth4 tc2  (cycles)
+RK_DDW_ST2INC = 16;  // synth4 punch.state2 (a decaying EXTRA phase increment)
+RK_DDW_F1     = 17;  // bp / cbp
+RK_DDW_F2     = 24;  // bp2 / cbp2
+RK_DDW_F3     = 31;  // bp3 / cbp3
+RK_DDW_F4     = 38;  // bp4 / cbp4
+RK_DDW_F5     = 45;  // bp5 / cbp5
+RK_DDW_F6     = 52;  // bp6 / cbp6
+RK_DDW_F7     = 59;  // lp  / cbp7
+RK_DDW_CELLS  = 66;
+
+function rk_syn_dd_cowbell_reset(st, wtype, tune, decay)
+local(t_s, tuning, twopi)
+global(srate, RK_DDW_SEED, RK_DDW_TYPE, RK_DDW_PST, RK_DDW_PST2, RK_DDW_PST3,
+       RK_DDW_PATK, RK_DDW_PK, RK_DDW_PK2, RK_DDW_PK3, RK_DDW_PKATK,
+       RK_DDW_PULSE, RK_DDW_PULSE2, RK_DDW_DT, RK_DDW_DT2, RK_DDW_T, RK_DDW_T2,
+       RK_DDW_ST2INC, RK_DDW_F1, RK_DDW_F2, RK_DDW_F3, RK_DDW_F4, RK_DDW_F5,
+       RK_DDW_F6, RK_DDW_F7)
+(
+  st[RK_DDW_TYPE] = wtype;
+  st[RK_DDW_SEED] <= 0 ? st[RK_DDW_SEED] = 55555;
+  tuning = pow(2, tune - 0.5);
+  twopi = 2 * $pi;
+
+  wtype == 0 ? (
+    t_s = 0.03 * (0.5 + decay);
+    st[RK_DDW_PST] = 1; st[RK_DDW_PST2] = 1; st[RK_DDW_PST3] = 1;
+    st[RK_DDW_PULSE]  = 0.005 * srate;
+    st[RK_DDW_PULSE2] = 0.02 * srate * (0.5 + decay);
+    st[RK_DDW_PATK]  = 1;
+    st[RK_DDW_PK]    = pow(10, -24 / (20 * t_s * srate));
+    st[RK_DDW_PK2]   = pow(10, -24 / (30 * t_s * srate));
+    st[RK_DDW_PK3]   = pow(10, -24 / (50 * t_s * srate));
+    st[RK_DDW_PKATK] = pow(10, -24 / (20 * 0.003 * srate));
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F1, 487 * tuning,  0.002);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F2, 1033 * tuning, 0.01);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F3, 1496,          0.06);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F4, 2000 * tuning, 1);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F5, 2300 * tuning, 0.001);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F6, 3000 * tuning, 0.001);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F7, 1500 * tuning, 1);   // his lp
+  ) : wtype == 1 ? (
+    t_s = 0.036 * (0.25 + 1.25 * decay);
+    st[RK_DDW_PULSE] = 0.002 * srate * (0.5 + decay);
+    // his reset assigns dt/dt2 three times; final pair wins (848.3 / 563.2)
+    st[RK_DDW_DT]  = 848.3 / srate * tuning;
+    st[RK_DDW_DT2] = 563.2 / srate * tuning;
+    st[RK_DDW_T] = 0.5; st[RK_DDW_T2] = 0.5;    // phases start at 0.5
+    st[RK_DDW_PATK]  = 1;
+    st[RK_DDW_PKATK] = pow(10, -24 / (20 * 0.0002 * srate));
+    st[RK_DDW_PST]  = 1.0;
+    st[RK_DDW_PST2] = 0.15;
+    st[RK_DDW_PK]   = pow(10, -24 / (20 * t_s * srate));
+    st[RK_DDW_PK2]  = pow(10, -24 / (20 * 10 * t_s * srate));
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F1, 709.3 * tuning, 0.4);
+  ) : wtype == 2 ? (
+    t_s = 0.15 * (0.5 + decay);
+    st[RK_DDW_PST] = 1; st[RK_DDW_PST2] = 1; st[RK_DDW_PST3] = 1;
+    st[RK_DDW_PULSE]  = 0.005 * srate;
+    st[RK_DDW_PULSE2] = 0.02 * srate * (0.25 + decay);
+    st[RK_DDW_PATK]  = 1;
+    st[RK_DDW_PK]    = pow(10, -24 / (20 * t_s * srate));
+    st[RK_DDW_PK2]   = pow(10, -24 / (30 * t_s * srate));
+    st[RK_DDW_PK3]   = pow(10, -24 / (50 * t_s * srate));
+    st[RK_DDW_PKATK] = pow(10, -24 / (20 * 0.003 * srate));
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F1, 387 * tuning,  0.002);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F2, 430 * tuning,  0.001);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F3, 802,           0.006);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F4, 1281 * tuning, 0.05);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F5, 2596 * tuning, 0.001);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F6, 3172 * tuning, 0.001);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F7, 4400 * tuning, 0.1);
+  ) : (
+    t_s = 0.15 * (0.5 + decay);
+    // his sr/sr2 and punch.state2 are RADIAN increments; stored in CYCLES for
+    // the LUT sine (spec §7 substitution)
+    st[RK_DDW_DT]  = (600 + 4200 * tune) / srate;
+    st[RK_DDW_DT2] = 0.62 * st[RK_DDW_DT];
+    st[RK_DDW_T] = 0; st[RK_DDW_T2] = 0;
+    st[RK_DDW_PST]    = 1;
+    st[RK_DDW_ST2INC] = 3600 / srate;
+    st[RK_DDW_PULSE]  = 0.005 * srate;
+    st[RK_DDW_PULSE2] = 0.02 * srate * (0.25 + decay);
+    st[RK_DDW_PATK]  = 1;
+    st[RK_DDW_PK]    = pow(10, -24 / (20 * t_s * srate));
+    st[RK_DDW_PK2]   = pow(10, -24 / (0.05 * t_s * srate));
+    st[RK_DDW_PKATK] = pow(10, -24 / (20 * 0.003 * srate));
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F3, 802 + 400 * tune, 0.0006);
+  );
+);
+
+function rk_syn_dd_cowbell_tick(st)
+local(y, nz, nz2, sqrs)
+global(RK_DDW_SEED, RK_DDW_TYPE, RK_DDW_PST, RK_DDW_PST2, RK_DDW_PST3,
+       RK_DDW_PATK, RK_DDW_PK, RK_DDW_PK2, RK_DDW_PK3, RK_DDW_PKATK,
+       RK_DDW_PULSE, RK_DDW_PULSE2, RK_DDW_DT, RK_DDW_DT2, RK_DDW_T, RK_DDW_T2,
+       RK_DDW_ST2INC, RK_DDW_F1, RK_DDW_F2, RK_DDW_F3, RK_DDW_F4, RK_DDW_F5,
+       RK_DDW_F6, RK_DDW_F7)
+(
+  st[RK_DDW_TYPE] == 0 ? (
+    st[RK_DDW_PATK] *= st[RK_DDW_PKATK];
+    st[RK_DDW_PULSE]  -= 1;
+    st[RK_DDW_PULSE2] -= 1;
+    st[RK_DDW_PULSE2] < 0 ? (
+      st[RK_DDW_PST]  *= st[RK_DDW_PK];
+      st[RK_DDW_PST2] *= st[RK_DDW_PK2];
+      st[RK_DDW_PST3] *= st[RK_DDW_PK3];
+    );
+    nz  = 2 * rk_syn_dd_rand01(st + RK_DDW_SEED) - 1;
+    nz2 = rk_syn_svf_bp(st + RK_DDW_F2, nz);
+    0.15 * (1 - st[RK_DDW_PATK]) * (
+      1.4 * st[RK_DDW_PST3] * rk_syn_svf_bp(st + RK_DDW_F1, st[RK_DDW_PULSE] > 0) +
+      0.3 * nz2 * st[RK_DDW_PST2] +
+      3   * rk_syn_svf_bp(st + RK_DDW_F3, st[RK_DDW_PST3]) * st[RK_DDW_PST] +
+      0.4 * rk_syn_svf_bp(st + RK_DDW_F4, nz) * st[RK_DDW_PST3] * st[RK_DDW_PST3] +
+      0.02 * rk_syn_svf_bp(st + RK_DDW_F5, nz) * st[RK_DDW_PST3] +
+      0.01 * rk_syn_svf_bp(st + RK_DDW_F6, nz) * st[RK_DDW_PST2] +
+      rk_syn_svf_lp(st + RK_DDW_F7, nz) * st[RK_DDW_PST]);
+  ) : st[RK_DDW_TYPE] == 1 ? (
+    st[RK_DDW_PULSE] < 0 ? (
+      st[RK_DDW_PST]  *= st[RK_DDW_PK];
+      st[RK_DDW_PST2] *= st[RK_DDW_PK2];
+    ) : (
+      st[RK_DDW_PST] = 1.0 - 1.0 * st[RK_DDW_PATK];
+      st[RK_DDW_PATK] *= st[RK_DDW_PKATK];
+    );
+    st[RK_DDW_PULSE] -= 1;
+    st[RK_DDW_T]  += st[RK_DDW_DT];
+    st[RK_DDW_T2] += st[RK_DDW_DT2];
+    sqrs = st[RK_DDW_PST] + st[RK_DDW_PST2];
+    sqrs = sqrs / (1.0 + sqrs);
+    0.35 * (
+      0.5 * rk_syn_dd_saw(st[RK_DDW_T], st[RK_DDW_DT])
+      + 3 * rk_syn_svf_bp(st + RK_DDW_F1,
+              rk_syn_dd_saw(st[RK_DDW_T], st[RK_DDW_DT]))
+      + rk_syn_dd_saw(st[RK_DDW_T2], st[RK_DDW_DT2])
+    ) * sqrs;
+  ) : st[RK_DDW_TYPE] == 2 ? (
+    st[RK_DDW_PATK] *= st[RK_DDW_PKATK];
+    st[RK_DDW_PULSE]  -= 1;
+    st[RK_DDW_PULSE2] -= 1;
+    st[RK_DDW_PULSE2] < 0 ? (
+      st[RK_DDW_PST]  *= st[RK_DDW_PK];
+      st[RK_DDW_PST2] *= st[RK_DDW_PK2];
+      st[RK_DDW_PST3] *= st[RK_DDW_PK3];
+    );
+    nz  = 2 * rk_syn_dd_rand01(st + RK_DDW_SEED) - 1;
+    nz2 = rk_syn_svf_bp(st + RK_DDW_F2, st[RK_DDW_PST3]);
+    0.24 * (1 - st[RK_DDW_PATK]) * (
+      1.4 * st[RK_DDW_PST3] * rk_syn_svf_bp(st + RK_DDW_F1, st[RK_DDW_PULSE] > 0) +
+      0.9 * nz2 * st[RK_DDW_PST2] +
+      0.3 * rk_syn_svf_bp(st + RK_DDW_F3, st[RK_DDW_PST]) * st[RK_DDW_PST] +
+      2.8 * rk_syn_svf_bp(st + RK_DDW_F4, st[RK_DDW_PST] + 0.1 * nz) * st[RK_DDW_PST3] * st[RK_DDW_PST3] +
+      0.2 * rk_syn_svf_bp(st + RK_DDW_F5, st[RK_DDW_PST]) * st[RK_DDW_PST3] +
+      0.2 * rk_syn_svf_bp(st + RK_DDW_F6, st[RK_DDW_PST]) * st[RK_DDW_PST2] +
+      6   * rk_syn_svf_bp(st + RK_DDW_F7, st[RK_DDW_PST]) * st[RK_DDW_PST]);
+  ) : (
+    st[RK_DDW_PATK] *= st[RK_DDW_PKATK];
+    st[RK_DDW_PULSE]  -= 1;
+    st[RK_DDW_PULSE2] -= 1;
+    st[RK_DDW_PULSE2] < 0 ? (
+      st[RK_DDW_PST]    *= st[RK_DDW_PK];
+      st[RK_DDW_ST2INC] *= st[RK_DDW_PK2];
+    );
+    // his: tc += sr + punch.state2 (radians). Ours accumulates CYCLES.
+    st[RK_DDW_T]  += st[RK_DDW_DT] + st[RK_DDW_ST2INC];
+    st[RK_DDW_T2] += st[RK_DDW_DT2];
+    nz2 = 0.1 * rk_syn_lut_sin(st[RK_DDW_T])
+        * (0.5 + rk_syn_lut_sin(st[RK_DDW_T2]))
+        * st[RK_DDW_PST]
+        * (1 + 0.2 * rk_syn_dd_rand01(st + RK_DDW_SEED));
+    0.04 * (1 - st[RK_DDW_PATK]) * (
+      rk_syn_svf_bp(st + RK_DDW_F3, rk_syn_dd_rand01(st + RK_DDW_SEED) - 0.5)
+      * st[RK_DDW_PST]
+    ) + nz2;
+  );
+);
+
+// ============================================================================
+// DD-101 SHAKER — synth types 0, 1, 2 (shaker_reset/tick, 2101-2203).
+// Type 3 is start_sample — out of scope. One shared env machine (attack
+// counter + up to 3 decaying states with threshold-triggered fast decays),
+// per-type filter stacks. t2 runs cos() per sample → LUT (phase in cycles;
+// his dt is RADIANS with a 44100/srate factor).
+// ⚠️ ALL noise-driven — no deterministic audio path (like the clap) → verified
+// by envelope-trajectory null + coefficient parity.
+// ⚠️ his reset writes global shaker_tune_freq (consumed by his MAIN jsfx, not
+// by drum_elements) — dropped from the port, noted here.
+// state: 62 cells.
+// ============================================================================
+RK_DDK2_SEED  = 0;
+RK_DDK2_TYPE  = 1;
+RK_DDK2_EST   = 2;   // env.state
+RK_DDK2_EST2  = 3;
+RK_DDK2_EST3  = 4;
+RK_DDK2_EATK  = 5;   // env.attack
+RK_DDK2_ENATK = 6;   // env.n_attack (counts down)
+RK_DDK2_EK    = 7;
+RK_DDK2_EKATK = 8;
+RK_DDK2_EKFST = 9;
+RK_DDK2_EKSLW = 10;
+RK_DDK2_T     = 11;  // t2 phase (cycles)
+RK_DDK2_DT    = 12;
+RK_DDK2_LP    = 13;  // lp   (t0)
+RK_DDK2_LP2   = 20;  // lp2  (t0)
+RK_DDK2_HP2   = 27;  // hp2  (t1/t2)
+RK_DDK2_HP1P  = 34;  // hp 1-pole (t1/t2): coeff + s
+RK_DDK2_BELL  = 36;  // bell  (t1/t2)  8 cells
+RK_DDK2_BELL2 = 44;  // bell2 (t1/t2)
+RK_DDK2_BELL3 = 52;  // bell3 (t0)
+RK_DDK2_CELLS = 60;
+
+function rk_syn_dd_shaker_reset(st, ktype, tune, decay)
+local(t_decay, t_atk, tuning)
+global(srate, RK_DDK2_SEED, RK_DDK2_TYPE, RK_DDK2_EST, RK_DDK2_EST2,
+       RK_DDK2_EST3, RK_DDK2_EATK, RK_DDK2_ENATK, RK_DDK2_EK, RK_DDK2_EKATK,
+       RK_DDK2_EKFST, RK_DDK2_EKSLW, RK_DDK2_T, RK_DDK2_DT,
+       RK_DDK2_LP, RK_DDK2_LP2, RK_DDK2_HP2, RK_DDK2_HP1P,
+       RK_DDK2_BELL, RK_DDK2_BELL2, RK_DDK2_BELL3)
+(
+  st[RK_DDK2_TYPE] = ktype;
+  st[RK_DDK2_SEED] <= 0 ? st[RK_DDK2_SEED] = 12321;
+  st[RK_DDK2_EST] = 0;
+
+  ktype == 0 ? (
+    t_atk = 0.015;
+    tuning = min(0.5 + tune, 1.5);
+    t_decay = 0.03 * (0.5 + decay);
+    rk_syn_dd_svf_set_keep(st + RK_DDK2_LP,  5982 * tuning,  0.25);
+    rk_syn_dd_svf_set_keep(st + RK_DDK2_LP2, 11340 * tuning, 0.25);
+    rk_syn_dd_bell_set_invq_keep(st + RK_DDK2_BELL3, 850 * tuning, 3, 0.01);
+  ) : ktype == 1 ? (
+    t_atk = 0.03 * (0.5 + 0.25 * decay);
+    tuning = 0.5 + tune;
+    t_decay = 0.3 * (0.5 + 0.25 * decay);
+    rk_syn_dd_lp1_set(st + RK_DDK2_HP1P, 500 * tuning);
+    rk_syn_dd_svf_set_keep(st + RK_DDK2_HP2, 3000 * tuning, 1);
+    rk_syn_dd_bell_set_invq_keep(st + RK_DDK2_BELL,  5121 * tuning,  7, 20);
+    rk_syn_dd_bell_set_invq_keep(st + RK_DDK2_BELL2, 10121 * tuning, 9, 20);
+    st[RK_DDK2_EST2] = 1;
+  ) : (
+    st[RK_DDK2_T] = 0;
+    // his dt is RADIANS incl. a 44100/srate factor; stored in cycles
+    st[RK_DDK2_DT] = (0.0006 + 0.0003 * decay) * 44100 / srate / (2 * $pi);
+    t_atk = 0.03 * (0.5 + 0.25 * decay);
+    tuning = 0.5 + tune;
+    t_decay = 0.5 * (0.5 + 0.5 * decay);
+    rk_syn_dd_lp1_set(st + RK_DDK2_HP1P, 500 * tuning);
+    rk_syn_dd_svf_set_keep(st + RK_DDK2_HP2, 3000 * tuning, 1);
+    rk_syn_dd_bell_set_invq_keep(st + RK_DDK2_BELL,  5121 * tuning, 7, 20);
+    rk_syn_dd_bell_set_invq_keep(st + RK_DDK2_BELL2, 7121 * tuning, 9, 20);
+    st[RK_DDK2_EST2] = 1;
+    st[RK_DDK2_EST3] = 1;
+  );
+
+  st[RK_DDK2_EK]    = pow(10, -24 / (20 * t_decay * srate));
+  st[RK_DDK2_EKATK] = pow(10, -24 / (20 * t_atk * srate));
+  st[RK_DDK2_EKFST] = pow(10, -24 / (10 * t_decay * srate));
+  st[RK_DDK2_EKSLW] = pow(10, -24 / (30 * t_decay * t_decay * srate));
+  st[RK_DDK2_EATK]  = 1;
+  st[RK_DDK2_ENATK] = 2 * t_atk * srate;
+);
+
+function rk_syn_dd_shaker_tick(st)
+local(nz, nz2, y, envsq)
+global(RK_DDK2_SEED, RK_DDK2_TYPE, RK_DDK2_EST, RK_DDK2_EST2, RK_DDK2_EST3,
+       RK_DDK2_EATK, RK_DDK2_ENATK, RK_DDK2_EK, RK_DDK2_EKATK, RK_DDK2_EKFST,
+       RK_DDK2_EKSLW, RK_DDK2_T, RK_DDK2_DT,
+       RK_DDK2_LP, RK_DDK2_LP2, RK_DDK2_HP2, RK_DDK2_HP1P,
+       RK_DDK2_BELL, RK_DDK2_BELL2, RK_DDK2_BELL3)
+(
+  st[RK_DDK2_ENATK] > 0 ? (
+    st[RK_DDK2_ENATK] -= 1;
+    st[RK_DDK2_EST] = 1.0 - st[RK_DDK2_EATK];
+    st[RK_DDK2_EATK] *= st[RK_DDK2_EKATK];
+  ) : (
+    st[RK_DDK2_EST] *= st[RK_DDK2_EK];
+  );
+
+  nz = rk_syn_dd_rand01(st + RK_DDK2_SEED) - 0.5;
+
+  st[RK_DDK2_TYPE] == 0 ? (
+    y = 100 * st[RK_DDK2_EST] * (
+      rk_syn_svf_lp(st + RK_DDK2_LP2,
+        rk_syn_svf_lp(st + RK_DDK2_LP,
+          rk_syn_bell(st + RK_DDK2_BELL3, nz * nz * nz)))
+      + 0.0001 * nz);
+  ) : st[RK_DDK2_TYPE] == 1 ? (
+    st[RK_DDK2_EST] < 0.75 ? st[RK_DDK2_EST] *= st[RK_DDK2_EKFST];
+    st[RK_DDK2_EST2] *= st[RK_DDK2_EKFST];
+    nz2 = rk_syn_dd_rand01(st + RK_DDK2_SEED) - 0.5;
+    envsq = st[RK_DDK2_EST] * st[RK_DDK2_EST];
+    y = 0.75 * envsq * (
+      0.005 * rk_syn_bell(st + RK_DDK2_BELL,
+                rk_syn_svf_hp(st + RK_DDK2_HP2, nz)) +
+      0.007 * st[RK_DDK2_EST2] * rk_syn_bell(st + RK_DDK2_BELL2,
+                rk_syn_dd_lp1_hp(st + RK_DDK2_HP1P, nz2)) +
+      0.0005 * nz);
+  ) : (
+    st[RK_DDK2_EST] < 0.175 ? st[RK_DDK2_EST] *= st[RK_DDK2_EKFST];
+    st[RK_DDK2_EST2] *= st[RK_DDK2_EKFST];
+    st[RK_DDK2_EST3] *= st[RK_DDK2_EKSLW];
+    nz2 = (rk_syn_dd_rand01(st + RK_DDK2_SEED) > 0.15)
+        * (rk_syn_dd_rand01(st + RK_DDK2_SEED) - 0.5);
+    nz *= (rk_syn_dd_rand01(st + RK_DDK2_SEED) > 0.995);
+
+    st[RK_DDK2_T] += st[RK_DDK2_DT];
+    envsq = st[RK_DDK2_EST] * st[RK_DDK2_EST];
+    y = 0.75 * rk_syn_lut_cos(st[RK_DDK2_T])
+      * (envsq + st[RK_DDK2_EST3] * (1 - st[RK_DDK2_EST]) * (1 - st[RK_DDK2_EST2])) * (
+      0.005 * rk_syn_bell(st + RK_DDK2_BELL,
+                rk_syn_svf_hp(st + RK_DDK2_HP2, nz)) +
+      0.009 * st[RK_DDK2_EST2] * rk_syn_bell(st + RK_DDK2_BELL2,
+                rk_syn_dd_lp1_hp(st + RK_DDK2_HP1P, nz2)) +
+      0.0005 * nz);
+  );
+  y;
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// ENGINE DISPATCH — DD-101 PARITY LAYER (Spec_Synthdrums_Parity §4-§5)
+//
+// ps_engine encodes family + 10*type (family = engine%10 0..8, type =
+// floor(engine/10) 0..3). Legacy values 0..5 decode as families 0..5 type 0;
+// the old CYM slot (4) is the RIDE family. The legacy rk_syn_<fam>_* engines
+// above are now DEAD CODE, kept only until a cleanup commit removes them.
+//
+// Voice-state layout: st[0] = family (tick dispatch), st[1] = per-hit PRNG
+// seed (written by rk_swing_core BEFORE reset — the existing contract),
+// engine state at st+2. Worst engine (ride t1 ~195 cells) + 2 <= 256.
+//
+// MACRO CONTRACT (spec §4.1): each macro is the normalized position of ONE of
+// his sliders, and rk_syn_dd_macro_default() returns his slider default in
+// that normalization — so ALL MACROS AT DEFAULT == THE DD-101 FACTORY SOUND,
+// exactly. Unassigned macros are inert. Velocity inside the engine is his
+// default (all sens = 0): the core already applies vel to level.
+//
+// Pad TUNE (semitones): families with exponential tune (tom/rim/cowbell) fold
+// in exactly (+s/12 pre-pow); kick/snare transpose their bottom frequency;
+// hat/ride post-scale every oscillator increment by 2^(s/12); shaker scales
+// its linear tuning term. ⚠️known small deviation: ride t0 recomputes its two
+// TONE-swept oscillators per sample — those two (of six) do not transpose.
+// ══════════════════════════════════════════════════════════════════════════
+RK_SYN_RIDE     = 4;   // the old CYM slot
+RK_SYN_RIM      = 6;
+RK_SYN_COWBELL  = 7;
+RK_SYN_SHAKER   = 8;
+RK_SYN_FAMILIES = 9;
+
+// assigned macros per family (UI hides the inert knobs beyond this)
+function rk_syn_dd_macro_count(fam)
+global()
+(
+  fam == 0 ? 6 : fam == 1 ? 6 : fam == 2 ? 2 :
+  fam == 3 ? 5 : fam == 4 ? 4 : fam == 5 ? 3 : 2;
+);
+
+// synth type variants per family (spec §3: sampler type-3s excluded)
+function rk_syn_dd_type_count(fam)
+global()
+(
+  fam == 0 || fam == 1 || fam == 7 ? 4 : 3;
+);
+
+// his slider defaults, normalized to macro space (spec §4.1 table)
+function rk_syn_dd_macro_default(fam, idx)
+global()
+(
+  fam == 0 ? (   // KICK: TUNE PDEC ADEC PENV NOISE SHIFT - -
+    idx == 0 ? 0.15 : idx == 1 ? 0.70 : idx == 2 ? 0.30 :
+    idx == 3 ? 0.60 : idx == 4 ? 0.78 : 0;
+  ) :
+  fam == 1 ? (   // SNARE: TUNE DECAY ADEC PENV NDEC SHIFT - -
+    idx == 1 ? 0.67 : idx == 2 ? 0.30 : idx == 3 ? 0.30 :
+    idx == 4 ? 0.20 : 0;
+  ) :
+  fam == 2 ? (   // CLAP: ATTACK DECAY - - - - - -
+    idx == 0 ? 0.50 : idx == 1 ? 0.25 : 0;
+  ) :
+  fam == 3 ? (   // HAT: ATTACK DECAY TONE BODY OPEN - - -
+    idx <= 2 ? 0.50 : idx == 3 ? 0.41666666666666667 /* 0.5 of 0..1.2 */ : 0;
+  ) :
+  fam == 4 ? (   // RIDE: ATTACK DECAY TONE DUTY - - - -
+    idx <= 2 ? 0.50 : idx == 3 ? 0.4798 : 0;
+  ) :
+  fam == 5 ? (   // TOM: TUNE DECAY WHICH(hi/mid/low) - - - - -
+    idx <= 2 ? 0.50 : 0;
+  ) : (          // RIM / COWBELL / SHAKER: TUNE DECAY - - - - - -
+    idx <= 1 ? 0.50 : 0;
+  );
+);
+
+function rk_syn_reset(engine, st, mac, tune, vel)
+local(fam, typ, es, seed, f, kb, t2, i)
+global(srate,
+       RK_DDK_SEED, RK_DDS_SEED, RK_DDH_SEED, RK_DDH_DT,
+       RK_DDC_SEED, RK_DDR_SEED, RK_DDR_DT, RK_DDT_SEED,
+       RK_DDM_SEED, RK_DDW_SEED, RK_DDK2_SEED)
+(
+  engine = max(0, engine|0);
+  typ = (engine * 0.1)|0;
+  fam = engine - typ * 10;
+  fam > 8 ? ( fam = 0; typ = 0; );
+  typ > 3 ? typ = 3;
+
+  st[0] = fam;
+  seed  = st[1];                      // per-hit seed from the core (nonzero)
+  es    = st + 2;
+  f     = pow(2, tune / 12);          // pad transposition factor
+
+  fam == 0 ? (
+    es[RK_DDK_SEED] = seed;
+    // transpose his bottom frequency (20 + 80*t), re-normalize, clamp
+    t2 = ((20 + 80 * mac[0]) * f - 20) / 80;
+    t2 = max(0, min(1, t2));
+    kb = log((20 + 80 * t2) / 22050);
+    rk_syn_dd_kick_reset(es, typ, mac[1], mac[2], mac[4],
+                         mac[3] * 0.5, kb, mac[5] >= 0.5);
+  ) :
+  fam == 1 ? (
+    es[RK_DDS_SEED] = seed;
+    t2 = ((170 + 230 * mac[0]) * f - 170) / 230;
+    t2 = max(0, min(1, t2));
+    rk_syn_dd_snare_reset(es, typ, mac[1], mac[2], mac[4],
+                          mac[3], log((170 + 230 * t2) / 22050), t2,
+                          mac[5] >= 0.5);
+  ) :
+  fam == 2 ? (
+    es[RK_DDC_SEED] = seed;
+    rk_syn_dd_clap_reset(es, min(typ, 2), mac[0], mac[1]);
+  ) :
+  fam == 3 ? (
+    es[RK_DDH_SEED] = seed;
+    rk_syn_dd_hat_reset(es, min(typ, 2), mac[4] < 0.5 ? 1 : 0,
+                        mac[0], mac[1], mac[2], mac[3] * 1.2);
+    tune != 0 ? ( i = 0; loop(13, es[RK_DDH_DT + i] *= f; i += 1; ); );
+  ) :
+  fam == 4 ? (
+    es[RK_DDR_SEED] = seed;
+    rk_syn_dd_ride_reset(es, min(typ, 2), mac[0], mac[1], mac[2], mac[3]);
+    tune != 0 ? ( i = 0; loop(13, es[RK_DDR_DT + i] *= f; i += 1; ); );
+  ) :
+  fam == 5 ? (
+    es[RK_DDT_SEED] = seed;
+    rk_syn_dd_tom_reset(es, min(typ, 2), min((mac[2] * 3)|0, 2),
+                        mac[0] + tune / 12, mac[1]);
+  ) :
+  fam == 6 ? (
+    es[RK_DDM_SEED] = seed;
+    rk_syn_dd_rim_reset(es, min(typ, 2), mac[0] + tune / 12, mac[1]);
+  ) :
+  fam == 7 ? (
+    es[RK_DDW_SEED] = seed;
+    rk_syn_dd_cowbell_reset(es, typ, mac[0] + tune / 12, mac[1]);
+  ) : (
+    es[RK_DDK2_SEED] = seed;
+    // linear tuning term (0.5 + t): scale it, re-normalize
+    rk_syn_dd_shaker_reset(es, min(typ, 2),
+                           (0.5 + mac[0]) * f - 0.5, mac[1]);
+  );
+  1;
+);
+
+function rk_syn_tick(st)
+global()
+(
+  st[0] == 0 ? rk_syn_dd_kick_tick(st + 2) :
+  st[0] == 1 ? rk_syn_dd_snare_tick(st + 2) :
+  st[0] == 2 ? rk_syn_dd_clap_tick(st + 2) :
+  st[0] == 3 ? rk_syn_dd_hat_tick(st + 2) :
+  st[0] == 4 ? rk_syn_dd_ride_tick(st + 2) :
+  st[0] == 5 ? rk_syn_dd_tom_tick(st + 2) :
+  st[0] == 6 ? rk_syn_dd_rim_tick(st + 2) :
+  st[0] == 7 ? rk_syn_dd_cowbell_tick(st + 2) :
+  st[0] == 8 ? rk_syn_dd_shaker_tick(st + 2) :
+  0;
+);

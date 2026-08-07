@@ -1,0 +1,418 @@
+@init
+// ═══════════════════════════════════════════════════════════════════════════
+// rk_swing_ui_overlay_syn.jsfx-inc — the SYN tab panel (Spec_Swing_Synth_Layer
+// §5). Drawn INSIDE the pad overlay when overlay_layer == MAX_LAYERS (the SYN
+// pseudo-tab): replaces the waveform/trim region (the waveform fn presents
+// _slen=0 for the SYN tab; this panel paints over that area). Pad ADSR / EQ /
+// FX knobs stay visible — they all apply to synth voices too.
+// Widgets: ssl_knob_* idiom + km_syn state pool; edits go through
+// mark_dirty_pad (undo/automation, the GFX→DSP bridge pattern).
+// ═══════════════════════════════════════════════════════════════════════════
+
+// engine FAMILY names (autoname + labels). Accepts a raw ps_engine value —
+// family = value % 10 (Spec_Synthdrums_Parity §5.1).
+function _syn_engine_name(_se_e)
+global(#_syn_en)
+(
+  _se_e = (_se_e|0) % 10;
+  _se_e == 0 ? strcpy(#_syn_en, "KICK") :
+  _se_e == 1 ? strcpy(#_syn_en, "SNARE") :
+  _se_e == 2 ? strcpy(#_syn_en, "CLAP") :
+  _se_e == 3 ? strcpy(#_syn_en, "HAT") :
+  _se_e == 4 ? strcpy(#_syn_en, "RIDE") :
+  _se_e == 5 ? strcpy(#_syn_en, "TOM") :
+  _se_e == 6 ? strcpy(#_syn_en, "RIM") :
+  _se_e == 7 ? strcpy(#_syn_en, "COWBELL") :
+               strcpy(#_syn_en, "SHAKER");
+);
+
+// compact names for the 9-wide pill row (COWBELL/SHAKER don't fit a pill)
+function _syn_engine_pill(_sp_e)
+global(#_syn_en)
+(
+  _sp_e = (_sp_e|0) % 10;
+  _sp_e == 7 ? strcpy(#_syn_en, "CWBL") :
+  _sp_e == 8 ? strcpy(#_syn_en, "SHKR") :
+  _syn_engine_name(_sp_e);
+);
+
+// per-family accent colors (identity, not state — the grid SYN chip carries
+// bright-on-dark variants of the same palette; keep the two in step).
+// RIDE inherits the old CYM blue.
+function _syn_engine_col(_ec_e, _ec_mul)
+global(_syn_ecr, _syn_ecg, _syn_ecb)
+(
+  _ec_e = (_ec_e|0) % 10;
+  _ec_e == 0 ? ( _syn_ecr = 0.80; _syn_ecg = 0.30; _syn_ecb = 0.20; ) :   // KICK
+  _ec_e == 1 ? ( _syn_ecr = 0.85; _syn_ecg = 0.58; _syn_ecb = 0.15; ) :   // SNARE
+  _ec_e == 2 ? ( _syn_ecr = 0.80; _syn_ecg = 0.38; _syn_ecb = 0.60; ) :   // CLAP
+  _ec_e == 3 ? ( _syn_ecr = 0.16; _syn_ecg = 0.62; _syn_ecb = 0.66; ) :   // HAT
+  _ec_e == 4 ? ( _syn_ecr = 0.42; _syn_ecg = 0.50; _syn_ecb = 0.85; ) :   // RIDE
+  _ec_e == 5 ? ( _syn_ecr = 0.32; _syn_ecg = 0.65; _syn_ecb = 0.28; ) :   // TOM
+  _ec_e == 6 ? ( _syn_ecr = 0.85; _syn_ecg = 0.45; _syn_ecb = 0.18; ) :   // RIM
+  _ec_e == 7 ? ( _syn_ecr = 0.70; _syn_ecg = 0.66; _syn_ecb = 0.20; ) :   // COWBELL
+               ( _syn_ecr = 0.58; _syn_ecg = 0.40; _syn_ecb = 0.78; );    // SHAKER
+  _syn_ecr *= _ec_mul; _syn_ecg *= _ec_mul; _syn_ecb *= _ec_mul;
+);
+
+// macro captions per FAMILY — DD-101 parity semantics (Spec_Synthdrums_Parity
+// §4.1: each macro is the normalized position of one of HIS sliders). Inert
+// macros beyond rk_syn_dd_macro_count() are hidden by the panel; label "".
+function _syn_macro_label(_sl_e, _sl_k)
+global(#_syn_ml)
+(
+  _sl_e = (_sl_e|0) % 10;
+  _sl_e == 0 ? (   // KICK: his tune / pitch decay / amp decay / pitch env / noise + shifter
+    _sl_k == 0 ? strcpy(#_syn_ml, "TUNE") : _sl_k == 1 ? strcpy(#_syn_ml, "P.DEC") :
+    _sl_k == 2 ? strcpy(#_syn_ml, "A.DEC") : _sl_k == 3 ? strcpy(#_syn_ml, "P.ENV") :
+    _sl_k == 4 ? strcpy(#_syn_ml, "NOISE") : _sl_k == 5 ? strcpy(#_syn_ml, "SHIFT") :
+    strcpy(#_syn_ml, "");
+  ) :
+  _sl_e == 1 ? (   // SNARE: tune / pitch decay / amp decay / pitch env / noise decay + shifter
+    _sl_k == 0 ? strcpy(#_syn_ml, "TUNE") : _sl_k == 1 ? strcpy(#_syn_ml, "DECAY") :
+    _sl_k == 2 ? strcpy(#_syn_ml, "A.DEC") : _sl_k == 3 ? strcpy(#_syn_ml, "P.ENV") :
+    _sl_k == 4 ? strcpy(#_syn_ml, "N.DEC") : _sl_k == 5 ? strcpy(#_syn_ml, "SHIFT") :
+    strcpy(#_syn_ml, "");
+  ) :
+  _sl_e == 2 ? (   // CLAP
+    _sl_k == 0 ? strcpy(#_syn_ml, "ATTACK") : _sl_k == 1 ? strcpy(#_syn_ml, "DECAY") :
+    strcpy(#_syn_ml, "");
+  ) :
+  _sl_e == 3 ? (   // HAT (mac4 = OPEN, same slot as pre-parity)
+    _sl_k == 0 ? strcpy(#_syn_ml, "ATTACK") : _sl_k == 1 ? strcpy(#_syn_ml, "DECAY") :
+    _sl_k == 2 ? strcpy(#_syn_ml, "TONE") : _sl_k == 3 ? strcpy(#_syn_ml, "BODY") :
+    _sl_k == 4 ? strcpy(#_syn_ml, "OPEN") : strcpy(#_syn_ml, "");
+  ) :
+  _sl_e == 4 ? (   // RIDE (DUTY default = the measured 47.98%)
+    _sl_k == 0 ? strcpy(#_syn_ml, "ATTACK") : _sl_k == 1 ? strcpy(#_syn_ml, "DECAY") :
+    _sl_k == 2 ? strcpy(#_syn_ml, "TONE") : _sl_k == 3 ? strcpy(#_syn_ml, "DUTY") :
+    strcpy(#_syn_ml, "");
+  ) :
+  _sl_e == 5 ? (   // TOM (WHICH = his hi/mid/low voicings)
+    _sl_k == 0 ? strcpy(#_syn_ml, "TUNE") : _sl_k == 1 ? strcpy(#_syn_ml, "DECAY") :
+    _sl_k == 2 ? strcpy(#_syn_ml, "WHICH") : strcpy(#_syn_ml, "");
+  ) : (            // RIM / COWBELL / SHAKER
+    _sl_k == 0 ? strcpy(#_syn_ml, "TUNE") : _sl_k == 1 ? strcpy(#_syn_ml, "DECAY") :
+    strcpy(#_syn_ml, "");
+  );
+);
+
+// engine-switch macro defaults — DD-101 parity: neutral == his slider
+// defaults == the factory sound (Spec_Synthdrums_Parity §4.1). The table
+// lives in the engine lib (rk_syn_dd_macro_default); this just applies it.
+// _sd_e may carry a type (family + 10*type) — defaults are per-FAMILY.
+function _syn_engine_defaults(_sd_p, _sd_e)
+local(_sd_f)
+global(ps_mac0, ps_mac1, ps_mac2, ps_mac3, ps_mac4, ps_mac5, ps_mac6, ps_mac7)
+(
+  _sd_f = (_sd_e|0) % 10;
+  ps_mac0[_sd_p] = rk_syn_dd_macro_default(_sd_f, 0);
+  ps_mac1[_sd_p] = rk_syn_dd_macro_default(_sd_f, 1);
+  ps_mac2[_sd_p] = rk_syn_dd_macro_default(_sd_f, 2);
+  ps_mac3[_sd_p] = rk_syn_dd_macro_default(_sd_f, 3);
+  ps_mac4[_sd_p] = rk_syn_dd_macro_default(_sd_f, 4);
+  ps_mac5[_sd_p] = rk_syn_dd_macro_default(_sd_f, 5);
+  ps_mac6[_sd_p] = rk_syn_dd_macro_default(_sd_f, 6);
+  ps_mac7[_sd_p] = rk_syn_dd_macro_default(_sd_f, 7);
+);
+
+// ── synth-only pad auto-naming (user request 2026-07-29) ───────────────────
+// A sample-less pad with the synth enabled takes its ENGINE's name as the pad
+// name — propagates through the normal cname plumbing (grid label, mixer
+// strips, PADNAMES gmem → multi-out track names, DM lanes). Ownership guard:
+// we only write when the cname is empty or is one of OUR six engine names, so
+// a user-typed name is never clobbered; disabling/clearing removes only names
+// we own.
+function _syn_name_owned(_sn_p)
+local(_sn_i, _sn_own)
+global(#_syn_en)
+(
+  _sn_own = 0;
+  _sn_i = 0;
+  loop(9,
+    _syn_engine_name(_sn_i);
+    strcmp(get_cname_slot(_sn_p), #_syn_en) == 0 ? _sn_own = 1;
+    _sn_i += 1;
+  );
+  // legacy grandfather: pads named by the pre-parity build ("CYM" engine 4)
+  strcmp(get_cname_slot(_sn_p), "CYM") == 0 ? _sn_own = 1;
+  _sn_own;
+);
+
+// is this published category one WE could have set? (the family glyphs:
+// kick/snare/clap/closed-hat/open-hat/ride/tom/rimshot/cowbell/shaker — the
+// cat-ownership guard, mirror of _syn_name_owned for names. 7 = Cymbal stays
+// grandfathered: pre-parity builds published it for engine 4.)
+function _syn_cat_owned(_co_c) (
+  _co_c == 0 || _co_c == 1 || _co_c == 2 || _co_c == 3 || _co_c == 4 ||
+  _co_c == 5 || _co_c == 7 || _co_c == 9 || _co_c == 12 || _co_c == 15 ||
+  _co_c == 18;
+);
+
+function _syn_autoname(_sa_p)
+local(_sa_c)
+global(ps_enable, ps_engine, #_syn_en, #_syn_prev, col_dirty, _syn_name_sync,
+       _syn_cat_pend)
+(
+  strcpy(#_syn_prev, get_cname_slot(_sa_p));
+  ps_enable[_sa_p] > 0.5 && !pad_has_audio(_sa_p) ? (
+    (strlen(get_cname_slot(_sa_p)) == 0 || _syn_name_owned(_sa_p)) ? (
+      _syn_engine_name(ps_engine[_sa_p]|0);
+      strcpy(get_cname_slot(_sa_p), #_syn_en);
+    );
+  ) : (
+    _syn_name_owned(_sa_p) ? strcpy(get_cname_slot(_sa_p), "");
+  );
+  // Rename COMMIT parity with the CMD-51 handler: the cname alone stays
+  // grid-local. col_dirty re-derives auto-color; the deferred flag fires ONE
+  // CMD 52 (bridge note-name + multi-out track sync — consumed in the main
+  // @gfx, see Swing_ReaKit) per batch. A direct sync_note_names() here would
+  // let the ALL+/ALL− 16-pad loops fire once and gate out the other 15.
+  strcmp(#_syn_prev, get_cname_slot(_sa_p)) != 0 ? (
+    col_dirty = 1;
+    _syn_name_sync = 1;
+    // Icon parity: keep the PUBLISHED category (badge + PAD-tab chip +
+    // StepSeq lane icons + DM — bridge-owned PADCAT band) in step with the
+    // engine name. GIVE → queue the engine's glyph; STRIP → queue Auto
+    // re-infer. Guards mirror the name guard: never clobber a user-picked
+    // category (only uncategorised or one of OUR six), never a LOCKED pad.
+    // Queued (not posted) — the main @gfx drains one per 4th frame; the
+    // REQ mailbox is single-slot and 16 same-frame posts would lose 15.
+    !swing_lcd_padcat_locked(_sa_p) ? (
+      _sa_c = swing_lcd_padcat_eff(_sa_p);
+      strlen(get_cname_slot(_sa_p)) > 0 ? (
+        // == -1 (nothing published) not < 0: PADCAT_NONE is a USER pick, and the
+        // guard's whole job is to never clobber one.
+        (_sa_c == -1 || _syn_cat_owned(_sa_c)) ?
+          _syn_cat_pend[_sa_p] = swing_grid_syn_cat(_sa_p);
+      ) : (
+        _syn_cat_owned(_sa_c) ? _syn_cat_pend[_sa_p] = -1;
+      );
+    );
+  );
+);
+
+// read/write one macro by index (macros live as 8 separate per-pad arrays)
+function _syn_mac_get(_sg_p, _sg_k)
+global(ps_mac0, ps_mac1, ps_mac2, ps_mac3, ps_mac4, ps_mac5, ps_mac6, ps_mac7)
+(
+  _sg_k == 0 ? ps_mac0[_sg_p] : _sg_k == 1 ? ps_mac1[_sg_p] :
+  _sg_k == 2 ? ps_mac2[_sg_p] : _sg_k == 3 ? ps_mac3[_sg_p] :
+  _sg_k == 4 ? ps_mac4[_sg_p] : _sg_k == 5 ? ps_mac5[_sg_p] :
+  _sg_k == 6 ? ps_mac6[_sg_p] : ps_mac7[_sg_p];
+);
+
+function _syn_mac_set(_ss_p, _ss_k, _ss_v)
+global(ps_mac0, ps_mac1, ps_mac2, ps_mac3, ps_mac4, ps_mac5, ps_mac6, ps_mac7)
+(
+  _ss_k == 0 ? ps_mac0[_ss_p] = _ss_v : _ss_k == 1 ? ps_mac1[_ss_p] = _ss_v :
+  _ss_k == 2 ? ps_mac2[_ss_p] = _ss_v : _ss_k == 3 ? ps_mac3[_ss_p] = _ss_v :
+  _ss_k == 4 ? ps_mac4[_ss_p] = _ss_v : _ss_k == 5 ? ps_mac5[_ss_p] = _ss_v :
+  _ss_k == 6 ? ps_mac6[_ss_p] = _ss_v : ps_mac7[_ss_p] = _ss_v;
+);
+
+// ── the panel — call AFTER _ov_draw_waveform_and_adsr when SYN tab active ──
+// Uses the wf_* region globals that function computed. No new active_id claims:
+// all interaction is knob-pool + click zones.
+function _ov_draw_syn_panel()
+local(_sp_x, _sp_y, _sp_w, _sp_h, _sp_eng, _sp_pill_w, _sp_pi, _sp_px, _sp_hit,
+      _sp_kr, _sp_kx, _sp_ky, _sp_ki, _sp_row, _sp_col, _sp_km, _sp_nv, _sp_ov,
+      _sp_on, tw, th, _sp_lx, _sp_fam, _sp_typ, _sp_cnt, _sp_tc, _sp_tx,
+      _sp_d3x, _sp_d3w, _sp_mi)
+global(oi, mx, my, lmb_down, wf_x, wf_y, wf_w, wf_h, KS, km_syn, KM_SYN_PER_PAD,
+       ps_enable, ps_engine, ps_level, ps_vel_lo, ps_vel_hi, p_held, p_held_vel,
+       _syn_drop_hint, MAX_LAYERS, p_rr_idx,
+       gfx_x, gfx_y,
+       _syn_ecr, _syn_ecg, _syn_ecb,
+       #_syn_en, #_syn_ml, #_syn_val)
+(
+  _sp_x = wf_x; _sp_y = wf_y; _sp_w = wf_w; _sp_h = wf_h + 46;
+  // panel background (covers the waveform region + the empty-state text)
+  gfx_set(0.08, 0.085, 0.11, 1); gfx_rect(_sp_x, _sp_y, _sp_w, _sp_h);
+  gfx_set(0.35, 0.55, 0.75, 0.5); gfx_rect(_sp_x, _sp_y, _sp_w, _sp_h, 0);
+
+  _sp_eng = ps_engine[oi]|0;
+  _sp_fam = _sp_eng % 10;                    // family + 10*type (spec §5.1)
+  _sp_typ = (_sp_eng * 0.1)|0;
+  _sp_cnt = rk_syn_dd_macro_count(_sp_fam);
+  _sp_on = ps_enable[oi] > 0.5;
+
+  // ── ENABLE toggle (top-left) ──
+  gfx_set(_sp_on ? 0.20 : 0.16, _sp_on ? 0.60 : 0.18, _sp_on ? 0.35 : 0.20, 1);
+  gfx_rect(_sp_x + 6, _sp_y + 6, 52, 18);
+  gfx_set(1, 1, 1, _sp_on ? 0.95 : 0.55);
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_measurestr(_sp_on ? "SYN ON" : "SYN OFF", tw, th);
+  gfx_x = _sp_x + 6 + (52 - tw) / 2; gfx_y = _sp_y + 6 + (18 - th) / 2;
+  gfx_drawstr(_sp_on ? "SYN ON" : "SYN OFF");
+  mx >= _sp_x + 6 && mx <= _sp_x + 58 && my >= _sp_y + 6 && my <= _sp_y + 24 && lmb_down ? (
+    ps_enable[oi] = _sp_on ? 0 : 1;
+    _syn_autoname(oi);
+    mark_dirty_pad(oi);
+  );
+
+  // ── INIT / RAND (this pad — replaced the kit-wide ALL+/ALL− 2026-07-29:
+  // nobody enables 16 synths at once; per-pad "reset to engine defaults" and
+  // "roll the dice on the macros" are the pair that earns the space) ──
+  gfx_setfont(1, "Arial", 7, 'b');
+  gfx_set(0.22, 0.30, 0.40, 1); gfx_rect(_sp_x + 6, _sp_y + 28, 25, 12);
+  gfx_set(0.75, 0.85, 0.95, 0.9);
+  gfx_measurestr("INIT", tw, th); gfx_x = _sp_x + 6 + (25 - tw) / 2; gfx_y = _sp_y + 28 + (12 - th) / 2;
+  gfx_drawstr("INIT");
+  mx >= _sp_x + 6 && mx <= _sp_x + 31 && my >= _sp_y + 28 && my <= _sp_y + 40 && lmb_down ? (
+    _syn_engine_defaults(oi, _sp_eng);
+    mark_dirty_pad(oi);
+  );
+  gfx_set(0.38, 0.24, 0.44, 1); gfx_rect(_sp_x + 33, _sp_y + 28, 25, 12);
+  gfx_set(0.88, 0.75, 0.95, 0.9);
+  gfx_measurestr("RAND", tw, th); gfx_x = _sp_x + 33 + (25 - tw) / 2; gfx_y = _sp_y + 28 + (12 - th) / 2;
+  gfx_drawstr("RAND");
+  mx >= _sp_x + 33 && mx <= _sp_x + 58 && my >= _sp_y + 28 && my <= _sp_y + 40 && lmb_down ? (
+    _sp_pi = 0; loop(_sp_cnt, _syn_mac_set(oi, _sp_pi, rand(1)); _sp_pi += 1; );
+    mark_dirty_pad(oi);
+  );
+
+  // ── FAMILY pill row (9) ──
+  _sp_pill_w = ((_sp_w - 70) / 9)|0;
+  _sp_pi = 0;
+  loop(9,
+    _sp_px = _sp_x + 64 + _sp_pi * _sp_pill_w;
+    // Each family wears its own color; the selected pill at full strength,
+    // the rest as dim tints of themselves (the row doubles as the legend).
+    _syn_engine_col(_sp_pi, _sp_pi == _sp_fam ? 1.0 : 0.30);
+    gfx_set(_syn_ecr, _syn_ecg, _syn_ecb, 1);
+    gfx_rect(_sp_px, _sp_y + 6, _sp_pill_w - 2, 18);
+    gfx_set(1, 1, 1, _sp_pi == _sp_fam ? 1.0 : 0.6);
+    gfx_setfont(1, "Arial", 7, 'b');
+    _syn_engine_pill(_sp_pi);
+    gfx_measurestr(#_syn_en, tw, th);
+    gfx_x = _sp_px + (_sp_pill_w - 2 - tw) / 2; gfx_y = _sp_y + 6 + (18 - th) / 2;
+    gfx_drawstr(#_syn_en);
+    _sp_hit = mx >= _sp_px && mx <= _sp_px + _sp_pill_w - 2 && my >= _sp_y + 6 && my <= _sp_y + 24;
+    _sp_hit && lmb_down && _sp_pi != _sp_fam ? (
+      ps_engine[oi] = _sp_pi;             // family switch -> type 0
+      _syn_engine_defaults(oi, _sp_pi);   // engine switch resets macros (spec §2.1)
+      p_rr_idx[oi] = 0;
+      _syn_autoname(oi);
+      mark_dirty_pad(oi);
+    );
+    _sp_pi += 1;
+  );
+
+  // ── TYPE selector (his type slider; count varies per family) ──
+  _sp_tc = rk_syn_dd_type_count(_sp_fam);
+  gfx_setfont(1, "Arial", 7, 'b');
+  gfx_set(0.55, 0.58, 0.62, 0.9);
+  gfx_x = _sp_x + 64; gfx_y = _sp_y + 30;
+  gfx_drawstr("TYPE");
+  _sp_pi = 0;
+  loop(_sp_tc,
+    _sp_tx = _sp_x + 92 + _sp_pi * 18;
+    _sp_pi == _sp_typ ? (
+      _syn_engine_col(_sp_fam, 1.0);
+      gfx_set(_syn_ecr, _syn_ecg, _syn_ecb, 1);
+    ) : gfx_set(0.20, 0.22, 0.27, 1);
+    gfx_rect(_sp_tx, _sp_y + 28, 16, 12);
+    gfx_set(1, 1, 1, _sp_pi == _sp_typ ? 1.0 : 0.55);
+    sprintf(#_syn_val, "%d", _sp_pi + 1);
+    gfx_measurestr(#_syn_val, tw, th);
+    gfx_x = _sp_tx + (16 - tw) / 2; gfx_y = _sp_y + 28 + (12 - th) / 2;
+    gfx_drawstr(#_syn_val);
+    mx >= _sp_tx && mx <= _sp_tx + 16 && my >= _sp_y + 28 && my <= _sp_y + 40
+      && lmb_down && _sp_pi != _sp_typ ? (
+      ps_engine[oi] = _sp_fam + 10 * _sp_pi;  // same family: macros KEPT
+      mark_dirty_pad(oi);
+    );
+    _sp_pi += 1;
+  );
+
+  // ── macro knobs (2 × 4 grid; only the family's ASSIGNED macros are shown —
+  // his families expose 2-6 sound params, the rest are inert) ──
+  _syn_engine_col(_sp_fam, 1.0);
+  _sp_kr = 15;
+  _sp_ki = 0;
+  loop(8,
+    _sp_ki < _sp_cnt ? (
+      _sp_row = (_sp_ki / 4)|0;
+      _sp_col = _sp_ki % 4;
+      _sp_kx = _sp_x + 44 + _sp_col * ((_sp_w - 130) / 4);
+      _sp_ky = _sp_y + 56 + _sp_row * 52;
+      _sp_km = km_syn + (oi * KM_SYN_PER_PAD + _sp_ki) * KS;
+      _sp_ov = _syn_mac_get(oi, _sp_ki);
+      _sp_nv = ssl_knob_interact(_sp_km, _sp_kx, _sp_ky, _sp_kr, _sp_ov, 0, 1.0, 0.5, 0);
+      _sp_nv != _sp_ov ? ( _syn_mac_set(oi, _sp_ki, _sp_nv); mark_dirty_pad(oi); );
+      ssl_knob_draw(_sp_kx, _sp_ky, _sp_kr, _syn_mac_get(oi, _sp_ki), 0, 1.0, 0, _sp_km[0],
+        _sp_on ? _syn_ecr : 0.25, _sp_on ? _syn_ecg : 0.28, _sp_on ? _syn_ecb : 0.32, 0);
+      gfx_setfont(1, "Arial", 8, 'b'); gfx_set(0.70, 0.72, 0.75, 1);
+      _syn_macro_label(_sp_fam, _sp_ki);
+      gfx_measurestr(#_syn_ml, tw, th);
+      gfx_x = _sp_kx - tw / 2; gfx_y = _sp_ky + _sp_kr + 2; gfx_drawstr(#_syn_ml);
+      sprintf(#_syn_val, "%.0f%%", _syn_mac_get(oi, _sp_ki) * 100);
+      gfx_measurestr(#_syn_val, tw, th); gfx_set(0.55, 0.57, 0.60, 1);
+      gfx_x = _sp_kx - tw / 2; gfx_y = _sp_ky + _sp_kr + 11; gfx_drawstr(#_syn_val);
+    );
+    _sp_ki += 1;
+  );
+
+  // ── 3D family drum ──
+  // Fills the dead column between the last macro knob and the LEVEL column.
+  // Derived from the same constants the knobs use, so it tracks any layout
+  // change instead of drifting. Works out at 77.5 x 111 with the fixed 420px
+  // overlay: 2px clear of the last knob, 4px clear of LEVEL.
+  // ⚠️ That box is PORTRAIT, so wide flat families (RIDE especially) frame
+  // small here however they are posed. The SYNTH big view is landscape and
+  // does not have the problem.
+  _sp_d3x = _sp_x + 44 + 3 * ((_sp_w - 130) / 4) + _sp_kr + 2;
+  _sp_d3w = (_sp_x + _sp_w - 40 - _sp_kr - 4) - _sp_d3x;
+  _sp_d3w > 24 ? (
+    // The accent is fetched HERE and passed in — rk_swing_ui_drum3d imports
+    // before this file, so it cannot call _syn_engine_col itself.
+    _syn_engine_col(_sp_fam, 1.0);
+    // HAT 4 OPEN / TOM 2 WHICH / CLAP 0 ATTACK; -1 for the other six
+    _sp_mi = swing_drum3d_morph_macro(_sp_fam);
+    swing_drum3d_draw(_sp_d3x, _sp_y + 41, _sp_d3w, 111, _sp_fam,
+                      p_held[oi] > 0.5, _sp_on ? 1 : 0.42,
+                      _syn_ecr, _syn_ecg, _syn_ecb,
+                      _sp_mi >= 0 ? _syn_mac_get(oi, _sp_mi) : 0,
+                      p_held[oi] > 0.5 ? p_held_vel[oi] / 127 : 0);
+  );
+
+  // ── LEVEL + VEL LO/HI (right column) ──
+  _sp_lx = _sp_x + _sp_w - 40;
+  _sp_km = km_syn + (oi * KM_SYN_PER_PAD + 8) * KS;
+  _sp_ov = ps_level[oi];
+  _sp_nv = ssl_knob_interact(_sp_km, _sp_lx, _sp_y + 56, _sp_kr, _sp_ov, 0, 2.0, 1.0, 0);
+  _sp_nv != _sp_ov ? ( ps_level[oi] = _sp_nv; mark_dirty_pad(oi); );
+  ssl_knob_draw(_sp_lx, _sp_y + 56, _sp_kr, ps_level[oi], 0, 2.0, 0, _sp_km[0], 0.85, 0.65, 0.25, 0);
+  gfx_setfont(1, "Arial", 8, 'b'); gfx_set(0.70, 0.72, 0.75, 1);
+  gfx_measurestr("LEVEL", tw, th); gfx_x = _sp_lx - tw / 2; gfx_y = _sp_y + 56 + _sp_kr + 2; gfx_drawstr("LEVEL");
+
+  _sp_km = km_syn + (oi * KM_SYN_PER_PAD + 9) * KS;
+  _sp_ov = ps_vel_lo[oi];
+  _sp_nv = ssl_knob_interact(_sp_km, _sp_lx, _sp_y + 108, 11, _sp_ov, 0, 1.0, 0, 0);
+  _sp_nv != _sp_ov ? ( ps_vel_lo[oi] = min(_sp_nv, ps_vel_hi[oi] - 1/127); mark_dirty_pad(oi); );
+  ssl_knob_draw(_sp_lx, _sp_y + 108, 11, ps_vel_lo[oi], 0, 1.0, 0, _sp_km[0], 0.85, 0.55, 0.20, 0);
+  gfx_setfont(1, "Arial", 7, 'b'); gfx_set(0.65, 0.67, 0.70, 1);
+  gfx_measurestr("V.LO", tw, th); gfx_x = _sp_lx - tw / 2; gfx_y = _sp_y + 108 + 13; gfx_drawstr("V.LO");
+
+  _sp_km = km_syn + (oi * KM_SYN_PER_PAD + 10) * KS;
+  _sp_ov = ps_vel_hi[oi];
+  _sp_nv = ssl_knob_interact(_sp_km, _sp_lx, _sp_y + 148, 11, _sp_ov, 0, 1.0, 1.0, 0);
+  _sp_nv != _sp_ov ? ( ps_vel_hi[oi] = max(_sp_nv, ps_vel_lo[oi] + 1/127); mark_dirty_pad(oi); );
+  ssl_knob_draw(_sp_lx, _sp_y + 148, 11, ps_vel_hi[oi], 0, 1.0, 0, _sp_km[0], 0.30, 0.70, 0.85, 0);
+  gfx_measurestr("V.HI", tw, th); gfx_x = _sp_lx - tw / 2; gfx_y = _sp_y + 148 + 13; gfx_drawstr("V.HI");
+
+  // ── hints ──
+  gfx_setfont(1, "Arial", 8, 0);
+  gfx_set(0.55, 0.58, 0.62, 0.8);
+  gfx_x = _sp_x + 6; gfx_y = _sp_y + _sp_h - 12;
+  gfx_drawstr("Synth follows the pad layer mode + TUNE. Sample drops land on L1-L4.");
+  _syn_drop_hint > 0 ? (
+    gfx_set(0.95, 0.75, 0.25, min(1, _syn_drop_hint / 30));
+    gfx_setfont(1, "Arial", 10, 'b');
+    gfx_measurestr("Samples can't load on the SYN tab — pick L1-L4", tw, th);
+    gfx_x = _sp_x + (_sp_w - tw) / 2; gfx_y = _sp_y + _sp_h / 2 - 6;
+    gfx_drawstr("Samples can't load on the SYN tab — pick L1-L4");
+    _syn_drop_hint -= 1;
+  );
+);

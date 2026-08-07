@@ -1,0 +1,1253 @@
+// rk_swing_lcd.jsfx-inc
+// Swing right-panel LCD bar: KIT / PAD tabs
+// Phase 2 — v2.1 LCD bar
+// (c) EON Studios — All Rights Reserved
+
+@init
+
+LCD_BAR_H = 130;
+LCD_TAB_H = 22;
+LCD_CONTENT_H = 108;
+
+// ─── LCD bar colors ──────────────────────────────────────────────────────
+lcd_bar_bg_r = 0.05; lcd_bar_bg_g = 0.10; lcd_bar_bg_b = 0.14;
+lcd_bar_tx_r = 0.70; lcd_bar_tx_g = 0.90; lcd_bar_tx_b = 0.92;
+
+// ─── Init ────────────────────────────────────────────────────────────────
+// ── Kit-categories shared helpers (used by the LCD pill AND the pad badge —
+// this inc imports before rk_swing_ui_grid_pads, so def-time resolution holds).
+// The bridge stays the band's sole writer: every set goes through the mailbox.
+function swing_lcd_padcat_get(pad) local(b) (
+  b = EON_PADCAT_BASE + _reg_my_slot*EON_PADCAT_STRIDE + pad*4;
+  gmem[b] > 0 ? gmem[b+1]|0 : -1;
+);
+function swing_lcd_padcat_locked(pad) (
+  gmem[EON_PADCAT_BASE + _reg_my_slot*EON_PADCAT_STRIDE + pad*4 + 3] > 0.5;
+);
+// Request codes on the mailbox's CAT arg: 0..45 = a category, -1 = Auto
+// (bridge re-infers from the pad name), -2 = toggle the audio LOCK, PADCAT_NONE
+// (-3) = the user says this pad has no job. srchint on the SRC arg: -1 leaves the
+// pad's provenance alone, 0..2 sets it (2 = the user's own sample, which FILL
+// refuses to stomp — the browser writes the same 2 through its ExtState queue).
+function swing_lcd_padcat_post_ex(pad, catid, srchint) (
+  gmem[EON_PADCAT_REQ + 1] = _reg_my_slot;
+  gmem[EON_PADCAT_REQ + 2] = gmem[INST_IDENT_BASE + _reg_my_slot*INST_IDENT_INST_STRIDE + pad*INST_IDENT_PAD_FIELDS + 4]|0;
+  gmem[EON_PADCAT_REQ + 3] = catid;
+  gmem[EON_PADCAT_REQ + 4] = srchint;
+  swing_padcat_reqseq += 1; gmem[EON_PADCAT_REQ] = swing_padcat_reqseq;   // seq LAST
+  // Optimistic display until the bridge republishes (wheel feels instant).
+  // NOT for -2: that's the lock toggle, not a category — the band never echoes
+  // -2 back, so latching it would leave eff() reporting -2 for this pad forever.
+  catid != -2 ? ( swing_catpick_optpad = pad; swing_catpick_opt = catid; );
+);
+function swing_lcd_padcat_post(pad, catid) (
+  swing_lcd_padcat_post_ex(pad, catid, -1);
+);
+// effective category for DISPLAY/wheel-base: optimistic value until the band
+// echoes it back (then cleared), else the published value.
+// ⭐ PADCAT_NONE is a real published value, not "unknown": the user cleared this
+// pad, so consumers must draw NOTHING rather than re-inferring a glyph from the
+// file name (-1 = never published still infers, which is what bootstraps a
+// fresh rack).
+function swing_lcd_padcat_eff(pad) local(c) (
+  c = swing_lcd_padcat_get(pad);
+  swing_catpick_optpad == pad && swing_catpick_opt >= PADCAT_NONE ? (
+    c == swing_catpick_opt ? ( swing_catpick_optpad = -1; ) : ( c = swing_catpick_opt; );
+  );
+  c;
+);
+// wheel-cycle: a 47-position ring — the 46 categories plus NONE, so the wheel
+// can take a pad back to no category at all (position 0 = none, 1..46 = cat
+// 0..45). steps = frame_wheel|0.
+function swing_lcd_padcat_wheel(pad, steps) local(c) (
+  c = swing_lcd_padcat_eff(pad);
+  c = c < 0 ? 0 : c + 1;
+  c = ((c - steps) % 47 + 47) % 47;
+  swing_lcd_padcat_post(pad, c == 0 ? PADCAT_NONE : c - 1);
+);
+// A sample dropped STRAIGHT onto a pad (Explorer, Media Explorer, arrange) never
+// touches the browser, so nothing classified it and the pad kept the PREVIOUS
+// sample's category — drop a crash on a kick pad and the badge stayed a kick.
+// Classify the pad's own file name (the untruncated cname, not the 32-char gmem
+// mirror the bridge's Auto has to work from) and queue a post.
+// Parity with the browser's queue_pad_category, deliberately: a CONFIDENT match
+// only — an ambiguous name ("Sample_04") leaves the category alone rather than
+// downgrading it — and SRC=2 rides along to mark the pad as the user's own.
+// Queued rather than posted: the mailbox is single-slot, so a 16-file drop
+// posting inline would land ONE category. The @gfx drain paces them out.
+function swing_lcd_padcat_queue_drop(pad) local(c, nm, p, i, len, ch, e1, e2) (
+  _reg_my_slot >= 0 && pad_has_audio(pad) ? (
+    // The pad's own name is the untruncated basename auto_name_from_file just
+    // derived — NOT the 32-char gmem mirror the bridge's Auto has to work from,
+    // which is why a drop classifies better here than a later re-infer would.
+    nm = get_cname_slot(pad);
+    strlen(nm) == 0 ? nm = get_name_slot(pad);
+    c = strlen(nm) > 0 ? eon_cat_for_name(nm) : 31;
+    // Filename said nothing: give the CONTAINING FOLDER a turn — "Kicks/01.wav"
+    // is a real naming style and the browser gets this right by passing the
+    // folder too. Folder SECOND and alone, never merged into the name: this
+    // classifier is first-match-wins over one string, so a folder handed in
+    // alongside the name would outvote it ("Kicks/Snare 01.wav" -> kick).
+    c == 31 ? (
+      p = get_path_slot(pad);
+      len = strlen(p); e1 = -1; e2 = -1; i = 0;
+      loop(len,
+        ch = str_getchar(p, i);
+        (ch == 47 || ch == 92) ? ( e2 = e1; e1 = i; );   // '/' or '\'
+        i += 1;
+      );
+      (e1 > 0 && e2 >= 0 && e1 - e2 > 1) ? (
+        strcpy_substr(#_pcd_fold, p, e2 + 1, e1 - e2 - 1);
+        c = eon_cat_for_name(#_pcd_fold);
+      );
+    );
+    // 31 is the classifier's "I don't know", not a category — posting it would
+    // downgrade a pad that had a real job into the generic glyph.
+    c >= 0 && c != 31 ? ( _syn_cat_pend[pad] = c; _syn_cat_src[pad] = 2; );
+  );
+);
+// the shared picker menu: Auto + the 46 frozen-vocab names in glyph-id order
+function swing_lcd_catmenu_open(px, py, pad) local(i) (
+  swing_catpick_pad = pad;
+  // item 1 = LOCK toggle (② semantics: locked pad is untouched by kit loads
+  // and fills), item 2 = Auto, 3.. = the 46 vocab names in glyph-id order.
+  strcpy(#swing_catmenu, swing_lcd_padcat_locked(pad)
+    ? "!Lock audio (survives kit loads)||Auto (from name)"
+    :  "Lock audio (survives kit loads)||Auto (from name)");
+  i = 0;
+  loop(46,
+    strcat(#swing_catmenu, "|");
+    eon_catname(#swing_catnm, i);
+    strcat(#swing_catmenu, #swing_catnm);
+    i += 1;
+  );
+  swing_popup_open(px, py, #swing_catmenu, SP_POPUP_CALLER_PAD_CATEGORY);
+);
+
+// Mode/algo picker (Repitch / Tuned / Stretch), wrapped so the RANGE-pill
+// right-click and the manual-capture mailbox open the SAME menu from ONE
+// string. Labels are display-only — selection is by 1-based index including
+// the disabled "#Mode" header — so the hint text cannot break routing.
+function swing_lcd_modemenu_open(px, py) (
+  // "no key range": chromatic key ranges track only on the Repitch path
+  // (engine support for the other two is post-3.0). Labels are display-only —
+  // selection is by index — so the caveat text cannot break routing.
+  swing_popup_open(px, py,
+    "#Mode|^g Repitch (drums)|^b Tuned (drums · no key range)|^a Stretch (sustained · no key range)",
+    SP_POPUP_CALLER_MODE_ALGO);
+);
+swing_catpick_optpad = -1; swing_catpick_opt = -2;   // no optimistic value yet
+
+// ─── Root-note band readers (BRIDGE-owned publisher; we only READ) ─────────
+// Constants + full band rationale in Swing_ReaKit.jsfx (EON_ROOTNOTE_BASE).
+// The publisher writes VER LAST, so VER>0 guarantees the rest of that pad's
+// record is complete — same discipline as PADCAT/IDENT. Reading an unclaimed
+// slot (_reg_my_slot < 0, pre-registration) must never index the band.
+function swing_lcd_rootnote_base(pad) (
+  EON_ROOTNOTE_BASE + _reg_my_slot * EON_ROOTNOTE_STRIDE + pad * EON_ROOTNOTE_FIELDS;
+);
+function swing_lcd_rootnote_published(pad) (
+  _reg_my_slot >= 0 && gmem[swing_lcd_rootnote_base(pad) + RN_OFF_VER] > 0;
+);
+// MIDI note, or -1 when nothing is published / the pad has no root note.
+function swing_lcd_rootnote_note(pad) (
+  swing_lcd_rootnote_published(pad) ? gmem[swing_lcd_rootnote_base(pad) + RN_OFF_NOTE] | 0 : -1;
+);
+function swing_lcd_rootnote_cents(pad) (
+  swing_lcd_rootnote_published(pad) ? gmem[swing_lcd_rootnote_base(pad) + RN_OFF_CENTS] : 0;
+);
+function swing_lcd_rootnote_conf(pad) (
+  swing_lcd_rootnote_published(pad) ? gmem[swing_lcd_rootnote_base(pad) + RN_OFF_CONF] : 0;
+);
+function swing_lcd_rootnote_src(pad) (
+  swing_lcd_rootnote_published(pad) ? gmem[swing_lcd_rootnote_base(pad) + RN_OFF_SRC] | 0 : RN_SRC_NONE;
+);
+// Ask the bridge to (re)analyse this instance: one pad, or -1 for all of them.
+function swing_lcd_rootnote_request(pad) (
+  _reg_my_slot >= 0 ? (
+    gmem[EON_ROOTNOTE_REQ + 1] = _reg_my_slot;
+    gmem[EON_ROOTNOTE_REQ + 2] = pad;
+    swing_lcd_rootnote_reqseq += 1;
+    gmem[EON_ROOTNOTE_REQ]     = swing_lcd_rootnote_reqseq;   // seq LAST
+  );
+);
+// Display string, e.g. "F#1"; empty when there is nothing to show.
+// Cents are deliberately NOT appended: on a gliding source (an 808 still
+// falling through its pitch envelope) the cents value is window-dependent —
+// two kicks 17 cents apart measured as different note names. The NOTE is the
+// stable quantity; cents stay available via swing_lcd_rootnote_cents() for tooltips.
+// Format ANY MIDI note as "F#1" into dst. Octave math deliberately matches the
+// MIDI-note pill further down, so the two readouts can never disagree.
+function swing_lcd_note_str(dst, n) local(pc) (
+  n < 0 ? ( strcpy(dst, ""); ) : (
+    pc = n % 12;
+    pc == 0  ? strcpy(dst, "C")  : pc == 1  ? strcpy(dst, "C#") :
+    pc == 2  ? strcpy(dst, "D")  : pc == 3  ? strcpy(dst, "D#") :
+    pc == 4  ? strcpy(dst, "E")  : pc == 5  ? strcpy(dst, "F")  :
+    pc == 6  ? strcpy(dst, "F#") : pc == 7  ? strcpy(dst, "G")  :
+    pc == 8  ? strcpy(dst, "G#") : pc == 9  ? strcpy(dst, "A")  :
+    pc == 10 ? strcpy(dst, "A#") : strcpy(dst, "B");
+    sprintf(#swing_rn_oct, "%d", (n / 12 | 0) - 1);
+    strcat(dst, #swing_rn_oct);
+  );
+);
+// The DETECTED root, unmodified.
+function swing_lcd_rootnote_str(dst, pad) (
+  swing_lcd_note_str(dst, swing_lcd_rootnote_note(pad));
+);
+// ─── SYNTH pads: root note straight from the engine's own parameters ──────
+// No detection needed — the synth knows its own pitch. Returns Hz, or -1 when
+// this engine has no root note worth showing.
+//
+// ⛔⛔ EVERY formula here comes from the LIVE DD-101 parity port (rk_syn_dd_*).
+// The legacy rk_syn_kick_reset / _snare_ / _tom_ engines are DEAD CODE with
+// zero call sites; quoting legacy kick would read 24.31 Hz where the truth is
+// 34.83 Hz — 6.1 semitones wrong. Each formula below was derived from the live
+// engine and then CONFIRMED BY RENDERING IT AND MEASURING THE SPECTRUM, because
+// reasoning about which partial dominates got it wrong twice.
+//
+// Silence is a deliberate answer in three distinct cases:
+//   * families that genuinely have no fundamental (filter cutoff / noise only),
+//   * engines that decay to nothing before their pitch ever settles,
+//   * settings where two modes swap dominance and the note would be a coin flip.
+function swing_lcd_synth_hz(pad)
+local(_e, _typ, _fam, _t, _m0, _m1, _m2, _m5, _tuning, _t2, _sb, _which, _hz)
+(
+  _hz = -1;
+  ps_enable[pad] > 0.5 ? (
+    // Engine decode (mirrors rk_syn_reset, including its fam>8 guard).
+    _e   = max(0, ps_engine[pad] | 0);
+    _typ = (_e * 0.1) | 0;
+    _fam = _e - _typ * 10;
+    _fam > 8 ? ( _fam = 0; _typ = 0; );
+    _typ > 3 ? _typ = 3;
+
+    _t  = p_tune[pad];
+    _m0 = ps_mac0[pad]; _m1 = ps_mac1[pad];
+    _m2 = ps_mac2[pad]; _m5 = ps_mac5[pad];
+    _tuning = pow(2, _m0 + _t / 12 - 0.5);
+
+    _fam == 0 ? (
+      // KICK, all 4 types. ⚠️ tune is applied INSIDE the clamp — a naive
+      // 2^(t/12) on the final Hz is wrong once the clamp bites.
+      // 160/147 = 24000/22050; srate cancels exactly. Default 34.83 Hz (C#1).
+      _t2 = max(0, min(1, ((20 + 80 * _m0) * pow(2, _t / 12) - 20) / 80));
+      _hz = (20 + 80 * _t2) * (160 / 147);
+    ) : _fam == 1 ? (
+      _sb = min(400, max(170, (170 + 230 * _m0) * pow(2, _t / 12)));
+      _typ == 0 ? (
+        // Type 0 is a DIFFERENT ENGINE — a 9-bandpass modal shell with no
+        // oscillator, so this is the strongest resonance rather than a
+        // fundamental. ⚠️ At DECAY >= 0.98 the mode at sb overtakes the one at
+        // 1.05*sb (measured −94 cents at 0.995 — a different note), so the
+        // answer becomes a coin flip. Show nothing there rather than guess.
+        _m1 < 0.98 ? _hz = 1.05 * _sb;
+      ) : (
+        _hz = _sb * (160 / 147);
+        // The SSB shifter is ticked on the type-2 branch only.
+        _typ == 2 && _m5 >= 0.5 ? _hz += 12.5;
+      );
+    ) : _fam == 5 ? (
+      _which = min((_m2 * 3) | 0, 2);
+      _typ == 0 ? (
+        // tom_synth2: partials at LOWSC*core and 0.7*core, nothing at core.
+        // A bandpass sits ON core, lifting LOWSC*core — measured convergence
+        // to ratio 1.0000. LOWSC is 1.0 / 1.1 / 1.1.
+        _hz = (_which == 0 ? 115 : _which == 1 ? 99 : 89.1) * _tuning;
+      ) : _typ == 1 ? (
+        // tom_synth1: sine recurrence, and its tick has no DT2 — no glide at
+        // all, so the pitch is exactly core. Measured 1.0000 on all variants.
+        _hz = (_which == 0 ? 154 : _which == 1 ? 147 : 101) * _tuning;
+      );
+      // ⛔ tom_synth3 (typ 2) gets NO pill: its shift (140) exceeds its core
+      // (130), and the amplitude reaches exact silence by 0.5 s while the pitch
+      // is still 1.29x sharp and falling. It never arrives anywhere.
+    ) : _fam == 6 ? (
+      _hz = (min(_typ, 2) == 0 ? 220 : min(_typ, 2) == 1 ? 511 : 413) * _tuning;
+    ) : _fam == 7 ? (
+      // COWBELL. Type 1's two oscillators sit at ~3/2, which looks like a
+      // missing fundamental — measured, it is not: spectral peak and YIN both
+      // land on osc1, because a 3x-weighted bandpass feeds that saw alone
+      // (+15.7 dB). Types 2/3 are unmeasured and scale differently, so no pill.
+      _typ == 0 ? _hz = 487 * _tuning :
+      _typ == 1 ? _hz = 848.3 * _tuning;
+    );
+    // fam 2 CLAP, 3 HAT, 4 RIDE, 8 SHAKER: filter cutoff / noise band only.
+    // CLAP is not even PASSED a tune value — its reset has no tune parameter.
+    // Showing nothing for these is the truth, not a gap.
+  );
+  _hz;
+);
+// Hz -> nearest MIDI note. log() is fine here: @gfx, never @sample.
+function swing_lcd_hz_to_note(hz) (
+  hz <= 0 ? -1 : max(0, min(127, (69 + 12 * log(hz / 440) / log(2) + 0.5) | 0));
+);
+
+// ⭐ The note the pad will actually SOUND at = detected root + PITCH offset.
+// This is what the pill shows, so dragging the PITCH knob answers "what key am
+// I tuning this sample to" live, rather than only stating where it started.
+// -1 when no root is known — a bare ±semitone offset has no key to report.
+// p_tune is continuous, so round to the nearest semitone for display; the
+// fractional part is the user's own detune and is not a different note name.
+// SYNTH pads win: their formula already folds the pad's tune in, so the value
+// is the final sounding pitch and must NOT have tune added a second time.
+// Sample pads fall back to the detected root plus the PITCH offset.
+function swing_lcd_rootnote_played(pad) local(n, _shz) (
+  _shz = swing_lcd_synth_hz(pad);
+  _shz > 0 ? swing_lcd_hz_to_note(_shz) : (
+    n = swing_lcd_rootnote_note(pad);
+    n < 0 ? -1 : max(0, min(127, (n + p_tune[pad] + 0.5) | 0));
+  );
+);
+function swing_lcd_rootnote_played_str(dst, pad) (
+  swing_lcd_note_str(dst, swing_lcd_rootnote_played(pad));
+);
+// Pan as a percentage: "C" dead centre, else "L37%" / "R80%".
+function swing_lcd_pan_str(dst, pad) local(v) (
+  v = p_pan[pad];
+  v > -0.005 && v < 0.005 ? ( strcpy(dst, "C"); ) : (
+    v < 0 ? sprintf(dst, "L%d%%", (-v * 100 + 0.5) | 0)
+          : sprintf(dst, "R%d%%", ( v * 100 + 0.5) | 0);
+  );
+);
+
+// ─── Shared value pill ────────────────────────────────────────────────────
+// One filled rect + 1 px inset border + centred bold text, centred on a knob at
+// (cx) with its top at (ty), tinted with that knob's own accent colour so the
+// pill reads as THAT control's live value rather than as chrome.
+// `hot` = the control is away from its neutral position; it brightens fill,
+// border and text so a moved knob is obvious at a glance.
+// @gfx only — every scratch is local() because @gfx runs concurrent with @block.
+function swing_lcd_value_pill(cx, ty, txt, r, g, b, hot)
+local(_tw, _th, _w, _h, _x)
+(
+  gfx_setfont(1, "Arial", 12, 'b');
+  gfx_measurestr(txt, _tw, _th);
+  _w = _tw + 12;                       // 6 px padding each side
+  _h = 17;
+  _x = cx - _w * 0.5;
+  hot ? gfx_set(r * 0.62, g * 0.62, b * 0.62, 1)
+      : gfx_set(r * 0.28, g * 0.28, b * 0.28, 1);
+  gfx_rect(_x, ty, _w, _h);
+  hot ? gfx_set(min(1, r * 1.3), min(1, g * 1.3), min(1, b * 1.3), 0.95)
+      : gfx_set(r * 0.8, g * 0.8, b * 0.8, 0.65);
+  gfx_rect(_x, ty, _w, 1);
+  gfx_rect(_x, ty + _h - 1, _w, 1);
+  gfx_rect(_x, ty, 1, _h);
+  gfx_rect(_x + _w - 1, ty, 1, _h);
+  hot ? gfx_set(1, 0.97, 1, 1)
+      : gfx_set(min(1, r + 0.28), min(1, g + 0.28), min(1, b + 0.28), 1);
+  gfx_x = _x + (_w - _tw) * 0.5;
+  gfx_y = ty + (_h - _th) * 0.5;
+  gfx_drawstr(txt);
+);
+swing_lcd_rootnote_reqseq = 0;
+
+function swing_lcd_init(mem_base)
+local(_base)
+(
+  _base = mem_base;
+  km_lcd = _base; _base += 4 * KS;  // 4 knobs × 16 memory slots (GAIN/PAN/PITCH/OUT)
+  memset(km_lcd, 0, 4 * KS);
+  lcd_right_tab = 0;  // 0=KIT, 1=PAD
+  _base;
+);
+
+// ─── Draw tab row (22px) ─────────────────────────────────────────────────
+function swing_lcd_draw_tabs(_tx, _ty, _tw)
+local(_num_tabs, _tab_w, _tab_h, _ti, _tab_x, _tab_mode, _is_active, _lbl, _tw_m, _th_m)
+(
+  _num_tabs = 2;
+  _tab_h = 18;
+  _tab_w = ((_tw - 8 - (_num_tabs - 1) * 3) / _num_tabs)|0;
+
+  _ti = 0; loop(_num_tabs,
+    _tab_x = _tx + 4 + _ti * (_tab_w + 3);
+    _tab_mode = _ti;
+    _is_active = lcd_right_tab == _tab_mode;
+
+    // Tab background
+    _is_active ? (
+      gfx_set(lcd_bar_tx_r * 0.25, lcd_bar_tx_g * 0.25, lcd_bar_tx_b * 0.25, 0.9);
+    ) : (
+      gfx_set(0.04, 0.07, 0.10, 0.7);
+    );
+    gfx_rect(_tab_x, _ty + 2, _tab_w, _tab_h);
+
+    // Active underline (Swing red)
+    _is_active ? (
+      gfx_set(0.85, 0.20, 0.12, 1);
+      gfx_rect(_tab_x, _ty + 2 + _tab_h - 2, _tab_w, 2);
+    );
+
+    // Tab label
+    _ti == 0 ? _lbl = "KIT" :
+    _lbl = "PAD";
+
+    gfx_setfont(1, "Arial", 9, 'b');
+    _is_active ? (
+      gfx_set(lcd_bar_tx_r, lcd_bar_tx_g, lcd_bar_tx_b, 1);
+    ) : (
+      gfx_set(lcd_bar_tx_r * 0.45, lcd_bar_tx_g * 0.45, lcd_bar_tx_b * 0.45, 0.7);
+    );
+    gfx_measurestr(_lbl, _tw_m, _th_m);
+    gfx_x = _tab_x + (_tab_w - _tw_m) * 0.5;
+    gfx_y = _ty + 2 + (_tab_h - _th_m) * 0.5;
+    gfx_drawstr(_lbl);
+
+    // Click detection
+    lmb_down && mx >= _tab_x && mx < _tab_x + _tab_w &&
+    my >= _ty + 2 && my < _ty + 2 + _tab_h ? (
+      lcd_right_tab = _tab_mode;
+    );
+
+    _ti += 1;
+  );
+);
+
+// ─── LCD mini button helper ──────────────────────────────────────────────
+function _lcd_btn(_bx, _by, _bw, _bh, _blbl, _active)
+local(_hover, _tw_m, _th_m, _clicked)
+(
+  _hover = mx >= _bx && mx < _bx + _bw && my >= _by && my < _by + _bh;
+  _clicked = _hover && lmb_down;
+
+  // Background
+  _active ? (
+    gfx_set(lcd_bar_tx_r * 0.4, lcd_bar_tx_g * 0.4, lcd_bar_tx_b * 0.4, 0.9);
+  ) : _hover ? (
+    gfx_set(lcd_bar_tx_r * 0.2, lcd_bar_tx_g * 0.2, lcd_bar_tx_b * 0.2, 0.7);
+  ) : (
+    gfx_set(lcd_bar_tx_r * 0.1, lcd_bar_tx_g * 0.1, lcd_bar_tx_b * 0.1, 0.5);
+  );
+  gfx_rect(_bx, _by, _bw, _bh);
+
+  // Border
+  _active ? (
+    gfx_set(lcd_bar_tx_r * 0.7, lcd_bar_tx_g * 0.7, lcd_bar_tx_b * 0.7, 0.8);
+  ) : (
+    gfx_set(lcd_bar_tx_r * 0.3, lcd_bar_tx_g * 0.3, lcd_bar_tx_b * 0.3, 0.4);
+  );
+  gfx_rect(_bx, _by, _bw, 1);
+  gfx_rect(_bx, _by + _bh - 1, _bw, 1);
+  gfx_rect(_bx, _by, 1, _bh);
+  gfx_rect(_bx + _bw - 1, _by, 1, _bh);
+
+  // Label
+  gfx_setfont(1, "Arial", 8, 'b');
+  gfx_set(lcd_bar_tx_r, lcd_bar_tx_g, lcd_bar_tx_b, _active ? 1 : 0.75);
+  gfx_measurestr(_blbl, _tw_m, _th_m);
+  gfx_x = _bx + (_bw - _tw_m) * 0.5;
+  gfx_y = _by + (_bh - _th_m) * 0.5;
+  gfx_drawstr(_blbl);
+
+  _clicked;
+);
+
+// ─── KIT tab content ─────────────────────────────────────────────────────
+function swing_lcd_draw_kit(_cx, _cy, _cw, _ch)
+local(_btn_w, _btn_h, _btn_y, _tw_m, _th_m, _name_x, _name_y, _tile, _tile_s)
+(
+  _btn_h = 16;
+  _btn_w = 38;
+
+  // ── Cover tile ──
+  // Square, full height of the content rect less a small margin. Everything else
+  // shifts right by _tile; the chips do NOT move, because swing_chgmap_draw is
+  // handed a rect whose RIGHT edge (_cx + _cw) is unchanged.
+  _tile_s = min(96, _ch - 8);
+  _tile   = _tile_s + 10;
+  swing_kitcover_draw(_cx + 4, _cy + 4, _tile_s);
+
+  // ── Kit name ──
+  _name_x = _cx + 4 + _tile;
+  _name_y = _cy + 4;
+
+  gfx_setfont(1, "Arial", 11, 'b');
+  gfx_set(lcd_bar_tx_r, lcd_bar_tx_g, lcd_bar_tx_b, 1);
+  strlen(#kit_name) > 0 ? (
+    gfx_x = _name_x; gfx_y = _name_y;
+    gfx_drawstr(#kit_name);
+  ) : (
+    gfx_x = _name_x; gfx_y = _name_y;
+    gfx_set(lcd_bar_tx_r * 0.4, lcd_bar_tx_g * 0.4, lcd_bar_tx_b * 0.4, 0.6);
+    gfx_drawstr("Untitled Kit");
+  );
+
+  // ── Note map + change map (Spec_Swing_Change_Map_And_Reroll §3) ──
+  // Permanent 4x4 note map of the rack; tints to report what the last kit
+  // operation did to each pad. Defined in rk_swing_ui_changemap.jsfx-inc,
+  // imported immediately before this file.
+  // Narrowed rect, same right edge: the tempo and summary shift right with the
+  // name, while the right-aligned NOTES/OUT/LAYERS chips stay exactly put.
+  swing_chgmap_draw(_cx + _tile, _cy, _cw - _tile, _ch);
+
+  // Kit name click to rename.
+  // Re-assert the font the NAME was drawn with before measuring its hit area:
+  // swing_chgmap_draw above ends on Arial 9, so this measured the 11-bold name
+  // at 9 and the click target came out ~20% narrower (and shorter) than the
+  // text the user can see.
+  gfx_setfont(1, "Arial", 11, 'b');
+  gfx_measurestr(strlen(#kit_name) > 0 ? #kit_name : "Untitled Kit", _tw_m, _th_m);
+  lmb_down && mx >= _name_x && mx < _name_x + _tw_m + 10 &&
+  my >= _name_y && my < _name_y + _th_m ? (
+    // Phase 3 save guard: CMD==0 was already checked; also refuse while this
+    // instance is importing or a data-ready delivery is in flight (the
+    // state-11 dump reads the SHARED staging bands — chimera-file vector).
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0
+      && !kit_busy && gmem[GS_KIT_LOAD_REQ] != 2 ? (
+      gmem[KIT_GMEM_LOCK] = instance_id;
+      gmem[KIT_GMEM_CMD] = 10;  // ask for name
+    );
+  );
+
+);
+
+// ─── PAD tab content ─────────────────────────────────────────────────────
+function swing_lcd_draw_pad(_cx, _cy, _cw, _ch)
+local(_name, _fname, _badge_x, _badge_y, _badge_r, _tw_m, _th_m,
+      _knob_y, _knob_r, _knob_gap, _knob_x, _ki, _nv,
+      _lbl, _val_str, _km_off,
+      _out_val, _stp_w, _stp_h, _stp_x, _stp_y, _arr_w, _resp,
+      // @gfx runs CONCURRENT with @block, so every scratch here must be
+      // function-local. _mode_val was already an unscoped global (harmless —
+      // nothing else writes it) and is folded in while adding _mode_dead.
+      // NOTE #_mode_lbl is deliberately absent: string handles are a separate
+      // namespace local() does not cover, and panels_controls shares that one.
+      _mode_val, _mode_dead,
+      _info_y, _info_x, _nn, _oct, _pc, _lcnt,
+      _pill_h, _pill_pad, _pill_gap, _pw, _algo,
+      // Value pills under the PAN / PITCH knobs. #swing_rn_lbl is a string
+      // handle (separate namespace — see the note above), unique bundle-wide.
+      _rn_w, _rn_y)
+(
+  // ── Row 1: Pad badge + name ──
+  _badge_x = _cx + 12;
+  _badge_y = _cy + 10;
+  _badge_r = 8;
+
+  // Pad number badge (red circle)
+  gfx_set(0.85, 0.20, 0.12, 1);
+  gfx_circle(_badge_x, _badge_y, _badge_r, 1);
+  gfx_setfont(1, "Arial", 8, 'b');
+  gfx_set(1, 1, 1, 1);
+  sprintf(#_pad_num, "%d", sel_pad + 1);
+  gfx_measurestr(#_pad_num, _tw_m, _th_m);
+  gfx_x = _badge_x - _tw_m * 0.5;
+  gfx_y = _badge_y - _th_m * 0.5;
+  gfx_drawstr(#_pad_num);
+
+  // Pad name
+  _name = get_cname_slot(sel_pad);
+  _fname = get_name_slot(sel_pad);
+  gfx_setfont(1, "Arial", 11, 'b');
+  gfx_set(lcd_bar_tx_r, lcd_bar_tx_g, lcd_bar_tx_b, 1);
+  gfx_x = _badge_x + _badge_r + 6;
+  gfx_y = _cy + 4;
+  strlen(_name) > 0 ? (
+    gfx_drawstr(_name);
+  ) : strlen(_fname) > 0 ? (
+    gfx_drawstr(_fname);
+  ) : (
+    gfx_set(lcd_bar_tx_r * 0.35, lcd_bar_tx_g * 0.35, lcd_bar_tx_b * 0.35, 0.5);
+    gfx_drawstr("Empty");
+  );
+
+  // ── Row 2: 5 mini knobs (GAIN / PAN / PITCH / OUT / MODE) ──
+  // Spacing math (_cw-40)/4 was already pre-sized for 5 slots — the existing
+  // 4-knob layout left the rightmost slot empty. MODE fills it without any
+  // reflow of the existing knobs.
+  _knob_y = _cy + 32;
+  _knob_r = 11;
+  _knob_gap = (_cw - 40) / 4;
+
+  _ki = 0; loop(5,
+    _knob_x = _cx + 20 + _ki * _knob_gap;
+    _km_off = km_lcd + _ki * KS;
+
+    _ki == 0 ? (
+      // GAIN: 0 to 2.0 (displayed as dB-ish)
+      _nv = mpc_knob_interact(_km_off, _knob_x, _knob_y, _knob_r,
+                               p_gain[sel_pad], 0, 2.0, 1.0, 0);
+      _nv != p_gain[sel_pad] ? (
+        p_gain[sel_pad] = _nv;
+        s_dirty[sel_pad] = 1;        // rebuild waveform cache to reflect new gain
+        mark_dirty_pad(sel_pad);
+      );
+      mpc_knob_draw(_knob_x, _knob_y, _knob_r, p_gain[sel_pad], 0, 2.0, 0,
+                    _km_off[0], 0.85, 0.85, 0.20, 0.25, 0.25, 0.25);
+      _lbl = "GAIN";
+    ) : _ki == 1 ? (
+      // PAN: -1 to +1 (symmetric)
+      _nv = mpc_knob_interact(_km_off, _knob_x, _knob_y, _knob_r,
+                               p_pan[sel_pad], -1.0, 1.0, 0, 0);
+      _nv != p_pan[sel_pad] ? (
+        p_pan[sel_pad] = _nv;
+        p_panL[sel_pad] = min(1.0, 1.0 - _nv);
+        p_panR[sel_pad] = min(1.0, 1.0 + _nv);
+        mark_dirty_pad(sel_pad);
+      );
+      mpc_knob_draw(_knob_x, _knob_y, _knob_r, p_pan[sel_pad], -1.0, 1.0, 1,
+                    _km_off[0], 0.20, 0.65, 0.85, 0.25, 0.25, 0.25);
+      _lbl = "PAN";
+    ) : _ki == 2 ? (
+      // PITCH: -24 to +24 semitones
+      _nv = mpc_knob_interact(_km_off, _knob_x, _knob_y, _knob_r,
+                               p_tune[sel_pad], -24, 24, 0, 0);
+      _nv != p_tune[sel_pad] ? (
+        p_tune[sel_pad] = _nv;
+        recalc_pad(sel_pad);
+        mark_dirty_pad(sel_pad);
+      );
+      mpc_knob_draw(_knob_x, _knob_y, _knob_r, p_tune[sel_pad], -24, 24, 1,
+                    _km_off[0], 0.65, 0.40, 0.85, 0.25, 0.25, 0.25);
+      _lbl = "PITCH";
+    ) : _ki == 3 ? (
+      // OUTPUT: color-coded stepper ◄ Out N ►
+      _out_val = p_output[sel_pad];
+      _stp_w = _knob_r * 2 + 8;  // total stepper width
+      _stp_h = 14;
+      _stp_x = _knob_x - _stp_w * 0.5;
+      _stp_y = _knob_y - _stp_h * 0.5;
+      _arr_w = 10;  // arrow button width
+
+      // HSL-colored background pill
+      hsl_to_rgb(_out_val / 16.0, 0.65, 0.22);
+      gfx_set(_hsl_r, _hsl_g, _hsl_b, 0.9);
+      gfx_rect(_stp_x, _stp_y, _stp_w, _stp_h);
+
+      // Left arrow ◄
+      gfx_setfont(1, "Arial", 10, 'b');
+      hsl_to_rgb(_out_val / 16.0, 0.55, 0.65);
+      gfx_set(_hsl_r, _hsl_g, _hsl_b, 0.9);
+      gfx_x = _stp_x + 2; gfx_y = _stp_y + 1;
+      gfx_drawstr("<");
+
+      // Right arrow ►
+      gfx_x = _stp_x + _stp_w - 8; gfx_y = _stp_y + 1;
+      gfx_drawstr(">");
+
+      // Center value text "Out N"
+      gfx_setfont(1, "Arial", 9, 'b');
+      hsl_to_rgb(_out_val / 16.0, 0.75, 0.72);
+      gfx_set(_hsl_r, _hsl_g, _hsl_b, 1);
+      sprintf(#_out_lbl, "Out %d", _out_val + 1);
+      gfx_measurestr(#_out_lbl, _tw_m, _th_m);
+      gfx_x = _knob_x - _tw_m * 0.5;
+      gfx_y = _stp_y + (_stp_h - _th_m) * 0.5;
+      gfx_drawstr(#_out_lbl);
+
+      // Click: left arrow decrements, right arrow increments
+      mx >= _stp_x && mx <= _stp_x + _arr_w && my >= _stp_y && my <= _stp_y + _stp_h && lmb_down ? (
+        p_output[sel_pad] = (_out_val - 1 + 16) % 16;
+        mark_dirty_pad(sel_pad);
+      );
+      mx >= _stp_x + _stp_w - _arr_w && mx <= _stp_x + _stp_w && my >= _stp_y && my <= _stp_y + _stp_h && lmb_down ? (
+        p_output[sel_pad] = (_out_val + 1) % 16;
+        mark_dirty_pad(sel_pad);
+      );
+
+      // Right-click anywhere on stepper: full output menu (16 buses).
+      // Migrated from gfx_showmenu to Swing-styled popup. No color tags —
+      // outputs are neutral pills; the popup's Strip styling carries the
+      // visual identity. Result indices stay 1-based (Out 1 == 1 etc.).
+      mx >= _stp_x && mx <= _stp_x + _stp_w && my >= _stp_y && my <= _stp_y + _stp_h && rmb_down ? (
+        swing_popup_open(mx, my,
+          "Out 1|Out 2|Out 3|Out 4|Out 5|Out 6|Out 7|Out 8|Out 9|Out 10|Out 11|Out 12|Out 13|Out 14|Out 15|Out 16",
+          SP_POPUP_CALLER_OUTPUT_BUS);
+      );
+      swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_OUTPUT_BUS ? (
+        p_output[sel_pad] = swing_popup_result - 1;
+        swing_popup_result = 0;
+        mark_dirty_pad(sel_pad);
+      );
+      swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_OUTPUT_BUS ? (
+        swing_popup_result = 0;
+      );
+
+      // Scroll wheel on stepper
+      mx >= _stp_x && mx <= _stp_x + _stp_w && my >= _stp_y && my <= _stp_y + _stp_h && frame_wheel != 0 ? (
+        p_output[sel_pad] = (p_output[sel_pad] + sign_of(frame_wheel) + 16) % 16;
+        mark_dirty_pad(sel_pad);
+      );
+
+      _lbl = "OUT";
+    ) : (
+      // MODE: Repitch / Tuned / Stretch  (Part B — three-mode pitch shift)
+      // Stepper mirrors OUTPUT's pattern. Mode = 0 (Repitch) is the default
+      // and matches today's behavior exactly (local SincResampler, zero
+      // latency). Modes 1 (Tuned) and 2 (Stretch) only have an audible
+      // effect when the EON Extension is installed and writing the
+      // SP_PITCH_HEARTBEAT slot — otherwise sp_pitch_ext_alive stays 0 and
+      // the Extension-side audio routing falls back to Repitch internally.
+      // Right-click brings up a Mode + Algo combined menu.
+      _mode_val = sp_pitch_mode[sel_pad];
+      _stp_w = _knob_r * 2 + 8;
+      _stp_h = 14;
+      _stp_x = _knob_x - _stp_w * 0.5;
+      _stp_y = _knob_y - _stp_h * 0.5;
+      _arr_w = 10;
+
+      // Is this pad asking for something only the Extension can do? Tuned and
+      // Stretch both fall back to plain varispeed repitch when it is absent —
+      // audible, but indistinguishable from a bug unless we say so.
+      // sp_pitch_ext_alive starts TRUE and only flips after ~1.4 s without a
+      // heartbeat, so this never flashes on a project load that does have it.
+      _mode_dead = !sp_pitch_ext_alive && _mode_val != SP_PITCH_MODE_REPITCH;
+
+      // Background pill — distinct color per mode for at-a-glance state:
+      //   Repitch = neutral grey, Tuned = cool blue, Stretch = warm amber.
+      // Desaturated toward grey when the engine is missing: the mode is still
+      // SET and still serialized, it just cannot do its job right now.
+      _mode_val == SP_PITCH_MODE_REPITCH ? gfx_set(0.30, 0.30, 0.32, 0.9) :
+      _mode_val == SP_PITCH_MODE_TUNED   ? (
+        _mode_dead ? gfx_set(0.28, 0.32, 0.38, 0.9) : gfx_set(0.22, 0.45, 0.72, 0.9);
+      ) : (
+        _mode_dead ? gfx_set(0.38, 0.34, 0.28, 0.9) : gfx_set(0.75, 0.48, 0.20, 0.9);
+      );
+      gfx_rect(_stp_x, _stp_y, _stp_w, _stp_h);
+
+      // Left arrow ◄
+      gfx_setfont(1, "Arial", 10, 'b');
+      gfx_set(0.88, 0.88, 0.90, 0.9);
+      gfx_x = _stp_x + 2; gfx_y = _stp_y + 1;
+      gfx_drawstr("<");
+
+      // Right arrow ►
+      gfx_x = _stp_x + _stp_w - 8; gfx_y = _stp_y + 1;
+      gfx_drawstr(">");
+
+      // Center mode text (truncated to fit; full name in menu)
+      gfx_setfont(1, "Arial", 9, 'b');
+      gfx_set(1, 1, 1, 1);
+      _mode_val == SP_PITCH_MODE_REPITCH ? strcpy(#_mode_lbl, "Repit") :
+      _mode_val == SP_PITCH_MODE_TUNED   ? strcpy(#_mode_lbl, "Tuned") :
+                                            strcpy(#_mode_lbl, "Strch");
+      _mode_dead ? gfx_set(0.72, 0.72, 0.74, 1);   // dim the label to match
+      gfx_measurestr(#_mode_lbl, _tw_m, _th_m);
+      gfx_x = _knob_x - _tw_m * 0.5;
+      gfx_y = _stp_y + (_stp_h - _th_m) * 0.5;
+      gfx_drawstr(#_mode_lbl);
+
+      // Amber dot in the pill's top-right corner: this mode is set but inert.
+      // A dot rather than a glyph — the pill is 14px tall and any character
+      // would be unreadable next to a 5-letter label.
+      _mode_dead ? (
+        gfx_set(0.95, 0.72, 0.25, 0.95);
+        gfx_circle(_stp_x + _stp_w - 4, _stp_y + 3.5, 2, 1, 1);
+      );
+
+      // Left-arrow click: decrement mode (wrap 0..2)
+      mx >= _stp_x && mx <= _stp_x + _arr_w && my >= _stp_y && my <= _stp_y + _stp_h && lmb_down ? (
+        sp_pitch_mode[sel_pad] = (_mode_val + 2) % 3;
+        mark_dirty_pad(sel_pad);
+      );
+      // Right-arrow click: increment mode (wrap 0..2)
+      mx >= _stp_x + _stp_w - _arr_w && mx <= _stp_x + _stp_w && my >= _stp_y && my <= _stp_y + _stp_h && lmb_down ? (
+        sp_pitch_mode[sel_pad] = (_mode_val + 1) % 3;
+        mark_dirty_pad(sel_pad);
+      );
+
+      // Right-click anywhere on stepper: Mode-only menu. Algo moved to its
+      // own dedicated pill in the Row-3 info strip (visible in Tuned/Stretch),
+      // so this menu no longer carries the Algo section.
+      // Uses swing_popup_open from rk_swing_popup.jsfx-inc — Swing-styled
+      // popup replacement for gfx_showmenu. Per-item color tags ('^X ')
+      // give each Mode its own pill color; index semantics are identical to
+      // gfx_showmenu (1-based, headers count):
+      //     1 #Mode (disabled, red)
+      //     2 ^g Repitch  (grey  — today's path, neutral)
+      //     3 ^b Tuned    (blue  — locked-in pre-render)
+      //     4 ^a Stretch  (amber — live realtime)
+      // Parenthetical use-case hints steer mode choice: Repitch/Tuned are the
+      // zero-latency drum modes; realtime Stretch only suits sustained material
+      // (toms/pads/loops) — short drum one-shots (hats/claps/snares) are silent
+      // or land ~115 ms late through élastique's fill. Labels are display-only;
+      // selection is by index (below), so the hint text can't break routing.
+      mx >= _stp_x && mx <= _stp_x + _stp_w && my >= _stp_y && my <= _stp_y + _stp_h && rmb_down ? (
+        swing_lcd_modemenu_open(mx, my);
+      );
+      // Poll for popup result — fires the frame after the user picks.
+      // Indices match gfx_showmenu's 1-based count including the disabled header.
+      swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_MODE_ALGO ? (
+        _resp = swing_popup_result;
+        swing_popup_result = 0;        // consume
+        _resp == 2 ? ( sp_pitch_mode[sel_pad] = SP_PITCH_MODE_REPITCH; mark_dirty_pad(sel_pad); );
+        _resp == 3 ? ( sp_pitch_mode[sel_pad] = SP_PITCH_MODE_TUNED;   mark_dirty_pad(sel_pad); );
+        _resp == 4 ? ( sp_pitch_mode[sel_pad] = SP_PITCH_MODE_STRETCH; mark_dirty_pad(sel_pad); );
+      );
+      // Cancelled (click outside / ESC) — clear the latch silently.
+      swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_MODE_ALGO ? (
+        swing_popup_result = 0;
+      );
+
+      // Scroll wheel cycles modes (matches OUTPUT stepper behavior)
+      mx >= _stp_x && mx <= _stp_x + _stp_w && my >= _stp_y && my <= _stp_y + _stp_h && frame_wheel != 0 ? (
+        sp_pitch_mode[sel_pad] = (sp_pitch_mode[sel_pad] + sign_of(frame_wheel) + 3) % 3;
+        mark_dirty_pad(sel_pad);
+      );
+
+      _lbl = "MODE";
+    );
+
+    // Knob label. PITCH additionally carries the pad's DETECTED ROOT NOTE from
+    // the EON_ROOTNOTE band, so the ±24 st knob reads as an offset from a known
+    // starting note instead of a bare number.
+    //
+    // Placement: BESIDE the label, not below it — row 3's separator sits only
+    // 3 px under the label baseline, so there is no vertical room. The pair is
+    // centred together on the knob, and the neighbouring labels (GAIN/PAN/OUT/
+    // MODE) are short enough that the wider PITCH label breathes into their
+    // slack rather than colliding.
+    //
+    // Nothing is drawn when the band has no answer. That is deliberate: the
+    // confidence gate rejects unpitched sources, and a WRONG root note actively
+    // misleads someone tuning to it, whereas a blank simply says "unknown".
+    // Cents are omitted for the same reason — on a gliding source they are
+    // window-dependent (two 808 kicks measured 17 cents apart landed on
+    // different note names); swing_lcd_rootnote_cents() has them if needed.
+    // ── Knob caption, or a VALUE PILL where a live number is more useful ──
+    // PAN and PITCH swap their captions for pills. They replace the caption
+    // rather than sitting beside it because row 3 leaves only ~20 px under the
+    // knob — a pill plus a caption does not fit. Each pill carries its own
+    // knob's accent colour, and the knob positions never move, so the controls
+    // stay identifiable. PITCH falls back to the plain caption when no root
+    // note is known, so nothing is ever lost.
+    _rn_w = 0;
+    _ki == 1 ? ( swing_lcd_pan_str(#swing_rn_lbl, sel_pad); _rn_w = 1; ) :
+    _ki == 2 ? ( swing_lcd_rootnote_played_str(#swing_rn_lbl, sel_pad);
+                 _rn_w = strlen(#swing_rn_lbl) > 0; );
+
+    _rn_w ? (
+      _rn_y = _knob_y + _knob_r + 3;
+      _ki == 1 ? (
+        // PAN — cyan, matching its knob arc. "hot" once off dead centre.
+        swing_lcd_value_pill(_knob_x, _rn_y, #swing_rn_lbl, 0.20, 0.65, 0.85,
+                             p_pan[sel_pad] < -0.005 || p_pan[sel_pad] > 0.005);
+      ) : (
+        // PITCH — violet. "hot" once tuned away from the detected root, so a
+        // transposed pad is visibly different from one at its natural pitch.
+        swing_lcd_value_pill(_knob_x, _rn_y, #swing_rn_lbl, 0.65, 0.40, 0.85,
+                             p_tune[sel_pad] < -0.05 || p_tune[sel_pad] > 0.05);
+      );
+    ) : (
+      gfx_setfont(1, "Arial", 9);
+      gfx_set(lcd_bar_tx_r * 0.85, lcd_bar_tx_g * 0.85, lcd_bar_tx_b * 0.85, 1);
+      gfx_measurestr(_lbl, _tw_m, _th_m);
+      gfx_x = _knob_x - _tw_m * 0.5;
+      gfx_y = _knob_y + _knob_r + 2;
+      gfx_drawstr(_lbl);
+    );
+
+    _ki += 1;
+  );
+
+  // ── Row 3: Info strip — pill buttons (MIDI note, choke, layers, reverse) ──
+  // +26 (was +18): the PITCH pill above is 17 px tall and ends at
+  // _knob_y + _knob_r + 20, so the old separator at +14 ran straight through
+  // it. Taken from the ~27 px of unused space at the bottom of the content
+  // area (pills now end at _cy+89 against _ch=108), so nothing is clipped.
+  _info_y = _knob_y + _knob_r + 26;
+  _pill_h = 20;
+  _pill_pad = 6;   // horizontal padding inside pill
+  _pill_gap = 6;   // gap between pills
+
+  // Thin separator line
+  gfx_set(lcd_bar_tx_r * 0.2, lcd_bar_tx_g * 0.2, lcd_bar_tx_b * 0.2, 0.6);
+  gfx_rect(_cx + 4, _info_y - 4, _cw - 8, 1);
+
+  gfx_setfont(1, "Arial", 10, 'b');
+  _info_x = _cx + 6;
+
+  // ── MIDI note pill ──
+  _nn = p_note[sel_pad];
+  _oct = (_nn / 12)|0 - 1;
+  _pc = _nn % 12;
+  _pc == 0 ? strcpy(#_nn_str, "C") : _pc == 1 ? strcpy(#_nn_str, "C#") :
+  _pc == 2 ? strcpy(#_nn_str, "D") : _pc == 3 ? strcpy(#_nn_str, "D#") :
+  _pc == 4 ? strcpy(#_nn_str, "E") : _pc == 5 ? strcpy(#_nn_str, "F") :
+  _pc == 6 ? strcpy(#_nn_str, "F#") : _pc == 7 ? strcpy(#_nn_str, "G") :
+  _pc == 8 ? strcpy(#_nn_str, "G#") : _pc == 9 ? strcpy(#_nn_str, "A") :
+  _pc == 10 ? strcpy(#_nn_str, "A#") : strcpy(#_nn_str, "B");
+  sprintf(#_note_lbl, "%s%d", #_nn_str, _oct);
+  gfx_measurestr(#_note_lbl, _tw_m, _th_m);
+  _pw = _tw_m + _pill_pad * 2;
+  // Pill background
+  gfx_set(0.10, 0.22, 0.30, 0.9);
+  gfx_rect(_info_x, _info_y, _pw, _pill_h);
+  // Pill text
+  gfx_set(0.45, 0.85, 0.95, 1);
+  gfx_x = _info_x + _pill_pad; gfx_y = _info_y + (_pill_h - _th_m) * 0.5;
+  gfx_drawstr(#_note_lbl);
+  // Interaction
+  mx >= _info_x && mx <= _info_x + _pw && my >= _info_y && my <= _info_y + _pill_h ? (
+    // Hover highlight
+    gfx_set(0.45, 0.85, 0.95, 0.12);
+    gfx_rect(_info_x, _info_y, _pw, _pill_h);
+    frame_wheel != 0 && !p_note_lock[sel_pad] ? (
+      p_note[sel_pad] = max(0, min(127, p_note[sel_pad] + sign_of(frame_wheel)));
+      mark_dirty_pad(sel_pad);
+    );
+    // Click opens the per-pad NOTE picker (3.0 item F) — the old click-to-
+    // increment moved into the picker's richer surface. Wheel nudge above is
+    // deliberately unchanged (the power-user path). Opens regardless of
+    // note-lock: viewing is always allowed, and a mapping-side drag sets the
+    // lock itself, same as the big view.
+    // pk_reframe, not an inlined copy of the framing maths: this lib imports
+    // BEFORE rk_swing_ui_notepick, so it cannot CALL into it (a def-time ref to
+    // a later function silently kills this whole file — feedback_jsfx_import_order).
+    // Writing a flag is import-order-free, and the picker claims it on its next
+    // draw. The capture mailbox (EON_POPUP_REQ kind 13) opens the same two ways,
+    // so the framing has exactly one implementation.
+    lmb_down ? (
+      pk_ov_pad = sel_pad;
+      pk_reframe = 1;
+      // Zero the modal-gate saves on open — the gate ran THIS frame with no
+      // modal active, so the _ov_* copies are STALE; a leftover _ov_lmb_down=1
+      // makes the picker's click-outside-close fire on its own open frame
+      // (flicker + never opens — the exact bug the RANGE pill documents and
+      // fixes the same way).
+      _ov_lmb_down = 0; _ov_rmb_down = 0; _ov_LMB = 0; _ov_RMB = 0; _ov_wheel = 0;
+    );
+    rmb_down && !p_note_lock[sel_pad] ? (
+      p_note[sel_pad] = max(0, min(127, p_note[sel_pad] - 1));
+      mark_dirty_pad(sel_pad);
+    );
+  );
+  _info_x += _pw + _pill_gap;
+
+  // ── Choke group pill ──
+  p_choke[sel_pad] > 0 ? (
+    sprintf(#_chk_lbl, "CHK %d", p_choke[sel_pad]);
+  ) : (
+    strcpy(#_chk_lbl, "CHOKE");
+  );
+  gfx_measurestr(#_chk_lbl, _tw_m, _th_m);
+  _pw = _tw_m + _pill_pad * 2;
+  // Pill background
+  p_choke[sel_pad] > 0 ? (
+    gfx_set(0.30, 0.08, 0.08, 0.9);
+  ) : (
+    gfx_set(0.10, 0.10, 0.12, 0.7);
+  );
+  gfx_rect(_info_x, _info_y, _pw, _pill_h);
+  // Pill text
+  p_choke[sel_pad] > 0 ? (
+    gfx_set(0.95, 0.40, 0.35, 1);
+  ) : (
+    gfx_set(lcd_bar_tx_r * 0.45, lcd_bar_tx_g * 0.45, lcd_bar_tx_b * 0.45, 0.7);
+  );
+  gfx_x = _info_x + _pill_pad; gfx_y = _info_y + (_pill_h - _th_m) * 0.5;
+  gfx_drawstr(#_chk_lbl);
+  // Click: popup menu (migrated from gfx_showmenu to Swing-styled popup).
+  // Result index 1 = "Off" (→ p_choke=0), 2..9 = "Group 1".."Group 8"
+  // (→ p_choke=1..8). The choke-group LCD pill is already tinted red when
+  // a group is active (the p_choke tint just above); the popup pills stay neutral
+  // so the menu visual matches the rest of the Strip-style popups.
+  mx >= _info_x && mx <= _info_x + _pw && my >= _info_y && my <= _info_y + _pill_h ? (
+    p_choke[sel_pad] > 0 ? gfx_set(0.95, 0.40, 0.35, 0.12) : gfx_set(1, 1, 1, 0.06);
+    gfx_rect(_info_x, _info_y, _pw, _pill_h);
+    lmb_down ? (
+      swing_popup_open(mx, my,
+        "Off|Group 1|Group 2|Group 3|Group 4|Group 5|Group 6|Group 7|Group 8",
+        SP_POPUP_CALLER_CHOKE_GROUP);
+    );
+  );
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_CHOKE_GROUP ? (
+    p_choke[sel_pad] = swing_popup_result - 1;
+    swing_popup_result = 0;
+    mark_dirty_pad(sel_pad);
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_CHOKE_GROUP ? (
+    swing_popup_result = 0;
+  );
+  _info_x += _pw + _pill_gap;
+
+  // ── Chromatic key-range pill (Spec_Swing_Chromatic_Pad Slice 1) ──
+  // Offsets from root: 0/0 = single-note pad (drum); >0 = plays chromatically
+  // across [root-lo, root+hi]. p_note (the NOTE pill) stays the root.
+  _rng_on = p_rng_lo[sel_pad] > 0 || p_rng_hi[sel_pad] > 0;
+  _rng_on ? (
+    sprintf(#_rng_lbl, "RNG -%d/+%d", p_rng_lo[sel_pad]|0, p_rng_hi[sel_pad]|0);
+  ) : (
+    strcpy(#_rng_lbl, "RANGE");
+  );
+  gfx_measurestr(#_rng_lbl, _tw_m, _th_m);
+  _pw = _tw_m + _pill_pad * 2;
+  _rng_on ? gfx_set(0.08, 0.26, 0.30, 0.9) : gfx_set(0.10, 0.10, 0.12, 0.7);
+  gfx_rect(_info_x, _info_y, _pw, _pill_h);
+  _rng_on ? gfx_set(0.45, 0.90, 0.95, 1) :
+    gfx_set(lcd_bar_tx_r * 0.45, lcd_bar_tx_g * 0.45, lcd_bar_tx_b * 0.45, 0.7);
+  gfx_x = _info_x + _pill_pad; gfx_y = _info_y + (_pill_h - _th_m) * 0.5;
+  gfx_drawstr(#_rng_lbl);
+  mx >= _info_x && mx <= _info_x + _pw && my >= _info_y && my <= _info_y + _pill_h ? (
+    _rng_on ? gfx_set(0.45, 0.90, 0.95, 0.12) : gfx_set(1, 1, 1, 0.06);
+    gfx_rect(_info_x, _info_y, _pw, _pill_h);
+    lmb_down ? (
+      swing_popup_open(mx, my,
+        "Single note|1 Octave up|2 Octaves up|1 Octave up+down|2 Octaves up+down|Full range",
+        SP_POPUP_CALLER_PAD_RANGE);
+    );
+    // right-click → per-pad piano range overlay (rk_swing_ui_range.jsfx-inc).
+    // Zero the modal-gate saves on open: the gate ran THIS frame with no
+    // modal active, so the _ov_* copies are STALE — a leftover _ov_lmb_down=1
+    // made the overlay's click-outside-close fire on its own open frame
+    // (same hazard swing_bigview_open documents).
+    rmb_down ? (
+      rng_ov_pad = sel_pad;
+      _ov_lmb_down = 0; _ov_rmb_down = 0; _ov_LMB = 0; _ov_RMB = 0; _ov_wheel = 0;
+    );
+  );
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_PAD_RANGE ? (
+    swing_popup_result == 1 ? ( p_rng_lo[sel_pad] = 0;   p_rng_hi[sel_pad] = 0;  );
+    swing_popup_result == 2 ? ( p_rng_lo[sel_pad] = 0;   p_rng_hi[sel_pad] = 12; );
+    swing_popup_result == 3 ? ( p_rng_lo[sel_pad] = 0;   p_rng_hi[sel_pad] = 24; );
+    swing_popup_result == 4 ? ( p_rng_lo[sel_pad] = 12;  p_rng_hi[sel_pad] = 12; );
+    swing_popup_result == 5 ? ( p_rng_lo[sel_pad] = 24;  p_rng_hi[sel_pad] = 24; );
+    swing_popup_result == 6 ? ( p_rng_lo[sel_pad] = 127; p_rng_hi[sel_pad] = 127; );
+    swing_popup_result = 0;
+    mark_dirty_pad(sel_pad);
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_PAD_RANGE ? (
+    swing_popup_result = 0;
+  );
+  _info_x += _pw + _pill_gap;
+
+  // ── CATEGORY pill (kit-categories §9b, USER DECISION: after L R/RANGE) ──
+  // Shows the pad's published category (PADCAT band, bridge-owned, VER-gated).
+  // LMB = 46-vocab picker + Auto; the pick goes through the SAME write-back
+  // mailbox Steppa uses (26004500) so the bridge stays the single band owner —
+  // note-keyed via our own IDENT NOTE cell for this pad.
+  _cat_cur = swing_lcd_padcat_eff(sel_pad);
+  // "NONE" vs "CATEGORY" is the difference between an answer and an empty
+  // field. Without it the pill looks identical whether the user cleared the
+  // pad or never touched it, so a NONE pick reads as if it didn't take.
+  _cat_cur >= 0          ? ( eon_catname(#_cat_lbl, _cat_cur); ) :
+  _cat_cur == PADCAT_NONE ? ( strcpy(#_cat_lbl, "NONE"); )
+                          : ( strcpy(#_cat_lbl, "CATEGORY"); );
+  gfx_measurestr(#_cat_lbl, _tw_m, _th_m);
+  _pw = _tw_m + _pill_pad * 2 + (_cat_cur >= 0 ? 14 : 0);   // room for the glyph
+  // hover EASE (animated): alpha ramps toward hovered state each frame
+  _cat_hov = mx >= _info_x && mx <= _info_x + _pw && my >= _info_y && my <= _info_y + _pill_h;
+  swing_catpill_hv += ((_cat_hov ? 1 : 0) - swing_catpill_hv) * 0.30;
+  swing_catpill_hv < 0.004 ? swing_catpill_hv = 0;
+  _cat_cur >= 0 ? gfx_set(0.10, 0.24 + 0.10*swing_catpill_hv, 0.16, 0.9)
+                : gfx_set(0.10 + 0.06*swing_catpill_hv, 0.10 + 0.06*swing_catpill_hv, 0.12 + 0.06*swing_catpill_hv, 0.7);
+  gfx_rect(_info_x, _info_y, _pw, _pill_h);
+  swing_catpill_hv > 0 ? (   // animated sweep lines, RANGE-pill accent family
+    gfx_set(0.55, 0.92, 0.62, 0.85 * swing_catpill_hv);
+    gfx_rect(_info_x, _info_y, _pw, 1);
+    gfx_rect(_info_x, _info_y + _pill_h - 1, _pw, 1);
+  );
+  _cat_cur >= 0 ? gfx_set(0.55, 0.92 , 0.62, 1) :
+    gfx_set(lcd_bar_tx_r * 0.45, lcd_bar_tx_g * 0.45, lcd_bar_tx_b * 0.45, 0.7 + 0.3*swing_catpill_hv);
+  _cat_cur >= 0 ? eon_draw_cat_glyph_hi(_cat_cur, _info_x + _pill_pad + 5, (_info_y + _pill_h * 0.5)|0, 5.5 + swing_catpill_hv, -1);
+  gfx_x = _info_x + _pill_pad + (_cat_cur >= 0 ? 14 : 0);
+  gfx_y = _info_y + (_pill_h - _th_m) * 0.5;
+  gfx_drawstr(#_cat_lbl);
+  _cat_hov ? (
+    // wheel = cycle categories live (posts through the bridge; optimistic echo).
+    // No pad_input_allowed() here: it's defined in rk_swing_ui_state (imported
+    // AFTER this inc — def-time resolution) and the LCD bar isn't gated by it
+    // anyway (RANGE pill precedent above).
+    frame_wheel != 0 ? swing_lcd_padcat_wheel(sel_pad, frame_wheel|0);
+    // Any click -> the §9c glyph-grid overlay. The 47-row text menu is retired
+    // (it spanned the whole plugin to show words; the panel shows all 46
+    // glyphs at once). swing_lcd_catmenu_open stays defined for future use.
+    (lmb_down || rmb_down) ? cat_ov_pad = sel_pad;
+  );
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_PAD_CATEGORY ? (
+    // 1 = lock toggle (mailbox sentinel -2), 2 = Auto (-1), 3.. = glyph id
+    swing_lcd_padcat_post(swing_catpick_pad,
+      swing_popup_result == 1 ? -2 :
+      swing_popup_result == 2 ? -1 : swing_popup_result - 3);
+    swing_popup_result = 0;
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_PAD_CATEGORY ? (
+    swing_popup_result = 0;
+  );
+  _info_x += _pw + _pill_gap;
+
+  // ── Layer count pill ──
+  _lcnt = p_layer_cnt[sel_pad];
+  _lcnt == 0 && s_len[sel_pad] > 0 ? _lcnt = 1;
+  _lcnt > 0 ? (
+    sprintf(#_lay_lbl, "%d LYR", _lcnt);
+  ) : (
+    strcpy(#_lay_lbl, "0 LYR");
+  );
+  gfx_measurestr(#_lay_lbl, _tw_m, _th_m);
+  _pw = _tw_m + _pill_pad * 2;
+  // Pill background
+  gfx_set(0.08, 0.15, 0.08, 0.8);
+  gfx_rect(_info_x, _info_y, _pw, _pill_h);
+  // Pill text
+  _lcnt > 0 ? (
+    gfx_set(0.55, 0.90, 0.40, 1);
+  ) : (
+    gfx_set(lcd_bar_tx_r * 0.3, lcd_bar_tx_g * 0.3, lcd_bar_tx_b * 0.3, 0.5);
+  );
+  gfx_x = _info_x + _pill_pad; gfx_y = _info_y + (_pill_h - _th_m) * 0.5;
+  gfx_drawstr(#_lay_lbl);
+  _info_x += _pw + _pill_gap;
+
+  // ── Reverse toggle pill ──
+  p_reverse[sel_pad] ? (
+    strcpy(#_rev_lbl, "REV");
+  ) : (
+    strcpy(#_rev_lbl, "FWD");
+  );
+  gfx_measurestr(#_rev_lbl, _tw_m, _th_m);
+  _pw = _tw_m + _pill_pad * 2;
+  // Pill background
+  p_reverse[sel_pad] ? (
+    gfx_set(0.22, 0.06, 0.28, 0.9);
+  ) : (
+    gfx_set(0.10, 0.10, 0.12, 0.7);
+  );
+  gfx_rect(_info_x, _info_y, _pw, _pill_h);
+  // Pill text
+  p_reverse[sel_pad] ? (
+    gfx_set(0.80, 0.35, 0.95, 1);
+  ) : (
+    gfx_set(lcd_bar_tx_r * 0.4, lcd_bar_tx_g * 0.4, lcd_bar_tx_b * 0.4, 0.65);
+  );
+  gfx_x = _info_x + _pill_pad; gfx_y = _info_y + (_pill_h - _th_m) * 0.5;
+  gfx_drawstr(#_rev_lbl);
+  // Click to toggle
+  mx >= _info_x && mx <= _info_x + _pw && my >= _info_y && my <= _info_y + _pill_h ? (
+    p_reverse[sel_pad] ? gfx_set(0.80, 0.35, 0.95, 0.12) : gfx_set(1, 1, 1, 0.06);
+    gfx_rect(_info_x, _info_y, _pw, _pill_h);
+    lmb_down ? (
+      p_reverse[sel_pad] = !p_reverse[sel_pad];
+      s_dirty[sel_pad] = 1; mark_dirty_pad(sel_pad);
+    );
+  );
+  _info_x += _pw + _pill_gap;
+
+  // ── L↔R channel swap pill ──
+  p_swapLR[sel_pad] ? strcpy(#_rev_lbl, "L<>R") : strcpy(#_rev_lbl, "L R");
+  gfx_measurestr(#_rev_lbl, _tw_m, _th_m);
+  _pw = _tw_m + _pill_pad * 2;
+  p_swapLR[sel_pad] ? (
+    gfx_set(0.06, 0.22, 0.28, 0.9);  // active: teal-ish
+  ) : (
+    gfx_set(0.10, 0.10, 0.12, 0.7);
+  );
+  gfx_rect(_info_x, _info_y, _pw, _pill_h);
+  p_swapLR[sel_pad] ? (
+    gfx_set(0.35, 0.85, 0.95, 1);
+  ) : (
+    gfx_set(lcd_bar_tx_r * 0.4, lcd_bar_tx_g * 0.4, lcd_bar_tx_b * 0.4, 0.65);
+  );
+  gfx_x = _info_x + _pill_pad; gfx_y = _info_y + (_pill_h - _th_m) * 0.5;
+  gfx_drawstr(#_rev_lbl);
+  // Click to toggle
+  mx >= _info_x && mx <= _info_x + _pw && my >= _info_y && my <= _info_y + _pill_h ? (
+    p_swapLR[sel_pad] ? gfx_set(0.35, 0.85, 0.95, 0.12) : gfx_set(1, 1, 1, 0.06);
+    gfx_rect(_info_x, _info_y, _pw, _pill_h);
+    lmb_down ? (
+      p_swapLR[sel_pad] = !p_swapLR[sel_pad];
+      mark_dirty_pad(sel_pad);
+    );
+  );
+  _info_x += _pw + _pill_gap;
+
+  // ── Algo pill (Tuned/Stretch only) ──
+  // Hidden in Repitch — that path is rate-based resampling and ignores the
+  // algo choice entirely (matches the Mode pill's right-click section gate).
+  // Colors mirror the popup palette tags: Drum=^r, Tonal=^G, Texture=^p,
+  // Voice=^c (see swing_popup_apply_color in rk_swing_popup.jsfx-inc).
+  sp_pitch_mode[sel_pad] != SP_PITCH_MODE_REPITCH ? (
+    _algo = sp_pitch_algo[sel_pad];
+    _algo == SP_PITCH_ALGO_DRUM    ? strcpy(#_rev_lbl, "Drum") :
+    _algo == SP_PITCH_ALGO_TONAL   ? strcpy(#_rev_lbl, "Tonal") :
+    _algo == SP_PITCH_ALGO_TEXTURE ? strcpy(#_rev_lbl, "Text") :
+                                     strcpy(#_rev_lbl, "Voice");
+    gfx_measurestr(#_rev_lbl, _tw_m, _th_m);
+    _pw = _tw_m + _pill_pad * 2;
+    // Pill background — algo color at low alpha
+    _algo == SP_PITCH_ALGO_DRUM    ? gfx_set(0.85, 0.20, 0.12, 0.22) :
+    _algo == SP_PITCH_ALGO_TONAL   ? gfx_set(0.30, 0.75, 0.40, 0.22) :
+    _algo == SP_PITCH_ALGO_TEXTURE ? gfx_set(0.65, 0.40, 0.85, 0.22) :
+                                     gfx_set(0.30, 0.80, 0.85, 0.22);
+    gfx_rect(_info_x, _info_y, _pw, _pill_h);
+    // Pill text — algo color full alpha
+    _algo == SP_PITCH_ALGO_DRUM    ? gfx_set(0.95, 0.45, 0.35, 1) :
+    _algo == SP_PITCH_ALGO_TONAL   ? gfx_set(0.45, 0.90, 0.55, 1) :
+    _algo == SP_PITCH_ALGO_TEXTURE ? gfx_set(0.80, 0.55, 0.95, 1) :
+                                     gfx_set(0.45, 0.90, 0.95, 1);
+    gfx_x = _info_x + _pill_pad; gfx_y = _info_y + (_pill_h - _th_m) * 0.5;
+    gfx_drawstr(#_rev_lbl);
+    // Interaction: left-click opens algo-only popup; scroll cycles 0..3.
+    mx >= _info_x && mx <= _info_x + _pw && my >= _info_y && my <= _info_y + _pill_h ? (
+      gfx_set(1, 1, 1, 0.06);
+      gfx_rect(_info_x, _info_y, _pw, _pill_h);
+      lmb_down ? (
+        swing_popup_open(mx, my,
+          "#Algo|^r Drum|^G Tonal|^p Texture|^c Voice",
+          SP_POPUP_CALLER_ALGO);
+      );
+      frame_wheel != 0 ? (
+        sp_pitch_algo[sel_pad] = (_algo + sign_of(frame_wheel) + 4) % 4;
+        mark_dirty_pad(sel_pad);
+      );
+    );
+    // Popup result — indices: 1 #Algo (header), 2 Drum, 3 Tonal, 4 Texture, 5 Voice.
+    swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_ALGO ? (
+      _resp = swing_popup_result;
+      swing_popup_result = 0;
+      _resp == 2 ? ( sp_pitch_algo[sel_pad] = SP_PITCH_ALGO_DRUM;    mark_dirty_pad(sel_pad); );
+      _resp == 3 ? ( sp_pitch_algo[sel_pad] = SP_PITCH_ALGO_TONAL;   mark_dirty_pad(sel_pad); );
+      _resp == 4 ? ( sp_pitch_algo[sel_pad] = SP_PITCH_ALGO_TEXTURE; mark_dirty_pad(sel_pad); );
+      _resp == 5 ? ( sp_pitch_algo[sel_pad] = SP_PITCH_ALGO_VOICE;   mark_dirty_pad(sel_pad); );
+    );
+    swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_ALGO ? (
+      swing_popup_result = 0;
+    );
+    _info_x += _pw + _pill_gap;
+
+    // Always-visible scope hint, STRETCH ONLY: realtime Stretch suits sustained
+    // material (toms/pads/loops); short drum hits (hats/claps/snares) are silent
+    // or land ~115 ms late through élastique's fill. Catches users who cycle the
+    // mode with the stepper arrows and never open the right-click menu. Tuned
+    // needs no hint (it's drum-appropriate). Plain grey text (non-interactive);
+    // reuses #_rev_lbl per the pill idiom above; clips gracefully on a narrow LCD.
+    sp_pitch_mode[sel_pad] == SP_PITCH_MODE_STRETCH ? (
+      strcpy(#_rev_lbl, "sustained");
+      gfx_measurestr(#_rev_lbl, _tw_m, _th_m);
+      gfx_set(0.55, 0.57, 0.60, 1);
+      gfx_x = _info_x; gfx_y = _info_y + (_pill_h - _th_m) * 0.5;
+      gfx_drawstr(#_rev_lbl);
+      _info_x += _tw_m + _pill_gap;
+    );
+  );
+);
+
+
+// ─── Main LCD bar draw ───────────────────────────────────────────────────
+function swing_lcd_draw(_lx, _ly, _lw, _lh)
+local(_cx, _cy, _cw, _ch)
+(
+  // Background
+  gfx_set(lcd_bar_bg_r, lcd_bar_bg_g, lcd_bar_bg_b, 1);
+  gfx_rect(_lx, _ly, _lw, _lh);
+
+  // Subtle border
+  gfx_set(0.02, 0.06, 0.08, 1);
+  gfx_rect(_lx, _ly + _lh - 1, _lw, 1);  // bottom edge
+  gfx_set(0.12, 0.18, 0.22, 0.5);
+  gfx_rect(_lx, _ly, _lw, 1);  // top highlight
+
+  // Tab row
+  swing_lcd_draw_tabs(_lx, _ly, _lw);
+
+  // Content area
+  _cx = _lx + 2;
+  _cy = _ly + LCD_TAB_H;
+  _cw = _lw - 4;
+  _ch = _lh - LCD_TAB_H;
+
+  lcd_right_tab == 0 ? swing_lcd_draw_kit(_cx, _cy, _cw, _ch);
+  lcd_right_tab == 1 ? swing_lcd_draw_pad(_cx, _cy, _cw, _ch);
+);

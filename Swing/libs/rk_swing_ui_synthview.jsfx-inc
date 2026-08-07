@@ -1,0 +1,312 @@
+// rk_swing_ui_synthview.jsfx-inc — Big View: SYNTH (the per-pad drum-synth
+// editor, promoted out of the pad right-click overlay 2026-07-31 by user
+// request). Full-page editor over the grid rect on the Big View framework
+// (Swing_ReaKit VIEW_*): 4x4 pad selector + family pills + TYPE selector +
+// parity macro knobs + LEVEL / velocity window.
+//
+// Entry: SYN chip on any pad, Alt+click any pad, RMB on a synth-only pad —
+// all via swing_synthview_open(pad) (defined in rk_swing_ui_state.jsfx-inc so
+// the earlier-imported grid_pads can resolve it at def-time). Close: X /
+// click outside the panel. The old overlay SYN pseudo-tab is REMOVED.
+//
+// Reuses the overlay_syn helper layer (_syn_engine_col/_syn_engine_pill/
+// _syn_macro_label/_syn_mac_get/_syn_mac_set/_syn_engine_defaults/
+// _syn_autoname) and the km_syn knob pool (same per-pad slots — one editor,
+// one pool). Modal mouse pattern copied from swing_mapping_draw: restore the
+// _ov_* saves the modal gate stashed, hit-test, draw.
+//
+// Naming: functions swing_synthview_*, mutable scratch _sv_* (globals).
+
+@init
+
+// Small header/action button. Returns 1 on click.
+function swing_synthview_btn(bx, by, bw, bh, lbl)
+local(hov, tw, th)
+global(mx, my, lmb_down, gfx_x, gfx_y)
+(
+  hov = mx >= bx && mx <= bx + bw && my >= by && my <= by + bh;
+  gfx_set(0.20, 0.22, 0.26, hov ? 1.0 : 0.85);
+  gfx_rect(bx, by, bw, bh);
+  gfx_set(0.45, 0.48, 0.54, 0.8);
+  gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
+  gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_set(0.85, 0.87, 0.90, hov ? 1.0 : 0.8);
+  gfx_measurestr(lbl, tw, th);
+  gfx_x = bx + (bw - tw) / 2; gfx_y = by + (bh - th) / 2;
+  gfx_drawstr(lbl);
+  hov && lmb_down;
+);
+
+function swing_synthview_draw()
+local(_sv_x, _sv_y, _sv_w, _sv_h, _sv_p, _sv_eng, _sv_fam, _sv_typ, _sv_cnt,
+      _sv_tc, _sv_i, _sv_r, _sv_c, _sv_cx, _sv_cy, _sv_cell, _sv_gap, _sv_gx,
+      _sv_gy, _sv_hit, _sv_on, _sv_px, _sv_pw, _sv_kx, _sv_ky, _sv_kr, _sv_km,
+      _sv_ov, _sv_nv, _sv_lx, _sv_tx, tw, th, _sv_inside, _sv_ex, _sv_row,
+      _sv_col, _sv_pn, _sv_d3y, _sv_d3h, _sv_mi)
+global(big_view_id, syn_view_pad, mx, my, lmb_down, rmb_down, LMB, RMB,
+       frame_wheel, _ov_lmb_down, _ov_rmb_down, _ov_LMB, _ov_RMB, _ov_wheel,
+       grid_x, grid_y, grid_w, grid_h, gfx_w, gfx_h, gfx_x, gfx_y,
+       NUM_PADS, KS, km_syn, KM_SYN_PER_PAD,
+       ps_enable, ps_engine, ps_level, ps_vel_lo, ps_vel_hi,
+       p_note, p_held, p_held_vel, p_held_note, gui_held_pad, sel_pad,
+       _syn_ecr, _syn_ecg, _syn_ecb,
+       #_syn_en, #_syn_ml, #_syn_val)
+(
+  // Restore the mouse state the modal gate suppressed this frame.
+  lmb_down = _ov_lmb_down; rmb_down = _ov_rmb_down;
+  LMB = _ov_LMB; RMB = _ov_RMB; frame_wheel = _ov_wheel;
+
+  _sv_x = grid_x; _sv_y = grid_y; _sv_w = grid_w; _sv_h = grid_h;
+  _sv_p = max(0, min(NUM_PADS - 1, syn_view_pad|0));
+  _sv_eng = ps_engine[_sv_p]|0;
+  _sv_fam = _sv_eng % 10;
+  _sv_typ = (_sv_eng * 0.1)|0;
+  _sv_cnt = rk_syn_dd_macro_count(_sv_fam);
+  _sv_on  = ps_enable[_sv_p] > 0.5;
+
+  // ── Backdrop + panel (mapping-view chrome) ──
+  gfx_set(0, 0, 0, 0.45);
+  gfx_rect(0, 28, gfx_w, gfx_h - 28);
+  gfx_set(0.05, 0.055, 0.075, 0.98);
+  gfx_rect(_sv_x, _sv_y, _sv_w, _sv_h);
+  _syn_engine_col(_sv_fam, 0.55);
+  gfx_set(_syn_ecr, _syn_ecg, _syn_ecb, 0.85);
+  gfx_rect(_sv_x, _sv_y, _sv_w, 1);
+  gfx_rect(_sv_x, _sv_y + _sv_h - 1, _sv_w, 1);
+  gfx_rect(_sv_x, _sv_y, 1, _sv_h);
+  gfx_rect(_sv_x + _sv_w - 1, _sv_y, 1, _sv_h);
+
+  // ── Header ──
+  gfx_setfont(1, "Arial", 12, 'b');
+  gfx_set(0.90, 0.85, 0.65, 0.95);
+  gfx_x = _sv_x + 8; gfx_y = _sv_y + 4;
+  gfx_drawstr("SYNTH");
+  _syn_engine_name(_sv_fam);
+  gfx_setfont(1, "Arial", 9, 'b');
+  _syn_engine_col(_sv_fam, 1.0);
+  gfx_set(_syn_ecr, _syn_ecg, _syn_ecb, 0.95);
+  gfx_x = _sv_x + 62; gfx_y = _sv_y + 6;
+  sprintf(#_syn_val, "PAD %d  %s  T%d", _sv_p + 1, #_syn_en, _sv_typ + 1);
+  gfx_drawstr(#_syn_val);
+
+  // Close X
+  _sv_cx = _sv_x + _sv_w - 20; _sv_cy = _sv_y + 3;
+  _sv_hit = mx >= _sv_cx - 3 && mx <= _sv_cx + 17 && my >= _sv_cy - 2 && my <= _sv_cy + 15;
+  gfx_setfont(1, "Arial", 13, 'b');
+  gfx_set(1, 1, 1, _sv_hit ? 0.95 : 0.55);
+  gfx_x = _sv_cx + 3; gfx_y = _sv_cy; gfx_drawstr("X");
+  _sv_hit && lmb_down ? swing_bigview_close();
+
+  // Click fully outside the panel closes too (mapping pattern).
+  _sv_inside = mx >= _sv_x && mx <= _sv_x + _sv_w && my >= _sv_y && my <= _sv_y + _sv_h;
+  lmb_down && !_sv_inside && my > 28 ? swing_bigview_close();
+
+  // ── Left: 4x4 pad selector (main-grid orientation: bottom-left = pad 1) ──
+  _sv_gap = 4;
+  _sv_cell = min((_sv_w * 0.34 - 5 * _sv_gap) / 4, (_sv_h - 40 - 5 * _sv_gap) / 4)|0;
+  _sv_gx = _sv_x + 10; _sv_gy = _sv_y + 30;
+  _sv_i = 0;
+  loop(NUM_PADS,
+    _sv_r = 3 - ((_sv_i / 4)|0);       // bottom-left origin
+    _sv_c = _sv_i % 4;
+    _sv_px = _sv_gx + _sv_c * (_sv_cell + _sv_gap);
+    _sv_ky = _sv_gy + _sv_r * (_sv_cell + _sv_gap);
+    _syn_engine_col(ps_engine[_sv_i]|0, ps_enable[_sv_i] > 0.5 ? 0.9 : 0.22);
+    gfx_set(_syn_ecr, _syn_ecg, _syn_ecb, 1);
+    gfx_rect(_sv_px, _sv_ky, _sv_cell, _sv_cell);
+    _sv_i == _sv_p ? (
+      gfx_set(1, 1, 1, 0.95);
+      gfx_rect(_sv_px, _sv_ky, _sv_cell, 2); gfx_rect(_sv_px, _sv_ky + _sv_cell - 2, _sv_cell, 2);
+      gfx_rect(_sv_px, _sv_ky, 2, _sv_cell); gfx_rect(_sv_px + _sv_cell - 2, _sv_ky, 2, _sv_cell);
+    );
+    gfx_setfont(1, "Arial", 9, 'b');
+    gfx_set(1, 1, 1, ps_enable[_sv_i] > 0.5 ? 0.95 : 0.45);
+    sprintf(#_syn_val, "%d", _sv_i + 1);
+    gfx_x = _sv_px + 3; gfx_y = _sv_ky + 2; gfx_drawstr(#_syn_val);
+    // click: select + audition (any playable pad — sample pads too)
+    lmb_down && mx >= _sv_px && mx <= _sv_px + _sv_cell &&
+    my >= _sv_ky && my <= _sv_ky + _sv_cell ? (
+      syn_view_pad = _sv_i; sel_pad = _sv_i;
+      pad_is_playable(_sv_i) ? (
+        launch_voices_for_pad(_sv_i, p_note[_sv_i], 110, 8);
+        p_held[_sv_i] = 1; p_held_vel[_sv_i] = 110;
+        p_held_note[_sv_i] = p_note[_sv_i]; gui_held_pad = _sv_i;
+      );
+    );
+    _sv_i += 1;
+  );
+
+  // ── Right column geometry ──
+  _sv_ex = _sv_gx + 4 * (_sv_cell + _sv_gap) + 14;   // editor left edge
+
+  // ENABLE + actions row
+  gfx_set(_sv_on ? 0.20 : 0.16, _sv_on ? 0.60 : 0.18, _sv_on ? 0.35 : 0.20, 1);
+  gfx_rect(_sv_ex, _sv_y + 30, 62, 20);
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_set(1, 1, 1, _sv_on ? 0.95 : 0.55);
+  gfx_measurestr(_sv_on ? "SYN ON" : "SYN OFF", tw, th);
+  gfx_x = _sv_ex + (62 - tw) / 2; gfx_y = _sv_y + 30 + (20 - th) / 2;
+  gfx_drawstr(_sv_on ? "SYN ON" : "SYN OFF");
+  lmb_down && mx >= _sv_ex && mx <= _sv_ex + 62 && my >= _sv_y + 30 && my <= _sv_y + 50 ? (
+    ps_enable[_sv_p] = _sv_on ? 0 : 1;
+    _syn_autoname(_sv_p);
+    mark_dirty_pad(_sv_p);
+  );
+  swing_synthview_btn(_sv_ex + 70,  _sv_y + 30, 44, 20, "INIT") ? (
+    _syn_engine_defaults(_sv_p, _sv_eng);
+    mark_dirty_pad(_sv_p);
+  );
+  swing_synthview_btn(_sv_ex + 118, _sv_y + 30, 44, 20, "RAND") ? (
+    _sv_i = 0; loop(_sv_cnt, _syn_mac_set(_sv_p, _sv_i, rand(1)); _sv_i += 1; );
+    mark_dirty_pad(_sv_p);
+  );
+  swing_synthview_btn(_sv_ex + 166, _sv_y + 30, 52, 20, "CLEAR") ? (
+    clear_pad_syn(_sv_p);
+    _syn_autoname(_sv_p);
+    mark_dirty_pad(_sv_p);
+  );
+
+  // ── Family pill row (9) ──
+  _sv_pw = ((_sv_x + _sv_w - 10 - _sv_ex) / 9)|0;
+  _sv_i = 0;
+  loop(9,
+    _sv_px = _sv_ex + _sv_i * _sv_pw;
+    _syn_engine_col(_sv_i, _sv_i == _sv_fam ? 1.0 : 0.30);
+    gfx_set(_syn_ecr, _syn_ecg, _syn_ecb, 1);
+    gfx_rect(_sv_px, _sv_y + 58, _sv_pw - 2, 22);
+    gfx_set(1, 1, 1, _sv_i == _sv_fam ? 1.0 : 0.6);
+    gfx_setfont(1, "Arial", 8, 'b');
+    _syn_engine_pill(_sv_i);
+    gfx_measurestr(#_syn_en, tw, th);
+    gfx_x = _sv_px + (_sv_pw - 2 - tw) / 2; gfx_y = _sv_y + 58 + (22 - th) / 2;
+    gfx_drawstr(#_syn_en);
+    lmb_down && _sv_i != _sv_fam &&
+    mx >= _sv_px && mx <= _sv_px + _sv_pw - 2 && my >= _sv_y + 58 && my <= _sv_y + 80 ? (
+      ps_engine[_sv_p] = _sv_i;              // family switch -> type 0
+      _syn_engine_defaults(_sv_p, _sv_i);
+      _syn_autoname(_sv_p);
+      mark_dirty_pad(_sv_p);
+    );
+    _sv_i += 1;
+  );
+
+  // ── TYPE selector ──
+  _sv_tc = rk_syn_dd_type_count(_sv_fam);
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_set(0.55, 0.58, 0.62, 0.9);
+  gfx_x = _sv_ex; gfx_y = _sv_y + 88;
+  gfx_drawstr("TYPE");
+  _sv_i = 0;
+  loop(_sv_tc,
+    _sv_tx = _sv_ex + 36 + _sv_i * 26;
+    _sv_i == _sv_typ ? (
+      _syn_engine_col(_sv_fam, 1.0);
+      gfx_set(_syn_ecr, _syn_ecg, _syn_ecb, 1);
+    ) : gfx_set(0.20, 0.22, 0.27, 1);
+    gfx_rect(_sv_tx, _sv_y + 85, 22, 16);
+    gfx_set(1, 1, 1, _sv_i == _sv_typ ? 1.0 : 0.55);
+    sprintf(#_syn_val, "%d", _sv_i + 1);
+    gfx_measurestr(#_syn_val, tw, th);
+    gfx_x = _sv_tx + (22 - tw) / 2; gfx_y = _sv_y + 85 + (16 - th) / 2;
+    gfx_drawstr(#_syn_val);
+    lmb_down && _sv_i != _sv_typ &&
+    mx >= _sv_tx && mx <= _sv_tx + 22 && my >= _sv_y + 85 && my <= _sv_y + 101 ? (
+      ps_engine[_sv_p] = _sv_fam + 10 * _sv_i;   // same family: macros KEPT
+      mark_dirty_pad(_sv_p);
+    );
+    _sv_i += 1;
+  );
+
+  // ── Macro knobs (2 x 4, only the family's assigned macros) ──
+  _syn_engine_col(_sv_fam, 1.0);
+  _sv_kr = 19;
+  _sv_i = 0;
+  loop(8,
+    _sv_i < _sv_cnt ? (
+      _sv_row = (_sv_i / 4)|0;
+      _sv_col = _sv_i % 4;
+      _sv_kx = _sv_ex + 30 + _sv_col * ((_sv_x + _sv_w - 90 - _sv_ex) / 4);
+      _sv_ky = _sv_y + 132 + _sv_row * 66;
+      _sv_km = km_syn + (_sv_p * KM_SYN_PER_PAD + _sv_i) * KS;
+      _sv_ov = _syn_mac_get(_sv_p, _sv_i);
+      _sv_nv = ssl_knob_interact(_sv_km, _sv_kx, _sv_ky, _sv_kr, _sv_ov, 0, 1.0, 0.5, 0);
+      _sv_nv != _sv_ov ? ( _syn_mac_set(_sv_p, _sv_i, _sv_nv); mark_dirty_pad(_sv_p); );
+      ssl_knob_draw(_sv_kx, _sv_ky, _sv_kr, _syn_mac_get(_sv_p, _sv_i), 0, 1.0, 0, _sv_km[0],
+        _sv_on ? _syn_ecr : 0.25, _sv_on ? _syn_ecg : 0.28, _sv_on ? _syn_ecb : 0.32, 0);
+      gfx_setfont(1, "Arial", 9, 'b'); gfx_set(0.72, 0.74, 0.77, 1);
+      _syn_macro_label(_sv_fam, _sv_i);
+      gfx_measurestr(#_syn_ml, tw, th);
+      gfx_x = _sv_kx - tw / 2; gfx_y = _sv_ky + _sv_kr + 3; gfx_drawstr(#_syn_ml);
+      sprintf(#_syn_val, "%.0f%%", _syn_mac_get(_sv_p, _sv_i) * 100);
+      gfx_measurestr(#_syn_val, tw, th); gfx_set(0.55, 0.57, 0.60, 1);
+      gfx_x = _sv_kx - tw / 2; gfx_y = _sv_ky + _sv_kr + 13; gfx_drawstr(#_syn_val);
+    );
+    _sv_i += 1;
+  );
+
+  // ── LEVEL + velocity window (right edge) ──
+  _sv_lx = _sv_x + _sv_w - 42;
+  _sv_km = km_syn + (_sv_p * KM_SYN_PER_PAD + 8) * KS;
+  _sv_ov = ps_level[_sv_p];
+  _sv_nv = ssl_knob_interact(_sv_km, _sv_lx, _sv_y + 132, 16, _sv_ov, 0, 2.0, 1.0, 0);
+  _sv_nv != _sv_ov ? ( ps_level[_sv_p] = _sv_nv; mark_dirty_pad(_sv_p); );
+  ssl_knob_draw(_sv_lx, _sv_y + 132, 16, ps_level[_sv_p], 0, 2.0, 0, _sv_km[0], 0.85, 0.65, 0.25, 0);
+  gfx_setfont(1, "Arial", 8, 'b'); gfx_set(0.70, 0.72, 0.75, 1);
+  gfx_measurestr("LEVEL", tw, th);
+  gfx_x = _sv_lx - tw / 2; gfx_y = _sv_y + 132 + 19; gfx_drawstr("LEVEL");
+
+  _sv_km = km_syn + (_sv_p * KM_SYN_PER_PAD + 9) * KS;
+  _sv_ov = ps_vel_lo[_sv_p];
+  _sv_nv = ssl_knob_interact(_sv_km, _sv_lx, _sv_y + 186, 12, _sv_ov, 0, 1.0, 0, 0);
+  _sv_nv != _sv_ov ? ( ps_vel_lo[_sv_p] = min(_sv_nv, ps_vel_hi[_sv_p] - 1/127); mark_dirty_pad(_sv_p); );
+  ssl_knob_draw(_sv_lx, _sv_y + 186, 12, ps_vel_lo[_sv_p], 0, 1.0, 0, _sv_km[0], 0.85, 0.55, 0.20, 0);
+  gfx_setfont(1, "Arial", 7, 'b'); gfx_set(0.65, 0.67, 0.70, 1);
+  gfx_measurestr("V.LO", tw, th);
+  gfx_x = _sv_lx - tw / 2; gfx_y = _sv_y + 186 + 14; gfx_drawstr("V.LO");
+
+  _sv_km = km_syn + (_sv_p * KM_SYN_PER_PAD + 10) * KS;
+  _sv_ov = ps_vel_hi[_sv_p];
+  _sv_nv = ssl_knob_interact(_sv_km, _sv_lx, _sv_y + 226, 12, _sv_ov, 0, 1.0, 1.0, 0);
+  _sv_nv != _sv_ov ? ( ps_vel_hi[_sv_p] = max(_sv_nv, ps_vel_lo[_sv_p] + 1/127); mark_dirty_pad(_sv_p); );
+  ssl_knob_draw(_sv_lx, _sv_y + 226, 12, ps_vel_hi[_sv_p], 0, 1.0, 0, _sv_km[0], 0.30, 0.70, 0.85, 0);
+  gfx_measurestr("V.HI", tw, th);
+  gfx_x = _sv_lx - tw / 2; gfx_y = _sv_y + 226 + 14; gfx_drawstr("V.HI");
+
+  // ── 3D family drum (hero) ──
+  // The lower two-thirds of this panel is dead space: the 4x4 pad grid ends at
+  // _sv_y+186 and every control ends by _sv_y+240, against a panel ~610 tall.
+  // Unlike the overlay's 83x111 slot this is a real product shot, so the drum
+  // is drawn large and centred rather than tucked into a gap.
+  _sv_d3y = _sv_y + 250;
+  _sv_d3h = _sv_h - 250 - 24;
+  _sv_d3h > 60 ? (
+    // Drag on the drum to orbit it; right-click restores the default angle.
+    // LMB (held), mx and my are Swing's own wrappers — a global() function
+    // can't reach mouse_cap / mouse_x directly.
+    swing_drum3d_orbit(_sv_x + 10, _sv_d3y, _sv_w - 20, _sv_d3h, mx, my, LMB);
+    rmb_down && mx >= _sv_x + 10 && mx <= _sv_x + _sv_w - 10 &&
+      my >= _sv_d3y && my <= _sv_d3y + _sv_d3h ? swing_drum3d_reset();
+    // Accent fetched here and passed in: rk_swing_ui_drum3d imports before
+    // rk_swing_ui_overlay_syn, so it cannot call _syn_engine_col itself.
+    _syn_engine_col(_sv_fam, 1.0);
+    // Geometry macro — HAT 4 OPEN / TOM 2 WHICH / CLAP 0 ATTACK, -1 for the
+    // other six. Resolved HERE because _syn_mac_get lives in
+    // rk_swing_ui_overlay_syn, which imports after rk_swing_ui_drum3d.
+    _sv_mi = swing_drum3d_morph_macro(_sv_fam);
+    swing_drum3d_draw(_sv_x + 10, _sv_d3y, _sv_w - 20, _sv_d3h, _sv_fam,
+                      p_held[_sv_p] > 0.5, _sv_on ? 1 : 0.42,
+                      _syn_ecr, _syn_ecg, _syn_ecb,
+                      _sv_mi >= 0 ? _syn_mac_get(_sv_p, _sv_mi) : 0,
+                      p_held[_sv_p] > 0.5 ? p_held_vel[_sv_p] / 127 : 0);
+  );
+
+  // ── Hint ──
+  gfx_setfont(1, "Arial", 8, 0);
+  gfx_set(0.55, 0.58, 0.62, 0.8);
+  gfx_x = _sv_x + 8; gfx_y = _sv_y + _sv_h - 13;
+  gfx_drawstr("Click a pad to edit + audition. Synth follows pad layer mode + TUNE. TYPE keeps knobs; family resets them.");
+
+  // Re-zero the saves so nothing drawn after us sees live input (modal rule).
+  lmb_down = 0; rmb_down = 0; LMB = 0; RMB = 0; frame_wheel = 0;
+);

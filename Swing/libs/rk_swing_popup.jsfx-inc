@@ -1,0 +1,570 @@
+// rk_swing_popup.jsfx-inc
+// Swing-styled custom popup menu — replacement for gfx_showmenu.
+// Locked to the Strip render style (user pick, 2026-05-24). A Card render
+// path is retained behind SP_POPUP_SHOW_STYLE_TOGGLE (default 0) for A/B.
+// (c) EON Studios — All Rights Reserved
+//
+// Usage:
+//   1. Caller (e.g. MODE stepper right-click handler) calls
+//        swing_popup_open(mx, my, "#Mode|^g Repitch|^b Tuned|^a Stretch",
+//                         SP_POPUP_CALLER_xxx);
+//      where the items string follows gfx_showmenu's format, plus our own
+//      color extension:
+//        '|'        separates items
+//        '||'       produces a blank separator row (empty item)
+//        '#'        prefix marks the item as a disabled header
+//                   (matches gfx_showmenu — always rendered Swing red)
+//        '^X '      prefix tags the item with a palette color (X = single
+//                   char). Recognised codes:
+//                       g grey   b blue   a amber   r Swing red
+//                       G green  p purple c cyan
+//                   The optional trailing space after the code is stripped.
+//                   '^' tags are OUR extension — gfx_showmenu would render
+//                   them as literal text. Caller-side is unchanged either
+//                   way (result indices are 1-based by visual row).
+//      '#' and '^X' can appear together; if so, '#' goes first.
+//   2. Each frame the caller checks:
+//        swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_xxx
+//          → that's the 1-based pick (matches gfx_showmenu semantics).
+//        After consuming the result the caller MUST set
+//          swing_popup_result = 0;  // mark consumed
+//   3. swing_popup_result == -1 indicates cancellation (click outside / ESC).
+//
+// Modal gating: when swing_popup_active is non-zero,
+//   swing_ui_modal_gate() suppresses the underlying UI's mouse state, and
+//   swing_popup_tick() (drawn LAST in @gfx) handles its own clicks via the
+//   _raw_lmb_down / _raw_LMB copies the gate preserved.
+
+@init
+
+// ─── Caller IDs (extend as new sites adopt the popup) ────────────────────
+SP_POPUP_CALLER_NONE        = 0;
+SP_POPUP_CALLER_MODE_ALGO   = 1;
+SP_POPUP_CALLER_OUTPUT_BUS  = 2;
+SP_POPUP_CALLER_CHOKE_GROUP = 3;
+SP_POPUP_CALLER_VEL_CURVE   = 4;
+SP_POPUP_CALLER_EMBED_MENU  = 5;
+SP_POPUP_CALLER_DLY_SYNC    = 6;
+SP_POPUP_CALLER_RVB_SYNC    = 7;
+SP_POPUP_CALLER_RPT_DIV     = 8;
+SP_POPUP_CALLER_MAP_PRESET  = 9;
+SP_POPUP_CALLER_MAP_ROOT    = 10;
+SP_POPUP_CALLER_SAVE_KIT    = 11;
+SP_POPUP_CALLER_LOAD_KIT    = 12;
+SP_POPUP_CALLER_NEW_KIT     = 13;
+SP_POPUP_CALLER_RESET_COLORS = 14;
+SP_POPUP_CALLER_MULTIOUT    = 15;
+SP_POPUP_CALLER_CLEAR_PADS  = 16;
+SP_POPUP_CALLER_OVERLAY_CLEAR_LAYER = 17;
+SP_POPUP_CALLER_OVERLAY_LAYER_MODE  = 18;
+SP_POPUP_CALLER_OVERLAY_OUTPUT_BUS  = 19;
+SP_POPUP_CALLER_OVERLAY_CHOKE       = 20;
+SP_POPUP_CALLER_OVERLAY_ONESHOT     = 21;
+SP_POPUP_CALLER_OVERLAY_CLEAR_PAD   = 22;
+SP_POPUP_CALLER_PAD_GRID_OUTPUT     = 23;  // pad grid output bus picker
+SP_POPUP_CALLER_PAD_GRID_NOTE       = 24;  // pad grid MIDI note re-assign
+SP_POPUP_CALLER_PAD_GRID_RPT        = 25;  // pad grid per-pad repeat divisor
+SP_POPUP_CALLER_ALGO        = 26;  // dedicated per-pad algo dropdown (Tuned/Stretch)
+SP_POPUP_CALLER_THEME       = 27;  // header THEME button right-click → unified-theme picker
+SP_POPUP_CALLER_KNOB_STYLE  = 28;  // left-panel KNOB button → pad-knob style picker
+SP_POPUP_CALLER_DM_BUILD    = 29;  // left-panel MATRIX button right-click → build menu (Matrix/Multi-Out/Both)
+SP_POPUP_CALLER_PREFS       = 30;  // header gear button → prefs toggles (MIDI Thru / Tooltips / Select-track-on-pad-click)
+SP_POPUP_CALLER_PAD_RANGE   = 31;  // LCD RANGE pill → chromatic key-range presets (Spec_Swing_Chromatic_Pad Slice 1)
+SP_POPUP_CALLER_PAD_GRID_KNOBS = 32;  // pad grid VOL/PAN knob right-click → knob style + colour override
+SP_POPUP_CALLER_SAMPLES_MISSING = 33; // "Kit samples missing" banner click → Relink folder / Load kit / Dismiss (P4 step 3)
+SP_POPUP_CALLER_PAD_CATEGORY = 34; // LCD CATEGORY pill → set the pad's category (kit-categories §9b; via bridge mailbox)
+SP_POPUP_CALLER_OVERLAY_CLEAR_SYN = 35; // SYN tab right-click → reset the synth slot (its "Clear Layer")
+
+// ─── Style enum + persisted default ──────────────────────────────────────
+SP_POPUP_STYLE_CARD       = 0;   // PAD-dialog-like — rounded-ish, red header
+SP_POPUP_STYLE_STRIP      = 1;   // LCD-pill-like   — flat, compact
+
+// Style toggle row was a mockup-phase comparison aid (user picked Strip
+// on 2026-05-24). Set to 1 again if you ever want to A/B styles again.
+// The Card render path is preserved in case a future caller wants it.
+SP_POPUP_SHOW_STYLE_TOGGLE = 0;
+
+// Default style for every popup. Locked to Strip — flat pills with each
+// item colored by its '^X' tag, matching the LCD pill language.
+swing_popup_style          = SP_POPUP_STYLE_STRIP;
+
+// ─── State ────────────────────────────────────────────────────────────────
+swing_popup_active     = 0;
+swing_popup_x          = 0;
+swing_popup_y          = 0;
+swing_popup_caller_id  = SP_POPUP_CALLER_NONE;
+swing_popup_result     = 0;     // 0 = nothing, 1..N = picked, -1 = cancelled
+swing_popup_hover_idx  = -1;
+swing_popup_just_opened = 0;    // 1 for the first frame after open → swallows the click that triggered the popup
+// Hover-scroll: when the wheel turns while the mouse is over an item, the tick
+// publishes the wheel direction (+1 up / -1 down) and that item's 1-based result
+// index. A caller can read these to change THAT option's value in place while
+// the menu stays open (e.g. the header gear toggles). Reset each frame by tick.
+swing_popup_wheel        = 0;
+swing_popup_wheel_result = 0;
+
+// Max items in one popup (Mode+Algo currently needs 9 + 2 separators = 11)
+SP_POPUP_MAX_ITEMS = 32;
+
+// ─── Init: allocate per-item parse tables ────────────────────────────────
+function swing_popup_init(_base)
+local(_b)
+(
+  _b = _base;
+  sp_popup_item_ofs   = _b; _b += SP_POPUP_MAX_ITEMS;
+  sp_popup_item_len   = _b; _b += SP_POPUP_MAX_ITEMS;
+  sp_popup_item_dis   = _b; _b += SP_POPUP_MAX_ITEMS;
+  sp_popup_item_sep   = _b; _b += SP_POPUP_MAX_ITEMS;
+  // Per-item color code (char from '^X' tag, or 0 if untagged → default
+  // text color). Applied by swing_popup_apply_color() at draw time.
+  sp_popup_item_color = _b; _b += SP_POPUP_MAX_ITEMS;
+  // Scratch slots for swing_popup_metrics_* out-params (width / height).
+  // Two single-cell arrays; addressed as sp_popup_scratch_w[0] /
+  // sp_popup_scratch_h[0] from the metrics functions.
+  sp_popup_scratch_w  = _b; _b += 1;
+  sp_popup_scratch_h  = _b; _b += 1;
+  _b;
+);
+
+// ─── Palette: apply a tagged color via gfx_set ───────────────────────────
+// `_alpha` lets callers tint backgrounds at low alpha while drawing text
+// at full alpha with the same code. Code 0 → default LCD-text color.
+function swing_popup_apply_color(_code, _alpha)
+(
+  _code == 'g' ? gfx_set(0.60, 0.63, 0.68, _alpha) :
+  _code == 'b' ? gfx_set(0.22, 0.55, 1.00, _alpha) :
+  _code == 'a' ? gfx_set(1.00, 0.62, 0.10, _alpha) :
+  _code == 'r' ? gfx_set(0.92, 0.22, 0.14, _alpha) :
+  _code == 'G' ? gfx_set(0.26, 0.85, 0.42, _alpha) :
+  _code == 'p' ? gfx_set(0.70, 0.42, 0.95, _alpha) :
+  _code == 'c' ? gfx_set(0.25, 0.85, 0.92, _alpha) :
+  gfx_set(0.85, 0.92, 0.94, _alpha);  // default — same as LCD text
+);
+
+// ─── Parse items_str into the tables ─────────────────────────────────────
+// Items string format mirrors gfx_showmenu plus our own extensions:
+//   "a|b||c"          → items: ["a"], ["b"], [""], ["c"]
+//                       (the empty one renders as a separator)
+//   "#hdr|x"          → items: ["hdr" disabled], ["x"]
+//   "^b Tuned|^a Hot" → items: ["Tuned" blue], ["Hot" amber]
+// Disabled headers → sp_popup_item_dis. Empty separators → sp_popup_item_sep.
+// Color tags → sp_popup_item_color. Markers (#, ^X, optional trailing space)
+// are stripped from the displayed text via ofs/len adjustment so the parser
+// stays single-pass.
+function swing_popup_parse_items()
+local(_n, _i, _start, _len, _ch, _is_dis, _color, _slen)
+(
+  _slen = strlen(#swing_popup_items);
+  _n = 0;
+  _start = 0;
+  _is_dis = 0;
+  _color  = 0;
+  // Consume leading markers on the very first item.
+  _slen > 0 && str_getchar(#swing_popup_items, _start) == '#' ? (
+    _is_dis = 1; _start += 1;
+  );
+  _start + 1 < _slen && str_getchar(#swing_popup_items, _start) == '^' ? (
+    _color = str_getchar(#swing_popup_items, _start + 1);
+    _start += 2;
+    _start < _slen && str_getchar(#swing_popup_items, _start) == ' ' ? (
+      _start += 1;
+    );
+  );
+  _i = _start;
+  loop(_slen + 1 - _start,
+    _ch = _i < _slen ? str_getchar(#swing_popup_items, _i) : '|';
+    _ch == '|' ? (
+      _len = _i - _start;
+      _n < SP_POPUP_MAX_ITEMS ? (
+        sp_popup_item_ofs[_n]   = _start;
+        sp_popup_item_len[_n]   = _len;
+        sp_popup_item_dis[_n]   = _is_dis;
+        sp_popup_item_sep[_n]   = (_len == 0);
+        sp_popup_item_color[_n] = _color;
+        _n += 1;
+      );
+      // Reset markers for the next item.
+      _start = _i + 1;
+      _is_dis = 0;
+      _color  = 0;
+      // Consume '#' (disabled-header marker) — must come first.
+      _start < _slen && str_getchar(#swing_popup_items, _start) == '#' ? (
+        _is_dis = 1; _start += 1;
+      );
+      // Consume '^X' (color tag) and optional trailing space.
+      _start + 1 < _slen && str_getchar(#swing_popup_items, _start) == '^' ? (
+        _color = str_getchar(#swing_popup_items, _start + 1);
+        _start += 2;
+        _start < _slen && str_getchar(#swing_popup_items, _start) == ' ' ? (
+          _start += 1;
+        );
+      );
+    );
+    _i += 1;
+  );
+  sp_popup_item_count = _n;
+);
+
+// ─── Map visual index → 1-based gfx_showmenu-equivalent result ───────────
+// gfx_showmenu numbers items starting at 1, including disabled headers but
+// NOT empty separator rows (the '||' tokens render as horizontal lines and
+// don't consume an index in the result). Replicate that exactly so the
+// existing switch-on-resp-number caller code is a drop-in port:
+//
+//   "OFF|1/4|1/4 T|1/4 D||1/8|..."
+//   → 1=OFF, 2=1/4, 3=1/4 T, 4=1/4 D, 5=1/8, ...   (sep at visual idx 4
+//                                                    is skipped in result)
+//
+//   "#Mode|Repitch|Tuned|Stretch||#Algo|Drum|..."
+//   → 1=#Mode, 2=Repitch, 3=Tuned, 4=Stretch,
+//     5=#Algo, 6=Drum, ...                          (headers count,
+//                                                    sep is skipped)
+function swing_popup_visual_to_result(_vi)
+local(_i, _result)
+(
+  _i = 0;
+  _result = 0;
+  loop(_vi + 1,
+    !sp_popup_item_sep[_i] ? _result += 1;
+    _i += 1;
+  );
+  _result;
+);
+
+// ─── Refresh the items of an already-open popup ──────────────────────────
+// Re-parses a new items string WITHOUT moving/closing the popup. Lets a caller
+// update labels live (e.g. after a hover-scroll toggled "ON" → "OFF") so the
+// open menu reflects the new state on the next frame.
+function swing_popup_refresh_items(_items_str)
+(
+  strcpy(#swing_popup_items, _items_str);
+  swing_popup_parse_items();
+);
+
+// ─── Open ────────────────────────────────────────────────────────────────
+function swing_popup_open(_x, _y, _items_str, _caller_id)
+(
+  strcpy(#swing_popup_items, _items_str);
+  swing_popup_parse_items();
+  swing_popup_x         = _x;
+  swing_popup_y         = _y;
+  swing_popup_caller_id = _caller_id;
+  swing_popup_active    = 1;
+  swing_popup_result    = 0;
+  swing_popup_hover_idx = -1;
+  swing_popup_just_opened = 1;
+  swing_popup_wheel     = 0;
+);
+
+function swing_popup_close(_result)
+(
+  swing_popup_active = 0;
+  swing_popup_result = _result;
+);
+
+function swing_popup_is_active()
+(
+  swing_popup_active;
+);
+
+// ─── Layout metrics (returns total width + height for current style) ─────
+function swing_popup_metrics_card(_w_out, _h_out)
+local(_i, _max_w, _w, _h, _tw, _th, _has_items)
+(
+  _max_w = 80;
+  _h = 8;          // top pad
+  SP_POPUP_SHOW_STYLE_TOGGLE ? _h += 22;   // toggle row
+  _i = 0;
+  loop(sp_popup_item_count,
+    sp_popup_item_sep[_i] ? (
+      _h += 6;
+    ) : (
+      // Measure text width
+      gfx_setfont(1, "Arial", 12);
+      sp_popup_item_dis[_i] ? gfx_setfont(1, "Arial", 11, 'b');
+      _tw = 0; _th = 0;
+      _tw = sp_popup_item_len[_i] * 7;  // rough estimate; refined below
+      // Use gfx_measurestr via temp string copy
+      strcpy_substr(#sp_popup_tmp, #swing_popup_items, sp_popup_item_ofs[_i], sp_popup_item_len[_i]);
+      gfx_measurestr(#sp_popup_tmp, _tw, _th);
+      _tw + 28 > _max_w ? _max_w = _tw + 28;
+      _h += 22;
+    );
+    _i += 1;
+  );
+  _h += 8;         // bottom pad
+  _w_out[0] = _max_w;
+  _h_out[0] = _h;
+);
+
+function swing_popup_metrics_strip(_w_out, _h_out)
+local(_i, _max_w, _h, _tw, _th)
+(
+  _max_w = 70;
+  _h = 5;
+  SP_POPUP_SHOW_STYLE_TOGGLE ? _h += 20;
+  _i = 0;
+  loop(sp_popup_item_count,
+    sp_popup_item_sep[_i] ? (
+      _h += 4;
+    ) : (
+      gfx_setfont(1, "Arial", 11);
+      strcpy_substr(#sp_popup_tmp, #swing_popup_items, sp_popup_item_ofs[_i], sp_popup_item_len[_i]);
+      gfx_measurestr(#sp_popup_tmp, _tw, _th);
+      _tw + 22 > _max_w ? _max_w = _tw + 22;
+      _h += 18;
+    );
+    _i += 1;
+  );
+  _h += 5;
+  _w_out[0] = _max_w;
+  _h_out[0] = _h;
+);
+
+// ─── Draw the [Card|Strip] toggle row + handle clicks on it ──────────────
+// Returns the y-cursor moved past the toggle row.
+function swing_popup_draw_toggle_row(_x, _y, _w, _lmb_edge, _mx_in, _my_in)
+local(_btn_w, _gap, _btn_h, _cx, _label_w, _label_h, _active, _hover, _bx)
+(
+  _btn_h = 18;
+  _gap = 4;
+  _btn_w = (_w - 12 - _gap) / 2;
+  _cx = _x + 6;
+
+  // Card button
+  _bx = _cx;
+  _active = (swing_popup_style == SP_POPUP_STYLE_CARD);
+  _hover  = (_mx_in >= _bx && _mx_in <= _bx + _btn_w && _my_in >= _y + 2 && _my_in <= _y + 2 + _btn_h);
+  _active ? gfx_set(0.18, 0.30, 0.38, 0.95) : (_hover ? gfx_set(0.10, 0.18, 0.22, 0.95) : gfx_set(0.06, 0.10, 0.13, 0.95));
+  gfx_rect(_bx, _y + 2, _btn_w, _btn_h);
+  _active ? ( gfx_set(0.85, 0.20, 0.12, 1); gfx_rect(_bx, _y + 2 + _btn_h - 2, _btn_w, 2); );
+  gfx_set(0.85, 0.92, 0.94, 1);
+  gfx_setfont(1, "Arial", 11);
+  gfx_measurestr("Card", _label_w, _label_h);
+  gfx_x = _bx + (_btn_w - _label_w) / 2; gfx_y = _y + 2 + (_btn_h - _label_h) / 2;
+  gfx_drawstr("Card");
+  _hover && _lmb_edge ? swing_popup_style = SP_POPUP_STYLE_CARD;
+
+  // Strip button
+  _bx = _cx + _btn_w + _gap;
+  _active = (swing_popup_style == SP_POPUP_STYLE_STRIP);
+  _hover  = (_mx_in >= _bx && _mx_in <= _bx + _btn_w && _my_in >= _y + 2 && _my_in <= _y + 2 + _btn_h);
+  _active ? gfx_set(0.18, 0.30, 0.38, 0.95) : (_hover ? gfx_set(0.10, 0.18, 0.22, 0.95) : gfx_set(0.06, 0.10, 0.13, 0.95));
+  gfx_rect(_bx, _y + 2, _btn_w, _btn_h);
+  _active ? ( gfx_set(0.85, 0.20, 0.12, 1); gfx_rect(_bx, _y + 2 + _btn_h - 2, _btn_w, 2); );
+  gfx_set(0.85, 0.92, 0.94, 1);
+  gfx_measurestr("Strip", _label_w, _label_h);
+  gfx_x = _bx + (_btn_w - _label_w) / 2; gfx_y = _y + 2 + (_btn_h - _label_h) / 2;
+  gfx_drawstr("Strip");
+  _hover && _lmb_edge ? swing_popup_style = SP_POPUP_STYLE_STRIP;
+
+  _y + 22;
+);
+
+// ─── Render Card style ───────────────────────────────────────────────────
+function swing_popup_draw_card(_x, _y, _w, _h, _lmb_edge, _mx_in, _my_in)
+local(_i, _cy, _row_h, _hover, _tw, _th, _label_w, _label_h, _picked)
+(
+  // Drop shadow
+  gfx_set(0, 0, 0, 0.45);
+  gfx_rect(_x + 3, _y + 3, _w, _h);
+
+  // Main background
+  gfx_set(0.06, 0.10, 0.13, 0.97);
+  gfx_rect(_x, _y, _w, _h);
+
+  // Top accent strip (Swing red)
+  gfx_set(0.85, 0.20, 0.12, 1);
+  gfx_rect(_x, _y, _w, 2);
+
+  // Border
+  gfx_set(0.20, 0.30, 0.36, 0.85);
+  gfx_rect(_x, _y, _w, 1);
+  gfx_rect(_x, _y + _h - 1, _w, 1);
+  gfx_rect(_x, _y, 1, _h);
+  gfx_rect(_x + _w - 1, _y, 1, _h);
+
+  _cy = _y + 6;
+
+  // Toggle row (mockup phase)
+  SP_POPUP_SHOW_STYLE_TOGGLE ? (
+    _cy = swing_popup_draw_toggle_row(_x, _cy, _w, _lmb_edge, _mx_in, _my_in);
+    // Subtle divider below toggle
+    gfx_set(0.20, 0.30, 0.36, 0.55);
+    gfx_rect(_x + 6, _cy + 1, _w - 12, 1);
+    _cy += 4;
+  );
+
+  _picked = -1;
+  _row_h = 22;
+  _i = 0;
+  loop(sp_popup_item_count,
+    sp_popup_item_sep[_i] ? (
+      gfx_set(0.20, 0.30, 0.36, 0.45);
+      gfx_rect(_x + 8, _cy + 2, _w - 16, 1);
+      _cy += 6;
+    ) : sp_popup_item_dis[_i] ? (
+      // Header — Swing red, slightly larger, no hover
+      gfx_setfont(1, "Arial", 11, 'b');
+      gfx_set(0.85, 0.20, 0.12, 1);
+      strcpy_substr(#sp_popup_tmp, #swing_popup_items, sp_popup_item_ofs[_i], sp_popup_item_len[_i]);
+      gfx_measurestr(#sp_popup_tmp, _label_w, _label_h);
+      gfx_x = _x + 10; gfx_y = _cy + (_row_h - _label_h) / 2;
+      gfx_drawstr(#sp_popup_tmp);
+      _cy += _row_h;
+    ) : (
+      _hover = (_mx_in >= _x && _mx_in <= _x + _w && _my_in >= _cy && _my_in <= _cy + _row_h);
+      _hover ? (
+        // Hover background tinted with the item's own color at low alpha.
+        swing_popup_apply_color(sp_popup_item_color[_i], 0.35);
+        gfx_rect(_x + 2, _cy, _w - 4, _row_h);
+        swing_popup_hover_idx = _i;
+      );
+      _hover && _lmb_edge ? _picked = _i;
+      gfx_setfont(1, "Arial", 12);
+      // Item text uses its tagged color at full alpha. Untagged → default.
+      swing_popup_apply_color(sp_popup_item_color[_i], 1);
+      strcpy_substr(#sp_popup_tmp, #swing_popup_items, sp_popup_item_ofs[_i], sp_popup_item_len[_i]);
+      gfx_measurestr(#sp_popup_tmp, _label_w, _label_h);
+      gfx_x = _x + 14; gfx_y = _cy + (_row_h - _label_h) / 2;
+      gfx_drawstr(#sp_popup_tmp);
+      _cy += _row_h;
+    );
+    _i += 1;
+  );
+
+  _picked >= 0 ? swing_popup_close(swing_popup_visual_to_result(_picked));
+);
+
+// ─── Render Strip style ──────────────────────────────────────────────────
+function swing_popup_draw_strip(_x, _y, _w, _h, _lmb_edge, _mx_in, _my_in)
+local(_i, _cy, _row_h, _hover, _label_w, _label_h, _picked, _pill_pad)
+(
+  // Drop shadow
+  gfx_set(0, 0, 0, 0.45);
+  gfx_rect(_x + 2, _y + 2, _w, _h);
+
+  // Main background — very dark, flat
+  gfx_set(0.03, 0.05, 0.07, 0.97);
+  gfx_rect(_x, _y, _w, _h);
+
+  // Single-pixel border
+  gfx_set(0.20, 0.30, 0.36, 0.70);
+  gfx_rect(_x, _y, _w, 1);
+  gfx_rect(_x, _y + _h - 1, _w, 1);
+  gfx_rect(_x, _y, 1, _h);
+  gfx_rect(_x + _w - 1, _y, 1, _h);
+
+  _cy = _y + 4;
+
+  // Toggle row (mockup phase)
+  SP_POPUP_SHOW_STYLE_TOGGLE ? (
+    _cy = swing_popup_draw_toggle_row(_x, _cy, _w, _lmb_edge, _mx_in, _my_in);
+    _cy += 2;
+  );
+
+  _picked = -1;
+  _row_h = 18;
+  _pill_pad = 4;
+  _i = 0;
+  loop(sp_popup_item_count,
+    sp_popup_item_sep[_i] ? (
+      gfx_set(0.20, 0.30, 0.36, 0.30);
+      gfx_rect(_x + 6, _cy + 1, _w - 12, 1);
+      _cy += 4;
+    ) : sp_popup_item_dis[_i] ? (
+      // Header — tiny caps, dimmer red
+      gfx_setfont(1, "Arial", 9, 'b');
+      gfx_set(0.85, 0.20, 0.12, 0.85);
+      strcpy_substr(#sp_popup_tmp, #swing_popup_items, sp_popup_item_ofs[_i], sp_popup_item_len[_i]);
+      gfx_measurestr(#sp_popup_tmp, _label_w, _label_h);
+      gfx_x = _x + 6; gfx_y = _cy + (_row_h - _label_h) / 2;
+      gfx_drawstr(#sp_popup_tmp);
+      _cy += _row_h;
+    ) : (
+      // Pill background uses the item's tagged color — low-alpha when
+      // resting, full-bodied on hover. Untagged → neutral dark fill.
+      _hover = (_mx_in >= _x + 4 && _mx_in <= _x + _w - 4 && _my_in >= _cy && _my_in <= _cy + _row_h - 2);
+      sp_popup_item_color[_i] ? (
+        swing_popup_apply_color(sp_popup_item_color[_i], _hover ? 1.0 : 0.62);
+      ) : (
+        _hover ? gfx_set(0.18, 0.32, 0.42, 0.90) : gfx_set(0.08, 0.13, 0.16, 0.85);
+      );
+      gfx_rect(_x + 4, _cy, _w - 8, _row_h - 2);
+      _hover ? (
+        // Red underline accent — consistent across colored / neutral pills
+        gfx_set(0.85, 0.20, 0.12, 0.90);
+        gfx_rect(_x + 4, _cy + _row_h - 4, _w - 8, 2);
+        swing_popup_hover_idx = _i;
+      );
+      _hover && _lmb_edge ? _picked = _i;
+      gfx_setfont(1, "Arial", 11);
+      gfx_set(0.95, 0.97, 0.98, 1);   // always white-ish text — readable on any color
+      strcpy_substr(#sp_popup_tmp, #swing_popup_items, sp_popup_item_ofs[_i], sp_popup_item_len[_i]);
+      gfx_measurestr(#sp_popup_tmp, _label_w, _label_h);
+      gfx_x = _x + (_w - _label_w) / 2; gfx_y = _cy + (_row_h - 2 - _label_h) / 2;
+      gfx_drawstr(#sp_popup_tmp);
+      _cy += _row_h;
+    );
+    _i += 1;
+  );
+
+  _picked >= 0 ? swing_popup_close(swing_popup_visual_to_result(_picked));
+);
+
+// ─── Per-frame tick — call LAST in @gfx so the popup renders on top ──────
+function swing_popup_tick()
+local(_w_arr, _h_arr, _w, _h, _x, _y, _lmb_edge, _esc, _click_outside, _mx_in, _my_in)
+(
+  swing_popup_active ? (
+    // Reserved scratch out-params (allocated in swing_popup_init).
+    swing_popup_style == SP_POPUP_STYLE_STRIP ?
+      swing_popup_metrics_strip(sp_popup_scratch_w, sp_popup_scratch_h)
+    : swing_popup_metrics_card(sp_popup_scratch_w, sp_popup_scratch_h);
+
+    _w = sp_popup_scratch_w[0];
+    _h = sp_popup_scratch_h[0];
+    _x = swing_popup_x;
+    _y = swing_popup_y;
+    // Clamp to window so the popup never falls off-screen
+    _x + _w > gfx_w ? _x = gfx_w - _w - 4;
+    _y + _h > gfx_h ? _y = gfx_h - _h - 4;
+    _x < 4 ? _x = 4;
+    _y < 4 ? _y = 4;
+
+    // Modal gate has zeroed lmb_down/LMB; read the preserved raw copies.
+    // Suppress the click that opened the popup (just_opened latch).
+    _lmb_edge = _raw_lmb_down && !swing_popup_just_opened;
+    swing_popup_just_opened = 0;
+
+    _mx_in = mx;
+    _my_in = my;
+    swing_popup_hover_idx = -1;
+    swing_popup_wheel = 0;   // cleared each frame; set below only on a wheel-over-item
+
+    swing_popup_style == SP_POPUP_STYLE_STRIP ?
+      swing_popup_draw_strip(_x, _y, _w, _h, _lmb_edge, _mx_in, _my_in)
+    : swing_popup_draw_card(_x, _y, _w, _h, _lmb_edge, _mx_in, _my_in);
+
+    // Hover-scroll: wheel turned while the mouse is over an item → publish the
+    // direction + that item's 1-based result index for the caller to act on
+    // (e.g. the gear menu toggles the hovered pref). The menu stays open. The
+    // draw sets swing_popup_hover_idx above; _raw_wheel is preserved by the
+    // modal gate (which zeroes frame_wheel so the underlying UI never reacts).
+    _raw_wheel != 0 && swing_popup_hover_idx >= 0 ? (
+      swing_popup_wheel        = _raw_wheel > 0 ? 1 : -1;
+      swing_popup_wheel_result = swing_popup_visual_to_result(swing_popup_hover_idx);
+    );
+
+    // Click outside → cancel
+    _click_outside = _lmb_edge && (_mx_in < _x || _mx_in > _x + _w || _my_in < _y || _my_in > _y + _h);
+    _click_outside ? swing_popup_close(-1);
+
+    // ESC closes — uses _char which the main @gfx captures once via
+    // gfx_getchar() at the top of every frame (the "Frame globals" block
+    // that opens Swing_ReaKit.jsfx's @gfx).
+    // Reading _char here is non-destructive (the queue was already drained).
+    _esc = swing_popup_active && _char == 27;
+    _esc ? swing_popup_close(-1);
+  );
+);

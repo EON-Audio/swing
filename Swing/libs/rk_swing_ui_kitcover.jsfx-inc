@@ -1,0 +1,238 @@
+// rk_swing_ui_kitcover.jsfx-inc — KIT-tab cover artwork tile
+//
+// Draws the loaded kit's cover image, or a generated portrait when it has none,
+// and accepts a PNG dropped from the OS to attach one.
+//
+// Covers live INSIDE the .swing as a tail record (see the v4 TAIL RECORDS block
+// in Swing_Kit_Bridge.lua). The bridge extracts one to a temp file on load and
+// publishes the PATH here, because gfx_loadimg takes a path and the bytes are
+// inside the kit file.
+//
+// ⚠️ IMAGE SLOT 96. Per the ReaKit buffer convention (.refs/jsfx_custom_gui_reference.md
+// §"ReaKit buffer convention"): cache buffers live at 95..126, 127 is reserved by
+// knobs_eq1979, never use low slots. Nothing else in Swing uses an image slot —
+// this is the plugin's first. Slots are 0..127 (EEL_LICE_DOC_MAXHANDLE) and are
+// believed per-instance; if two Swings ever show each other's cover, that
+// assumption is wrong and the slot has to become per-slot instead of fixed.
+//
+// IMPORT ORDER: after rk_cat_glyphs (needs eon_cat_glyph_lg) and before
+// rk_swing_lcd (swing_lcd_draw_kit calls in here) — EEL resolves function
+// references at definition time.
+//
+// @gfx runs CONCURRENT with @block, so every function declares local() for all
+// its scratch.
+
+@init
+
+KC_SLOT      = 96;    // see the slot note above
+KC_IMG_NONE  = -1;
+
+function swing_kitcover_init(_mem)
+(
+  kc_cats = _mem; _mem += 16;  // distinct category ids for the generated portrait
+  memset(kc_cats, 0, 16);
+  kc_img       = KC_IMG_NONE;  // gfx_loadimg handle, or -1
+  kc_pub_seen  = -1;           // last published seq consumed
+  kc_pending   = 0;            // a dropped cover is staged but not yet baked
+  kc_hot       = 0;            // pointer over the tile this frame
+  _mem;
+);
+
+// ── Path helpers ─────────────────────────────────────────────────────────
+// Length-prefixed record: [0]=len, [1..len]=chars, [1+len]=0. Same convention
+// as GS_MIGR/GS_REB_PAD_CELLS, not the kits-view _kv_str (which caps at 40).
+function _kc_read_path(_dst, _base) local(_n, _i)
+(
+  _n = gmem[_base] | 0;
+  (_n > 0 && _n <= KITCOVER_PATH_MAX) ? (
+    strcpy(_dst, "");
+    _i = 0;
+    loop(_n,
+      str_setchar(_dst, _i, gmem[_base + 1 + _i] | 0);
+      _i += 1;
+    );
+    str_setlen(_dst, _n);
+    _n;
+  ) : ( strcpy(_dst, ""); 0; );
+);
+
+function _kc_write_path(_src, _base) local(_n, _i)
+(
+  _n = min(strlen(_src), KITCOVER_PATH_MAX);
+  gmem[_base] = _n;
+  _i = 0;
+  loop(_n,
+    gmem[_base + 1 + _i] = str_getchar(_src, _i);
+    _i += 1;
+  );
+  gmem[_base + 1 + _n] = 0;
+  _n;
+);
+
+function _kc_lower(_c) ( (_c >= 65 && _c <= 90) ? _c + 32 : _c; );
+
+// Accept .png / .jpg / .jpeg ONLY. An audio drop must fall through to the pad
+// handler rather than being eaten by the tile.
+function _kc_is_image(_s) local(_n, _a, _b, _c, _d)
+(
+  _n = strlen(_s);
+  _n < 4 ? 0 : (
+    _a = _kc_lower(str_getchar(_s, _n - 4));
+    _b = _kc_lower(str_getchar(_s, _n - 3));
+    _c = _kc_lower(str_getchar(_s, _n - 2));
+    _d = _kc_lower(str_getchar(_s, _n - 1));
+    // ".png"                              ".jpg"                              "jpeg" (from .jpeg)
+    (_a == 46 && _b == 112 && _c == 110 && _d == 103) ||
+    (_a == 46 && _b == 106 && _c == 112 && _d == 103) ||
+    (_a == 106 && _b == 112 && _c == 101 && _d == 103);
+  );
+);
+
+// ── Published-cover poll ─────────────────────────────────────────────────
+// Reloads ONLY when the bridge bumps the seq. gfx_loadimg hits the disk, so
+// calling it per frame would re-read the file 60 times a second; the seq gate is
+// the same shape as the hash gate on the cached EQ plate in 4BandEQ_ReaKit.
+// Call once per @gfx frame, before the tile is drawn.
+function swing_kitcover_tick() local(_b, _seq)
+(
+  _reg_my_slot >= 0 ? (
+    _b = EON_KITCOVER_BASE + _reg_my_slot * EON_KITCOVER_STRIDE;
+    _seq = gmem[_b + KITCOVER_OFF_PUB_SEQ] | 0;
+    _seq != kc_pub_seen ? (
+      kc_pub_seen = _seq;
+      kc_img = KC_IMG_NONE;
+      _kc_read_path(#kc_path, _b + KITCOVER_OFF_PUB_PATH) > 0 ? (
+        // -1 back from gfx_loadimg just means "no cover" — a missing or corrupt
+        // file must degrade to the generated portrait, never to a blank tile.
+        kc_img = gfx_loadimg(KC_SLOT, #kc_path);
+      );
+      // The publish is the bake: whatever was pending has landed in the kit.
+      kc_pending = 0;
+    );
+  );
+);
+
+// ── Generated portrait ───────────────────────────────────────────────────
+// Shown when a kit has no cover, so the tile is never an empty box. The kit's
+// DISTINCT categories, laid out in a grid — a portrait of what is actually in
+// the rack. Reuses eon_cat_glyph_lg, so it themes for free and ships no assets.
+//
+// Deliberately not the drum3d tableau: swing_drum3d_draw keeps one mesh at a
+// time in shared globals keyed on d3_fam, so a multi-drum scene would rebuild
+// once per drum per frame.
+function _kc_draw_portrait(_x, _y, _s)
+local(_i, _c, _n, _seen, _cols, _rows, _cw, _ch, _gx, _gy, _r, _k, _dup, _j, _art)
+(
+  // A named machine wins outright: "808 Trap Kit" states an intent the pad
+  // categories cannot, so the archetype portrait beats the glyph grid when the
+  // name matches one. Everything else keeps the category portrait below.
+  _art = swing_kitart_pick();
+  _art >= 0 ? (
+    swing_kitart_draw(_art, _x, _y, _s);
+  ) : (
+
+  // Collect distinct category ids into kc_cats (16 cells, allocated by init).
+  _n = 0;
+  _i = 0;
+  loop(NUM_PADS,
+    _c = gmem[EON_PADCAT_BASE + _reg_my_slot * EON_PADCAT_STRIDE + _i * 4] > 0
+       ? gmem[EON_PADCAT_BASE + _reg_my_slot * EON_PADCAT_STRIDE + _i * 4 + 1] | 0
+       : -1;
+    _c >= 0 ? (
+      _dup = 0; _j = 0;
+      loop(_n, kc_cats[_j] == _c ? _dup = 1; _j += 1; );
+      (!_dup && _n < 9) ? ( kc_cats[_n] = _c; _n += 1; );
+    );
+    _i += 1;
+  );
+
+  _n < 1 ? (
+    // Nothing categorised and no name to go on — the neutral machine, which
+    // still reads as a drum kit. (Was a plain grey circle.)
+    swing_kitart_draw(9, _x, _y, _s);
+  ) : (
+    _cols = _n <= 1 ? 1 : (_n <= 4 ? 2 : 3);
+    _rows = ceil(_n / _cols);
+    _cw = _s / _cols;
+    _ch = _s / _rows;
+    _r = min(_cw, _ch) * 0.30;
+    _i = 0;
+    loop(_n,
+      _gx = _x + (_i % _cols) * _cw + _cw * 0.5;
+      _gy = _y + ((_i / _cols) | 0) * _ch + _ch * 0.5;
+      gfx_set(lcd_bar_tx_r * 0.62, lcd_bar_tx_g * 0.62, lcd_bar_tx_b * 0.62, 1);
+      eon_cat_glyph_lg(kc_cats[_i], _gx, _gy, _r);
+      _i += 1;
+    );
+  );
+
+  );  // end: no name-matched archetype
+);
+
+// ── The tile ─────────────────────────────────────────────────────────────
+// Draws at (_x,_y) in a _s x _s square, and takes the drop for that square.
+// Called from swing_lcd_draw_kit, which runs during the LCD pass — early enough
+// that a claimed drop never reaches the pad grid below.
+function swing_kitcover_draw(_x, _y, _s)
+local(_iw, _ih, _sc, _dw, _dh, _dx, _dy, _b)
+(
+  // Frame
+  gfx_set(lcd_bar_tx_r * 0.10, lcd_bar_tx_g * 0.10, lcd_bar_tx_b * 0.10, 1);
+  gfx_rect(_x, _y, _s, _s);
+
+  kc_img >= 0 ? (
+    gfx_getimgdim(kc_img, _iw, _ih);
+    (_iw > 0 && _ih > 0) ? (
+      // FIT inside the square and centre — never crop. User covers arrive at
+      // every aspect ratio, and cropping would cut the subject out of a tall one.
+      _sc = min(_s / _iw, _s / _ih);
+      _dw = _iw * _sc; _dh = _ih * _sc;
+      _dx = _x + (_s - _dw) * 0.5;
+      _dy = _y + (_s - _dh) * 0.5;
+      // gfx_blit honours the current gfx_a / gfx_mode, so set both explicitly.
+      gfx_a = 1; gfx_mode = 0;
+      gfx_blit(kc_img, 1, 0, 0, 0, _iw, _ih, _dx, _dy, _dw, _dh);
+    ) : _kc_draw_portrait(_x, _y, _s);
+  ) : _kc_draw_portrait(_x, _y, _s);
+
+  // Border, brighter while the pointer is over the drop target
+  kc_hot = mx >= _x && mx < _x + _s && my >= _y && my < _y + _s;
+  gfx_set(lcd_bar_tx_r * (kc_hot ? 0.75 : 0.38),
+          lcd_bar_tx_g * (kc_hot ? 0.75 : 0.38),
+          lcd_bar_tx_b * (kc_hot ? 0.75 : 0.38), 1);
+  gfx_rect(_x, _y, _s, 1);
+  gfx_rect(_x, _y + _s - 1, _s, 1);
+  gfx_rect(_x, _y, 1, _s);
+  gfx_rect(_x + _s - 1, _y, 1, _s);
+
+  // Unsaved cue — a dropped cover shows at once but only lands in the .swing on
+  // the next save, so say so rather than letting the user assume it is safe.
+  kc_pending ? (
+    gfx_setfont(1, "Arial", 9, 'b');
+    gfx_set(0.88, 0.63, 0.13, 1);
+    gfx_rect(_x + 3, _y + _s - 14, 42, 11);
+    gfx_set(0.10, 0.08, 0.02, 1);
+    gfx_x = _x + 6; gfx_y = _y + _s - 14;
+    gfx_drawstr("UNSAVED");
+  );
+
+  // ── Drop ──
+  // Hit-test FIRST: the && short-circuit is what stops us consuming a drop meant
+  // for the pad grid. Same idiom as rk_swing_ui_grid_pads.jsfx-inc:1057.
+  kc_hot && gfx_getdropfile(0, #kc_df) ? (
+    _kc_is_image(#kc_df) ? (
+      // Show it immediately from the dropped file itself, then hand the path to
+      // the bridge to bake into the kit on the next save.
+      kc_img = gfx_loadimg(KC_SLOT, #kc_df);
+      _reg_my_slot >= 0 ? (
+        _b = EON_KITCOVER_BASE + _reg_my_slot * EON_KITCOVER_STRIDE;
+        _kc_write_path(#kc_df, _b + KITCOVER_OFF_PEND_PATH);
+        gmem[_b + KITCOVER_OFF_PEND_SEQ] = gmem[_b + KITCOVER_OFF_PEND_SEQ] + 1;  // LAST
+        kc_pending = 1;
+      );
+    );
+    // Clear whether or not we took it: we already refused non-images above, and
+    // leaving the list armed would re-fire every frame.
+    gfx_getdropfile(-1);
+  );
+);

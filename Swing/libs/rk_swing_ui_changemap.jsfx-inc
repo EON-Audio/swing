@@ -1,0 +1,569 @@
+// rk_swing_ui_changemap.jsfx-inc — KIT-tab dropdown panels
+//
+// Spec: .docs/specs/Spec_Swing_Change_Map_And_Reroll.md §3 (the note map).
+//
+// Hosts the KIT tab's chip row and the 4x4 dropdown panels behind it. All three
+// panels are the same per-pad map with different cell content, so they share one
+// draw (swing_kdd_panel) switched on a mode:
+//
+//   1 NOTES   every pad's MIDI note, tinted by what the last kit operation did
+//             to it (the change map — we only READ EON_CHGMAP_BASE; the bridge
+//             is its sole writer)
+//   2 OUT     every pad's output bus, for multi-out routing at a glance
+//   3 LAYERS  velocity layers / round-robin, which are invisible on the pad face
+//
+// MACROS is deliberately NOT a chip yet: the macro system is unbuilt, so the
+// panel would have nothing to show. Adding it later is one mode branch in
+// swing_kdd_panel plus one swing_kdd_chip call — see KDD_MODE_* below.
+//
+// The panels are REFERENCE readouts, not live meters, so they stay closed by
+// default and the KIT tab keeps the kit name, the project tempo and the last
+// operation's summary.
+//
+// IMPORT ORDER: must come AFTER rk_cat_glyphs (eon_catname) and BEFORE
+// rk_swing_lcd (swing_lcd_draw_kit calls into here) — EEL resolves function
+// references at definition time. (Which is also why nothing here calls
+// swing_tooltip_check: rk_swing_tooltips imports later still.)
+//
+// @gfx runs CONCURRENT with @block, so every function below declares local()
+// for all its scratch and the band is snapshotted through a seqlock before use.
+
+@init
+
+// ── Panel geometry ───────────────────────────────────────────────────────
+// Cells are fixed now that the panel sizes itself instead of squeezing into
+// whatever the KIT tab had left. Grid = 4*34 + 3*3 = 145 wide, 4*19 + 3*3 = 85
+// tall; the panel adds 8px margins, a title row, a legend to the right of the
+// grid, and the hover-detail line along the bottom.
+CHGMAP_CELL_W  = 34;
+CHGMAP_CELL_H  = 19;
+CHGMAP_GAP     = 3;
+CHGMAP_PANEL_W = 268;
+CHGMAP_PANEL_H = 132;
+
+KDD_MODE_NONE   = 0;
+KDD_MODE_NOTES  = 1;
+KDD_MODE_OUT    = 2;
+KDD_MODE_LAYERS = 3;
+// KDD_MODE_MACROS = 4;  // reserved — see the header note
+
+// ── State ────────────────────────────────────────────────────────────────
+// chgmap_codes: 16 per-pad outcome codes, snapshotted from the band.
+//   0 empty · 1 changed · 2 changed-shared(cycle) · 3 locked · 4 custom ·
+//   5 no-match · 6 synth
+// 0 and 5 are DIFFERENT answers: 0 = nothing was here, 5 = we looked and found
+// nothing. Only 5 is a reason to go add sources.
+function swing_chgmap_init(_mem)
+(
+  chgmap_codes = _mem; _mem += 16;
+  memset(chgmap_codes, 0, 16);
+  chgmap_op = 0;
+  chgmap_seq_seen = -1;
+  chgmap_n_chg = 0; chgmap_n_lock = 0; chgmap_n_custom = 0;
+  chgmap_n_nomatch = 0; chgmap_surplus = 0;
+  chgmap_stamp = 0;
+  kdd_hover = -1;
+  kdd_open = KDD_MODE_NONE;     // no panel until asked for
+  kdd_px = 0; kdd_py = 0;       // panel anchor, handed from input to paint
+  _mem;
+);
+
+// ── Band snapshot (seqlock) ──────────────────────────────────────────────
+// The bridge writes SEQ last, so: read seq, copy payload, re-read seq. If it
+// moved we caught a publish mid-flight — keep the previous snapshot and pick it
+// up next frame. The map is a RECORD of a finished operation, not a live meter,
+// so a one-frame delay is invisible and a torn read would be a lie.
+function swing_chgmap_read() local(_b, _s0, _s1, _i)
+(
+  _b = EON_CHGMAP_BASE + _reg_my_slot * EON_CHGMAP_STRIDE;
+  _s0 = gmem[_b + CHGMAP_OFF_SEQ];
+  _s0 != chgmap_seq_seen ? (
+    chgmap_op        = gmem[_b + CHGMAP_OFF_OP]|0;
+    chgmap_n_chg     = gmem[_b + CHGMAP_OFF_N_CHG]|0;
+    chgmap_n_lock    = gmem[_b + CHGMAP_OFF_N_LOCK]|0;
+    chgmap_n_custom  = gmem[_b + CHGMAP_OFF_N_CUSTOM]|0;
+    chgmap_n_nomatch = gmem[_b + CHGMAP_OFF_N_NOMATCH]|0;
+    chgmap_surplus   = gmem[_b + CHGMAP_OFF_SURPLUS]|0;
+    chgmap_stamp     = gmem[_b + CHGMAP_OFF_STAMP];
+    _i = 0;
+    loop(16,
+      chgmap_codes[_i] = gmem[_b + CHGMAP_OFF_PADS + _i]|0;
+      _i += 1;
+    );
+    _s1 = gmem[_b + CHGMAP_OFF_SEQ];
+    _s1 == _s0 ? chgmap_seq_seen = _s0;   // commit only on a clean read
+  );
+);
+
+// Is the snapshot still worth showing? An optimistic value that never expires
+// is logged audit debt #1 from the categories strand — this must not repeat it.
+// A dead bridge means nothing can ever correct the map, so stop asserting it.
+function swing_chgmap_live()
+(
+  chgmap_op > 0
+    && gmem[KIT_GMEM_BRIDGE_ALIVE] > 0
+    && (time_precise() - chgmap_stamp) < CHGMAP_EXPIRE_S;
+);
+
+// ── Note name ────────────────────────────────────────────────────────────
+// Local copy of the pitch-class table. The pad face and the PAD tab each have
+// their own inline copy; folding all three into one helper means editing two
+// working call sites, which is a separate change with its own verification.
+// _out = string HANDLE (callers pass a #string; # names are illegal as
+// function params — EEL2 only allows them in instance()/globals()).
+function swing_chgmap_note(_out, _nn) local(_oct, _pc)
+(
+  _oct = (_nn / 12)|0 - 1;
+  _pc = _nn % 12;
+  _pc == 0 ? strcpy(_out, "C") : _pc == 1 ? strcpy(_out, "C#") :
+  _pc == 2 ? strcpy(_out, "D") : _pc == 3 ? strcpy(_out, "D#") :
+  _pc == 4 ? strcpy(_out, "E") : _pc == 5 ? strcpy(_out, "F") :
+  _pc == 6 ? strcpy(_out, "F#") : _pc == 7 ? strcpy(_out, "G") :
+  _pc == 8 ? strcpy(_out, "G#") : _pc == 9 ? strcpy(_out, "A") :
+  _pc == 10 ? strcpy(_out, "A#") : strcpy(_out, "B");
+  sprintf(_out, "%s%d", _out, _oct);
+);
+
+// ── Cell fill for a change-map outcome code ──────────────────────────────
+// Tints stay mid-dark: the cell also carries text in white, so a bright fill
+// would make it unreadable. Returns 1 if the cell is FILLED (caller uses bright
+// text), 0 if it is an outline (caller uses dim text).
+function swing_chgmap_cell_col(_code)
+(
+  _code == 1 || _code == 2 ? ( gfx_set(0.659, 0.153, 0.102, 1); 1; ) :
+  _code == 3 ? ( gfx_set(0.604, 0.431, 0.071, 1); 1; ) :
+  _code == 4 ? ( gfx_set(0.494, 0.420, 0.816, 1); 1; ) :
+  _code == 6 ? ( gfx_set(0.290, 0.267, 0.471, 1); 1; ) :
+  0;
+);
+
+// Output-bus fill. There are SIXTEEN buses, not eight — the PAD tab cycles the
+// value with `% 16` (rk_swing_lcd:561/589) and kits really do use Out 13..16.
+//
+// Hue comes from Swing's own convention, `bus / 16.0`, the same mapping behind
+// col_auto_hue and the FX overlay's Out label — so a bus is recognisably the
+// same colour wherever you meet it. Lightness is pulled down from the 0.60 those
+// use for TEXT, because here the colour is a FILL with white text on top.
+function swing_kdd_bus_col(_bus)
+(
+  _bus = max(0, min(15, _bus | 0));
+  hsl_to_rgb(_bus / 16.0, 0.55, 0.34);
+  gfx_set(_hsl_r, _hsl_g, _hsl_b, 1);
+  1;
+);
+
+// Layer fill — by PLAYBACK MODE, not count: the mode is what changes how the
+// pad behaves. 0=single 1=vel-split 2=round-robin 3=sum.
+// Returns 1 filled / 0 outline; a pad with <2 layers is always an outline
+// however its mode is set, because the mode does nothing with one layer.
+function swing_kdd_layer_col(_cnt, _mode)
+(
+  _cnt < 2 ? 0 :
+  _mode == 1 ? ( gfx_set(0.208, 0.427, 0.518, 1); 1; ) :   // vel-split
+  _mode == 2 ? ( gfx_set(0.494, 0.420, 0.816, 1); 1; ) :   // round-robin
+  _mode == 3 ? ( gfx_set(0.259, 0.463, 0.290, 1); 1; ) :   // sum
+  0;
+);
+
+// ── Reason text for the hover line ───────────────────────────────────────
+// _out = string HANDLE, same convention as swing_chgmap_note above.
+function swing_chgmap_reason(_out, _code)
+(
+  _code == 1 ? strcpy(_out, "changed") :
+  _code == 2 ? strcpy(_out, "changed \x2D shares a sample") :
+  _code == 3 ? strcpy(_out, "locked \x2D kept") :
+  _code == 4 ? strcpy(_out, "your own sample \x2D kept") :
+  _code == 5 ? strcpy(_out, "no match in the kit") :
+  _code == 6 ? strcpy(_out, "synth pad \x2D no sample slot") :
+  strcpy(_out, "empty");
+);
+
+function swing_kdd_layer_mode_name(_out, _mode)
+(
+  _mode == 1 ? strcpy(_out, "vel\x2Dsplit") :
+  _mode == 2 ? strcpy(_out, "round\x2Drobin") :
+  _mode == 3 ? strcpy(_out, "sum") :
+  strcpy(_out, "single");
+);
+
+// ── One chip in the KIT-tab row ──────────────────────────────────────────
+// Takes the RIGHT edge and returns its own LEFT edge, so the caller can chain
+// right-to-left without knowing any label's width. Passing an x and separately
+// advancing by the measured width would misalign every chip whose label didn't
+// happen to match the guess.
+// Lit when its mode is the open one; toggles kdd_open on click and SWALLOWS it.
+function swing_kdd_chip(_lbl, _rx, _by, _bh, _mode)
+local(_tw, _th, _bw, _bx, _hov, _on)
+(
+  _on = (kdd_open == _mode);
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_measurestr(_lbl, _tw, _th);
+  _bw = _tw + 16;
+  _bx = _rx - _bw;
+  _hov = mx >= _bx && mx < _bx + _bw && my >= _by && my < _by + _bh;
+
+  _on ? (
+    gfx_set(0.659, 0.153, 0.102, _hov ? 1 : 0.85);
+  ) : (
+    gfx_set(lcd_bar_tx_r * 0.16, lcd_bar_tx_g * 0.16, lcd_bar_tx_b * 0.16, _hov ? 0.9 : 0.6);
+  );
+  gfx_rect(_bx, _by, _bw, _bh);
+  gfx_set(lcd_bar_tx_r * 0.45, lcd_bar_tx_g * 0.45, lcd_bar_tx_b * 0.45, _on ? 0.9 : 0.5);
+  gfx_rect(_bx, _by, _bw, 1);
+  gfx_rect(_bx, _by + _bh - 1, _bw, 1);
+  gfx_rect(_bx, _by, 1, _bh);
+  gfx_rect(_bx + _bw - 1, _by, 1, _bh);
+  gfx_set(lcd_bar_tx_r, lcd_bar_tx_g, lcd_bar_tx_b, (_on || _hov) ? 1 : 0.8);
+  gfx_x = _bx + (_bw - _tw) * 0.5;
+  gfx_y = _by + (_bh - _th) * 0.5;
+  gfx_drawstr(_lbl);
+
+  // Clicking the open chip closes it; clicking another switches straight to it.
+  _hov && lmb_down ? (
+    kdd_open = _on ? KDD_MODE_NONE : _mode;
+    lmb_down = 0;
+  );
+  _bx;
+);
+
+// ── KIT-tab row: tempo, chip row, last-operation summary ─────────────────
+// Called from swing_lcd_draw_kit with the KIT tab's content rect, immediately
+// after it has drawn the kit name.
+//
+// This also takes ALL of the dropdown input, and it has to: the LCD is drawn at
+// the TOP of the floating @gfx branch, the pad grid well below it. If an open
+// panel waited until its own paint to swallow a click, the pads would have taken
+// it already. Same input-early / paint-late split as the shared theme picker
+// (rkth_input / rkth_overlay_draw).
+function swing_chgmap_draw(_cx, _cy, _cw, _ch)
+local(_live, _bx, _by, _bh, _tw, _th, _in_panel, _nw, _nh, _uw, _uh)
+(
+  swing_chgmap_read();
+  _live = swing_chgmap_live();
+
+  // ── Chip row, chained right-to-left along the name row ──
+  // Laid out FIRST so the tempo below knows where the row starts and can bow
+  // out rather than sliding underneath it on a long kit name.
+  _bh = 16;
+  _by = _cy + 2;
+  _bx = swing_kdd_chip(kdd_open == KDD_MODE_LAYERS ? "LAYERS ▴" : "LAYERS ▾",
+                       _cx + _cw - 8, _by, _bh, KDD_MODE_LAYERS) - 4;
+  _bx = swing_kdd_chip(kdd_open == KDD_MODE_OUT ? "OUT ▴" : "OUT ▾",
+                       _bx, _by, _bh, KDD_MODE_OUT) - 4;
+  _bx = swing_kdd_chip(kdd_open == KDD_MODE_NOTES ? "NOTES ▴" : "NOTES ▾",
+                       _bx, _by, _bh, KDD_MODE_NOTES);
+
+  // ── Project tempo, sat next to the kit name ──
+  // `tempo` is a JSFX host variable (already read by rk_delay / rk_swing_block),
+  // so this is REAPER's live project BPM, not a stored kit field. Measured in
+  // the font the NAME was drawn in — swing_lcd_draw_kit uses Arial 11 bold — or
+  // it would land on top of a longer name. Dropped entirely when the name has
+  // eaten the row: overlapping the chips is worse than not showing the tempo.
+  gfx_setfont(1, "Arial", 11, 'b');
+  gfx_measurestr(strlen(#kit_name) > 0 ? #kit_name : "Untitled Kit", _nw, _nh);
+  sprintf(#_kdd_bpm, "%.4g", tempo);
+  gfx_setfont(1, "Arial", 15, 'b');
+  gfx_measurestr(#_kdd_bpm, _tw, _th);
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_measurestr(" BPM", _uw, _uh);
+  (_cx + 4 + _nw + 12 + _tw + _uw) < (_bx - 6) ? (
+    // Number at full brightness and larger than the kit name; the unit stays
+    // small and dim so the eye lands on the figure, not the word.
+    gfx_setfont(1, "Arial", 15, 'b');
+    gfx_set(lcd_bar_tx_r, lcd_bar_tx_g, lcd_bar_tx_b, 1);
+    gfx_x = _cx + 4 + _nw + 12;
+    gfx_y = _cy + 2 + (_nh - _th) * 0.5;
+    gfx_drawstr(#_kdd_bpm);
+    gfx_setfont(1, "Arial", 9, 'b');
+    gfx_set(lcd_bar_tx_r * 0.55, lcd_bar_tx_g * 0.55, lcd_bar_tx_b * 0.55, 1);
+    gfx_y = _cy + 2 + (_nh - _th) * 0.5 + (_th - _uh) - 1;
+    gfx_drawstr(" BPM");
+  );
+
+  // ── Last-operation summary ──
+  gfx_setfont(1, "Arial", 9, 'b');
+  _live ? (
+    chgmap_op == 1 ? strcpy(#_chg_hd, "Load") :
+    chgmap_op == 2 ? strcpy(#_chg_hd, "Fill") :
+    chgmap_op == 3 ? strcpy(#_chg_hd, "Roll") :
+                     strcpy(#_chg_hd, "Roll pad");
+    sprintf(#_chg_hd, "%s \x2D %d changed", #_chg_hd, chgmap_n_chg);
+    chgmap_n_lock   > 0 ? sprintf(#_chg_hd, "%s, %d locked", #_chg_hd, chgmap_n_lock);
+    chgmap_n_custom > 0 ? sprintf(#_chg_hd, "%s, %d yours", #_chg_hd, chgmap_n_custom);
+    gfx_set(lcd_bar_tx_r, lcd_bar_tx_g, lcd_bar_tx_b, 1);
+    gfx_x = _cx + 6; gfx_y = _cy + 26; gfx_drawstr(#_chg_hd);
+
+    strcpy(#_chg_sub, "");
+    chgmap_n_nomatch > 0 ?
+      sprintf(#_chg_sub, "%d pad(s) had no match", chgmap_n_nomatch);
+    chgmap_surplus > 0 ? (
+      strlen(#_chg_sub) > 0 ? strcat(#_chg_sub, " \x2D ");
+      sprintf(#_chg_sub, "%s%d sample(s) unused", #_chg_sub, chgmap_surplus);
+    );
+    strlen(#_chg_sub) > 0 ? (
+      gfx_setfont(1, "Arial", 9);
+      gfx_set(lcd_bar_tx_r * 0.62, lcd_bar_tx_g * 0.62, lcd_bar_tx_b * 0.62, 1);
+      gfx_x = _cx + 6; gfx_y = _cy + 40; gfx_drawstr(#_chg_sub);
+    );
+  ) : (
+    // Idle text has to read on its own — it is no longer a caption sitting next
+    // to a visible grid.
+    gfx_setfont(1, "Arial", 9);
+    gfx_set(lcd_bar_tx_r * 0.45, lcd_bar_tx_g * 0.45, lcd_bar_tx_b * 0.45, 1);
+    gfx_x = _cx + 6; gfx_y = _cy + 26; gfx_drawstr("No recent kit change");
+  );
+
+  // ── Open-panel input ──
+  kdd_open != KDD_MODE_NONE ? (
+    // Right-align the panel under the chip row, then clamp to the window.
+    kdd_px = max(4, min(_cx + _cw - 8 - CHGMAP_PANEL_W, gfx_w - CHGMAP_PANEL_W - 4));
+    kdd_py = _by + _bh + 3;
+    _in_panel = mx >= kdd_px && mx < kdd_px + CHGMAP_PANEL_W &&
+                my >= kdd_py && my < kdd_py + CHGMAP_PANEL_H;
+    _in_panel ? (
+      // Swallow — the pad grid draws after this and would otherwise take the
+      // click (or the wheel) straight through the open panel.
+      lmb_down = 0; rmb_down = 0; frame_wheel = 0;
+    ) : (
+      // A click anywhere else closes, and that click is spent closing: letting
+      // it through would fire a pad the user was only trying to uncover.
+      lmb_down ? ( kdd_open = KDD_MODE_NONE; lmb_down = 0; );
+    );
+  ) : (
+    kdd_hover = -1;
+  );
+);
+
+// ── Legend row ───────────────────────────────────────────────────────────
+// _kind: 0 = change-map code, 1 = output bus, 2 = layer mode.
+// A negative _code draws the no-match outline swatch, which has no fill of its
+// own. _lbl = literal string or a # handle.
+function swing_kdd_legend(_lx, _ly, _kind, _code, _lbl) local(_filled)
+(
+  _filled = _code < 0 ? 0 :
+            _kind == 0 ? swing_chgmap_cell_col(_code) :
+            _kind == 1 ? swing_kdd_bus_col(_code) :
+                         swing_kdd_layer_col(2, _code);
+  _filled ? (
+    gfx_rect(_lx, _ly + 2, 9, 9);
+  ) : (
+    gfx_set(0.200, 0.314, 0.361, 1);
+    gfx_rect(_lx, _ly + 2, 9, 1);
+    gfx_rect(_lx, _ly + 10, 9, 1);
+    gfx_rect(_lx, _ly + 2, 1, 9);
+    gfx_rect(_lx + 8, _ly + 2, 1, 9);
+  );
+  gfx_setfont(1, "Arial", 9);
+  gfx_set(lcd_bar_tx_r * 0.72, lcd_bar_tx_g * 0.72, lcd_bar_tx_b * 0.72, 1);
+  gfx_x = _lx + 14; gfx_y = _ly;
+  gfx_drawstr(_lbl);
+);
+
+// ── The panel ────────────────────────────────────────────────────────────
+// Painted from the floating @gfx branch AFTER the pad grid (so it floats over
+// the pads) but BEFORE the modal big views (so a full-screen view still covers
+// it). All input was already taken in swing_chgmap_draw above.
+//
+// GRID ORDER IS MPC, NOT READING ORDER: row 0 (top) = pads 12-15, row 3
+// (bottom) = pads 0-3, matching rk_swing_ui_grid_pads gi=(3-grow)*4+gcol.
+// A transposed map teaches the wrong pad and is worse than no map at all.
+function swing_kdd_panel(_mode)
+local(_px, _py, _gx, _gy, _lx, _ly, _row, _col, _pad, _x, _y,
+      _code, _filled, _live, _tw, _th, _hov, _n, _i, _cnt, _lm, _bus)
+(
+  _px = kdd_px; _py = kdd_py;
+  _live = swing_chgmap_live();
+
+  // Shadow, body, border
+  gfx_set(0, 0, 0, 0.40);
+  gfx_rect(_px + 3, _py + 4, CHGMAP_PANEL_W, CHGMAP_PANEL_H);
+  gfx_set(lcd_bar_bg_r, lcd_bar_bg_g, lcd_bar_bg_b, 1);
+  gfx_rect(_px, _py, CHGMAP_PANEL_W, CHGMAP_PANEL_H);
+  gfx_set(lcd_bar_tx_r * 0.45, lcd_bar_tx_g * 0.45, lcd_bar_tx_b * 0.45, 0.9);
+  gfx_rect(_px, _py, CHGMAP_PANEL_W, 1);
+  gfx_rect(_px, _py + CHGMAP_PANEL_H - 1, CHGMAP_PANEL_W, 1);
+  gfx_rect(_px, _py, 1, CHGMAP_PANEL_H);
+  gfx_rect(_px + CHGMAP_PANEL_W - 1, _py, 1, CHGMAP_PANEL_H);
+
+  // Title
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_set(lcd_bar_tx_r * 0.75, lcd_bar_tx_g * 0.75, lcd_bar_tx_b * 0.75, 1);
+  gfx_x = _px + 8; gfx_y = _py + 6;
+  _mode == KDD_MODE_NOTES ? gfx_drawstr("NOTE MAP") :
+  _mode == KDD_MODE_OUT   ? gfx_drawstr("OUTPUT BUS") :
+                            gfx_drawstr("LAYERS");
+
+  // ── Cells ──
+  _gx = _px + 8;
+  _gy = _py + 22;
+  kdd_hover = -1;
+
+  _row = 0;
+  loop(4,
+    _col = 0;
+    loop(4,
+      _pad = (3 - _row) * 4 + _col;          // MPC layout
+      _x = _gx + _col * (CHGMAP_CELL_W + CHGMAP_GAP);
+      _y = _gy + _row * (CHGMAP_CELL_H + CHGMAP_GAP);
+
+      _hov = mx >= _x && mx < _x + CHGMAP_CELL_W && my >= _y && my < _y + CHGMAP_CELL_H;
+      _hov ? kdd_hover = _pad;
+
+      // Fill + cell text, per mode.
+      _mode == KDD_MODE_NOTES ? (
+        _code = _live ? chgmap_codes[_pad] : 0;
+        _filled = swing_chgmap_cell_col(_code);
+        swing_chgmap_note(#_chg_nn, p_note[_pad]);
+      ) : _mode == KDD_MODE_OUT ? (
+        _bus = max(0, min(15, p_output[_pad] | 0));
+        _code = 0;
+        _filled = swing_kdd_bus_col(_bus);
+        sprintf(#_chg_nn, "%d", _bus + 1);
+      ) : (
+        _cnt = p_layer_cnt[_pad] | 0;
+        _lm  = p_layer_mode[_pad] | 0;
+        _code = 0;
+        _filled = swing_kdd_layer_col(_cnt, _lm);
+        _cnt >= 2 ? (
+          _lm == 1 ? sprintf(#_chg_nn, "%dV", _cnt) :
+          _lm == 2 ? sprintf(#_chg_nn, "%dR", _cnt) :
+          _lm == 3 ? sprintf(#_chg_nn, "%dS", _cnt) :
+                     sprintf(#_chg_nn, "%d", _cnt);
+        ) : strcpy(#_chg_nn, "\x2D");
+      );
+
+      _filled ? (
+        gfx_rect(_x, _y, CHGMAP_CELL_W, CHGMAP_CELL_H);
+      ) : (
+        // NOTES only: empty (0) is fainter than no-match (5) — "nothing was
+        // here" should recede, "we looked and found nothing" should register.
+        (_mode == KDD_MODE_NOTES && _code == 5) ? gfx_set(0.200, 0.314, 0.361, 1)
+                                                : gfx_set(0.133, 0.200, 0.231, 1);
+        gfx_rect(_x, _y, CHGMAP_CELL_W, 1);
+        gfx_rect(_x, _y + CHGMAP_CELL_H - 1, CHGMAP_CELL_W, 1);
+        gfx_rect(_x, _y, 1, CHGMAP_CELL_H);
+        gfx_rect(_x + CHGMAP_CELL_W - 1, _y, 1, CHGMAP_CELL_H);
+      );
+
+      // Shared-sample marker: a dot on EVERY pad in the sharing group, not just
+      // the wrapped copies — singling one of three out reads as noise.
+      (_mode == KDD_MODE_NOTES && _code == 2) ? (
+        gfx_set(0.24, 0.05, 0.02, 1);
+        gfx_circle(_x + CHGMAP_CELL_W - 5, _y + 4, 2, 1);
+      );
+
+      _hov ? (
+        gfx_set(0.92, 0.96, 0.97, 0.9);
+        gfx_rect(_x - 1, _y - 1, CHGMAP_CELL_W + 2, 1);
+        gfx_rect(_x - 1, _y + CHGMAP_CELL_H, CHGMAP_CELL_W + 2, 1);
+        gfx_rect(_x - 1, _y - 1, 1, CHGMAP_CELL_H + 2);
+        gfx_rect(_x + CHGMAP_CELL_W, _y - 1, 1, CHGMAP_CELL_H + 2);
+      );
+
+      gfx_setfont(1, "Arial", 9, 'b');
+      _filled ? gfx_set(1, 1, 1, 0.95)
+              : gfx_set(lcd_bar_tx_r * 0.65, lcd_bar_tx_g * 0.65, lcd_bar_tx_b * 0.65, 0.9);
+      gfx_measurestr(#_chg_nn, _tw, _th);
+      gfx_x = _x + (CHGMAP_CELL_W - _tw) * 0.5;
+      gfx_y = _y + (CHGMAP_CELL_H - _th) * 0.5;
+      gfx_drawstr(#_chg_nn);
+
+      _col += 1;
+    );
+    _row += 1;
+  );
+
+  // ── Legend — what the fills mean, in the space right of the grid ──
+  _lx = _gx + 4 * (CHGMAP_CELL_W + CHGMAP_GAP) + 8;
+  _ly = _gy;
+  _mode == KDD_MODE_NOTES ? (
+    swing_kdd_legend(_lx, _ly,      0,  1, "changed");
+    swing_kdd_legend(_lx, _ly + 14, 0,  3, "locked");
+    swing_kdd_legend(_lx, _ly + 28, 0,  4, "your sample");
+    swing_kdd_legend(_lx, _ly + 42, 0,  6, "synth pad");
+    swing_kdd_legend(_lx, _ly + 56, 0, -1, "no match");
+  ) : _mode == KDD_MODE_OUT ? (
+    // Only the buses this kit actually uses — a fixed 1..16 key would be
+    // fifteen rows of nothing on a stereo kit, and only five fit anyway.
+    //
+    // A kit CAN use more than five buses, so the last row reports the overflow
+    // instead of silently stopping: a legend that just ends looks complete.
+    _i = 0; _row = 0; _n = 0;
+    loop(16,
+      _cnt = 0; _col = 0;
+      loop(16, (max(0, min(15, p_output[_col] | 0)) == _i) ? _cnt += 1; _col += 1; );
+      _cnt > 0 ? (
+        _n += 1;
+        _row < 5 ? (
+          sprintf(#_kdd_lg, "Out %d \x2D %d pad%s", _i + 1, _cnt, _cnt == 1 ? "" : "s");
+          swing_kdd_legend(_lx, _ly + _row * 14, 1, _i, #_kdd_lg);
+          _row += 1;
+        );
+      );
+      _i += 1;
+    );
+    _n > 5 ? (
+      gfx_setfont(1, "Arial", 9);
+      gfx_set(lcd_bar_tx_r * 0.55, lcd_bar_tx_g * 0.55, lcd_bar_tx_b * 0.55, 1);
+      sprintf(#_kdd_lg, "+%d more bus%s", _n - 5, (_n - 5) == 1 ? "" : "es");
+      gfx_x = _lx; gfx_y = _ly + 4 * 14 + 14;
+      gfx_drawstr(#_kdd_lg);
+    );
+  ) : (
+    swing_kdd_legend(_lx, _ly,      2,  1, "vel\x2Dsplit");
+    swing_kdd_legend(_lx, _ly + 14, 2,  2, "round\x2Drobin");
+    swing_kdd_legend(_lx, _ly + 28, 2,  3, "sum");
+    swing_kdd_legend(_lx, _ly + 42, 2, -1, "single sample");
+  );
+
+  // ── Hover detail ──
+  gfx_setfont(1, "Arial", 9);
+  kdd_hover >= 0 ? (
+    // Read PADCAT directly rather than via swing_lcd_padcat_eff(): that lives in
+    // rk_swing_lcd, which imports AFTER this file, and EEL resolves function
+    // references at DEFINITION time — calling it here is a silent compile death.
+    _n = gmem[EON_PADCAT_BASE + _reg_my_slot * EON_PADCAT_STRIDE + kdd_hover * 4] > 0
+      ? gmem[EON_PADCAT_BASE + _reg_my_slot * EON_PADCAT_STRIDE + kdd_hover * 4 + 1]|0
+      : -1;
+    _n >= 0 ? eon_catname(#_chg_cat, _n) : strcpy(#_chg_cat, "");
+
+    _mode == KDD_MODE_NOTES ? (
+      _code = _live ? chgmap_codes[kdd_hover] : 0;
+      swing_chgmap_note(#_chg_nn, p_note[kdd_hover]);
+      swing_chgmap_reason(#_chg_rs, _code);
+      strlen(#_chg_cat) > 0 ?
+        sprintf(#_chg_det, "Pad %d \x2D %s \x2D %s \x2D %s",
+                kdd_hover + 1, #_chg_nn, #_chg_cat, #_chg_rs) :
+        sprintf(#_chg_det, "Pad %d \x2D %s \x2D %s",
+                kdd_hover + 1, #_chg_nn, #_chg_rs);
+      _code == 3 ? gfx_set(0.88, 0.63, 0.13, 1) :
+                   gfx_set(lcd_bar_tx_r * 0.85, lcd_bar_tx_g * 0.85, lcd_bar_tx_b * 0.85, 1);
+    ) : _mode == KDD_MODE_OUT ? (
+      _bus = max(0, min(15, p_output[kdd_hover] | 0));
+      strlen(#_chg_cat) > 0 ?
+        sprintf(#_chg_det, "Pad %d \x2D %s \x2D Out %d", kdd_hover + 1, #_chg_cat, _bus + 1) :
+        sprintf(#_chg_det, "Pad %d \x2D Out %d", kdd_hover + 1, _bus + 1);
+      gfx_set(lcd_bar_tx_r * 0.85, lcd_bar_tx_g * 0.85, lcd_bar_tx_b * 0.85, 1);
+    ) : (
+      _cnt = p_layer_cnt[kdd_hover] | 0;
+      swing_kdd_layer_mode_name(#_chg_rs, p_layer_mode[kdd_hover] | 0);
+      _cnt >= 2 ?
+        sprintf(#_chg_det, "Pad %d \x2D %d layers, %s", kdd_hover + 1, _cnt, #_chg_rs) :
+        sprintf(#_chg_det, "Pad %d \x2D single sample", kdd_hover + 1);
+      gfx_set(lcd_bar_tx_r * 0.85, lcd_bar_tx_g * 0.85, lcd_bar_tx_b * 0.85, 1);
+    );
+    gfx_x = _px + 8; gfx_y = _py + CHGMAP_PANEL_H - 17;
+    gfx_drawstr(#_chg_det);
+  ) : (
+    gfx_set(lcd_bar_tx_r * 0.38, lcd_bar_tx_g * 0.38, lcd_bar_tx_b * 0.38, 1);
+    gfx_x = _px + 8; gfx_y = _py + CHGMAP_PANEL_H - 17;
+    gfx_drawstr("Hover a pad for detail");
+  );
+);
+
+// Dispatcher — the name the main @gfx tail calls. Guarded on the KIT tab so a
+// panel left open behind a tab switch does not paint over the PAD tab.
+function swing_chgmap_overlay_draw()
+(
+  (kdd_open != KDD_MODE_NONE && lcd_right_tab == 0) ? swing_kdd_panel(kdd_open);
+);

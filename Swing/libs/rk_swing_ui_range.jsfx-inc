@@ -1,0 +1,235 @@
+// rk_swing_ui_range.jsfx-inc — per-pad chromatic KEY-RANGE overlay
+// (c) EON Studios — All Rights Reserved
+//
+// Opens on RIGHT-CLICK of the LCD RANGE pill (rng_ov_pad = pad). A focused modal
+// panel with a chromatic key strip (piano): the pad's key range paints across
+// the keys in the pad colour, the ROOT is the bright anchor (plays native
+// pitch), and the two end handles drag to set p_rng_lo / p_rng_hi (snap = one
+// key, root fixed, can't invert). Preset buttons + a readout below. Close via
+// the X, a click on the dimmed backdrop, or picking a preset is non-closing.
+//
+// Modal contract (matches the console / mapping overlays): input is already
+// suppressed for the underlying UI by swing_ui_modal_gate() when rng_ov_pad>=0;
+// this restores the real mouse from the _ov_* saves, hit-tests, and draws last.
+// A LINEAR strip (one equal cell per semitone) is used rather than offset
+// white/black geometry — simpler, robust, and still reads as a keyboard.
+//
+// Naming: function swing_range_ov_draw(), mutable scratch _rg_* (globals).
+
+@init
+
+// note pitch-class → is-black (sharp)
+function swing_range_is_black(n) local(pc) (
+  pc = n - floor(n / 12) * 12;
+  pc == 1 || pc == 3 || pc == 6 || pc == 8 || pc == 10;
+);
+
+// note → "C#2" label into a dest string
+function swing_range_note_lbl(n, dest) local(pc, oct) (
+  pc = n - floor(n / 12) * 12; oct = floor(n / 12) - 1;
+  pc == 0  ? sprintf(dest, "C%d",  oct) : pc == 1  ? sprintf(dest, "C#%d", oct) :
+  pc == 2  ? sprintf(dest, "D%d",  oct) : pc == 3  ? sprintf(dest, "D#%d", oct) :
+  pc == 4  ? sprintf(dest, "E%d",  oct) : pc == 5  ? sprintf(dest, "F%d",  oct) :
+  pc == 6  ? sprintf(dest, "F#%d", oct) : pc == 7  ? sprintf(dest, "G%d",  oct) :
+  pc == 8  ? sprintf(dest, "G#%d", oct) : pc == 9  ? sprintf(dest, "A%d",  oct) :
+  pc == 10 ? sprintf(dest, "A#%d", oct) : sprintf(dest, "B%d", oct);
+);
+
+// small labelled button; returns 1 on click (uses restored _rg_mdn edge)
+function swing_range_btn(bx, by, bw, bh, lbl) local(hov) (
+  hov = _rg_mx >= bx && _rg_mx <= bx + bw && _rg_my >= by && _rg_my <= by + bh;
+  gfx_set(0.20, 0.22, 0.26, hov ? 1.0 : 0.85); gfx_rect(bx, by, bw, bh);
+  gfx_set(0.45, 0.48, 0.54, 0.8);
+  gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
+  gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_set(0.85, 0.87, 0.92, hov ? 1.0 : 0.85);
+  gfx_measurestr(lbl, _rg_tw, _rg_th);
+  gfx_x = bx + (bw - _rg_tw) * 0.5; gfx_y = by + (bh - _rg_th) * 0.5; gfx_drawstr(lbl);
+  hov && _rg_mdn;
+);
+
+function swing_range_ov_draw()
+local(pad, root, lo_n, hi_n, win_lo, win_hi, ncnt, cell_w, j, n, cx, r, g, b,
+      inrng, kb_x, kb_y, kb_w, kb_h, px, py, pw, ph, hov_note, rx0, rx1, rrx,
+      bx, by, bw) (
+  pad = rng_ov_pad;
+  (pad < 0 || pad >= NUM_PADS) ? ( rng_ov_pad = -1 ) : (
+    // ── restore real mouse from the modal-gate saves ──
+    _rg_mx = _ov_mx; _rg_my = _ov_my;
+    _rg_mdn = _ov_lmb_down; _rg_lmb = _ov_LMB;
+
+    // ── panel + dim backdrop ──
+    pw = min(640, gfx_w - 40); ph = 216;
+    px = ((gfx_w - pw) / 2) | 0; py = (28 + (gfx_h - 28 - ph) / 2) | 0;
+    gfx_set(0, 0, 0, 0.45); gfx_rect(0, 28, gfx_w, gfx_h - 28);
+    gfx_set(0.14, 0.15, 0.18, 1); gfx_rect(px, py, pw, ph);
+    hsl_to_rgb(p_color[pad], 0.70, 0.55);
+    gfx_set(_hsl_r, _hsl_g, _hsl_b, 1);
+    gfx_rect(px, py, pw, ph, 0); gfx_rect(px + 1, py + 1, pw - 2, ph - 2, 0);
+
+    // ── header + close X ──
+    gfx_set(_hsl_r * 0.4, _hsl_g * 0.4, _hsl_b * 0.4, 1); gfx_rect(px, py, pw, 26);
+    gfx_setfont(1, "Arial", 11, 'b'); gfx_set(1, 1, 1, 0.9);
+    sprintf(#_rg_s, "PAD %d — KEY RANGE", pad + 1);
+    gfx_x = px + 10; gfx_y = py + 7; gfx_drawstr(#_rg_s);
+    _rg_cbx = px + pw - 22; _rg_cby = py + 5;
+    _rg_xhov = _rg_mx >= _rg_cbx && _rg_mx <= _rg_cbx + 16 && _rg_my >= _rg_cby && _rg_my <= _rg_cby + 16;
+    gfx_setfont(1, "Arial", 15, 'b'); gfx_set(1, 1, 1, _rg_xhov ? 1.0 : 0.6);
+    gfx_x = _rg_cbx + 3; gfx_y = _rg_cby - 1; gfx_drawstr("x");
+
+    root = p_note[pad];
+    lo_n = root - p_rng_lo[pad];
+    hi_n = root + p_rng_hi[pad];
+
+    // visible window: whole octaves that always show root ±1 octave and the
+    // full current range, with a little margin, clamped to MIDI bounds.
+    win_lo = min(lo_n, root - 12) - 1;
+    win_hi = max(hi_n, root + 12) + 1;
+    win_lo = max(0, floor(win_lo / 12) * 12);
+    win_hi = min(127, floor(win_hi / 12) * 12 + 11);
+    ncnt = win_hi - win_lo + 1;
+
+    // ── key strip geometry ──
+    kb_x = px + 14; kb_y = py + 40; kb_w = pw - 28; kb_h = 96;
+    cell_w = kb_w / ncnt;
+
+    // which key is the mouse over?
+    hov_note = -1;
+    (_rg_my >= kb_y && _rg_my <= kb_y + kb_h && _rg_mx >= kb_x && _rg_mx < kb_x + kb_w) ? (
+      hov_note = win_lo + ((_rg_mx - kb_x) / cell_w) | 0;
+      hov_note > win_hi ? hov_note = win_hi;
+    );
+
+    // ── draw keys ──
+    j = 0;
+    loop(ncnt,
+      n = win_lo + j;
+      cx = kb_x + (j * cell_w) | 0;
+      inrng = (n >= lo_n && n <= hi_n);
+      // base key colour (black keys darker)
+      swing_range_is_black(n) ? gfx_set(0.16, 0.16, 0.19, 1) : gfx_set(0.80, 0.80, 0.84, 1);
+      gfx_rect(cx, kb_y, (cell_w | 0) - 1, kb_h);
+      // range fill (pad colour; root brightest)
+      inrng ? (
+        hsl_to_rgb(p_color[pad], 0.85, 0.55);
+        gfx_set(_hsl_r, _hsl_g, _hsl_b, n == root ? 0.92 : 0.55);
+        gfx_rect(cx, kb_y, (cell_w | 0) - 1, kb_h);
+      );
+      // C anchor labels at the foot (F anchors tried 2026-08-05, removed by
+      // user call — the root label + hover readout carry identification).
+      // Every-key names are geometrically impossible here (cells ~13-17px,
+      // names ~15-18px). The root skips the anchor pass — labeled below.
+      (n - floor(n / 12) * 12) == 0 && n != root ? (
+        swing_range_note_lbl(n, #_rg_s);
+        gfx_setfont(1, "Arial", 8, 0);
+        gfx_measurestr(#_rg_s, _rg_tw, _rg_th);
+        _rg_tw < cell_w + 6 ? (
+          gfx_set(0, 0, 0, 0.55);
+          gfx_x = cx + (cell_w - _rg_tw) * 0.5; gfx_y = kb_y + kb_h - _rg_th - 2; gfx_drawstr(#_rg_s);
+        );
+      );
+      // The ROOT key carries its own name (user call: the one key that
+      // matters gets named where it stands). It sits on the brightest fill
+      // of the range band under the white tick, so the label is white over
+      // a 1px dark shadow — readable on any pad hue, light or dark.
+      n == root ? (
+        // Bright outline around the whole root cell — the tick alone read
+        // too quiet (user 2026-08-05). Drawn as 4 thin rects over the fill.
+        gfx_set(1, 1, 1, 0.95);
+        gfx_rect(cx, kb_y, (cell_w | 0) - 1, 2);
+        gfx_rect(cx, kb_y + kb_h - 2, (cell_w | 0) - 1, 2);
+        gfx_rect(cx, kb_y, 2, kb_h);
+        gfx_rect(cx + (cell_w | 0) - 3, kb_y, 2, kb_h);
+        swing_range_note_lbl(n, #_rg_s);
+        gfx_setfont(1, "Arial", 9, 'b');
+        gfx_measurestr(#_rg_s, _rg_tw, _rg_th);
+        _rg_tw < cell_w + 6 ? (
+          gfx_set(0, 0, 0, 0.75);
+          gfx_x = cx + (cell_w - _rg_tw) * 0.5 + 1; gfx_y = kb_y + kb_h - _rg_th - 1; gfx_drawstr(#_rg_s);
+          gfx_set(1, 1, 1, 0.95);
+          gfx_x = cx + (cell_w - _rg_tw) * 0.5; gfx_y = kb_y + kb_h - _rg_th - 2; gfx_drawstr(#_rg_s);
+        );
+      );
+      j += 1;
+    );
+
+    // ── root marker — 3px tick with a wider overhang cap, paired with the
+    // cell outline + bold label drawn in the key loop. All three together
+    // is what makes the root unmissable at a glance (user 2026-08-05).
+    (root >= win_lo && root <= win_hi) ? (
+      rrx = kb_x + ((root - win_lo) * cell_w) + cell_w * 0.5;
+      gfx_set(1, 1, 1, 0.95);
+      gfx_rect(rrx - 1, kb_y - 6, 3, kb_h + 12);
+      gfx_rect(rrx - 4, kb_y - 6, 9, 2);
+    );
+
+    // ── end handles ──
+    rx0 = kb_x + ((max(lo_n, win_lo) - win_lo) * cell_w) | 0;
+    rx1 = (kb_x + ((min(hi_n, win_hi) - win_lo + 1) * cell_w)) | 0;
+    hsl_to_rgb(p_color[pad], 0.85, 0.62);
+    gfx_set(_hsl_r, _hsl_g, _hsl_b, 1.0);
+    gfx_rect(rx0, kb_y - 4, 5, kb_h + 8);
+    gfx_rect(rx1 - 5, kb_y - 4, 5, kb_h + 8);
+
+    // ── readout ──
+    gfx_setfont(1, "Arial", 10, 'b'); gfx_set(0.85, 0.88, 0.93, 1);
+    swing_range_note_lbl(lo_n, #_rg_lbl1);
+    swing_range_note_lbl(hi_n, #_rg_lbl2);
+    swing_range_note_lbl(root, #_rg_lbl3);
+    (p_rng_lo[pad] == 0 && p_rng_hi[pad] == 0) ?
+      sprintf(#_rg_ro, "Single note — %s (drum). Drag the edges to spread chromatically.", #_rg_lbl3) :
+      sprintf(#_rg_ro, "%s  ->  %s     (root %s, plays native pitch)", #_rg_lbl1, #_rg_lbl2, #_rg_lbl3);
+    gfx_x = px + 14; gfx_y = kb_y + kb_h + 10; gfx_drawstr(#_rg_ro);
+    // Hovered-key readout, right-aligned on the same line — names the exact
+    // key under the mouse, which the C/F anchors alone cannot. Reuses the
+    // hov_note the drag handlers already compute; -1 = not over the strip.
+    hov_note >= 0 ? (
+      swing_range_note_lbl(hov_note, #_rg_lbl1);
+      sprintf(#_rg_ro, "%s · %d", #_rg_lbl1, hov_note);
+      gfx_setfont(1, "Arial", 10, 'b');
+      gfx_measurestr(#_rg_ro, _rg_tw, _rg_th);
+      gfx_set(0.50, 0.85, 0.60, 0.95);
+      gfx_x = px + pw - 14 - _rg_tw; gfx_y = kb_y + kb_h + 10; gfx_drawstr(#_rg_ro);
+    );
+
+    // ── Repitch-only notice ── key range varispeeds off the baked sample,
+    // which only the Repitch path does; in Tuned/Stretch the spread keys do
+    // not track (engine support is post-3.0). Shown whenever the pad is in
+    // either mode so the user learns it BEFORE spreading a range and filing
+    // "range is broken". Sits in the free band between readout and presets.
+    sp_pitch_mode[pad] != SP_PITCH_MODE_REPITCH ? (
+      gfx_setfont(1, "Arial", 10, 'b');
+      gfx_set(0.95, 0.72, 0.25, 0.92);
+      sprintf(#_rg_s, "Key range plays in REPITCH mode only — this pad is in %s.",
+              sp_pitch_mode[pad] == SP_PITCH_MODE_TUNED ? "TUNED" : "STRETCH");
+      gfx_x = px + 14; gfx_y = py + 164; gfx_drawstr(#_rg_s);
+    );
+
+    // ── preset buttons ──
+    by = py + ph - 30; bw = 92; bx = px + 14;
+    swing_range_btn(bx, by, 76, 22, "Single")     ? ( p_rng_lo[pad] = 0;   p_rng_hi[pad] = 0;   mark_dirty_pad(pad); ); bx += 82;
+    swing_range_btn(bx, by, 76, 22, "1 Oct")       ? ( p_rng_lo[pad] = 0;   p_rng_hi[pad] = 12;  mark_dirty_pad(pad); ); bx += 82;
+    swing_range_btn(bx, by, 76, 22, "2 Oct")       ? ( p_rng_lo[pad] = 0;   p_rng_hi[pad] = 24;  mark_dirty_pad(pad); ); bx += 82;
+    swing_range_btn(bx, by, 84, 22, "-1/+1 Oct") ? ( p_rng_lo[pad] = 12;  p_rng_hi[pad] = 12;  mark_dirty_pad(pad); ); bx += 90;
+    swing_range_btn(bx, by, 84, 22, "-2/+2 Oct") ? ( p_rng_lo[pad] = 24;  p_rng_hi[pad] = 24;  mark_dirty_pad(pad); ); bx += 90;
+    swing_range_btn(bx, by, 60, 22, "Full")        ? ( p_rng_lo[pad] = 127; p_rng_hi[pad] = 127; mark_dirty_pad(pad); );
+
+    // ── interaction: start / continue / end the edge drag ──
+    (_rg_mdn && _rg_my >= kb_y - 6 && _rg_my <= kb_y + kb_h + 6) ? (
+      abs(_rg_mx - rx0) <= 7 ? ( _rg_drag = 1 ) :
+      abs(_rg_mx - rx1) <= 7 ? ( _rg_drag = 2 ) : 0;
+    );
+    (_rg_drag > 0 && _rg_lmb && hov_note >= 0) ? (
+      _rg_drag == 1 ? ( p_rng_lo[pad] = max(0, root - hov_note) )
+                    : ( p_rng_hi[pad] = max(0, hov_note - root) );
+      mark_dirty_pad(pad);
+    );
+    !_rg_lmb ? _rg_drag = 0;
+
+    // ── close: X, or a click on the dimmed backdrop (outside the panel) ──
+    (_rg_xhov && _rg_mdn) ? ( rng_ov_pad = -1; _rg_drag = 0 );
+    (_rg_mdn && _rg_drag == 0 &&
+      (_rg_mx < px || _rg_mx > px + pw || _rg_my < py || _rg_my > py + ph)) ? ( rng_ov_pad = -1 );
+  );
+);

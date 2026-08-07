@@ -1,0 +1,179 @@
+// rk_swing_ui_category.jsfx-inc — per-pad CATEGORY picker overlay (§9c)
+// (c) EON Studios — All Rights Reserved
+//
+// Opens on RIGHT-CLICK of a pad's badge corner or the LCD CATEGORY pill
+// (cat_ov_pad = pad). An 8x6 grid of the 46 category glyphs (2 dead cells,
+// Steppa lane-picker parity) with the hovered category's NAME in the header,
+// an AUTO button (re-infer from the pad name) and the LOCK toggle. Picks go
+// through the same bridge mailbox as every other category set (single band
+// writer); the overlay closes on pick / X / backdrop click; LOCK is
+// non-closing (it's a toggle — the amber state updates in place).
+//
+// Modal contract (RANGE-overlay clone): input is suppressed for the underlying
+// UI by swing_ui_modal_gate() when cat_ov_pad >= 0; this restores the real
+// mouse from the _ov_* saves, hit-tests, and draws last.
+//
+// Naming: swing_catov_* functions, _co_* scratch (globals, @gfx-only).
+
+@init
+
+function swing_catov_btn(bx, by, bw, bh, lbl, active) local(hov) (
+  hov = _co_mx >= bx && _co_mx <= bx + bw && _co_my >= by && _co_my <= by + bh;
+  active ? gfx_set(0.32, 0.26, 0.12, 1.0)
+         : gfx_set(0.20, 0.22, 0.26, hov ? 1.0 : 0.85);
+  gfx_rect(bx, by, bw, bh);
+  active ? gfx_set(0.95, 0.72, 0.25, 0.9) : gfx_set(0.45, 0.48, 0.54, 0.8);
+  gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
+  gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
+  // 11px, not 9: these two are the panel's only words, and at 9 the lock button
+  // read as decoration. Labels are kept SHORT so the bigger font still fits —
+  // the sentence that used to live on the button is now the hint line below it.
+  gfx_setfont(1, "Arial", 11, 'b');
+  active ? gfx_set(1.0, 0.85, 0.45, 1.0) : gfx_set(0.85, 0.87, 0.92, hov ? 1.0 : 0.85);
+  gfx_measurestr(lbl, _co_tw, _co_th);
+  gfx_x = bx + (bw - _co_tw) * 0.5; gfx_y = by + (bh - _co_th) * 0.5; gfx_drawstr(lbl);
+  hov && _co_mdn;
+);
+
+function swing_catov_draw()
+local(pad, px, py, pw, ph, cell, gx, gy, col, row, id, cx, cy, hov_id, cur,
+      bx, by, lockd) (
+  pad = cat_ov_pad;
+  (pad < 0 || pad >= NUM_PADS) ? ( cat_ov_pad = -1; _co_lastpad = -1; ) : (
+    // ── restore real mouse from the modal-gate saves ──
+    // FRESH-FRAME GUARD: on the opening frame the gate hasn't saved for us yet
+    // (its modal branch didn't run before cat_ov_pad was set), so _ov_* holds
+    // STALE state from the last modal — a leftover lmb_down + outside coords
+    // instant-closed the panel. Swallow the click edge on that first frame.
+    _co_fresh = cat_ov_pad != _co_lastpad; _co_lastpad = cat_ov_pad;
+    _co_mx = _ov_mx; _co_my = _ov_my; _co_mdn = _co_fresh ? 0 : _ov_lmb_down;
+
+    cell = 40;
+    // +18 over the old height: a hint line under the action row. LOCK is the one
+    // control here whose effect isn't guessable from its name, and every guess
+    // is wrong in a different direction ("locks the category?" "locks playback?").
+    pw = 8 * cell + 28; ph = 26 + 6 * cell + 46 + 14 + 18;
+    px = ((gfx_w - pw) / 2) | 0; py = (28 + (gfx_h - 28 - ph) / 2) | 0;
+    gfx_set(0, 0, 0, 0.45); gfx_rect(0, 28, gfx_w, gfx_h - 28);
+    gfx_set(0.14, 0.15, 0.18, 1); gfx_rect(px, py, pw, ph);
+    hsl_to_rgb(p_color[pad], 0.70, 0.55);
+    gfx_set(_hsl_r, _hsl_g, _hsl_b, 1);
+    gfx_rect(px, py, pw, ph, 0); gfx_rect(px + 1, py + 1, pw - 2, ph - 2, 0);
+
+    // EFFECTIVE category (optimistic overlay incl. an in-flight pick), not
+    // the raw band — the pill/badge use the same read, so the overlay's
+    // highlighted glyph can't lag them during the post→bridge-echo window
+    // (2026-07-27 audit surface-consistency pass).
+    cur   = swing_lcd_padcat_eff(pad);
+    lockd = swing_lcd_padcat_locked(pad);
+
+    // ── glyph grid (before the header so hover feeds the title) ──
+    // 8x6 = 48 cells for 46 categories. Cell 46 is the NONE pick — the way back
+    // out of the vocabulary, which the picker had no way to express: AUTO
+    // re-infers (and lands right back on a glyph for any name that classifies)
+    // and the wheel only cycled the 46. Cell 47 stays dead.
+    gx = px + 14; gy = py + 34;
+    hov_id = -1;
+    (_co_mx >= gx && _co_mx < gx + 8 * cell && _co_my >= gy && _co_my < gy + 6 * cell) ? (
+      hov_id = ((_co_my - gy) / cell | 0) * 8 + ((_co_mx - gx) / cell | 0);
+      hov_id > 46 ? hov_id = -1;   // the 1 remaining dead cell
+    );
+    id = 0;
+    loop(46,
+      col = id % 8; row = (id / 8) | 0;
+      cx = gx + col * cell; cy = gy + row * cell;
+      id == cur ? (          // current pick: pad-colour plate
+        hsl_to_rgb(p_color[pad], 0.75, 0.40);
+        gfx_set(_hsl_r, _hsl_g, _hsl_b, 0.85);
+        gfx_rect(cx + 1, cy + 1, cell - 2, cell - 2);
+      ) : id == hov_id ? (
+        gfx_set(1, 1, 1, 0.10); gfx_rect(cx + 1, cy + 1, cell - 2, cell - 2);
+      );
+      gfx_set(0.85, 0.88, 0.93, id == hov_id || id == cur ? 1.0 : 0.72);
+      eon_draw_cat_glyph_hi(id, cx + cell * 0.5, cy + cell * 0.5, cell * 0.34, -1);
+      id += 1;
+    );
+
+    // ── cell 46: NONE. Drawn as a struck-through empty plate rather than a
+    //    glyph — it is the absence of one, and any icon would read as a 47th
+    //    category. Highlights like the rest when it IS the pad's answer.
+    cx = gx + (46 % 8) * cell; cy = gy + ((46 / 8) | 0) * cell;
+    cur == PADCAT_NONE ? (
+      hsl_to_rgb(p_color[pad], 0.75, 0.40);
+      gfx_set(_hsl_r, _hsl_g, _hsl_b, 0.85);
+      gfx_rect(cx + 1, cy + 1, cell - 2, cell - 2);
+    ) : hov_id == 46 ? (
+      gfx_set(1, 1, 1, 0.10); gfx_rect(cx + 1, cy + 1, cell - 2, cell - 2);
+    );
+    gfx_set(0.85, 0.88, 0.93, hov_id == 46 || cur == PADCAT_NONE ? 1.0 : 0.55);
+    gfx_circle(cx + cell * 0.5, cy + cell * 0.5, cell * 0.30, 0, 1);
+    gfx_line(cx + cell * 0.5 - cell * 0.21, cy + cell * 0.5 + cell * 0.21,
+             cx + cell * 0.5 + cell * 0.21, cy + cell * 0.5 - cell * 0.21);
+
+    // ── header: pad + hovered/current category name + close X ──
+    gfx_set(_hsl_r * 0.4, _hsl_g * 0.4, _hsl_b * 0.4, 1);
+    hsl_to_rgb(p_color[pad], 0.70, 0.55);
+    gfx_set(_hsl_r * 0.4, _hsl_g * 0.4, _hsl_b * 0.4, 1); gfx_rect(px, py, pw, 26);
+    // "none" (the user's answer) reads differently from "uncategorised"
+    // (nobody has said yet) — the picker is where that distinction is made, so
+    // it is the one surface that must never blur them.
+    hov_id == 46      ? strcpy(#_co_nm, "none") :
+    hov_id >= 0       ? eon_catname(#_co_nm, hov_id) :
+    cur == PADCAT_NONE ? strcpy(#_co_nm, "none") :
+    cur    >= 0       ? eon_catname(#_co_nm, cur) : strcpy(#_co_nm, "uncategorised");
+    gfx_setfont(1, "Arial", 11, 'b'); gfx_set(1, 1, 1, 0.9);
+    sprintf(#_co_s, "PAD %d — CATEGORY:  %s", pad + 1, #_co_nm);
+    gfx_x = px + 10; gfx_y = py + 7; gfx_drawstr(#_co_s);
+    _co_cbx = px + pw - 22; _co_cby = py + 5;
+    _co_xhov = _co_mx >= _co_cbx && _co_mx <= _co_cbx + 16 && _co_my >= _co_cby && _co_my <= _co_cby + 16;
+    gfx_setfont(1, "Arial", 15, 'b'); gfx_set(1, 1, 1, _co_xhov ? 1.0 : 0.6);
+    gfx_x = _co_cbx + 3; gfx_y = _co_cby - 1; gfx_drawstr("x");
+
+    // ── action row: AUTO + LOCK ──
+    by = py + ph - 54; bx = px + 14;
+    swing_catov_btn(bx, by, 160, 24, "AUTO (from name)", 0) ? (
+      swing_lcd_padcat_post(pad, -1); cat_ov_pad = -1; _co_lastpad = -1;
+    ); bx += 168;
+    // ⚠️ "Lock audio" was a MISNOMER and the source of the confusion: the flag
+    // does not freeze playback and it is not category-only. Grounded in the four
+    // places that actually read it — the JSFX kit-load adopt gate
+    // (rk_swing_ui_state.jsfx-inc:1021,1169 skip the pad's whole adopt: paths,
+    // clears, meta), eon_padcat_from_load, eon_fill_begin, eon_padcat_queue_tick
+    // — it means ONE thing: **kit loads and fills skip this pad entirely**,
+    // sample AND category. Your own edits are never blocked by it.
+    swing_catov_btn(bx, by, 160, 24, lockd ? "LOCKED" : "LOCK PAD", lockd) ? (
+      // Unlocking a SYNTH pad has to re-sync the category by hand. The synth
+      // autonamer (rk_swing_ui_overlay_syn.jsfx-inc:181) refuses to touch a
+      // locked pad, and it only ever fires on an ENGINE change — so a pad locked
+      // while its engine changed keeps a stale glyph forever after unlocking,
+      // which reads as "unlock is broken". Same guard the autonamer uses, so a
+      // hand-picked category is still never clobbered.
+      lockd && ps_enable[pad] > 0.5 && !pad_has_audio(pad) &&
+        (cur == -1 || _syn_cat_owned(cur)) ? (
+          _syn_cat_pend[pad] = swing_grid_syn_cat(pad);
+      );
+      swing_lcd_padcat_post(pad, -2);   // toggle; non-closing (state redraws)
+    );
+
+    // ── hint line: what LOCK actually does, in the panel that offers it ──
+    gfx_setfont(1, "Arial", 10);
+    gfx_set(0.62, 0.66, 0.72, 0.85);
+    gfx_x = px + 14; gfx_y = by + 28;
+    // Kept under ~58 chars: the panel's inner width is 8*cell = 320px and
+    // Arial 10 runs ~4.8px/char, so a longer line runs off the plate.
+    gfx_drawstr(lockd
+      ? "Locked: kit loads and Fill skip it. Your edits still apply."
+      : "Lock = kit loads and Fill skip this pad, sample and all.");
+
+    // ── pick a glyph (cell 46 = NONE) ──
+    (hov_id >= 0 && _co_mdn) ? (
+      swing_lcd_padcat_post(pad, hov_id == 46 ? PADCAT_NONE : hov_id);
+      cat_ov_pad = -1; _co_lastpad = -1;
+    );
+
+    // ── close: X or backdrop click ──
+    (_co_xhov && _co_mdn) ? ( cat_ov_pad = -1; _co_lastpad = -1; );
+    (_co_mdn && hov_id < 0 && !_co_xhov &&
+      (_co_mx < px || _co_mx > px + pw || _co_my < py || _co_my > py + ph)) ? ( cat_ov_pad = -1; _co_lastpad = -1; );
+  );
+);
