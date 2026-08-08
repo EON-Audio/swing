@@ -88,34 +88,35 @@ local PID_TO_STRIP = {
   [G.FX_PID_SND_RVB]      = "Reverb Send",
 }
 
--- Strip FX path relative to REAPER's Effects dir, derived from this script's
--- own location so dev (installer/src) and installed layouts both resolve.
-local function strip_fx_addname()
-  local effects_root = reaper.GetResourcePath() .. sep .. "Effects" .. sep
-  -- SCRIPT_DIR = <...>/installer/src/Scripts or .Scripts → strip lives in
-  -- the sibling Swing/ dir.
-  local src_dir = SCRIPT_DIR:match("^(.*)[/\\]") or SCRIPT_DIR
-  local abs = src_dir .. sep .. "Swing" .. sep .. "EON_Drum_Strip.jsfx"
-  local rel = abs
-  if abs:sub(1, #effects_root):lower() == effects_root:lower() then
-    rel = abs:sub(#effects_root + 1)
+-- ⚠️ These used to derive the add-name from SCRIPT_DIR's parent + "/Swing/",
+-- which assumes Scripts/ and Swing/ are SIBLINGS. That is true ONLY in the dev
+-- repo. Both shipped layouts put Lua under <resource>/Scripts/... and JSFX under
+-- <resource>/Effects/..., so the derived path pointed into Scripts/, no file was
+-- there, AddByName returned -1, and the strip silently never appeared -- on every
+-- customer install, every platform, every channel. core.jsfx_addname resolves
+-- against the Effects tree itself and verifies the file exists.
+-- Resolved LAZILY (not at load) so a hint track can be supplied and so a failure
+-- is reported at the moment of use rather than losing the reason at startup.
+local ADDNAME_WARNED = {}
+local function addname_for(basename, hint_tr, hint_fx)
+  local name, _, why = core.jsfx_addname(basename, hint_tr, hint_fx)
+  if not name and not ADDNAME_WARNED[basename] then
+    -- ONE console line, unconditionally. This class of bug survived to release
+    -- precisely because its only diagnostic went to a DBG() that is off by
+    -- default -- see the note on DBG above. Do not route this through it.
+    ADDNAME_WARNED[basename] = true
+    reaper.ShowConsoleMsg("[EON] Could not locate " .. basename ..
+      " under the Effects folder -- it will not be inserted.\n  " ..
+      tostring(why) .. "\n  Reinstall Swing, or check the plugin is present.\n")
   end
-  return "JS:" .. rel:gsub("\\", "/")
+  return name
 end
-local STRIP_ADDNAME = strip_fx_addname()
-
--- Same derivation for the FX-return contributors viewer (sibling Swing/ dir).
-local function viewer_fx_addname()
-  local effects_root = reaper.GetResourcePath() .. sep .. "Effects" .. sep
-  local src_dir = SCRIPT_DIR:match("^(.*)[/\\]") or SCRIPT_DIR
-  local abs = src_dir .. sep .. "Swing" .. sep .. "EON_FX_Return_View.jsfx"
-  local rel = abs
-  if abs:sub(1, #effects_root):lower() == effects_root:lower() then
-    rel = abs:sub(#effects_root + 1)
-  end
-  return "JS:" .. rel:gsub("\\", "/")
+local function strip_addname(hint_tr, hint_fx)
+  return addname_for("EON_Drum_Strip.jsfx", hint_tr, hint_fx)
 end
-local VIEWER_ADDNAME = viewer_fx_addname()
+local function viewer_addname(hint_tr, hint_fx)
+  return addname_for("EON_FX_Return_View.jsfx", hint_tr, hint_fx)
+end
 
 local EPS = 1e-5
 
@@ -240,7 +241,8 @@ local function push_return_viewers(inst)
         local vfx = _find_viewer_fx(dt)
         if vfx < 0 then
           -- Find-or-add, same pattern the strips use (query 0 → insert 1).
-          vfx = reaper.TrackFX_AddByName(dt, VIEWER_ADDNAME, false, 1)
+          local vname = viewer_addname(tr, 0)
+          if vname then vfx = reaper.TrackFX_AddByName(dt, vname, false, 1) end
         end
         if vfx >= 0 then
           _set_param_named(dt, vfx, "Linked registry slot", inst.slot)
@@ -293,10 +295,12 @@ local function ensure_strip(tr)
     -- migration that pushes Swing's pad values is meant for a brand-new strip,
     -- and running it on an adopted strip wipes the user's edits back to default
     -- (the "HPF reverts to default after alt-tab/recompile" bug).
-    fxidx = reaper.TrackFX_AddByName(tr, STRIP_ADDNAME, false, 0)   -- query only
+    local sname = strip_addname(tr, 0)
+    if not sname then return nil, "EON_Drum_Strip.jsfx not found under Effects" end
+    fxidx = reaper.TrackFX_AddByName(tr, sname, false, 0)   -- query only
     if fxidx < 0 then
-      fxidx = reaper.TrackFX_AddByName(tr, STRIP_ADDNAME, false, 1) -- insert new
-      if fxidx < 0 then return nil, "AddByName failed (" .. STRIP_ADDNAME .. ")" end
+      fxidx = reaper.TrackFX_AddByName(tr, sname, false, 1) -- insert new
+      if fxidx < 0 then return nil, "AddByName failed (" .. sname .. ")" end
       was_new = true
     end
     reaper.GetSetMediaTrackInfo_String(tr, "P_EXT:eon_strip_guid",
@@ -999,5 +1003,5 @@ local function self_register()
 end
 self_register()
 
-DBG("[strip_sync] started: " .. STRIP_ADDNAME .. "\n")
+DBG("[strip_sync] started: " .. tostring(strip_addname()) .. "\n")
 loop()

@@ -14435,10 +14435,20 @@ local function poll()
     -- StepSeq passes incoming MIDI through, so MIDI items / live notes still reach
     -- Swing below it. Toggles its floating window.
     local seq_tr = find_swing_track()
-    if seq_tr then
-      local seq_idx = reaper.TrackFX_AddByName(seq_tr, "JS:EON_StepSeq.jsfx", false, 0)   -- query main chain
+    -- ⚠️ This was the literal "JS:EON_StepSeq.jsfx" -- an Effects-ROOT path that is
+    -- only true on a dev machine with the hand-maintained flat copy. The installer
+    -- puts it in Effects/EON/Swing/ and ReaPack in Effects/<index name>/EON/Swing/,
+    -- so for every customer AddByName returned -1 twice and the STEP SEQ button
+    -- did nothing at all, with no message. Resolve it properly.
+    local seq_name, _, seq_why = core.jsfx_addname("EON_StepSeq.jsfx")
+    if seq_tr and not seq_name then
+      reaper.ShowConsoleMsg("[EON] Could not locate EON_StepSeq.jsfx under the " ..
+        "Effects folder -- Steppa cannot be opened.\n  " .. tostring(seq_why) .. "\n")
+    end
+    if seq_tr and seq_name then
+      local seq_idx = reaper.TrackFX_AddByName(seq_tr, seq_name, false, 0)   -- query main chain
       if seq_idx < 0 then
-        seq_idx = reaper.TrackFX_AddByName(seq_tr, "JS:EON_StepSeq.jsfx", false, -1)       -- insert at end of main chain
+        seq_idx = reaper.TrackFX_AddByName(seq_tr, seq_name, false, -1)       -- insert at end of main chain
         if seq_idx and seq_idx >= 0 then
           -- Move it just above the Swing FX so the generated MIDI feeds Swing.
           local sw_idx, nfx, fi = -1, reaper.TrackFX_GetCount(seq_tr), 0

@@ -52,6 +52,130 @@ function core.get_kits_dir()
   return dir
 end
 
+-- ── JSFX add-name resolution ─────────────────────────────────────────────────
+-- TrackFX_AddByName wants "JS:<path relative to <resource>/Effects>", and that
+-- path differs in EVERY layout we ship:
+--   dev       Effects/EON_ReaKit_Bundle/installer/src/Swing/   (Scripts/ is a SIBLING)
+--   installer Effects/EON/Swing/                               (Scripts/ is NOT)
+--   ReaPack   Effects/<index name>/EON/Swing/                  (Scripts/ is NOT)
+-- Deriving it from the calling SCRIPT's own directory only works in dev, which is
+-- why the Drum Strip, the FX Return View, the Step Sequencer, the RS5k import and
+-- New Song's Swing insert silently did nothing on every customer install, on every
+-- platform, through every channel. Resolve against the Effects tree itself and
+-- confirm the file exists BEFORE handing anything to AddByName.
+--
+-- Returns  addname, abspath   on success
+--          nil, nil, reason   on failure -- callers MUST surface the reason.
+-- basename MUST include the extension: it is part of the registered ident, and
+-- omitting it is why eon_song_starter's "EON/Swing/Swing_ReaKit" never matched.
+-- hint_tr/hint_fx: any already-loaded EON JSFX; they all share one directory, so
+-- this is a zero-IO fast path.
+core._jsfx_cache = {}
+
+local function _jsfx_probe(p)
+  if not p or p == "" then return nil end
+  local f = io.open(p, "rb")
+  if f then f:close(); return p end
+  return nil
+end
+
+-- Depth-limited basename search. Subdirectories are COLLECTED BEFORE recursing:
+-- REAPER keeps ONE EnumerateFiles/EnumerateSubdirectories cache per path, so
+-- interleaving parent and child enumeration corrupts it. Same shape as
+-- eon_relink_find in Swing_Kit_Bridge.lua.
+local function _jsfx_scan(dir, want_lower, depth)
+  if depth > 5 then return nil end
+  reaper.EnumerateFiles(dir, -1)
+  local i = 0
+  while true do
+    local fn = reaper.EnumerateFiles(dir, i)
+    if not fn or fn == "" then break end
+    if fn:lower() == want_lower then return dir .. "/" .. fn end
+    i = i + 1
+  end
+  local subs = {}
+  reaper.EnumerateSubdirectories(dir, -1)
+  i = 0
+  while true do
+    local sd = reaper.EnumerateSubdirectories(dir, i)
+    if not sd or sd == "" then break end
+    subs[#subs + 1] = sd
+    i = i + 1
+  end
+  for _, sd in ipairs(subs) do
+    local hit = _jsfx_scan(dir .. "/" .. sd, want_lower, depth + 1)
+    if hit then return hit end
+  end
+  return nil
+end
+
+function core.jsfx_addname(basename, hint_tr, hint_fx)
+  -- Only successes are cached. A miss must stay retryable so a mid-session
+  -- ReaPack install heals without a REAPER restart.
+  local hit = core._jsfx_cache[basename]
+  if hit then return hit.addname, hit.abs end
+
+  local eff = reaper.GetResourcePath() .. core.sep .. "Effects"
+  local abs
+
+  -- 1. Sibling of a live EON JSFX. Probe the ident BOTH as Effects-relative and
+  --    as absolute: this codebase has only ever substring-tested fx_ident, so its
+  --    exact shape is not established here and guessing would reintroduce the bug.
+  if hint_tr and hint_fx and hint_fx >= 0 then
+    local ok, ident = reaper.TrackFX_GetNamedConfigParm(hint_tr, hint_fx, "fx_ident")
+    if ok and ident and ident ~= "" then
+      local d = ident:gsub("\\", "/"):match("^(.*)/")
+      if d and d ~= "" then
+        abs = _jsfx_probe(eff .. "/" .. d .. "/" .. basename)
+           or _jsfx_probe(d .. "/" .. basename)
+      end
+    end
+  end
+
+  -- 2. Known relative candidates, ordered by customer population.
+  if not abs then
+    for _, c in ipairs({ "EON/Swing/", "", "EON_ReaKit_Bundle/installer/src/Swing/" }) do
+      abs = _jsfx_probe(eff .. core.sep .. c .. basename)
+      if abs then break end
+    end
+  end
+
+  -- 3. ReaPack: <resource>/Effects/<index name>/EON/Swing/<basename>. The index
+  --    name is DISCOVERED, never typed -- it is remote metadata the user can
+  --    rename in ReaPack. The only literal here is "EON/Swing", which is our own
+  --    <category> in index.xml. Spaces and the em-dash come back verbatim.
+  if not abs then
+    reaper.EnumerateSubdirectories(eff, -1)
+    local i = 0
+    while true do
+      local d = reaper.EnumerateSubdirectories(eff, i)
+      if not d or d == "" then break end
+      abs = _jsfx_probe(eff .. core.sep .. d .. core.sep .. "EON"
+                            .. core.sep .. "Swing" .. core.sep .. basename)
+      if abs then break end
+      i = i + 1
+    end
+  end
+
+  -- 4. Backstop: hand-moved install, or a ReaPack category rename.
+  if not abs then abs = _jsfx_scan(eff, basename:lower(), 0) end
+
+  if not abs then
+    return nil, nil, basename .. " was not found anywhere under " .. eff
+  end
+
+  -- NEVER return "JS:" glued onto an absolute path -- that is the exact silent
+  -- failure this function replaces.
+  local root = (eff .. core.sep):gsub("\\", "/")
+  local n = abs:gsub("\\", "/")
+  if n:sub(1, #root):lower() ~= root:lower() then
+    return nil, nil, basename .. " resolved outside the Effects tree: " .. abs
+  end
+  local addname = "JS:" .. n:sub(#root + 1)
+  core._jsfx_cache[basename] = { addname = addname, abs = abs }
+  return addname, abs
+end
+
 -- Persistent analysis cache (BPM/key short-circuit data, see Swing_Browser.lua).
 -- Lives next to Swing_Kits so it ships+backs-up with the rest of Swing's data.
 function core.get_cache_dir()

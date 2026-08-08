@@ -16,6 +16,14 @@
 
 local M = {}
 
+-- rk_lua_core lives one level up in EVERY layout (dev .Scripts/, installer and
+-- ReaPack Scripts/<...>/), so resolve it from this file's own directory rather
+-- than package.path -- this module is dofile'd, so it cannot rely on the
+-- caller's search path being set.
+local _ss_dir = (debug.getinfo(1, "S").source:match("@?(.*)") or ""):match("^(.*)[/\\]") or ""
+local _ss_sep = package.config:sub(1, 1)
+local core = dofile(_ss_dir .. _ss_sep .. ".." .. _ss_sep .. "rk_lua_core.lua")
+
 -- Region tints, roughly matching the Swing pad hue vocabulary so a starter
 -- project reads as EON-branded rather than REAPER-default grey.
 local REGION_COLORS = {
@@ -56,10 +64,19 @@ local function add_swing(tr)
   -- -1 = instantiate if not already present. AddByName reports success even
   -- when the JSFX failed to COMPILE, so a non-negative return here means "the
   -- file was found", not "the plugin is healthy".
-  local fx = reaper.TrackFX_AddByName(tr, "Swing_ReaKit", false, -1)
-  if fx < 0 then
-    fx = reaper.TrackFX_AddByName(tr, "EON/Swing/Swing_ReaKit", false, -1)
+  -- ⚠️ This used to guess two literals: "Swing_ReaKit" (matches no registered
+  -- ident in any layout) and "EON/Swing/Swing_ReaKit" (written for the installer
+  -- layout but missing the ".jsfx" that is part of the ident). Neither could ever
+  -- match under ReaPack, where the path carries the index-name segment. Result:
+  -- New Song produced a track named "Swing" with no Swing on it and no Drum
+  -- Matrix lanes, since the lane build is gated on this returning non-nil.
+  local name, _, why = core.jsfx_addname("Swing_ReaKit.jsfx")
+  if not name then
+    reaper.ShowConsoleMsg("[EON] New Song could not locate Swing_ReaKit.jsfx " ..
+      "under the Effects folder.\n  " .. tostring(why) .. "\n")
+    return nil
   end
+  local fx = reaper.TrackFX_AddByName(tr, name, false, -1)
   return fx >= 0 and fx or nil
 end
 

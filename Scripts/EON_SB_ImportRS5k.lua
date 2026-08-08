@@ -12,18 +12,22 @@ local CMD = 26090300     -- v1 header relocated 2026-07-09 (cells 0..35 dead; se
 local BRIDGE_ALIVE = 99
 local sep = package.config:sub(1, 1)
 
--- "JS:<path-relative-to-Effects>" add-name for Swing_ReaKit.jsfx, mirroring
--- EON_Swing_Strip_Sync.strip_fx_addname. This companion lives in
--- installer/src/(.)Scripts; the JSFX is the sibling Swing/ dir.
+-- ⚠️ This used to walk up from the script's own directory to a sibling Swing/
+-- dir. Scripts/ and Swing/ are siblings ONLY in the dev repo -- both shipped
+-- layouts split them across <resource>/Scripts and <resource>/Effects, so the
+-- derived path pointed at nothing and Swing was never auto-created. Resolve
+-- against the Effects tree instead. (core.jsfx_addname, rk_lua_core.lua)
+local _rs5k_dir = (select(2, reaper.get_action_context()) or ""):match("^(.*)[/\\]") or ""
+package.path = _rs5k_dir .. sep .. "?.lua;" .. (package.path or "")
+local core = require("rk_lua_core")
+
 local function swing_addname()
-  local _, this = reaper.get_action_context()
-  local script_dir = (this or ""):match("^(.*)[/\\]") or ""
-  local src_dir = script_dir:match("^(.*)[/\\]") or script_dir
-  local abs = src_dir .. sep .. "Swing" .. sep .. "Swing_ReaKit.jsfx"
-  local eff = reaper.GetResourcePath() .. sep .. "Effects" .. sep
-  local rel = abs
-  if abs:sub(1, #eff):lower() == eff:lower() then rel = abs:sub(#eff + 1) end
-  return "JS:" .. rel:gsub("\\", "/")
+  local name, _, why = core.jsfx_addname("Swing_ReaKit.jsfx")
+  if not name then
+    reaper.ShowConsoleMsg("[EON] Could not locate Swing_ReaKit.jsfx under the " ..
+      "Effects folder -- cannot create a Swing instance.\n  " .. tostring(why) .. "\n")
+  end
+  return name
 end
 
 -- Same Swing-instance test the bridge/browser use.
@@ -76,7 +80,8 @@ if not any_swing_exists() then
   reaper.InsertTrackAtIndex(idx, true)
   local tr = reaper.GetTrack(0, idx)
   reaper.GetSetMediaTrackInfo_String(tr, "P_NAME", "Swing", true)
-  local fx = reaper.TrackFX_AddByName(tr, swing_addname(), false, -1)
+  local sname = swing_addname()
+  local fx = sname and reaper.TrackFX_AddByName(tr, sname, false, -1) or -1
   if fx < 0 then
     reaper.Undo_EndBlock("Import RS5k Rack (couldn't add Swing)", -1)
     reaper.MB("Couldn't add the Swing instrument automatically.\n\nAdd a Swing "
