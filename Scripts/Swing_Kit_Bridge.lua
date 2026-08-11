@@ -15228,6 +15228,31 @@ local function poll()
       if nm then reaper.SetExtState("Swing", "eon_theme", nm, true) end
       reaper.gmem_write(G.GS_THEME_REQ, 0)
     end
+    -- EON FX rollout LISTEN-BACK: an in-FX theme picker (1175, EQs, ...) writes
+    -- GS_THEME_REQ / GS_THEME_KNOB_REQ into its OWN gmem segment — the main
+    -- drain above never sees those. Sweep the curated segments (~200ms),
+    -- forward the first pending request into the shared ExtState (the name
+    -- read + change-detect BELOW then republish everywhere in this same tick),
+    -- and mirror GS_THEME_CUR into each segment so picker labels track the
+    -- active theme. State on _theme fields, NOT locals (main chunk sits at
+    -- the 200-local limit).
+    if (heartbeat_counter % 6) == 0 and core.drain_theme_fx_segments then
+      _theme.fx_treq, _theme.fx_kreq =
+        core.drain_theme_fx_segments(_theme.idx[_theme.last_name or ""] or 0)
+      if _theme.fx_treq >= 1 and _theme.fx_treq <= #_theme.names
+         and _theme.names[_theme.fx_treq] then
+        reaper.SetExtState("Swing", "eon_theme", _theme.names[_theme.fx_treq], true)
+      end
+      if _theme.fx_kreq >= 1 then
+        -- Same formula as the main GS_THEME_KNOB_REQ handler below: 1 = clear
+        -- override, else style index + 1. Keyed to the (possibly just-updated)
+        -- theme name; inlined reads — no new locals.
+        reaper.SetExtState("Swing",
+          "eon_knob_" .. (reaper.GetExtState("Swing", "eon_theme") ~= ""
+                          and reaper.GetExtState("Swing", "eon_theme") or "eon"),
+          _theme.fx_kreq == 1 and "" or tostring(_theme.fx_kreq - 1), true)
+      end
+    end
     local name = reaper.GetExtState("Swing", "eon_theme")
     if name == "" then name = "eon" end
     -- KNOB button (Swing left panel): a JSFX can't SetExtState, so it writes a

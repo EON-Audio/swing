@@ -161,13 +161,55 @@ end
 local FEELS = { 'Straight', 'Swung', 'Triplet' }
 local FEEL_COL = { Straight = 0xAEB6C2FF, Swung = 0xE6B84FFF, Triplet = 0x64D8F0FF }
 local fsel, fsel_n = {}, 0
+-- SECTION filter chips (the role facet: MAIN/FILL/BUILD/BREAK/PERC) — same model.
+local rsel, rsel_n = {}, 0
 
--- An entry passes when it survives the genre chips, feel chips AND text filter.
+-- An entry passes when it survives the genre, section and feel chips AND the
+-- text filter: OR within a facet, AND across facets (empty facet = pass-all).
 local function entry_visible(e, lf)
   if gsel_n > 0 and not gsel[e.genre] then return false end
+  if rsel_n > 0 and not rsel[e.role] then return false end
   if fsel_n > 0 and not fsel[e.feel] then return false end
   return lf == '' or e.full:lower():find(lf, 1, true) ~= nil
 end
+
+-- ── Wrapped chip-flow helpers ────────────────────────────────────────────────
+-- Chips wrap to as many rows as the CURRENT panel width needs (the one-row
+-- SameLine chain was why the panel only worked at full width). Width accounting
+-- is manual — measure label + frame padding, track the row fill — so it uses
+-- only ReaImGui calls this script's baseline already has (no GetItemRect*).
+local chip_row_w, chip_x_used = 0, 0
+local function chip_row_begin()
+  chip_row_w  = select(1, r.ImGui_GetContentRegionAvail(ctx))
+  chip_x_used = 0
+end
+local function chip_place(vis)   -- vis = VISIBLE label only (ids carry ##tags)
+  local sp = select(1, r.ImGui_GetStyleVar(ctx, r.ImGui_StyleVar_ItemSpacing()))
+  local fp = select(1, r.ImGui_GetStyleVar(ctx, r.ImGui_StyleVar_FramePadding()))
+  local w  = select(1, r.ImGui_CalcTextSize(ctx, vis)) + 2 * fp
+  if chip_x_used > 0 and chip_x_used + sp + w <= chip_row_w then
+    r.ImGui_SameLine(ctx)
+    chip_x_used = chip_x_used + sp + w
+  else
+    chip_x_used = w                -- wrap: new line, this chip starts the row
+  end
+end
+-- One filter pill. Lit = hue-tinted bg + white text (unambiguously CHECKED —
+-- the old text-dim-only state read as decoration); off = dimmed hue text.
+local function chip(vis, id, on, hue)
+  chip_place(vis)
+  r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(),
+    on and 0xFFFFFFFF or ((hue & 0xFFFFFF00) | 0x66))
+  if on then
+    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), (hue & 0xFFFFFF00) | 0x50)
+  end
+  local clicked = r.ImGui_SmallButton(ctx, vis .. id)
+  if on then r.ImGui_PopStyleColor(ctx) end
+  r.ImGui_PopStyleColor(ctx)
+  return clicked
+end
+local GENRE_COLLAPSE_W = 340   -- below this avail width, genre chips collapse
+                               -- to a Genres ▾ button + stay-open checkbox popup
 
 
 local function frame()
@@ -183,36 +225,61 @@ local function frame()
     r.ImGui_SetNextItemWidth(ctx, -1)
     local chg, txt = r.ImGui_InputTextWithHint(ctx, '##filter', 'search presets…', filter)
     if chg then filter = txt end
-    -- Genre chips: ALL + one per genre, colored in the genre hue; dim when off.
-    do
-      local all_on = (gsel_n == 0)
-      r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), all_on and 0xFFFFFFFF or 0x778089FF)
-      if r.ImGui_SmallButton(ctx, 'ALL') then gsel = {}; gsel_n = 0 end
-      r.ImGui_PopStyleColor(ctx)
+    -- ── Filter facets: Genres (wrapped / collapsed) · Sections · Feel ────────
+    -- Every chip is a multi-select toggle: OR within a facet, AND across facets.
+    chip_row_begin()
+    if chip_row_w < GENRE_COLLAPSE_W then
+      -- Narrow panel: 20+ genre chips can't earn their rows — collapse to one
+      -- button + a stay-open checkbox popup (Checkbox never auto-closes it).
+      local lbl = (gsel_n == 0) and 'Genres: ALL \u{25BE}'
+                                or ('Genres: ' .. gsel_n .. ' \u{25BE}')
+      chip_place(lbl)
+      if r.ImGui_SmallButton(ctx, lbl .. '###genres_btn') then
+        r.ImGui_OpenPopup(ctx, 'genres_pop')
+      end
+      if r.ImGui_BeginPopup(ctx, 'genres_pop') then
+        local all_on = (gsel_n == 0)
+        local ac, av = r.ImGui_Checkbox(ctx, 'ALL', all_on)
+        if ac and av and not all_on then gsel = {}; gsel_n = 0 end
+        r.ImGui_Separator(ctx)
+        for _, g in ipairs(genres) do
+          local on = gsel[g] and true or false
+          r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), gcol(g))
+          local cc, cv = r.ImGui_Checkbox(ctx, g, on)
+          r.ImGui_PopStyleColor(ctx)
+          if cc then
+            if cv then gsel[g] = true; gsel_n = gsel_n + 1
+            else gsel[g] = nil; gsel_n = gsel_n - 1 end
+          end
+        end
+        r.ImGui_EndPopup(ctx)
+      end
+    else
+      if chip('ALL', '##gall', gsel_n == 0, 0xAEB6C2FF) then gsel = {}; gsel_n = 0 end
       for _, g in ipairs(genres) do
-        r.ImGui_SameLine(ctx)
         local on = gsel[g] and true or false
-        local hue = gcol(g)
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), on and hue or (hue & 0xFFFFFF00 | 0x66))
-        if r.ImGui_SmallButton(ctx, g .. '##chip') then
+        if chip(g, '##chip', on, gcol(g)) then
           if on then gsel[g] = nil; gsel_n = gsel_n - 1
           else gsel[g] = true; gsel_n = gsel_n + 1 end
         end
-        r.ImGui_PopStyleColor(ctx)
       end
     end
-    -- Feel chips: Straight / Swung / Triplet (grid+timing facet; dim when off).
-    do
-      for i, f in ipairs(FEELS) do
-        if i > 1 then r.ImGui_SameLine(ctx) end
-        local on = fsel[f] and true or false
-        local hue = FEEL_COL[f]
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), on and hue or (hue & 0xFFFFFF00 | 0x66))
-        if r.ImGui_SmallButton(ctx, f .. '##feel') then
-          if on then fsel[f] = nil; fsel_n = fsel_n - 1
-          else fsel[f] = true; fsel_n = fsel_n + 1 end
-        end
-        r.ImGui_PopStyleColor(ctx)
+    -- Sections + feel share one wrapped flow (5 + 3 chips, wraps only when tiny).
+    chip_row_begin()
+    for _, role in ipairs(ROLE_ORDER) do
+      local on = rsel[role] and true or false
+      if chip(ROLE_LABEL[role] or role, '##sec', on, ROLE_COL[role] or 0xAEB6C2FF) then
+        if on then rsel[role] = nil; rsel_n = rsel_n - 1
+        else rsel[role] = true; rsel_n = rsel_n + 1 end
+      end
+    end
+    chip_place('·')
+    r.ImGui_TextColored(ctx, 0x555F6AFF, '·')
+    for _, f in ipairs(FEELS) do
+      local on = fsel[f] and true or false
+      if chip(f, '##feel', on, FEEL_COL[f]) then
+        if on then fsel[f] = nil; fsel_n = fsel_n - 1
+        else fsel[f] = true; fsel_n = fsel_n + 1 end
       end
     end
     r.ImGui_Separator(ctx)

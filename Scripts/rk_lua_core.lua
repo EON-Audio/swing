@@ -1243,6 +1243,34 @@ function core.clear_theme_fx_segments()
   reaper.gmem_attach(core.GMEM_NAME)
 end
 
+-- Listen-back for the FX rollout: sweep every curated FX segment, collect any
+-- pending theme / knob REQUEST an in-plugin picker wrote there (the bridge's
+-- main-segment drain never sees those), clear it, and mirror the active theme
+-- index into GS_THEME_CUR so each picker's label highlights correctly.
+-- cur_idx < 1 skips the CUR write (nothing published yet). Returns
+-- theme_req, knob_req (0 = none; last segment wins if several raced a click).
+-- Same attach discipline as publish_theme_fx_segments: pcall-guarded so an
+-- error can never leave the bridge attached to an FX segment.
+function core.drain_theme_fx_segments(cur_idx)
+  local segs = core.THEME_FX_SEGMENTS
+  local G = core.GMEM
+  local treq, kreq = 0, 0
+  pcall(function()
+    local i = 1
+    while i <= #segs do
+      reaper.gmem_attach(segs[i])
+      local r = math.floor(reaper.gmem_read(G.GS_THEME_REQ) or 0)
+      if r >= 1 then treq = r; reaper.gmem_write(G.GS_THEME_REQ, 0) end
+      r = math.floor(reaper.gmem_read(G.GS_THEME_KNOB_REQ) or 0)
+      if r >= 1 then kreq = r; reaper.gmem_write(G.GS_THEME_KNOB_REQ, 0) end
+      if cur_idx and cur_idx >= 1 then reaper.gmem_write(G.GS_THEME_CUR, cur_idx) end
+      i = i + 1
+    end
+  end)
+  reaper.gmem_attach(core.GMEM_NAME)   -- ALWAYS restore the main segment
+  return treq, kreq
+end
+
 -- Reader (Lua consumers): one semantic color → r,g,b (0..1), or nil if idle.
 function core.read_theme_color(slot)
   local G = core.GMEM
