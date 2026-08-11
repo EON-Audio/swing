@@ -99,8 +99,14 @@ if json and json.decode then
 end
 
 if #flat == 0 then
-  r.ShowMessageBox('No presets found. Run gen_presets.py to build preset_cache.json,\n'
-    .. 'then restart REAPER.', 'EON Preset Browser', 0)
+  -- Customer-facing: the library file simply is not on disk (or is unreadable).
+  -- The old text told customers to run gen_presets.py -- a dev tool that does
+  -- not ship (and whose absence was itself the bug: preset_cache.json was in
+  -- no manifest until 2026-08-11).
+  r.ShowMessageBox('The preset library is missing or empty.\n\n'
+    .. 'Reinstall Swing to restore it (ReaPack: Extensions > ReaPack >\n'
+    .. 'Browse packages > right-click Swing > Reinstall), then restart REAPER.',
+    'EON Preset Browser', 0)
   return
 end
 
