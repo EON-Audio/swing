@@ -1101,7 +1101,10 @@ last_hl_state=0;
 lastpreviewsel=-1;
 gfx_clear=-1;
 ext_noinit=1;
-noteonstate=0;
+// noteonstate deliberately NOT reset here: fresh instances start at 0 anyway, and an
+// @init re-run mid-play must not orphan sounding notes -- under the physical invariant
+// a wiped bit is a note-off that never fires (legacy's unconditional per-step rebuild
+// used to paper over this).
 want_preview=-1;
 last_preview=-1;
 want_preview_nt=-1;
@@ -3367,10 +3370,17 @@ while (
       );
     );
     !cur_note_trigger ? ( // This note was not triggering pattern change
-      buf_offset[i_buf]=offset;
-      buf_msg1[i_buf]=msg1;
-      buf_msg23[i_buf]=msg23;
-      i_buf+=1;
+      i_buf < 1024 ? ( // capacity of buf_offset/buf_msg1/buf_msg23 (see @init freemem map);
+                       // unchecked, event 1025 would overwrite buf_msg1[0]/buf_msg23[0]/
+                       // start_adj_orig_list[0] in one iteration
+        buf_offset[i_buf]=offset;
+        buf_msg1[i_buf]=msg1;
+        buf_msg23[i_buf]=msg23;
+        i_buf+=1;
+      ) : (
+        midisend(offset,msg1,msg23); // overflow: pass through unmodified (same fallback as
+                                     // out-of-grid events in the replay loop below)
+      );
     );
     cur_note_trigger=0;
     loop_to_start=1; // just to keep while loop repeating
@@ -3434,6 +3444,7 @@ loop((play_state&1) ? samplesblock : 1,
     npos=0;
     noneed=noteonstate;
     a = swingstate;
+    sdr_t = sdreach; // subdiv-lane reach walk (see the boundary sdreach comment)
     ltiestate_t=ltiestate;
     while(
       // EON GROOVE: unified per-step delay. eff = hand-nudged start offset + the lane's
@@ -3449,16 +3460,25 @@ loop((play_state&1) ? samplesblock : 1,
         notelen_eff = defnotelen + eff; notelen_eff > tpb ? notelen_eff = tpb;   // ==tpb -> off falls to the boundary (legacy truncation)
         (noneed&1) && notelen_eff == ticks && !(ltiestate_t&1) ? (
           midisend(cursplpos,0x80+chan[npos],npos+basenote+trans[npos]);
-          noteonstate &= (0xFFFFFFFF ~ (1 << npos));
+          noteonstate -= 2^npos; // exact to lane 48; guarded by (noneed&1) so the bit is
+            // provably set. ⚠️NEVER use (1<<npos)/0xFFFFFFFF idioms on lane masks: EEL2
+            // shifts are 32-BIT (probe-verified: 1<<40==256) and the old clear here wiped
+            // every bit >=32 -- legacy survived only because it rebuilt noteonstate each
+            // boundary; the physical invariant does not.
         );
         eff == ticks && (a&1) ? (   // deferred note-on (the a-bit is only set when eff>0)
           is_midi_val(note_to_send = npos+basenote+trans[npos]) ? (
             !(ltiestate_t&1) ? ( // send new note only when there is no tie from previous note
-              eon_audible(npos) ? midisend(cursplpos,0x90+chan[npos],note_to_send + grv_velo(getVelo(npos*listlength+beatpos), npos, beatpos)*256); // EON: mute/solo gate
+              eon_audible(npos) ? ( // EON: mute/solo gate -- PHYSICAL noteonstate: bit set
+                                    // only when the note-on actually left the JSFX
+                midisend(cursplpos,0x90+chan[npos],note_to_send + grv_velo(getVelo(npos*listlength+beatpos), npos, beatpos)*256);
+                noteonstate |= 2^npos; // pow not shift: EEL2 << is 32-bit, lanes go to 48
+              );
             ) : (
-              ltiestate-=2^npos; // clear old tiestate
+              ltiestate-=2^npos; // clear old tiestate; the held note's physical bit was
+                                 // already carried across the boundary (deferred-tie branch)
+                                 // -- do NOT add it again here
             );
-            noteonstate+=2^npos;
             (swingtiestate & 2^npos) && (beatpos < listlength-1) ? ltiestate+=2^npos; // Set tie state if tie enabled and not last note of sequence
           );
         );
@@ -3470,12 +3490,23 @@ loop((play_state&1) ? samplesblock : 1,
           sd_ticks < 1 ? sd_ticks = 1;   // guard: large groove offsets can zero the spacing
           ticks >= grv_sdo && ((ticks-grv_sdo) % sd_ticks) == 0 ? (
             sdpos=((ticks-grv_sdo)/sd_ticks)|0;
-            (sd_playstate[2*npos+1] >> (sdpos-1))&1 ? (// previous sd step was enabled
+            // PHYSICAL noteonstate per sub-hit: the off is gated on "a hit of this lane is
+            // actually sounding" (bit set), not on "previous sd step was enabled" -- the
+            // enabled-check made a MUTED ratchet lane spray one note-off per sub-boundary
+            // with zero note-ons. For audible lanes timing is identical: the bit is set
+            // exactly where the legacy prev-step-enabled check was true. Also retires the
+            // (sdpos-1) negative-shift edge at the first deferred hit. All mask math is
+            // 2^npos pow -- EEL2 shifts are 32-bit, lanes go to 48 (probe-verified).
+            (noteonstate & 2^npos) ? (
               midisend(cursplpos,0x80+chan[npos],npos+basenote+trans[npos]); // note-off previous subdiv note
+              noteonstate -= 2^npos; // exact: guarded by the & test above
             );
             (sd_playstate[2*npos+1] >> (sdpos))&1 ? (// current sd step is enabled
               playvelo=grv_velo(getSubdivVelo(npos, beatpos, sdpos), npos, beatpos);
-              eon_audible(npos) ? midisend(cursplpos,0x90+chan[npos],npos+basenote+trans[npos] + playvelo*256); // note-on subdiv note (EON: mute/solo gate)
+              eon_audible(npos) ? ( // EON: mute/solo gate
+                midisend(cursplpos,0x90+chan[npos],npos+basenote+trans[npos] + playvelo*256); // note-on subdiv note
+                noteonstate |= 2^npos;
+              );
             );
             sdpos==sd_playstate[2*npos] ? sd_playstate[2*npos]=0;
           );
@@ -3484,7 +3515,8 @@ loop((play_state&1) ? samplesblock : 1,
       npos+=1;
       noneed*=0.5;
       ltiestate_t*=0.5;
-      (a*=0.5) >=1 || noneed >= 1;
+      sdr_t*=0.5;
+      (a*=0.5) >=1 || noneed >= 1 || sdr_t >= 1;
     );
     ticks+=1;
     ltickpos=tickpos;
@@ -3559,6 +3591,7 @@ loop((play_state&1) ? samplesblock : 1,
     tiestate=0;
     swingtiestate=0;
     swingstate=0;
+    sdreach=0;
     ticks = 0;
     while(
       // EON GROOVE: unified defer decision -- any lane whose step event lands after the
@@ -3576,15 +3609,30 @@ loop((play_state&1) ? samplesblock : 1,
           eff > 0 ? (
             swingstate+=2^npos; // flag a delayed (groove/offset) note to be played by the tick loop
             (notetie[beatpos] & 2^npos) ? swingtiestate+=2^npos;
-            (ltiestate&1) ? tiestate+=2^npos; // keep the tiestate
+            (ltiestate&1) ? (
+              tiestate+=2^npos; // keep the tiestate
+              (noneed&1) ? noteonstate |= 2^npos; // tie into a deferred note: the held note
+                // keeps sounding until the tick loop consumes the tie, so carry its PHYSICAL
+                // bit across the boundary. (Also closes a legacy hole: transport stop inside
+                // this window used to hang the held note -- all_playing_notes_off saw no bit.)
+            );
           ) : ( // on-the-boundary note playback
 
             playvelo=grv_velo(getVelo(npos*listlength+beatpos), npos, beatpos);
             is_midi_val(note_to_send = npos+basenote+trans[npos]) ? (
-              !(ltiestate&1) ? ( // send new note only when there is no tie from previous note
-                eon_audible(npos) ? midisend(cursplpos,0x90+chan[npos],note_to_send + playvelo*256); // send note on (EON: mute/solo gate)
+              // PHYSICAL noteonstate: bit = "a note-on actually left this JSFX and owns a
+              // future note-off". Muted lanes set no bit, so they no longer emit note-offs
+              // they never earned (those cut live-played notes on gate-mode/ranged pads).
+              // Tie continuations INHERIT the sounding note's bit -- gating the set on
+              // audibility here would hang tied notes.
+              !(ltiestate&1) ? ( // no tie from previous note -> fresh note-on
+                eon_audible(npos) ? ( // EON: mute/solo gate
+                  midisend(cursplpos,0x90+chan[npos],note_to_send + playvelo*256);
+                  noteonstate |= 2^npos; // pow not shift: EEL2 << is 32-bit, lanes go to 48
+                );
+              ) : (
+                (noneed&1) ? noteonstate |= 2^npos; // tie: held note keeps sounding
               );
-              noteonstate+=2^npos;
               (notetie[beatpos] & 2^npos) && (beatpos < listlength-1) ? tiestate+=2^npos; // Set tie state if tie enabled and not last note of sequence
             );
           );
@@ -3592,19 +3640,33 @@ loop((play_state&1) ? samplesblock : 1,
 
           sd_playstate[2*npos]=sdnum;
           sd_playstate[2*npos+1]=getSubdivNotelist(npos, beatpos); // sd note enable bits
-          groove_off_rt[npos*max_seqlength+beatpos] > 0 ? (
-            swingstate+=2^npos; // deferred burst -- fired by the tick loop from ticks==groove offset
-            noteonstate+=2^npos; // LEGACY BUG FIX (post-S1, deliberate): without this the last
-            // sub-hit of a delayed ratchet got no boundary note-off (it only died on the next
-            // same-pitch note-off). Mirrors the immediate branch below; a spurious boundary
-            // note-off when the burst never fired (transport stop mid-step) is benign MIDI.
-          ) : (
+          sdreach+=2^npos; // REACH (immediate + deferred bursts): the tick loop's while()
+            // only iterates lanes while its masks are nonzero. Legacy got reach from the
+            // unconditional noteonstate set; with PHYSICAL noteonstate a muted burst sets
+            // no bit and the loop could stop short of this lane -- skipping sub-hit
+            // processing and mid-burst unmute. DEDICATED mask, not swingstate: swingstate
+            // arms the tick loop's deferred NOTE-ON branch via (a&1), and a mid-step
+            // pattern change can flip this cell to sdnum==0 -- a swingstate bit would then
+            // fire a note-on the sequencer never scheduled. sdreach is consulted by the
+            // while() tail ONLY.
+          (ltiestate&1) && (noneed&1) ? noteonstate |= 2^npos; // tie held into a ratchet
+            // step: carry the sounding note's bit so the first sub-boundary off releases it
+            // (legacy released it a full step later via the unconditional bit; without the
+            // carry it would hang).
+          groove_off_rt[npos*max_seqlength+beatpos] == 0 ? (
             sd_playstate[2*npos+1]&1 ? (// first sd step is enabled
               playvelo=grv_velo(getSubdivVelo(npos, beatpos, 0), npos, beatpos);
-              eon_audible(npos) ? midisend(cursplpos,0x90+chan[npos],npos+basenote+trans[npos] + playvelo*256); // note-on subdiv note (EON: mute/solo gate)
+              eon_audible(npos) ? ( // EON: mute/solo gate -- PHYSICAL noteonstate
+                midisend(cursplpos,0x90+chan[npos],npos+basenote+trans[npos] + playvelo*256); // note-on subdiv note
+                noteonstate |= 2^npos; // |= : idempotent vs the tie-carry above
+              );
             );
-            noteonstate+=2^npos;
           );
+          // Deferred burst (groove offset > 0): every hit incl. the first fires from the
+          // tick loop, which maintains noteonstate per sub-hit -- the last AUDIBLE hit
+          // leaves its bit set so the boundary note-off still lands. This preserves the
+          // post-S1 "last sub-hit of a delayed ratchet" fix WITHOUT the spurious note-off
+          // for muted lanes / transport-stop-mid-step that the unconditional set caused.
         );
       );
       npos+=1;
@@ -4105,7 +4167,7 @@ function draw_col_header() local(i, cx, cw, on, lbl, hot, pin) (
     loop(7,
       cx = eon_colx[i]; cw = eon_colw[i];
       cw > 0 ? (
-        on  = eon_colvis & (1 << i);
+        on  = eon_colvis & (2^i);
         hot = mouse_y >= eon_colhdr_y && mouse_y < eon_colhdr_y + eon_colhdr_h
               && mouse_x >= cx && mouse_x < cx + cw;
         lbl = i==0 ? $'I' : i==1 ? $'N' : i==2 ? $'M' : i==3 ? $'S' : i==4 ? $'V' : i==5 ? $'P' : $'W';
@@ -7529,7 +7591,7 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
     eon_ch_i += 1;
   );
   eon_ch_hit >= 0 ? (
-    eon_ch_bit = 1 << eon_ch_hit;
+    eon_ch_bit = 2^eon_ch_hit;
     eon_ch_new = (eon_colvis & eon_ch_bit) ? eon_colvis - eon_ch_bit : eon_colvis + eon_ch_bit;
     // Icon/name validity rule, enforced at the click so hiding the second of the
     // pair visibly refuses instead of appearing to work then snapping back.
@@ -8883,9 +8945,9 @@ colorscheme==10 ? (
       eon_tti += 1;
     );
     eon_tth >= 0 ? (
-      (eon_tth < 2 && (eon_colvis & 3) != 3 && (eon_colvis & (1 << eon_tth))) ?
+      (eon_tth < 2 && (eon_colvis & 3) != 3 && (eon_colvis & (2^eon_tth))) ?
         eon_tt = "Kept: a lane needs its icon or its name — show the other one first" :
-      (eon_colvis & (1 << eon_tth)) ?
+      (eon_colvis & (2^eon_tth)) ?
         eon_tt = (eon_tth==0 ? "Hide the icon column" : eon_tth==1 ? "Hide the name column" :
                   eon_tth==2 ? "Hide Mute" : eon_tth==3 ? "Hide Solo" : eon_tth==4 ? "Hide the VOL knob" :
                   eon_tth==5 ? "Hide the PAN knob" : "Hide the swing/groove pill") :
@@ -9500,7 +9562,7 @@ eon_so_open ? (
   eon_so_ci = 0;
   loop(7,
     eon_so_cbx = eon_so_cx + eon_so_ci*28;
-    eon_so_cbit = 1 << eon_so_ci;
+    eon_so_cbit = 2^eon_so_ci;
     // Amber = PINNED: the last of the icon/name pair, which cannot be turned off.
     // Same language as the column-header strip so the two surfaces agree.
     eon_so_pin = (eon_so_ci < 2) && ((eon_colvis & 3) != 3) && (eon_colvis & eon_so_cbit);
