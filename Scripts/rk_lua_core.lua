@@ -52,6 +52,22 @@ function core.get_kits_dir()
   return dir
 end
 
+-- ── Companion-script liveness ────────────────────────────────────────────────
+-- EON_Swing_Strip_Sync stamps time_precise() here on every defer tick; the Kit
+-- Bridge reads it to decide whether that script needs starting. Defined HERE,
+-- once, because the writer and the reader are different files: the last time a
+-- flag like this was spelled out separately at each end they drifted (the
+-- browser wrote gmem 2368 while the JSFX read 2624, and nobody noticed).
+-- Non-persistent on purpose -- REAPER clears it on restart, so a stale value
+-- can never survive into a session where the script is not actually running.
+core.ALIVE_STRIP_SYNC_SECTION = "EON_Swing_Strip_Sync"
+core.ALIVE_STRIP_SYNC_KEY     = "alive_t"
+-- Treat the script as dead once its stamp is this old. The stamp is written at
+-- the top of every defer tick (~30 Hz, unconditional), so 2 s is ~60 missed
+-- ticks of slack -- generous enough that a heavy project-load stall cannot be
+-- mistaken for a dead script and get a second copy launched on top of it.
+core.ALIVE_STALE_S            = 2.0
+
 -- ── JSFX add-name resolution ─────────────────────────────────────────────────
 -- TrackFX_AddByName wants "JS:<path relative to <resource>/Effects>", and that
 -- path differs in EVERY layout we ship:
@@ -338,6 +354,9 @@ core.GMEM = {
   -- GS_STRIP_REINIT_PULSE (26090100).
   GS_PAD_RANGE_BASE    = 26090200,  -- ..26090215
   GS_COMPANION_CMD     = 1710,
+  GS_COMPANION_TARGET  = 2250,  -- instance_id the companion cmd is FOR (0 = broadcast).
+                                -- Stamp BEFORE the cmd; the consumer clears both.
+                                -- 2248..2255 gap (2248 LOAD_MODE, 2249 NAME_ADOPT).
   -- Heartbeat + update-channel slots (mirror Swing JSFX; previously absent
   -- here, which forced Lua tools to hardcode 1711). Monotonic GS_SWING_ALIVE
   -- is the canonical "is Swing running + ticking" signal.

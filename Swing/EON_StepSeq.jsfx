@@ -134,7 +134,7 @@ slider45:0<0,1,1>--PatternMode
 slider46:0<0,1,1>--XtraPatts
 slider47:48<48,96,48>--NumberOfPatts
 slider48:0<-65,65,1>--EON Pair Slot (bridge-assigned; 0=unpaired, +N=auto, -N=manual)
-slider49:0<0,1,1{Off,On}>--EON Sync Mode (Drum Matrix two-views; 0=standalone)
+slider49:1<0,1,1{Off,On}>--EON Sync Mode (Drum Matrix two-views; 0=standalone; default ON)
 slider50:1<0,1,1{Off,On}>--EON Grid Lines (beat lines + per-lane tinted separators; view-only, persists via FX chunk)
 slider51:127<0,127,1>--EON Lane Columns (bitmask: 1 icon, 2 name, 4 mute, 8 solo, 16 vol, 32 pan, 64 swing; view-only, persists via FX chunk)
 in_pin:none
@@ -553,6 +553,28 @@ function eon_lm_rowlbl(dest, r) (
     r == 10 ? "Randomize lane (50%)"     : r == 11 ? "Accent every 4 (+30 vel)":
     r == 12 ? "Accent every 2 (+30 vel)" : "Humanize velocity (+/-10)");
 );
+// eon_pm house context-menu row labels. Kinds: 1 = pattern tab, 2 = pager pill,
+// 3 = song-strip chip, 4 = song-strip background, 5 = grid picker.
+function eon_pm_rowlbl(dest, kind, r) (
+  strcpy(dest,
+    kind == 1 ? (
+      r == 0 ? "Rename pattern..." : r == 1 ? "Change color..." : "Delete pattern"
+    ) :
+    kind == 2 ? (
+      r == 0 ? "Next page" : r == 1 ? "Previous page" : "New pattern"
+    ) :
+    kind == 3 ? (
+      r == 0 ? "Repeats: 1" : r == 1 ? "Repeats: 2" : r == 2 ? "Repeats: 3" :
+      r == 3 ? "Repeats: 4" : r == 4 ? "Repeats: 6" : r == 5 ? "Repeats: 8" :
+      r == 6 ? "Remove"     : r == 7 ? "Clear song" : "Commit to timeline"
+    ) :
+    kind == 4 ? (
+      r == 0 ? "Clear song" : "Commit to timeline"
+    ) : (
+      r == 0 ? "Straight  (16ths)"   : r == 1 ? "Triplet  (8th triplets)" :
+      r == 2 ? "Fine straight  (32nds)" : "Fine triplet  (16th triplets)"
+    ));
+);
 
 npatterns=48;          // no of patterns - 48 for startup in either mode
 // EON serialize-safety: patternmode (0 = 96 patterns x 64 steps; 1 = 48 x 128) is NOT
@@ -888,8 +910,8 @@ function eon_lane_has_mix(lane) (
 //                 or consume their own clicks (theme, rkth_input). _open would freeze
 //                 every lane knob for as long as the panel is showing.
 function ss_knob_input_ok() (
-  !eon_gdd_open && !eon_ico_open && !eon_lm_open && !eon_vdd_open && !eon_prdd_open
-  && !eon_so_in_panel && !eon_thdd_in_panel;
+  !eon_gdd_open && !eon_ico_open && !eon_lm_open && !eon_pm_open && !eon_vdd_open
+  && !eon_prdd_open && !eon_so_in_panel && !eon_thdd_in_panel;
 );
 function eon_lane_gain(lane) local(pd) (
   pd = eon_pair_slot >= 0 ? eon_lane_pad[lane] : -1;
@@ -1334,6 +1356,9 @@ EON_SS_SYNC_NEW_REQ    = 16;     // StepSeq -> courier: monotonic bump = "+" cli
 EON_SS_SYNC_REN_REQ    = 17;     // StepSeq -> courier: monotonic bump = RENAME region (1-based ordinal in OP_ORD; bridge opens the dialog)
 EON_SS_SYNC_OP_ORD     = 18;     // StepSeq -> courier: ordinal payload for REN/DEL (written BEFORE the counter bump)
 EON_SS_SYNC_DEL_REQ    = 19;     // StepSeq -> courier: monotonic bump = DELETE region (ordinal in OP_ORD; bridge confirms first)
+EON_SS_SYNC_COL_REQ    = 54;     // StepSeq -> courier: monotonic bump = CHANGE COLOR of region (ordinal in OP_ORD;
+                                 // bridge opens the native picker). 54 because 20/21/22.. are taken and field 52
+                                 // is GS_SSWIN_OPEN (see warning below) — next truly free field after OPT_AA=53.
 EON_SS_SYNC_RGNCOL     = 22;     // courier -> StepSeq: + i -> packed colour (r*65536+g*256+b) of region ordinal PAGE+1+i; fields 22..37
 EON_SS_SYNC_OPENSW_REQ = 38;     // StepSeq -> courier: monotonic bump = TOGGLE this slot's paired Swing FX window
 EON_SS_SYNC_SWING_OPEN = 39;     // courier -> StepSeq: 1 if the paired Swing's FX window is open (button highlight)
@@ -1369,7 +1394,7 @@ EON_SS_SYNC_RGNQN      = 48;     // courier -> StepSeq: bound region length in Q
 // panel toggles write the values + bump REQ; the bridge persists the bump and
 // republishes the canonical values every tick, so all instances agree.
 EON_SS_SYNC_OPT_AZ     = 49;     // both ways: "Zoom on select" (auto-frame a pattern's region on select)
-EON_SS_SYNC_OPT_SO     = 50;     // both ways: "Sync on by default" (fresh instances engage Sync (DM) on first pairing)
+EON_SS_SYNC_OPT_SO     = 50;     // both ways: "Sync on by default" (slider49 defaults On; the bridge enforces an explicit Off on first pairing)
 EON_SS_SYNC_OPT_REQ    = 51;     // StepSeq -> courier: option-set request counter (edge-detected)
 // ⚠️ field 52 = GS_SSWIN_OPEN (bridge seq-window heartbeat, Swing_ReaKit.jsfx) — NOT free, do not reuse.
 EON_SS_SYNC_OPT_AA     = 53;     // both ways: "Auto-adapt patterns" (③ apply the kit-load lane perm automatically,
@@ -1441,7 +1466,11 @@ EON_SS_GRV_OPEN_USLOT = 26140203;  // suggested USER slot 0..6 (menu's empty-slo
 // [1..1120] = 7 x 160 raw slot floats. 26141000 + 16*1200 = ..26160199, verified free.
 EON_SS_GRV_PUB_BASE   = 26141000;
 EON_SS_GRV_PUB_STRIDE = 1200;
-eon_sync_mode     = 0;         // set each frame from slider49; 0 = standalone (no sync behaviour)
+eon_sync_mode     = 0;         // set each frame from slider49; 0 = standalone (no sync behaviour).
+                               // slider49 DEFAULTS ON (fresh instances come up armed; sync stays inert
+                               // until a Swing pairs, so unpaired = standalone row as before). Saved
+                               // projects keep their stored slider value; the bridge enforces an explicit
+                               // machine-wide "Sync on by default = Off" on first pairing instead.
 eon_sync_last_push = 0;        // last consumed dm_push (import edge-detect)
 eon_export_pending = 0;        // @gfx "Export -> DM" click -> @block serializes the grid once
 eon_export_seq     = 0;        // monotonic export-request seq (StepSeq -> bridge, EXPORTREQ)
@@ -1462,7 +1491,8 @@ eon_pat_flash            = 0;  // AP-4: pattern-select flash 1->0 (decays each @
 eon_pat_flash_p          = -1; // AP-4: which pattern index is currently flashing
 eon_pat_big              = 0;  // AP-4: 1 while redrawing the selected pattern button enlarged (2nd pass)
 eon_dm_patseq_last       = 0;  // DM->SS: last consumed DM_PATSEQ (a clicked DM pattern switches us)
-eon_newrgn_seq           = 0;  // P3b-3b-2: our monotonic "+" (new region) request counter
+// (request counters live IN gmem now -- read-modify-write at the emit sites;
+//  an instance-local counter restarts at 0 on reload and stops edging)
 eon_opensw_seq           = 0;  // SETTINGS "Open Swing" request counter
 eon_dmopen_seq           = 0;  // SETTINGS "Drum Matrix" request counter
 eon_pair_slot     = -1;        // set each @gfx frame from slider48; -1 = unpaired
@@ -2133,20 +2163,39 @@ function change_seqlen(newsz) local(ip, y, pstart, pstartv, pstart_n, pstartv_n,
 //  and AP-0c calls change_seqlen — defined above — from this function.)
 function eon_ss_apply_grid() local(nr, buf_ns, buf_spb, use_ns, r, s, vel,
                                    sd_n, sd_i, sd_ptr, sd_cell, sd_k, sd_r, sd_s,
-                                   sd_v0, sd_base, sd_p, sd_v)
+                                   sd_v0, sd_base, sd_p, sd_v,
+                                   ap_rgnqn, ap_spb, ap_want, ap_geo, sd_rep)
 (
   nr      = gmem[EON_SS_APPLY_BASE + 2]|0;         // numrows the bridge wrote
   buf_ns  = gmem[EON_SS_APPLY_BASE + 3]|0;         // numsteps the bridge wrote
   buf_spb = gmem[EON_SS_APPLY_BASE + 4]|0;         // steps_per_beat the bridge wrote
+  // P3b-6 TILE (user 2026-08-11): synced with length-follow active, the REGION
+  // owns the grid length (the Match rule) — a one-bar preset must LOOP across
+  // it, not shrink the grid out from under the region (Song Starter sections
+  // are 4-16 bars; presets are authored as ONE bar). Geometry target =
+  // floor(region_QN x preset spb + 0.5), the EXACT formula the length-follow
+  // block enforces (same clamp), so its next-block recompute is a no-op and
+  // the two can never fight. Unsynced (or no region): target = the preset's
+  // own length — the original AP-0c adopt, byte-identical.
+  ap_spb   = (buf_spb >= 1 && buf_spb <= max_steps_per_beat) ? buf_spb : steps_per_beat;
+  ap_rgnqn = (eon_sync_mode && _eon_blk_ps >= 0)
+             ? gmem[EON_SS_SYNC_BASE + _eon_blk_ps*EON_SS_SYNC_STRIDE + EON_SS_SYNC_RGNQN] : 0;
+  ap_rgnqn > 0 ? (
+    ap_geo = floor(ap_rgnqn * ap_spb + 0.5);
+    ap_geo < 1 ? ap_geo = 1;
+    ap_geo > max_seqlength ? ap_geo = max_seqlength;
+  ) : (
+    ap_geo = buf_ns;
+  );
   // AP-0c: ADOPT the staged grid's geometry so non-16 presets (triplet grid:
   // 12 steps, spb 3) apply with the right feel instead of clamping. Mirrors
   // @slider's resize (change_seqlen repacks + updates listlength/velolist);
   // skipped mid @gfx pattern gesture (same _ui_patop guard as @slider) — the
   // rare race degrades to the old clamp behavior. Sliders are synced via
   // sliderchange (AP-4 pattern) or the next @slider pass would resize back.
-  (!_ui_patop && buf_ns >= 1 && buf_ns <= max_seqlength && buf_ns != listlength) ? (
-    change_seqlen(buf_ns);
-    sliderchange(slider3 = buf_ns);
+  (!_ui_patop && ap_geo >= 1 && ap_geo <= max_seqlength && ap_geo != listlength) ? (
+    change_seqlen(ap_geo);
+    sliderchange(slider3 = ap_geo);
   );
   (!_ui_patop && buf_spb >= 1 && buf_spb <= max_steps_per_beat && buf_spb != steps_per_beat) ? (
     steps_per_beat = buf_spb;
@@ -2154,7 +2203,10 @@ function eon_ss_apply_grid() local(nr, buf_ns, buf_spb, use_ns, r, s, vel,
     rateadj = steps_per_beat * rate;
     sliderchange(slider9 = buf_spb);
   );
-  use_ns = buf_ns < listlength ? buf_ns : listlength;   // clamp (post-adopt: usually ==)
+  // Write span: the whole grid when tiling (source column wraps modulo the
+  // preset length below); otherwise the original min(preset, grid) clamp.
+  use_ns = ap_rgnqn > 0 ? listlength
+                        : (buf_ns < listlength ? buf_ns : listlength);
   use_ns < 0 ? use_ns = 0;
   memset(notelist, 0, listlength);
   memset(velolist, 0, max_numnotes*listlength);
@@ -2165,7 +2217,9 @@ function eon_ss_apply_grid() local(nr, buf_ns, buf_spb, use_ns, r, s, vel,
     (r < nr && buf_ns > 0) ? (
       s = 0;
       loop(use_ns,
-        vel = gmem[EON_SS_APPLY_DATA + r*buf_ns + s]|0;
+        // Source column wraps modulo the preset's length — the TILE. In every
+        // non-tile case s < buf_ns, so the modulo is a no-op (original path).
+        vel = gmem[EON_SS_APPLY_DATA + r*buf_ns + (s % buf_ns)]|0;
         vel > 0 ? (
           notelist[s] += 2^r;                                  // set lane r presence bit
           setVelo(r*listlength + s, vel > 127 ? 127 : (vel < 1 ? 1 : vel));
@@ -2190,21 +2244,28 @@ function eon_ss_apply_grid() local(nr, buf_ns, buf_spb, use_ns, r, s, vel,
       sd_k    = gmem[sd_ptr + 1]|0;
       sd_r    = buf_ns > 0 ? (sd_cell / buf_ns)|0 : 0;
       sd_s    = sd_cell - sd_r*buf_ns;
-      (sd_k > 1 && sd_k <= max_subdivs && sd_r < numnotes && sd_s < use_ns) ? (
+      (sd_k > 1 && sd_k <= max_subdivs && sd_r < numnotes && sd_s < use_ns && buf_ns > 0) ? (
         sd_v0 = gmem[sd_ptr + 2]|0;
         sd_v0 < 1 ? sd_v0 = 1;
         sd_v0 > 127 ? sd_v0 = 127;
-        setVelo(sd_r*listlength + sd_s, sd_v0);              // low bits = FIRST sub-hit
-        velolist[sd_r*listlength + sd_s] |= (sd_k - 1)*65536;
-        sd_base = sdlist_p + sd_r*max_seqlength*max_subdivs + sd_s*max_subdivs;
-        sdlist[sd_base] = (2^sd_k - 1)*65536 + sd_v0;        // mask<<16 | v0
-        sd_p = 1;
-        loop(sd_k - 1,
-          sd_v = gmem[sd_ptr + 2 + sd_p]|0;
-          sd_v < 1 ? sd_v = 1;
-          sd_v > 127 ? sd_v = 127;
-          sdlist[sd_base + sd_p] = sd_v;
-          sd_p += 1;
+        // P3b-6: replicate the ratchet cell at every tile of the preset. In
+        // the non-tile case use_ns <= buf_ns, so the while runs exactly once
+        // at sd_rep == sd_s — the original single write.
+        sd_rep = sd_s;
+        while(sd_rep < use_ns) (
+          setVelo(sd_r*listlength + sd_rep, sd_v0);          // low bits = FIRST sub-hit
+          velolist[sd_r*listlength + sd_rep] |= (sd_k - 1)*65536;
+          sd_base = sdlist_p + sd_r*max_seqlength*max_subdivs + sd_rep*max_subdivs;
+          sdlist[sd_base] = (2^sd_k - 1)*65536 + sd_v0;      // mask<<16 | v0
+          sd_p = 1;
+          loop(sd_k - 1,
+            sd_v = gmem[sd_ptr + 2 + sd_p]|0;
+            sd_v < 1 ? sd_v = 1;
+            sd_v > 127 ? sd_v = 127;
+            sdlist[sd_base + sd_p] = sd_v;
+            sd_p += 1;
+          );
+          sd_rep += buf_ns;
         );
       );
       sd_i += 1;
@@ -2870,6 +2931,14 @@ eon_apply_primed ? (
     eon_ss_apply_grid();
     eon_apply_last = gmem[EON_SS_APPLY_BASE + 1];
     eon_apply_dirty = 1; eon_apply_settle = 0;   // arm settle-debounced undo capture
+    // P3b-6: StepSeq-wins force-export, same flag the @serialize preset path
+    // sets — WITHOUT it, an apply that changes listlen/spb (any preset on a
+    // region-owned grid; every triplet preset) races the bridge's res-change
+    // watcher: the watcher fires ~30ms after the change while the live echo
+    // needs ~100ms of settle, so the re-import could clobber the fresh apply
+    // with the region's OLD content. The flag's export fires later THIS SAME
+    // @block (site order), so EXPORTREQ is bumped before the bridge can look.
+    eon_preset_loaded = 1;
   );
 ) : (
   eon_apply_last = gmem[EON_SS_APPLY_BASE + 1];   // baseline the pre-existing request -> open blank
@@ -3706,6 +3775,9 @@ eon_sync_mode   = slider49 > 0.5;
 // Selection is an ABSOLUTE ordinal (eon_sel_ord, published as SS_SELORD) so flipping
 // pages is a pure VIEW change — the synced region only moves on an actual click.
 eon_pat_sync = eon_sync_mode && eon_pair_slot >= 0;
+// P3b-4f: outside sync the grid backdrop must not keep wearing a region tint
+// (eon_selrc is captured by the selected chip's draw, which stops running).
+!eon_pat_sync ? eon_selrc = 0;
 eon_npat_total = eon_pat_sync ? max(gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_DM_RGNCNT]|0, 1) : 8;
 eon_pat_pages  = ((eon_npat_total + 7) / 8)|0;
 eon_pat_page   = min(max(eon_pat_page, 0), eon_pat_pages - 1);
@@ -3891,6 +3963,11 @@ function draw_pat_button(patnum, x, y, hl) local(bx, by, bw, bh, bw_lum, eon_cl,
     // P3b-4: field 22+patnum is a PAGE WINDOW (bridge slices at SS_PAGE), so index by button.
     eon_pat_sync ? (
       eon_rc = gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_RGNCOL + patnum]|0;
+      // P3b-4f: the grid backdrop tint follows the SELECTED chip's region
+      // colour — captured here (0 = colourless region -> backdrop falls back
+      // to its standalone look) so the two can never disagree on what
+      // "selected" or "its colour" means.
+      eon_issel ? eon_selrc = eon_rc;
       eon_rc > 0 ? (
         eon_rcl = eon_issel ? 1.0 : (has_notes[patnum] ? 0.66 : 0.46);
         gfx_r = ((eon_rc/65536)|0)/255*eon_rcl;
@@ -5598,6 +5675,22 @@ eon_swing_alive && mode==1 && eon_pair_slot >= 0 && (eon_sync_tick >= 3 || lnote
 // only the embed is shown. (Borderless 0x100 is requested in @init.)
 // ═══════════════════════════════════════════════════════════════════════════
 ss_emb = gfx_ext_flags & 1;
+// ⚠️ MODE-FLIP REPAINT. This file runs gfx_clear=-1 (line ~1080), so REAPER
+// never wipes the framebuffer and the full UI repaints only the bands whose
+// dirty flag is set (refresh_tb / refresh_pianokeys / refresh_cc_controls).
+// The embed renderer, by contrast, blanks the WHOLE surface every pass
+// (ss_embed_grid, gfx_rect(0,0,gfx_w,gfx_h)). So after any embedded pass the
+// full view's dirty flags are LYING: they say "still drawn" about pixels the
+// embed just erased, and every band that does not repaint each frame — the
+// header strip above all — keeps showing the compact grid underneath.
+// Nothing detected that transition before, which is why embedding in the MCP
+// left the compact grid painted into the floating window's header.
+// EON_Drum_Strip and EON_FX_Return_View never hit this: neither sets
+// gfx_clear=-1, so REAPER wipes for them and there is nothing stale to carry.
+ss_emb != ss_prev_emb ? (
+  ss_prev_emb = ss_emb;
+  refresh_tb = 1; refresh_pianokeys = 1; refresh_cc_controls = 1;
+);
 ss_emb ? (
   ss_mx = mouse_x; ss_my = mouse_y;
   gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;     // clear passthrough (EEL2 has no ~); re-armed over dead space
@@ -5999,6 +6092,108 @@ eon_lm_open && mstate==0 && (mouse_cap==1 || mouse_cap==2) ? (
     !(mouse_cap==2 && mode==1 && mouse_x < pkw && mouse_y >= tbh && mouse_y < grid_bottom) ? (
       refresh_tb=1; eon_pdraw=4; mstate=ms_tb_button_noundo;
     ) : (refresh_tb=1; eon_pdraw=4;);
+  );
+);
+
+// EON P3b-4f: house context menu (lane-menu pattern -- replaces every native
+// gfx_showmenu in the toolbar). Geometry + hover + click here; drawing in the
+// panel layer at the end of @gfx. Kinds:
+//   1 = pattern tab (Rename / Change color / Delete -> sync-band region ops)
+//   2 = pager pill  (page nav + New pattern)
+//   3 = song-strip chip (Repeats 1/2/3/4/6/8, Remove, Clear song, Commit;
+//       payload eon_pm_ord = 1-based chain pos, eon_pm_btn = 0-based entry)
+//   4 = song-strip background (Clear song / Commit)
+//   5 = grid picker (Straight/Triplet/Fine; eon_pm_ord = beat count captured
+//       at open -- Elektron model, the bar re-divides)
+eon_pm_open ? (
+  eon_pm_hh = 22; eon_pm_rh = 19;
+  eon_pm_n = eon_pm_kind == 3 ? 9 : eon_pm_kind == 4 ? 2 : eon_pm_kind == 5 ? 4 : 3;
+  eon_pm_w = eon_pm_kind == 5 ? 190 : 150;
+  eon_pm_h = eon_pm_hh + eon_pm_n*eon_pm_rh;
+  eon_pm_x > gfx_w - eon_pm_w - 2 ? eon_pm_x = max(0, gfx_w - eon_pm_w - 2);
+  eon_pm_y + eon_pm_h > gfx_h - 2 ? eon_pm_y = max(0, gfx_h - 2 - eon_pm_h);
+  eon_pm_in_panel = mouse_x>=eon_pm_x && mouse_x<eon_pm_x+eon_pm_w && mouse_y>=eon_pm_y && mouse_y<eon_pm_y+eon_pm_h;
+  eon_pm_hrow = -1;
+  (eon_pm_in_panel && mouse_y >= eon_pm_y + eon_pm_hh) ? (
+    eon_pm_hrow = ((mouse_y - eon_pm_y - eon_pm_hh)/eon_pm_rh)|0;
+    eon_pm_hrow >= eon_pm_n ? eon_pm_hrow = -1;
+  );
+) : (eon_pm_in_panel = 0; eon_pm_hrow = -1;);
+eon_pm_open && mstate==0 && (mouse_cap==1 || mouse_cap==2) ? (
+  eon_pm_in_panel ? (
+    (mouse_cap==1 && eon_pm_hrow >= 0) ? (
+      eon_pm_b = EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE;
+      eon_pm_kind == 1 ? (
+        // ordinal-payload-FIRST + counter-bump-LAST, same as the old menu.
+        // Bumps are gmem READ-modify-write (this JSFX is the field's sole
+        // writer): an instance-local counter restarts at 0 on project reload
+        // while gmem + the bridge's last-seen persist, so the first request of
+        // a fresh instance would rewrite the OLD value and never edge.
+        gmem[eon_pm_b + EON_SS_SYNC_OP_ORD] = eon_pm_ord;
+        eon_pm_hrow == 0 ? (
+          gmem[eon_pm_b + EON_SS_SYNC_REN_REQ] = (gmem[eon_pm_b + EON_SS_SYNC_REN_REQ]|0) + 1;
+        ) :
+        eon_pm_hrow == 1 ? (
+          gmem[eon_pm_b + EON_SS_SYNC_COL_REQ] = (gmem[eon_pm_b + EON_SS_SYNC_COL_REQ]|0) + 1;
+        ) : (
+          // Delete only when a region actually backs this tab. Tab 1 shows even
+          // with ZERO regions (floor tab) -- Rename/Color seed it bridge-side,
+          // but Delete has nothing to act on (row draws greyed to match).
+          (gmem[eon_pm_b + EON_SS_SYNC_DM_RGNCNT]|0) >= eon_pm_ord ? (
+            gmem[eon_pm_b + EON_SS_SYNC_DEL_REQ] = (gmem[eon_pm_b + EON_SS_SYNC_DEL_REQ]|0) + 1;
+          );
+        );
+      ) :
+      eon_pm_kind == 2 ? (
+        eon_pm_hrow == 0 ? (eon_pat_page = (eon_pat_page + 1) % eon_pat_pages;) :
+        eon_pm_hrow == 1 ? (eon_pat_page = (eon_pat_page + eon_pat_pages - 1) % eon_pat_pages;) : (
+          gmem[eon_pm_b + EON_SS_SYNC_NEW_REQ] = (gmem[eon_pm_b + EON_SS_SYNC_NEW_REQ]|0) + 1;
+        );
+      ) :
+      eon_pm_kind == 3 ? (
+        // rows 0..5 = repeats 1,2,3,4,6,8 -> SET_REPEATS; 6=Remove; 7=Clear; 8=Commit
+        eon_pm_hrow <= 5 ? (
+          eon_song_cmd(4, eon_pm_ord, eon_pm_hrow == 4 ? 6 : (eon_pm_hrow == 5 ? 8 : eon_pm_hrow + 1));
+        ) :
+        eon_pm_hrow == 6 ? eon_song_cmd(2, eon_pm_ord, 0) :
+        eon_pm_hrow == 7 ? eon_song_cmd(8, 0, 0) :
+                           eon_song_cmd(9, 0, 0);
+      ) :
+      eon_pm_kind == 4 ? (
+        eon_pm_hrow == 0 ? eon_song_cmd(8, 0, 0) : eon_song_cmd(9, 0, 0);
+      ) : (
+        // kind 5: grid re-divide -- the old inline gfx_showmenu apply, verbatim.
+        // Beat count was captured at OPEN in eon_pm_ord; same apply idiom as the
+        // Len drag (sliderchange + change_seqlen from @gfx).
+        eon_pm_spb = eon_pm_hrow == 0 ? 4 : eon_pm_hrow == 1 ? 3 : eon_pm_hrow == 2 ? 8 : 6;
+        eon_pm_len = eon_pm_ord * eon_pm_spb;
+        eon_pm_len < 2 ? eon_pm_len = 2;
+        eon_pm_len > max_seqlength ? eon_pm_len = max_seqlength;
+        steps_per_beat = eon_pm_spb;
+        sliderchange(slider3 = eon_pm_len);
+        change_seqlen(eon_pm_len);             // sets listlength itself; no-op when equal
+        sliderchange(slider9 = steps_per_beat);
+        steps_per_beat_pat[p] = steps_per_beat;
+        rateadj = steps_per_beat * rate;
+        p <= chain ? update_chain_beats();
+        eon_pm_undo = 1;   // real grid edit -> release must fire the undo point
+      );
+    );
+    eon_pm_open = 0;
+    refresh_tb=1; eon_pdraw=4;
+    // ms_tb_gridmenu is exempt from nothing: the central release reset fires
+    // sliderchange(-1) on it -> undo point AFTER the grid edit (old-flow
+    // semantics). Every other pick/dismiss stays noundo.
+    mstate = eon_pm_undo ? ms_tb_gridmenu : ms_tb_button_noundo;
+    eon_pm_undo = 0;
+  ) : (
+    eon_pm_open = 0;
+    // ALWAYS consume the dismissing click. The lane menu's re-anchor
+    // fall-through is safe because its region holds only its own opener; the
+    // toolbar is NOT -- a leaked right-click lands on real edits (pattern/note
+    // length detents, move buttons, pianokeys latch, preset strip, ADAPT chip,
+    // standalone hue-cycle). Re-anchoring costs one extra right-click instead.
+    refresh_tb=1; eon_pdraw=4; mstate=ms_tb_button_noundo;
   );
 );
 
@@ -7188,8 +7383,10 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
       // DM region; New() sets it current so the DM->SS sync then switches us to the new pattern.
       (eon_pat_addbtn && button == eon_npat_vis) ? (
         mstate = ms_tb_button_noundo;
-        eon_newrgn_seq += 1;
-        gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_NEW_REQ] = eon_newrgn_seq;
+        // gmem read-modify-write, not a local counter (sole writer = this JSFX;
+        // a reloaded instance restarting at 0 would never edge -- see eon_pm)
+        gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_NEW_REQ] =
+          (gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_NEW_REQ]|0) + 1;
       );
       // EON P3b-4: pager pill (slot 8, only when >8 regions) -> next page, wrapping.
       (eon_pat_sync && eon_npat_total > 8 && button == 8) ? (
@@ -7287,39 +7484,25 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
   );
 
   // EON P3b-4: SYNC-mode plain Right click -> region ops. On a pattern button: Rename /
-  // Delete its DM region — the JSFX can't touch regions or take text input, so it posts
+  // Change color / Delete its DM region — the JSFX can't touch regions or take text input,
+  // so the eon_pm panel (house style; open here, act in the eon_pm EARLY block) posts
   // ordinal-payload-FIRST + counter-bump-LAST to the sync band and the bridge runs the
-  // dialog (GetUserInputs / confirm box) + pattern_regions.Rename/Delete. On the pager
+  // dialog (GetUserInputs / native color picker / confirm box) +
+  // pattern_regions.Rename/SetColor/Delete. On the pager
   // pill: page nav + New pattern (covers '+' when the last page is full).
-  // gfx_showmenu blocks @gfx while open — fine (matches REAPER-native menus).
   (mouse_cap==2 && eon_pat_sync) ? (
     mstate==0 ? (
       mstate = ms_tb_button_noundo;
-      _eon_rops_b = EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE;
       button >= 0 && button < eon_npat_vis ? (
-        eon_rops_ord = eon_pat_base + button + 1;
-        gfx_x = mouse_x; gfx_y = mouse_y;
-        eon_rops_sel = gfx_showmenu("Rename pattern...|Delete pattern");
-        eon_rops_sel == 1 ? (
-          gmem[_eon_rops_b + EON_SS_SYNC_OP_ORD]  = eon_rops_ord;
-          eon_renreq_seq += 1;
-          gmem[_eon_rops_b + EON_SS_SYNC_REN_REQ] = eon_renreq_seq;
-        );
-        eon_rops_sel == 2 ? (
-          gmem[_eon_rops_b + EON_SS_SYNC_OP_ORD]  = eon_rops_ord;
-          eon_delreq_seq += 1;
-          gmem[_eon_rops_b + EON_SS_SYNC_DEL_REQ] = eon_delreq_seq;
-        );
+        eon_pm_open = 1; eon_pm_kind = 1;
+        eon_pm_ord  = eon_pat_base + button + 1;
+        eon_pm_btn  = button;
+        eon_pm_x = mouse_x; eon_pm_y = mouse_y;
         refresh_tb = 1;
       ) : (eon_npat_total > 8 && button == 8) ? (
-        gfx_x = mouse_x; gfx_y = mouse_y;
-        eon_rops_sel = gfx_showmenu("Next page|Previous page||New pattern");
-        eon_rops_sel == 1 ? (eon_pat_page = (eon_pat_page + 1) % eon_pat_pages;);
-        eon_rops_sel == 2 ? (eon_pat_page = (eon_pat_page + eon_pat_pages - 1) % eon_pat_pages;);
-        eon_rops_sel == 3 ? (
-          eon_newrgn_seq += 1;
-          gmem[_eon_rops_b + EON_SS_SYNC_NEW_REQ] = eon_newrgn_seq;
-        );
+        eon_pm_open = 1; eon_pm_kind = 2;
+        eon_pm_ord  = 0; eon_pm_btn = -1;
+        eon_pm_x = mouse_x; eon_pm_y = mouse_y;
         refresh_tb = 1;
       );
     );
@@ -7412,23 +7595,18 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
       );
     );
     (mouse_cap == 2 && mstate == 0) ? (
+      // eon_pm house panel (kind 3 = chip ops, kind 4 = strip background);
+      // actions dispatch in the eon_pm EARLY block via eon_song_cmd.
       mstate = ms_tb_button_noundo;
       eon_schip = ((mouse_x - eon_sg_x0) / eon_sg_cw)|0;
-      gfx_x = mouse_x; gfx_y = mouse_y;
       (mouse_x >= eon_sg_x0 && eon_schip >= 0 && eon_schip < eon_sg_len) ? (
-        // separators don't consume menu ids (precedent: pager menu above)
-        eon_ssel = gfx_showmenu("Repeats: 1|Repeats: 2|Repeats: 3|Repeats: 4|Repeats: 6|Repeats: 8||Remove||Clear song|Commit to timeline");
-        (eon_ssel >= 1 && eon_ssel <= 6) ? (
-          eon_song_cmd(4, eon_schip + 1, eon_ssel == 5 ? 6 : (eon_ssel == 6 ? 8 : eon_ssel));
-        );
-        eon_ssel == 7 ? eon_song_cmd(2, eon_schip + 1, 0);
-        eon_ssel == 8 ? eon_song_cmd(8, 0, 0);
-        eon_ssel == 9 ? eon_song_cmd(9, 0, 0);
+        eon_pm_open = 1; eon_pm_kind = 3;
+        eon_pm_ord  = eon_schip + 1; eon_pm_btn = eon_schip;
       ) : (
-        eon_ssel = gfx_showmenu("Clear song|Commit to timeline");
-        eon_ssel == 1 ? eon_song_cmd(8, 0, 0);
-        eon_ssel == 2 ? eon_song_cmd(9, 0, 0);
+        eon_pm_open = 1; eon_pm_kind = 4;
+        eon_pm_ord  = 0; eon_pm_btn = -1;
       );
+      eon_pm_x = mouse_x; eon_pm_y = mouse_y;
       refresh_tb = 1;
     );
   );
@@ -7808,29 +7986,21 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
         );
       );
      (mouse_cap==2) ? (
-          mstate==0 ? ( // Click / Button down — EON GRID PICKER (was: raw resolution cycle)
-            mstate=ms_tb_gridmenu;
+          mstate==0 ? ( // Click / Button down — EON GRID PICKER (eon_pm house panel)
+            // noundo: the OPEN gesture edits nothing (the old blocking flow
+            // applied inside this latch; async panel applies later, and the
+            // APPLY click re-latches ms_tb_gridmenu so the undo point lands
+            // AFTER the change, not before it).
+            mstate=ms_tb_button_noundo;
             // Straight/Triplet as a coherent len+spb PAIR: the beat count stays
             // put and the bar re-divides (Elektron model — cells keep their
-            // positions, timing reinterprets). Uses the SAME apply idiom as the
-            // Len drag above (sliderchange + change_seqlen from @gfx).
+            // positions, timing reinterprets). Beats captured HERE at open; the
+            // eon_pm kind-5 click handler runs the apply.
             eon_grid_beats = steps_per_beat > 0 ? ((listlength / steps_per_beat) + 0.5)|0 : 4;
             eon_grid_beats < 1 ? eon_grid_beats = 1;
-            strcpy(#eon_gridmenu, "");
-            strcat(#eon_gridmenu, steps_per_beat==4 ? "!Straight  (16ths)|" : "Straight  (16ths)|");
-            strcat(#eon_gridmenu, steps_per_beat==3 ? "!Triplet  (8th triplets)||" : "Triplet  (8th triplets)||");
-            strcat(#eon_gridmenu, steps_per_beat==8 ? "!Fine straight  (32nds)|" : "Fine straight  (32nds)|");
-            strcat(#eon_gridmenu, steps_per_beat==6 ? "!Fine triplet  (16th triplets)" : "Fine triplet  (16th triplets)");
-            eon_grid_sel = gfx_showmenu(#eon_gridmenu);
-            eon_grid_spb = eon_grid_sel==1 ? 4 : eon_grid_sel==2 ? 3 : eon_grid_sel==3 ? 8 : eon_grid_sel==4 ? 6 : 0;
-            eon_grid_spb ? (
-              eon_grid_len = eon_grid_beats * eon_grid_spb;
-              eon_grid_len < 2 ? eon_grid_len = 2;
-              eon_grid_len > max_seqlength ? eon_grid_len = max_seqlength;
-              steps_per_beat = eon_grid_spb;         // shared tail below publishes slider9/spb_pat
-              sliderchange(slider3 = eon_grid_len);
-              change_seqlen(eon_grid_len);           // sets listlength itself; no-op when equal
-            );
+            eon_pm_open = 1; eon_pm_kind = 5;
+            eon_pm_ord  = eon_grid_beats; eon_pm_btn = -1;
+            eon_pm_x = mouse_x; eon_pm_y = mouse_y;
 	  );
       );
       sliderchange(slider9=steps_per_beat);
@@ -8110,6 +8280,21 @@ refresh_cc_controls ? (
 // EON: deep-teal LCD backdrop behind the STEP GRID only (x >= pkw); the lane-label
 // column (0..pkw) is left to draw_drum_note so its names/glyphs/colours survive
 colorscheme==10 ? (
+  (eon_pat_sync && eon_selrc > 0) ? (
+    // P3b-4f: SYNCED grid wears its DM REGION's colour — same packed RGB the
+    // selected chip draws (captured in draw_pat_button), backdrop + empty-cell
+    // pair derived by hue-preserving luminance scaling so every region lands
+    // at the same board darkness. Depth order mirrors the hue branch below:
+    // backdrop lightest (gaps read as light gridlines), first-beat cells
+    // brighter than off-beat cells on a dark board. Standalone is untouched.
+    eon_srr = ((eon_selrc/65536)|0)/255; eon_srg = (((eon_selrc/256)|0)%256)/255; eon_srb = (eon_selrc%256)/255;
+    eon_srm = max(max(eon_srr, eon_srg), eon_srb);
+    eon_srm < 0.02 ? eon_srm = 0.02;
+    gfx_set(eon_srr*(0.26/eon_srm), eon_srg*(0.26/eon_srm), eon_srb*(0.26/eon_srm), 1);
+    gfx_x=pkw; gfx_y=tbh; gfx_rectto(gfx_w, grid_bottom);
+    eon_pc24r=eon_srr*(0.22/eon_srm); eon_pc24g=eon_srg*(0.22/eon_srm); eon_pc24b=eon_srb*(0.22/eon_srm);
+    eon_pc25r=eon_srr*(0.15/eon_srm); eon_pc25g=eon_srg*(0.15/eon_srm); eon_pc25b=eon_srb*(0.15/eon_srm);
+  ) :
   pattern_hue[p] < 0 ? (   // cream/default pattern -> MPC cream board (matches the housing the plugin sits in)
     gfx_set(0.55, 0.52, 0.46, 1); gfx_x=pkw; gfx_y=tbh; gfx_rectto(gfx_w, grid_bottom);   // darker-cream gridlines (clear grid)
     eon_pc24r=0.75; eon_pc24g=0.72; eon_pc24b=0.66;   // empty cell, first beat (medium cream -> beat grouping)
@@ -9058,6 +9243,95 @@ eon_lm_open ? (
   gfx_setfont(0);
 );
 
+// EON P3b-4f: pattern-tab / pager context menu -- house style (lane-menu clone).
+// Header = the pattern's live name from the courier name band (same NAMEPAGE
+// gate the tabs use; falls back to "PATTERN N"), or "PATTERNS" on the pager.
+// The Change color row wears a right-aligned swatch of the region's CURRENT
+// colour (RGNCOL window, same cells the tab chips read). Divider before the
+// last row of both kinds (destructive Delete / New pattern).
+eon_pm_open ? (
+  // OPEN-frame geometry: the early block ran before the opener this frame, so
+  // recompute the kind-derived metrics here -- otherwise the first frame paints
+  // the PREVIOUS panel's size (first-ever open: invisible; kind switch: cropped).
+  eon_pm_hh = 22; eon_pm_rh = 19;
+  eon_pm_n = eon_pm_kind == 3 ? 9 : eon_pm_kind == 4 ? 2 : eon_pm_kind == 5 ? 4 : 3;
+  eon_pm_w = eon_pm_kind == 5 ? 190 : 150;
+  eon_pm_h = eon_pm_hh + eon_pm_n*eon_pm_rh;
+  gfx_set(0,0,0,0.30);         gfx_rect(eon_pm_x+3, eon_pm_y+4, eon_pm_w, eon_pm_h);   // shadow
+  gfx_set(0.84,0.81,0.76,1.0); gfx_rect(eon_pm_x, eon_pm_y, eon_pm_w, eon_pm_h);       // cream panel
+  gfx_set(0.40,0.37,0.32,1.0); gfx_rect(eon_pm_x, eon_pm_y, eon_pm_w, eon_pm_h, 0);    // border
+  gfx_set(0.10,0.26,0.35,1.0); gfx_rect(eon_pm_x, eon_pm_y, eon_pm_w, eon_pm_hh);      // teal header
+  gfx_setfont(7,"Verdana",12,'b'); gfx_set(0.92,0.95,0.97,1.0);
+  gfx_x = eon_pm_x+8; gfx_y = eon_pm_y+4;
+  eon_pm_kind == 1 ? (
+    strcpy(#eon_pmt, "");
+    (eon_pm_btn >= 0 && eon_pm_btn < 8
+     && (gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_NAMEPAGE]|0) == eon_pat_base + 1) ? (
+      eon_rgnname(eon_pm_btn, #eon_pmt, 18);
+    );
+    strlen(#eon_pmt) == 0 ? sprintf(#eon_pmt, "PATTERN %d", eon_pm_ord);
+    gfx_drawstr(#eon_pmt);
+  ) :
+  eon_pm_kind == 3 ? (
+    strcpy(#eon_pmt, "");
+    eon_pm_btn >= 0 ? eon_songname(eon_pm_btn, #eon_pmt, 16);
+    strlen(#eon_pmt) == 0 ? sprintf(#eon_pmt, "ENTRY %d", eon_pm_ord);
+    gfx_drawstr(#eon_pmt);
+  ) : (
+    gfx_drawstr(eon_pm_kind == 2 ? "PATTERNS" : eon_pm_kind == 4 ? "SONG" : "GRID");
+  );
+  // current-item row: song chip = its live repeat count; grid = live steps_per_beat
+  eon_pm_cur = -1;
+  eon_pm_kind == 3 && eon_pm_btn >= 0 ? (
+    eon_pm_rep = (gmem[eon_sg_b + 8 + eon_pm_btn*2]|0)/256|0; eon_pm_rep < 1 ? eon_pm_rep = 1;
+    eon_pm_cur = eon_pm_rep <= 4 ? eon_pm_rep - 1 : eon_pm_rep == 6 ? 4 : eon_pm_rep == 8 ? 5 : -1;
+  );
+  eon_pm_kind == 5 ? (
+    eon_pm_cur = steps_per_beat == 4 ? 0 : steps_per_beat == 3 ? 1 :
+                 steps_per_beat == 8 ? 2 : steps_per_beat == 6 ? 3 : -1;
+  );
+  eon_pm_tx = eon_pm_cur >= 0 ? 20 : 10;   // dot gutter only on kinds that mark a current row
+  gfx_setfont(7,"Verdana",12);
+  eon_pm_r = 0;
+  loop(eon_pm_n,
+    eon_pm_ry = eon_pm_y + eon_pm_hh + eon_pm_r*eon_pm_rh;
+    eon_pm_hrow == eon_pm_r ? (
+      gfx_set(0.10,0.26,0.35,1.0); gfx_rect(eon_pm_x+1, eon_pm_ry, eon_pm_w-2, eon_pm_rh);   // teal hover row
+      gfx_set(0.95,0.97,1.0,1.0);
+    ) : (
+      (eon_pm_kind == 1 && eon_pm_r == 2
+       && (gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_DM_RGNCNT]|0) < eon_pm_ord)
+        ? gfx_set(0.52,0.49,0.44,1.0)      // greyed: no region behind this tab yet (lane-menu grey)
+      : eon_pm_r == eon_pm_cur
+        ? gfx_set(0.10,0.30,0.40,1.0)      // current = teal text (lane-menu channel idiom)
+        : gfx_set(0.16,0.14,0.10,1.0);
+    );
+    gfx_x = eon_pm_x+eon_pm_tx; gfx_y = eon_pm_ry+3;
+    eon_pm_rowlbl(#eon_pmn, eon_pm_kind, eon_pm_r);
+    gfx_drawstr(#eon_pmn);
+    eon_pm_r == eon_pm_cur ? (
+      gfx_set(0.10,0.30,0.40,1.0);
+      gfx_circle(eon_pm_x+11, (eon_pm_ry+eon_pm_rh*0.5)|0, 3, 1, 1);
+    );
+    // current-colour swatch on the Change color row (packed r*65536+g*256+b; 0 = unpublished)
+    (eon_pm_kind == 1 && eon_pm_r == 1 && eon_pm_btn >= 0) ? (
+      eon_pm_pc = gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_RGNCOL + eon_pm_btn]|0;
+      eon_pm_pc > 0 ? (
+        gfx_set(((eon_pm_pc/65536)|0)/255, (((eon_pm_pc/256)|0)%256)/255, (eon_pm_pc%256)/255, 1.0);
+        gfx_rect(eon_pm_x+eon_pm_w-19, eon_pm_ry+5, 9, 9);
+        gfx_set(0.40,0.37,0.32,0.9); gfx_rect(eon_pm_x+eon_pm_w-19, eon_pm_ry+5, 9, 9, 0);
+      );
+    );
+    // group dividers: k3 after Repeats-8 and Remove; k4 none; others before last row
+    (eon_pm_kind == 3 ? (eon_pm_r == 5 || eon_pm_r == 6)
+     : eon_pm_kind == 4 ? 0 : eon_pm_r == 1) ? (
+      gfx_set(0.55,0.51,0.44,0.6); gfx_rect(eon_pm_x+6, eon_pm_ry+eon_pm_rh-1, eon_pm_w-12, 1);
+    );
+    eon_pm_r += 1;
+  );
+  gfx_setfont(0);
+);
+
 eon_so_open ? (
   eon_so_click = (mouse_cap&1) && !eon_so_clk_last;
 
@@ -9154,9 +9428,10 @@ eon_so_open ? (
   eon_so_ry+=30;
 
   // Sync on by default (MACHINE-WIDE, bridge-persisted via ExtState): fresh
-  // StepSeq instances engage Sync (DM) automatically when the bridge first
-  // pairs them — insert and go, no settings trip. Mirror = sync-band fields
-  // 49-51 (values + set-request); the bridge republishes canon every tick.
+  // StepSeq instances now ship with slider49 ON (insert and go, bridge or not);
+  // this option makes an explicit Off stick — the bridge pushes the machine
+  // default (on OR off) onto a fresh instance at its first pairing. Mirror =
+  // sync-band fields 49-51 (values + set-request); bridge republishes per tick.
   eon_so_b = eon_pair_slot >= 0 ? EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE : -1;
   eon_opt_so = eon_so_b >= 0 && gmem[eon_so_b + EON_SS_SYNC_OPT_SO] > 0.5;
   gfx_set(0.14,0.16,0.14,1); gfx_x=eon_so_lx; gfx_y=eon_so_ry+4; gfx_drawstr("Sync on by default");

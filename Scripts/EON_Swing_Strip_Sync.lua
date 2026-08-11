@@ -909,6 +909,18 @@ local function loop()
   tick = tick + 1
   hb_counter = hb_counter + 1
 
+  -- Script-level "I am running" heartbeat, read by the Kit Bridge so it can
+  -- start this script when nothing else has. Both names live in rk_lua_core so
+  -- the writer and the reader cannot drift apart.
+  -- ⚠️ Deliberately NOT the per-instance GS_STRIP_OFF_LUA_HB heartbeat: that one
+  -- only begins once an instance's strips are inserted and migrated, so it reads
+  -- "dead" in exactly the situation the bridge needs to detect — no strips yet.
+  -- ExtState rather than a gmem cell: no new cell to claim, and a non-persistent
+  -- ExtState is cleared by REAPER on restart, so a value can never outlive the
+  -- session that wrote it. time_precise is session-relative, so both sides agree.
+  reaper.SetExtState(core.ALIVE_STRIP_SYNC_SECTION, core.ALIVE_STRIP_SYNC_KEY,
+                     tostring(reaper.time_precise()), false)
+
   -- Fast scan (~170 ms) until every detected multi-out instance has its
   -- strips adopted, then settle to ~1 Hz. Cuts the project-open adoption
   -- lapse from "up to a second per stage" to near-instant without paying

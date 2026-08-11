@@ -50,6 +50,7 @@ M.CAT.toggles = {
   { "Grid",           "EON_Swing_ToggleGrid.lua",          checked = chk.grid  },
   { "Paint",          "EON_Swing_TogglePaint.lua",         checked = chk.paint },
   { "Step Sequencer", "EON_Swing_ToggleStepSeq.lua" },
+  { "Swing Window",   "EON_Toggle_Swing_Window.lua" },
   { "Pad FX",         "EON_Toggle_Swing_PadFX.lua" },
   { "Media Explorer", "EON_Swing_ToggleMediaExplorer.lua", checked = chk.media },
 }

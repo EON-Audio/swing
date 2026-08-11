@@ -119,7 +119,7 @@ local(_ki, _cj, _cn, _cnl, gi)  // localized 2026-07-09: these globals raced the
 (
   multi_out = 1;
   gi = 0; loop(NUM_PADS, p_output[gi] = gi; gi += 1;);
-  mark_dirty_kit();
+  _kd_site = 6; mark_dirty_kit();
   gmem[KIT_GMEM_LOCK] = instance_id;
   _ki = 0; loop(NUM_PADS,
     _cn = get_cname_slot(_ki);
@@ -1255,7 +1255,7 @@ function swing_panels_draw_controls() (
   gfx_set(1, 1, 1, 1);
   gfx_measurestr("CLEAR", tw, th);
   gfx_x = _btn1_x + (_btn_full_w - tw) / 2; gfx_y = _clr_y + (_btn_h - th) / 2; gfx_drawstr("CLEAR");
-  mx >= _btn1_x && mx <= _btn1_x+_btn_full_w && my >= _clr_y && my <= _clr_y+_btn_h ? swing_tooltip_check(20, "Clear all 16 pads (audio + names + per-pad FX). Asks for confirmation. Ctrl+Z restores everything via REAPER's undo.");
+  mx >= _btn1_x && mx <= _btn1_x+_btn_full_w && my >= _clr_y && my <= _clr_y+_btn_h ? swing_tooltip_check(20, "Clear all 16 pads (audio + names + per-pad FX). Asks for confirmation. Undo restores everything.");
   // CLEAR confirmation menu (migrated). The original menu had "---" + " "
   // dummy entries after the confirm item as visual padding; we just keep
   // the confirm option since the Strip popup needs no padding.
@@ -1445,6 +1445,34 @@ function swing_panels_draw_controls() (
 
 );
 
+// ── Master VOL taper (dB ⇄ knob position) ─────────────────────────────────
+// The value range is deliberately lopsided — 48 dB of cut against 12 dB of
+// boost — so a LINEAR value→angle map lands unity at 80% of the 260° sweep:
+// the arc reads "nearly maxed" on an untouched instance. These two functions
+// warp between dB and knob POSITION (0..1 along the sweep) so 0 dB sits at
+// exactly 0.5 = 12 o'clock:
+//
+//   pos = ((db + 48) / 60) ^ 3.106284        db = -48 + 60 * pos ^ 0.3219281
+//
+// The exponent is ln(0.5)/ln(0.8) — the only value that maps unity's linear
+// norm (0.8) onto the midpoint. Quarter points: 25% = -9.6 dB, 50% = 0 dB,
+// 75% = +6.7 dB. Wanted side effect: drag and scroll are position-relative,
+// so both get finer around unity (~0.6 dB per scroll tick vs 1.08 before) and
+// coarser on the dive to silence.
+//
+// Deliberately NOT in knobs_kbsg.jsfx-inc: jog_knob_draw and ssl_knob_interact
+// both work in whatever units the caller passes, so handing them a 0..1
+// position leaves every other knob in the bundle — and the Forge preview
+// port of the shared lib — completely untouched.
+function swing_panels_mvol_db2pos(_db) (
+  pow(max(0, min(1, (_db + 48) / 60)), 3.106284);
+);
+// Inverse, snapped to the slider's own 0.1 dB step so the round trip can never
+// produce values like -0.0374 that would write back forever.
+function swing_panels_mvol_pos2db(_p) (
+  floor((-48 + 60 * pow(max(0, min(1, _p)), 0.3219281)) * 10 + 0.5) / 10;
+);
+
 function swing_panels_draw_master() (
   // Available area below last button row
   _ctrl_area_y = _btn7_y + _btn_h + 8;
@@ -1593,20 +1621,27 @@ function swing_panels_draw_master() (
   _mvol_cx = _drv_zone_w + _knob_zone_w / 2;
   _mvol_cy = _ctrl_area_y + (_ctrl_area_h / 2)|0;
 
-  // Master vol is now logged as dB (ver 40+). Knob reads -60..+12 dB,
-  // default 0 dB = unity gain. Conversion to linear amplitude happens
-  // in Swing_ReaKit.jsfx @slider where it sets global_vol from master_db.
+  // Master vol is logged as dB (ver 40+): -48 dB (silence) .. +12 dB, default
+  // 0 dB = unity gain. The knob is driven in POSITION space (0..1) through the
+  // taper above so unity sits at 12 o'clock instead of 80% round. Conversion to
+  // linear amplitude still happens in Swing_ReaKit.jsfx @slider, from master_db.
   // Tooltip: zone 21 = master VOL knob. Hitbox matches the interact zone.
   _mvol_dx = mx - _mvol_cx; _mvol_dy = my - _mvol_cy;
   _mvol_dx*_mvol_dx + _mvol_dy*_mvol_dy <= (_mvol_r+6)*(_mvol_r+6) ?
-    swing_tooltip_check(21, "Master output volume (-48 dB silence to +6 dB). Drag, scroll, or double-click to reset to 0 dB (unity).");
-  jog_knob_draw(_mvol_cx, _mvol_cy, _mvol_r, master_db, -48, 6, km_master_vol[0],
+    swing_tooltip_check(21, "Master output volume (-48 dB silence to +12 dB). Drag, scroll, or double-click to reset to 0 dB (unity).");
+  _mvol_pos = swing_panels_mvol_db2pos(master_db);
+  jog_knob_draw(_mvol_cx, _mvol_cy, _mvol_r, _mvol_pos, 0, 1, km_master_vol[0],
                 0.15, 0.55, 1.0);
 
-  // Interact: drag, scroll, double-click reset to 0 dB (unity)
-  nv = jog_knob_interact(km_master_vol, _mvol_cx, _mvol_cy, _mvol_r + 6, master_db, -48, 6, 0, 0);
-  nv != master_db ? (
-    master_db = nv;
+  // Interact: drag, scroll, double-click reset to 0 dB (= position 0.5).
+  // The change test is in POSITION space, not dB: when the knob is untouched
+  // jog_knob_interact hands back cur_val bit-identical, so an automation
+  // envelope driving master_db to a non-0.1 value is never snapped and written
+  // back underneath itself.
+  _mvol_np = jog_knob_interact(km_master_vol, _mvol_cx, _mvol_cy, _mvol_r + 6,
+                               _mvol_pos, 0, 1, 0.5, 0);
+  _mvol_np != _mvol_pos ? (
+    master_db = swing_panels_mvol_pos2db(_mvol_np);
     slider2 = master_db;
     slider_automate(slider2);
     // Recompute global_vol immediately so the next @sample uses the new amp

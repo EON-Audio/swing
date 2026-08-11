@@ -58,6 +58,17 @@ local _sep = package.config:sub(1,1)
 package.path = _SCRIPT_DIR .. _sep .. "?.lua;" .. (package.path or "")
 local core = require("rk_lua_core")
 
+-- Styled dialog module (ReaImGui). pcall'd: a missing file or missing ReaImGui
+-- is fine -- every call site keeps its native GetUserInputs/ShowMessageBox
+-- fallback and gates on eon_dlg.available() per the module's contract.
+-- ⚠️ its prompts are ASYNC (callback) -- do the work inside on_ok, never after
+-- the call.
+local eon_dlg
+do
+  local ok, m = pcall(dofile, _SCRIPT_DIR .. _sep .. "EON" .. _sep .. "eon_imgui_dialog.lua")
+  if ok and type(m) == "table" then eon_dlg = m end
+end
+
 -- EON unified theme publisher → JSFX gmem color band. rk_lua_theme resolves the
 -- selected palette (EON / Dark / Light / REAPER); core.publish_theme_band writes
 -- it to the shared band so the Swing + StepSeq JSFX re-skin in step with the
@@ -201,6 +212,56 @@ function eon_padcat_from_load(pad, kit_cat, name, path)
   reaper.gmem_write(b + 3, 0)                       -- LOCK stays off for unlocked pads
   reaper.gmem_write(b + 0, eon_padcat_ver)          -- VER LAST (seqlock)
   if pad == 15 then eon_padcat_pext_write(slot); eon_padcat_adapt_compute(slot) end
+end
+-- User pad-RENAME → category re-inference (user 2026-08-10: renaming a pad to
+-- an instrument name should move its badge to that category). Direct sibling
+-- of the REQ mailbox's Auto branch (same classify, same confidence gate) —
+-- but a rename is FRESH name authority, so it also refreshes a pad the user
+-- had previously badged (the rename is the newer intent). Hard guards only:
+-- the audio LOCK (+3) always wins, NONE (-3) always wins (an ANSWER,
+-- published verbatim, never re-inferred — same contract as the Auto branch),
+-- and an unconfident / "other" classification keeps the current badge rather
+-- than clearing a working lane mapping ("Blorp 3" is not a category). SRC
+-- (+2) is left untouched — renaming doesn't change where the pad's sample
+-- came from (FILL's SRC==2 refusal must survive a rename).
+-- Core takes a KNOWN (slot, pad): shared by the CMD-50 rename dialog (slot
+-- from the LOCK cell) and the TCP child-track rename adoption (slot from the
+-- identity walker).
+function eon_padcat_apply_rename(slot, pad, name)
+  if not _bridge_categorizer or not name or name == "" then return end
+  if slot < 0 or slot > 15 or pad < 0 or pad > 15 then return end
+  -- A name filling the whole 32-char transport is a suspected TRUNCATION
+  -- (same rule as the backfill): classifying a chopped tail flips hat
+  -- articulations ("...Hi Hat Open" -> "...Hi Hat "). Keep the badge.
+  if #name >= 32 then return end
+  local b = EON_PADCAT_BASE + slot * EON_PADCAT_STRIDE + pad * 4
+  if (reaper.gmem_read(b + 3) or 0) > 0.5 then return end       -- LOCKed pad
+  local curix = math.floor((reaper.gmem_read(b + 1) or -1) + 0.5)
+  if (reaper.gmem_read(b) or 0) > 0 and curix == EON_PADCAT_NONE then return end
+  local c, conf = _bridge_categorizer.classify(name)
+  if not (conf and c) then return end
+  local newix = eon_padcat_index(c)                             -- -1 for "other"/unknown
+  if newix < 0 then return end
+  if (reaper.gmem_read(b) or 0) > 0 and newix == curix then return end
+  eon_padcat_ver = eon_padcat_ver + 1
+  reaper.gmem_write(b + 1, newix)
+  reaper.gmem_write(b + 0, eon_padcat_ver)                      -- VER LAST (seqlock)
+  eon_padcat_pext_write(slot)
+end
+-- Dialog-route wrapper: slot from the LOCK cell, same as the loaders — the
+-- CMD-50 rename flow holds it until the JSFX consumes CMD 51.
+function eon_padcat_from_rename(pad, name)
+  local _id = math.floor((reaper.gmem_read(97) or 0) + 0.5)
+  local slot = -1
+  if _id > 0 then
+    for _s = 0, core.GMEM.GS_INST_REG_MAX - 1 do
+      if math.floor(reaper.gmem_read(
+           core.GMEM.GS_INST_REG_BASE + _s * core.GMEM.GS_INST_REG_STRIDE
+           + core.GMEM.GS_INST_REG_OFF_ID) or 0) == _id then slot = _s break end
+    end
+    if slot < 0 then slot = _id - 1 end
+  end
+  eon_padcat_apply_rename(slot, pad, name)
 end
 -- ③ ADAPT (spec rev 2026-07-23; articulation-safe rework 2026-08-04): after a
 -- positional load, compute the LANE PERMUTATION that re-aims patterns at their
@@ -908,6 +969,7 @@ function eon_courier_tick()
   -- window base+1..base+16. F_SELORD = ABSOLUTE selected ordinal (0 = old JSFX/unset ->
   -- fall back to the positional PATIDX map).
   local F_REN_REQ, F_OP_ORD, F_DEL_REQ, F_PAGE, F_SELORD = 17, 18, 19, 40, 41
+  local F_COL_REQ = 54  -- change-color request (52 = seq-window heartbeat, NOT free)
   -- P3b-4b region NAMES (courier -> StepSeq): per-slot char band at
   -- RGNNAME_BASE + slot*320 = 8 windowed names x 32 chars 0-terminated (window =
   -- the F_PAGE colour window) + the SELECTED ordinal's name at +256. Key fields
@@ -1497,9 +1559,25 @@ function eon_courier_tick()
         -- right-click Rename below; the DM pattern-bar "+" prompts on its own.
         if nidx and C.pattern_regions.Rename then
           local nreg = C.pattern_regions.GetByIndex and C.pattern_regions.GetByIndex(nidx)
-          local okd, nm = reaper.GetUserInputs('Name new pattern', 1,
-            'Name:,extrawidth=220', (nreg and nreg.name) or '')
-          if okd and nm and nm ~= '' then C.pattern_regions.Rename(nidx, nm) end
+          local defname = (nreg and nreg.name) or ''
+          -- Styled prompt when ReaImGui is present (ASYNC -- the rename runs in
+          -- on_ok); native GetUserInputs otherwise. Cancel keeps the default.
+          local shown = eon_dlg and eon_dlg.available() and eon_dlg.open({
+            title = 'Name new pattern', ok_label = 'Name',
+            fields = { { key = 'name', label = 'Name', value = defname } },
+            on_ok = function(v)
+              if v.name and v.name ~= '' then
+                -- idx-reuse guard (see the rename handler below)
+                local cur = C.pattern_regions.GetByIndex and C.pattern_regions.GetByIndex(nidx)
+                if cur and cur.name == defname then C.pattern_regions.Rename(nidx, v.name) end
+              end
+            end,
+          })
+          if not shown then
+            local okd, nm = reaper.GetUserInputs('Name new pattern', 1,
+              'Name:,extrawidth=220', defname)
+            if okd and nm and nm ~= '' then C.pattern_regions.Rename(nidx, nm) end
+          end
         end
       end
     end
@@ -1507,6 +1585,19 @@ function eon_courier_tick()
     -- ordinal in F_OP_ORD (written before the counter bump). Both open a modal — the
     -- courier is pcall'd and the bridge tolerates a blocked tick (same precedent as
     -- the Rename Pad GetUserInputs dialog). Baseline on first observation.
+    -- Tab 1 exists even with ZERO regions (the StepSeq floors its tab count at 1),
+    -- so Rename/Change-color on a fresh project used to silently no-op. For that
+    -- one tab, seed the first region via the same New() path the '+' uses, then
+    -- run the op on it. Delete stays a no-op (the JSFX greys the row instead).
+    local function rgn_for_op(ord)
+      local rl = region_list()
+      local reg = rl[ord]
+      if not reg and ord == 1 and #rl == 0
+         and C.pattern_regions and C.pattern_regions.New then
+        if C.pattern_regions.New(nil) then reg = region_list()[1] end
+      end
+      return reg
+    end
     local renreq = math.floor((gr(b + F_REN_REQ) or 0) + 0.5)
     C.ren_last = C.ren_last or {}
     if C.ren_last[slot] == nil then
@@ -1515,11 +1606,26 @@ function eon_courier_tick()
       C.ren_last[slot] = renreq
       if renreq > 0 and on and C.pattern_regions and C.pattern_regions.Rename then
         local ord = math.floor((gr(b + F_OP_ORD) or 0) + 0.5)
-        local reg = region_list()[ord]
+        local reg = rgn_for_op(ord)
         if reg then
-          local okd, nm = reaper.GetUserInputs('Rename pattern ' .. ord, 1,
-            'Name:,extrawidth=220', reg.name or '')
-          if okd then C.pattern_regions.Rename(reg.idx, nm) end
+          local shown = eon_dlg and eon_dlg.available() and eon_dlg.open({
+            title = 'Rename pattern ' .. ord, ok_label = 'Rename',
+            fields = { { key = 'name', label = 'Name', value = reg.name or '' } },
+            on_ok = function(v)
+              -- idx can be REUSED while the dialog sits open (delete the region
+              -- in the ruler + add another -> REAPER hands out the lowest free
+              -- number). Act only if idx still holds the region we opened on.
+              local cur = C.pattern_regions.GetByIndex(reg.idx)
+              if cur and cur.name == reg.name then
+                C.pattern_regions.Rename(reg.idx, v.name or '')
+              end
+            end,
+          })
+          if not shown then
+            local okd, nm = reaper.GetUserInputs('Rename pattern ' .. ord, 1,
+              'Name:,extrawidth=220', reg.name or '')
+            if okd then C.pattern_regions.Rename(reg.idx, nm) end
+          end
         end
       end
     end
@@ -1534,9 +1640,41 @@ function eon_courier_tick()
         local reg = region_list()[ord]
         if reg then
           local label = (reg.name and reg.name ~= '') and ('"' .. reg.name .. '"') or ('#' .. ord)
-          if reaper.ShowMessageBox('Delete pattern ' .. label .. ' and its region?',
-               'EON StepSeq', 4) == 6 then
-            C.pattern_regions.Delete(reg.idx)
+          local msg = 'Delete pattern ' .. label .. ' and its region?'
+          local function do_delete()
+            -- Same idx-reuse guard as Rename: never delete a region that is no
+            -- longer the one the confirm was opened on (destructive op).
+            local cur = C.pattern_regions.GetByIndex(reg.idx)
+            if cur and cur.name == reg.name then C.pattern_regions.Delete(reg.idx) end
+          end
+          local shown = eon_dlg and eon_dlg.available() and eon_dlg.confirm and eon_dlg.confirm({
+            title = 'Delete pattern', ok_label = 'Delete',
+            message = msg, on_ok = do_delete,
+          })
+          if not shown then
+            if reaper.ShowMessageBox(msg, 'EON StepSeq', 4) == 6 then do_delete() end
+          end
+        end
+      end
+    end
+    -- Change color (StepSeq right-click menu): ordinal in F_OP_ORD like REN/DEL.
+    -- GR_SelectColor is the native modal picker — same blocked-tick precedent as
+    -- the Rename dialog. Cancel returns retval 0 -> no write. The new colour
+    -- reaches the StepSeq tabs on its own: the 22..37 colour window republishes
+    -- from live region colours every tick.
+    local colreq = math.floor((gr(b + F_COL_REQ) or 0) + 0.5)
+    C.col_last = C.col_last or {}
+    if C.col_last[slot] == nil then
+      C.col_last[slot] = colreq
+    elseif colreq ~= C.col_last[slot] then
+      C.col_last[slot] = colreq
+      if colreq > 0 and on and C.pattern_regions and C.pattern_regions.SetColor then
+        local ord = math.floor((gr(b + F_OP_ORD) or 0) + 0.5)
+        local reg = rgn_for_op(ord)
+        if reg then
+          local okc, ncol = reaper.GR_SelectColor(nil)
+          if okc and okc ~= 0 and ncol then
+            C.pattern_regions.SetColor(reg.idx, ncol)
           end
         end
       end
@@ -1908,6 +2046,91 @@ function eon_preset_browser_launch_tick()
     reaper.AddRemoveReaScript(false, 0, browser_path, true)
     eon_browser_launch_t = now
   end
+end
+
+-- ── Start EON_Swing_Strip_Sync if nothing else has ───────────────────────────
+-- That script is what puts an EON Drum Strip on each multi-out child track --
+-- it is the ONLY file that inserts one. It is a background defer script, so it
+-- has to be RUNNING, and it only adds itself to __startup.lua after a human has
+-- run it once from the Action List.
+-- ⚠️ Nothing ever did that for a customer: neither installer nor ReaPack writes
+-- a startup entry for it, and no guide mentions it. On a real install it was not
+-- even in the action list, so multi-out never grew strips -- while dev machines
+-- had the startup entry from an old manual run, which is why this looked fine
+-- here and worked nowhere else. The bridge is the right place to fix it: it is
+-- already running everywhere, and it is the one script customers ARE told to run.
+--
+-- ⛔ Launched at most ONCE per bridge session, never retried. Re-running a live
+-- defer script makes REAPER put up a modal "already running" prompt, and
+-- strip_sync itself MB()s and exits when SWS is missing -- a retry loop would
+-- turn either into a dialog storm the user cannot dismiss.
+-- ⛔ Registered and left registered: strip_sync's own self_register() writes the
+-- resulting command ID into __startup.lua, so unregistering after launch (the
+-- idiom the two browsers above use, correctly, as they are one-shot dialogs)
+-- would leave a dead ID there and it would strip itself back out on next launch.
+--
+-- After launching, we watch for its heartbeat and print ONE console line if it
+-- fails to appear -- strip_sync exits with a MB() when SWS is missing, and
+-- without this the bridge would just look like it had done nothing at all.
+local eon_ss_state        = 'init'   -- 'init' → 'launched' → 'confirmed' | 'unresponsive'
+local eon_ss_ensure_first = nil
+local eon_ss_launch_t     = nil
+function eon_strip_sync_ensure_tick()
+  if eon_ss_state == 'confirmed' or eon_ss_state == 'unresponsive' then return end
+  local now = reaper.time_precise()
+
+  -- Post-launch watch: give strip_sync a window to write its first heartbeat,
+  -- then warn once if none appears. Do NOT retry the launch itself — that risks
+  -- the dialog storm the top-of-function comment describes.
+  if eon_ss_state == 'launched' then
+    local stamp = tonumber(reaper.GetExtState(core.ALIVE_STRIP_SYNC_SECTION,
+                                              core.ALIVE_STRIP_SYNC_KEY) or "")
+    if stamp and (now - stamp) < core.ALIVE_STALE_S then
+      eon_ss_state = 'confirmed'
+      return
+    end
+    if (now - eon_ss_launch_t) > 8.0 then
+      eon_ss_state = 'unresponsive'
+      reaper.ShowConsoleMsg("[EON] EON_Swing_Strip_Sync.lua was launched but is not " ..
+        "writing heartbeats -- it likely exited on startup (SWS extension missing?).\n" ..
+        "  Multi-out tracks will not get an EON Drum Strip.\n")
+    end
+    return
+  end
+
+  -- Grace period. Both scripts can sit in __startup.lua, and the bridge may well
+  -- get its first tick in before strip_sync has written a single heartbeat.
+  -- Without this the bridge would race its own sibling and launch a second copy.
+  if not eon_ss_ensure_first then eon_ss_ensure_first = now; return end
+  if (now - eon_ss_ensure_first) < 5.0 then return end
+
+  local stamp = tonumber(reaper.GetExtState(core.ALIVE_STRIP_SYNC_SECTION,
+                                            core.ALIVE_STRIP_SYNC_KEY) or "")
+  if stamp and (now - stamp) < core.ALIVE_STALE_S then
+    eon_ss_state = 'confirmed'         -- already running (startup entry, or by hand)
+    return
+  end
+
+  local path = _SCRIPT_DIR:gsub("[/\\]+", "/"):gsub("/+$", "")
+                          .. "/EON_Swing_Strip_Sync.lua"
+  local f = io.open(path, "r")
+  if not f then
+    eon_ss_state = 'unresponsive'
+    reaper.ShowConsoleMsg("[EON] EON_Swing_Strip_Sync.lua is missing (" .. path ..
+      ")\n  Multi-out tracks will not get an EON Drum Strip. Reinstall Swing.\n")
+    return
+  end
+  f:close()
+  local cmd_id = reaper.AddRemoveReaScript(true, 0, path, true)
+  if not cmd_id or cmd_id <= 0 then
+    eon_ss_state = 'unresponsive'
+    reaper.ShowConsoleMsg("[EON] Could not add EON_Swing_Strip_Sync.lua to the " ..
+      "Action List -- multi-out tracks will not get an EON Drum Strip.\n")
+    return
+  end
+  reaper.Main_OnCommand(cmd_id, 0)
+  eon_ss_state    = 'launched'
+  eon_ss_launch_t = now
 end
 
 -- GROOVE S3: the StepSeq groove menu's "Import grooves..." row bumps GRV_OPEN_REQ
@@ -2903,7 +3126,14 @@ local function _eon_sweep_temp_audio()
     local fname = reaper.EnumerateFiles(dir, i)
     if not fname or fname == "" then break end
     if fname:lower():match("%.wav$") then
-      files[#files + 1] = dir .. "\\" .. fname
+      -- ⚠️ Was a hard-coded "\\" — the one join in this group that did not use
+      -- the platform separator (_eon_temp_audio_dir and _eon_temp_audio_path
+      -- both do). os.remove then got "/tmp/eon_swing_pitch\name.wav", which
+      -- matches nothing on Mac or Linux, and its return value is discarded
+      -- below, so the sweep reported nothing and deleted nothing. One
+      -- full-size WAV per pad per kit load accumulated for ever — and on
+      -- Linux /tmp is usually tmpfs, so that is RAM until reboot.
+      files[#files + 1] = dir .. package.config:sub(1, 1) .. fname
     end
     i = i + 1
   end
@@ -7366,9 +7596,9 @@ end
 -- sanitization) the user picked one name and the header showed another
 -- ("kit loaded under the wrong name" with no load bug at all). Every loader
 -- now stages the basename; the manifest name is demoted to descriptive
--- metadata, with a one-line console note on divergence so legacy files
--- "renaming themselves" is explained. GLOBAL (bridge chunk is at Lua's
--- 200-local ceiling).
+-- metadata (divergence is silent — every re-baked _v2 factory kit diverges,
+-- so a console note here fired on every factory load). GLOBAL (bridge chunk
+-- is at Lua's 200-local ceiling).
 function eon_kit_display_name(filepath, manifest_name)
   local base = (filepath or ""):match("([^/\\]+)%.[sS][wW][iI][nN][gG]$")
             or (filepath or ""):match("([^/\\]+)$")
@@ -7384,10 +7614,10 @@ function eon_kit_display_name(filepath, manifest_name)
     return manifest_name
   end
   if base and base ~= "" then
-    if manifest_name and manifest_name ~= "" and manifest_name ~= base then
-      reaper.ShowConsoleMsg(("[Swing] kit name: file %q carries internal name %q — filename wins\n")
-        :format(base, manifest_name))
-    end
+    -- Divergence is NORMAL and silent (user 2026-08-11): every re-baked _v2
+    -- factory kit carries its original internal name, so the old console
+    -- note here fired (and popped the console window) on every factory kit
+    -- load. Filename wins; the internal name is descriptive metadata only.
     return base
   end
   return (manifest_name and manifest_name ~= "") and manifest_name or "Kit"
@@ -8977,6 +9207,33 @@ function rk_ops.do_build_multiout(opts)
     return
   end
 
+  -- Put Swing into MULTI before the tracks exist. Swing's own right-click
+  -- builder calls swing_panels_multiout_prep() before it raises CMD 40, so it
+  -- is already in MULTI by the time we finish. Every route that lands here from
+  -- LUA instead -- EON_Swing_BuildMultiOut / BuildBoth, the EON menu, the Song
+  -- Starter checkbox -- skipped that, and produced the child tracks with Swing
+  -- still summing to stereo Out 1. Companion cmd 5 is the JSFX-side half.
+  --
+  -- ⚠️ MUST come AFTER the find_swing_track() bail, not before it. Posting it
+  -- first (as this originally did) left cmd 5 armed FOREVER on the no-Swing
+  -- path -- nothing exists to consume it -- so the next Swing inserted into the
+  -- project would silently adopt multi-out and reassign all 16 pad outputs out
+  -- of nowhere. There is no point commanding an instance we just proved is not
+  -- there. Swing runs gfx_idle, so its @gfx consumes this with the window
+  -- closed, and the `_ccmd > 0 && !kit_busy` gate holds it pending, not drops it.
+  -- ADDRESSED (2026-08-10): stamp the target instance BEFORE the cmd -- the
+  -- companion cell is otherwise a broadcast any instance consumes, and in a
+  -- multi-Swing project a bystander could adopt the 5 and flip the WRONG kit
+  -- to multi-out. 0 (no id readable) keeps legacy broadcast. The poll()
+  -- watchdog clears a lingering targeted cmd whose instance died mid-flight.
+  local c5tgt = 0
+  if swing_fx then
+    c5tgt = math.floor(reaper.TrackFX_GetParam(swing_track, swing_fx, 3) or 0)
+    if c5tgt < 0 then c5tgt = 0 end
+  end
+  if G.GS_COMPANION_TARGET then reaper.gmem_write(G.GS_COMPANION_TARGET, c5tgt) end
+  reaper.gmem_write(G.GS_COMPANION_CMD, 5)
+
   -- Read pad names and colors from gmem (JSFX syncs these before sending CMD=40)
   local pad_names = {}
   local pad_hues = {}
@@ -9330,7 +9587,16 @@ function rk_ops.do_build_multiout(opts)
     summary = summary .. "\n  + EON Verb Return  (ch 33/34)\n  + EON Delay Return (ch 35/36)\n"
   end
   summary = summary .. "\nSwing master send muted (audio routes through child tracks)."
-  reaper.ShowMessageBox(summary, SCRIPT_NAME, 0)
+  -- Styled + ASYNC. The old ShowMessageBox froze the WHOLE bridge (pollers,
+  -- kit loads, companion ticks) until OK was clicked -- right after a build,
+  -- which is exactly when the strip-sync work needs the bridge ticking.
+  local _, _nl = summary:gsub('\n', '')
+  local shown = eon_dlg and eon_dlg.available() and eon_dlg.open({
+    title = SCRIPT_NAME, ok_label = 'OK',
+    fields = { { key = '_info', kind = 'block', height = (_nl + 2) * 17,
+      draw = function(ctx) reaper.ImGui_TextWrapped(ctx, summary) end } },
+  })
+  if not shown then reaper.ShowMessageBox(summary, SCRIPT_NAME, 0) end
 end
 
 -- Run a script from the EON Drum Matrix folder by file name. Shared by CMD 73 /
@@ -10904,6 +11170,11 @@ function refresh_multiout_identity_per_instance()
                       reaper.gmem_write(nbx + 1, cst.ngen)  -- gen 2nd-to-last
                       reaper.gmem_write(nbx + 0, 1)         -- flag LAST
                       cst.npush = nm ; cst.npush_t = now
+                      -- Rename → category: a TCP child-track rename is the
+                      -- same fresh name authority as the rename dialog
+                      -- (guards + rationale in eon_padcat_apply_rename).
+                      -- npush latches above, so this fires once per rename.
+                      eon_padcat_apply_rename(slot, pad, nm)
                     end
                   end
                   -- MUTE/SOLO: edge-triggered two-way (E-1), same skeleton as
@@ -11084,19 +11355,25 @@ function refresh_stepseq_pairing()
             if p0n and p0n:find("Pattern") then
               reaper.TrackFX_SetParam(tr, ss_fx, 0, 0)
             end
-            -- Sync-on-open default: also engage Sync (DM) when the machine
-            -- default says so (SETTINGS "Sync on by default" -> ExtState
-            -- EON_StepSeq/sync_on_open, "0" = off, unset = on). Param resolved
-            -- BY NAME like Pair Slot above (sparse sliders).
-            if reaper.GetExtState("EON_StepSeq", "sync_on_open") ~= "0" then
-              local sync_param = nil
-              local p2 = 0
-              while p2 < np do
-                local _, pn2 = reaper.TrackFX_GetParamName(tr, ss_fx, p2, "")
-                if pn2 and pn2:find("Sync Mode") then sync_param = p2; break end
-                p2 = p2 + 1
+            -- Sync-on-open default: enforce the machine default (SETTINGS
+            -- "Sync on by default" -> ExtState EON_StepSeq/sync_on_open,
+            -- "0" = off, unset = on). slider49 now DEFAULTS ON in the JSFX
+            -- (a Steppa inserted with no Swing still comes up armed), so this
+            -- write's real job is making an explicit machine-wide Off stick.
+            -- SYMMETRIC (writes 0 too), value-guarded (writes = undo points).
+            -- Param resolved BY NAME like Pair Slot above (sparse sliders).
+            local sync_param = nil
+            local p2 = 0
+            while p2 < np do
+              local _, pn2 = reaper.TrackFX_GetParamName(tr, ss_fx, p2, "")
+              if pn2 and pn2:find("Sync Mode") then sync_param = p2; break end
+              p2 = p2 + 1
+            end
+            if sync_param then
+              local sync_want = reaper.GetExtState("EON_StepSeq", "sync_on_open") ~= "0" and 1 or 0
+              if math.floor(reaper.TrackFX_GetParam(tr, ss_fx, sync_param) or 0) ~= sync_want then
+                reaper.TrackFX_SetParam(tr, ss_fx, sync_param, sync_want)
               end
-              if sync_param then reaper.TrackFX_SetParam(tr, ss_fx, sync_param, 1) end
             end
           end
           if reaper.GetExtState("EON_Bridge", "debug_pairing") == "1" then
@@ -13453,9 +13730,23 @@ function eon_clean_store_kick()
     return false   -- transient: leave clean_store_req set, retry next poll
   end
   eon_clean_busy_since = nil
-  local store = _eon_cln_norm(projfn:match("(.*[/\\])") .. "Swing/samples")
+  -- ⚠️ TWO forms of the same path, and they are NOT interchangeable.
+  -- `store`      lowercased — ONLY ever a lookup key (st.keep) or the safety
+  --              clamp prefix, where both sides go through _eon_cln_norm.
+  -- `store_real` real case — EVERY filesystem call must use this one.
+  -- They used to be the same lowercased string, which on a case-sensitive
+  -- filesystem named a directory that does not exist (the real one is
+  -- "Swing/samples", capital S — see eon_kit_store_dir's caller at :8250).
+  -- The sweep then enumerated nothing, deleted nothing, and still reported
+  -- "reclaimed 0 ... kept 0", so the store grew for ever on Linux with no
+  -- symptom. It also fed the lowercased path to eon_kit_store_dir, which
+  -- io.opens the file to build its content key — that open fails on Linux,
+  -- yielding a degenerate key that could never match the keep-set.
+  local store_real = (projfn:match("(.*[/\\])") .. "Swing/samples"):gsub("\\", "/")
+  local store = _eon_cln_norm(store_real)
   reaper.SetExtState("EON_Bridge", "health_tick", "0", false)   -- own the CMD-87 channel
   eon_clean_state = { phase = "collect", noui = noui, store = store,
+    store_real = store_real,
     swings = enumerate_all_swings(), si = 1, keep = {}, nonce = 0,
     deadline = 0, tries = 0, waiting = false }
   return true
@@ -13514,7 +13805,10 @@ function eon_clean_pump()
     return
 
   elseif st.phase == "sidecars" then
-    local sdir = st.store:gsub("/samples$", "")   -- <projdir>/Swing
+    -- Real case: this is enumerated, and each hit is handed to
+    -- eon_kit_store_dir, which io.opens it. Only the RESULT is normalised
+    -- into a keep-set key.
+    local sdir = st.store_real:gsub("/samples$", "")   -- <projdir>/Swing
     local i = 0
     while true do
       local fn = reaper.EnumerateFiles(sdir, i)
@@ -13529,7 +13823,9 @@ function eon_clean_pump()
   elseif st.phase == "sweep" then
     local removed, kept = 0, 0
     for _, sub in ipairs({ "kits", "chops" }) do
-      local base = st.store .. "/" .. sub
+      -- Real case for enumeration and removal; the clamp below still compares
+      -- normalised key against normalised st.store, so both sides stay lowercase.
+      local base = st.store_real .. "/" .. sub
       local dirs, i = {}, 0
       while true do
         local dn = reaper.EnumerateSubdirectories(base, i)
@@ -14164,6 +14460,49 @@ local function poll()
 
   local cmd = math.floor(reaper.gmem_read(G.CMD))
 
+  -- 98/99 are COMPLETION codes (op cancelled/done), left on the bus for the
+  -- armed JSFX that raised the op to consume (it clears kit_busy and writes
+  -- CMD=0). Ops fired from plain Lua — the Song Starter checkboxes, the EON
+  -- menu wrappers — have no armed instance: nothing consumes, the code sits
+  -- there FOREVER, and every CMD==0 gate in the system (all action posts
+  -- included) silently starves until REAPER restarts. Same class as the
+  -- 2026-07-15 stale-CMD 66 audit. A live armed JSFX consumes within a couple
+  -- of @block cycles (~ms); five seconds of lingering means nobody is coming —
+  -- release the bus. (An armed instance with the audio device closed can't
+  -- consume either, but its own kit-busy watchdog covers that recovery.)
+  if cmd == 98 or cmd == 99 then
+    local nowc = reaper.time_precise()
+    if not eon_done_code_since then eon_done_code_since = nowc end
+    if nowc - eon_done_code_since > 5.0 then
+      reaper.gmem_write(G.CMD, 0)
+      eon_done_code_since = nil
+    end
+  else
+    eon_done_code_since = nil
+  end
+
+  -- Companion-bus twin of the watchdog above, needed BECAUSE of instance
+  -- addressing: a broadcast companion cmd was always consumed by SOME
+  -- instance, but a TARGETED one whose instance died mid-flight lingers
+  -- forever -- and companion posts are only made on an idle bus, so it would
+  -- block every later companion command. 15s is geological for a live @gfx
+  -- (gfx_idle consumes in ms) while still clearing a genuinely long
+  -- kit_busy pending-hold only well after the kit pipeline's own watchdogs.
+  do
+    local comp = math.floor(reaper.gmem_read(G.GS_COMPANION_CMD) or 0)
+    if comp > 0 then
+      local nowc = reaper.time_precise()
+      if not eon_comp_since then eon_comp_since = nowc end
+      if nowc - eon_comp_since > 15.0 then
+        reaper.gmem_write(G.GS_COMPANION_CMD, 0)
+        if G.GS_COMPANION_TARGET then reaper.gmem_write(G.GS_COMPANION_TARGET, 0) end
+        eon_comp_since = nil
+      end
+    else
+      eon_comp_since = nil
+    end
+  end
+
   -- Kit ops
   if cmd == 10 or cmd == 12 or cmd == 15 then
     -- Phase 3 save guard (bridge belt-and-suspenders): refuse while any load
@@ -14728,6 +15067,11 @@ local function poll()
       reaper.gmem_write(G.PARAM1, pad_idx)
       reaper.gmem_write(G.CMD, 51)  -- signal JSFX: name ready
 
+      -- Rename → category: the badge follows the new name (guards + rationale
+      -- in eon_padcat_from_rename; LOCKed pads and unclassifiable names keep
+      -- their current badge).
+      eon_padcat_from_rename(pad_idx, new_name)
+
       -- Auto-update multi-out track name if it exists
       local sw_tr = find_swing_track()
       if sw_tr then
@@ -15036,6 +15380,8 @@ local function poll()
   pcall(eon_preset_browser_launch_tick)
   -- GROOVE S3: open the .rgt groove importer when the groove menu asks for it.
   pcall(eon_groove_browser_launch_tick)
+  -- Start the Drum Strip sync companion if no one else has (once per session).
+  pcall(eon_strip_sync_ensure_tick)
   -- StepSeq SETTINGS: Open Swing / Drum Matrix command buttons.
   pcall(eon_ss_commands_tick)
   -- Toolbar lit-state for the EON toggle buttons (Grid/Paint/StepSeq/PadFX/Media/Browser).

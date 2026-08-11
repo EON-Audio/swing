@@ -30,7 +30,11 @@ local UPDATE_URL        = "https://api.github.com/repos/EON-Audio/swing/releases
 -- JSFX version (Swing_ReaKit.jsfx: version: 3.0). Compared against the
 -- GitHub tag_name (stripped of leading "v" if present).
 -- ⚠️ A GitHub release carrying this tag has to actually EXIST on the repo
--- below, or the check silently reports "up to date" forever.
+-- above. With no releases published, /releases/latest answers 404, whose body
+-- carries no tag_name -- so the parse below finds nothing and the state lands
+-- on 0 (idle), NOT 2 (up to date). The user is told nothing at all, and the
+-- failure is indistinguishable from "no network". Verified against the live
+-- endpoint 2026-08-08.
 local CURRENT_VERSION   = "3.0"
 local POLL_INTERVAL     = 5.0        -- seconds between heartbeat polls
 local HEARTBEAT_TIMEOUT = 2.0        -- seconds of stale counter = Swing gone
@@ -168,6 +172,19 @@ end
 ---------------------------------------------------------------------------
 -- UPDATE CHECK (non-blocking via ExecProcess)
 ---------------------------------------------------------------------------
+-- Failure diagnostics are console-GATED. Both check triggers are automatic
+-- (Swing writes GS_UPDATE_REQUEST=1 on first load and again on project load;
+-- there is no manual "check for updates" action anywhere in the UI), so an
+-- ungated ShowConsoleMsg would pop the console unprompted for every customer
+-- who is offline -- and, until the first GitHub Release exists, for everyone.
+-- Same convention as EON_Swing/load_debug:
+--   reaper.SetExtState("EON_Swing", "update_debug", "1", false)
+local function update_dbg(line)
+  if reaper.GetExtState("EON_Swing", "update_debug") == "1" then
+    reaper.ShowConsoleMsg(line)
+  end
+end
+
 local function start_update_check()
   if checking_update then return end
   checking_update = true
@@ -219,9 +236,24 @@ local function start_update_check()
         gmem_write(GS_UPDATE_STATE, 2) -- up-to-date (or ahead)
       end
     else
-      gmem_write(GS_UPDATE_STATE, 0) -- failed silently → idle
+      -- Common bodies at this point: (a) 404 with {"message":"Not Found"}
+      -- when no releases have been published, (b) rate-limit responses,
+      -- (c) captive-portal HTML on public wifi. A truncated snippet
+      -- distinguishes all three at a glance -- vs. bare state 0, which is
+      -- indistinguishable from a network error. Debug-gated (see update_dbg).
+      local msg  = retval:match('"message"%s*:%s*"([^"]+)"')
+      local snip = retval:sub(1, 160):gsub("[\r\n]+", " ")
+      update_dbg("[EON] Update check: no tag_name in response " ..
+        (msg and ("(" .. msg .. ") ") or "") ..
+        "-- " .. snip .. (retval:len() > 160 and "..." or "") .. "\n")
+      gmem_write(GS_UPDATE_STATE, 0) -- failed → idle
     end
   else
+    -- Network offline, curl absent, or the 5s timeout expired. This is the
+    -- NORMAL state on an offline studio machine, so it must stay silent for
+    -- customers -- debug-gated trail only.
+    update_dbg("[EON] Update check: no response from " .. UPDATE_URL ..
+      " (network offline, curl missing, or timed out).\n")
     gmem_write(GS_UPDATE_STATE, 0) -- network error → idle
   end
 

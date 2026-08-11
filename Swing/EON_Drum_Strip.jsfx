@@ -738,6 +738,55 @@ function strip_kn_name(_id) (
 function strip_kn_next(_id) ( _id >= 18 ? 0 : (_id == 8 || _id == 9) ? 10 : _id + 1; );
 function strip_kn_prev(_id) ( _id <= 0 ? 18 : (_id == 10 || _id == 9) ? 8 : _id - 1; );
 
+// ── House dropdown (replaces the native gfx_showmenu on the VIEW / VU / KNOB
+// chips). Row labels by kind: 1 = view mode, 2 = VU face (row 0 = AUTO, then
+// styles 0..10 at row-1), 3 = knob style (row -> id skips the mem-only bb=9:
+// id = row<=8 ? row : row+1). Panel state ds_dd_*: interaction runs EARLY
+// (right after the frame mouse globals) so an open panel swallows the click
+// before the chip handlers can re-open it; painting runs LAST, over everything.
+function ds_dd_lbl(dest, kind, r) (
+  kind == 1 ? (
+    strcpy(dest, r == 0 ? "Graph Only" : r == 1 ? "Channel Strip" :
+                 r == 2 ? "Strip + VU" : "Full Strip");
+  ) :
+  kind == 2 ? (
+    strcpy(dest, r == 0 ? "AUTO (follow theme)" :
+      r == 1 ? "Classic" : r == 2 ? "Knight"   : r == 3  ? "Purple"   :
+      r == 4 ? "Moss"    : r == 5 ? "Moo"      : r == 6  ? "Warm"     :
+      r == 7 ? "Ivory"   : r == 8 ? "Trooper"  : r == 9  ? "Ultimate" :
+      r == 10 ? "Mooncake" : "Black");
+  ) : (
+    strcpy(dest,
+      r == 0  ? "Default"   : r == 1  ? "SSL"     : r == 2  ? "Vari-Mu"   :
+      r == 3  ? "API"       : r == 4  ? "Witti"   : r == 5  ? "Neve"      :
+      r == 6  ? "Joanny"    : r == 7  ? "MPC"     : r == 8  ? "Jog"       :
+      r == 9  ? "Spice"     : r == 10 ? "Encoder" : r == 11 ? "Pultec"    :
+      r == 12 ? "Ableton"   : r == 13 ? "FL"      : r == 14 ? "Pro Tools" :
+      r == 15 ? "FabFilter" : r == 16 ? "Serum"   : "Roland");
+  );
+);
+// Open at (ax, ay): row height = the chip height so the list reads as an
+// extension of the button; width measured from the widest label (font set
+// FIRST — gfx_measurestr fails silently under a stale font).
+function ds_dd_openat(kind, n, ax, ay, rh) local(_di, _dw, _dh) (
+  ds_dd_open = 1; ds_dd_kind = kind; ds_dd_n = n;
+  ds_dd_x = ax; ds_dd_y = ay; ds_dd_rh = rh;
+  gfx_setfont(1, "Arial", _uf8, 'b');
+  ds_dd_w = 0; _di = 0;
+  loop(n,
+    ds_dd_lbl(#ds_ddl, kind, _di);
+    gfx_measurestr(#ds_ddl, _dw, _dh);
+    _dw > ds_dd_w ? ds_dd_w = _dw;
+    _di += 1;
+  );
+  ds_dd_w = (ds_dd_w + floor(28 * sc))|0;
+  // Height + clamps HERE too so the OPEN frame paints correctly — the early
+  // block has already run this frame and won't see the open until the next.
+  ds_dd_h = n * rh + 2;
+  ds_dd_x + ds_dd_w > gfx_w - 2 ? ds_dd_x = max(0, gfx_w - 2 - ds_dd_w);
+  ds_dd_y + ds_dd_h > gfx_h - 2 ? ds_dd_y = max(0, gfx_h - 2 - ds_dd_h);
+);
+
 // ─── Init: reset state, compute coefficients, snap (no ramp-in on load) ──
 // `_ini_i`, not the global `i` — @init re-runs on a samplerate change, which can
 // happen while the GUI is open, and vu_kbsg's zm_draw_3D / zm_draw_arcs /
@@ -861,6 +910,43 @@ dt = min(time_precise() - sk_last_t, 0.05);
 sk_last_t = time_precise();
 hv_speed = 11;
 frame_wheel = mouse_wheel / 120;
+
+// ── House dropdown interaction (VIEW / VU / KNOB): FIRST, so an open panel
+// swallows the click before anything underneath it — including the chip that
+// opened it (click the chip again = dismiss). Paint happens at the end of
+// @gfx; geometry is clamped here each frame so a window resize can't strand it.
+// ⚠️ Embed passes must SKIP the panel, never CLEAR it: with a TCP/MCP embed
+// open, REAPER interleaves @gfx passes for BOTH surfaces of this instance (the
+// micro_view bit-test note above), so an embed pass zeroing ds_dd_open would
+// kill the panel the floating pass just opened — and the VIEW dropdown exists
+// precisely to configure that embed. rkth precedent: theme-picker state is
+// simply untouched in embed passes.
+!micro_view && ds_dd_open ? (
+  ds_dd_h = ds_dd_n * ds_dd_rh + 2;
+  ds_dd_x + ds_dd_w > gfx_w - 2 ? ds_dd_x = max(0, gfx_w - 2 - ds_dd_w);
+  ds_dd_y + ds_dd_h > gfx_h - 2 ? ds_dd_y = max(0, gfx_h - 2 - ds_dd_h);
+  ds_dd_in = mx >= ds_dd_x && mx < ds_dd_x + ds_dd_w && my >= ds_dd_y && my < ds_dd_y + ds_dd_h;
+  ds_dd_hrow = ds_dd_in ? ((my - ds_dd_y - 1) / ds_dd_rh)|0 : -1;
+  ds_dd_hrow >= ds_dd_n ? ds_dd_hrow = -1;
+  ds_dd_in ? ( frame_wheel = 0; mouse_wheel = 0; );   // wheel dead over the panel
+  lmb_down ? (
+    (ds_dd_in && ds_dd_hrow >= 0) ? (
+      ds_dd_kind == 1 ? (
+        strip_view_mode = ds_dd_hrow;    // plain global — read live by the embedded view
+        strip_view_touch += 1; slider_automate(2^22);
+        strip_view_lock > 0.5 ? ( strip_view_bcast = (strip_view_mode | 0) + 1; slider_automate(2^24); _abflash = 1; );
+      ) :
+      ds_dd_kind == 2 ? (
+        strip_vu_style = ds_dd_hrow - 1;               // row 0 = AUTO = -1
+        strip_view_touch += 1; slider_automate(2^22);
+      ) : (
+        gmem[GS_THEME_KNOB_REQ] = (ds_dd_hrow <= 8 ? ds_dd_hrow : ds_dd_hrow + 1) + 1;
+      );
+    );
+    ds_dd_open = 0;
+    lmb_down = 0;                        // pick or dismiss — nothing underneath reacts
+  );
+) : micro_view ? 0 : (ds_dd_in = 0; ds_dd_hrow = -1;);
 // ★ Embedded wheel fix: REAPER delivers a wheel event WITHOUT a fresh mouse_x/y,
 // so hover tests (knobs AND EQ nodes) miss. Remember the cursor on normal frames
 // and reuse it on wheel frames, so the wheel hits whatever is under the cursor.
@@ -1008,17 +1094,7 @@ gfx_x = vb_x + floor(5 * sc); gfx_y = vb_y + floor(2 * sc); gfx_drawstr(#vmode);
 // Swing's EMBED button. Current option is checkmarked. gfx_showmenu is fine in
 // the floating window. Sets strip_view_mode; the embedded view reads it.
 lmb_down && _vmhov ? (
-  gfx_x = vb_x; gfx_y = vb_y + vb_h;
-  strcpy(#vmenu, _vm == 0 ? "!Graph Only|" : "Graph Only|");
-  strcat(#vmenu, _vm == 1 ? "!Channel Strip|" : "Channel Strip|");
-  strcat(#vmenu, _vm == 2 ? "!Strip + VU|" : "Strip + VU|");
-  strcat(#vmenu, _vm == 3 ? "!Full Strip" : "Full Strip");
-  _vsel = gfx_showmenu(#vmenu);
-  _vsel > 0 ? (
-    strip_view_mode = _vsel - 1;          // plain global — read live by the embedded view
-    strip_view_touch += 1; slider_automate(2^22);   // mark dirty so it persists/undoes
-    strip_view_lock > 0.5 ? ( strip_view_bcast = (strip_view_mode | 0) + 1; slider_automate(2^24); _abflash = 1; );
-  );
+  ds_dd_openat(1, 4, vb_x, vb_y + vb_h + 1, vb_h);   // house dropdown; apply in the early block
   lmb_down = 0;
 );
 // Hover-wheel cycles the view (suite selector convention, like the THEME chip;
@@ -1078,24 +1154,9 @@ gfx_rect(vu_bx, vu_by, vu_bw, 1); gfx_rect(vu_bx, vu_by + vu_bh - 1, vu_bw, 1);
 gfx_rect(vu_bx, vu_by, 1, vu_bh); gfx_rect(vu_bx + vu_bw - 1, vu_by, 1, vu_bh);
 _th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.80, 0.82, 0.86, 1);
 gfx_x = vu_bx + floor(5 * sc); gfx_y = vu_by + floor(2 * sc); gfx_drawstr(#sk_vuname);
-// Click → dropdown (current item check-marked). strip_vu_style = pick - 2 (AUTO -> -1).
+// Click → house dropdown (current item dotted). Apply lives in the early block.
 lmb_down && _vuhov ? (
-  gfx_x = vu_bx; gfx_y = vu_by + vu_bh;
-  _vs = strip_vu_style | 0;
-  strcpy(#vumenu, _vs <  0 ? "!AUTO (follow theme)|" : "AUTO (follow theme)|");
-  strcat(#vumenu, _vs == 0 ? "!Classic|"  : "Classic|");
-  strcat(#vumenu, _vs == 1 ? "!Knight|"   : "Knight|");
-  strcat(#vumenu, _vs == 2 ? "!Purple|"   : "Purple|");
-  strcat(#vumenu, _vs == 3 ? "!Moss|"     : "Moss|");
-  strcat(#vumenu, _vs == 4 ? "!Moo|"      : "Moo|");
-  strcat(#vumenu, _vs == 5 ? "!Warm|"     : "Warm|");
-  strcat(#vumenu, _vs == 6 ? "!Ivory|"    : "Ivory|");
-  strcat(#vumenu, _vs == 7 ? "!Trooper|"  : "Trooper|");
-  strcat(#vumenu, _vs == 8 ? "!Ultimate|" : "Ultimate|");
-  strcat(#vumenu, _vs == 9 ? "!Mooncake|" : "Mooncake|");
-  strcat(#vumenu, _vs == 10 ? "!Black"    : "Black");
-  _vusel = gfx_showmenu(#vumenu);
-  _vusel > 0 ? ( strip_vu_style = _vusel - 2; strip_view_touch += 1; slider_automate(2^22); );
+  ds_dd_openat(2, 12, vu_bx, vu_by + vu_bh + 1, vu_bh);
   lmb_down = 0;
 );
 // Hover-wheel cycles AUTO(-1) .. Black(10) with wrap.
@@ -1124,29 +1185,10 @@ gfx_rect(kn_bx, kn_by, kn_bw, 1); gfx_rect(kn_bx, kn_by + kn_bh - 1, kn_bw, 1);
 gfx_rect(kn_bx, kn_by, 1, kn_bh); gfx_rect(kn_bx + kn_bw - 1, kn_by, 1, kn_bh);
 _th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.80, 0.82, 0.86, 1);
 gfx_x = kn_bx + floor(5 * sc); gfx_y = kn_by + floor(2 * sc); gfx_drawstr(#sk_knname);
-// Click → dropdown (id order, 9/bb skipped → id = sel<=9 ? sel-1 : sel). Write id+1.
+// Click → house dropdown (current item dotted; row → id skips bb=9). Apply in
+// the early block.
 lmb_down && _knhov ? (
-  gfx_x = kn_bx; gfx_y = kn_by + kn_bh;
-  strcpy(#knmenu, _kncur == 0  ? "!Default|"   : "Default|");
-  strcat(#knmenu, _kncur == 1  ? "!SSL|"       : "SSL|");
-  strcat(#knmenu, _kncur == 2  ? "!Vari-Mu|"   : "Vari-Mu|");
-  strcat(#knmenu, _kncur == 3  ? "!API|"       : "API|");
-  strcat(#knmenu, _kncur == 4  ? "!Witti|"     : "Witti|");
-  strcat(#knmenu, _kncur == 5  ? "!Neve|"      : "Neve|");
-  strcat(#knmenu, _kncur == 6  ? "!Joanny|"    : "Joanny|");
-  strcat(#knmenu, _kncur == 7  ? "!MPC|"       : "MPC|");
-  strcat(#knmenu, _kncur == 8  ? "!Jog|"       : "Jog|");
-  strcat(#knmenu, _kncur == 10 ? "!Spice|"     : "Spice|");
-  strcat(#knmenu, _kncur == 11 ? "!Encoder|"   : "Encoder|");
-  strcat(#knmenu, _kncur == 12 ? "!Pultec|"    : "Pultec|");
-  strcat(#knmenu, _kncur == 13 ? "!Ableton|"   : "Ableton|");
-  strcat(#knmenu, _kncur == 14 ? "!FL|"        : "FL|");
-  strcat(#knmenu, _kncur == 15 ? "!Pro Tools|" : "Pro Tools|");
-  strcat(#knmenu, _kncur == 16 ? "!FabFilter|" : "FabFilter|");
-  strcat(#knmenu, _kncur == 17 ? "!Serum|"     : "Serum|");
-  strcat(#knmenu, _kncur == 18 ? "!Roland"     : "Roland");
-  _knsel = gfx_showmenu(#knmenu);
-  _knsel > 0 ? ( gmem[GS_THEME_KNOB_REQ] = (_knsel <= 9 ? _knsel - 1 : _knsel) + 1; );
+  ds_dd_openat(3, 18, kn_bx, kn_by + kn_bh + 1, kn_bh);
   lmb_down = 0;
 );
 // Hover-wheel cycles the style (skips bb=9, wraps).
@@ -1726,6 +1768,43 @@ kgrid_show ? (
 
 // ── THEME dropdown panel: shared widget paints the open list last (on top) ──
 !micro_view ? rkth_overlay_draw();
+
+// ── House dropdown paint (VIEW / VU / KNOB) — after everything, so the open
+// list sits on top. Chip visual language: dark panel, band(7) border, amber
+// hover row with dark text (the lit->ALL idiom), amber dot = current item.
+// micro_view-gated like the interaction: embed passes neither paint nor touch. ──
+!micro_view && ds_dd_open ? (
+  gfx_setfont(1, "Arial", _uf8, 'b');
+  gfx_set(0, 0, 0, 0.35); gfx_rect(ds_dd_x + 3, ds_dd_y + 4, ds_dd_w, ds_dd_h);      // shadow
+  _th_live ? setcolor_band(1, 255, 0.98) : gfx_set(0.13, 0.14, 0.17, 0.98);          // panel
+  gfx_rect(ds_dd_x, ds_dd_y, ds_dd_w, ds_dd_h);
+  _th_live ? setcolor_band(7, 200, 1.0) : gfx_set(0.40, 0.42, 0.48, 0.9);            // border
+  gfx_rect(ds_dd_x, ds_dd_y, ds_dd_w, ds_dd_h, 0);
+  _ddcur = ds_dd_kind == 1 ? (strip_view_mode | 0)
+         : ds_dd_kind == 2 ? ((strip_vu_style | 0) + 1)
+         : ((gmem[GS_THEME_KNOB_P] | 0) <= 8 ? gmem[GS_THEME_KNOB_P] | 0
+                                             : (gmem[GS_THEME_KNOB_P] | 0) - 1);
+  _ddr = 0;
+  loop(ds_dd_n,
+    _ddry = ds_dd_y + 1 + _ddr * ds_dd_rh;
+    _ddhv = _ddr == ds_dd_hrow;
+    _ddhv ? (
+      _th_live ? setcolor_band(4, 255, 0.95) : gfx_set(0.95, 0.65, 0.15, 0.95);      // amber hover
+      gfx_rect(ds_dd_x + 1, _ddry, ds_dd_w - 2, ds_dd_rh);
+    );
+    _ddr == _ddcur ? (                                                               // current dot
+      _ddhv ? gfx_set(0.10, 0.10, 0.12, 1)
+            : (_th_live ? setcolor_band(4, 255, 1.0) : gfx_set(0.95, 0.65, 0.15, 1.0));
+      gfx_circle(ds_dd_x + floor(9 * sc), (_ddry + ds_dd_rh * 0.5)|0, max(2, floor(2.5 * sc)), 1, 1);
+    );
+    _ddhv ? gfx_set(0.10, 0.10, 0.12, 1)
+          : (_th_live ? setcolor_band(2, 255, 0.95) : gfx_set(0.80, 0.82, 0.86, 0.95));
+    gfx_x = ds_dd_x + floor(18 * sc); gfx_y = _ddry + floor(2 * sc);
+    ds_dd_lbl(#ds_ddl, ds_dd_kind, _ddr);
+    gfx_drawstr(#ds_ddl);
+    _ddr += 1;
+  );
+);
 
 // ── Embedded click/wheel passthrough (re-armed AFTER the knobs so it can read
 // their hover): arm 0x200 (open the floating window on click) only when the

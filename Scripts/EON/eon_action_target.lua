@@ -22,6 +22,7 @@ local M = {}
 local SEG  = "Swing_Media_Transfer"
 local CMD  = 26090300  -- v1 header relocated 2026-07-09 (cells 0..35 dead)
 local COMP = 1710
+local COMPT = 2250     -- companion TARGET (instance id; 0 = broadcast)
 local LOCK = 97
 
 -- Mirror of Swing_Kit_Bridge.lua is_swing_fx(): fx_ident is the reliable key,
@@ -34,6 +35,10 @@ local function fx_is_swing(tr, fx)
   if fname and (fname:match("^JS: Swing") or fname:match("Swing %— 16%-Pad")) then return true end
   return false
 end
+
+-- Exported so actions that need to FIND a Swing slot do not each grow their own
+-- copy of the predicate — there were already three, and they drift.
+M.fx_is_swing = fx_is_swing
 
 -- Point LOCK at the currently focused Swing FX. If nothing (or a non-Swing FX)
 -- is focused, LOCK is left untouched — the bridge then falls back to whatever
@@ -61,10 +66,13 @@ function M.bridge(code)
   end
 end
 
--- Post to the JSFX companion bus (gmem[1710]) only if idle.
+-- Post to the JSFX companion bus (gmem[1710]) only if idle. Stamps the
+-- TARGET cell 0 (broadcast) so a stale address from an interrupted
+-- targeted arm can never mis-route this post.
 function M.companion(code)
   reaper.gmem_attach(SEG)
   if math.floor(reaper.gmem_read(COMP)) == 0 then
+    reaper.gmem_write(COMPT, 0)
     reaper.gmem_write(COMP, code)
   end
 end
@@ -74,6 +82,21 @@ end
 function M.fire(code)
   M.focus_lock()
   M.bridge(code)
+end
+
+-- Post `code` routed at a SPECIFIC instance id, bypassing the focus heuristic —
+-- for callers that just CREATED the instance (the Song Starter): a windowless
+-- TrackFX_AddByName is never the focused FX, so focus_lock() would leave a
+-- stale LOCK and the bridge would build against the FIRST Swing it finds
+-- instead of the new one. Posts only when the bus is idle (M.bridge's posture)
+-- but REPORTS the result, so callers can retry on a defer tick instead of
+-- silently losing the command. Returns true when the command was posted.
+function M.post_locked(iid, code)
+  reaper.gmem_attach(SEG)
+  if math.floor(reaper.gmem_read(CMD)) ~= 0 then return false end
+  if iid and iid > 0 then reaper.gmem_write(LOCK, math.floor(iid)) end
+  reaper.gmem_write(CMD, code)
+  return true
 end
 
 -- ── Big-view actions ────────────────────────────────────────────────────────

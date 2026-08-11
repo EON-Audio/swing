@@ -155,6 +155,24 @@ function M.GetByIndex(idx)
   return enum_regions()[idx]
 end
 
+-- Adopt an EXISTING region (by region index number) into the pattern
+-- membership set. For EON tools that lay out their own regions (the Song
+-- Starter's Intro/Verse/... sections): List() deliberately returns members
+-- only — it must not hijack regions the user made for other purposes — so an
+-- unadopted region has no DM chip, no bridge name/colour publish, and no
+-- StepSeq sync binding. Set semantics (re-adopting is a no-op write-skip);
+-- a bogus idx self-heals out on the next List() like any other stale member.
+function M.Adopt(idx)
+  idx = tonumber(idx)
+  if not idx or idx < 0 then return false end
+  local set = read_set()
+  if not set[idx] then
+    set[idx] = true
+    write_set(set)
+  end
+  return true
+end
+
 function M.GetCurrent() return get_current() end
 function M.SetCurrent(idx) set_current(idx) end
 
@@ -252,6 +270,15 @@ function M.Rename(idx, name)
   local r = M.GetByIndex(idx)
   if not r then return false end
   return reaper.SetProjectMarker3(0, idx, true, r.start, r.end_, name or '', r.color)
+end
+
+-- color = native OS colour (what GR_SelectColor returns); the 0x1000000
+-- "custom colour" flag is OR'd in here so callers don't have to know about it.
+function M.SetColor(idx, color)
+  local r = M.GetByIndex(idx)
+  if not r then return false end
+  return reaper.SetProjectMarker3(0, idx, true, r.start, r.end_, r.name or '',
+                                  (math.floor(color) % 16777216) | 0x1000000)
 end
 
 function M.Delete(idx)

@@ -6,7 +6,7 @@ author: EON Studios
 version: 3.0
 
 slider1:root_note=36<0,127,1>-Base Note
-slider2:master_db=0<-48,6,0.1>-Master Volume (dB)
+slider2:master_db=0<-48,12,0.1>-Master Volume (dB)
 // slider3 + slider6..slider21 are hidden COUNTERS that increment on
 // every parameter change. REAPER captures the FX chunk for undo only
 // when a slider VALUE actually changes; coalesces multiple changes to
@@ -173,6 +173,17 @@ out_pin:Delay Return R
 @init
 ext_noinit = 1.0;
 ext_tail_size = -1;
+
+// Borderless embed in the TCP / MCP (REAPER 7.45+). Swing was the only EON
+// JSFX not asking for this, which is why it alone carried a title strip in the
+// mixer — EON_Drum_Strip, EON_FX_Return_View and EON_StepSeq all set it.
+// ⚠️ MUST be set in @init: writing it later has no effect. jsfx-lint flags this
+//    as wrong_context — its model predates 7.45, and the other three EON JSFX
+//    raise the identical warning. Accepted, not a defect.
+// ⛔ Copy ONLY this line from them. The retina-scaling flag that sits next to it
+//    in those files stays off in Swing (named nowhere here on purpose, so the
+//    standing "is it absent?" grep keeps returning clean).
+gfx_ext_flags |= 0x100;
 
 // Generate unique instance ID (persists via slider4 + ext_noinit).
 //
@@ -1401,7 +1412,12 @@ gmem[GS_PAD_SELECT_REQ] = -1;  // no pending pad selection from browser
 gmem[GS_PAD_TRIGGER]    = -1;  // no pending pad trigger from browser
 GS_BROWSER_PATH   = 1450;     // browser sample path chars (260 max: 1450–1709)
 GS_BROWSER_PATH_MAX = 260;
-GS_COMPANION_CMD  = 1710;     // companion script command (0=idle, 3=toggle lock, 4=new kit)
+GS_COMPANION_CMD  = 1710;     // companion script command (0=idle, 3=toggle lock, 4=new kit, 5=adopt multi-out)
+GS_COMPANION_TARGET = 2250;   // instance_id the companion cmd is FOR; 0 = broadcast (legacy
+                              // writers). The consumer gates on it — without this, the cmd is
+                              // a single unaddressed cell and in a multi-Swing project a
+                              // BYSTANDER instance could consume a 5 and flip the wrong kit
+                              // to multi-out. 2248..2255 gap (2248 LOAD_MODE, 2249 NAME_ADOPT).
 
 // Companion / update system
 GS_SWING_ALIVE      = 1711;     // heartbeat counter (Lua detects changes)
@@ -1923,7 +1939,7 @@ swing_block_pitch_tick();
 
 // ─── Slider recalc ────────────────────────────────────────────────────────
 @slider
-// Convert master_db (slider unit: dB, range -48..+6) to global_vol
+// Convert master_db (slider unit: dB, range -48..+12) to global_vol
 // (linear amplitude, used directly in @sample). exp(x * 0.11512925465) =
 // pow(10, x / 20) — EEL has no log10/pow10 so we use the ln equivalent.
 // At -48 dB or below (knob minimum), snap to true silence.
@@ -4676,7 +4692,7 @@ _syn_newkit_req && _undo_pending == 0 && !kit_busy ? (
     s_dirty[_snk_p] = 1;
     _snk_p += 1;
   );
-  mark_dirty_kit();
+  _kd_site = 7; mark_dirty_kit();
   col_dirty = 1;
   _syn_newkit_req = 0;
 );
@@ -4707,6 +4723,7 @@ rmb_down = RMB && !prev_RMB;
 // mouse-UP edge below for whichever pads mark_dirty_pad() flagged.
 lmb_down ? undo_capture_baseline();
 CTRL  = mouse_cap & 4;
+
 SHIFT = mouse_cap & 8;
 ALT   = mouse_cap & 16;
 // Global safety: release active_id when mouse button is up
@@ -4877,11 +4894,39 @@ _is_browser_target() ? (
 //    PENDING_LOAD_INST routing, same _auto_load_attempted flag.
 
 // ── Companion script commands ──────────────────────────────────────────
+// Instance-addressed: a nonzero TARGET means the cmd is for that instance
+// ONLY — bystanders neither obey nor clear it (it stays pending for the
+// target, same hold semantics as kit_busy). 0 = broadcast, legacy writers.
 _ccmd = gmem[GS_COMPANION_CMD]|0;
-_ccmd > 0 && !kit_busy ? (
+_cctgt = gmem[GS_COMPANION_TARGET]|0;
+_ccmd > 0 && !kit_busy && (_cctgt == 0 || _cctgt == (instance_id|0)) ? (
   _ccmd == 4 ? ( // New kit — full reset (pads + name + FX). See rk_swing_defaults.jsfx-inc.
     swing_new_kit_full_reset();
   );
+  _ccmd == 5 ? (
+    // Adopt MULTI routing for a BRIDGE-initiated multi-out build (CMD 40/74).
+    // Swing's own right-click builder calls swing_panels_multiout_prep() before
+    // raising CMD 40, so it is already in MULTI when the tracks appear. The
+    // action / EON-menu / Song-Starter routes call do_build_multiout() straight
+    // from Lua and never ran it — so they built the child tracks with Swing
+    // still summing to stereo Out 1, which is the exact failure that prep
+    // exists to prevent.
+    // ⚠️ Deliberately NOT a call to swing_panels_multiout_prep(): that also
+    // seizes KIT_GMEM_LOCK and republishes pad names, which on THIS route the
+    // bridge is already doing for itself. Only the two things the bridge cannot
+    // do are done here.
+    // NO mark_dirty_kit here — USER POLICY 2026-08-11 (diag src=1005 t=0.2s
+    // n=0 pinned it): this adopt is the tail of a BUILD action (Song Starter /
+    // MATRIX / EON menu), i.e. session routing, not a kit-content edit — and
+    // it lit the SAVE dot on every fresh multi-out build (the 2→32 channel
+    // bump re-runs @init, then the held-pending 5 flips the still-stereo
+    // default 0.2s later). A later kit SAVE persists multi_out/p_output from
+    // live state regardless of the dot, so nothing is lost by staying quiet.
+    // (The 2026-08-10 idempotence guard is folded into this: no dirty either way.)
+    multi_out = 1;
+    _mo_i = 0; loop(NUM_PADS, p_output[_mo_i] = _mo_i; _mo_i += 1;);
+  );
+  gmem[GS_COMPANION_TARGET] = 0;   // consume the address WITH the cmd (cmd cleared LAST)
   gmem[GS_COMPANION_CMD] = 0;
 );
 
@@ -4896,6 +4941,68 @@ is_embedded ? (
   // popup and theme overlays paint, so a highlight drawn there would sit on
   // top of modal UI. Must follow the draw — it reuses e_cw/e_ch/e_gap.
   swing_grid_extdrag();
+
+  // ── Hover title bar: the way OUT of the embed ─────────────────────────────
+  // Going borderless (0x100) removed the strip REAPER used to draw above the
+  // embed, which was the only way to open the floating window. The other EON
+  // embeds arm 0x200 (click passthrough) over DEAD SPACE and let a passed-
+  // through click do it, but Swing's embed is a full-bleed 4x4 pad grid with
+  // no dead space at all — hence @gfx clearing 0x200 by default and capturing
+  // everything.
+  //
+  // ⚠️ This replaces a CTRL+click gesture, which could not work and was
+  // removed rather than left in as documented-but-dead. 0x200 is a hint REAPER
+  // reads to route the NEXT click, so it must already be armed while the mouse
+  // merely HOVERS. Pointer position is delivered to an embedded UI on hover
+  // (every other EON embed's hover test depends on that); modifier state is
+  // not, so CTRL only became true once the button was already down — a frame
+  // too late to affect that click's routing. Position works, modifiers cannot.
+  //
+  // ⭐ LOOK and CLICK-BAND are deliberately DECOUPLED. The bar reveals over a
+  // generous approach zone, but the band that actually takes the click is
+  // always exactly the bar's own height. Letting the grab area grow with the
+  // fade would make every click near the top a coin toss between "pad" and
+  // "open window"; a soft reveal over a hard target is predictable.
+  //
+  // Cost, accepted deliberately: within that fixed band a click opens the
+  // window instead of triggering the pad under it. Nothing is drawn at rest.
+  _eb_h = max(9, min(18, (gfx_h * 0.09)|0));
+  // Approach zone, clamped: 3x the bar normally, but never more than 45% of a
+  // short MCP strip or the "approach" would be the whole embed.
+  _eb_zone = max(_eb_h + 1, min(_eb_h * 3, (gfx_h * 0.45)|0));
+  _eb_in  = mx >= 0 && mx < gfx_w && my >= 0 && my < gfx_h;
+  _eb_hot = _eb_in && my < _eb_h;          // the FIXED armed band
+  // Proximity target: 0 at the bottom of the zone, 1 at the top edge.
+  _eb_want = _eb_in ? max(0, min(1, (_eb_zone - my) / _eb_zone)) : 0;
+  // Eased toward the target rather than tracked pixel-for-pixel, so a jittering
+  // hand does not strobe the bar. Same dt/hv_speed the knob hovers ride on.
+  _eb_t += (_eb_want - _eb_t) * min(1, dt * hv_speed);
+
+  _eb_t > 0.01 ? (
+    // Fill holds off until you are genuinely close (45% of the way in), so at
+    // the far edge of the zone all you get is the accent line hinting — no
+    // grey slab sitting over the pads.
+    _eb_fill = max(0, min(1, (_eb_t - 0.45) * 1.818));
+    _eb_fill > 0 ? (
+      gfx_set(0.05, 0.06, 0.08, _eb_fill * 0.85);
+      gfx_rect(0, 0, gfx_w, _eb_h);
+    );
+    gfx_set(0.10, 0.70, 0.85, _eb_t * (_eb_hot ? 1.0 : 0.8));
+    gfx_rect(0, _eb_h - 1, gfx_w, 1);
+    // Label only once the fill is carrying it, and only when the bar is tall
+    // enough to seat it without clipping.
+    _eb_h >= 12 && _eb_fill > 0.25 ? (
+      gfx_setfont(1, "Arial", max(9, _eb_h - 5), 'b');
+      gfx_measurestr("OPEN", _eb_tw, _eb_th);
+      _eb_tw < gfx_w - 8 ? (
+        gfx_set(0.85, 0.90, 0.95, _eb_fill);
+        gfx_x = (gfx_w - _eb_tw) / 2; gfx_y = (_eb_h - _eb_th) / 2;
+        gfx_drawstr("OPEN");
+      );
+    );
+  );
+  // Position-only, and independent of the fade: the click band never moves.
+  _eb_hot ? gfx_ext_flags |= 0x200;
 ) : (
   // ═══════════════════════════════════════════════════════════════════════
   // FLOATING WINDOW
