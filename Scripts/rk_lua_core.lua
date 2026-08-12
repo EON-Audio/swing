@@ -1326,6 +1326,15 @@ function core.relay_vu_fx_segments(vreq)
     end
   end)
   reaper.gmem_attach(core.GMEM_NAME)   -- ALWAYS restore the main segment
+  -- ChannelTool runs the appearance cluster but its options:gmem= IS the main
+  -- segment, so it is deliberately absent from THEME_FX_SEGMENTS and the loop
+  -- above never reaches it. Mirror the broadcast here too — payload before
+  -- generation, same order as the loop — or ChannelTool never adopts a sync.
+  pcall(function()
+    reaper.gmem_write(G.GS_THEME_VU_P, vreq)
+    reaper.gmem_write(G.GS_THEME_VU_GEN,
+      math.floor(reaper.gmem_read(G.GS_THEME_VU_GEN) or 0) + 1)
+  end)
 end
 
 -- Reader (Lua consumers): one semantic color → r,g,b (0..1), or nil if idle.

@@ -15458,6 +15458,14 @@ local function poll()
         or tostring(math.floor(reaper.gmem_read(G.GS_THEME_KNOB_REQ)) - 1), true)
       reaper.gmem_write(G.GS_THEME_KNOB_REQ, 0)
     end
+    -- VU-face SYNC raised by a cluster plugin that lives on the MAIN segment
+    -- (ChannelTool). The FX-segment sweep cannot see this mailbox, so drain and
+    -- relay it here; without this its ">ALL" click is a no-op and leaves the
+    -- request latched non-zero forever. No new locals (200-local limit above).
+    if math.floor(reaper.gmem_read(G.GS_THEME_VU_REQ) or 0) >= 1 then
+      core.relay_vu_fx_segments(math.floor(reaper.gmem_read(G.GS_THEME_VU_REQ)))
+      reaper.gmem_write(G.GS_THEME_VU_REQ, 0)
+    end
     -- Publish the active theme index so JSFX selectors can highlight it.
     reaper.gmem_write(G.GS_THEME_CUR, _theme.idx[name] or 1)
     -- Any of the three REAPER entries re-derives when the active .ReaperTheme file
