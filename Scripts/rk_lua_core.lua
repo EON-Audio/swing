@@ -624,6 +624,27 @@ core.GMEM = {
   -- bridge→JSFX: EON toolbar open (1 = its "Open/close toolbar N" toggle state is
   -- on). The Swing header TOOLBAR chip reads it for its lit colour.
   GS_TOOLBAR_OPEN   = 2699,
+  -- Appearance-cluster VU-face SYNC broadcast (rk_theme.jsfx-inc rkth_cluster's
+  -- ">ALL" latch). REQ: JSFX→bridge, written into the FX's OWN gmem segment as
+  -- (face index + 1); core.drain_theme_fx_segments collects + clears it, then
+  -- core.relay_vu_fx_segments writes P = req and bumps GEN in EVERY curated FX
+  -- segment (THEME_FX_SEGMENTS) so sibling rkth_vu_follow() polls adopt the
+  -- face. Deliberately NO ExtState persistence (unlike eon_knob_*): the
+  -- broadcast is a follow-me EVENT — each instance persists its own face on
+  -- its slider (FX chunk), and the follower's GEN-seen-at-@init guard keeps a
+  -- late-loading instance from adopting a stale broadcast.
+  -- SLOTS 2752..2754 verified free 2026-08-11: the 2674..2699 gap above the
+  -- theme band is FULL (see the four cells above); EON_StepSeq owns 2700+
+  -- (ALIVE 2700, ANYSOLO 2702, MUTE 2710-2725, SOLO 2730-2745, PICKER_REQ/SEL
+  -- 2750/2751, ROSTER 2760-2999 per EON_StepSeq.jsfx:1220-1227) and the
+  -- KIT_GMEM_AUDIO scratch bus starts at 3000. The 2752..2759 hole between the
+  -- picker mailbox and the roster is claimed by NOTHING: bundle-wide + EON-tree
+  -- grep, swing_gmem_bridge_protocol.md §3 band map, gmem_regions_supplement
+  -- .tsv (row added) and EON/.Extension/src/gmem/*.h all clean. Mirrors
+  -- rk_theme.jsfx-inc GS_THEME_VU_*.
+  GS_THEME_VU_REQ   = 2752,  -- JSFX→bridge: 0 = none; else picked face index + 1
+  GS_THEME_VU_P     = 2753,  -- bridge→JSFX: broadcast face index + 1 (0 = never)
+  GS_THEME_VU_GEN   = 2754,  -- bridge→JSFX: bump-on-publish generation counter
 
   -- ────────────────────────────────────────────────────────────────────────
   -- PER-INSTANCE IDENTITY BANDS (unified single-source-of-truth, P1)
@@ -1207,6 +1228,14 @@ core.THEME_FX_SEGMENTS = {
   "ReaKit1175", "ReaKit3BEQ", "ReaKit4BEQ", "ReaKitDeEsser", "ReaKitDelay",
   "ReaKitExpressBus", "ReaKitGate", "ReaKitLimiter", "ReaKitReverb",
   "ReaKitSaturation", "ReaKitStereoWidth", "FrostReaKitNetwork",
+  -- Added with the appearance cluster (THEME/KNOB chips).
+  -- (Prism Comp was briefly listed; it is a character plugin and no longer
+  -- imports rk_theme, so it is off the list.)
+  -- (ChannelTool reads the band from the main Swing_Media_Transfer segment,
+  -- so it needs no mirror entry. Spice, DirtSqueeze and Reelism were listed
+  -- briefly while the cluster was fleet-wide; they are character plugins and
+  -- no longer import rk_theme, so they are back off the list per the rule
+  -- above — we never write into a character plugin's segment.)
 }
 
 -- Mirror the band + knob identity into every FX segment, then RESTORE the main
@@ -1244,17 +1273,17 @@ function core.clear_theme_fx_segments()
 end
 
 -- Listen-back for the FX rollout: sweep every curated FX segment, collect any
--- pending theme / knob REQUEST an in-plugin picker wrote there (the bridge's
--- main-segment drain never sees those), clear it, and mirror the active theme
--- index into GS_THEME_CUR so each picker's label highlights correctly.
--- cur_idx < 1 skips the CUR write (nothing published yet). Returns
--- theme_req, knob_req (0 = none; last segment wins if several raced a click).
--- Same attach discipline as publish_theme_fx_segments: pcall-guarded so an
--- error can never leave the bridge attached to an FX segment.
+-- pending theme / knob / VU-face REQUEST an in-plugin picker wrote there (the
+-- bridge's main-segment drain never sees those), clear it, and mirror the
+-- active theme index into GS_THEME_CUR so each picker's label highlights
+-- correctly. cur_idx < 1 skips the CUR write (nothing published yet). Returns
+-- theme_req, knob_req, vu_req (0 = none; last segment wins if several raced a
+-- click). Same attach discipline as publish_theme_fx_segments: pcall-guarded
+-- so an error can never leave the bridge attached to an FX segment.
 function core.drain_theme_fx_segments(cur_idx)
   local segs = core.THEME_FX_SEGMENTS
   local G = core.GMEM
-  local treq, kreq = 0, 0
+  local treq, kreq, vreq = 0, 0, 0
   pcall(function()
     local i = 1
     while i <= #segs do
@@ -1263,12 +1292,40 @@ function core.drain_theme_fx_segments(cur_idx)
       if r >= 1 then treq = r; reaper.gmem_write(G.GS_THEME_REQ, 0) end
       r = math.floor(reaper.gmem_read(G.GS_THEME_KNOB_REQ) or 0)
       if r >= 1 then kreq = r; reaper.gmem_write(G.GS_THEME_KNOB_REQ, 0) end
+      r = math.floor(reaper.gmem_read(G.GS_THEME_VU_REQ) or 0)
+      if r >= 1 then vreq = r; reaper.gmem_write(G.GS_THEME_VU_REQ, 0) end
       if cur_idx and cur_idx >= 1 then reaper.gmem_write(G.GS_THEME_CUR, cur_idx) end
       i = i + 1
     end
   end)
   reaper.gmem_attach(core.GMEM_NAME)   -- ALWAYS restore the main segment
-  return treq, kreq
+  return treq, kreq, vreq
+end
+
+-- VU-face SYNC relay (appearance-cluster ">ALL" latch — see GS_THEME_VU_* in
+-- core.GMEM). vreq = the drained GS_THEME_VU_REQ (face index + 1). Writes
+-- GS_THEME_VU_P = vreq then bumps GS_THEME_VU_GEN (payload first, generation
+-- LAST) in EVERY curated FX segment so sibling instances' rkth_vu_follow()
+-- polls adopt the face — including the broadcaster's own segment (its follow
+-- is a no-op: the face already matches). DIRECT republish, deliberately NO
+-- ExtState (unlike the knob relay): the broadcast is a follow-me EVENT, not
+-- suite state — each instance persists its own face in its FX chunk. Same
+-- attach discipline as publish_theme_fx_segments: pcall-guarded so an error
+-- can never leave the bridge attached to an FX segment.
+function core.relay_vu_fx_segments(vreq)
+  local segs = core.THEME_FX_SEGMENTS
+  local G = core.GMEM
+  pcall(function()
+    local i = 1
+    while i <= #segs do
+      reaper.gmem_attach(segs[i])
+      reaper.gmem_write(G.GS_THEME_VU_P, vreq)
+      reaper.gmem_write(G.GS_THEME_VU_GEN,
+        math.floor(reaper.gmem_read(G.GS_THEME_VU_GEN) or 0) + 1)
+      i = i + 1
+    end
+  end)
+  reaper.gmem_attach(core.GMEM_NAME)   -- ALWAYS restore the main segment
 end
 
 -- Reader (Lua consumers): one semantic color → r,g,b (0..1), or nil if idle.

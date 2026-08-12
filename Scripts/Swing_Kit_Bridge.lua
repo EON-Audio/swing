@@ -69,6 +69,37 @@ do
   if ok and type(m) == "table" then eon_dlg = m end
 end
 
+-- One-line styled notice (message + OK), native ShowMessageBox when ReaImGui is
+-- absent. Every fire-and-forget box in this file routes through here so the
+-- fallback lives in ONE place instead of 40-odd copies.
+--
+-- ⚠️⚠️ THE RE-ENTRANCY GUARD IS LOAD-BEARING, NOT TIDINESS. ShowMessageBox
+-- BLOCKED, and that blocking silently rate-limited every notice raised from
+-- inside the defer poll loop: the box stopped the loop, so a failing per-tick
+-- path could only ever produce ONE. The house dialog returns immediately, so
+-- the same path would stack a fresh dialog every tick until REAPER buckles.
+-- While a notice is up we drop further ones — a per-tick storm is the same
+-- message repeated anyway, and the alternative (a queue) would just replay the
+-- storm one OK-click at a time. The native branch keeps its own blocking
+-- behaviour and needs no guard.
+local _notice_up = false
+local function eon_notice(msg, title)
+  title = title or SCRIPT_NAME
+  if not (eon_dlg and eon_dlg.available() and eon_dlg.info) then
+    reaper.ShowMessageBox(msg, title, 0)
+    return
+  end
+  if _notice_up then return end
+  _notice_up = true
+  -- info() routes BOTH the OK button and window-dismiss to on_ok, so the flag
+  -- clears on every exit path; a false return means it never opened.
+  if not eon_dlg.info({ title = title, message = msg,
+                        on_ok = function() _notice_up = false end }) then
+    _notice_up = false
+    reaper.ShowMessageBox(msg, title, 0)
+  end
+end
+
 -- EON unified theme publisher → JSFX gmem color band. rk_lua_theme resolves the
 -- selected palette (EON / Dark / Light / REAPER); core.publish_theme_band writes
 -- it to the shared band so the Swing + StepSeq JSFX re-skin in step with the
@@ -2823,6 +2854,43 @@ local G = core.GMEM
 -- G.NAME_BASE would silently re-point the shadowed uses in there, so it stays.
 local NAME_BASE     = G.NAME_BASE
 
+-- Styled yes/no confirm for a decision sitting INSIDE a CMD handler, with the
+-- async plumbing that makes it safe. One local (the budget above allows it);
+-- lives here rather than beside eon_notice because it needs G, which is the
+-- line above.
+--
+-- ⚠️ THE PROBLEM IT SOLVES: the dispatcher is LEVEL-triggered (`if cmd == 10 or
+-- cmd == 12 …`, no else, nothing clears CMD on entry), so a handler that
+-- returns while a dialog is still open would be re-entered on the very next
+-- poll tick, opening another dialog, forever. Parking CMD at 97 ("prompt
+-- pending", see .refs/swing_gmem_bridge_protocol.md) matches no branch, so the
+-- handler stops re-firing, the mailbox stays claimed against other producers,
+-- and the tail's lock-release (which only fires on 0/98/99) correctly HOLDS the
+-- instance lock until a real terminal code lands. Same seam as
+-- do_build_multiout's FX-returns prompt (a04e384).
+--
+-- RETURN VALUE IS THE CONTRACT: true = the decision went async, the caller must
+-- return IMMEDIATELY and do nothing else (on_yes/on_no will fire later). false =
+-- no ReaImGui, so the native box already blocked and the matching callback has
+-- ALREADY RUN synchronously — the caller must still just return. Either way the
+-- call site reads `eon_confirm_cmd(...) ; return`.
+local function eon_confirm_cmd(msg, ok_label, on_yes, on_no)
+  local shown = eon_dlg and eon_dlg.available() and eon_dlg.confirm and eon_dlg.confirm({
+    title    = SCRIPT_NAME,
+    message  = msg,
+    ok_label = ok_label or "OK",
+    cancel_label = "Cancel",
+    on_ok    = on_yes,
+    on_cancel = on_no,
+  })
+  if shown then
+    reaper.gmem_write(G.CMD, 97)   -- park the mailbox while the dialog is up
+    return true
+  end
+  if reaper.ShowMessageBox(msg, SCRIPT_NAME, 4) == 6 then on_yes() else on_no() end
+  return false
+end
+
 -- ── SYN slot band (synth layer Batch 4; .refs/swing_gmem_bridge_protocol.md §3)
 -- JSFX publishes live synth state at 26090400 + pad*14; kit save reads it,
 -- kit load stages it back and raises the flag at +SYN_STAGED_OFF (the JSFX
@@ -5283,6 +5351,70 @@ function eon_kit_author_from_file(filepath)
 end
 
 local function do_export_name_prompt()
+  -- Everything downstream of the NAME prompt, so the prompt itself can be async.
+  -- Reached from both the styled form (values arrive in a table) and the native
+  -- GetUserInputs fallback (values arrive from the CSV split), so it trims its
+  -- own inputs rather than trusting either caller.
+  local function proceed(kit_name, author, desc)
+    kit_name = (kit_name or ""):match("^%s*(.-)%s*$")
+    author   = (author   or ""):match("^%s*(.-)%s*$")
+    desc     = (desc     or ""):match("^%s*(.-)%s*$")
+
+    if kit_name == "" then
+      eon_notice("Kit name cannot be empty.")
+      reaper.gmem_write(G.CMD, 98)
+      return
+    end
+
+    local filename = kit_name:gsub('[<>:"/\\|%?%*]', '_')
+    local kits_dir = core.get_kits_dir()
+    local filepath = kits_dir .. core.sep .. filename .. ".swing"
+
+    -- Everything past the overwrite decision, so the confirm can be async too.
+    local function commit()
+      core.gmem_write_string(kit_name, NAME_BASE, G.NAMELEN, 32)
+
+      pending_export = {
+        filepath = filepath, kit_name = kit_name,
+        author = author, desc = desc, filename = filename
+      }
+
+      reaper.gmem_write(G.CMD, 11)
+    end
+
+    local f_check = io.open(filepath, "rb")
+    if not f_check then commit() return end
+    f_check:close()
+    -- See eon_confirm_cmd: async when ReaImGui is present (CMD parks at 97),
+    -- native-blocking when it isn't. Both paths run one of the callbacks, so
+    -- there is nothing to do after the call but return.
+    eon_confirm_cmd('"' .. filename .. '.swing" exists. Overwrite?', "Overwrite",
+      commit,
+      function() reaper.gmem_write(G.CMD, 98) end)
+  end
+
+  -- Styled form first. This is the box the whole save flow OPENS with, so
+  -- leaving it native made the styled overwrite confirm behind it invisible.
+  -- ⭐It also fixes a real defect: GetUserInputs returns its fields CSV-encoded,
+  -- so a kit name (or author, or description) containing a comma is split at
+  -- the comma and silently mangled. The form hands back a keyed table instead,
+  -- and has no such limit.
+  local shown = eon_dlg and eon_dlg.available() and eon_dlg.open and eon_dlg.open({
+    title = "Save Swing Kit", width = 420, ok_label = "Save",
+    fields = {
+      { key = "name",   label = "Kit Name:",              value = "My Kit" },
+      { key = "author", label = "Author (optional):",     value = "" },
+      { key = "desc",   label = "Description (optional):", value = "" },
+    },
+    on_ok     = function(v) proceed(v.name, v.author, v.desc) end,
+    on_cancel = function() reaper.gmem_write(G.CMD, 98) end,
+  })
+  if shown then
+    reaper.gmem_write(G.CMD, 97)   -- park the mailbox while the form is up
+    return
+  end
+
+  -- Native fallback (no ReaImGui) — unchanged behaviour, comma limit included.
   local retval, csv = reaper.GetUserInputs(
     "Save Swing Kit", 3,
     "Kit Name:,Author (optional):,Description (optional):,extrawidth=220",
@@ -5297,37 +5429,7 @@ local function do_export_name_prompt()
   for field in (csv .. ","):gmatch("(.-),") do
     fields[#fields + 1] = field
   end
-  local kit_name = (fields[1] or ""):match("^%s*(.-)%s*$")
-  local author   = (fields[2] or ""):match("^%s*(.-)%s*$")
-  local desc     = (fields[3] or ""):match("^%s*(.-)%s*$")
-
-  if kit_name == "" then
-    reaper.ShowMessageBox("Kit name cannot be empty.", SCRIPT_NAME, 0)
-    reaper.gmem_write(G.CMD, 98)
-    return
-  end
-
-  local filename = kit_name:gsub('[<>:"/\\|%?%*]', '_')
-  local kits_dir = core.get_kits_dir()
-  local filepath = kits_dir .. core.sep .. filename .. ".swing"
-
-  local f_check = io.open(filepath, "rb")
-  if f_check then
-    f_check:close()
-    if reaper.ShowMessageBox('"' .. filename .. '.swing" exists. Overwrite?', SCRIPT_NAME, 4) ~= 6 then
-      reaper.gmem_write(G.CMD, 98)
-      return
-    end
-  end
-
-  core.gmem_write_string(kit_name, NAME_BASE, G.NAMELEN, 32)
-
-  pending_export = {
-    filepath = filepath, kit_name = kit_name,
-    author = author, desc = desc, filename = filename
-  }
-
-  reaper.gmem_write(G.CMD, 11)
+  proceed(fields[1], fields[2], fields[3])
 end
 
 -- CMD 12: SAVE IN PLACE. Overwrite the kit this instance was loaded from, no
@@ -5419,24 +5521,25 @@ local function do_export_browse()
 
   local kit_name = filepath:match("([^/\\]+)%.swing$") or "Kit"
 
-  -- Check overwrite
-  local f_check = io.open(filepath, "rb")
-  if f_check then
-    f_check:close()
-    if reaper.ShowMessageBox('"' .. kit_name .. '.swing" exists. Overwrite?', SCRIPT_NAME, 4) ~= 6 then
-      reaper.gmem_write(G.CMD, 98)
-      return
-    end
+  -- Everything past the overwrite decision, so the confirm can be async.
+  local function commit()
+    core.gmem_write_string(kit_name, NAME_BASE, G.NAMELEN, 32)
+
+    pending_export = {
+      filepath = filepath, kit_name = kit_name,
+      author = "", desc = "", filename = kit_name
+    }
+
+    reaper.gmem_write(G.CMD, 11)
   end
 
-  core.gmem_write_string(kit_name, NAME_BASE, G.NAMELEN, 32)
-
-  pending_export = {
-    filepath = filepath, kit_name = kit_name,
-    author = "", desc = "", filename = kit_name
-  }
-
-  reaper.gmem_write(G.CMD, 11)
+  -- Check overwrite (see eon_confirm_cmd — async when ReaImGui is present)
+  local f_check = io.open(filepath, "rb")
+  if not f_check then commit() return end
+  f_check:close()
+  eon_confirm_cmd('"' .. kit_name .. '.swing" exists. Overwrite?', "Overwrite",
+    commit,
+    function() reaper.gmem_write(G.CMD, 98) end)
 end
 
 -- Export/dump subsystem helpers live on ONE table, not separate top-level
@@ -5464,23 +5567,24 @@ function rk_export.do_export_sfz_browse()
 
   local kit_name = filepath:match("([^/\\]+)%.sfz$") or "Kit"
 
-  local f_check = io.open(filepath, "rb")
-  if f_check then
-    f_check:close()
-    if reaper.ShowMessageBox('"' .. kit_name .. '.sfz" exists. Overwrite?', SCRIPT_NAME, 4) ~= 6 then
-      reaper.gmem_write(G.CMD, 98)
-      return
-    end
+  -- Everything past the overwrite decision, so the confirm can be async.
+  local function commit()
+    core.gmem_write_string(kit_name, NAME_BASE, G.NAMELEN, 32)
+
+    pending_export = {
+      filepath = filepath, kit_name = kit_name,
+      author = "", desc = "", filename = kit_name, format = "sfz"
+    }
+
+    reaper.gmem_write(G.CMD, 11)  -- reuse the same per-pad dump the .swing saves use
   end
 
-  core.gmem_write_string(kit_name, NAME_BASE, G.NAMELEN, 32)
-
-  pending_export = {
-    filepath = filepath, kit_name = kit_name,
-    author = "", desc = "", filename = kit_name, format = "sfz"
-  }
-
-  reaper.gmem_write(G.CMD, 11)  -- reuse the same per-pad dump the .swing saves use
+  local f_check = io.open(filepath, "rb")
+  if not f_check then commit() return end
+  f_check:close()
+  eon_confirm_cmd('"' .. kit_name .. '.sfz" exists. Overwrite?', "Overwrite",
+    commit,
+    function() reaper.gmem_write(G.CMD, 98) end)
 end
 
 -- CMD 21: Export current kit as a ReaSamplOmatic5000 rack. Like the SFZ export
@@ -5517,7 +5621,7 @@ end
 local function write_kit_v2(filepath, info)
   local f = io.open(filepath, "w")
   if not f then
-    reaper.ShowMessageBox("Could not create file:\n" .. filepath, SCRIPT_NAME, 0)
+    eon_notice("Could not create file:\n" .. filepath)
     reaper.gmem_write(G.CMD, 98)
     return
   end
@@ -5607,7 +5711,7 @@ local function write_kit_v2(filepath, info)
   f:close()
 
   if not write_ok then
-    reaper.ShowMessageBox("Error writing kit file (disk full?):\n" .. tostring(write_err), SCRIPT_NAME, 0)
+    eon_notice("Error writing kit file (disk full?):\n" .. tostring(write_err))
     os.remove(filepath)
     reaper.gmem_write(G.CMD, 98)
     return
@@ -5616,12 +5720,10 @@ local function write_kit_v2(filepath, info)
   reaper.gmem_write(G.CMD, 99)
   -- Signal browser to refresh kit list
   reaper.SetExtState("Swing", "kit_saved", "1", false)
-  reaper.ShowMessageBox(
+  eon_notice(
     'Kit saved (v2)!\n\n' ..
     'Name: ' .. info.kit_name .. '\n' ..
-    'Location: ' .. filepath,
-    SCRIPT_NAME, 0
-  )
+    'Location: ' .. filepath)
 end
 
 -- ═════════════════════════════════════════════════════════════════════════════
@@ -5816,17 +5918,15 @@ function rk_export.write_kit_sfz(filepath, info)
 
   if #regions == 0 then
     reaper.gmem_write(G.CMD, 98)
-    reaper.ShowMessageBox(
+    eon_notice(
       "This kit has no pad audio to export.\n\n" ..
-      "Load or build a kit with samples on the pads, then export.",
-      SCRIPT_NAME, 0
-    )
+      "Load or build a kit with samples on the pads, then export.")
     return
   end
 
   local f = io.open(filepath, "w")
   if not f then
-    reaper.ShowMessageBox("Could not create file:\n" .. filepath, SCRIPT_NAME, 0)
+    eon_notice("Could not create file:\n" .. filepath)
     reaper.gmem_write(G.CMD, 98)
     return
   end
@@ -5874,21 +5974,19 @@ function rk_export.write_kit_sfz(filepath, info)
   f:close()
 
   if not write_ok then
-    reaper.ShowMessageBox("Error writing SFZ file (disk full?):\n" .. tostring(write_err), SCRIPT_NAME, 0)
+    eon_notice("Error writing SFZ file (disk full?):\n" .. tostring(write_err))
     os.remove(filepath)
     reaper.gmem_write(G.CMD, 98)
     return
   end
 
   reaper.gmem_write(G.CMD, 99)
-  reaper.ShowMessageBox(
+  eon_notice(
     'Exported self-contained SFZ.\n\n' ..
     'Kit: ' .. (info.kit_name or "") .. '\n' ..
     'Pads written: ' .. #regions .. ' of ' .. G.NUM_PADS .. '\n' ..
     'SFZ: ' .. filepath .. '\n' ..
-    'Samples folder: "' .. samples_subdir .. '" (kept next to the .sfz)',
-    SCRIPT_NAME, 0
-  )
+    'Samples folder: "' .. samples_subdir .. '" (kept next to the .sfz)')
 end
 
 -- ═════════════════════════════════════════════════════════════════════════════
@@ -5982,11 +6080,9 @@ function rk_export.write_kit_rs5k(info)
   local regions = rk_export.extract_kit_to_wavs(samples_dir, samples_subdir, true)
   if #regions == 0 then
     reaper.gmem_write(G.CMD, 98)
-    reaper.ShowMessageBox(
+    eon_notice(
       "This kit has no pad audio to export.\n\n" ..
-      "Load or build a kit with samples on the pads, then export.",
-      SCRIPT_NAME, 0
-    )
+      "Load or build a kit with samples on the pads, then export.")
     return
   end
 
@@ -6028,14 +6124,12 @@ function rk_export.write_kit_rs5k(info)
   reaper.TrackList_AdjustWindows(false)
   reaper.UpdateArrange()
   reaper.gmem_write(G.CMD, 99)
-  reaper.ShowMessageBox(
+  eon_notice(
     'Built RS5k rack.\n\n' ..
     'Kit: ' .. (info.kit_name or "") .. '\n' ..
     'RS5k instances: ' .. built .. ' across ' .. pads_done .. ' pad(s)\n' ..
     'New track: "' .. (info.kit_name or "RS5k Kit") .. ' (RS5k)"\n' ..
-    'Samples folder: ' .. samples_dir,
-    SCRIPT_NAME, 0
-  )
+    'Samples folder: ' .. samples_dir)
 end
 
 -- ═════════════════════════════════════════════════════════════════════════════
@@ -6533,13 +6627,11 @@ local function write_kit_v4(filepath, info, silent)
       local existing = io.open(filepath, "rb")
       if existing then
         existing:close()
-        reaper.ShowMessageBox(
+        eon_notice(
           "This kit has no audio loaded — saving would overwrite the existing file " ..
           "with a metadata-only shell.\n\n" ..
           "If you really want to clear this kit, delete the .swing file manually " ..
-          "and re-save. Otherwise, load samples or a kit first, then save.",
-          SCRIPT_NAME, 0
-        )
+          "and re-save. Otherwise, load samples or a kit first, then save.")
         reaper.gmem_write(G.CMD, 98)
         return
       end
@@ -6816,7 +6908,7 @@ local function write_kit_v4(filepath, info, silent)
   -- 3. Open file and write: magic + lua_len + lua + per-pad audio
   local f = io.open(filepath, "wb")
   if not f then
-    reaper.ShowMessageBox("Could not create file:\n" .. filepath, SCRIPT_NAME, 0)
+    eon_notice("Could not create file:\n" .. filepath)
     reaper.gmem_write(G.CMD, 98)
     return
   end
@@ -6905,7 +6997,7 @@ local function write_kit_v4(filepath, info, silent)
   end
 
   if not write_ok then
-    reaper.ShowMessageBox("Error writing kit file (disk full?):\n" .. tostring(write_err), SCRIPT_NAME, 0)
+    eon_notice("Error writing kit file (disk full?):\n" .. tostring(write_err))
     os.remove(filepath)
     reaper.gmem_write(G.CMD, 98)
     return
@@ -6930,13 +7022,11 @@ local function write_kit_v4(filepath, info, silent)
   else
     reaper.gmem_write(G.CMD, 99)
     reaper.SetExtState("Swing", "kit_saved", "1", false)
-    reaper.ShowMessageBox(
+    eon_notice(
       'Kit saved (self-contained, multi-layer)!\n\n' ..
       'Name: ' .. info.kit_name .. '\n' ..
       'Size: ' .. core.format_size(fsize) .. '\n' ..
-      'Location: ' .. filepath,
-      SCRIPT_NAME, 0
-    )
+      'Location: ' .. filepath)
   end
   update_folder_track_name(find_swing_track())
 end
@@ -7159,7 +7249,7 @@ local function write_kit_v5(filepath, info, silent)
         .. "didn't update AUDIOLEN. Using META for capture.\n", total_meta))
     end
     if total_audio == 0 then
-      reaper.ShowMessageBox(
+      eon_notice(
         "This kit has no audio loaded in gmem at the moment SAVE fired — the .swing file " ..
         "would only contain pad names and parameters (no wav data).\n\n" ..
         "Common causes:\n" ..
@@ -7168,9 +7258,7 @@ local function write_kit_v5(filepath, info, silent)
         "  - CLEAR/NEW was clicked between chop and SAVE\n\n" ..
         "Try: redo the chop, wait ~1 second for the audio waveforms to appear on the pads, " ..
         "THEN click SAVE.\n\n" ..
-        "Aborting save to avoid creating an empty kit file.",
-        SCRIPT_NAME, 0
-      )
+        "Aborting save to avoid creating an empty kit file.")
       reaper.gmem_write(G.CMD, 98)
       return
     end
@@ -7423,7 +7511,7 @@ local function write_kit_v5(filepath, info, silent)
   -- 4. Hand off to the v5 bundle writer
   local ok, err = swing_kit_v5.write_kit(filepath, manifest, pad_buffers)
   if not ok then
-    reaper.ShowMessageBox("Error writing v5 kit:\n" .. tostring(err), SCRIPT_NAME, 0)
+    eon_notice("Error writing v5 kit:\n" .. tostring(err))
     reaper.gmem_write(G.CMD, 98)
     return
   end
@@ -7440,13 +7528,11 @@ local function write_kit_v5(filepath, info, silent)
   else
     reaper.gmem_write(G.CMD, 99)
     reaper.SetExtState("Swing", "kit_saved", "1", false)
-    reaper.ShowMessageBox(
+    eon_notice(
       'Kit saved (v5 bundle — kit owns its audio)!\n\n' ..
       'Name: ' .. info.kit_name .. '\n' ..
       'Size: ' .. core.format_size(fsize) .. '\n' ..
-      'Location: ' .. filepath,
-      SCRIPT_NAME, 0
-    )
+      'Location: ' .. filepath)
   end
   update_folder_track_name(find_swing_track())
 end
@@ -7491,7 +7577,7 @@ function rk_export.do_export_write_file()
 
   local f = io.open(info.filepath, "wb")
   if not f then
-    reaper.ShowMessageBox("Could not create file:\n" .. info.filepath, SCRIPT_NAME, 0)
+    eon_notice("Could not create file:\n" .. info.filepath)
     reaper.gmem_write(G.CMD, 98)
     pending_export = nil
     return
@@ -7554,10 +7640,9 @@ function rk_export.do_export_write_file()
     -- Disk-full / permission-denied / etc. Remove the partial file and
     -- surface the error rather than leaving corrupted output.
     os.remove(info.filepath)
-    reaper.ShowMessageBox(
+    eon_notice(
       "Could not write kit (disk full?):\n" .. info.filepath ..
-      "\n\nDetails: " .. tostring(write_err),
-      SCRIPT_NAME, 0)
+      "\n\nDetails: " .. tostring(write_err))
     reaper.gmem_write(G.CMD, 98)
     pending_export = nil
     return
@@ -7573,15 +7658,13 @@ function rk_export.do_export_write_file()
   reaper.gmem_write(G.CMD, 99)
   -- Signal browser to refresh kit list
   reaper.SetExtState("Swing", "kit_saved", "1", false)
-  reaper.ShowMessageBox(
+  eon_notice(
     'Kit saved!\n\n' ..
     'Name: ' .. info.kit_name .. '\n' ..
     (info.author ~= "" and ('Author: ' .. info.author .. '\n') or '') ..
     'Samples: ' .. total_saved .. '\n' ..
     'Size: ' .. core.format_size(fsize) .. '\n' ..
-    'Location: ' .. info.filepath,
-    SCRIPT_NAME, 0
-  )
+    'Location: ' .. info.filepath)
   update_folder_track_name(find_swing_track())
   pending_export = nil
 end
@@ -7626,7 +7709,7 @@ end
 local function load_swing_file(filepath, internal)
   local f = io.open(filepath, "rb")
   if not f then
-    reaper.ShowMessageBox("Could not open: " .. filepath, SCRIPT_NAME, 0)
+    eon_notice("Could not open: " .. filepath)
     reaper.gmem_write(G.CMD, 98)
     return
   end
@@ -7634,7 +7717,7 @@ local function load_swing_file(filepath, internal)
   f:close()
 
   if #content < 24 then
-    reaper.ShowMessageBox("File too small to be a valid .swing kit.", SCRIPT_NAME, 0)
+    eon_notice("File too small to be a valid .swing kit.")
     reaper.gmem_write(G.CMD, 98)
     return
   end
@@ -7643,7 +7726,7 @@ local function load_swing_file(filepath, internal)
   local magic
   magic, pos = unpack_double(content, pos)
   if math.floor(magic) ~= MAGIC then
-    reaper.ShowMessageBox("Invalid .swing file (bad magic).", SCRIPT_NAME, 0)
+    eon_notice("Invalid .swing file (bad magic).")
     reaper.gmem_write(G.CMD, 98)
     return
   end
@@ -7746,13 +7829,13 @@ local function load_kit_v2(filepath, internal)
   -- (prevents malicious kit files from accessing globals / io / os)
   local chunk, err = loadfile(filepath, "t", {})
   if not chunk then
-    reaper.ShowMessageBox("Invalid v2 kit file:\n" .. (err or ""), SCRIPT_NAME, 0)
+    eon_notice("Invalid v2 kit file:\n" .. (err or ""))
     reaper.gmem_write(G.CMD, 98)
     return
   end
   local ok, kit = pcall(chunk)
   if not ok or type(kit) ~= "table" then
-    reaper.ShowMessageBox("Invalid v2 kit data:\n" .. tostring(kit), SCRIPT_NAME, 0)
+    eon_notice("Invalid v2 kit data:\n" .. tostring(kit))
     reaper.gmem_write(G.CMD, 98)
     return
   end
@@ -7866,7 +7949,7 @@ end
 local function load_kit_v4(filepath, internal)
   local f = io.open(filepath, "rb")
   if not f then
-    reaper.ShowMessageBox("Could not open: " .. filepath, SCRIPT_NAME, 0)
+    eon_notice("Could not open: " .. filepath)
     reaper.gmem_write(G.CMD, 98)
     return
   end
@@ -7874,20 +7957,20 @@ local function load_kit_v4(filepath, internal)
   f:close()
 
   if #content < 16 then
-    reaper.ShowMessageBox("Kit file too small to be v4.", SCRIPT_NAME, 0)
+    eon_notice("Kit file too small to be v4.")
     reaper.gmem_write(G.CMD, 98)
     return
   end
 
   if content:sub(1, 8) ~= "SWINGv04" then
-    reaper.ShowMessageBox("Invalid v4 magic in " .. filepath, SCRIPT_NAME, 0)
+    eon_notice("Invalid v4 magic in " .. filepath)
     reaper.gmem_write(G.CMD, 98)
     return
   end
 
   local lua_len = math.floor(string.unpack("<d", content, 9))
   if lua_len <= 0 or 16 + lua_len > #content then
-    reaper.ShowMessageBox("Corrupt v4 header (bad lua_len).", SCRIPT_NAME, 0)
+    eon_notice("Corrupt v4 header (bad lua_len).")
     reaper.gmem_write(G.CMD, 98)
     return
   end
@@ -7895,13 +7978,13 @@ local function load_kit_v4(filepath, internal)
   local lua_text = content:sub(17, 16 + lua_len)
   local chunk, err = load(lua_text, "swing_v4_kit", "t", {})
   if not chunk then
-    reaper.ShowMessageBox("Invalid v4 Lua section:\n" .. (err or ""), SCRIPT_NAME, 0)
+    eon_notice("Invalid v4 Lua section:\n" .. (err or ""))
     reaper.gmem_write(G.CMD, 98)
     return
   end
   local ok, kit = pcall(chunk)
   if not ok or type(kit) ~= "table" then
-    reaper.ShowMessageBox("Invalid v4 kit data:\n" .. tostring(kit), SCRIPT_NAME, 0)
+    eon_notice("Invalid v4 kit data:\n" .. tostring(kit))
     reaper.gmem_write(G.CMD, 98)
     return
   end
@@ -8763,7 +8846,7 @@ end
 local function load_kit_v5(filepath, internal)
   local manifest, pad_buffers, err = swing_kit_v5.load_kit(filepath)
   if not manifest then
-    reaper.ShowMessageBox("Could not load v5 kit:\n" .. tostring(err), SCRIPT_NAME, 0)
+    eon_notice("Could not load v5 kit:\n" .. tostring(err))
     reaper.gmem_write(G.CMD, 98)
     return
   end
@@ -8948,7 +9031,7 @@ local function load_swing_dispatch_now(filepath, internal, no_attrib)
   reaper.gmem_write(G.GS_KIT_PRESERVE_LIVE, 0)
   local valid, fmt = validate_swing(filepath)
   if not valid then
-    reaper.ShowMessageBox("Invalid file: " .. (fmt or ""), SCRIPT_NAME, 0)
+    eon_notice("Invalid file: " .. (fmt or ""))
     reaper.gmem_write(G.CMD, 98)
     return
   end
@@ -9121,11 +9204,9 @@ function rk_ops.do_import()
       reaper.gmem_write(G.CMD, 98); return   -- release the armed JSFX
     end
   elseif #kits == 0 then
-    reaper.ShowMessageBox(
+    eon_notice(
       "No .swing kit files found.\n\nKit directory:\n" .. kits_dir ..
-      "\n\nSave a kit first, or place .swing files in this folder.",
-      SCRIPT_NAME, 0
-    )
+      "\n\nSave a kit first, or place .swing files in this folder.")
     reaper.gmem_write(G.CMD, 98)
     return
   else
@@ -9206,11 +9287,9 @@ function rk_ops.do_build_multiout(opts)
   end
   local swing_track, swing_fx = find_swing_track()
   if not swing_track then
-    reaper.ShowMessageBox(
+    eon_notice(
       "Could not find Swing on any track.\n\n" ..
-      "Make sure Swing (Swing_ReaKit.jsfx) is loaded as an FX on a track.",
-      SCRIPT_NAME, 0
-    )
+      "Make sure Swing (Swing_ReaKit.jsfx) is loaded as an FX on a track.")
     reaper.gmem_write(G.CMD, 98)
     done(false)
     return
@@ -9382,7 +9461,7 @@ function rk_ops.do_build_multiout(opts)
       for i = 0, G.NUM_PADS - 1 do
         summary = summary .. string.format("  Ch %02d → %s\n", i + 1, make_track_name(i))
       end
-      reaper.ShowMessageBox(summary, SCRIPT_NAME, 0)
+      eon_notice(summary)
       done(true)
       return
 
@@ -9796,7 +9875,7 @@ function rk_ops.do_batch_import()
   end
 
   if #files == 0 then
-    reaper.ShowMessageBox("No audio files found in:\n" .. folder, SCRIPT_NAME, 0)
+    eon_notice("No audio files found in:\n" .. folder)
     reaper.gmem_write(G.CMD, 98)
     return
   end
@@ -9815,11 +9894,17 @@ function rk_ops.do_batch_import()
     msg = msg .. "  Pad " .. i .. ": " .. files[i].name .. "\n"
   end
   msg = msg .. "\nLoad these samples?"
-  if reaper.ShowMessageBox(msg, SCRIPT_NAME, 4) ~= 6 then
-    reaper.gmem_write(G.CMD, 98)
-    return
-  end
+  eon_confirm_cmd(msg, "Load",
+    function() rk_ops.batch_import_commit(files, count) end,
+    function() reaper.gmem_write(G.CMD, 98) end)
+end
 
+-- The post-confirm half of do_batch_import, split out rather than nested in a
+-- closure so the ~110-line body keeps its original indentation (and its
+-- ::next_batch_file:: label keeps working — a goto label is function-scoped).
+-- Everything it needs from the caller arrives as an argument; it is not called
+-- from anywhere else. Hangs off rk_ops so it costs no top-level local.
+function rk_ops.batch_import_commit(files, count)
   -- Acquire one scratch track for the whole batch — placed at the end of
   -- the project so we don't pollute the user's first track. Reused for
   -- every pad's temp item (track stays until release after the loop).
@@ -9940,17 +10025,15 @@ function rk_ops.do_chop_to_pads()
   -- Get selected media item
   local item = reaper.GetSelectedMediaItem(0, 0)
   if not item then
-    reaper.ShowMessageBox(
-      "No media item selected.\n\nSelect an audio item on the timeline, then try again.",
-      SCRIPT_NAME, 0
-    )
+    eon_notice(
+      "No media item selected.\n\nSelect an audio item on the timeline, then try again.")
     reaper.gmem_write(G.CMD, 98)
     return
   end
 
   local take = reaper.GetActiveTake(item)
   if not take or reaper.TakeIsMIDI(take) then
-    reaper.ShowMessageBox("Selected item is not audio.", SCRIPT_NAME, 0)
+    eon_notice("Selected item is not audio.")
     reaper.gmem_write(G.CMD, 98)
     return
   end
@@ -9962,59 +10045,118 @@ function rk_ops.do_chop_to_pads()
   local total_samples = math.floor(item_len * sr)
 
   -- Ask for number of slices. Dev override: ExtState EON_Bridge/chop_auto="N"
-  -- skips the modal dialog (headless test harness; same pattern as the
+  -- skips the dialog entirely (headless test harness; same pattern as the
   -- pathload dev gate). Cleared after one use so it can't leak into a session.
-  local num_slices, use_transients
   local chop_auto = tonumber(reaper.GetExtState("EON_Bridge", "chop_auto"))
   if chop_auto then
     reaper.SetExtState("EON_Bridge", "chop_auto", "", false)
-    num_slices = math.max(2, math.min(16, math.floor(chop_auto)))
-    use_transients = false
-  else
-    local retval, input = reaper.GetUserInputs(
-      "Chop to Pads", 2,
-      "Number of slices (2-16):,Transient detection (0=equal, 1=auto):,extrawidth=180",
-      "16,0"
-    )
-    if not retval then reaper.gmem_write(G.CMD, 98); return end
-
-    local fields = {}
-    for field in (input .. ","):gmatch("(.-),") do
-      fields[#fields + 1] = field
-    end
-    num_slices = math.max(2, math.min(16, math.floor(tonumber(fields[1]) or 16)))
-    use_transients = (tonumber(fields[2]) or 0) == 1
+    rk_ops.chop_commit(take, source, sr, nch, total_samples,
+                       math.max(2, math.min(16, math.floor(chop_auto))), false)
+    return
   end
 
+  -- Styled form. The old prompt asked for "Transient detection (0=equal,
+  -- 1=auto)" — a numeric field standing in for a two-way choice because
+  -- GetUserInputs has no other control; the form has a real picker, so the
+  -- question can be asked in words. Slice count is an int field with its own
+  -- 2..16 clamp (applied on accept, not while typing).
+  local shown = eon_dlg and eon_dlg.available() and eon_dlg.open and eon_dlg.open({
+    title = "Chop to Pads", width = 400, ok_label = "Chop",
+    fields = {
+      { key = "slices", label = "Number of slices:", kind = "int",
+        value = 16, min = 2, max = 16, sub = "2-16, one per pad" },
+      { key = "mode", label = "Slice at:", kind = "choice", value = 1,
+        choices = { "Equal spacing", "Transients (auto-detect)" } },
+    },
+    on_ok = function(v)
+      rk_ops.chop_commit(take, source, sr, nch, total_samples,
+        math.max(2, math.min(16, math.floor(tonumber(v.slices) or 16))),
+        (tonumber(v.mode) or 1) == 2)
+    end,
+    on_cancel = function() reaper.gmem_write(G.CMD, 98) end,
+  })
+  if shown then
+    reaper.gmem_write(G.CMD, 97)   -- park the mailbox while the form is up
+    return
+  end
+
+  -- Native fallback (no ReaImGui) — unchanged behaviour.
+  local retval, input = reaper.GetUserInputs(
+    "Chop to Pads", 2,
+    "Number of slices (2-16):,Transient detection (0=equal, 1=auto):,extrawidth=180",
+    "16,0"
+  )
+  if not retval then reaper.gmem_write(G.CMD, 98); return end
+
+  local fields = {}
+  for field in (input .. ","):gmatch("(.-),") do
+    fields[#fields + 1] = field
+  end
+  rk_ops.chop_commit(take, source, sr, nch, total_samples,
+    math.max(2, math.min(16, math.floor(tonumber(fields[1]) or 16))),
+    (tonumber(fields[2]) or 0) == 1)
+end
+
+-- The post-prompt half of do_chop_to_pads, split out rather than nested in a
+-- closure so the ~230-line body keeps its original indentation. Everything it
+-- needs arrives as an argument (item/item_len are NOT used past this point);
+-- not called from anywhere else. On rk_ops so it costs no top-level local.
+function rk_ops.chop_commit(take, source, sr, nch, total_samples,
+                            num_slices, use_transients)
   -- Create audio accessor
   local aa = reaper.CreateTakeAudioAccessor(take)
   if not aa then
-    reaper.ShowMessageBox("Could not create audio accessor.", SCRIPT_NAME, 0)
+    eon_notice("Could not create audio accessor.")
     reaper.gmem_write(G.CMD, 98)
     return
   end
 
-  -- Cap total samples to prevent runaway memory allocation (~60s stereo @ 192kHz)
+  -- Cap total samples to prevent runaway memory allocation
   local MAX_CHOP_SAMPLES = 12000000
   if total_samples > MAX_CHOP_SAMPLES then total_samples = MAX_CHOP_SAMPLES end
 
-  -- Read entire audio into Lua table
-  local full_buf = reaper.new_array(total_samples * nch)
-  full_buf.clear()
-  reaper.GetAudioAccessorSamples(aa, sr, nch, 0, total_samples, full_buf)
+  -- Zero-length guard: new_array(0) is a HARD ERROR that kills the whole
+  -- bridge (same trap load_audio_to_pad documents at its own read).
+  if total_samples <= 0 then
+    reaper.DestroyAudioAccessor(aa)
+    eon_notice("Selected item has no audio to chop.")
+    reaper.gmem_write(G.CMD, 98)
+    return
+  end
 
-  -- Mono mixdown into a Lua table
+  -- ⭐ Read in CHUNKS, mixing to mono as we go.
+  -- This used to allocate the ENTIRE item in one go —
+  -- `reaper.new_array(total_samples * nch)` — which fails outright with
+  -- "bad argument #1 to 'new_array' (invalid size)" on any reasonably long
+  -- selection: the cap above bounds FRAMES, but the array asked for is
+  -- frames × channels, and a reaper.array has its own hard ceiling far below
+  -- 12M×2. So chop was broken for long items and nobody had hit it.
+  -- Every OTHER accessor reader in this file already chunks at 1M frames
+  -- (load_audio_to_pad, the layer variants, batch import); chop was the lone
+  -- outlier. Chunking also caps peak memory at one chunk instead of the whole
+  -- item, and `mono` stays a plain Lua table, which has no such ceiling.
+  local CHUNK = math.min(total_samples, 1000000)
+  local buf = reaper.new_array(CHUNK * nch)
   local mono = {}
-  for j = 0, total_samples - 1 do
-    if nch == 1 then
-      mono[j] = full_buf[j + 1]
-    else
-      local sum = 0
-      for ch = 0, nch - 1 do
-        sum = sum + (full_buf[j * nch + ch + 1] or 0)
+  local read_frames = 0
+  while read_frames < total_samples do
+    local to_read = math.min(CHUNK, total_samples - read_frames)
+    buf.clear()
+    -- 4th arg is a TIME in seconds, not a frame index (same call shape the
+    -- chunked readers above use).
+    reaper.GetAudioAccessorSamples(aa, sr, nch, read_frames / sr, to_read, buf)
+    for j = 0, to_read - 1 do
+      if nch == 1 then
+        mono[read_frames + j] = buf[j + 1]
+      else
+        local sum = 0
+        for ch = 0, nch - 1 do
+          sum = sum + (buf[j * nch + ch + 1] or 0)
+        end
+        mono[read_frames + j] = sum / nch
       end
-      mono[j] = sum / nch
     end
+    read_frames = read_frames + to_read
   end
 
   reaper.DestroyAudioAccessor(aa)
@@ -10470,9 +10612,8 @@ local function auto_migrate_kits()
   end
 
   if moved > 0 then
-    reaper.ShowMessageBox(
-      "Moved " .. moved .. " kit(s) to:\n" .. kits_dir,
-      SCRIPT_NAME, 0)
+    eon_notice(
+      "Moved " .. moved .. " kit(s) to:\n" .. kits_dir)
   end
 end
 
@@ -13735,7 +13876,7 @@ function _eon_clean_finish(st, msg)
   reaper.SetExtState("EON_Bridge", "health_tick", "", false)   -- restore the tick
   reaper.SetExtState("EON_Bridge", "clean_store_result", msg, false)
   reaper.ShowConsoleMsg("[EON store] clean: " .. msg .. "\n")
-  if not st.noui then reaper.ShowMessageBox("Clean sample store:\n\n" .. msg, "EON Swing", 0) end
+  if not st.noui then eon_notice("Clean sample store:\n\n" .. msg, "EON Swing") end
   eon_clean_state = nil
 end
 
@@ -13749,7 +13890,7 @@ function eon_clean_store_kick()
   local function reject(msg)   -- terminal: report + settle
     reaper.SetExtState("EON_Bridge", "clean_store_result", msg, false)
     reaper.ShowConsoleMsg("[EON store] clean: " .. msg .. "\n")
-    if not noui then reaper.ShowMessageBox("Clean sample store:\n\n" .. msg, "EON Swing", 0) end
+    if not noui then eon_notice("Clean sample store:\n\n" .. msg, "EON Swing") end
     eon_clean_busy_since = nil
     return true
   end
@@ -14973,10 +15114,9 @@ local function poll()
       if ok_tb and TB then
         TB.ensure(_SCRIPT_DIR)
       else
-        reaper.ShowMessageBox(
+        eon_notice(
           "No EON toolbar found, and the toolbar builder is missing.\n\n" ..
-          "Run \"EON: Install / Refresh Toolbar\" from the Action List.",
-          "EON Toolbar", 0)
+          "Run \"EON: Install / Refresh Toolbar\" from the Action List.", "EON Toolbar")
       end
     end
     reaper.gmem_write(G.CMD, 0)
@@ -15273,15 +15413,15 @@ local function poll()
       reaper.gmem_write(G.GS_THEME_REQ, 0)
     end
     -- EON FX rollout LISTEN-BACK: an in-FX theme picker (1175, EQs, ...) writes
-    -- GS_THEME_REQ / GS_THEME_KNOB_REQ into its OWN gmem segment — the main
-    -- drain above never sees those. Sweep the curated segments (~200ms),
-    -- forward the first pending request into the shared ExtState (the name
-    -- read + change-detect BELOW then republish everywhere in this same tick),
-    -- and mirror GS_THEME_CUR into each segment so picker labels track the
-    -- active theme. State on _theme fields, NOT locals (main chunk sits at
-    -- the 200-local limit).
+    -- GS_THEME_REQ / GS_THEME_KNOB_REQ / GS_THEME_VU_REQ into its OWN gmem
+    -- segment — the main drain above never sees those. Sweep the curated
+    -- segments (~200ms), forward the first pending request into the shared
+    -- ExtState (the name read + change-detect BELOW then republish everywhere
+    -- in this same tick), and mirror GS_THEME_CUR into each segment so picker
+    -- labels track the active theme. State on _theme fields, NOT locals (main
+    -- chunk sits at the 200-local limit).
     if (heartbeat_counter % 6) == 0 and core.drain_theme_fx_segments then
-      _theme.fx_treq, _theme.fx_kreq =
+      _theme.fx_treq, _theme.fx_kreq, _theme.fx_vreq =
         core.drain_theme_fx_segments(_theme.idx[_theme.last_name or ""] or 0)
       if _theme.fx_treq >= 1 and _theme.fx_treq <= #_theme.names
          and _theme.names[_theme.fx_treq] then
@@ -15295,6 +15435,14 @@ local function poll()
           "eon_knob_" .. (reaper.GetExtState("Swing", "eon_theme") ~= ""
                           and reaper.GetExtState("Swing", "eon_theme") or "eon"),
           _theme.fx_kreq == 1 and "" or tostring(_theme.fx_kreq - 1), true)
+      end
+      -- VU-face SYNC relay (appearance cluster ">ALL" latch): DIRECT republish
+      -- into every curated FX segment — deliberately NO ExtState (see
+      -- rk_lua_core GS_THEME_VU_* note: the broadcast is a follow-me event;
+      -- per-instance persistence lives on each FX's own slider/chunk). The
+      -- fx_vreq guard also covers an old core without the third return (nil).
+      if _theme.fx_vreq and _theme.fx_vreq >= 1 and core.relay_vu_fx_segments then
+        core.relay_vu_fx_segments(_theme.fx_vreq)
       end
     end
     local name = reaper.GetExtState("Swing", "eon_theme")
