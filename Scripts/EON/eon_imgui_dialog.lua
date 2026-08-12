@@ -283,16 +283,31 @@ function M.open(spec)
 
       -- Buttons right-aligned, OK last: matches the platform order the rest of
       -- REAPER uses, so muscle memory still lands on the right one.
-      local BW = 92
+      -- cancel_label lets a confirm carry two REAL choices ("Keep on Main" vs
+      -- "Add Returns") instead of forcing the second choice to read as an
+      -- abort; no_cancel drops the left button entirely for pure notices
+      -- (M.info) — an OK-only box with a Cancel button invents a choice that
+      -- does not exist. Widths grow past the 92px floor to fit their label.
+      local cl = spec.cancel_label or 'Cancel'
+      local ol = spec.ok_label or 'OK'
+      local function btn_w(lbl)
+        local w = r.ImGui_CalcTextSize(ctx, lbl) + 26
+        if w < 92 then w = 92 end
+        return w
+      end
+      local cw = spec.no_cancel and 0 or btn_w(cl)
+      local ow = btn_w(ol)
       local avail = r.ImGui_GetContentRegionAvail(ctx)
-      local pad = avail - (BW * 2 + 8)
+      local pad = avail - (cw + ow + (cw > 0 and 8 or 0))
       if pad > 0 then r.ImGui_Dummy(ctx, pad, 1); r.ImGui_SameLine(ctx) end
-      if r.ImGui_Button(ctx, 'Cancel', BW, 0) then finish(false) end
-      r.ImGui_SameLine(ctx)
+      if cw > 0 then
+        if r.ImGui_Button(ctx, cl, cw, 0) then finish(false) end
+        r.ImGui_SameLine(ctx)
+      end
       r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(),        COL_OK)
       r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonHovered(), COL_OK_HOVER)
       r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonActive(),  COL_OK_ACTIVE)
-      if r.ImGui_Button(ctx, spec.ok_label or 'OK', BW, 0) then finish(true) end
+      if r.ImGui_Button(ctx, ol, ow, 0) then finish(true) end
       r.ImGui_PopStyleColor(ctx, 3)
 
       -- Enter accepts from inside a field too — that is the whole point of a
@@ -325,25 +340,49 @@ function M.open(spec)
   return true
 end
 
--- Confirmation dialog: a message + Cancel / <ok_label>. Same contract as
--- M.open — returns false when ReaImGui is absent so the caller can fall back
--- to ShowMessageBox; on_ok fires only on the accept button (or Enter).
--- spec = { title, message, ok_label, width, on_ok, on_cancel }
+-- Confirmation dialog: a message + <cancel_label> / <ok_label>. Same contract
+-- as M.open — returns false when ReaImGui is absent so the caller can fall
+-- back to ShowMessageBox; on_ok fires only on the accept button (or Enter).
+-- cancel_label relabels the left button for two-real-choices questions;
+-- no_cancel drops it (used by M.info below). Height estimate follows the
+-- message's line count — it only seeds the first frame, the measured fit
+-- corrects it — so a multi-line question no longer clips at the fixed 44.
+-- spec = { title, message, ok_label, cancel_label, no_cancel, width,
+--          on_ok, on_cancel }
 function M.confirm(spec)
+  local _, nl = tostring(spec.message or ''):gsub('\n', '')
   return M.open({
     title    = spec.title or 'Confirm',
     width    = spec.width or 360,
     ok_label = spec.ok_label or 'OK',
+    cancel_label = spec.cancel_label,
+    no_cancel    = spec.no_cancel,
     on_ok    = spec.on_ok,
     on_cancel = spec.on_cancel,
     fields   = { {
       key  = '_msg',
       kind = 'block',
-      height = 44,
+      height = 28 + nl * 17,
       draw = function(ctx)
         r.ImGui_TextWrapped(ctx, spec.message or '')
       end,
     } },
+  })
+end
+
+-- Notice dialog: message + a single OK. Closing the window (X / Escape)
+-- counts as acknowledged too — a notice has no choice to abandon — so both
+-- paths land on on_ok (optional; omit it for fire-and-forget).
+-- spec = { title, message, ok_label, width, on_ok }
+function M.info(spec)
+  return M.confirm({
+    title     = spec.title or 'EON',
+    message   = spec.message,
+    ok_label  = spec.ok_label or 'OK',
+    width     = spec.width,
+    no_cancel = true,
+    on_ok     = spec.on_ok,
+    on_cancel = spec.on_ok,
   })
 end
 

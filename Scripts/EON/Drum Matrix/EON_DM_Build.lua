@@ -42,6 +42,12 @@ local safety   = dofile(SCRIPT_DIR .. 'lib/safety.lua')
 local folder_layout = dofile(SCRIPT_DIR .. 'lib/folder_layout.lua')
 -- Swing-FX detection + per-instance registry/identity reads (multi-Swing).
 local swing_state = dofile(SCRIPT_DIR .. 'lib/swing_state_reader.lua')
+-- House dialog (ReaImGui, async) for the end-of-build notice; every use
+-- gates on available() and keeps ShowMessageBox as the fallback, so a
+-- missing ReaImGui or a missing module file costs nothing but the styling.
+local _dlg_ok, eon_dlg = pcall(dofile,
+  SCRIPT_DIR .. '..' .. SCRIPT_DIR:sub(-1) .. 'eon_imgui_dialog.lua')
+if not _dlg_ok then eon_dlg = nil end
 
 -- Case #37: prevent rapid-double-press from creating duplicate kit folders.
 -- 30 s TTL is generous — the defer-based build sequence runs ~10 frames so
@@ -637,10 +643,16 @@ local function do_build(slot)
   r.UpdateArrange()
   r.TrackList_AdjustWindows(false)
 
-  r.ShowMessageBox(
-    string.format('Built "%s" lanes for kit "%s" — 16 lanes ready.\nLoad/restart eon_drum_matrix.lua to display.',
-                  folder_name, kit_name),
-    'EON DM Build', 0)
+  local done_msg = string.format(
+    'Built "%s" lanes for kit "%s" — 16 lanes ready.\nLoad/restart eon_drum_matrix.lua to display.',
+    folder_name, kit_name)
+  -- House notice, async: the dialog's own defer loop keeps this one-shot
+  -- script alive until OK, so atexit (script-lock release) fires after the
+  -- dismiss — the lock's 30 s TTL caps the hold if the box is left open.
+  local shown = eon_dlg and eon_dlg.available() and eon_dlg.info and eon_dlg.info({
+    title = 'EON DM Build', message = done_msg,
+  })
+  if not shown then r.ShowMessageBox(done_msg, 'EON DM Build', 0) end
 end
 
 local function wait_then_build()

@@ -9196,6 +9196,14 @@ end
 -- opts.fx_returns: true/false to force the FX-return-tracks decision, nil to
 -- decide automatically (preserve if return tracks already exist, else ask).
 function rk_ops.do_build_multiout(opts)
+  -- opts.on_done(ok): fires at every terminal — ok=true after a completed
+  -- build/update (CMD left at 99), false on cancel/failure (98). Callers that
+  -- used to read G.CMD the moment this returned (Build Both) MUST use this
+  -- instead: the FX-returns prompt below is an async house dialog, so the
+  -- function can return with the decision still pending.
+  local function done(ok)
+    if opts and opts.on_done then opts.on_done(ok) end
+  end
   local swing_track, swing_fx = find_swing_track()
   if not swing_track then
     reaper.ShowMessageBox(
@@ -9204,6 +9212,7 @@ function rk_ops.do_build_multiout(opts)
       SCRIPT_NAME, 0
     )
     reaper.gmem_write(G.CMD, 98)
+    done(false)
     return
   end
 
@@ -9289,7 +9298,8 @@ function rk_ops.do_build_multiout(opts)
     return v, d
   end
   local have_verb, have_delay = detect_returns()
-  local want_returns   -- decided after the Rebuild/Update dialog (creation paths only)
+  -- want_returns is decided after the Rebuild/Update dialog (creation paths
+  -- only) and travels as proceed_build's parameter — see the async seam below.
 
   -- Set/clear the JSFX fx_returns flag by NAME (slider index mapping is fragile;
   -- resolve via TrackFX_GetParamName like the StepSeq pairing does). slider24
@@ -9373,6 +9383,7 @@ function rk_ops.do_build_multiout(opts)
         summary = summary .. string.format("  Ch %02d → %s\n", i + 1, make_track_name(i))
       end
       reaper.ShowMessageBox(summary, SCRIPT_NAME, 0)
+      done(true)
       return
 
     elseif choice == 6 then
@@ -9402,25 +9413,24 @@ function rk_ops.do_build_multiout(opts)
     else
       -- Cancel / closed dialog
       reaper.gmem_write(G.CMD, 98)
+      done(false)
       return
     end
   end
 
   -- Decide FX returns now — only the creation paths (fresh build or Rebuild)
   -- reach here; Update/Cancel already returned, so we never prompt needlessly.
-  if opts and opts.fx_returns ~= nil then
-    want_returns = opts.fx_returns and true or false
-  elseif have_verb or have_delay then
-    want_returns = true   -- preserve an existing opt-in across a Rebuild
-  else
-    local c = reaper.ShowMessageBox(
-      "Add delay/reverb FX return tracks?\n\n" ..
-      "YES = create EON Verb / Delay Return tracks and route the wet to them\n" ..
-      "NO = keep the wet on the Main bus (current behavior)",
-      SCRIPT_NAME, 4  -- Yes/No → 6=Yes, 7=No
-    )
-    want_returns = (c == 6)
-  end
+  -- ⚠️ ASYNC SEAM. The house dialog (eon_dlg) runs on the defer loop and hands
+  -- the answer to a callback, so the entire remainder of the build lives in
+  -- proceed_build below. While the dialog is up, G.CMD is parked at 97
+  -- ("prompt pending"): the dispatcher has no 97 branch and no unknown-else,
+  -- so the pending 40/74 cannot re-fire every tick, and the mailbox stays
+  -- claimed so no other producer can stage into it. The JSFX side holds
+  -- kit_busy until the 98/99 that proceed_build eventually writes — the same
+  -- wait it had when the old blocking MessageBox froze the whole bridge,
+  -- except the pollers keep ticking now. (97 is registered in
+  -- .refs/swing_gmem_bridge_protocol.md next to 98/99.)
+  local function proceed_build(want_returns)
 
   local swing_idx = math.floor(reaper.GetMediaTrackInfo_Value(swing_track, "IP_TRACKNUMBER")) - 1
 
@@ -9590,13 +9600,46 @@ function rk_ops.do_build_multiout(opts)
   -- Styled + ASYNC. The old ShowMessageBox froze the WHOLE bridge (pollers,
   -- kit loads, companion ticks) until OK was clicked -- right after a build,
   -- which is exactly when the strip-sync work needs the bridge ticking.
-  local _, _nl = summary:gsub('\n', '')
-  local shown = eon_dlg and eon_dlg.available() and eon_dlg.open({
-    title = SCRIPT_NAME, ok_label = 'OK',
-    fields = { { key = '_info', kind = 'block', height = (_nl + 2) * 17,
-      draw = function(ctx) reaper.ImGui_TextWrapped(ctx, summary) end } },
+  -- (Was a bespoke eon_dlg.open block; M.info is that exact shape now.)
+  local shown = eon_dlg and eon_dlg.available() and eon_dlg.info and eon_dlg.info({
+    title = SCRIPT_NAME, message = summary,
   })
   if not shown then reaper.ShowMessageBox(summary, SCRIPT_NAME, 0) end
+  done(true)
+  end  -- proceed_build
+
+  -- The decision itself. Programmatic and preserve paths stay synchronous;
+  -- only the genuine question goes through the house dialog. Its two buttons
+  -- are two REAL choices — "Keep on Main" is a valid outcome, not an abort —
+  -- and dismissing the window (X / Escape) lands on keep-on-main, the
+  -- current-behavior default.
+  if opts and opts.fx_returns ~= nil then
+    proceed_build(opts.fx_returns and true or false)
+  elseif have_verb or have_delay then
+    proceed_build(true)   -- preserve an existing opt-in across a Rebuild
+  else
+    local shown = eon_dlg and eon_dlg.available() and eon_dlg.confirm and eon_dlg.confirm({
+      title = "FX Return Tracks", width = 430,
+      ok_label = "Add Returns", cancel_label = "Keep on Main",
+      message = "Add delay/reverb FX return tracks?\n\n" ..
+                "Add Returns — create EON Verb / Delay Return tracks and route the wet to them.\n" ..
+                "Keep on Main — leave the wet on the Main bus (current behavior).",
+      on_ok     = function() proceed_build(true)  end,
+      on_cancel = function() proceed_build(false) end,
+    })
+    if shown then
+      reaper.gmem_write(G.CMD, 97)   -- park the mailbox while the dialog is up
+    else
+      -- No ReaImGui: the native Yes/No, blocking as it always was.
+      local c = reaper.ShowMessageBox(
+        "Add delay/reverb FX return tracks?\n\n" ..
+        "YES = create EON Verb / Delay Return tracks and route the wet to them\n" ..
+        "NO = keep the wet on the Main bus (current behavior)",
+        SCRIPT_NAME, 4  -- Yes/No → 6=Yes, 7=No
+      )
+      proceed_build(c == 6)
+    end
+  end
 end
 
 -- Run a script from the EON Drum Matrix folder by file name. Shared by CMD 73 /
@@ -14838,14 +14881,15 @@ local function poll()
 
   elseif cmd == 74 then
     -- MATRIX "Build Both": audio multi-outs FIRST, then the Drum Matrix MIDI
-    -- lanes. do_build_multiout() writes CMD 98 (cancel/fail) or 99 (done) and
-    -- may pop a Rebuild/Update dialog when multi-outs already exist — only go
-    -- on to the DM build when it wasn't cancelled. Do NOT write CMD=0 here: the
-    -- 98/99 it left is the completion code the JSFX consumes to clear kit_busy.
-    rk_ops.do_build_multiout()
-    if math.floor(reaper.gmem_read(G.CMD)) ~= 98 then
-      run_dm_script("EON_DM_Build.lua")
-    end
+    -- lanes. The DM step rides do_build_multiout's on_done callback — the
+    -- FX-returns prompt inside it is an async house dialog, so "did it
+    -- cancel?" can no longer be read off G.CMD the moment the call returns
+    -- (it may return with the dialog still open and CMD parked at 97).
+    -- Do NOT write CMD=0 here: the 98/99 the build leaves is the completion
+    -- code the JSFX consumes to clear kit_busy.
+    rk_ops.do_build_multiout({ on_done = function(ok)
+      if ok then run_dm_script("EON_DM_Build.lua") end
+    end })
 
   elseif cmd == 75 then
     -- PAINT (the single Drum Matrix grid control): if the overlay is already
