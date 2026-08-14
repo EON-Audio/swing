@@ -201,6 +201,34 @@ function core.get_cache_dir()
   return dir
 end
 
+-- Windows-safe atomic file write. Writes to path.tmp, closes it, removes the
+-- old path, then renames tmp -> path. Windows os.rename fails if the target
+-- exists, so the remove is required — the brief window where the file is
+-- missing is acceptable only if callers treat "missing" as "no data yet"
+-- (defaults, rebuild from empty). A crash before rename leaves the previous
+-- file intact and an orphaned .tmp; a crash after rename is the new file.
+-- `writer` is either a body string or a function(f) that streams into f.
+-- Returns true on success, false (+ message) on any failure — a writer that
+-- throws is caught so the old file is not clobbered.
+function core.atomic_write(path, writer)
+  local tmp = path .. ".tmp"
+  local f = io.open(tmp, "w")
+  if not f then return false, "open failed: " .. tmp end
+  local ok, err = true, nil
+  if type(writer) == "function" then
+    ok, err = pcall(writer, f)
+  else
+    f:write(tostring(writer))
+  end
+  f:close()
+  if not ok then
+    os.remove(tmp)
+    return false, err
+  end
+  os.remove(path)
+  return os.rename(tmp, path)
+end
+
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- FORMAT HELPERS
 -- ═══════════════════════════════════════════════════════════════════════════════
@@ -745,6 +773,7 @@ core.GMEM = {
   KITCOVER_STRIDE     = 544,
   KITCOVER_PUB_SEQ    = 0,    -- bridge -> JSFX. WRITTEN LAST, after the path.
   KITCOVER_PUB_PATH   = 1,    -- extracted temp-file path of the loaded cover
+  KITCOVER_PUB_PREVIEW = 261, -- 1 = published path is an UNSAVED drop preview
   KITCOVER_PEND_SEQ   = 272,  -- JSFX -> bridge. WRITTEN LAST, after the path.
   KITCOVER_PEND_PATH  = 273,  -- a just-dropped image, awaiting the next save
   KITCOVER_PATH_MAX   = 258,
@@ -829,7 +858,10 @@ core.GMEM = {
   --   SP_PITCH_ALGO = 3 (Voice)   — Elastique Soloist + Speech
   --
   -- Single-pad-request channel — slot layout in Swing_Media_Transfer:
-  --   1445  SP_PITCH_PROTOCOL_VER  JSFX writes value 2 on first @block (latched)
+  --   1445  SP_PITCH_PROTOCOL_VER  JSFX republishes SP_PITCH_PROTOCOL_VER_VALUE
+  --                                (4) EVERY tick, from @init/@slider/@block/@gfx —
+  --                                deliberately NOT latched: an @init-only write to
+  --                                the named pool can silently fail to land
   --   1446  SP_PITCH_HEARTBEAT     Extension writes counter; JSFX reads
   --   1447  SP_PITCH_REQ_PAD       JSFX writes 0..15 = request, -1 = idle
   --                                (Extension writes -1 to ack/clear)

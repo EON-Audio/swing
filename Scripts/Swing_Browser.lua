@@ -151,7 +151,7 @@ local playback = {
   preview       = nil,      -- CF_Preview handle
   is_playing    = false,
   is_paused     = false,
-  volume        = 0.8,      -- 0-1
+  volume        = 1.0,      -- 0-1; keep in sync with the settings-table default
   pitch         = 0,        -- semitones (-12 to +12)
   loop          = false,
   position      = 0,        -- seconds
@@ -218,49 +218,20 @@ local ui = {
 
 local SETTINGS_VERSION = 1  -- increment on breaking schema changes (see §11 migration)
 
-local settings = {
-  version        = SETTINGS_VERSION,
-  last_folder    = "",
-  window_w       = 900,
-  window_h       = 550,
-  volume         = 0.8,
-  auto_play      = true,
-  favorites      = {},
-  recent_folders = {},
-  sort_column    = 1,
-  sort_ascending = true,
-  loop_preview   = false,
-  theme          = "dark",   -- "dark" or "light"
-  show_shortcuts = true,
-  show_favorites = true,
-  show_recent    = true,
-  show_kits      = true,
-  show_categories = true,
-  categories_open = true,
-  -- Sidebar collapsible-section open state. ImGui's CollapsingHeader uses
-  -- DefaultOpen on every script launch, which resets the user's collapse
-  -- choices. We mirror the state into settings each frame and feed it
-  -- back via SetNextItemOpen(Cond_Once) on init so the layout survives
-  -- a browser close → reopen cycle.
-  kits_open      = true,
-  shortcuts_open = true,
-  favorites_open = true,
-  recent_open    = true,
-  -- Left-pane 4x4 pad grid. Optional since samples can be dragged straight
-  -- onto the plugin's own pads (EON_DRAG); collapsing it hands the vertical
-  -- space to the favorites/kits sidebar below. Default open — the grid is
-  -- still how you see loaded/muted pads and pick a target pad.
-  pads_open      = true,
-  -- Whole left pane (pads + pad controls + kits/favorites sidebar). Hiding it
-  -- is the one that widens the FILE TABLE, since that lives in the right pane
-  -- — collapsing the pad grid alone only frees vertical space within the left.
-  left_pane_open = true,
-  dock_id        = 0,        -- 0 = floating, negative = REAPER docker, positive = ImGui dock
-  spectral_view  = false,    -- TK-style spectral coloring of waveform preview (FFT per pixel)
-  grid_overlay   = false,    -- TK-style time grid overlay on waveform preview
-  recurse_subfolders = false,-- Subfolders mode: flatten all audio files from subdirectories into one list
-  kit_fill_mode  = false,    -- Kit-categories ④: OFF = LOAD (author's layout), ON = FILL (category-match onto MY layout)
-}
+-- Fresh-install defaults live in ONE place — the shipped seed file that
+-- also serves as first-run prefs (see the header comment in it). dofile'd
+-- here so a new setting only has to be added there; the shallow-clone
+-- into `settings` below gives the working table its own container.
+local SEED_FILE_PATH = _SCRIPT_DIR .. sep .. "Swing_Browser_Settings.lua"
+local DEFAULTS = dofile(SEED_FILE_PATH)
+DEFAULTS.version = SETTINGS_VERSION   -- version is code-owned, not seed-owned
+
+local settings = {}
+for k, v in pairs(DEFAULTS) do
+  -- Shallow-clone: scalars go in as-is; tables (favorites, recent_folders)
+  -- get their own {} so mutations via file_mgr.* never leak into DEFAULTS.
+  settings[k] = (type(v) == "table") and {} or v
+end
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- KIT AWARENESS + DATABASE
@@ -654,22 +625,14 @@ local SCRIPT_DIR = _SCRIPT_DIR
 local USER_DIR = (reaper.GetResourcePath() or "") .. sep .. "Data" .. sep .. "EON_Swing"
 local SETTINGS_FILE = USER_DIR .. sep .. "Swing_Browser_Settings.lua"
 -- One-time migration: if the legacy settings file exists next to the script,
--- read it (so we don't lose prefs) and delete it from the source tree.
+-- read it so we don't lose prefs (the file itself stays put — see the
+-- downgrade note inside load_settings).
 local LEGACY_SETTINGS_FILE = SCRIPT_DIR .. sep .. "Swing_Browser_Settings.lua"
 
--- mkdir -p USER_DIR (REAPER doesn't expose this; use os.execute as a fallback)
+-- mkdir -p USER_DIR via the native API (same call core.get_cache_dir uses;
+-- os.execute here flashed a console window on Windows first run).
 local function ensure_user_dir()
-  local probe = io.open(USER_DIR .. sep .. ".probe", "w")
-  if probe then probe:close(); os.remove(USER_DIR .. sep .. ".probe"); return true end
-  if is_windows then
-    os.execute('mkdir "' .. USER_DIR .. '" 2>nul')
-  else
-    os.execute('mkdir -p "' .. USER_DIR .. '"')
-  end
-  -- Re-probe
-  local p2 = io.open(USER_DIR .. sep .. ".probe", "w")
-  if p2 then p2:close(); os.remove(USER_DIR .. sep .. ".probe"); return true end
-  return false
+  reaper.RecursiveCreateDirectory(USER_DIR, 0)
 end
 
 local function save_settings()
@@ -683,52 +646,57 @@ local function save_settings()
   settings.loop_preview   = playback.loop
 
   ensure_user_dir()
-  local f = io.open(SETTINGS_FILE, "w")
-  if not f then return end
-  f:write("return {\n")
-  -- version (required for future migration — see §11)
-  f:write(string.format('  version = %d,\n', SETTINGS_VERSION))
-  -- scalars
-  f:write(string.format('  last_folder = %q,\n', settings.last_folder))
-  f:write(string.format('  window_w = %d,\n', settings.window_w))
-  f:write(string.format('  window_h = %d,\n', settings.window_h))
-  f:write(string.format('  volume = %.3f,\n', settings.volume))
-  f:write(string.format('  auto_play = %s,\n', tostring(settings.auto_play)))
-  f:write(string.format('  sort_column = %d,\n', settings.sort_column))
-  f:write(string.format('  sort_ascending = %s,\n', tostring(settings.sort_ascending)))
-  f:write(string.format('  loop_preview = %s,\n', tostring(settings.loop_preview)))
-  f:write(string.format('  theme = %q,\n', settings.theme or "dark"))
-  f:write(string.format('  show_shortcuts = %s,\n', tostring(settings.show_shortcuts ~= false)))
-  f:write(string.format('  show_favorites = %s,\n', tostring(settings.show_favorites ~= false)))
-  f:write(string.format('  show_recent = %s,\n', tostring(settings.show_recent ~= false)))
-  f:write(string.format('  show_kits = %s,\n', tostring(settings.show_kits ~= false)))
-  f:write(string.format('  show_categories = %s,\n', tostring(settings.show_categories ~= false)))
-  f:write(string.format('  categories_open = %s,\n', tostring(settings.categories_open ~= false)))
-  f:write(string.format('  kits_open = %s,\n',      tostring(settings.kits_open ~= false)))
-  f:write(string.format('  shortcuts_open = %s,\n', tostring(settings.shortcuts_open ~= false)))
-  f:write(string.format('  pads_open = %s,\n',      tostring(settings.pads_open ~= false)))
-  f:write(string.format('  left_pane_open = %s,\n', tostring(settings.left_pane_open ~= false)))
-  f:write(string.format('  favorites_open = %s,\n', tostring(settings.favorites_open ~= false)))
-  f:write(string.format('  recent_open = %s,\n',    tostring(settings.recent_open ~= false)))
-  f:write(string.format('  dock_id = %d,\n', math.floor(settings.dock_id or 0)))
-  f:write(string.format('  spectral_view = %s,\n', tostring(settings.spectral_view == true)))
-  f:write(string.format('  grid_overlay = %s,\n',  tostring(settings.grid_overlay == true)))
-  f:write(string.format('  recurse_subfolders = %s,\n', tostring(settings.recurse_subfolders == true)))
-  f:write(string.format('  kit_fill_mode = %s,\n', tostring(settings.kit_fill_mode == true)))
-  -- favorites
-  f:write('  favorites = {\n')
-  for _, fav in ipairs(settings.favorites) do
-    f:write(string.format('    {path=%q, name=%q},\n', fav.path, fav.name))
-  end
-  f:write('  },\n')
-  -- recent
-  f:write('  recent_folders = {\n')
-  for _, r in ipairs(settings.recent_folders) do
-    f:write(string.format('    %q,\n', r))
-  end
-  f:write('  },\n')
-  f:write("}\n")
-  f:close()
+  -- Atomic tmp+rename via core.atomic_write: a crash mid-write must never
+  -- leave a truncated settings file (load_settings would then silently
+  -- reset every pref to defaults). The brief missing-file window between
+  -- remove+rename is acceptable because load_settings treats missing as
+  -- "use defaults" (same tradeoff as save_persistent_cache).
+  core.atomic_write(SETTINGS_FILE, function(f)
+    f:write("return {\n")
+    -- version (required for future migration — see §11)
+    f:write(string.format('  version = %d,\n', SETTINGS_VERSION))
+    -- scalars
+    f:write(string.format('  last_folder = %q,\n', settings.last_folder))
+    -- floor: GetWindowSize feeds these as floats, and %d raises on fractionals
+    f:write(string.format('  window_w = %d,\n', math.floor(settings.window_w)))
+    f:write(string.format('  window_h = %d,\n', math.floor(settings.window_h)))
+    f:write(string.format('  volume = %.3f,\n', settings.volume))
+    f:write(string.format('  auto_play = %s,\n', tostring(settings.auto_play)))
+    f:write(string.format('  sort_column = %d,\n', settings.sort_column))
+    f:write(string.format('  sort_ascending = %s,\n', tostring(settings.sort_ascending)))
+    f:write(string.format('  loop_preview = %s,\n', tostring(settings.loop_preview)))
+    f:write(string.format('  theme = %q,\n', settings.theme or DEFAULTS.theme))
+    f:write(string.format('  show_shortcuts = %s,\n', tostring(settings.show_shortcuts ~= false)))
+    f:write(string.format('  show_favorites = %s,\n', tostring(settings.show_favorites ~= false)))
+    f:write(string.format('  show_recent = %s,\n', tostring(settings.show_recent ~= false)))
+    f:write(string.format('  show_kits = %s,\n', tostring(settings.show_kits ~= false)))
+    f:write(string.format('  show_categories = %s,\n', tostring(settings.show_categories ~= false)))
+    f:write(string.format('  categories_open = %s,\n', tostring(settings.categories_open ~= false)))
+    f:write(string.format('  kits_open = %s,\n',      tostring(settings.kits_open ~= false)))
+    f:write(string.format('  shortcuts_open = %s,\n', tostring(settings.shortcuts_open ~= false)))
+    f:write(string.format('  pads_open = %s,\n',      tostring(settings.pads_open ~= false)))
+    f:write(string.format('  left_pane_open = %s,\n', tostring(settings.left_pane_open ~= false)))
+    f:write(string.format('  favorites_open = %s,\n', tostring(settings.favorites_open ~= false)))
+    f:write(string.format('  recent_open = %s,\n',    tostring(settings.recent_open ~= false)))
+    f:write(string.format('  dock_id = %d,\n', math.floor(settings.dock_id or 0)))
+    f:write(string.format('  spectral_view = %s,\n', tostring(settings.spectral_view == true)))
+    f:write(string.format('  grid_overlay = %s,\n',  tostring(settings.grid_overlay == true)))
+    f:write(string.format('  recurse_subfolders = %s,\n', tostring(settings.recurse_subfolders == true)))
+    f:write(string.format('  kit_fill_mode = %s,\n', tostring(settings.kit_fill_mode == true)))
+    -- favorites
+    f:write('  favorites = {\n')
+    for _, fav in ipairs(settings.favorites) do
+      f:write(string.format('    {path=%q, name=%q},\n', fav.path, fav.name))
+    end
+    f:write('  },\n')
+    -- recent
+    f:write('  recent_folders = {\n')
+    for _, r in ipairs(settings.recent_folders) do
+      f:write(string.format('    %q,\n', r))
+    end
+    f:write('  },\n')
+    f:write("}\n")
+  end)
 end
 
 -- Settings migration (§11.3): add future migrations here
@@ -759,8 +727,10 @@ local function load_settings()
       local body = legacy:read("*a")
       legacy:close()
       ensure_user_dir()
-      local out = io.open(SETTINGS_FILE, "w")
-      if out then out:write(body); out:close() end
+      -- Atomic like save_settings: a crash mid-copy would otherwise leave a
+      -- truncated file that both fails to load AND blocks this migration
+      -- from ever re-running (the file would exist).
+      core.atomic_write(SETTINGS_FILE, body)
     end
   end
 
@@ -864,40 +834,35 @@ local function save_persistent_cache(force)
   if not force and now - cache_last_save < 1.0 then return end
 
   local cache_path = core.get_cache_dir() .. sep .. "analysis.lua"
-  local tmp_path = cache_path .. ".tmp"
-  local f = io.open(tmp_path, "w")
-  if not f then return end
-
-  f:write("return {\n  version = 1,\n  entries = {\n")
-  for path, entry in pairs(analysis_cache) do
-    -- Re-pack live metrics; entries loaded from disk and never re-measured
-    -- still hold their original packed string and are written straight back.
-    local packed = entry.packed
-    if not packed and entry.metrics then packed = measure.pack(entry.metrics) end
-    -- Only persist entries we actually have data for (skip in-flight queue
-    -- placeholders). Measurements count as data on their own: a drum one-shot
-    -- routinely has neither BPM nor key, and gating on those would throw away
-    -- every measurement for exactly the content this browser is built for.
-    if entry.analyzed and (entry.bpm or entry.key or packed or entry.root) then
-      f:write("    [" .. core.lua_quote(path) .. "] = { ")
-      -- mtime is a string from JS_File_Stat (not epoch number) — quote it.
-      f:write("mtime = ", core.lua_quote(tostring(entry.mtime or "")), ", ")
-      if entry.bpm then f:write("bpm = ", tostring(entry.bpm), ", ") end
-      if entry.key then f:write("key = ", core.lua_quote(entry.key), ", ") end
-      if packed then f:write("m = ", core.lua_quote(packed), ", ") end
-      -- Additive like `m`; version stays 1 and an older build just ignores it.
-      if entry.root then f:write("root = ", tostring(entry.root), ", ") end
-      f:write("source = ", core.lua_quote(entry.source or "dsp"), " },\n")
+  -- Atomic tmp+rename via core.atomic_write. Brief missing-file window is
+  -- acceptable because load_persistent_cache treats missing as empty and
+  -- we'll rebuild from live metrics as the user browses.
+  core.atomic_write(cache_path, function(f)
+    f:write("return {\n  version = 1,\n  entries = {\n")
+    for path, entry in pairs(analysis_cache) do
+      -- Re-pack live metrics; entries loaded from disk and never re-measured
+      -- still hold their original packed string and are written straight back.
+      local packed = entry.packed
+      if not packed and entry.metrics then packed = measure.pack(entry.metrics) end
+      -- Only persist entries we actually have data for (skip in-flight queue
+      -- placeholders). Measurements count as data on their own: a drum
+      -- one-shot routinely has neither BPM nor key, and gating on those would
+      -- throw away every measurement for exactly the content this browser is
+      -- built for.
+      if entry.analyzed and (entry.bpm or entry.key or packed or entry.root) then
+        f:write("    [" .. core.lua_quote(path) .. "] = { ")
+        -- mtime is a string from JS_File_Stat (not epoch number) — quote it.
+        f:write("mtime = ", core.lua_quote(tostring(entry.mtime or "")), ", ")
+        if entry.bpm then f:write("bpm = ", tostring(entry.bpm), ", ") end
+        if entry.key then f:write("key = ", core.lua_quote(entry.key), ", ") end
+        if packed then f:write("m = ", core.lua_quote(packed), ", ") end
+        -- Additive like `m`; version stays 1 and an older build just ignores it.
+        if entry.root then f:write("root = ", tostring(entry.root), ", ") end
+        f:write("source = ", core.lua_quote(entry.source or "dsp"), " },\n")
+      end
     end
-  end
-  f:write("  },\n}\n")
-  f:close()
-
-  -- Atomic rename. Windows os.rename fails if target exists, so remove first.
-  -- Brief window between remove+rename where cache is missing — acceptable
-  -- because load_persistent_cache treats missing as empty and we'll rebuild.
-  os.remove(cache_path)
-  os.rename(tmp_path, cache_path)
+    f:write("  },\n}\n")
+  end)
   cache_dirty = false
   cache_last_save = now
 end

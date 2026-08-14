@@ -1,0 +1,569 @@
+desc:EON Lens — artwork card
+// Artwork card, embedded in the TCP/MCP like album art. TWO MODES, chosen
+// solely by link_slot. Contracts: Spec_EON_Lens.md (linked) and
+// Spec_EON_Lens_Standalone.md (standalone + the revocation that feeds it).
+//
+//   LINKED (link_slot >= 0) — the multi-out parent folder track
+//     ("Swing — <kit>"). The BRIDGE owns the picture: it publishes the loaded
+//     kit's cover and the card follows. Built + auto-embedded by the multi-out
+//     build. Drops funnel into the kit's cover.
+//   STANDALONE (link_slot < 0) — any track at all. No Swing, no bridge, no
+//     gmem reader. The CARD owns its picture: an image dropped on the floating
+//     window is kept in @serialize and rides the project.
+//
+// The kit always wins — a stored local path is kept but never drawn while
+// linked. That matters because link_slot rides the FX chunk: it survives an FX
+// drag, a track template and an FX-chain preset, so a card can end up naming a
+// kit it no longer sits with. The bridge revokes those (link_slot = -1) and
+// standalone mode is where they land, instead of going dead.
+//
+// Data: SECOND READER of the per-instance EON_KITCOVER band. The PUB half is
+// bridge-written broadcast (path of the extracted cover temp file), consumed
+// independently by Swing's kit tile and by this card — each keeps its own
+// last-seen seq, so fan-out is free and no publish code knows we exist.
+// An image dropped on the FLOATING window is forwarded to the PEND half,
+// where the bridge's existing poll stages it as the kit's cover for the next
+// save (same funnel as the kit tile; drops on the EMBEDDED card never reach
+// a JSFX — REAPER's own TCP/MCP drop handling wins).
+//
+// The owning Swing instance's registry slot arrives in link_slot, pushed by
+// the bridge identity sweep (slots are session-volatile, never baked) — the
+// same contract as EON_FX_Return_View.
+//
+// Audio is never MODIFIED — samples pass through bit-identical, and there is no
+// @block. There IS a @sample section, but only a STANDALONE card enters it (a
+// linked one skips on a single compare): it peak-meters its own track to feed
+// the shimmer, because off a Swing there is no GS_STRIP band to read. A linked
+// card on a multi-out parent still costs the summing path nothing.
+
+options:gmem=Swing_Media_Transfer
+
+// Hidden/internal — driven by the bridge. Not meant for the user.
+slider1:link_slot=-1<-1,64,1>-Linked registry slot (internal; Lua-pushed)
+// Hidden like link_slot — the on-card button (top-right of the floating
+// window) is the only visible face of this toggle, keeping the FX panel
+// pure @gfx. Still a real param: automatable, undoable, project-persisted.
+slider2:lens_shimmer=1<0,1,1{Off,On}>-Activity shimmer (toggled by the card's button)
+// Bumped on every accepted STANDALONE drop. The artwork path is a @serialize
+// global, and mutating one on its own neither marks the project dirty nor lands
+// an undo point — so a REAL param has to move or the drop is lost silently on
+// close. The value itself carries no meaning; only the change does.
+slider3:lens_art_gen=0<0,1023,1>-Artwork generation (internal; forces the state snapshot)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+ext_noinit = 1.0;
+gfx_ext_retina == 0 ? gfx_ext_retina = 1;
+// Embed support — bit 0x100 MUST be set in @init (no effect later; REAPER 7.45+).
+gfx_ext_flags |= 0x100;
+
+// ── EON_KITCOVER band — MUST match Swing_ReaKit.jsfx / rk_lua_core.lua ──────
+// (declared in .refs/gmem_regions_supplement.tsv; duplicated-constants house
+// pattern for cross-plugin readers, same as the Return View's GS_STRIP_*.)
+EON_KITCOVER_BASE      = 26251792;  // + slot * STRIDE
+EON_KITCOVER_STRIDE    = 544;
+KITCOVER_OFF_PUB_SEQ   = 0;    // bridge -> JSFX, written LAST after the path
+KITCOVER_OFF_PUB_PATH  = 1;    // extracted temp-file path of the loaded cover
+KITCOVER_OFF_PUB_PREVIEW = 261; // 1 = unsaved drop preview (keep the UNSAVED cue up)
+KITCOVER_OFF_PEND_SEQ  = 272;  // JSFX -> bridge, written LAST after the path
+KITCOVER_OFF_PEND_PATH = 273;  // path of a just-dropped image, awaiting the next save
+KITCOVER_PATH_MAX      = 258;
+
+// ── GS_STRIP band (read-only feed for the shimmer) ──────────────────────────
+// MUST match Swing_ReaKit.jsfx / EON_FX_Return_View.jsfx. Swing publishes each
+// pad's live peak + effective hue at ~23 Hz for EVERY slotted instance — the
+// strip-sync Lua heartbeat only gates takeover, never this publish.
+GS_STRIP_BASE       = 26050000;
+GS_STRIP_STRIDE     = 1024;
+GS_STRIP_PADS       = 8;     // header cells before the per-pad blocks
+GS_STRIP_PAD_STRIDE = 32;
+PAD_OFF_PEAK        = 23;
+PAD_OFF_HUE         = 24;
+NUM_PADS            = 16;
+
+// Image slot 96 — per the ReaKit buffer convention cache slots live at 95..126.
+// Slots are per-instance (see the kit tile's note).
+LENS_IMG_SLOT = 96;
+// 97 = scratch for the artwork-colour probe. The card's artwork is blitted into
+// it at LENS_ACC_N squared and read back; nothing is ever drawn FROM it.
+LENS_ACC_SLOT = 97;
+LENS_ACC_N    = 8;    // 8x8 = 64 pixel reads, once per image load
+
+lens_img       = -1;   // gfx_loadimg handle, or -1
+lens_seen      = -1;   // last PUB seq consumed
+lens_slot_used = -2;   // slot the current image was read for (reload on change)
+lens_pending   = 0;    // a dropped cover is staged but not yet baked
+lens_act       = 0;    // smoothed shimmer activity 0..1 (fast attack, slow release)
+lens_hr = 0.72; lens_hg = 0.72; lens_hb = 0.74;   // accent rgb of the loudest pad
+// Standalone state. #lens_local (the stored path) is deliberately NOT assigned
+// here: named strings zero-init empty, @serialize runs AFTER @init on load, and
+// an unconditional @init reset is exactly how a loaded value gets lost.
+lens_local_dirty = 0;  // 1 = (re)load the standalone image from #lens_local
+lens_missing     = 0;  // 1 = a stored path that no longer resolves
+lens_apk         = 0;  // @sample peak since the last frame (standalone shimmer)
+lens_art_hue     = -1; // dominant hue of the standalone artwork (-1 = neutral)
+
+// ── Path helpers — length-prefixed record: [0]=len [1..len]=chars [1+len]=0 ──
+// Same convention as the kit tile (rk_swing_ui_kitcover.jsfx-inc).
+function lens_read_path(_dst, _base) local(_n, _i)
+(
+  _n = gmem[_base] | 0;
+  (_n > 0 && _n <= KITCOVER_PATH_MAX) ? (
+    strcpy(_dst, "");
+    _i = 0;
+    loop(_n,
+      str_setchar(_dst, _i, gmem[_base + 1 + _i] | 0);
+      _i += 1;
+    );
+    str_setlen(_dst, _n);
+    _n;
+  ) : ( strcpy(_dst, ""); 0; );
+);
+
+function lens_write_path(_src, _base) local(_n, _i)
+(
+  _n = min(strlen(_src), KITCOVER_PATH_MAX);
+  gmem[_base] = _n;
+  _i = 0;
+  loop(_n,
+    gmem[_base + 1 + _i] = str_getchar(_src, _i);
+    _i += 1;
+  );
+  gmem[_base + 1 + _n] = 0;
+  _n;
+);
+
+function lens_lower(_c) ( (_c >= 65 && _c <= 90) ? _c + 32 : _c; );
+
+// Accept .png / .jpg / .jpeg ONLY — anything else is not ours to eat.
+function lens_is_image(_s) local(_n, _a, _b, _c, _d)
+(
+  _n = strlen(_s);
+  _n < 4 ? 0 : (
+    _a = lens_lower(str_getchar(_s, _n - 4));
+    _b = lens_lower(str_getchar(_s, _n - 3));
+    _c = lens_lower(str_getchar(_s, _n - 2));
+    _d = lens_lower(str_getchar(_s, _n - 1));
+    // ".png"                              ".jpg"                              "jpeg" (from .jpeg)
+    (_a == 46 && _b == 112 && _c == 110 && _d == 103) ||
+    (_a == 46 && _b == 106 && _c == 112 && _d == 103) ||
+    (_a == 106 && _b == 112 && _c == 101 && _d == 103);
+  );
+);
+
+// hue (0..1, or sentinel <0) → lens_hr/hg/hb at the pad-face S/V. The Return
+// View's hue2rgb, retargeted to the accent registers instead of gfx_r/g/b.
+function lens_hue_rgb(h) local(i, f, p, q, t, s, v) (
+  h < 0 ? ( lens_hr = 0.72; lens_hg = 0.72; lens_hb = 0.74; ) : (
+    s = 0.62; v = 0.96;
+    h = h - floor(h);
+    i = floor(h * 6); f = h * 6 - i;
+    p = v * (1 - s); q = v * (1 - s * f); t = v * (1 - s * (1 - f));
+    i == 0 ? ( lens_hr = v; lens_hg = t; lens_hb = p; ) :
+    i == 1 ? ( lens_hr = q; lens_hg = v; lens_hb = p; ) :
+    i == 2 ? ( lens_hr = p; lens_hg = v; lens_hb = t; ) :
+    i == 3 ? ( lens_hr = p; lens_hg = q; lens_hb = v; ) :
+    i == 4 ? ( lens_hr = t; lens_hg = p; lens_hb = v; ) :
+             ( lens_hr = v; lens_hg = p; lens_hb = q; );
+  );
+);
+
+// ── Artwork colour probe ────────────────────────────────────────────────────
+// RGB -> hue (0..1), or -1 when there is no usable chroma. Pure max/min
+// arithmetic: the inverse of lens_hue_rgb above, and no transcendentals.
+function lens_rgb_hue(_r, _g, _b) local(_mx, _mn, _d, _h)
+(
+  _mx = max(_r, max(_g, _b));
+  _mn = min(_r, min(_g, _b));
+  _d  = _mx - _mn;
+  _d <= 0.001 ? -1 : (
+    _mx == _r ? ( _h = (_g - _b) / _d; _h < 0 ? _h += 6; ) :
+    _mx == _g ? ( _h = (_b - _r) / _d + 2; ) :
+                ( _h = (_r - _g) / _d + 4; );
+    _h / 6;
+  );
+);
+
+// Dominant artwork colour, as a HUE. Deliberately a hue and not an RGB: it goes
+// through the very same lens_hue_rgb() the pad path uses, so a standalone card's
+// accent is rendered identically to a linked one at the house S/V — only its
+// SOURCE differs. Runs once per image load, never per frame.
+function lens_art_probe(_img) local(_x, _y, _r, _g, _b, _mx, _mn, _c, _lum, _w, _bw, _bh, _iw, _ih, _pd)
+(
+  _bw = -1; _bh = -1;
+  gfx_getimgdim(_img, _iw, _ih);
+  (_iw > 0 && _ih > 0) ? (
+    // SAVE/restore the destination rather than assuming -1: an embedded @gfx may
+    // not be drawing to the main framebuffer, and leaving gfx_dest pointed at
+    // the scratch would paint the entire card into it.
+    _pd = gfx_dest;
+    gfx_setimgdim(LENS_ACC_SLOT, 0, 0);     // free first, so the resize below
+    gfx_setimgdim(LENS_ACC_SLOT, LENS_ACC_N, LENS_ACC_N);   // hands back a CLEAR buffer
+    gfx_dest = LENS_ACC_SLOT;
+    gfx_a = 1; gfx_mode = 0;
+    gfx_blit(_img, 1, 0, 0, 0, _iw, _ih, 0, 0, LENS_ACC_N, LENS_ACC_N);
+    _y = 0;
+    loop(LENS_ACC_N,
+      _x = 0;
+      loop(LENS_ACC_N,
+        gfx_x = _x; gfx_y = _y;
+        gfx_getpixel(_r, _g, _b);
+        _mx  = max(_r, max(_g, _b));
+        _mn  = min(_r, min(_g, _b));
+        _c   = _mx - _mn;                    // chroma
+        _lum = (_r + _g + _b) * 0.33333;
+        // Chroma wins, but discount near-black and near-white: a cover's colour
+        // lives in its midtones, not its letterboxing or its blown highlights.
+        _w = _c * (1 - abs(_lum - 0.5) * 1.4);
+        _w > _bw ? ( _bw = _w; _bh = lens_rgb_hue(_r, _g, _b); );
+        _x += 1;
+      );
+      _y += 1;
+    );
+    gfx_dest = _pd;
+  );
+  // Nothing colourful enough (greyscale art, or a probe that read nothing) ->
+  // -1, which lens_hue_rgb renders as the neutral accent. Same as having no art.
+  _bw < 0.05 ? -1 : _bh;
+);
+
+// ── Monogram — shown when there is no cover, so the card is never blank ─────
+// A "lens": concentric iris rings + the wordmark. Vector, no assets.
+function lens_draw_monogram(_w, _h) local(_cx, _cy, _r, _i, _rr, _fs, _tw, _th)
+(
+  _cx = _w * 0.5;
+  _cy = _h * 0.46;
+  _r  = min(_w, _h) * 0.30;
+  _i = 0;
+  loop(4,
+    _rr = _r * (1.0 - _i * 0.22);
+    gfx_set(0.30 + _i * 0.06, 0.31 + _i * 0.06, 0.34 + _i * 0.07, 1);
+    gfx_circle(_cx, _cy, _rr, 0, 1);
+    _i += 1;
+  );
+  // Iris glint
+  gfx_set(0.55, 0.57, 0.62, 1);
+  gfx_circle(_cx + _r * 0.28, _cy - _r * 0.28, _r * 0.10, 1, 1);
+
+  _fs = max(9, min(_w, _h) * 0.085) | 0;
+  gfx_setfont(1, "Arial", _fs, 'b');
+  gfx_measurestr("EON LENS", _tw, _th);
+  gfx_set(0.42, 0.43, 0.46, 1);
+  gfx_x = _cx - _tw * 0.5;
+  gfx_y = _h * 0.80;
+  gfx_drawstr("EON LENS");
+);
+
+@sample
+// ── Standalone shimmer feed ─────────────────────────────────────────────────
+// The ONLY audio this plugin touches, and it only reads: spl0/spl1 are never
+// written, so the signal stays bit-identical either way. A LINKED card leaves
+// on the first compare — the shimmer there comes from the owning instance's
+// GS_STRIP band, and every multi-out parent wears a linked card, so that path
+// must stay free.
+// No transcendentals here (audit rule): this is a bare running max, and the
+// perceptual curve is applied once per FRAME in @gfx, where sqrt is legal.
+// gfx_race_audit reports two crossings here and BOTH are deliberate:
+//   lens_apk     — raised here, read-and-zeroed in @gfx. The reset can at worst
+//                  drop one sample's peak. Invisible at frame rate; this is the
+//                  stock JSFX meter idiom.
+//   lens_shimmer — the on-card button writes it in @gfx and this gate reads it
+//                  unsynchronised. It is only ever 0 or 1, both valid, so the
+//                  only consequence is the meter running a few samples longer
+//                  than the click. Nothing to lock.
+(link_slot < 0 && lens_shimmer >= 0.5) ? (
+  lens_as  = abs(spl0);
+  lens_as2 = abs(spl1);
+  lens_as2 > lens_as ? lens_as = lens_as2;
+  lens_as > lens_apk ? lens_apk = lens_as;
+);
+
+@gfx 220 220
+
+W = gfx_w; H = gfx_h;
+micro = gfx_ext_flags & 1;
+
+// ── Poll — reload ONLY on a publish-seq bump or a slot change ───────────────
+// (gfx_loadimg hits the disk; the seq gate is the kit tile's idiom.)
+lens_ls = link_slot | 0;
+lens_ls >= 0 ? (
+  lens_b   = EON_KITCOVER_BASE + lens_ls * EON_KITCOVER_STRIDE;
+  lens_seq = gmem[lens_b + KITCOVER_OFF_PUB_SEQ] | 0;
+  (lens_seq != lens_seen || lens_ls != lens_slot_used) ? (
+    lens_seen      = lens_seq;
+    lens_slot_used = lens_ls;
+    lens_img       = -1;
+    lens_read_path(#lens_path, lens_b + KITCOVER_OFF_PUB_PATH) > 0 ? (
+      // -1 back just means "no cover" — a missing/corrupt file degrades to the
+      // monogram, never to a blank card.
+      lens_img = gfx_loadimg(LENS_IMG_SLOT, #lens_path);
+    );
+    // preview=0 → the publish IS the bake (load/save/New Kit): the cue
+    // clears. preview=1 → an unsaved drop staged on some face of this
+    // instance (the LCD tile or a Lens) — the bridge re-broadcast it so
+    // every face shows it at once; keep UNSAVED up until a real bake.
+    lens_pending = gmem[lens_b + KITCOVER_OFF_PUB_PREVIEW] > 0.5 ? 1 : 0;
+  );
+) : (
+  // STANDALONE. EDGE-gated: this branch runs every frame, so an unconditional
+  // assignment here would re-load the image forever. Entering standalone (a
+  // fresh insert, or the bridge revoking a stray) is when the local store takes
+  // over — and the UNSAVED cue goes with the kit funnel it belongs to.
+  lens_slot_used != -2 ? (
+    lens_slot_used   = -2;
+    lens_pending     = 0;
+    lens_local_dirty = 1;
+    // Drop the departed kit's accent — a revoked card must not sit there idling
+    // in the colour of a pad it no longer watches.
+    lens_hue_rgb(-1);
+  );
+);
+
+// ── Local art (standalone) ──────────────────────────────────────────────────
+// @gfx owns every gfx_loadimg call, so @serialize and the edge above only ever
+// raise the flag. Consumed in both modes — a linked card simply has nothing to
+// do with it — so the flag can never stick and fire late.
+lens_local_dirty ? (
+  lens_local_dirty = 0;
+  lens_ls < 0 ? (
+    lens_img     = -1;
+    lens_missing = 0;
+    lens_art_hue = -1;
+    strlen(#lens_local) > 0 ? (
+      // -1 back means the path no longer resolves (moved, deleted, offline
+      // drive). Degrade to the monogram and SAY so, but keep the path: a
+      // reconnected drive restores the card on the next load.
+      lens_img     = gfx_loadimg(LENS_IMG_SLOT, #lens_local);
+      lens_missing = lens_img < 0;
+      lens_img >= 0 ? lens_art_hue = lens_art_probe(lens_img);
+    );
+  );
+);
+
+// ── Shimmer — live level pulses the frame ───────────────────────────────────
+// TWO FEEDS, one look. LINKED: the loudest pad's peak and ITS hue, from the
+// owning instance's GS_STRIP band. STANDALONE: the card's own track audio,
+// metered in @sample — no pads exist off a Swing, so the accent stays neutral.
+// Fast attack (take the hit's hue on the way up), slow release toward the live
+// target — the Return View's glow idiom, card-wide instead of per-bar.
+lens_shimmer >= 0.5 ? (
+  lens_ls >= 0 ? (
+    lens_sb = GS_STRIP_BASE + lens_ls * GS_STRIP_STRIDE + GS_STRIP_PADS;
+    lens_pk = 0; lens_ph = -1;
+    lens_i = 0;
+    loop(NUM_PADS,
+      lens_v = gmem[lens_sb + lens_i * GS_STRIP_PAD_STRIDE + PAD_OFF_PEAK];
+      lens_v > lens_pk ? (
+        lens_pk = lens_v;
+        lens_ph = gmem[lens_sb + lens_i * GS_STRIP_PAD_STRIDE + PAD_OFF_HUE];
+      );
+      lens_i += 1;
+    );
+    lens_g = min(1, lens_pk * 1.6);
+  ) : (
+    // Peak since the last frame, then CONSUME it. The @sample writer only ever
+    // RAISES lens_apk, so the worst this cross-thread reset can lose is a single
+    // sample — invisible in something that repaints at frame rate.
+    // sqrt is the perceptual curve the raw peak needs: a -20 dBFS track reads
+    // 0.1 and would barely register linearly, but lands near 0.4 here.
+    lens_g   = min(1, sqrt(lens_apk) * 1.25);
+    lens_apk = 0;
+    // No pads off a Swing, so the ARTWORK supplies the hue — the card breathes
+    // in its own dominant colour. -1 (greyscale art, or none) = neutral accent.
+    lens_ph  = lens_art_hue;
+  );
+  lens_g > lens_act ? ( lens_act = lens_g; lens_hue_rgb(lens_ph); )
+                    : ( lens_act += (lens_g - lens_act) * 0.12; );
+) : (
+  lens_act += (0 - lens_act) * 0.12;
+);
+
+// ── Plate ───────────────────────────────────────────────────────────────────
+gfx_set(0.055, 0.058, 0.066, 1);
+gfx_rect(0, 0, W, H);
+
+lens_drawn = 0;
+lens_img >= 0 ? (
+  gfx_getimgdim(lens_img, lens_iw, lens_ih);
+  (lens_iw > 0 && lens_ih > 0) ? (
+    // FIT and centre — never crop; covers arrive at every aspect ratio.
+    lens_sc = min((W - 2) / lens_iw, (H - 2) / lens_ih);
+    lens_dw = lens_iw * lens_sc;
+    lens_dh = lens_ih * lens_sc;
+    lens_dx = (W - lens_dw) * 0.5;
+    lens_dy = (H - lens_dh) * 0.5;
+    // gfx_blit honours the current gfx_a / gfx_mode, so set both explicitly.
+    gfx_a = 1; gfx_mode = 0;
+    gfx_blit(lens_img, 1, 0, 0, 0, lens_iw, lens_ih, lens_dx, lens_dy, lens_dw, lens_dh);
+    lens_drawn = 1;
+  );
+);
+lens_drawn == 0 ? lens_draw_monogram(W, H);
+
+// ── Frame (base color pulled toward the shimmer accent by activity) ─────────
+lens_hot = mouse_x >= 0 && mouse_x < W && mouse_y >= 0 && mouse_y < H;
+lens_fr = 0.22; lens_fg = 0.23; lens_fb = 0.26;
+// Hover brightens in the EMBED too — pointer position is delivered to
+// embedded UIs, and the cue says "this is clickable" (click opens floating).
+lens_hot ? ( lens_fr = 0.38; lens_fg = 0.40; lens_fb = 0.44; );
+lens_a2 = lens_act * 0.85;
+gfx_set(lens_fr + (lens_hr - lens_fr) * lens_a2,
+        lens_fg + (lens_hg - lens_fg) * lens_a2,
+        lens_fb + (lens_hb - lens_fb) * lens_a2, 1);
+gfx_rect(0, 0, W, 1);
+gfx_rect(0, H - 1, W, 1);
+gfx_rect(0, 0, 1, H);
+gfx_rect(W - 1, 0, 1, H);
+// Soft underglow just inside the bottom edge — reads as the card "breathing"
+// with the kit without ever washing the artwork.
+lens_act > 0.02 ? (
+  gfx_set(lens_hr, lens_hg, lens_hb, lens_act * 0.55);
+  gfx_rect(1, H - 3, W - 2, 2);
+);
+
+// ── Drop hints (floating only — embedded cards cannot receive OS drops) ─────
+// MODE-AWARE: an unlinked card used to advertise "set the kit cover" while
+// silently refusing every drop. Every line here is now something the card in
+// its current state will actually do.
+!micro && lens_drawn == 0 ? (
+  lens_missing ? strcpy(#lens_hint, "artwork not found - drop a new image") :
+  lens_ls >= 0 ? strcpy(#lens_hint, "drop artwork here to set the kit cover")
+               : strcpy(#lens_hint, "drop artwork here");
+  gfx_setfont(1, "Arial", max(9, (min(W, H) * 0.055) | 0), 0);
+  gfx_measurestr(#lens_hint, lens_tw, lens_th);
+  gfx_set(0.34, 0.35, 0.38, 1);
+  gfx_x = (W - lens_tw) * 0.5; gfx_y = H * 0.90 - lens_th * 0.5;
+  gfx_drawstr(#lens_hint);
+);
+!micro && lens_hot && lens_drawn && !lens_pending ? (
+  lens_ls >= 0 ? strcpy(#lens_hint, "drop artwork to replace the cover")
+               : strcpy(#lens_hint, "drop artwork to replace");
+  gfx_setfont(1, "Arial", 9, 0);
+  gfx_measurestr(#lens_hint, lens_tw, lens_th);
+  gfx_set(0, 0, 0, 0.55);
+  gfx_rect(0, H - 16, W, 16);
+  gfx_set(0.85, 0.86, 0.88, 0.90);
+  gfx_x = (W - lens_tw) * 0.5; gfx_y = H - 13;
+  gfx_drawstr(#lens_hint);
+);
+
+// ── Shimmer button (floating only) — top-right iris toggle ──────────────────
+// ON = accent dot inside a ring, breathing with the live activity; OFF =
+// hollow dim ring. The embed stays a pure card: a click there opens the
+// floating window, where this lives.
+// Shown in BOTH modes: a standalone card meters its own track in @sample, so
+// the toggle has something to do either way. (It was linked-only for exactly as
+// long as standalone had no feed — never draw a control that cannot do its job.)
+!micro ? (
+  lens_bx = W - 22; lens_by = 6;
+  lens_over_btn = mouse_x >= lens_bx && mouse_x < lens_bx + 16 &&
+                  mouse_y >= lens_by && mouse_y < lens_by + 16;
+  lens_lmb = mouse_cap & 1;
+  lens_over_btn && lens_lmb && !lens_plmb ? (
+    lens_shimmer = lens_shimmer > 0.5 ? 0 : 1;
+    // Explicit bitmask (2 = bit 1 = slider2). The value form would post
+    // slider_automate(1) on ON, notifying slider1 (link_slot) by mistake.
+    slider_automate(2);
+  );
+  lens_ccx = lens_bx + 8; lens_ccy = lens_by + 8;
+  gfx_set(0, 0, 0, lens_over_btn ? 0.60 : 0.35);
+  gfx_circle(lens_ccx, lens_ccy, 9, 1, 1);
+  lens_shimmer > 0.5 ? (
+    gfx_set(lens_hr, lens_hg, lens_hb, 0.95);
+    gfx_circle(lens_ccx, lens_ccy, 2.5 + lens_act * 1.5, 1, 1);
+    gfx_set(lens_hr, lens_hg, lens_hb, 0.55 + lens_act * 0.40);
+    gfx_circle(lens_ccx, lens_ccy, 5.5, 0, 1);
+  ) : (
+    gfx_set(0.45, 0.46, 0.50, 0.85);
+    gfx_circle(lens_ccx, lens_ccy, 5.5, 0, 1);
+  );
+  // Label chip on hover — the dot must say what it is. Drawn AFTER the click
+  // handler above, so the text already reflects the state you just toggled.
+  lens_over_btn ? (
+    gfx_setfont(1, "Arial", 9, 'b');
+    // Name the FEED, not just the state — the same dot means "the kit's pads"
+    // on a linked card and "this track's audio" on a standalone one.
+    lens_ls >= 0 ? strcpy(#lens_bl, "ACTIVITY SHIMMER  ")
+                 : strcpy(#lens_bl, "AUDIO SHIMMER  ");
+    lens_shimmer > 0.5 ? strcat(#lens_bl, "ON") : strcat(#lens_bl, "OFF");
+    gfx_measurestr(#lens_bl, lens_tw, lens_th);
+    gfx_set(0, 0, 0, 0.70);
+    gfx_rect(lens_bx - lens_tw - 12, lens_by, lens_tw + 10, 16);
+    gfx_set(0.88, 0.89, 0.92, 0.95);
+    gfx_x = lens_bx - lens_tw - 7; gfx_y = lens_by + 3;
+    gfx_drawstr(#lens_bl);
+  );
+) : ( lens_over_btn = 0; );
+
+// ── Unsaved cue — a dropped cover lands in the .swing on the NEXT save ──────
+lens_pending ? (
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_set(0.88, 0.63, 0.13, 1);
+  gfx_rect(3, H - 14, 42, 11);
+  gfx_set(0.10, 0.08, 0.02, 1);
+  gfx_x = 6; gfx_y = H - 14;
+  gfx_drawstr("UNSAVED");
+);
+
+// ── Drop (floating window; embedded cards never receive drop files) ─────────
+// Hit-test FIRST — the && short-circuit refuses drops that are not over us.
+lens_hot && gfx_getdropfile(0, #lens_df) ? (
+  lens_is_image(#lens_df) ? (
+    // Show it immediately from the dropped file either way; only where the
+    // path GOES depends on the mode.
+    lens_img     = gfx_loadimg(LENS_IMG_SLOT, #lens_df);
+    lens_missing = 0;
+    lens_ls >= 0 ? (
+      // LINKED: hand the path to the bridge to bake into the kit on the next
+      // save (kit-tile funnel). Unchanged.
+      lens_write_path(#lens_df, lens_b + KITCOVER_OFF_PEND_PATH);
+      gmem[lens_b + KITCOVER_OFF_PEND_SEQ] = gmem[lens_b + KITCOVER_OFF_PEND_SEQ] + 1;  // LAST
+      lens_pending = 1;
+    ) : (
+      // STANDALONE: the card keeps it. Stored by ABSOLUTE PATH — a JSFX has no
+      // byte-accurate file copy, so the image is referenced, never duplicated.
+      strcpy(#lens_local, #lens_df);
+      // Re-probe now rather than deferring: this block is the LAST thing in the
+      // frame (nothing is drawn after it), so borrowing gfx_dest here is safe
+      // and the new accent is live on the very next repaint.
+      lens_img >= 0 ? lens_art_hue = lens_art_probe(lens_img) : lens_art_hue = -1;
+      // Move a real param so REAPER captures the @serialize state and lands an
+      // undo point. slider_automate, NOT sliderchange: rk_swing_core's
+      // mark_dirty() records that Swing moved OFF slider_automate precisely
+      // because it "mints REAPER global-undo points" — which is the behaviour
+      // this needs, and which sliderchange does not reliably give from @gfx.
+      // (First cut used sliderchange(4) and undo did nothing.) Same call the
+      // shimmer button above already uses. EXPLICIT bitmask: 4 = bit 2 =
+      // slider3 — the value form would post the counter AS the mask and notify
+      // whatever sliders those bits happen to name.
+      lens_art_gen = lens_art_gen >= 1023 ? 0 : lens_art_gen + 1;
+      slider_automate(4);
+    );
+  );
+  // Clear whether or not we took it — an armed list re-fires every frame.
+  gfx_getdropfile(-1);
+);
+
+// ── Embed: the whole card is dead space — arm 0x200 so a click opens the
+// floating window (Drum Strip pattern; hint read by REAPER on hover).
+micro ? gfx_ext_flags |= 0x200;
+lens_plmb = mouse_cap & 1;
+
+@serialize
+// Standalone artwork path. Fresh v1 gate — per the immutable-gate rule a
+// shipped gate is BUMPED, never appended to, so the shape is fixed here on
+// purpose: one version cell, one string, static, no loop.
+// Direction test FIRST (Swing_ReaKit.jsfx idiom). The read branch only raises a
+// flag: @gfx owns every gfx_loadimg call, and this runs on the other thread.
+lens_is_read = file_avail(0) >= 0;
+lens_ser_ver = 1;
+file_var(0, lens_ser_ver);
+lens_ser_ver >= 1 ? file_string(0, #lens_local);
+// slider3 (lens_art_gen) is deliberately NOT in the stream — REAPER already
+// persists slider values with the FX chunk, and a second copy would only race
+// the load order.
+lens_is_read ? lens_local_dirty = 1;

@@ -4885,6 +4885,7 @@ end
 
 -- Check if an FX slot is a Swing instance
 local function is_swing_fx(tr, fx)
+  if _eon_perf then _eon_perf.probes = _eon_perf.probes + 1 end
   local _, fname = reaper.TrackFX_GetFXName(tr, fx, "")
   local retval, ident = reaper.TrackFX_GetNamedConfigParm(tr, fx, "fx_ident")
   if retval and ident:find("DrumKit_ReaKit") then return true end
@@ -4910,6 +4911,7 @@ end
 -- Find the Swing instance that currently holds the gmem lock (slider4 = instance_id)
 -- Falls back to first Swing found if no lock or lock doesn't match
 local function find_swing_track()
+  if _eon_perf then _eon_perf.walks = _eon_perf.walks + 1 end
   local lock_id = math.floor(reaper.gmem_read(G.LOCK))
   local first_tr, first_fx = nil, nil
 
@@ -6487,6 +6489,14 @@ end
 -- src_path guard both want the real destination. Defaults to filepath so the
 -- (unrenamed) callers and any future one behave exactly as before.
 function eon_kit_cover_for_save(filepath, prior_path)
+  -- Kit-undo snapshots must capture the LIVE cover — the whole point of the
+  -- dump is live state — so take the staged bytes regardless of src_path (the
+  -- temp destination never matches it), and never fall through to the temp
+  -- file's own tail, which is a stale previous snapshot at best. Without this
+  -- an undo after New Kit / a load restored the audio but dropped the art.
+  if pending_export and pending_export.undo_dump then
+    return eon_kit_cover_bytes
+  end
   local base = filepath:gsub("%.[Ss][Ww][Ii][Nn][Gg]$", "")
   local cand = { base .. ".png", base .. ".PNG", base .. ".jpg", base .. ".jpeg" }
   local i = 1
@@ -6521,7 +6531,10 @@ end
 -- ── Cover path exchange over the per-instance EON_KITCOVER band ───────────
 -- Publish: path first, seq LAST. Called with a nil path too, so an instance
 -- that loads a coverless kit clears its tile instead of keeping the last one.
-function eon_kitcover_publish(slot, path)
+-- `preview` (optional): 1 marks the published path as an UNSAVED drop preview
+-- — readers (kit tile + Lens) show the image but keep their UNSAVED cue up
+-- until a real bake/load publishes with preview absent.
+function eon_kitcover_publish(slot, path, preview)
   if not slot or slot < 0 or slot >= G.GS_INST_REG_MAX then return end
   local b  = G.KITCOVER_BASE + slot * G.KITCOVER_STRIDE
   local pb = b + G.KITCOVER_PUB_PATH
@@ -6530,8 +6543,129 @@ function eon_kitcover_publish(slot, path)
   reaper.gmem_write(pb, n)
   for i = 1, n do reaper.gmem_write(pb + i, s:byte(i)) end
   reaper.gmem_write(pb + n + 1, 0)
+  reaper.gmem_write(b + G.KITCOVER_PUB_PREVIEW, preview and 1 or 0)
   reaper.gmem_write(b + G.KITCOVER_PUB_SEQ,
                     (reaper.gmem_read(b + G.KITCOVER_PUB_SEQ) or 0) + 1)
+end
+
+-- ── EON Lens — kit artwork card on the instrument parent folder ────────────
+-- Display-only JSFX (Spec_EON_Lens.md) that SECOND-READS the PUB half of the
+-- EON_KITCOVER band above: publish is a broadcast, so the card needs no
+-- publish-side code at all — only its link_slot slider kept current (slots
+-- are session-volatile; same contract as EON_FX_Return_View's link_slot,
+-- but owned by the bridge identity sweep, not the strip-sync companion).
+EON_LENS_BASENAME = "EON_Lens.jsfx"
+
+-- Resolve the Lens FX on a parent track. Query only (-1 when absent): a
+-- user-deleted Lens is respected — only an explicit multi-out Build re-adds.
+function eon_lens_query(parent, hint_tr, hint_fx)
+  local addname = core.jsfx_addname(EON_LENS_BASENAME, hint_tr, hint_fx)
+  if not addname then return -1, nil end
+  return reaper.TrackFX_AddByName(parent, addname, false, 0), addname
+end
+
+-- Detect the Lens JSFX anywhere. fx_ident is the .jsfx filename, so this
+-- survives a display-name change (the card's desc dropped "kit" when standalone
+-- mode landed). ONE API call on purpose — it runs per FX per track.
+function is_lens_fx(tr, fx)
+  local ok, ident = reaper.TrackFX_GetNamedConfigParm(tr, fx, "fx_ident")
+  if ok and ident and ident:find(EON_LENS_BASENAME, 1, true) then return true end
+  return false
+end
+
+-- Write link_slot on an already-resolved Lens. Param BY NAME, never by slider
+-- index (sparse-slider lesson). Compare-before-write is not an optimisation:
+-- TrackFX_SetParam marks the project dirty, so an idempotent pass MUST NOT
+-- write, or merely opening a project would leave it unsaved.
+function eon_lens_set_slot(tr, fx, slot)
+  local p = 0
+  while p < reaper.TrackFX_GetNumParams(tr, fx) do
+    local _, pn = reaper.TrackFX_GetParamName(tr, fx, p, "")
+    if pn and pn:find("Linked registry slot", 1, true) then
+      if math.abs((reaper.TrackFX_GetParam(tr, fx, p) or -99) - slot) > 1e-6 then
+        reaper.TrackFX_SetParam(tr, fx, p, slot)
+      end
+      return true
+    end
+    p = p + 1
+  end
+  return false
+end
+
+-- Keep a parent's Lens pointed at its Swing's registry slot. Called from the
+-- identity sweep with the (engine track, slot, fx) it already resolved.
+function eon_lens_sync(swing_track, slot, hint_fx)
+  local parent = find_folder_track(swing_track)
+  if not parent then return end
+  local fx = eon_lens_query(parent, swing_track, hint_fx)
+  if not fx or fx < 0 then return end
+  eon_lens_set_slot(parent, fx, slot)
+end
+
+-- ── Stray revocation (Spec_EON_Lens_Standalone.md) ─────────────────────────
+-- link_slot rides the FX CHUNK, so it survives an FX drag, a track template and
+-- an FX-chain preset. eon_lens_sync above only ever GRANTS a slot — it pushes to
+-- Swing parents — so before this, a card dragged off its parent stayed linked
+-- forever: it kept showing that kit's cover, and a drop on it still wrote that
+-- kit's PEND, silently changing a real kit's art on the next save. Same for an
+-- orphaned parent whose Swing was deleted, since slot N gets REUSED later.
+--
+-- Home test is ANCESTRY, not track equality: a Lens legitimately moved inside
+-- its own instrument (onto the Audio header, say) must survive. Anything with no
+-- serviced parent above it is revoked to -1, where the JSFX's standalone mode
+-- takes over and the card shows its own artwork instead of going dead.
+--
+-- TWO STRIKES before revoking (~1s apart): a sweep that transiently fails to
+-- resolve an instance's slot must not cost a real card its link. The strike
+-- table is rebuilt each pass so deleted tracks cannot accumulate in it.
+function eon_lens_revoke_strays(found, parents)
+  local strikes, revoked = {}, 0
+  for i = 1, #found do
+    local e = found[i]
+    local home, t, guard = nil, e.tr, 0
+    while t and guard < 16 do
+      if parents[t] then home = parents[t] ; break end
+      t = reaper.GetParentTrack(t)
+      guard = guard + 1
+    end
+    if home then
+      eon_lens_set_slot(e.tr, e.fx, home)
+    else
+      local s = ((_eon_lens_strikes and _eon_lens_strikes[e.tr]) or 0) + 1
+      strikes[e.tr] = s
+      -- Already-standalone cards land here every pass; set_slot compares first,
+      -- so they cost a read and never a write.
+      if s >= 2 and eon_lens_set_slot(e.tr, e.fx, -1) then revoked = revoked + 1 end
+    end
+  end
+  _eon_lens_strikes = strikes
+  return revoked
+end
+
+-- Fire REAPER's "Show last focused FX embedded UI in TCP/MCP" action. There
+-- is NO API for embedding (see CMD 90/91 for the full story); ids are looked
+-- up BY NAME via SWS's CF_EnumerateActions so they cannot drift between
+-- REAPER versions. The action is a TOGGLE — callers fire it only on an FX
+-- they know is not yet embedded. False when SWS or the action is missing.
+function eon_embed_last_focused(want_tcp)
+  if not reaper.CF_EnumerateActions then return false end
+  local want = want_tcp and "in TCP" or "in MCP"
+  -- Bounded: the enumeration ends on a 0 id, but never trust an external
+  -- API to terminate a while-true in the middle of the dispatcher.
+  local i = 0
+  while i < 30000 do
+    local cid, nm = reaper.CF_EnumerateActions(0, i, "")
+    if not cid or cid == 0 then break end
+    -- Both halves matter: "Show next single FX embedded UI in TCP" also
+    -- contains "in TCP" but is a different action entirely.
+    if nm and nm:find("Show last focused FX embedded UI ", 1, true)
+          and nm:find(want, 1, true) then
+      reaper.Main_OnCommand(cid, 0)
+      return true
+    end
+    i = i + 1
+  end
+  return false
 end
 
 -- Write cover bytes to a temp file and return its path, because gfx_loadimg
@@ -6577,15 +6711,30 @@ function eon_kitcover_poll_pending()
           for i = 1, n do
             t[i] = string.char(math.floor(reaper.gmem_read(pb + i) or 0))
           end
-          local fh = io.open(table.concat(t), "rb")
+          local dp = table.concat(t)
+          local fh = io.open(dp, "rb")
           if fh then
             local bytes = fh:read("*a"); fh:close()
             if bytes and #bytes > 0 then
               eon_kit_cover_bytes    = bytes
               eon_kit_cover_src_path = nil   -- a drop: applies to the next save
               eon_kit_cover_pend_slot = slot -- who to ack once it is really baked
+              -- Live preview across every face of this instance: the droppee
+              -- shows the file locally, but the OTHER reader (LCD tile vs the
+              -- Lens card) only watches the PUB mailbox. preview=1 keeps the
+              -- UNSAVED cue up everywhere until a real bake publishes 0.
+              eon_kitcover_publish(slot, dp, true)
             end
           end
+        elseif n == 0 then
+          -- Empty pend = the JSFX hit New Kit: the cover belonged to the kit
+          -- that was wiped. Unstage anything waiting for the next save and
+          -- broadcast "no cover" so every PUB reader (tile, Lens card)
+          -- drops the old art immediately.
+          eon_kit_cover_bytes     = nil
+          eon_kit_cover_src_path  = nil
+          eon_kit_cover_pend_slot = nil
+          eon_kitcover_publish(slot, "")
         end
       end
     end
@@ -9557,6 +9706,32 @@ function rk_ops.do_build_multiout(opts)
   -- (was on the audio sub-folder pre-rename), so the sub-folders stay static.
   update_folder_track_name(swing_track)
 
+  -- EON Lens — kit artwork card on the parent folder (Spec_EON_Lens.md).
+  -- Fresh inserts are auto-embedded in TCP+MCP via the CMD-90/91 action
+  -- route; an existing Lens is left exactly as the user has it — the embed
+  -- actions TOGGLE, so refiring on a Rebuild would un-embed it. "focused"
+  -- is re-asserted before each fire so the second toggle cannot land on a
+  -- different FX. No FX is inserted after this point in the build.
+  do
+    local lens_parent = find_folder_track(swing_track)
+    if lens_parent then
+      local swing_fx = -1
+      for f = 0, reaper.TrackFX_GetCount(swing_track) - 1 do
+        if is_swing_fx(swing_track, f) then swing_fx = f; break end
+      end
+      local lfx, laddname = eon_lens_query(lens_parent, swing_track, swing_fx)
+      if lfx < 0 and laddname then
+        lfx = reaper.TrackFX_AddByName(lens_parent, laddname, false, 1)
+        if lfx >= 0 then
+          reaper.TrackFX_SetNamedConfigParm(lens_parent, lfx, "focused", "1")
+          eon_embed_last_focused(true)   -- TCP
+          reaper.TrackFX_SetNamedConfigParm(lens_parent, lfx, "focused", "1")
+          eon_embed_last_focused(false)  -- MCP
+        end
+      end
+    end
+  end
+
   -- Create 16 multi-out child tracks INSIDE the audio sub-folder
   local created = {}
   local _bwt = bridge_lane_policy(swing_track)  -- write_tracks: gate lane paint
@@ -11122,6 +11297,13 @@ function refresh_multiout_identity_per_instance()
   if not _inc_col_st then _inc_col_st = {} end
   local now = reaper.time_precise()
   local serviced = 0
+  -- Lens link upkeep rides a ~1 Hz sub-tick of this ~10 Hz sweep. Strays are
+  -- rare and a second of latency is invisible, whereas an fx_ident read per FX
+  -- on every pass would not be. _eon_lens_scan_t is a module GLOBAL (no `local`
+  -- — this chunk is at Lua's 200-local limit).
+  local lens_scan = (now - (_eon_lens_scan_t or 0)) >= 1.0
+  local lens_parents = nil
+  if lens_scan then _eon_lens_scan_t = now ; lens_parents = {} end
   local eff_s = reaper.gmem_read(G.GS_COL_EFFECTIVE_S)
   local eff_l = reaper.gmem_read(G.GS_COL_EFFECTIVE_L)
   if eff_l <= 0 then eff_s = 0.75; eff_l = 0.55 end
@@ -11173,6 +11355,18 @@ function refresh_multiout_identity_per_instance()
         end
         if slot and sends >= G.NUM_PADS then
           serviced = serviced + 1
+          -- Lens link_slot upkeep (Spec_EON_Lens.md): serialized slots go
+          -- stale across sessions (registration order), so re-assert from
+          -- the live registry each pass. Query-only — never re-inserts a
+          -- Lens the user deleted.
+          eon_lens_sync(tr, slot, fx)
+          -- ...and note this instrument's parent so the revocation pass below
+          -- can tell a Lens that is merely somewhere else INSIDE the instrument
+          -- from one that has left it entirely.
+          if lens_scan then
+            local lp = find_folder_track(tr)
+            if lp then lens_parents[lp] = slot end
+          end
           -- Lane color ownership: consume a pending set-request from the JSFX
           -- Colors panel FIRST (payload-first/flag-last mailbox; we zero the
           -- flag to consume), so this same pass already runs under the new
@@ -11439,6 +11633,22 @@ function refresh_multiout_identity_per_instance()
         end
       end
     end
+  end
+  -- Lens link upkeep. Runs AFTER the main walk so lens_parents is complete, and
+  -- only when at least one instance was serviced: with no live map to judge
+  -- against (project still loading, registry not resolved yet) every card would
+  -- look like a stray. That guard opens no hole — an orphaned Lens is only
+  -- dangerous while a live Swing exists to own the slot, and then serviced > 0.
+  -- Separate enumeration on purpose: at ~1 Hz it is cheap, and it keeps this out
+  -- of the per-instance block above.
+  if lens_scan and serviced > 0 then
+    local lens_found = {}
+    for tr in core.iter_all_tracks() do
+      for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
+        if is_lens_fx(tr, fx) then lens_found[#lens_found + 1] = { tr = tr, fx = fx } end
+      end
+    end
+    eon_lens_revoke_strays(lens_found, lens_parents)
   end
   return serviced
 end
@@ -12040,6 +12250,7 @@ end
 -- legacy projects opened in a fresh bridge session inherit their saved
 -- kit-source paths without requiring a manual reload.
 local function enumerate_all_swings()
+  if _eon_perf then _eon_perf.walks = _eon_perf.walks + 1 end
   local list = {}
   for tr in core.iter_all_tracks() do
     for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
@@ -14436,7 +14647,88 @@ function eon_update_toggle_states()
   end
 end
 
+-- ═════════════════════════════════════════════════════════════════════════════
+-- PERF PROFILER (dev instrumentation, 2026-08-14 — "REAPER feels heavier" hunt)
+-- Off by default. Arm/disarm at runtime (picked up within a second, no restart):
+--   reaper.SetExtState("EON_Bridge", "perf", "1", false)   -- "0"/"" = off
+-- While armed, poll() stamps ~13 section boundaries and every ~5s appends ONE
+-- summary line to Data/EON_Swing/perf_log.txt (128KB cap, then restarts):
+--   effective defer rate (a sag below ~30Hz = the UI thread is saturated —
+--   possibly by @gfx, which this profiler deliberately does NOT see), avg/max
+--   tick cost, the track-walk rate (enumerate_all_swings + find_swing_track
+--   calls/s) and per-FX identity-probe rate (is_swing_fx calls/s) — the
+--   numbers behind the post-3.0 "shared roster" queue item — then the top
+--   sections by average cost, and the project track/FX census.
+-- Cost when off: one nil-check per mark. When armed: ~15 time_precise calls
+-- per tick + one small append per window — too small to perturb the measure.
+-- All state GLOBAL (bridge main chunk sits at Lua's 200-local ceiling).
+_eon_perf = nil
+function eon_perf_mark(sec)
+  local P = _eon_perf
+  if not P then return end
+  local now = reaper.time_precise()
+  if P.cur then P.acc[P.cur] = (P.acc[P.cur] or 0) + (now - P.last) end
+  P.cur, P.last = sec, now
+end
+
+function eon_perf_flush(now)
+  local P = _eon_perf
+  local win = now - P.w0
+  if win <= 0 or P.ticks == 0 then P.w0 = now return end
+  -- Census pass: one track×FX count per flush window (~5s), outside any tick.
+  local nfx = 0
+  for tr in core.iter_all_tracks() do nfx = nfx + reaper.TrackFX_GetCount(tr) end
+  local secs = {}
+  for k, v in pairs(P.acc) do secs[#secs + 1] = { k, v } end
+  table.sort(secs, function(a, b) return a[2] > b[2] end)
+  local top = {}
+  for i = 1, math.min(6, #secs) do
+    top[#top + 1] = ("%s %.2fms/%d%%"):format(secs[i][1],
+      secs[i][2] / P.ticks * 1000,
+      P.tsum > 0 and math.floor(secs[i][2] / P.tsum * 100 + 0.5) or 0)
+  end
+  local line = ("perf: %.1fHz | tick avg %.2fms max %.1fms | walks %.0f/s probes %.0f/s | %s | %dtr/%dfx\n")
+    :format(P.ticks / win, P.tsum / P.ticks * 1000, P.tmax * 1000,
+            P.walks / win, P.probes / win, table.concat(top, "  "),
+            reaper.CountTracks(0), nfx)
+  local dir = reaper.GetResourcePath() .. "/Data/EON_Swing"
+  reaper.RecursiveCreateDirectory(dir, 0)
+  local path = dir .. "/perf_log.txt"
+  local ex = io.open(path, "rb")
+  local sz = ex and ex:seek("end") or 0
+  if ex then ex:close() end
+  local f = io.open(path, sz > 131072 and "wb" or "ab")
+  if f then f:write(os.date("%H:%M:%S "), line) f:close() end
+  P.acc, P.ticks, P.tsum, P.tmax = {}, 0, 0, 0
+  P.walks, P.probes, P.w0 = 0, 0, now
+end
+
+function eon_perf_tick_begin()
+  local P = _eon_perf
+  if not P then return end
+  local now = reaper.time_precise()
+  P.cur, P.last, P.t0 = nil, now, now
+end
+
+function eon_perf_tick_end()
+  local P = _eon_perf
+  if not P then return end
+  -- Armed mid-tick (the heartbeat check sits inside poll): no tick_begin ran
+  -- this pass, so there is nothing coherent to account — start clean next tick.
+  -- Without this guard the nil t0 arithmetic would kill the whole defer loop.
+  if not P.t0 then P.cur = nil return end
+  eon_perf_mark(nil)
+  local now = reaper.time_precise()
+  local dt = now - P.t0
+  P.ticks = P.ticks + 1
+  P.tsum = P.tsum + dt
+  if dt > P.tmax then P.tmax = dt end
+  if now - P.w0 >= 5.0 then eon_perf_flush(now) end
+end
+
 local function poll()
+  eon_perf_tick_begin()                 -- perf profiler (no-op unless armed)
+  eon_perf_mark("loader")
   -- EON Loader protocol v1 — file-based external sample loader
   loader_poll()
 
@@ -14445,9 +14737,11 @@ local function poll()
 
   -- Auto-kit-sidecar — save/load per-instance .swing files in project folder
   -- so big kits survive REAPER's chunk-size truncation.
+  eon_perf_mark("sidecar")
   poll_sidecar_events()
 
   -- Kit cover dropped onto a JSFX tile — read it in so the next save bakes it.
+  eon_perf_mark("cover")
   eon_kitcover_poll_pending()
 
   -- Drum Matrix MIDI-lane sync (name/color/blank → P_EXT:EON_DRUM_LANE
@@ -14455,11 +14749,13 @@ local function poll()
   -- Matrix overlay is closed. Same code the overlay ticks; digest-gated so
   -- it's a cheap no-op when nothing changed. pcall'd so a Drum-Matrix-side
   -- error can't take down the bridge.
+  eon_perf_mark("dmsync")
   if dm_swing_sync then pcall(dm_swing_sync.Tick) end
 
   -- Root-note detection: drain one queued analysis per tick and service the
   -- JSFX re-analysis mailbox. pcall'd so a detector error can't take down the
   -- bridge (same discipline as dm_swing_sync above).
+  eon_perf_mark("rootnote")
   pcall(eon_rootnote_tick)
 
   -- P2/P6: per-instance identity → multi-out tracks (color + name + icon).
@@ -14469,6 +14765,7 @@ local function poll()
   -- module GLOBAL (no `local` — this chunk is at Lua's 200-local limit) and
   -- sticks across the 2 off-ticks so the legacy fallback writers below stay
   -- disabled while >=1 instance is serviced here.
+  eon_perf_mark("ident")
   if (heartbeat_counter % 3) == 0 then
     _ident_active = (refresh_multiout_identity_per_instance() or 0) > 0
     -- STICKY identity flag (heartbeat disease #5, 2026-06-12): _ident_active
@@ -14499,6 +14796,7 @@ local function poll()
 
   -- EON: handle a selection coming back from the StepSeq's custom PAIR dropdown. A cheap
   -- no-op when nothing is queued; run every tick so the UI feels responsive.
+  eon_perf_mark("stepseq")
   handle_stepseq_picker_sel()
 
   -- EON: same-track StepSeq<->Swing auto-pairing (manual P_EXT pairing overrides). Push
@@ -14529,6 +14827,7 @@ local function poll()
   -- GS_PAD_TRACK_SELECT; bridge resolves the multi-out child track via
   -- the existing send-walk pattern (same as CMD=50 rename auto-update)
   -- and exclusively-selects it. Slot reset to 0 to consume the request.
+  eon_perf_mark("cmd")
   do
     local req = math.floor(reaper.gmem_read(G.GS_PAD_TRACK_SELECT) or 0)
     if req > 0 and req <= G.NUM_PADS then
@@ -14780,32 +15079,17 @@ local function poll()
   -- looked up BY NAME via SWS's CF_EnumerateActions rather than hardcoded,
   -- so they cannot drift between REAPER versions.
   elseif cmd == 90 or cmd == 91 then
-    local want = (cmd == 90) and "in TCP" or "in MCP"
+    local want_tcp = (cmd == 90)
     reaper.gmem_write(G.CMD, 0)
     local tr, fx = find_swing_track()
-    if tr and fx and reaper.CF_EnumerateActions then
+    if tr and fx then
       reaper.TrackFX_SetNamedConfigParm(tr, fx, "focused", "1")
-      -- Bounded: the enumeration ends on a 0 id, but never trust an external
-      -- API to terminate a while-true in the middle of the dispatcher.
-      local id, i = 0, 0
-      while i < 30000 do
-        local cid, nm = reaper.CF_EnumerateActions(0, i, "")
-        if not cid or cid == 0 then break end
-        -- Both halves matter: "Show next single FX embedded UI in TCP" also
-        -- contains "in TCP" but is a different action entirely.
-        if nm and nm:find("Show last focused FX embedded UI ", 1, true)
-              and nm:find(want, 1, true) then
-          id = cid
-          break
-        end
-        i = i + 1
-      end
-      if id ~= 0 then
-        reaper.Main_OnCommand(id, 0)
-      else
+      -- Lookup + fire live in eon_embed_last_focused (shared with the Lens
+      -- build path); false = SWS absent or the action name not found.
+      if not eon_embed_last_focused(want_tcp) then
         reaper.ShowConsoleMsg("[EON Swing] could not find the \"Show last focused " ..
-          "FX embedded UI " .. want .. "\" action — embed it from the FX chain's " ..
-          "right-click menu instead.\n")
+          "FX embedded UI " .. (want_tcp and "in TCP" or "in MCP") ..
+          "\" action — embed it from the FX chain's right-click menu instead.\n")
       end
     end
 
@@ -15308,6 +15592,7 @@ local function poll()
   -- change (replacing the old slider_automate undo-capture). Flag REAPER's
   -- project as dirty so edits prompt-to-save — WITHOUT minting a global-undo
   -- point. (The old undo-block leak protection is gone: no blocks to leak.)
+  eon_perf_mark("misc")
   if reaper.gmem_read(GS_PROJ_DIRTY) ~= 0 then
     reaper.gmem_write(GS_PROJ_DIRTY, 0)
     reaper.MarkProjectDirty(0)
@@ -15320,6 +15605,17 @@ local function poll()
   heartbeat_counter = heartbeat_counter + 1
   if heartbeat_counter >= 30 then
     reaper.gmem_write(G.BRIDGE_ALIVE, os.time())
+    -- Perf profiler arm/disarm (dev flag — block comment above poll). Checked
+    -- here at ~1Hz so toggling needs no bridge restart.
+    if reaper.GetExtState("EON_Bridge", "perf") == "1" then
+      if not _eon_perf then
+        _eon_perf = { acc = {}, ticks = 0, tsum = 0, tmax = 0,
+                      walks = 0, probes = 0, w0 = reaper.time_precise() }
+        reaper.ShowConsoleMsg("[Swing] perf profiler ON -> Data/EON_Swing/perf_log.txt (ExtState EON_Bridge/perf=0 stops it)\n")
+      end
+    elseif _eon_perf then
+      _eon_perf = nil
+    end
     -- Write track number for browser title
     local sw_tr = find_swing_track()
     if sw_tr then
@@ -15331,6 +15627,7 @@ local function poll()
 
   -- Publish Media Explorer toggle state every tick so the JSFX EXPLORE button
   -- recolors instantly when the user opens/closes it (action 50124).
+  eon_perf_mark("publish")
   reaper.gmem_write(G.GS_MEDIA_EXPLORER_OPEN, reaper.GetToggleCommandState(50124) == 1 and 1 or 0)
 
   -- Publish Drum Matrix paint-mode state every tick so the Swing PAINT button
@@ -15401,6 +15698,7 @@ local function poll()
   -- "reaper" theme, when the active .ReaperTheme file changes — REAPER fires no
   -- theme-changed event). gmem writes don't wake the JSFX, so publish_theme_band
   -- bumps GS_THEME_ID last as the generation handshake the JSFX poll each frame.
+  eon_perf_mark("theme")
   if _theme.mod and (heartbeat_counter % 2) == 0 then
     -- Theme button on a JSFX (Swing / StepSeq) can't SetExtState, so it writes a
     -- 1..4 request to GS_THEME_REQ; pick it up, write the shared ExtState, clear
@@ -15516,6 +15814,7 @@ local function poll()
   -- Banded mirror services every PAIRED StepSeq+Swing pair independently; the legacy
   -- global mirror remains as the fallback for UNPAIRED StepSeqs (it self-silences when
   -- everything is paired, because nothing advances the legacy heartbeat anymore).
+  eon_perf_mark("mirror")
   if (heartbeat_counter % 3) == 0 then
     -- Legacy global mirror ONLY when an unpaired StepSeq exists (pairing-keyed,
     -- see refresh_stepseq_pairing). nil = pairing pass hasn't run yet (~1s
@@ -15552,6 +15851,7 @@ local function poll()
 
   -- VER-26 per-pad kit-load stream: publish/advance one blob per tick while a
   -- load is in flight (no-op otherwise). See Spec_Swing_PerPad_Sidecar_Load.
+  eon_perf_mark("pumps")
   eon_pp_pump()
 
   -- P3 eager capture: deferred chop WAV writes (one slice per tick, then a
@@ -15589,6 +15889,7 @@ local function poll()
   -- EON: StepSeq<->DM Import-on-engage courier (folded in; see loader near top).
   -- Cheap when idle (16 gmem reads/pass); pcall-guarded so a courier fault can
   -- never stall the bridge poll loop.
+  eon_perf_mark("tail")
   if eon_courier then pcall(eon_courier_tick) end
 
   -- AP-2: StepSeq custom-preset apply menu (scroll-audition). Independent of the courier
@@ -15612,6 +15913,7 @@ local function poll()
   -- Toolbar lit-state for the EON toggle buttons (Grid/Paint/StepSeq/PadFX/Media/Browser).
   pcall(eon_update_toggle_states)
 
+  eon_perf_tick_end()                   -- perf profiler window close (no-op unless armed)
   -- Ops: graceful self-exit for headless bridge restarts (dev workflow — the
   -- Lua source has no hot-reload). Set ExtState EON_Bridge/exit_req=1: the
   -- loop ends WITHOUT re-arming, so the script terminates through atexit

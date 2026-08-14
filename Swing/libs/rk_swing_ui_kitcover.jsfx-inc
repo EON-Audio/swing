@@ -95,6 +95,21 @@ function _kc_is_image(_s) local(_n, _a, _b, _c, _d)
 // Call once per @gfx frame, before the tile is drawn.
 function swing_kitcover_tick() local(_b, _seq)
 (
+  // New Kit wiped the kit this cover belonged to (flag set by
+  // swing_new_kit_full_reset — defaults imports before us, so it can't call
+  // in). Drop the tile image now and pend an EMPTY path so the bridge
+  // unstages any cover waiting for the next save and broadcasts "no cover"
+  // to every PUB reader (this tile after reload, the Lens card).
+  kc_clear_req ? (
+    kc_clear_req = 0;
+    kc_img = KC_IMG_NONE;
+    kc_pending = 0;
+    _reg_my_slot >= 0 ? (
+      _b = EON_KITCOVER_BASE + _reg_my_slot * EON_KITCOVER_STRIDE;
+      _kc_write_path("", _b + KITCOVER_OFF_PEND_PATH);
+      gmem[_b + KITCOVER_OFF_PEND_SEQ] = gmem[_b + KITCOVER_OFF_PEND_SEQ] + 1;  // seq LAST
+    );
+  );
   _reg_my_slot >= 0 ? (
     _b = EON_KITCOVER_BASE + _reg_my_slot * EON_KITCOVER_STRIDE;
     _seq = gmem[_b + KITCOVER_OFF_PUB_SEQ] | 0;
@@ -106,8 +121,11 @@ function swing_kitcover_tick() local(_b, _seq)
         // file must degrade to the generated portrait, never to a blank tile.
         kc_img = gfx_loadimg(KC_SLOT, #kc_path);
       );
-      // The publish is the bake: whatever was pending has landed in the kit.
-      kc_pending = 0;
+      // preview=0 → the publish IS the bake (load/save/New Kit): the cue
+      // clears. preview=1 → an unsaved drop staged on some face of this
+      // instance (this tile or the Lens card) — the bridge re-broadcast it so
+      // both faces agree; keep the UNSAVED cue up until a real bake.
+      kc_pending = gmem[_b + KITCOVER_OFF_PUB_PREVIEW] > 0.5 ? 1 : 0;
     );
   );
 );
@@ -174,7 +192,7 @@ local(_i, _c, _n, _seen, _cols, _rows, _cw, _ch, _gx, _gy, _r, _k, _dup, _j, _ar
 // Called from swing_lcd_draw_kit, which runs during the LCD pass — early enough
 // that a claimed drop never reaches the pad grid below.
 function swing_kitcover_draw(_x, _y, _s)
-local(_iw, _ih, _sc, _dw, _dh, _dx, _dy, _b)
+local(_iw, _ih, _sc, _dw, _dh, _dx, _dy, _b, _tw, _th)
 (
   // Frame
   gfx_set(lcd_bar_tx_r * 0.10, lcd_bar_tx_g * 0.10, lcd_bar_tx_b * 0.10, 1);
@@ -214,6 +232,18 @@ local(_iw, _ih, _sc, _dw, _dh, _dx, _dy, _b)
     gfx_set(0.10, 0.08, 0.02, 1);
     gfx_x = _x + 6; gfx_y = _y + _s - 14;
     gfx_drawstr("UNSAVED");
+  );
+
+  // Drop affordance — the tile accepts .png/.jpg drops but nothing says so.
+  // Hover-only, and the UNSAVED cue keeps the corner when both would show.
+  (kc_hot && !kc_pending) ? (
+    gfx_setfont(1, "Arial", 9, 'b');
+    gfx_measurestr("DROP IMAGE", _tw, _th);
+    gfx_set(lcd_bar_tx_r * 0.12, lcd_bar_tx_g * 0.12, lcd_bar_tx_b * 0.12, 0.85);
+    gfx_rect(_x + 3, _y + _s - 14, _tw + 8, 11);
+    gfx_set(lcd_bar_tx_r * 0.85, lcd_bar_tx_g * 0.85, lcd_bar_tx_b * 0.85, 0.95);
+    gfx_x = _x + 7; gfx_y = _y + _s - 14;
+    gfx_drawstr("DROP IMAGE");
   );
 
   // ── Drop ──
