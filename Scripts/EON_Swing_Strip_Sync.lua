@@ -982,6 +982,22 @@ local function loop()
   reaper.defer(loop)
 end
 
+-- Rewrite __startup.lua via tmp-file + rename instead of truncating in place.
+-- The file is SHARED -- other vendors' startup lines live in it too -- so a
+-- crash or full disk mid-write must never be able to eat it. Returns true
+-- only once the new content is fully on disk under `path`. Global on purpose:
+-- same helper as the other EON self-registering scripts.
+function eon_write_startup(path, content)
+  local tmp = path .. ".eon-tmp"
+  local f = io.open(tmp, "w")
+  if not f then return false end
+  local wok = f:write(content)
+  local cok = f:close()
+  if not wok or not cok then os.remove(tmp) return false end
+  os.remove(path)                    -- Windows os.rename won't overwrite
+  return os.rename(tmp, path) and true or false
+end
+
 -- ── Self-register as startup action (one-time, first manual run) ──────────
 -- Same self-cleaning __startup.lua block the Kit Bridge uses: runs this
 -- script on every REAPER launch; if the file is removed (uninstall), the
@@ -1030,11 +1046,12 @@ local function self_register()
     "end end\n" ..
     marker .. " END\n"
 
-  local fw = io.open(startup_path, "w")
-  if fw then fw:write(existing .. block); fw:close() end
-
-  reaper.SetExtState(SCRIPT_NAME, key, "1", true)
-  reaper.ShowConsoleMsg("[strip_sync] registered as startup action (auto-starts with REAPER).\n")
+  -- Flag as registered only once the block is really on disk; a failed write
+  -- leaves the ExtState clear so the next run simply retries.
+  if eon_write_startup(startup_path, existing .. block) then
+    reaper.SetExtState(SCRIPT_NAME, key, "1", true)
+    reaper.ShowConsoleMsg("[strip_sync] registered as startup action (auto-starts with REAPER).\n")
+  end
 end
 self_register()
 

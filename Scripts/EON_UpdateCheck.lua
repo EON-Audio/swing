@@ -58,6 +58,23 @@ local GS_LATEST_VER_BASE   = 1714  -- 5 slots: 1714–1718
 -- (which have the old single-line format) to re-register and pick up
 -- the new self-cleaning block on next script run.
 ---------------------------------------------------------------------------
+-- Rewrite __startup.lua via tmp-file + rename instead of truncating in place.
+-- The file is SHARED -- other vendors' startup lines live in it too -- so a
+-- crash or full disk mid-write must never be able to eat it. Returns true
+-- only once the new content is fully on disk under `path`. Global, not local:
+-- the same helper rides in every EON self-registering script, and in the Kit
+-- Bridge a top-level local would count against Lua's 200-local ceiling.
+function eon_write_startup(path, content)
+  local tmp = path .. ".eon-tmp"
+  local f = io.open(tmp, "w")
+  if not f then return false end
+  local wok = f:write(content)
+  local cok = f:close()
+  if not wok or not cok then os.remove(tmp) return false end
+  os.remove(path)                    -- Windows os.rename won't overwrite
+  return os.rename(tmp, path) and true or false
+end
+
 local function self_register()
   local _, script_path = reaper.get_action_context()
   local key = SCRIPT_NAME .. "_registered_v3"
@@ -122,14 +139,12 @@ local function self_register()
     "end end\n" ..
     marker .. " END\n"
 
-  local fw = io.open(startup_path, "w")
-  if fw then
-    fw:write(existing .. block)
-    fw:close()
+  -- Flag as registered only once the block is really on disk; a failed write
+  -- leaves the ExtState clear so the next run simply retries.
+  if eon_write_startup(startup_path, existing .. block) then
+    reaper.SetExtState(SCRIPT_NAME, key, "1", true)
+    reaper.ShowConsoleMsg("[EON] " .. SCRIPT_NAME .. " registered as startup action (auto-cleans on uninstall).\n")
   end
-
-  reaper.SetExtState(SCRIPT_NAME, key, "1", true)
-  reaper.ShowConsoleMsg("[EON] " .. SCRIPT_NAME .. " registered as startup action (auto-cleans on uninstall).\n")
 end
 
 ---------------------------------------------------------------------------
@@ -158,7 +173,23 @@ local function write_version_string(str)
   end
 end
 
+-- Hand the URL to the OS opener WITHOUT building a shell command line.
+-- CF_ShellExecute (SWS -- a required dependency) takes the string verbatim,
+-- so there is nothing to quote or escape. The os.execute fallback exists only
+-- for an install missing SWS, and only ever sees URLs that passed the
+-- allowlist: https-only, characters restricted to the URL-safe set -- no
+-- quotes, spaces, $, backticks or other shell metacharacters to break out
+-- with. (The only caller feeds it html_url parsed from the GitHub API with a
+-- quote-free capture, so the gate is belt-and-braces, not load-bearing.)
 local function open_url(url)
+  if type(url) ~= "string"
+     or not url:match("^https://[%w%.%-_/#%%%?=&:+~@]+$") then
+    return
+  end
+  if reaper.CF_ShellExecute then
+    reaper.CF_ShellExecute(url)
+    return
+  end
   local os_name = reaper.GetOS()
   if os_name:match("Win") then
     os.execute('start "" "' .. url .. '"')

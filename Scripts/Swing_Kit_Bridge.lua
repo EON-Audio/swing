@@ -6378,7 +6378,9 @@ function eon_kit_tail_read(content, pos)
   while pos + 15 <= #content do
     local tag = math.floor(string.unpack("<d", content, pos) or 0); pos = pos + 8
     local len = math.floor(string.unpack("<d", content, pos) or 0); pos = pos + 8
-    if tag <= 0 or len < 0 or pos + len - 1 > #content then break end
+    -- Positive-form guard: a NaN tag would otherwise slip past every "bad"
+    -- test and land as a table index -- a hard Lua error.
+    if not (tag > 0 and len >= 0 and pos + len - 1 <= #content) then break end
     out[tag] = len > 0 and content:sub(pos, pos + len - 1) or ""
     pos = pos + len
   end
@@ -6406,7 +6408,7 @@ function eon_kit_tail_offset(content, lua_len)
   while pad < G.NUM_PADS do
     if pos + 7 > #content then return nil end
     local lc = math.floor(string.unpack("<d", content, pos) or 0); pos = pos + 8
-    if lc < 0 then lc = 0 end
+    if not (lc >= 0) then return nil end  -- NaN/negative: bail, don't guess
     -- Deliberately NOT clamped to MAX_LAYERS. That clamp in the audio walk is a
     -- staging guard, but the FILE still contains every layer it wrote, so
     -- clamping here would leave pos short and mis-read the tail. A wild value
@@ -6417,6 +6419,7 @@ function eon_kit_tail_offset(content, lua_len)
     while b < blobs do
       if pos + 15 > #content then return nil end
       local alen = math.floor(string.unpack("<d", content, pos) or 0)
+      if not (alen >= 0) then return nil end  -- NaN/negative length: bail
       pos = pos + 16                      -- [len:8B][sr:8B]
       if alen > 0 then
         if pos + alen * 2 - 1 > #content then return nil end
@@ -6458,7 +6461,7 @@ function eon_kit_cover_from_file(filepath)
   local ok, lua_len = pcall(string.unpack, "<d", content, 9)
   if not ok or not lua_len then return nil end
   lua_len = math.floor(lua_len)
-  if lua_len <= 0 or 16 + lua_len > #content then return nil end
+  if not (lua_len > 0 and 16 + lua_len <= #content) then return nil end
   local pos = eon_kit_tail_offset(content, lua_len)
   if not pos then return nil end
   return eon_kit_tail_read(content, pos)[EON_KIT_TAIL_COVER]
@@ -8173,7 +8176,10 @@ local function load_kit_v4(filepath, internal)
   end
 
   local lua_len = math.floor(string.unpack("<d", content, 9))
-  if lua_len <= 0 or 16 + lua_len > #content then
+  -- Positive-form guard (same as the scanner's): NaN fails EVERY comparison,
+  -- so require the good case instead of testing for the bad ones -- the
+  -- negative form let a NaN lua_len through to :sub() as an uncaught error.
+  if not (lua_len > 0 and 16 + lua_len <= #content) then
     eon_notice("Corrupt v4 header (bad lua_len).")
     reaper.gmem_write(G.CMD, 98)
     return
@@ -8413,7 +8419,10 @@ local function load_kit_v4(filepath, internal)
     if pos + 16 > #content then return 0, 0, "" end
     local alen = math.floor(string.unpack("<d", content, pos));  pos = pos + 8
     local sr   = string.unpack("<d", content, pos);               pos = pos + 8
-    if alen <= 0 then return 0, sr, "" end
+    -- Positive-form guards (NaN fails every comparison): a NaN/negative
+    -- length is an empty blob, a wild sample rate becomes 0 = "unknown".
+    if not (sr >= 0 and sr < 1e7) then sr = 0 end
+    if not (alen > 0) then return 0, sr, "" end
     if pos + alen * 2 - 1 > #content then
       pos = pos + alen * 2
       return 0, sr, ""
@@ -8446,7 +8455,7 @@ local function load_kit_v4(filepath, internal)
     if pos + 8 <= #content then
       lc_bin = math.floor(string.unpack("<d", content, pos))
       pos = pos + 8
-      if lc_bin < 0 then lc_bin = 0 end
+      if not (lc_bin > 0) then lc_bin = 0 end   -- NaN/negative land on 0 too
       if lc_bin > G.MAX_LAYERS then lc_bin = G.MAX_LAYERS end
     end
 
@@ -10766,6 +10775,24 @@ end
 -- Bump from registered_v2 to registered_v3 forces existing installs
 -- (which have the old single-line format) to re-register and pick up
 -- the new self-cleaning block on next bridge run.
+
+-- Rewrite __startup.lua via tmp-file + rename instead of truncating in place.
+-- The file is SHARED -- other vendors' startup lines live in it too -- so a
+-- crash or full disk mid-write must never be able to eat it. Returns true
+-- only once the new content is fully on disk under `path`. Global, not local:
+-- this chunk runs at Lua's 200-local ceiling (same helper rides in every EON
+-- self-registering script).
+function eon_write_startup(path, content)
+  local tmp = path .. ".eon-tmp"
+  local f = io.open(tmp, "w")
+  if not f then return false end
+  local wok = f:write(content)
+  local cok = f:close()
+  if not wok or not cok then os.remove(tmp) return false end
+  os.remove(path)                    -- Windows os.rename won't overwrite
+  return os.rename(tmp, path) and true or false
+end
+
 local function self_register()
   -- Probe/host opt-out (kitpipe harness, any dofile host): registration
   -- records get_action_context()'s script path — the HOSTING script, not
@@ -10836,14 +10863,12 @@ local function self_register()
     "end end\n" ..
     marker .. " END\n"
 
-  local fw = io.open(startup_path, "w")
-  if fw then
-    fw:write(existing .. block)
-    fw:close()
+  -- Flag as registered only once the block is really on disk; a failed write
+  -- leaves the ExtState clear so the next run simply retries.
+  if eon_write_startup(startup_path, existing .. block) then
+    reaper.SetExtState(SCRIPT_NAME, key, "1", true)
+    reaper.ShowConsoleMsg("[EON] " .. SCRIPT_NAME .. " registered as startup action (auto-cleans on uninstall).\n")
   end
-
-  reaper.SetExtState(SCRIPT_NAME, key, "1", true)
-  reaper.ShowConsoleMsg("[EON] " .. SCRIPT_NAME .. " registered as startup action (auto-cleans on uninstall).\n")
 end
 self_register()
 
@@ -12535,7 +12560,8 @@ function eon_fill_parse_kit_v4(filepath)
     return nil, "this kit has no category data — use Load"
   end
   local lua_len = math.floor(string.unpack("<d", content, 9))
-  if lua_len <= 0 or 16 + lua_len > #content then
+  -- Positive-form guard: NaN fails every comparison (see load_kit_v4).
+  if not (lua_len > 0 and 16 + lua_len <= #content) then
     return nil, "corrupt v4 header"
   end
   local chunk = load(content:sub(17, 16 + lua_len), "swing_v4_fill", "t", {})
@@ -12550,7 +12576,7 @@ function eon_fill_parse_kit_v4(filepath)
     local lc = 0
     if pos + 7 <= #content then
       lc = math.floor(string.unpack("<d", content, pos)); pos = pos + 8
-      if lc < 0 then lc = 0 end
+      if not (lc > 0) then lc = 0 end           -- NaN/negative land on 0 too
       if lc > G.MAX_LAYERS then lc = G.MAX_LAYERS end
     end
     plc[pad] = lc
@@ -12559,14 +12585,15 @@ function eon_fill_parse_kit_v4(filepath)
       if pos + 15 <= #content then
         alen = math.floor(string.unpack("<d", content, pos)); pos = pos + 8
         sr = string.unpack("<d", content, pos); pos = pos + 8
+        if not (sr >= 0 and sr < 1e7) then sr = 0 end
         if alen > 0 then
           if pos + alen * 2 - 1 <= #content then
             bytes = content:sub(pos, pos + alen * 2 - 1)
           end
           pos = pos + alen * 2
           if #bytes == 0 then alen = 0 end
-        elseif alen < 0 then
-          alen = 0
+        else
+          alen = 0   -- negative or NaN: treat as an empty blob
         end
       end
       blobs[#blobs + 1] = { pad = pad, layer = layer, len = alen, sr = sr,
@@ -12574,6 +12601,89 @@ function eon_fill_parse_kit_v4(filepath)
     end
   end
   return kit, blobs, plc
+end
+
+-- ── Embed-on-insert: FX-browser parity for the MCP house default ───────────
+-- The song starter and the RS5k import embed Swing in the MCP because they DO
+-- the insert; a Swing added from REAPER's own FX browser had no hook and
+-- opened un-embedded (portable-install report 2026-08-19). The JSFX writes
+-- itself into the gmem instance registry on its first @block, so a NEW id
+-- appearing mid-session IS the fresh-insert event, whatever UI performed the
+-- insert.
+--
+-- Same contract as strip_sync's ensure_strip: FRESH INSERTS ONLY. Instances
+-- present when the bridge starts, or arriving with a project/tab switch, are
+-- adopted untouched (a user who un-embedded keeps their choice). Keyed by FX
+-- GUID so each instance is defaulted at most once per session -- registry ids
+-- can re-mint on recompile without re-triggering (the GUID stays put).
+--
+-- ⚠️ fx_embed_mcp rewrites the track chunk, which reloads the FX chain -- NOT
+-- safe mid-kit-load (it would cut the auto-load handshake). A registry change
+-- therefore only ARMS the sweep; it runs once the change is ~1.5s old AND the
+-- pipeline is idle (the same gate eon_fill_tick uses), then embeds unseen
+-- GUIDs exactly once. False arms (id re-mint, instance removal) are free: the
+-- sweep finds no unseen GUID and does nothing.
+eon_embed_seen    = {}    -- fx GUID -> true (adopted or already defaulted)
+eon_embed_pending = nil   -- time the registry last changed, while unswept
+eon_embed_reg     = nil   -- last registry fingerprint ("id@slot;...")
+eon_embed_proj    = nil   -- project at last adoption snapshot
+
+function eon_embed_snapshot()
+  for tr in core.iter_all_tracks() do
+    for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
+      if is_swing_fx(tr, fx) then
+        local g = reaper.TrackFX_GetFXGUID(tr, fx)
+        if g then eon_embed_seen[g] = true end
+      end
+    end
+  end
+end
+
+function eon_embed_tick()
+  local fp = {}
+  for slot = 0, G.GS_INST_REG_MAX - 1 do
+    local id = math.floor(reaper.gmem_read(
+      G.GS_INST_REG_BASE + slot * G.GS_INST_REG_STRIDE + G.GS_INST_REG_OFF_ID) or 0)
+    if id ~= 0 then fp[#fp + 1] = id .. "@" .. slot end
+  end
+  fp = table.concat(fp, ";")
+
+  local proj = reaper.EnumProjects(-1)
+  if proj ~= eon_embed_proj then
+    -- Bridge start or project/tab switch: adopt everything present, embed
+    -- nothing -- what a project brings with it is the user's saved state.
+    eon_embed_proj, eon_embed_reg, eon_embed_pending = proj, fp, nil
+    eon_embed_seen = {}
+    eon_embed_snapshot()
+    return
+  end
+
+  if fp ~= eon_embed_reg then
+    eon_embed_reg = fp
+    eon_embed_pending = reaper.time_precise()
+  end
+  if not eon_embed_pending then return end
+  if reaper.time_precise() - eon_embed_pending < 1.5 then return end
+  if math.floor(reaper.gmem_read(G.CMD) or 0) ~= 0
+     or math.floor(reaper.gmem_read(G.LOCK) or 0) ~= 0
+     or math.floor(reaper.gmem_read(G.GS_KIT_LOAD_REQ) or 0) == 2
+     or current_load ~= nil or #pending_load_queue > 0
+     or eon_pp_stream ~= nil or eon_chop_state ~= nil then
+    return   -- stay armed; embed on a later idle tick
+  end
+  eon_embed_pending = nil
+  for tr in core.iter_all_tracks() do
+    for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
+      if is_swing_fx(tr, fx) then
+        local g = reaper.TrackFX_GetFXGUID(tr, fx)
+        if g and not eon_embed_seen[g] then
+          eon_embed_seen[g] = true
+          -- One Swing per track in practice; the frag match flips the first.
+          core.fx_embed_mcp(tr, "Swing_ReaKit")
+        end
+      end
+    end
+  end
 end
 
 -- Browser request entry (called from the kit_req==1 pickup). Stashes the
@@ -16188,6 +16298,9 @@ local function poll()
   -- Kit-categories ④ FILL: one CMD 63/64 per idle tick while a fill is in
   -- flight (no-op when eon_fill_state/eon_fill_pending are nil).
   pcall(eon_fill_tick)
+  -- Embed-on-insert: default a freshly-inserted Swing to MCP-embedded
+  -- (FX-browser parity; no-op unless the gmem instance registry changed).
+  pcall(eon_embed_tick)
   -- AP-4: open the browser panel when the JSFX Preset strip is right-clicked.
   pcall(eon_preset_browser_launch_tick)
   -- GROOVE S3: open the .rgt groove importer when the groove menu asks for it.

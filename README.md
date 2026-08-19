@@ -96,6 +96,28 @@ happened instead. Screenshots welcome. For kit-loading problems, attach
 always restart. A running Swing keeps old code in memory and will happily
 confuse you otherwise.
 
+## What Swing changes on your machine
+
+Plain answers, because you shouldn't have to read source to know:
+
+- **Startup action.** That one-time Swing_Kit_Bridge run adds a small block to
+  `Scripts/__startup.lua` in your REAPER resource folder so the bridge starts
+  with REAPER (the Drum Strip sync helper registers itself the same way). The
+  blocks are self-cleaning: uninstall the scripts and each block removes
+  itself and its settings on the next launch. The file is rewritten through a
+  temp file + rename, so other scripts' startup lines are never at risk.
+- **Network: none, by default.** A ReaPack install of Swing makes no network
+  requests — updates come from ReaPack Synchronize, which only talks to this
+  repository. (The Windows .exe channel ships an update checker that asks
+  `api.github.com` for the latest release number when Swing loads; it sends
+  nothing about you or your projects and stays silent offline. On a ReaPack
+  install it only runs if you launch **EON_UpdateCheck** from the Action List
+  yourself.)
+- **Where your data lives.** Kits: `Data/Swing_Kits/`. Settings, caches and
+  logs: `Data/EON_Swing/` and `Data/Swing_Cache/` — all inside your REAPER
+  resource folder. The only thing written next to a project is that project's
+  own kit audio.
+
 ## Good to know
 
 - **Update notifications are Windows-only** for now; ReaPack Synchronize is
@@ -107,6 +129,15 @@ confuse you otherwise.
 - **Audio cutting out when REAPER loses focus is a REAPER preference**, not
   Swing: Preferences → Audio → Device → *Close audio device when stopped and
   application is inactive*. Uncheck it.
+
+## License
+
+Swing is commercial software; this repository is its delivery channel, so the
+source is visible but not open source. Install it, use it on your music
+(commercial or not), share kits you make yourself — just don't redistribute
+or resell the code or factory content. Full terms: [LICENSE.md](LICENSE.md).
+The open-source work Swing builds on is credited in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ---
 
