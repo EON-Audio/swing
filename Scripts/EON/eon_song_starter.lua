@@ -155,6 +155,9 @@ end
 --   insert_swing boolean       — add a track with Swing on it
 --   midi_items   boolean       — one empty MIDI item per region on that track
 --   build_lanes  boolean       — fire the Drum Matrix lane build (async)
+--   step_seq     boolean       — insert EON StepSeq above Swing, embedded in the MCP
+--   float_swing  boolean|nil   — open Swing's floating window after the kit
+--                                request (nil = true, the historic behavior)
 --   target       table  | nil  — eon_action_target module, required for lanes
 --
 -- Returns ok, message.
@@ -253,9 +256,9 @@ function M.build(opts)
   elseif opts.build_lanes                 then build_code = 73
   elseif opts.multi_out                   then build_code = 40 end
 
-  if build_code and opts.target and fx then
-    -- Route the build at the Swing WE created, on the defer loop. Three reasons
-    -- this cannot be a plain focus_lock()+fire():
+  if fx then
+    -- Route the follow-up work at the Swing WE created, on the defer loop.
+    -- Three reasons this cannot be a plain focus_lock()+fire():
     --   * our windowless AddByName is never the focused FX, so focus_lock()
     --     leaves a stale LOCK and the bridge builds the FIRST Swing it finds —
     --     in a project that already has one, that's the WRONG instance;
@@ -263,19 +266,37 @@ function M.build(opts)
     --     runs, which is AFTER this action returns — it cannot be read here;
     --   * fire() drops the command silently when the bus is busy (a lingering
     --     completion code takes ~5s to clear via the bridge watchdog).
-    -- So: poll for the id, then post LOCKed at it, retrying while busy, with a
-    -- deadline so a dead bridge surfaces as a console message, not silence.
-    local target, deadline = opts.target, reaper.time_precise() + 12.0
+    --
+    -- SEQUENCE: kit FIRST, build second (the dead-window fix, 2026-08-19).
+    -- The build used to be posted the moment the id existed, which held the
+    -- CMD bus through the whole build + FX-returns dialog; the JSFX-side
+    -- default-kit auto-load gates on an IDLE bus, so the kit (and with it the
+    -- Lens artwork and the pad names/colors the build reads from gmem) only
+    -- arrived seconds after everything else. The kit-load REQUEST channel is
+    -- independent of the CMD bus, so we queue the default kit directly, wait
+    -- for it to land, then post the build — children are created with real
+    -- names/colors and the Lens is born with its artwork. The JSFX auto-load
+    -- stays as the fallback and self-disarms when it sees loaded pads.
+    local target = opts.target
+    -- Default kit — mirrors the bridge's CMD-22 auto-load resolution
+    -- (Swing_Kit_Bridge.lua, cmd == 22 — that copy is canonical; keep in
+    -- sync). Missing file = skip the request silently, same as CMD 22.
+    local kit_path = core.get_kits_dir() .. _ss_sep .. "Fischer 808"
+                     .. _ss_sep .. "808 F.swing"
+    do
+      local kf = io.open(kit_path, "rb")
+      if kf then kf:close() else kit_path = nil end
+    end
+    -- gmem cells, mirrored from rk_lua_core GMEM (inlined, the
+    -- eon_action_target posture — this module must not depend on the bridge).
+    local GS_KIT_LOAD_REQ, GS_LOAD_WANT = 1444, 26090340
     -- `fx` is an INDEX and the retry window is seconds long — re-resolve
     -- through the FX GUID each tick so an FX inserted above it mid-arm can't
     -- make us read a stranger's param 3 (garbage iid -> LOCK misroute).
     local fx_guid = reaper.TrackFX_GetFXGUID(tr, fx)
+    local phase = kit_path and "kit_post" or "build"
+    local deadline = reaper.time_precise() + 12.0
     local function arm()
-      if reaper.time_precise() > deadline then
-        reaper.ShowConsoleMsg("[EON] New Song: bridge build (cmd " .. build_code ..
-          ") was never posted -- is the Swing Kit Bridge running?\n")
-        return
-      end
       if not reaper.ValidatePtr2(0, tr, "MediaTrack*") then return end
       local rfx = fx
       if fx_guid then
@@ -286,9 +307,70 @@ function M.build(opts)
         if rfx < 0 then return end   -- our Swing was deleted: stand down
       end
       local iid = math.floor(reaper.TrackFX_GetParam(tr, rfx, 3) or 0)  -- slider4 = instance_id
-      if not (iid > 0 and target.post_locked and target.post_locked(iid, build_code)) then
-        reaper.defer(arm)
+
+      if phase == "kit_post" then
+        if reaper.time_precise() > deadline then
+          -- Could not even request the kit (id never claimed / REQ never
+          -- freed) — fall through to the build; the JSFX auto-load remains.
+          phase = "kit_wait"; deadline = 0
+        elseif iid > 0 then
+          reaper.gmem_attach("Swing_Media_Transfer")
+          if math.floor(reaper.gmem_read(GS_KIT_LOAD_REQ) or 0) == 0 then
+            reaper.SetExtState("Swing", "kit_load_path", kit_path, false)
+            reaper.gmem_write(GS_LOAD_WANT, iid)  -- WANT only; PENDING is the
+            -- bridge→JSFX delivery binding and must never be stomped from here
+            reaper.gmem_write(GS_KIT_LOAD_REQ, 1)
+            -- CMD-22 parity: the auto-load pops Swing open on a fresh insert;
+            -- a windowless AddByName is closed by definition. Float Swing is
+            -- now an option (nil = the historic float).
+            if opts.float_swing ~= false then
+              reaper.TrackFX_Show(tr, rfx, 3)
+              if core.hub_notify then core.hub_notify("open", "swing", tr, rfx) end
+            end
+            -- Step sequencer (opt-in): find-or-insert above Swing so its MIDI
+            -- feeds the sampler, embedded-first in the MCP — never floated.
+            if opts.step_seq then
+              local sq = core.jsfx_addname("EON_StepSeq.jsfx")
+              if sq then
+                local si = reaper.TrackFX_AddByName(tr, sq, false, 0)
+                if si < 0 then
+                  si = reaper.TrackFX_AddByName(tr, sq, false, -1)
+                  if si and si >= 0 then
+                    if si > rfx then
+                      reaper.TrackFX_CopyToTrack(tr, si, tr, rfx, true)
+                      rfx = rfx + 1   -- Swing shifted down one slot
+                    end
+                    core.fx_embed_mcp(tr, "EON_StepSeq")
+                  end
+                end
+              end
+            end
+            phase = "kit_wait"; deadline = reaper.time_precise() + 8.0
+          end
+        end
+      elseif phase == "kit_wait" then
+        -- The bridge stamps the track's kit-source breadcrumb on positive load
+        -- ack — that is the "kit really landed" edge (pads, colors, artwork
+        -- all staged before it). Deadline just means "build anyway".
+        local _, src = reaper.GetSetMediaTrackInfo_String(tr, "P_EXT:swing_kit_src", "", false)
+        if src == kit_path then
+          phase = "build"; deadline = reaper.time_precise() + 12.0
+        elseif reaper.time_precise() > deadline then
+          reaper.ShowConsoleMsg("[EON] New Song: default kit did not confirm in time -- building anyway\n")
+          phase = "build"; deadline = reaper.time_precise() + 12.0
+        end
+      elseif phase == "build" then
+        if not (build_code and target) then return end   -- kit-only run: done
+        if reaper.time_precise() > deadline then
+          reaper.ShowConsoleMsg("[EON] New Song: bridge build (cmd " .. build_code ..
+            ") was never posted -- is the Swing Kit Bridge running?\n")
+          return
+        end
+        if iid > 0 and target.post_locked and target.post_locked(iid, build_code) then
+          return
+        end
       end
+      reaper.defer(arm)
     end
     arm()
   end
@@ -659,6 +741,8 @@ function M.prompt(on_accept)
             { key = "midi_items",  label = "MIDI items",     value = true },
             { key = "build_lanes", label = "MIDI lanes",     value = true },
             { key = "multi_out",   label = "Multi-out audio", value = true },
+            { key = "step_seq",    label = "Step sequencer",  value = true },
+            { key = "float_swing", label = "Float Swing",     value = true },
           } },
         -- Saving rides along with Create rather than opening a second modal:
         -- one text box, no nesting, and the common case (leave it blank) costs
@@ -693,6 +777,8 @@ function M.prompt(on_accept)
           midi_items  = ex.midi_items,
           build_lanes = ex.build_lanes,
           multi_out   = ex.multi_out,
+          step_seq    = ex.step_seq,
+          float_swing = ex.float_swing,
         })
       end,
     })

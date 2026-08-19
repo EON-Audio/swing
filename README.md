@@ -17,7 +17,7 @@ recipes, every view illustrated. GitHub renders it right in your browser.
 
 ## What's in the box
 
-One install, five plugins, one ecosystem:
+One install, one ecosystem:
 
 - **Swing** — 16-pad drum sampler. Four layers per pad (velocity splits,
   round-robin, sum), per-pad FX chains, ADSR, choke groups, key ranges,
@@ -31,7 +31,12 @@ One install, five plugins, one ecosystem:
 - **Drum Matrix** — your patterns as real REAPER MIDI items in the arrange
   window. Edit either end; the other follows, ratchets included.
 - **Drum Strip + FX Return View** — a mixer channel per drum with SSL-style
-  controls, plus delay/reverb return metering.
+  controls, plus hardware-faceplate return monitors: the EON 480 reverb and
+  EON H9 delay decks, every contributing pad's send on a fader.
+- **EON 76** *(new)* — a bus compressor with a real GR needle. The multi-out
+  build can drop one on your drum bus for glue, and one always drives the new
+  **Smash** return: parallel compression on a fader, fed by a per-pad SMASH
+  send next to DLY and RVB.
 - **EON Lens** — a kit-artwork card for the track panel. Your kit's cover,
   living on the track, pulsing with the audio.
 
@@ -47,6 +52,10 @@ wipe a kit anymore.
    ```
    https://raw.githubusercontent.com/EON-Audio/swing/main/index.xml
    ```
+
+   > ⚠️ Paste that raw address **exactly** — this page's own URL
+   > (`github.com/EON-Audio/swing`) is not a ReaPack index, and importing
+   > it fails with an XML parse error.
 
 3. **Synchronize packages**, install **EON Swing 3**, and **restart REAPER**.
 

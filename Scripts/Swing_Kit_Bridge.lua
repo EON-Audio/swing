@@ -3954,6 +3954,7 @@ local function write_default_pad_meta(pad_idx, interleaved_len, sr, hue, pad_nam
   reaper.gmem_write(mb + 23, 0)       -- bc_rate (0 = off)
   reaper.gmem_write(mb + 24, 16)      -- bc_bits
   reaper.gmem_write(mb + 25, 0)       -- snd_dly
+  reaper.gmem_write(G.GS_PAD_SMASH_BASE + pad_idx, 0)  -- snd_smash (overflow band)
   reaper.gmem_write(mb + 26, 0)       -- snd_rvb
   reaper.gmem_write(mb + 27, 200)     -- eq_lo_freq
   reaper.gmem_write(mb + 28, 1000)    -- eq_mid_freq
@@ -5691,6 +5692,7 @@ local function write_kit_v2(filepath, info)
     f:write('      fx_bc_bits = ' .. reaper.gmem_read(base + 24) .. ',\n')
     f:write('      fx_snd_dly = ' .. reaper.gmem_read(base + 25) .. ',\n')
     f:write('      fx_snd_rvb = ' .. reaper.gmem_read(base + 26) .. ',\n')
+    f:write('      fx_snd_smash = ' .. reaper.gmem_read(G.GS_PAD_SMASH_BASE + pad) .. ',\n')
     f:write('      fx_eq_lo_freq = ' .. reaper.gmem_read(base + 27) .. ',\n')
     f:write('      fx_eq_mid_freq = ' .. reaper.gmem_read(base + 28) .. ',\n')
     f:write('      fx_eq_hi_freq = ' .. reaper.gmem_read(base + 29) .. ',\n')
@@ -6514,9 +6516,19 @@ function eon_kit_cover_for_save(filepath, prior_path)
   --   src_path == filepath -> re-saving the kit we took it from. Carry over.
   --   src_path == nil      -> it came from a DROP, so it is meant for the next
   --                           save by definition.
+  --   src_path == the LOCK-holding instance's loaded kit -> a SAVE-AS of the
+  --                           live kit under a new name: same art, new file.
+  --                           Refusing this is how a factory-kit Save-As
+  --                           minted art-less twins (the 2026-08-19 "808 F"
+  --                           root copy). eon_kit_src_for_lock answers for
+  --                           the instance actually saving, so another
+  --                           instance's staged art still cannot leak in.
   --   otherwise            -> a different kit. Leave it alone.
-  if eon_kit_cover_src_path == nil or eon_kit_cover_src_path == filepath then
-    if eon_kit_cover_bytes then return eon_kit_cover_bytes end
+  if eon_kit_cover_bytes
+     and (eon_kit_cover_src_path == nil
+          or eon_kit_cover_src_path == filepath
+          or eon_kit_cover_src_path == eon_kit_src_for_lock()) then
+    return eon_kit_cover_bytes
   end
   -- Nothing staged for this kit. write_kit_v4 opens "wb", so writing a coverless
   -- file over one that HAS artwork destroys it with no way back. Re-read the
@@ -6534,6 +6546,8 @@ end
 -- `preview` (optional): 1 marks the published path as an UNSAVED drop preview
 -- — readers (kit tile + Lens) show the image but keep their UNSAVED cue up
 -- until a real bake/load publishes with preview absent.
+eon_kitcover_by_inst  = {}   -- inst_id -> last published {path, preview}
+_eon_cover_slot_seen  = {}   -- inst_id -> slot the identity sweep last saw it on
 function eon_kitcover_publish(slot, path, preview)
   if not slot or slot < 0 or slot >= G.GS_INST_REG_MAX then return end
   local b  = G.KITCOVER_BASE + slot * G.KITCOVER_STRIDE
@@ -6546,6 +6560,42 @@ function eon_kitcover_publish(slot, path, preview)
   reaper.gmem_write(b + G.KITCOVER_PUB_PREVIEW, preview and 1 or 0)
   reaper.gmem_write(b + G.KITCOVER_PUB_SEQ,
                     (reaper.gmem_read(b + G.KITCOVER_PUB_SEQ) or 0) + 1)
+  -- Remember what this INSTANCE was last shown, keyed by id, not slot — the
+  -- follow pass below re-aims it when the instance migrates. Recorded in the
+  -- funnel so every publish flavour (load, save-ack, drop preview, New-Kit
+  -- clear) is covered. Freshness-gated like ss_resolve_slot: a stale registry
+  -- band must not file the cover under a ghost's id.
+  local rb  = G.GS_INST_REG_BASE + slot * G.GS_INST_REG_STRIDE
+  local iid = math.floor(reaper.gmem_read(rb + G.GS_INST_REG_OFF_ID) or 0)
+  if iid > 0 and (reaper.time_precise() - (reaper.gmem_read(rb + G.GS_INST_REG_OFF_HEARTBEAT) or 0))
+                 <= G.GS_INST_REG_TIMEOUT then
+    eon_kitcover_by_inst[iid] = { path = s, preview = preview and true or false }
+  end
+end
+
+-- Re-aim the cover when an instance changes registry slots. Slots are session-
+-- volatile and DO move mid-session: every Swing recompile migrates (the old
+-- incarnation's heartbeat is still fresh, so swing_registry_claim's re-adopt
+-- pass refuses the old slot and Pass B takes a new one), and a collision
+-- vacate/reclaim can too. The cover is the only ONE-SHOT slot-keyed broadcast
+-- — strip/identity/colors re-publish every pass — so the publish stayed behind
+-- on the old band: the kit tile fell back to its generated portrait and the
+-- Lens to its monogram until the next kit load. Called per slotted instance
+-- from the identity sweep; two table reads when nothing changed.
+-- (A duplicated instrument's re-minted id has no memory here on purpose — its
+-- art arrives with the primed_instances sidecar reload for the new id.)
+function eon_kitcover_follow_slot(inst_id, slot)
+  local prev = _eon_cover_slot_seen[inst_id]
+  _eon_cover_slot_seen[inst_id] = slot
+  if prev == nil or prev == slot then return end
+  local last = eon_kitcover_by_inst[inst_id]
+  if last then
+    eon_kitcover_publish(slot, last.path, last.preview)
+  else
+    -- No memory (bridge restarted since the last load): still scrub the target
+    -- band, so the migrated instance cannot wear a dead occupant's stale art.
+    eon_kitcover_publish(slot, "")
+  end
 end
 
 -- ── EON Lens — kit artwork card on the instrument parent folder ────────────
@@ -6991,6 +7041,7 @@ local function write_kit_v4(filepath, info, silent)
     w('      fx_bc_bits = ' .. reaper.gmem_read(base + 24) .. ',\n')
     w('      fx_snd_dly = ' .. reaper.gmem_read(base + 25) .. ',\n')
     w('      fx_snd_rvb = ' .. reaper.gmem_read(base + 26) .. ',\n')
+    w('      fx_snd_smash = ' .. reaper.gmem_read(G.GS_PAD_SMASH_BASE + pad) .. ',\n')
     w('      fx_eq_lo_freq = ' .. reaper.gmem_read(base + 27) .. ',\n')
     w('      fx_eq_mid_freq = ' .. reaper.gmem_read(base + 28) .. ',\n')
     w('      fx_eq_hi_freq = ' .. reaper.gmem_read(base + 29) .. ',\n')
@@ -7322,6 +7373,7 @@ local function write_kit_v5(filepath, info, silent)
   local snap_padname  = {}    -- raw pad name characters per pad
   local snap_offset   = {}    -- sample offset per pad
   local snap_range    = {}    -- packed chromatic key-range (lo*128+hi) per pad
+  local snap_smash    = {}    -- smash send per pad (overflow band; META is full)
   for pad = 0, G.NUM_PADS - 1 do
     snap_audiolen[pad] = math.floor(reaper.gmem_read(G.AUDIOLEN_BASE + pad) or 0)
     local mb = G.META_BASE + pad * G.META_PP
@@ -7336,6 +7388,7 @@ local function write_kit_v5(filepath, info, silent)
     end
     snap_offset[pad] = reaper.gmem_read(G.GS_PAD_OFFSET_BASE + pad)
     snap_range[pad]  = reaper.gmem_read(G.GS_PAD_RANGE_BASE + pad)
+    snap_smash[pad]  = reaper.gmem_read(G.GS_PAD_SMASH_BASE + pad)
   end
 
   -- Optional gmem-state dump at save time. Enable via:
@@ -7517,6 +7570,7 @@ local function write_kit_v5(filepath, info, silent)
       fx_bc_bits    = m[24],
       fx_snd_dly    = m[25],
       fx_snd_rvb    = m[26],
+      fx_snd_smash  = snap_smash[pad] or 0,
       fx_eq_lo_freq = m[27],
       fx_eq_mid_freq= m[28],
       fx_eq_hi_freq = m[29],
@@ -8035,6 +8089,7 @@ local function load_kit_v2(filepath, internal)
     reaper.gmem_write(base + 24, p.fx_bc_bits or 16)
     reaper.gmem_write(base + 25, p.fx_snd_dly or 0)
     reaper.gmem_write(base + 26, p.fx_snd_rvb or 0)
+    reaper.gmem_write(G.GS_PAD_SMASH_BASE + pad, p.fx_snd_smash or 0)
     reaper.gmem_write(base + 27, p.fx_eq_lo_freq or 200)
     reaper.gmem_write(base + 28, p.fx_eq_mid_freq or 1000)
     reaper.gmem_write(base + 29, p.fx_eq_hi_freq or 5000)
@@ -8199,6 +8254,7 @@ local function load_kit_v4(filepath, internal)
     reaper.gmem_write(base + 24, p.fx_bc_bits or 16)
     reaper.gmem_write(base + 25, p.fx_snd_dly or 0)
     reaper.gmem_write(base + 26, p.fx_snd_rvb or 0)
+    reaper.gmem_write(G.GS_PAD_SMASH_BASE + pad, p.fx_snd_smash or 0)
     reaper.gmem_write(base + 27, p.fx_eq_lo_freq or 200)
     reaper.gmem_write(base + 28, p.fx_eq_mid_freq or 1000)
     reaper.gmem_write(base + 29, p.fx_eq_hi_freq or 5000)
@@ -9047,6 +9103,7 @@ local function load_kit_v5(filepath, internal)
     reaper.gmem_write(base + 24, p.fx_bc_bits or 16)
     reaper.gmem_write(base + 25, p.fx_snd_dly or 0)
     reaper.gmem_write(base + 26, p.fx_snd_rvb or 0)
+    reaper.gmem_write(G.GS_PAD_SMASH_BASE + pad, p.fx_snd_smash or 0)
     reaper.gmem_write(base + 27, p.fx_eq_lo_freq or 200)
     reaper.gmem_write(base + 28, p.fx_eq_mid_freq or 1000)
     reaper.gmem_write(base + 29, p.fx_eq_hi_freq or 5000)
@@ -9512,20 +9569,96 @@ function rk_ops.do_build_multiout(opts)
   -- child-track 0. Detect existing return tracks NOW (before a Rebuild can
   -- delete them) so the decision can preserve them.
   local function detect_returns()
-    local v, d = false, false
+    local v, d, sm = false, false, false
     local ns = reaper.GetTrackNumSends(swing_track, 0)
     for s = 0, ns - 1 do
       local dt = reaper.BR_GetMediaTrackSendInfo_Track(swing_track, 0, s, 1)
       if dt then
         local _, vt = reaper.GetSetMediaTrackInfo_String(dt, "P_EXT:EON_VERB_RETURN", "", false)
         local _, dd = reaper.GetSetMediaTrackInfo_String(dt, "P_EXT:EON_DELAY_RETURN", "", false)
+        local _, sr = reaper.GetSetMediaTrackInfo_String(dt, "P_EXT:EON_SMASH_RETURN", "", false)
         if vt == "1" then v = true end
         if dd == "1" then d = true end
+        if sr == "1" then sm = true end
       end
     end
-    return v, d
+    return v, d, sm
   end
-  local have_verb, have_delay = detect_returns()
+  local have_verb, have_delay, have_smash = detect_returns()
+  -- An existing EON 76 on the Audio submix parent (it survives a Rebuild) is
+  -- the user's standing opt-in for the drum-bus comp — preserved, not re-asked.
+  local have_buscomp = false
+  do
+    local pre_sub = find_audio_subfolder(swing_track)
+    if pre_sub then
+      for fx = 0, reaper.TrackFX_GetCount(pre_sub) - 1 do
+        local _, fn = reaper.TrackFX_GetFXName(pre_sub, fx, "")
+        if fn and fn:find("EON 76", 1, true) then have_buscomp = true break end
+      end
+    end
+  end
+
+  -- Existing StepSeq on the Swing track = a standing opt-in, preserved.
+  local have_stepseq = false
+  do
+    local sq = core.jsfx_addname("EON_StepSeq.jsfx")
+    if sq and reaper.TrackFX_AddByName(swing_track, sq, false, 0) >= 0 then
+      have_stepseq = true
+    end
+  end
+
+  -- Find-or-insert EON StepSeq just above Swing (the generated MIDI must feed
+  -- it — same find/move shape as the Steppa-open toggle) and open it embedded
+  -- in the MCP on a fresh insert. Existing instances are left exactly as-is.
+  local function ensure_stepseq()
+    local sq, _, sq_why = core.jsfx_addname("EON_StepSeq.jsfx")
+    if not sq then
+      reaper.ShowConsoleMsg("[Swing] EON_StepSeq.jsfx not found -- step sequencer skipped" ..
+        string.char(10) .. "  " .. tostring(sq_why) .. string.char(10))
+      return
+    end
+    if reaper.TrackFX_AddByName(swing_track, sq, false, 0) >= 0 then return end
+    local seq_idx = reaper.TrackFX_AddByName(swing_track, sq, false, -1)
+    if not seq_idx or seq_idx < 0 then return end
+    local sw_idx, nfx, fi = -1, reaper.TrackFX_GetCount(swing_track), 0
+    while fi < nfx do
+      if is_swing_fx(swing_track, fi) then sw_idx = fi; break end
+      fi = fi + 1
+    end
+    if sw_idx >= 0 and seq_idx > sw_idx then
+      reaper.TrackFX_CopyToTrack(swing_track, seq_idx, swing_track, sw_idx, true)
+    end
+    core.fx_embed_mcp(swing_track, "EON_StepSeq")
+  end
+
+  -- Find-or-insert an EON 76 on a track. Fresh inserts get the context
+  -- defaults (matched by param NAME with plain find — the labels carry
+  -- "(dB)" parens) and open EMBEDDED in the MCP; an existing instance keeps
+  -- its settings and embed state, so a Rebuild never stomps the user's comp.
+  local function ensure_eon76(tr, defaults)
+    if not tr then return end
+    local name = core.jsfx_addname("EON_76.jsfx", swing_track, swing_fx)
+    if not name then
+      reaper.ShowConsoleMsg("[Swing] EON_76.jsfx not found -- bus compressor skipped" .. string.char(10))
+      return
+    end
+    if reaper.TrackFX_AddByName(tr, name, false, 0) >= 0 then return end
+    local fx = reaper.TrackFX_AddByName(tr, name, false, 1)
+    if fx < 0 then
+      reaper.ShowConsoleMsg("[Swing] Could not insert EON 76 (" .. tostring(name) .. ")" .. string.char(10))
+      return
+    end
+    for pat, val in pairs(defaults or {}) do
+      for p = 0, reaper.TrackFX_GetNumParams(tr, fx) - 1 do
+        local _, pn = reaper.TrackFX_GetParamName(tr, fx, p, "")
+        if pn and pn:find(pat, 1, true) then
+          reaper.TrackFX_SetParam(tr, fx, p, val)
+          break
+        end
+      end
+    end
+    core.fx_embed_mcp(tr, "EON_76")   -- opens embedded in the MCP by default
+  end
   -- want_returns is decided after the Rebuild/Update dialog (creation paths
   -- only) and travels as proceed_build's parameter — see the async seam below.
 
@@ -9658,7 +9791,7 @@ function rk_ops.do_build_multiout(opts)
   -- wait it had when the old blocking MessageBox froze the whole bridge,
   -- except the pollers keep ticking now. (97 is registered in
   -- .refs/swing_gmem_bridge_protocol.md next to 98/99.)
-  local function proceed_build(want_returns)
+  local function proceed_build(want_returns, want_buscomp, want_stepseq)
 
   local swing_idx = math.floor(reaper.GetMediaTrackInfo_Value(swing_track, "IP_TRACKNUMBER")) - 1
 
@@ -9780,8 +9913,8 @@ function rk_ops.do_build_multiout(opts)
   -- dedicated return pins (verb ch32/33, delay ch34/35). Appended to `created`
   -- so the self-contained folder close below lands on the last return track.
   if want_returns and #created > 0 then
-    if reaper.GetMediaTrackInfo_Value(swing_track, "I_NCHAN") < 36 then
-      reaper.SetMediaTrackInfo_Value(swing_track, "I_NCHAN", 36)
+    if reaper.GetMediaTrackInfo_Value(swing_track, "I_NCHAN") < 38 then
+      reaper.SetMediaTrackInfo_Value(swing_track, "I_NCHAN", 38)
     end
     local function mk_return(offset, label, tag, srcchan, cat)
       local idx = audio_sub_idx + 1 + G.NUM_PADS + offset
@@ -9801,6 +9934,7 @@ function rk_ops.do_build_multiout(opts)
       -- Thematic track colour matching the faceplate: verb green, delay orange.
       local cr, cg, cb = 50, 170, 95
       if cat == "delay" then cr, cg, cb = 210, 120, 40 end
+      if tag == "EON_SMASH_RETURN" then cr, cg, cb = 190, 70, 60 end
       reaper.SetMediaTrackInfo_Value(rtr, "I_CUSTOMCOLOR", reaper.ColorToNative(cr, cg, cb) | 0x1000000)
       local si = reaper.CreateTrackSend(swing_track, rtr)
       if si >= 0 then
@@ -9809,12 +9943,32 @@ function rk_ops.do_build_multiout(opts)
         reaper.SetTrackSendInfo_Value(swing_track, 0, si, "I_SENDMODE", 0)
       end
       created[#created + 1] = rtr
+      return rtr
     end
     mk_return(0, "EON Verb Return",  "EON_VERB_RETURN",  32, "reverb")
     mk_return(1, "EON Delay Return", "EON_DELAY_RETURN", 34, "delay")
+    local smash_rtr = mk_return(2, "EON Smash Return", "EON_SMASH_RETURN", 36, "fx")
+    -- The smasher itself — integral to the smash return (the return is just a
+    -- dry copy without it). Fresh-insert defaults = crushed parallel settings.
+    ensure_eon76(smash_rtr, {
+      ["Threshold"] = -25, ["Ratio"] = 10, ["Attack"] = 3,
+      ["Release"] = 120, ["Knee"] = 3, ["Makeup"] = 8, ["Mix"] = 1,
+    })
   end
   -- Drive the JSFX routing flag to match this build (off → wet stays on Main).
   set_fx_returns(want_returns)
+
+  -- Step sequencer above Swing (opt-in; embedded-first on fresh inserts).
+  if want_stepseq then ensure_stepseq() end
+
+  -- Serial glue on the drum submix parent (the separate want_buscomp opt-in;
+  -- gentler defaults than the smash-return instance).
+  if want_buscomp then
+    ensure_eon76(audio_sub, {
+      ["Threshold"] = -12, ["Ratio"] = 2, ["Attack"] = 10,
+      ["Release"] = 200, ["Knee"] = 6, ["Makeup"] = 0, ["Mix"] = 1,
+    })
+  end
 
   if #created > 0 then
     reaper.SetMediaTrackInfo_Value(swing_track, "B_MAINSEND", 0)
@@ -9849,6 +10003,13 @@ function rk_ops.do_build_multiout(opts)
   end
   if want_returns then
     summary = summary .. "\n  + EON Verb Return  (ch 33/34)\n  + EON Delay Return (ch 35/36)\n"
+    summary = summary .. "  + EON Smash Return (ch 37/38 -> EON 76)\n"
+  end
+  if want_buscomp then
+    summary = summary .. "  + EON 76 on the Audio bus\n"
+  end
+  if want_stepseq then
+    summary = summary .. "  + EON StepSeq above Swing (embedded)\n"
   end
   summary = summary .. "\nSwing master send muted (audio routes through child tracks)."
   -- Styled + ASYNC. The old ShowMessageBox froze the WHOLE bridge (pollers,
@@ -9868,30 +10029,51 @@ function rk_ops.do_build_multiout(opts)
   -- and dismissing the window (X / Escape) lands on keep-on-main, the
   -- current-behavior default.
   if opts and opts.fx_returns ~= nil then
-    proceed_build(opts.fx_returns and true or false)
-  elseif have_verb or have_delay then
-    proceed_build(true)   -- preserve an existing opt-in across a Rebuild
+    proceed_build(opts.fx_returns and true or false, have_buscomp, have_stepseq)
+  elseif have_verb or have_delay or have_smash or have_buscomp then
+    -- Preserve existing opt-ins across a Rebuild (returns, bus comp; StepSeq
+    -- rides along as-is). ⚠️ have_stepseq must NOT trigger this branch — a
+    -- StepSeq can exist for reasons that aren't a prior build opt-in (the
+    -- Steppa-open toggle, the song builder inserting it BEFORE firing this
+    -- build), and treating it as evidence silently skipped the dialog and
+    -- built without returns or the EON 76.
+    proceed_build(have_verb or have_delay or have_smash, have_buscomp, have_stepseq)
   else
-    local shown = eon_dlg and eon_dlg.available() and eon_dlg.confirm and eon_dlg.confirm({
-      title = "FX Return Tracks", width = 430,
-      ok_label = "Add Returns", cancel_label = "Keep on Main",
-      message = "Add delay/reverb FX return tracks?\n\n" ..
-                "Add Returns — create EON Verb / Delay Return tracks and route the wet to them.\n" ..
-                "Keep on Main — leave the wet on the Main bus (current behavior).",
-      on_ok     = function() proceed_build(true)  end,
-      on_cancel = function() proceed_build(false) end,
+    local shown = eon_dlg and eon_dlg.available() and eon_dlg.open and eon_dlg.open({
+      title = "Drum Bus Options", width = 680,
+      ok_label = "Build", cancel_label = "Skip",
+      fields = {
+        { key = "opts", label = "Add", kind = "checks",
+          sub = "returns = Verb / Delay / Smash tracks; EON 76 = bus compressor on the Audio bus",
+          items = {
+            { key = "fx_returns", label = "FX return tracks",       value = true },
+            { key = "bus_comp",   label = "EON 76 on the drum bus", value = true },
+            { key = "step_seq",   label = "Step sequencer",         value = true },
+          } },
+      },
+      on_ok = function(v)
+        local ex = v.opts or {}
+        proceed_build(ex.fx_returns and true or false, ex.bus_comp and true or false,
+                      ex.step_seq and true or false)
+      end,
+      on_cancel = function() proceed_build(false, false, false) end,
     })
     if shown then
       reaper.gmem_write(G.CMD, 97)   -- park the mailbox while the dialog is up
     else
-      -- No ReaImGui: the native Yes/No, blocking as it always was.
+      -- No ReaImGui: two native Yes/No questions, blocking as before.
       local c = reaper.ShowMessageBox(
-        "Add delay/reverb FX return tracks?\n\n" ..
-        "YES = create EON Verb / Delay Return tracks and route the wet to them\n" ..
+        "Add FX return tracks?" .. string.char(10,10) ..
+        "YES = create EON Verb / Delay / Smash Return tracks and route the wet to them" .. string.char(10) ..
         "NO = keep the wet on the Main bus (current behavior)",
-        SCRIPT_NAME, 4  -- Yes/No → 6=Yes, 7=No
-      )
-      proceed_build(c == 6)
+        SCRIPT_NAME, 4)  -- Yes/No -> 6=Yes, 7=No
+      local c2 = reaper.ShowMessageBox(
+        "Add an EON 76 bus compressor on the Audio bus?",
+        SCRIPT_NAME, 4)
+      local c3 = reaper.ShowMessageBox(
+        "Add the EON step sequencer above Swing?",
+        SCRIPT_NAME, 4)
+      proceed_build(c == 6, c2 == 6, c3 == 6)
     end
   end
 end
@@ -11253,6 +11435,28 @@ function ss_resolve_slot(inst_id)
   return nil
 end
 
+-- Positive death evidence for an instance id: it sits in the registry with a
+-- heartbeat that STOPPED (stale beyond the live timeout). A BOOTING instance
+-- was never registered (absent from the registry entirely) and a live one is
+-- fresh — only a re-minted/dead incarnation matches. The distinction is what
+-- lets the load queue re-bind a dead target without ever re-aiming a fresh
+-- insert's auto-load at a bystander (ss_resolve_slot alone cannot tell the
+-- two apart: it returns nil for both).
+function eon_inst_is_corpse(inst_id)
+  if not inst_id or inst_id <= 0 then return false end
+  local now = reaper.time_precise()
+  local slot = 0
+  while slot < G.GS_INST_REG_MAX do
+    local base = G.GS_INST_REG_BASE + slot * G.GS_INST_REG_STRIDE
+    if math.floor(reaper.gmem_read(base + G.GS_INST_REG_OFF_ID) or 0) == inst_id then
+      local hb = reaper.gmem_read(base + G.GS_INST_REG_OFF_HEARTBEAT) or 0
+      if hb > 0 and (now - hb) > G.GS_INST_REG_TIMEOUT then return true end
+    end
+    slot = slot + 1
+  end
+  return false
+end
+
 -- P4-2: pad index for a multi-out child — the explicit P_EXT tag (stamped at
 -- build), with an I_SRCCHAN/2 fallback + one-time retro-tag for pre-P4
 -- projects. The fallback is valid exactly while routing is still default,
@@ -11314,6 +11518,10 @@ function refresh_multiout_identity_per_instance()
         local slot = ss_resolve_slot(inst_id)
         local sends = slot and reaper.GetTrackNumSends(tr, 0) or 0
         if slot then
+          -- Cover follows the instance across slot migrations (recompile,
+          -- collision reclaim) — the one-shot publish does not do it itself.
+          -- Before the sends gate: stereo instances' kit tiles need it too.
+          eon_kitcover_follow_slot(inst_id, slot)
           -- P4-2: per-instance piano-roll note names on the HOST track —
           -- every slotted instance's track gets ITS pads' names at ITS
           -- trigger notes (the legacy CMD-48/52 writer only served the
@@ -13162,15 +13370,33 @@ local function drive_load_queue()
       -- instance. Without the fallback, a dead id retried itself forever:
       -- dispatch → no consumer → retry same id → ... while real loads
       -- queued behind it (kitpipe_retrykill caught exactly this).
-      local exact, first_live = nil, nil
+      local exact, first_live, live_n = nil, nil, 0
       for _, swing in ipairs(enumerate_all_swings()) do
         if (swing.inst_id or 0) > 0 then
+          live_n = live_n + 1
           if not first_live then first_live = swing end
           if swing.inst_id == item.inst_id then exact = swing; break end
         end
       end
       local pick = exact
       if not pick and (item.inst_id or 0) <= 0 then pick = first_live end
+      -- Dead-target re-bind (2026-08-19, "808F art never published"): a want
+      -- naming an id that is un-enumerated AND a registry corpse means the
+      -- instance re-minted (identity duel / recompile fallout) while a stale
+      -- binding — browser INSTANCE cell, requester WANT — kept the old id.
+      -- Dispatching at it costs the 2.5s no-consumer abort, and the retry
+      -- re-arm skips load_swing_dispatch, so the cover publish and the
+      -- folder rename silently vanish with it. Re-bind on the FIRST attempt,
+      -- but only on positive corpse evidence and only when exactly one live
+      -- instance exists: a BOOTING id (param 3 lags registration) is absent
+      -- from both surfaces and keeps the explicit-want AS-IS contract below,
+      -- so a fresh insert's auto-load can never be re-aimed at a bystander.
+      if not pick and (item.inst_id or 0) > 0 and live_n == 1
+         and eon_inst_is_corpse(item.inst_id) then
+        eon_load_report(("target inst=%d re-minted — re-bound to inst=%d")
+          :format(item.inst_id, first_live.inst_id))
+        pick = first_live
+      end
       if not pick and (item.retries or 0) > 0 and first_live then
         eon_load_report(("target inst=%d not found — retry falls back to inst=%d")
           :format(item.inst_id or 0, first_live.inst_id))
@@ -14504,6 +14730,53 @@ local function poll_sidecar_events()
     local lock_now = math.floor(reaper.gmem_read(G.LOCK) or 0)
     if cmd_now == 0 and lock_now ~= 0 then
       reaper.gmem_write(G.LOCK, 0)
+    end
+  end
+
+  -- Lua-posted completion release (2026-08-19). Ops posted from plain Lua
+  -- (eon_action_target bridge()/post_locked — the Song Starter, the EON menu
+  -- wrappers) have no armed JSFX waiting on their completion code. Orphan 99s
+  -- are eaten in ms by every idle instance's misc_cmds — and that consume
+  -- doubles as the pad name/color refresh, so 99 must be LEFT ALONE — but
+  -- nothing eats an orphan 98 (teaching bystander instances to eat 98 would
+  -- let them steal an ARMED importer's abort): a cancelled FX-returns dialog
+  -- parked a 98 on the bus for the watchdog's full 5s fuse, dropping every
+  -- CMD==0-gated post in the window. The poster stamps GS_CMD_LUA_POST with
+  -- the code; track the op and release its 98 the tick it lands. Guarded on
+  -- the constant so a stale rk_lua_core degrades to the watchdog, not a crash.
+  if G.GS_CMD_LUA_POST then
+    local cmd_now = math.floor(reaper.gmem_read(G.CMD) or 0)
+    local stamp   = math.floor(reaper.gmem_read(G.GS_CMD_LUA_POST) or 0)
+    if stamp ~= 0 then
+      if cmd_now == stamp then
+        _eon_lua_op = stamp                          -- op observed on the bus
+        reaper.gmem_write(G.GS_CMD_LUA_POST, 0)      -- stamp consumed
+        _eon_lua_stale = nil
+      elseif cmd_now == 0 then
+        -- Two sightings before declaring the stamp stale: the poster writes
+        -- the stamp a hair before CMD, so one idle-bus sighting can be a
+        -- mid-post snapshot.
+        if _eon_lua_stale then
+          reaper.gmem_write(G.GS_CMD_LUA_POST, 0)
+          _eon_lua_stale = nil
+        else
+          _eon_lua_stale = true
+        end
+      else
+        _eon_lua_stale = nil   -- an older op still draining; keep the stamp
+      end
+    else
+      _eon_lua_stale = nil
+    end
+    if _eon_lua_op then
+      if cmd_now == 98 then
+        reaper.gmem_write(G.CMD, 0)
+        reaper.gmem_write(G.LOCK, 0)
+        _eon_lua_op = nil
+      elseif cmd_now == 0 then
+        _eon_lua_op = nil     -- completed (self-cleared or misc_cmds ate a 99)
+      end
+      -- 97 (parked dialog) and mid-op codes: keep tracking
     end
   end
 

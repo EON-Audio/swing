@@ -122,6 +122,7 @@ import libs/rk_swing_ui_drum3d.jsfx-inc
 import libs/rk_swing_ui_overlay_syn.jsfx-inc
 import libs/rk_swing_ui_grid_overlay_fx.jsfx-inc
 import libs/rk_swing_ui_grid_overlay.jsfx-inc
+import libs/rk_swing_ui_mapping_core.jsfx-inc
 import libs/rk_swing_ui_mapping.jsfx-inc
 import libs/rk_swing_ui_synthview.jsfx-inc
 import libs/rk_swing_ui_range.jsfx-inc
@@ -169,6 +170,8 @@ out_pin:Verb Return L
 out_pin:Verb Return R
 out_pin:Delay Return L
 out_pin:Delay Return R
+out_pin:Smash Return L
+out_pin:Smash Return R
 
 @init
 ext_noinit = 1.0;
@@ -183,7 +186,8 @@ ext_tail_size = -1;
 // ⛔ Copy ONLY this line from them. The retina-scaling flag that sits next to it
 //    in those files stays off in Swing (named nowhere here on purpose, so the
 //    standing "is it absent?" grep keeps returning clean).
-gfx_ext_flags |= 0x100;
+// 0x400 = suppress REAPER's hover tooltip over the MCP embed (7.79+; older ignores).
+gfx_ext_flags |= 0x100 | 0x400;
 
 // Generate unique instance ID (persists via slider4 + ext_noinit).
 //
@@ -499,6 +503,7 @@ fx_bc_rate  = freemem; freemem += NUM_PADS;  // Bitcrush rate reduction (0=off, 
 fx_bc_bits  = freemem; freemem += NUM_PADS;  // Bitcrush bit depth (16=clean, 1=destroyed)
 fx_snd_dly  = freemem; freemem += NUM_PADS;  // Per-pad delay send amount (0–1)
 fx_snd_rvb  = freemem; freemem += NUM_PADS;  // Per-pad reverb send amount (0–1)
+fx_snd_smash = freemem; freemem += NUM_PADS; // Per-pad smash send amount (0–1) — parallel-comp bus
 fx_cmp_amt  = freemem; freemem += NUM_PADS;  // Per-pad compressor amount/mix (0=off, 1=full)
 fx_cmp_mode = freemem; freemem += NUM_PADS;  // Comp mode: 0=PUNCH 1=GLUE 2=SQUASH
 fx_reso     = freemem; freemem += NUM_PADS;  // Per-pad filter resonance Q (0.707–12)
@@ -605,6 +610,8 @@ snd_dly_accL = freemem; freemem += 1;
 snd_dly_accR = freemem; freemem += 1;
 snd_rvb_accL = freemem; freemem += 1;
 snd_rvb_accR = freemem; freemem += 1;
+snd_sms_accL = freemem; freemem += 1;
+snd_sms_accR = freemem; freemem += 1;
 
 // GUI state arrays (must be before audio buffers to avoid overlap)
 pad_flash   = freemem; freemem += NUM_PADS;
@@ -655,6 +662,7 @@ sv_fx_bc_rate    = freemem; freemem += NUM_PADS;
 sv_fx_bc_bits    = freemem; freemem += NUM_PADS;
 sv_fx_snd_dly    = freemem; freemem += NUM_PADS;
 sv_fx_snd_rvb    = freemem; freemem += NUM_PADS;
+sv_fx_snd_smash  = freemem; freemem += NUM_PADS;
 sv_fx_eq_lo_freq = freemem; freemem += NUM_PADS;
 sv_fx_eq_mid_freq= freemem; freemem += NUM_PADS;
 sv_fx_eq_mid2_freq= freemem; freemem += NUM_PADS;
@@ -730,7 +738,7 @@ freemem = swing_mapping_init(freemem);
 sel_pad = 0;
 
 // Anti-pop crossfade: stores last output per channel for smooth transitions
-_xf_prev    = freemem; freemem += 36;  // previous output values (up to 36 channels: 16 buses + verb/delay returns)
+_xf_prev    = freemem; freemem += 38;  // previous output values (up to 38 channels: 16 buses + verb/delay/smash returns)
 
 // ─── Internal PARAM undo/redo engine state (v2, Phase 1A) ─────────────────
 // Field tables = the single source of truth for which per-pad arrays the undo
@@ -738,7 +746,7 @@ _xf_prev    = freemem; freemem += 36;  // previous output values (up to 36 chann
 // metadata. NOT audio, NOT names/paths. Built HERE because every per-pad array
 // it points at is already allocated above; consumed by the engine functions at
 // run-time. Session-volatile (freemem) — undo history clears on reinstantiate.
-UDO_NS     = 68;                              // scalar fields per pad (54 + 14 SYN slot)
+UDO_NS     = 69;                              // scalar fields per pad (54 + 14 SYN slot + smash send)
 UDO_NL     = 8;                               // per-layer fields per pad
 UDO_STRIDE = UDO_NS + UDO_NL * MAX_LAYERS;    // packed floats per pad snapshot
 UDO_DEPTH  = 32;                              // undo / redo ring depth
@@ -757,6 +765,7 @@ udo_fs[32]=fx_eq_mid2;   udo_fs[33]=fx_eq_hi;      udo_fs[34]=fx_eq_lo_freq;  ud
 udo_fs[36]=fx_eq_mid2_freq; udo_fs[37]=fx_eq_hi_freq; udo_fs[38]=fx_eq_lo_q;  udo_fs[39]=fx_eq_mid_q;
 udo_fs[40]=fx_eq_mid2_q; udo_fs[41]=fx_eq_hi_q;    udo_fs[42]=fx_sat_drv;     udo_fs[43]=fx_drv_mode;
 udo_fs[44]=fx_bc_rate;   udo_fs[45]=fx_bc_bits;    udo_fs[46]=fx_snd_dly;     udo_fs[47]=fx_snd_rvb;
+udo_fs[68]=fx_snd_smash;
 udo_fs[48]=fx_cmp_amt;   udo_fs[49]=fx_cmp_mode;   udo_fs[50]=sp_pitch_mode;  udo_fs[51]=sp_pitch_algo;
 udo_fs[52]=p_rng_lo;     udo_fs[53]=p_rng_hi;
 udo_fs[54]=ps_enable;    udo_fs[55]=ps_engine;     udo_fs[56]=ps_level;    udo_fs[57]=ps_vel_lo;
@@ -889,6 +898,7 @@ i = 0; loop(NUM_PADS,
   fx_bc_bits[i]  = 16;     // bitcrush depth: 16 = clean
   fx_snd_dly[i]  = 0;      // delay send: 0 = off
   fx_snd_rvb[i]  = 0;      // reverb send: 0 = off
+  fx_snd_smash[i] = 0;     // smash send: 0 = off
   fx_cmp_amt[i]  = 0;      // compressor off
   fx_cmp_mode[i] = 0;      // default PUNCH
   fx_reso[i]     = 0.707;  // Butterworth Q (flat response)
@@ -953,7 +963,7 @@ _transport_grace = 0;  // note-off suppression counter after transport start
 _xf_active = 0;           // anti-pop crossfade: not active until deserialize
 _xf_pos = 0;
 _xf_len = 1;
-memset(_xf_prev, 0, 36);  // no previous output at init (36 = 16 buses + verb/delay returns)
+memset(_xf_prev, 0, 38);  // no previous output at init (38 = 16 buses + verb/delay/smash returns)
 _coll_last_check = time_precise();  // avoid spurious reconciliation on first @block
 
 // ─── GUI state ────────────────────────────────────────────────────────────
@@ -1101,6 +1111,10 @@ GS_PAD_OFFSET_BASE   = 2232;  // per-pad sample offset (16 floats, 2232–2247)
 // GS_FX_PUB (26090000-63) and GS_STRIP_REINIT_PULSE (26090100). Keep in
 // sync with rk_lua_core.lua GMEM.GS_PAD_RANGE_BASE.
 GS_PAD_RANGE_BASE    = 26090200;  // ..26090215
+// Per-pad smash-send kit overflow (KIT_GMEM_META's 80-float stride is FULL —
+// see the GS_PAD_OFFSET_BASE note; same precedent as GS_PAD_RANGE_BASE).
+// MUST match rk_lua_core.lua GS_PAD_SMASH_BASE.
+GS_PAD_SMASH_BASE    = 26090240;  // ..26090255
 GS_SYN_META_BASE     = 26090400;  // ..26090623 — SYN slot publish/stage, pad×14
                                   // (enable, engine, level, vel_lo, vel_hi,
                                   // rr_order, mac0..7); registered in
@@ -1594,7 +1608,9 @@ GS_FX_SEL_PAD      = 2625;
 // INST_INCMD_BASE (26100000). 64 slots reserved:
 // 26090000..26090062 params, 26090063 handshake. Old 2626..2644 slots retired.
 GS_FX_PUB_BASE     = 26090000;  // params at base + FX_PID_*
-GS_FX_PUB_COUNT    = 23;        // ids 0..22 used; band reserved through +62
+GS_FX_PUB_COUNT    = 28;        // ids 0..22 + smash send at 27 (23..26 published
+                                // as zeros — they are strip-band cells, not pids);
+                                // band reserved through +62. MUST match rk_lua_core.lua.
 GS_FX_PUB_PAD      = 26090063;  // handshake — which pad the band describes
 GS_FX_ACTION_PAD   = 2646;
 GS_FX_ACTION_PARAM = 2647;
@@ -1662,12 +1678,55 @@ GS_STRIP_OFF_TIE_VER  = 601;
 // v48: per-band shelf Q
 FX_PID_EQ_LO_Q = 21;
 FX_PID_EQ_HI_Q = 22;
+// Smash send (parallel-comp bus). ⚠️ 23–26 are BURNED as strip-band per-pad
+// cells (PEAK/HUE/VOL/PAN share the 32-float stride with the pids) — 27 is the
+// first legal new pid and 27..31 are the last free ones. MUST match
+// rk_lua_core.lua / EON_Swing_Strip_Sync.lua ("Smash Send") / the viewers.
+FX_PID_SND_SMASH = 27;
+
+// Bus-global param ids (FX-return viewer deck → strip CMD mailbox). Range 64+
+// stays clear of the per-pad ids (0..22) and any near-term growth; pad is
+// ignored for these. MUST match EON_FX_Return_View.jsfx.
+FX_PID_BUS_RVB_SIZE     = 64;
+FX_PID_BUS_RVB_DAMP     = 65;
+FX_PID_BUS_RVB_WIDTH    = 66;
+FX_PID_BUS_RVB_PREDELAY = 67;
+FX_PID_BUS_RVB_HPF      = 68;
+FX_PID_BUS_RVB_MIX      = 69;
+FX_PID_BUS_DLY_DIV      = 70;
+FX_PID_BUS_DLY_FB       = 71;
+FX_PID_BUS_DLY_HPF      = 72;
+FX_PID_BUS_DLY_LPF      = 73;
+FX_PID_BUS_DLY_PING     = 74;
+FX_PID_BUS_DLY_MIX      = 75;
+// Published bus-param echo for the viewer deck (band offsets: pad region ends
+// at 519, 600 = VU_REQ, 601 = TIE_VER; 610..621 free until now). Order = the
+// FX_PID_BUS_* ids above minus 64. MUST match EON_FX_Return_View.jsfx.
+GS_STRIP_OFF_BUS_BASE = 610;
 
 // Apply one (pad, pid, value) FX edit exactly like the overlay's own edits:
 // set the array value, rebuild coefficients, mark the pad dirty (undo +
 // @serialize persistence). Shared by the Pad FX panel consumer and the
 // strip-sync mailbox consumer (both @block).
 function swing_fx_apply(_fa_pad, _fa_pid, _fa_val) (
+  // Bus-global params (pad ignored) — from the FX-return viewer's deck. Clamps
+  // and recalc pairing mirror the LCD FX panel exactly: rvb recalcs all but MIX;
+  // dly recalcs only DIV/HPF/LPF (FB/PING/MIX are read live by the DSP).
+  _fa_pid >= FX_PID_BUS_RVB_SIZE && _fa_pid <= FX_PID_BUS_DLY_MIX ? (
+    _fa_pid == FX_PID_BUS_RVB_SIZE     ? ( rvb_size     = max(0, min(1, _fa_val));       rvb_recalc(); );
+    _fa_pid == FX_PID_BUS_RVB_DAMP     ? ( rvb_damp     = max(0, min(1, _fa_val));       rvb_recalc(); );
+    _fa_pid == FX_PID_BUS_RVB_WIDTH    ? ( rvb_width    = max(0, min(1, _fa_val));       rvb_recalc(); );
+    _fa_pid == FX_PID_BUS_RVB_PREDELAY ? ( rvb_predelay = max(0, min(250, _fa_val));     rvb_recalc(); );
+    _fa_pid == FX_PID_BUS_RVB_HPF      ? ( rvb_hpf      = max(0, min(500, _fa_val));     rvb_recalc(); );
+    _fa_pid == FX_PID_BUS_RVB_MIX      ? ( rvb_mix      = max(0, min(1, _fa_val)); );
+    _fa_pid == FX_PID_BUS_DLY_DIV      ? ( dly_div      = max(0, min(RPT_NUM_DIVS, _fa_val | 0)); dly_recalc(); );
+    _fa_pid == FX_PID_BUS_DLY_FB       ? ( dly_fb       = max(0, min(0.95, _fa_val)); );
+    _fa_pid == FX_PID_BUS_DLY_HPF      ? ( dly_hpf_hz   = max(20, min(2000, _fa_val));   dly_recalc(); );
+    _fa_pid == FX_PID_BUS_DLY_LPF      ? ( dly_lpf_hz   = max(1000, min(20000, _fa_val)); dly_recalc(); );
+    _fa_pid == FX_PID_BUS_DLY_PING     ? ( dly_ping     = _fa_val >= 0.5; );
+    _fa_pid == FX_PID_BUS_DLY_MIX      ? ( dly_mix      = max(0, min(1, _fa_val)); );
+    mark_dirty_kit();
+  ) :
   _fa_pad >= 0 && _fa_pad < NUM_PADS ? (
     _fa_pid == FX_PID_HPF_FREQ    ? ( fx_hpf_freq[_fa_pad]    = _fa_val; );
     _fa_pid == FX_PID_LPF_FREQ    ? ( fx_lpf_freq[_fa_pad]    = _fa_val; );
@@ -1686,6 +1745,7 @@ function swing_fx_apply(_fa_pad, _fa_pid, _fa_val) (
     _fa_pid == FX_PID_DRV_MODE    ? ( fx_drv_mode[_fa_pad]    = (_fa_val | 0); );
     _fa_pid == FX_PID_SND_DLY     ? ( fx_snd_dly[_fa_pad]     = _fa_val; );
     _fa_pid == FX_PID_SND_RVB     ? ( fx_snd_rvb[_fa_pad]     = _fa_val; );
+    _fa_pid == FX_PID_SND_SMASH   ? ( fx_snd_smash[_fa_pad]   = _fa_val; );
     _fa_pid == FX_PID_EQ_MID2      ? ( fx_eq_mid2[_fa_pad]      = _fa_val; );
     _fa_pid == FX_PID_EQ_MID2_FREQ ? ( fx_eq_mid2_freq[_fa_pad] = _fa_val; );
     _fa_pid == FX_PID_EQ_MID_Q     ? ( fx_eq_mid_q[_fa_pad]     = _fa_val; );
@@ -2262,6 +2322,7 @@ strip_pub_div >= 4 ? (
     gmem[_sp_pb + FX_PID_DRV_MODE]     = fx_drv_mode[_sp_i];
     gmem[_sp_pb + FX_PID_SND_DLY]      = fx_snd_dly[_sp_i];
     gmem[_sp_pb + FX_PID_SND_RVB]      = fx_snd_rvb[_sp_i];
+    gmem[_sp_pb + FX_PID_SND_SMASH]    = fx_snd_smash[_sp_i];
     gmem[_sp_pb + FX_PID_EQ_MID2]      = fx_eq_mid2[_sp_i];
     gmem[_sp_pb + FX_PID_EQ_MID2_FREQ] = fx_eq_mid2_freq[_sp_i];
     gmem[_sp_pb + FX_PID_EQ_MID_Q]     = fx_eq_mid_q[_sp_i];
@@ -2279,6 +2340,19 @@ strip_pub_div >= 4 ? (
     gmem[_sp_pb + GS_STRIP_PAD_OFF_PAN]  = p_pan[_sp_i];
     _sp_i += 1;
   );
+  // Bus-param echo for the FX-return viewer's control deck (order = FX_PID_BUS_* − 64).
+  gmem[_strip_b + GS_STRIP_OFF_BUS_BASE]      = rvb_size;
+  gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 1]  = rvb_damp;
+  gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 2]  = rvb_width;
+  gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 3]  = rvb_predelay;
+  gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 4]  = rvb_hpf;
+  gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 5]  = rvb_mix;
+  gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 6]  = dly_div;
+  gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 7]  = dly_fb;
+  gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 8]  = dly_hpf_hz;
+  gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 9]  = dly_lpf_hz;
+  gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 10] = dly_ping;
+  gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 11] = dly_mix;
   gmem[_strip_b + GS_STRIP_OFF_SEQ] += 1;
 );
 ) : (
@@ -3211,7 +3285,7 @@ _xf_active ? (
 // 36 channels in multi-out: 16 stereo buses (0..31) + verb return (32/33) +
 // delay return (34/35). Returns are routed to dedicated pins when fx_returns is on.
 multi_out ? (
-  i = 0; loop(36, spl(i) = 0; i += 1;);
+  i = 0; loop(38, spl(i) = 0; i += 1;);
 ) : (
   spl(0) = 0; spl(1) = 0;
 );
@@ -3416,6 +3490,12 @@ _pi = 0; loop(NUM_PADS,
 // Clear send bus accumulators
 snd_dly_accL[0] = 0; snd_dly_accR[0] = 0;
 snd_rvb_accL[0] = 0; snd_rvb_accR[0] = 0;
+snd_sms_accL[0] = 0; snd_sms_accR[0] = 0;
+// Smash is returns-only (the compressor lives ON the return track as EON 76 —
+// with no return there is no effect, and folding the dry send into Main would
+// just be a per-pad volume boost). Hoisted here so the pad loop can skip the
+// accumulate entirely outside multi-out+returns.
+_fx_ret_pins = multi_out && fx_returns;
 
 _pi = 0; loop(NUM_PADS,
   // process_pad_fx sets _pfxL/_pfxR (post-pan output)
@@ -3436,6 +3516,10 @@ _pi = 0; loop(NUM_PADS,
     snd_rvb_accL[0] += _pfx_sendL * fx_snd_rvb[_pi];
     snd_rvb_accR[0] += _pfx_sendR * fx_snd_rvb[_pi];
   );
+  _fx_ret_pins && fx_snd_smash[_pi] > 0.005 ? (
+    snd_sms_accL[0] += _pfx_sendL * fx_snd_smash[_pi];
+    snd_sms_accR[0] += _pfx_sendR * fx_snd_smash[_pi];
+  );
 
   // Peak tracking for per-pad meters (smooth decay)
   _absL = abs(_pfxL); _absR = abs(_pfxR);
@@ -3451,7 +3535,7 @@ _pi = 0; loop(NUM_PADS,
 // dedicated output pairs (verb 32/33, delay 34/35) so it feeds its own return
 // tracks instead of leaking into the Main bus / child-track 0. Otherwise the
 // returns mix into the Main stereo bus (spl 0/1) exactly as before.
-_fx_ret_pins = multi_out && fx_returns;
+// (_fx_ret_pins hoisted above the pad loop — the smash accumulate needs it.)
 // Delay
 dly_div > 0 ? (
   dly_process(snd_dly_accL[0], snd_dly_accR[0]);
@@ -3480,6 +3564,15 @@ rvb_size > 0.001 ? (
     spl(0) += rvb_outL * rvb_mix;
     spl(1) += rvb_outR * rvb_mix;
   );
+);
+
+// Smash (parallel-comp send) — RAW summed sends out to the return pair; the
+// EON 76 on the return track does the compression and the return fader is the
+// blend. No else-fold and no mix scale: outside multi-out+returns the
+// accumulate above never ran (returns-only by design).
+_fx_ret_pins ? (
+  spl(36) += snd_sms_accL[0];
+  spl(37) += snd_sms_accR[0];
 );
 
 // ─── Global FX on main stereo bus (SVF filters) ─────────────────────────
@@ -3552,7 +3645,7 @@ _xf_active ? (
   _xf_t = _xf_t * _xf_t * (3 - 2 * _xf_t);  // smoothstep for click-free curve
   _xf_w = 1.0 - _xf_t;                  // weight of old signal (1→0)
   multi_out ? (
-    i = 0; loop(36,
+    i = 0; loop(38,
       spl(i) = spl(i) * _xf_t + _xf_prev[i] * _xf_w;
       i += 1;
     );
@@ -3563,7 +3656,7 @@ _xf_active ? (
 ) : (
   // Only track output when crossfade is NOT active (freeze _xf_prev during crossfade)
   multi_out ? (
-    i = 0; loop(36, _xf_prev[i] = spl(i); i += 1;);
+    i = 0; loop(38, _xf_prev[i] = spl(i); i += 1;);
   ) : (
     _xf_prev[0] = spl(0); _xf_prev[1] = spl(1);
   );
@@ -3584,7 +3677,7 @@ _moR > master_meterR ? master_meterR = _moR : master_meterR *= _mst_meter_decay;
 // below as a harmless idempotent re-set).
 is_read = file_avail(0) >= 0;
 // Version tag for forward-compat
-ser_ver = 52;
+ser_ver = 53;
 file_var(0, ser_ver);
 file_var(0, multi_out);
 
@@ -4144,6 +4237,11 @@ _srz_i = 0; loop(NUM_PADS,
     file_var(0, fx_eq_lo_q[_srz_i]);
     file_var(0, fx_eq_hi_q[_srz_i]);
   );
+  // v53: smash send (parallel-comp bus) — FRESH gate. ⚠️ the transient shaper
+  // re-targeted 54 (gates land in ship order; wire order = file order).
+  ser_ver >= 53 ? (
+    file_var(0, fx_snd_smash[_srz_i]);
+  );
   is_read ? (
     // Defaults for older presets
     ser_ver < 4 ? (
@@ -4207,6 +4305,7 @@ _srz_i = 0; loop(NUM_PADS,
     ser_ver < 47 ? ( fx_eq_mid_q[_srz_i] = 0.8; fx_eq_mid2_q[_srz_i] = 0.8; );
     // v48: pre-shelf-Q projects — Qs at the old fixed S=1.0 equivalent
     ser_ver < 48 ? ( fx_eq_lo_q[_srz_i] = 0.7071; fx_eq_hi_q[_srz_i] = 0.7071; );
+    ser_ver < 53 ? ( fx_snd_smash[_srz_i] = 0; );  // smash send off
     ser_ver < 27 ? (
       _srz_li = 0; loop(MAX_LAYERS,
         l_gain[_srz_i * MAX_LAYERS + _srz_li] = 1.0;
@@ -4871,6 +4970,13 @@ _is_browser_target() ? (
     gmem[GS_FX_PUB_BASE + FX_PID_EQ_MID2_Q]    = fx_eq_mid2_q[_fxsp];
     gmem[GS_FX_PUB_BASE + FX_PID_EQ_LO_Q]      = fx_eq_lo_q[_fxsp];
     gmem[GS_FX_PUB_BASE + FX_PID_EQ_HI_Q]      = fx_eq_hi_q[_fxsp];
+    // 23..26 are strip-band cells, not pids — publish zeros so the Lua reader
+    // (loop 0..GS_FX_PUB_COUNT-1) never crosses stale gmem on its way to 27.
+    gmem[GS_FX_PUB_BASE + 23] = 0;
+    gmem[GS_FX_PUB_BASE + 24] = 0;
+    gmem[GS_FX_PUB_BASE + 25] = 0;
+    gmem[GS_FX_PUB_BASE + 26] = 0;
+    gmem[GS_FX_PUB_BASE + FX_PID_SND_SMASH]    = fx_snd_smash[_fxsp];
     gmem[GS_FX_PUB_PAD] = _fxsp;
   );
 );

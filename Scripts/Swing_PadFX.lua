@@ -109,6 +109,7 @@ local DYN_COLS = {
   { title = "SENDS", items = {
     { pid = G.FX_PID_SND_DLY, label = "Delay",  min = 0, max = 1, fmt = "%.2f", default = 0, role = 6 },
     { pid = G.FX_PID_SND_RVB, label = "Reverb", min = 0, max = 1, fmt = "%.2f", default = 0, role = 2 },
+    { pid = G.FX_PID_SND_SMASH, label = "Smash", min = 0, max = 1, fmt = "%.2f", default = 0, role = 1 },
   }},
 }
 

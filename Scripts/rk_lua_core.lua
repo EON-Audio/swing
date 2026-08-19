@@ -381,6 +381,9 @@ core.GMEM = {
   -- New home = the verified-free gap after GS_FX_PUB (26090000-63) and
   -- GS_STRIP_REINIT_PULSE (26090100).
   GS_PAD_RANGE_BASE    = 26090200,  -- ..26090215
+  -- Per-pad smash-send kit overflow (META's 80-float stride is full).
+  -- MUST match Swing_ReaKit.jsfx GS_PAD_SMASH_BASE.
+  GS_PAD_SMASH_BASE    = 26090240,  -- ..26090255
   GS_COMPANION_CMD     = 1710,
   GS_COMPANION_TARGET  = 2250,  -- instance_id the companion cmd is FOR (0 = broadcast).
                                 -- Stamp BEFORE the cmd; the consumer clears both.
@@ -458,6 +461,15 @@ core.GMEM = {
                                     -- shipped build has written. Headless LOAD coverage =
                                     -- the kitsview devpick mailbox (EON_KITLIST +7,
                                     -- KV_DEVPICK_MAGIC + index + 1).
+  GS_CMD_LUA_POST      = 26090342,  -- Lua poster → bridge: code of a CMD posted from
+                                    -- plain Lua (eon_action_target bridge()/post_locked —
+                                    -- Song Starter, EON menu wrappers). Those ops have no
+                                    -- armed JSFX waiting on a completion code; the bridge
+                                    -- tracks the stamp and releases an orphan 98 the tick
+                                    -- it lands instead of the watchdog's 5s fuse. 99 is
+                                    -- deliberately left alone: misc_cmds eats it in ms
+                                    -- and that consume doubles as the pad name/color
+                                    -- refresh signal. Stamp written BEFORE CMD.
   -- Bridge → browser: 0-based FX-chain index of the active target. Paired
   -- with GS_TRACK_NUM so the browser can disambiguate stacked Swings on
   -- the same track (track_num collides; fx_index doesn't).
@@ -544,7 +556,9 @@ core.GMEM = {
   -- end (..26080719) and INST_INCMD_BASE (26100000): 64 slots reserved
   -- 26090000..26090063. The old 2626..2644 box had no room to grow.
   GS_FX_PUB_BASE     = 26090000, -- JSFX→panel: FX params for that pad (base + FX_PID_*)
-  GS_FX_PUB_COUNT    = 23,       -- ids 0..22 used; band reserved through +62
+  GS_FX_PUB_COUNT    = 28,       -- ids 0..22 + smash send at 27 (23..26 read as
+                                 -- zeros — strip-band cells, not pids); band
+                                 -- reserved through +62. MUST match Swing_ReaKit.jsfx.
   GS_FX_PUB_PAD      = 26090063, -- JSFX→panel: handshake, which pad the band describes
   GS_FX_ACTION_PAD   = 2646,   -- panel→JSFX: target pad, -1 = idle (write LAST)
   GS_FX_ACTION_PARAM = 2647,   -- panel→JSFX: param id (FX_PID_*)
@@ -562,6 +576,9 @@ core.GMEM = {
   FX_PID_EQ_MID_Q = 19, FX_PID_EQ_MID2_Q = 20,
   -- v48: per-band shelf Q (0.7071 == the old fixed S=1.0)
   FX_PID_EQ_LO_Q = 21, FX_PID_EQ_HI_Q = 22,
+  -- 23..26 are BURNED (strip-band PEAK/HUE/VOL/PAN share the per-pad stride);
+  -- 27..31 are the last free pids.
+  FX_PID_SND_SMASH = 27,
 
   -- ─── Strip-sync band (Path B) — per-instance, registry-slot strided ──────
   -- Swing publishes its FULL per-pad FX state per registry slot; the
@@ -1182,6 +1199,36 @@ end
 -- ─── Pad FX panel helpers (Swing JSFX ↔ ReaImGui "Pad FX" window) ─────────
 -- JSFX→panel: FX-focused pad the browser-target instance is publishing.
 -- Returns -1 when nothing is focused / no instance picked.
+-- Show-embedded-UI-in-MCP for one FX, matched by a name fragment on its <JS/
+-- <VST chunk header. There is NO API for the embed state (forum-confirmed gap;
+-- feature request open) — it lives as bit 2 of the WAK line's SECOND field in
+-- the track chunk, verified empirically against this user's own projects
+-- (every MCP-embedded Drum Strip carries "WAK 0 2"; non-embedded FX "WAK 0 0").
+-- One-field WAK lines (older writers) no-op gracefully.
+function core.fx_embed_mcp(tr, frag)
+  local ok, chunk = reaper.GetTrackStateChunk(tr, "", false)
+  if not ok or not chunk then return false end
+  local out, inhit, done = {}, false, false
+  for line in (chunk .. string.char(10)):gmatch("(.-)" .. string.char(10)) do
+    if not done then
+      if line:find("<JS ", 1, true) or line:find("<VST ", 1, true) then
+        inhit = line:find(frag, 1, true) ~= nil
+      end
+      if inhit then
+        local head, wak2 = line:match("^(%s*WAK%s+%d+%s+)(%d+)%s*$")
+        if head then
+          local v = tonumber(wak2) or 0
+          if math.floor(v / 2) % 2 == 0 then line = head .. tostring(v + 2) end
+          done = true
+        end
+      end
+    end
+    out[#out + 1] = line
+  end
+  if done then reaper.SetTrackStateChunk(tr, table.concat(out, string.char(10)), false) end
+  return done
+end
+
 function core.read_selected_pad()
   return math.floor(reaper.gmem_read(core.GMEM.GS_FX_SEL_PAD) or -1)
 end

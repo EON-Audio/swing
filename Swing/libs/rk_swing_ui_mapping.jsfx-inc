@@ -19,638 +19,29 @@
 // (swing_panels_draw_mixer_big): restore the _ov_* mouse saves the modal gate
 // stashed, hit-test, then re-zero so nothing drawn after us sees live input.
 //
-// Naming: functions swing_mapping_*, mutable scratch _mv_* (globals). Buffers
-// (_mv_wki key x-index, _mv_n2p/_mv_n2c note->pad lookup) are allocated from
-// freemem by swing_mapping_init(), which the main @init calls after freemem=0.
+// Naming: functions swing_mapping_*, mutable scratch _mv_* (globals).
+// SPLIT: the shared helpers, freemem buffers (swing_mapping_init) and the
+// pad-grid / Push / vpiano / NOTE-MAP renderers live in
+// rk_swing_ui_mapping_core.jsfx-inc, which MUST be imported before this file
+// (fn refs resolve at definition time). This file keeps swing_mapping_draw():
+// panel chrome, header buttons, octave nav, layout dispatch, the horizontal
+// keyboard + pins + span edge-drag (KEYS only), choke lane, learn banner.
 
 @init
 
-// One-time buffer allocation. Called from the main @init (freemem pattern):
-//   freemem = swing_mapping_init(freemem);
-function swing_mapping_init(fm) (
-  _mv_wki = fm; fm += 128;   // per-key x left-edge
-  _mv_n2p = fm; fm += 128;   // note -> owning pad index (first), else -1
-  _mv_n2c = fm; fm += 128;   // note -> count of pads on it
-  _mv_n2r = fm; fm += 128;   // note -> pad whose KEY RANGE covers it (first), else -1
-  _mv_drag_pad = -1;         // pad whose pin is being dragged (-1 = none)
-  _mv_label_mode = 0;        // key labels: 0=icon+name 1=icon 2=name
-  _mv_note_labels = 1;       // note labels: 0=C keys only 1=every key
-  _mv_note_hash = -1;        // last-seen pad-note set; change -> re-fit the view
-  _mv_layout = 0;            // 0=keys 1=8-pad 2=16-pad 3=keys+8 4=keys+16 5=push 6=notemap
-  _mv_bank = 0;              // 8-pad bank: 0 = pads 1-8, 1 = pads 9-16
-  _mv_padswap = 0;           // pad-grid drag = swap pads (opt-in, off by default)
-  _mv_swap_pad = -1;         // pad grabbed for a swap drag (-1 = none)
-  _mv_padorder = 0;          // pad grid order: 0 = MPC bottom-left, 1 = reading top-left
-  _mv_push_mode = 0;         // push grid: 0 = melodic 4ths, 1 = drum quadrants
-  _mv_learn = 0;             // MIDI-learn bulk step-through active
-  _mv_learn_next = 0;        // next pad to arm during bulk learn
-  fm;                        // advanced cursor back to the caller
-);
-
-// Should pad p's range coverage TINT keys/cells? Wide spans (>48 semis, e.g.
-// the Full preset) would paint the whole keyboard — noise, not information —
-// so they are excluded from COLOR only. Attribution (_mv_n2r itself, the dim
-// pad number, audition, right-click-edit) stays truthful for every span.
-function swing_mapping_rng_tintable(p) (
-  p >= 0 && p_rng_lo[p] + p_rng_hi[p] <= 48;
-);
-
-// Is MIDI note n a black key (sharp/flat)? floor-based so it needs no % op.
-function swing_mapping_is_black(n) local(pc) (
-  pc = n - floor(n / 12) * 12;
-  pc == 1 || pc == 3 || pc == 6 || pc == 8 || pc == 10;
-);
-
-// Small header button. Returns 1 on click (uses the restored lmb_down).
-function swing_mapping_btn(bx, by, bw, bh, lbl) local(hov) (
-  hov = mx >= bx && mx <= bx + bw && my >= by && my <= by + bh;
-  gfx_set(0.20, 0.22, 0.26, hov ? 1.0 : 0.85);
-  gfx_rect(bx, by, bw, bh);
-  gfx_set(0.45, 0.48, 0.54, 0.8);
-  gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
-  gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
-  gfx_setfont(1, "Arial", 9, 'b');
-  gfx_set(0.85, 0.87, 0.92, hov ? 1.0 : 0.85);
-  gfx_measurestr(lbl, _mv_tw, _mv_th);
-  gfx_x = bx + (bw - _mv_tw) * 0.5; gfx_y = by + (bh - _mv_th) * 0.5; gfx_drawstr(lbl);
-  hov && lmb_down;
-);
-
-// MIDI note -> "C#2"-style label into dest string.
-function swing_mapping_note_lbl(n, dest) local(pc, oct) (
-  pc = n - floor(n / 12) * 12; oct = floor(n / 12) - 1;
-  pc == 0  ? sprintf(dest, "C%d",  oct) : pc == 1  ? sprintf(dest, "C#%d", oct) :
-  pc == 2  ? sprintf(dest, "D%d",  oct) : pc == 3  ? sprintf(dest, "D#%d", oct) :
-  pc == 4  ? sprintf(dest, "E%d",  oct) : pc == 5  ? sprintf(dest, "F%d",  oct) :
-  pc == 6  ? sprintf(dest, "F#%d", oct) : pc == 7  ? sprintf(dest, "G%d",  oct) :
-  pc == 8  ? sprintf(dest, "G#%d", oct) : pc == 9  ? sprintf(dest, "A%d",  oct) :
-  pc == 10 ? sprintf(dest, "A#%d", oct) : sprintf(dest, "B%d", oct);
-);
-
-// Build the hover readout for pad p ("what am I looking at"): pad number,
-// name, and — when ranged — the resolved span plus the edit hint. Written
-// into #_mv_hovinfo, drawn ONCE per frame right-aligned on the CHOKE line;
-// empty when nothing is hovered, so it costs zero standing screen space
-// (user 2026-08-05: "i wanna know what im looking at" / no overcrowding).
-function swing_mapping_hovinfo(p) local(nmp) (
-  p >= 0 ? (
-    nmp = get_cname_slot(p);
-    strlen(nmp) == 0 ? nmp = get_name_slot(p);
-    (p_rng_lo[p] > 0 || p_rng_hi[p] > 0) ? (
-      swing_mapping_note_lbl(max(0, p_note[p] - p_rng_lo[p]), #_mv_rl);
-      swing_mapping_note_lbl(min(127, p_note[p] + p_rng_hi[p]), #_mv_rl2);
-      sprintf(#_mv_hovinfo, "PAD %d %s — range %s..%s (-%d/+%d) · right-click key edits",
-              p + 1, nmp, #_mv_rl, #_mv_rl2, p_rng_lo[p], p_rng_hi[p]);
-    ) : (
-      swing_mapping_note_lbl(p_note[p], #_mv_rl);
-      sprintf(#_mv_hovinfo, "PAD %d %s — %s", p + 1, nmp, #_mv_rl);
-    );
-  );
-);
-
-// Draw a legible note label bottom-anchored at a key foot: bold white text on
-// a dark pill so it reads on any key color. Hidden if it can't fit the width.
-function swing_mapping_draw_note_lbl(cx, key_bottom, w, note) (
-  swing_mapping_note_lbl(note, #_mv_kl);
-  gfx_setfont(1, "Arial", 9, 'b');
-  gfx_measurestr(#_mv_kl, _mv_tw, _mv_th);
-  _mv_tw <= w - 1 ? (
-    gfx_set(0, 0, 0, 0.62);
-    gfx_rect((cx - _mv_tw * 0.5 - 3) | 0, (key_bottom - _mv_th - 4) | 0, (_mv_tw + 6) | 0, _mv_th + 3);
-    gfx_set(1, 1, 1, 1);
-    gfx_x = cx - _mv_tw * 0.5; gfx_y = key_bottom - _mv_th - 3; gfx_drawstr(#_mv_kl);
-  );
-);
-
-// Draw one bold horizontal name line, centered at cx with its top at y,
-// shrinking the font (11 -> 9 -> 7) to fit the key width. Shadow + ink auto-
-// contrast (dark = light keys). Returns the line height it used.
-function swing_mapping_name_line(cx, y, kw, s, dark) local(f) (
-  f = 11; gfx_setfont(1, "Arial", f, 'b'); gfx_measurestr(s, _mv_tw, _mv_th);
-  _mv_tw > kw - 2 ? ( f = 9; gfx_setfont(1, "Arial", f, 'b'); gfx_measurestr(s, _mv_tw, _mv_th); );
-  _mv_tw > kw - 2 ? ( f = 7; gfx_setfont(1, "Arial", f, 'b'); gfx_measurestr(s, _mv_tw, _mv_th); );
-  dark ? gfx_set(1, 1, 1, 0.4) : gfx_set(0, 0, 0, 0.5);
-  gfx_x = cx - _mv_tw * 0.5 + 1; gfx_y = y + 1; gfx_drawstr(s);
-  dark ? gfx_set(0.05, 0.05, 0.08, 1) : gfx_set(1, 1, 1, 1);
-  gfx_x = cx - _mv_tw * 0.5; gfx_y = y; gfx_drawstr(s);
-  _mv_th;
-);
-
-// Draw an assigned key's content clustered at the BOTTOM: the note label sits
-// at the very foot (drawn by the caller), the 46-category glyph just above it,
-// and the pad name(s) stacked directly above the glyph. Every pad sharing the
-// note gets its own name line (layering, e.g. Kick + Sub). Label modes:
-// 0=icon+name 1=icon 2=name.
-function swing_mapping_key_content(kx, ky, kw, kh, note, r, g, b)
-local(nm, dark, gs, cat, footh, owner, icon_top, ny, pi) (
-  dark = (r + g + b) * 0.333 > 0.5;
-  owner = _mv_n2p[note];
-  nm = get_cname_slot(owner);
-  strlen(nm) == 0 ? nm = get_name_slot(owner);
-  footh = 15;
-  // category glyph (owner) just above the note label
-  gs = min(kw - 6, 14) | 0;
-  icon_top = ky + kh - footh;
-  _mv_label_mode != 2 && gs >= 6 && kh >= gs + footh + 10 ? (
-    icon_top = ky + kh - footh - gs - 2;
-    dark ? gfx_set(0.08, 0.09, 0.11, 0.95) : gfx_set(0.95, 0.96, 0.98, 0.95);
-    cat = eon_cat_for_name(nm);
-    eon_draw_cat_glyph_hi(cat, (kx + kw * 0.5) | 0, (icon_top + gs * 0.5) | 0, gs, -1);
-  );
-  // pad name(s) stacked upward, directly above the glyph (modes 0/2)
-  _mv_label_mode != 1 ? (
-    ny = icon_top - 3;
-    pi = 0;
-    loop(NUM_PADS,
-      p_note[pi] == note ? (
-        nm = get_cname_slot(pi);
-        strlen(nm) == 0 ? nm = get_name_slot(pi);
-        strlen(nm) > 0 ? (
-          gfx_setfont(1, "Arial", 11, 'b'); gfx_measurestr(nm, _mv_tw, _mv_th);
-          ny -= _mv_th;
-          ny > ky + 2 ? swing_mapping_name_line(kx + kw * 0.5, ny, kw, nm, dark);
-          ny -= 2;
-        );
-      );
-      pi += 1;
-    );
-  );
-);
-
-// Draw a rows x cols pad grid in the given rect, starting at pad index `first`
-// (for bank A/B on the 8-pad views). MPC order: first pad bottom-left, going
-// right then up. Each cell shows the pad color, number, mapped note, glyph and
-// name; click auditions + selects; wheel retunes. Empty pads dim out.
-// Note->pad lookups, extracted so the per-pad NOTE picker (which hosts the
-// notemap renderer WITHOUT the big view running) rebuilds them identically.
-function swing_mapping_build_lookups() (
-    // ── note -> pad lookup (owner = first pad on the note; + count) ──
-    _mv_j = 0; loop(128, _mv_n2p[_mv_j] = -1; _mv_n2c[_mv_j] = 0; _mv_n2r[_mv_j] = -1; _mv_j += 1;);
-    _mv_i = 0; loop(NUM_PADS,
-      _mv_n = p_note[_mv_i];
-      (_mv_n >= 0 && _mv_n < 128) ? (
-        _mv_n2c[_mv_n] += 1;
-        _mv_n2p[_mv_n] < 0 ? _mv_n2p[_mv_n] = _mv_i;
-      );
-      _mv_i += 1;
-    );
-    // Range coverage: which pad's KEY RANGE covers each note. First-pad-wins
-    // over ALL ranged pads — the same candidate set and order as the engine's
-    // note-on pass 2 (main:2080), so attribution, audition and the dim pad
-    // number always name the pad that will actually sound. NO width filter
-    // here (an earlier cut skipped >48-semi spans and mis-attributed keys a
-    // Full-preset pad would steal); wide spans are filtered at the TINT sites
-    // only, via swing_mapping_rng_tintable, so color noise is suppressed
-    // without lying about ownership.
-    _mv_i = 0; loop(NUM_PADS,
-      (p_rng_lo[_mv_i] > 0 || p_rng_hi[_mv_i] > 0) ? (
-        _mv_n   = max(0, p_note[_mv_i] - p_rng_lo[_mv_i]);
-        _mv_rhi = min(127, p_note[_mv_i] + p_rng_hi[_mv_i]);
-        while(_mv_n <= _mv_rhi) (
-          _mv_n2r[_mv_n] < 0 ? _mv_n2r[_mv_n] = _mv_i;
-          _mv_n += 1;
-        );
-      );
-      _mv_i += 1;
-    );
-);
-
-function swing_mapping_draw_padgrid(px, py, pw, ph, rows, cols, first)
-local(n, gap, cw, ch, p, pad, col, row, cx, cy, hov, dark, gs, cat, nm, has) (
-  n = rows * cols;
-  gap = 5;
-  cw = (pw - gap * (cols - 1)) / cols;
-  ch = (ph - gap * (rows - 1)) / rows;
-  _mv_pg_hit = -1;
-  p = 0;
-  loop(n,
-    pad = first + p;
-    col = p % cols;
-    // MPC (default): first pad bottom-left; reading order: first pad top-left
-    row = _mv_padorder ? (p / cols | 0) : (rows - 1) - (p / cols | 0);
-    cx = px + col * (cw + gap);
-    cy = py + row * (ch + gap);
-    hov = mx >= cx && mx < cx + cw && my >= cy && my < cy + ch;
-    hov ? swing_mapping_hovinfo(pad);
-    has = pad_is_playable(pad);
-
-    hsl_to_rgb(p_color[pad], 0.70, 0.52);
-    dark = (_hsl_r + _hsl_g + _hsl_b) * 0.333 > 0.5;
-    gfx_set(_hsl_r, _hsl_g, _hsl_b, hov ? 1.0 : (has ? 0.9 : 0.38));
-    gfx_rect(cx, cy, cw, ch);
-    // border (bright when hovered)
-    hov ? gfx_set(1, 1, 1, 0.6) : gfx_set(0, 0, 0, 0.5);
-    gfx_rect(cx, cy, cw, 1); gfx_rect(cx, cy + ch - 1, cw, 1);
-    gfx_rect(cx, cy, 1, ch); gfx_rect(cx + cw - 1, cy, 1, ch);
-
-    // pad number (top-left)
-    gfx_setfont(1, "Arial", 9, 'b');
-    dark ? gfx_set(0.08, 0.08, 0.10, 0.9) : gfx_set(0.98, 0.98, 1, 0.9);
-    sprintf(#_mv_pl, "%d", pad + 1);
-    gfx_x = cx + 3; gfx_y = cy + 2; gfx_drawstr(#_mv_pl);
-    // note label (top-right) — a ranged pad shows its whole span
-    // ("F1..F3" — the RANGE pill's -x/+y offsets resolved to real keys, so
-    // the pad grid answers "what does this pad cover" at a glance).
-    (p_rng_lo[pad] > 0 || p_rng_hi[pad] > 0) ? (
-      swing_mapping_note_lbl(max(0, p_note[pad] - p_rng_lo[pad]), #_mv_rl);
-      swing_mapping_note_lbl(min(127, p_note[pad] + p_rng_hi[pad]), #_mv_rl2);
-      // two temps, then compose — sprintf must never read the string it is
-      // writing (self-reference reads half-overwritten data).
-      sprintf(#_mv_kl, "%s..%s", #_mv_rl, #_mv_rl2);
-    ) : swing_mapping_note_lbl(p_note[pad], #_mv_kl);
-    gfx_setfont(1, "Arial", 8, 'b');
-    gfx_measurestr(#_mv_kl, _mv_tw, _mv_th);
-    // Fit guard (audit R2): the span label can hit ~10 chars; on narrow cells
-    // it would run left into the pad number. Too wide -> root-only, remeasure.
-    _mv_tw > cw - 22 ? (
-      swing_mapping_note_lbl(p_note[pad], #_mv_kl);
-      gfx_measurestr(#_mv_kl, _mv_tw, _mv_th);
-    );
-    dark ? gfx_set(0.08, 0.08, 0.10, 0.85) : gfx_set(0.98, 0.98, 1, 0.85);
-    gfx_x = cx + cw - _mv_tw - 3; gfx_y = cy + 2; gfx_drawstr(#_mv_kl);
-
-    nm = get_cname_slot(pad);
-    strlen(nm) == 0 ? nm = get_name_slot(pad);
-    strlen(nm) > 0 ? (
-      // category glyph (center) + name (bottom)
-      _mv_label_mode != 2 ? (
-        gs = (min(cw, ch) * 0.42) | 0;
-        gs > 6 ? (
-          dark ? gfx_set(0.08, 0.09, 0.11, 0.9) : gfx_set(0.95, 0.96, 0.98, 0.9);
-          cat = eon_cat_for_name(nm);
-          eon_draw_cat_glyph_hi(cat, (cx + cw * 0.5) | 0, (cy + ch * 0.44) | 0, gs, -1);
-        );
-      );
-      _mv_label_mode != 1 ? swing_mapping_name_line(cx + cw * 0.5, cy + ch - 15, cw - 4, nm, dark);
-    );
-
-    midi_learn_pad == pad ? (
-      gfx_set(1, 0.2, 0.2, 0.95);
-      gfx_rect(cx, cy, cw, 2); gfx_rect(cx, cy + ch - 2, cw, 2);
-      gfx_rect(cx, cy, 2, ch); gfx_rect(cx + cw - 2, cy, 2, ch);
-    );
-    hov ? _mv_pg_hit = pad;   // pad under the cursor (for swap-drag)
-    // audition + select
-    hov && lmb_down ? (
-      sel_pad = pad;
-      has ? launch_voices_for_pad(pad, p_note[pad], 110, 8);
-    );
-    // wheel over a cell → nudge its note (Shift = octave)
-    hov && frame_wheel != 0 ? (
-      p_note[pad] = max(0, min(127, p_note[pad] + (frame_wheel > 0 ? 1 : -1) * (SHIFT ? 12 : 1)));
-      p_note_lock[pad] = 1;
-      mark_dirty_pad(pad);
-      frame_wheel = 0;
-    );
-    p += 1;
-  );
-
-  // Opt-in pad swap: drag one cell onto another to swap the two pads.
-  _mv_padswap ? (
-    lmb_down && _mv_pg_hit >= 0 ? (
-      _mv_swap_pad = _mv_pg_hit; _mv_swap_x0 = mx; _mv_swap_y0 = my; _mv_swap_moved = 0;
-    );
-    _mv_swap_pad >= 0 && LMB ? (
-      abs(mx - _mv_swap_x0) + abs(my - _mv_swap_y0) > 4 ? _mv_swap_moved = 1;
-      _mv_swap_moved ? (
-        hsl_to_rgb(p_color[_mv_swap_pad], 0.75, 0.55);
-        gfx_set(_hsl_r, _hsl_g, _hsl_b, 0.6);
-        gfx_rect(mx - 10, my - 8, 20, 16);
-      );
-    );
-    _mv_swap_pad >= 0 && !LMB ? (
-      _mv_swap_moved && _mv_pg_hit >= 0 && _mv_pg_hit != _mv_swap_pad ? swing_do_pad_swap(_mv_swap_pad, _mv_pg_hit);
-      _mv_swap_pad = -1; _mv_swap_moved = 0;
-    );
-  );
-);
-
-// Draw an 8x8 Ableton-Push melodic grid (bottom-left origin, "4ths" tuning:
-// note = base + 5*row + col, row 0 = bottom, col 0 = left; base = _mv_nav_lo).
-// Cells whose note has a pad light up with the pad color/glyph/name; unmapped
-// cells show a faint note. Click a mapped cell to audition + select. (Research:
-// Ableton manual — bottom-left = C1, each row +a fourth, each column +1 note.)
-function swing_mapping_draw_pushgrid(px, py, pw, ph)
-local(gap, cw, ch, r, c, rowb, note, cx, cy, hov, own, dark, gs, cat, nm, base) (
-  base = _mv_nav_lo;
-  gap = 4;
-  cw = (pw - gap * 7) / 8;
-  ch = (ph - gap * 7) / 8;
-  _mv_push_hn = -1; _mv_push_hit = -1;   // note + pad under the cursor
-  r = 0;
-  loop(8,
-    rowb = 7 - r;                       // screen row -> row-from-bottom
-    c = 0;
-    loop(8,
-      _mv_push_mode ? (
-        // Push drum mode: four 4x4 quadrants (bottom row of quadrants first),
-        // each +16; within a quadrant notes ascend L->R then bottom->top.
-        note = base + ((rowb / 4 | 0) * 2 + (c / 4 | 0)) * 16 + (rowb % 4) * 4 + (c % 4);
-      ) : (
-        note = base + 5 * rowb + c;     // Push melodic 4ths chromatic layout
-      );
-      cx = px + c * (cw + gap);
-      cy = py + r * (ch + gap);
-      hov = mx >= cx && mx < cx + cw && my >= cy && my < cy + ch;
-      own = (note >= 0 && note < 128) ? _mv_n2p[note] : -1;
-      hov ? (
-        _mv_push_hn = note; _mv_push_hit = own;
-        (note >= 0 && note < 128) ? swing_mapping_hovinfo(own >= 0 ? own : _mv_n2r[note]);
-      );
-      own >= 0 ? (
-        hsl_to_rgb(p_color[own], 0.70, 0.52);
-        dark = (_hsl_r + _hsl_g + _hsl_b) * 0.333 > 0.5;
-        gfx_set(_hsl_r, _hsl_g, _hsl_b, hov ? 1.0 : 0.92);
-      ) : (
-        dark = 0;
-        // Range coverage on Push cells — same rule as keys/notemap: unowned
-        // cell inside a pad's range = dark tint of the covering pad's hue
-        // (wins over the C-anchor shade; coverage carries more information).
-        (note >= 0 && note < 128 && swing_mapping_rng_tintable(_mv_n2r[note])) ? (
-          hsl_to_rgb(p_color[_mv_n2r[note]], 0.55, 0.22);
-          gfx_set(_hsl_r, _hsl_g, _hsl_b, hov ? 1.0 : 0.85);
-        ) :
-        (note - floor(note / 12) * 12) == 0 ? gfx_set(0.22, 0.22, 0.27, hov ? 0.95 : 0.8) : gfx_set(0.13, 0.13, 0.16, hov ? 0.9 : 0.65);
-      );
-      gfx_rect(cx, cy, cw, ch);
-      hov ? gfx_set(1, 1, 1, 0.6) : gfx_set(0, 0, 0, 0.45);
-      gfx_rect(cx, cy, cw, 1); gfx_rect(cx, cy + ch - 1, cw, 1);
-      gfx_rect(cx, cy, 1, ch); gfx_rect(cx + cw - 1, cy, 1, ch);
-      // note name (top-right)
-      (note >= 0 && note < 128) ? (
-        swing_mapping_note_lbl(note, #_mv_kl);
-        gfx_setfont(1, "Arial", 7, 0);
-        own >= 0 ? ( dark ? gfx_set(0.1, 0.1, 0.12, 0.8) : gfx_set(0.95, 0.95, 1, 0.8) ) : gfx_set(0.5, 0.5, 0.55, 0.7);
-        gfx_measurestr(#_mv_kl, _mv_tw, _mv_th);
-        gfx_x = cx + cw - _mv_tw - 2; gfx_y = cy + 1; gfx_drawstr(#_mv_kl);
-      );
-      // pad content when mapped
-      own >= 0 ? (
-        nm = get_cname_slot(own);
-        strlen(nm) == 0 ? nm = get_name_slot(own);
-        strlen(nm) > 0 ? (
-          _mv_label_mode != 2 ? (
-            gs = (min(cw, ch) * 0.40) | 0;
-            gs > 6 ? (
-              dark ? gfx_set(0.08, 0.09, 0.11, 0.9) : gfx_set(0.95, 0.96, 0.98, 0.9);
-              cat = eon_cat_for_name(nm);
-              eon_draw_cat_glyph_hi(cat, (cx + cw * 0.5) | 0, (cy + ch * 0.42) | 0, gs, -1);
-            );
-          );
-          _mv_label_mode != 1 ? swing_mapping_name_line(cx + cw * 0.5, cy + ch - 13, cw - 3, nm, dark);
-        );
-        hov && lmb_down ? (
-          sel_pad = own;
-          pad_is_playable(own) ? launch_voices_for_pad(own, p_note[own], 110, 8);
-        );
-      );
-      // covered cell: audition the range owner at this cell's pitch
-      own < 0 && note >= 0 && note < 128 && _mv_n2r[note] >= 0 && hov && lmb_down ? (
-        sel_pad = _mv_n2r[note];
-        pad_is_playable(sel_pad) ? launch_voices_for_pad(sel_pad, note, 110, 8);
-      );
-      // right-click any resolvable cell → RANGE EDITOR
-      hov && rmb_down && note >= 0 && note < 128 && (own >= 0 || _mv_n2r[note] >= 0) ? (
-        rng_ov_pad = own >= 0 ? own : _mv_n2r[note];
-        sel_pad = rng_ov_pad;
-        _mv_drag_pad = -1; _mv_drag_moved = 0;   // no ghost drop after rng closes (audit R1)
-      );
-      c += 1;
-    );
-    r += 1;
-  );
-
-  // Drag a lit pad cell onto another cell to reassign that pad's note.
-  lmb_down && _mv_push_hit >= 0 ? (
-    _mv_drag_pad = _mv_push_hit; _mv_drag_x0 = mx; _mv_drag_y0 = my; _mv_drag_moved = 0;
-  );
-  _mv_drag_pad >= 0 && LMB ? (
-    abs(mx - _mv_drag_x0) + abs(my - _mv_drag_y0) > 4 ? _mv_drag_moved = 1;
-    _mv_drag_moved ? (
-      hsl_to_rgb(p_color[_mv_drag_pad], 0.75, 0.55);
-      gfx_set(_hsl_r, _hsl_g, _hsl_b, 0.6);
-      gfx_rect(mx - 10, my - 8, 20, 16);
-    );
-  );
-  _mv_drag_pad >= 0 && !LMB ? (
-    _mv_drag_moved && _mv_push_hn >= 0 && _mv_push_hn < 128 && _mv_push_hn != p_note[_mv_drag_pad] ? (
-      p_note[_mv_drag_pad] = _mv_push_hn;
-      p_note_lock[_mv_drag_pad] = 1;
-      mark_dirty_pad(_mv_drag_pad);
-    );
-    _mv_drag_pad = -1; _mv_drag_moved = 0;
-  );
-);
-
-// Draw a vertical piano keyboard (bottom = lowest note) spanning _mv_lo.._mv_hi.
-// White keys are full-width bands; black keys are shorter/narrower on top and
-// offset to the key boundary. Keys with a mapped pad tint to the pad color;
-// click a key to audition. Used as the left axis of the NOTE-MAP layout.
-function swing_mapping_draw_vpiano(px, py, pw, ph)
-local(wc, wh, bw, bh, note, y, own, hov, wi, wb, k) (
-  wc = 0; note = _mv_lo; loop(_mv_cnt, swing_mapping_is_black(note) ? 0 : wc += 1; note += 1;);
-  wh = ph / max(wc, 1);
-  bw = pw * 0.60;
-  bh = wh * 0.62;
-  // white keys, bottom-up
-  wi = 0; note = _mv_lo;
-  loop(_mv_cnt,
-    swing_mapping_is_black(note) ? 0 : (
-      y = py + ph - (wi + 1) * wh;
-      own = _mv_n2p[note];
-      hov = mx >= px && mx < px + pw && my >= y && my < y + wh;
-      own >= 0 ? ( hsl_to_rgb(p_color[own], 0.60, 0.70); gfx_set(_hsl_r, _hsl_g, _hsl_b, 1); )
-      : swing_mapping_rng_tintable(_mv_n2r[note]) ? ( hsl_to_rgb(p_color[_mv_n2r[note]], 0.45, 0.80); gfx_set(_hsl_r, _hsl_g, _hsl_b, 1); )   // range wash, matches the main keyboard
-      : gfx_set(0.80, 0.80, 0.83, 1);
-      gfx_rect(px, y, pw, wh);
-      gfx_set(0.25, 0.25, 0.30, 1); gfx_rect(px, y, pw, 1);
-      // Every white key gets its name when the key is tall enough for the
-      // 7px font; below that, C-only exactly as before — never a clipped
-      // half-label. Black keys stay unlabeled; the white anchors identify them.
-      (wh >= 9 || (note - floor(note / 12) * 12) == 0) ? (
-        gfx_setfont(1, "Arial", 7, 0); gfx_set(0.20, 0.20, 0.24, 1);
-        swing_mapping_note_lbl(note, #_mv_kl);
-        gfx_x = px + 2; gfx_y = y + wh - 9; gfx_drawstr(#_mv_kl);
-      );
-      hov ? swing_mapping_hovinfo(own >= 0 ? own : _mv_n2r[note]);
-      hov && lmb_down && own >= 0 ? ( sel_pad = own; pad_is_playable(own) ? launch_voices_for_pad(own, p_note[own], 110, 8); );
-      // covered key, no exact owner: audition the range owner AT THIS pitch
-      hov && lmb_down && own < 0 && _mv_n2r[note] >= 0 ? (
-        sel_pad = _mv_n2r[note];
-        pad_is_playable(sel_pad) ? launch_voices_for_pad(sel_pad, note, 110, 8);
-      );
-      wi += 1;
-    );
-    note += 1;
-  );
-  // black keys on top
-  note = _mv_lo;
-  loop(_mv_cnt,
-    swing_mapping_is_black(note) ? (
-      wb = 0; k = _mv_lo; loop(note - _mv_lo, swing_mapping_is_black(k) ? 0 : wb += 1; k += 1;);
-      y = py + ph - wb * wh - bh * 0.5;
-      own = _mv_n2p[note];
-      hov = mx >= px && mx < px + bw && my >= y && my < y + bh;
-      own >= 0 ? ( hsl_to_rgb(p_color[own], 0.75, 0.42); gfx_set(_hsl_r, _hsl_g, _hsl_b, 1); )
-      : swing_mapping_rng_tintable(_mv_n2r[note]) ? ( hsl_to_rgb(p_color[_mv_n2r[note]], 0.60, 0.25); gfx_set(_hsl_r, _hsl_g, _hsl_b, 1); )   // range tint (audit R3)
-      : gfx_set(0.09, 0.09, 0.11, 1);
-      gfx_rect(px, y, bw, bh);
-      gfx_set(0, 0, 0, 0.85); gfx_rect(px, y, bw, 1); gfx_rect(px, y + bh - 1, bw, 1); gfx_rect(px + bw - 1, y, 1, bh);
-      hov ? swing_mapping_hovinfo(own >= 0 ? own : _mv_n2r[note]);
-      hov && lmb_down && own >= 0 ? ( sel_pad = own; pad_is_playable(own) ? launch_voices_for_pad(own, p_note[own], 110, 8); );
-      // covered key, no exact owner: audition the range owner AT THIS pitch
-      hov && lmb_down && own < 0 && _mv_n2r[note] >= 0 ? (
-        sel_pad = _mv_n2r[note];
-        pad_is_playable(sel_pad) ? launch_voices_for_pad(sel_pad, note, 110, 8);
-      );
-    ) : 0;
-    note += 1;
-  );
-);
-
-// Draw a chromatic NOTE-MAP grid: each cell is a note (bottom-left origin,
-// note = _mv_lo + rowFromBottom*cols + col), with a note-name header and a
-// "well" body that shows the mapped pad (color/glyph/name) or an empty slot.
-// Drag a mapped cell onto another cell to reassign that pad's note. Range
-// follows the octave nav (FIT/OCT/ZM), so it covers all pads.
-function swing_mapping_draw_notemap(px, py, pw, ph)
-local(cols, rows, gap, cw, ch, hh, i, col, rowb, srow, note, cx, cy, hov, own, dark, gs, cat, nm) (
-  // vertical piano axis on the left, note cells fill the rest
-  swing_mapping_draw_vpiano(px, py, 40, ph);
-  px += 46; pw -= 46;
-  cols = 4;
-  rows = (_mv_cnt + cols - 1) / cols | 0;
-  rows < 1 ? rows = 1;
-  gap = 4;
-  cw = (pw - gap * (cols - 1)) / cols;
-  ch = (ph - gap * (rows - 1)) / rows;
-  hh = min(16, (ch * 0.35) | 0);
-  _mv_nm_hn = -1; _mv_nm_hit = -1;
-  i = 0;
-  loop(rows * cols,
-    col = i % cols;
-    rowb = i / cols | 0;
-    srow = (rows - 1) - rowb;
-    note = _mv_lo + rowb * cols + col;
-    note <= _mv_hi && note < 128 ? (
-      cx = px + col * (cw + gap);
-      cy = py + srow * (ch + gap);
-      hov = mx >= cx && mx < cx + cw && my >= cy && my < cy + ch;
-      own = _mv_n2p[note];
-      hov ? (
-        _mv_nm_hn = note; _mv_nm_hit = own;
-        swing_mapping_hovinfo(own >= 0 ? own : _mv_n2r[note]);
-      );
-
-      // body: pad well (mapped) or empty slot
-      own >= 0 ? (
-        hsl_to_rgb(p_color[own], 0.70, 0.52);
-        dark = (_hsl_r + _hsl_g + _hsl_b) * 0.333 > 0.5;
-        gfx_set(_hsl_r, _hsl_g, _hsl_b, hov ? 1.0 : 0.9);
-        gfx_rect(cx, cy + hh, cw, ch - hh);
-      ) : (
-        dark = 1;
-        // Cell inside another pad's KEY RANGE (no exact owner): dark tint of
-        // the covering pad's hue instead of the bare-slot grey — the notemap
-        // twin of the keyboard layouts' pale wash. First-covering-pad-wins
-        // matches the engine's note-on resolution exactly (main:2080), so the
-        // tint names the pad that will actually sound on this key.
-        swing_mapping_rng_tintable(_mv_n2r[note]) ? (
-          hsl_to_rgb(p_color[_mv_n2r[note]], 0.55, 0.22);
-          gfx_set(_hsl_r, _hsl_g, _hsl_b, hov ? 1.0 : 0.9);
-          gfx_rect(cx, cy + hh, cw, ch - hh);
-        ) : (
-          gfx_set(0.10, 0.10, 0.12, 1);
-          gfx_rect(cx, cy + hh, cw, ch - hh);
-          gfx_set(0.17, 0.17, 0.20, hov ? 0.95 : 0.7);
-          gfx_rect(cx + 4, cy + hh + 3, cw - 8, ch - hh - 8);
-        );
-      );
-      // header band + note name
-      gfx_set(0.13, 0.13, 0.16, 1);
-      gfx_rect(cx, cy, cw, hh);
-      swing_mapping_note_lbl(note, #_mv_kl);
-      gfx_setfont(1, "Arial", 9, 'b');
-      gfx_set(0.88, 0.88, 0.93, 0.95);
-      gfx_x = cx + 4; gfx_y = cy + (hh - 9) * 0.5; gfx_drawstr(#_mv_kl);
-      own >= 0 ? (
-        sprintf(#_mv_pl, "%d", own + 1);
-        gfx_measurestr(#_mv_pl, _mv_tw, _mv_th);
-        gfx_set(0.65, 0.65, 0.72, 0.9);
-        gfx_x = cx + cw - _mv_tw - 4; gfx_y = cy + (hh - _mv_th) * 0.5; gfx_drawstr(#_mv_pl);
-      ) : _mv_n2r[note] >= 0 ? (
-        // covered cell: the covering pad's number, dimmed — answers "whose
-        // range is this" without opening anything
-        sprintf(#_mv_pl, "%d", _mv_n2r[note] + 1);
-        gfx_measurestr(#_mv_pl, _mv_tw, _mv_th);
-        gfx_set(0.55, 0.55, 0.60, 0.6);
-        gfx_x = cx + cw - _mv_tw - 4; gfx_y = cy + (hh - _mv_th) * 0.5; gfx_drawstr(#_mv_pl);
-      );
-      // pad content in the body
-      own >= 0 ? (
-        nm = get_cname_slot(own);
-        strlen(nm) == 0 ? nm = get_name_slot(own);
-        strlen(nm) > 0 ? (
-          _mv_label_mode != 2 ? (
-            gs = (min(cw, ch - hh) * 0.44) | 0;
-            gs > 6 ? (
-              dark ? gfx_set(0.08, 0.09, 0.11, 0.9) : gfx_set(0.95, 0.96, 0.98, 0.9);
-              cat = eon_cat_for_name(nm);
-              eon_draw_cat_glyph_hi(cat, (cx + cw * 0.5) | 0, (cy + hh + (ch - hh) * 0.42) | 0, gs, -1);
-            );
-          );
-          _mv_label_mode != 1 ? swing_mapping_name_line(cx + cw * 0.5, cy + ch - 14, cw - 4, nm, dark);
-        );
-      );
-      // border
-      hov ? gfx_set(1, 1, 1, 0.5) : gfx_set(0, 0, 0, 0.4);
-      gfx_rect(cx, cy, cw, 1); gfx_rect(cx, cy + ch - 1, cw, 1);
-      gfx_rect(cx, cy, 1, ch); gfx_rect(cx + cw - 1, cy, 1, ch);
-      // audition
-      hov && lmb_down && own >= 0 ? (
-        sel_pad = own;
-        pad_is_playable(own) ? launch_voices_for_pad(own, p_note[own], 110, 8);
-      );
-    );
-    i += 1;
-  );
-
-  // Drag a mapped cell onto another cell to reassign that pad's note.
-  lmb_down && _mv_nm_hit >= 0 ? (
-    _mv_drag_pad = _mv_nm_hit; _mv_drag_x0 = mx; _mv_drag_y0 = my; _mv_drag_moved = 0;
-  );
-  // Covered cell (no exact owner): audition the range owner AT the cell's
-  // pitch + select — these cells were previously dead to clicks.
-  lmb_down && _mv_nm_hit < 0 && _mv_nm_hn >= 0 && _mv_n2r[_mv_nm_hn] >= 0 ? (
-    sel_pad = _mv_n2r[_mv_nm_hn];
-    pad_is_playable(sel_pad) ? launch_voices_for_pad(sel_pad, _mv_nm_hn, 110, 8);
-  );
-  // Right-click a cell → RANGE EDITOR for its resolved pad.
-  rmb_down && _mv_nm_hn >= 0 && (_mv_nm_hit >= 0 || _mv_n2r[_mv_nm_hn] >= 0) ? (
-    rng_ov_pad = _mv_nm_hit >= 0 ? _mv_nm_hit : _mv_n2r[_mv_nm_hn];
-    sel_pad = rng_ov_pad;
-    // Kill any in-flight tile drag: the range overlay replaces this view in
-    // the dispatch chain, so the drop handler would otherwise fire with STALE
-    // drag state on the first frame after it closes — a ghost reassignment to
-    // whatever cell the mouse happens to be over (audit R1).
-    _mv_drag_pad = -1; _mv_drag_moved = 0;
-  );
-  _mv_drag_pad >= 0 && LMB ? (
-    abs(mx - _mv_drag_x0) + abs(my - _mv_drag_y0) > 4 ? _mv_drag_moved = 1;
-    _mv_drag_moved ? (
-      hsl_to_rgb(p_color[_mv_drag_pad], 0.75, 0.55);
-      gfx_set(_hsl_r, _hsl_g, _hsl_b, 0.6);
-      gfx_rect(mx - 10, my - 8, 20, 16);
-    );
-  );
-  _mv_drag_pad >= 0 && !LMB ? (
-    _mv_drag_moved && _mv_nm_hn >= 0 && _mv_nm_hn < 128 && _mv_nm_hn != p_note[_mv_drag_pad] ? (
-      p_note[_mv_drag_pad] = _mv_nm_hn;
-      p_note_lock[_mv_drag_pad] = 1;
-      mark_dirty_pad(_mv_drag_pad);
-    );
-    _mv_drag_pad = -1; _mv_drag_moved = 0;
-  );
+// Edge geometry for pad p's span edge (side: 0 = lo, 1 = hi) on the
+// horizontal keyboard. Sets _mv_ex (edge x) and _mv_eh (grab height — an edge
+// on a black key only stands _mv_bk_h tall) and returns 1 when the edge key
+// is inside the visible _mv_lo.._mv_hi window. Reads the key geometry the
+// keyboard pre-pass filled (_mv_wki / _mv_white_w / _mv_black_w / _mv_kb_h /
+// _mv_bk_h) — only meaningful after that pre-pass has run.
+function swing_mapping_rng_edge_geom(p, side) local(en) (
+  en = side ? min(127, p_note[p] + p_rng_hi[p]) : max(0, p_note[p] - p_rng_lo[p]);
+  en >= _mv_lo && en <= _mv_hi ? (
+    _mv_ex = _mv_wki[en - _mv_lo] + (side ? (swing_mapping_is_black(en) ? _mv_black_w : _mv_white_w - 1) : 0);
+    _mv_eh = swing_mapping_is_black(en) ? _mv_bk_h : _mv_kb_h;
+    1;
+  ) : 0;
 );
 
 function swing_mapping_draw() (
@@ -745,6 +136,13 @@ function swing_mapping_draw() (
   _mv_layout == 5 ? strcpy(#_mv_lyb, "PUSH") :
                     strcpy(#_mv_lyb, "NOTEMAP");
   swing_mapping_btn(_mv_nbx, _mv_nby, 54, _mv_nbh, #_mv_lyb) ? _mv_layout = (_mv_layout + 1) % 7;
+  // Wheel over the LAYOUT button steps the cycle in either direction — the
+  // click alone is a one-way ride through 7 stops. Wheel up = next (house
+  // convention: wheel up increments, as in the choke lane / note nudge).
+  frame_wheel != 0 && mx >= _mv_nbx && mx <= _mv_nbx + 54 && my >= _mv_nby && my <= _mv_nby + _mv_nbh ? (
+    _mv_layout = (_mv_layout + (frame_wheel > 0 ? 1 : 6)) % 7;
+    frame_wheel = 0;
+  );
   _mv_nbx += 58;
   // PUSH sub-mode — melodic 4ths vs drum quadrants (push view only)
   _mv_layout == 5 ? (
@@ -800,23 +198,36 @@ function swing_mapping_draw() (
     );
   );
 
-  // Mouse wheel over the keyboard: scroll octaves, Ctrl = zoom. Only in
-  // keyboard/push modes — pad grids consume the wheel to edit per-pad notes.
-  frame_wheel != 0 && _mv_kbmode && my >= _mv_kb_y && my <= _mv_kb_y + _mv_kb_h ? (
+  // Mouse wheel scrolls the note range, Ctrl = zoom. Only in keyboard/push/
+  // notemap modes — pad grids consume the wheel to edit per-pad notes.
+  // Push + NOTEMAP have no pin strip (their grids start at _mv_pin_y), so the
+  // wheel band covers their whole grid. NOTEMAP scrolls one grid ROW = 4
+  // notes per notch — the octave step threw the view 3 rows at a time and
+  // FIT parks the pads at the view bottom, so one notch up lost most of them
+  // (user 2026-08-18: "scrolls too far when i mouse wheel up").
+  _mv_wty = (_mv_layout == 5 || _mv_layout == 6) ? _mv_pin_y : _mv_kb_y;
+  _mv_wby = (_mv_layout == 5 || _mv_layout == 6) ? _mv_ch_y - 4 : _mv_kb_y + _mv_kb_h;
+  frame_wheel != 0 && _mv_kbmode && my >= _mv_wty && my <= _mv_wby ? (
     CTRL ? (
       _mv_nav_oct += frame_wheel > 0 ? -1 : 1;
     ) : (
-      _mv_nav_lo += frame_wheel > 0 ? 12 : -12;
+      _mv_nav_lo += (frame_wheel > 0 ? 1 : -1) * (_mv_layout == 6 ? 4 : 12);
     );
     frame_wheel = 0;
   );
 
-  // Clamp nav + derive the visible range (whole octaves, C-aligned).
+  // Clamp nav + derive the visible range. Keyboard/push layouts stay whole
+  // C-aligned octaves; NOTEMAP aligns to its own 4-note grid rows instead —
+  // a C-octave floor here would snap the one-row wheel steps straight back.
   _mv_nav_oct < 1 ? _mv_nav_oct = 1;
   _mv_nav_oct > 8 ? _mv_nav_oct = 8;
-  _mv_nav_lo = floor(_mv_nav_lo / 12) * 12;
+  _mv_layout == 6 ? _mv_nav_lo = floor(_mv_nav_lo / 4) * 4
+                  : _mv_nav_lo = floor(_mv_nav_lo / 12) * 12;
   _mv_nav_lo < 0 ? _mv_nav_lo = 0;
-  _mv_nav_lo + _mv_nav_oct * 12 > 128 ? _mv_nav_lo = floor((128 - _mv_nav_oct * 12) / 12) * 12;
+  _mv_nav_lo + _mv_nav_oct * 12 > 128 ? (
+    _mv_nav_lo = 128 - _mv_nav_oct * 12;   // multiple of 4, so notemap rows land
+    _mv_layout != 6 ? _mv_nav_lo = floor(_mv_nav_lo / 12) * 12;
+  );
   _mv_nav_lo < 0 ? _mv_nav_lo = 0;
   _mv_lo  = _mv_nav_lo;
   _mv_hi  = _mv_nav_lo + _mv_nav_oct * 12 - 1;
@@ -959,6 +370,62 @@ function swing_mapping_draw() (
     _mv_j += 1;
   );
 
+  // ── Key-range EDGE handles (KEYS layout only — other layouts stay
+  // display-only, user ruling 2026-08-18). A ranged pad carries grab bars at
+  // its span edges; a single-note pad grows them only while its key is
+  // hovered — edge-drag IS the gesture that turns a drum pad into a key
+  // range, no buried mode toggle. Precision editing stays in the RANGE
+  // overlay (right-click a key).
+  _mv_redge_pad = -1; _mv_redge_d = 5;   // closest edge within ±4px wins
+  _mv_layout == 0 ? (
+    // pass 1: find the grabbable edge under the mouse (skipped mid-drag)
+    _mv_drag_pad < 0 && _mv_rdrag_pad < 0 ? (
+      _mv_i = 0;
+      loop(NUM_PADS,
+        _mv_has_rng = p_rng_lo[_mv_i] > 0 || p_rng_hi[_mv_i] > 0;
+        (_mv_has_rng || (_mv_hover_note >= 0 && _mv_hover_note == p_note[_mv_i])) ? (
+          _mv_side = 0;
+          loop(2,
+            swing_mapping_rng_edge_geom(_mv_i, _mv_side) &&
+            my >= _mv_kb_y && my < _mv_kb_y + _mv_eh && abs(mx - _mv_ex) < _mv_redge_d ? (
+              _mv_redge_d = abs(mx - _mv_ex);
+              _mv_redge_pad = _mv_i; _mv_redge_side = _mv_side;
+            );
+            _mv_side += 1;
+          );
+        );
+        _mv_i += 1;
+      );
+    );
+    // pass 2: draw the bars — hot (white, wider) = the edge being dragged,
+    // or the pass-1 winner about to be grabbed
+    _mv_i = 0;
+    loop(NUM_PADS,
+      _mv_has_rng = p_rng_lo[_mv_i] > 0 || p_rng_hi[_mv_i] > 0;
+      (_mv_has_rng || (_mv_hover_note >= 0 && _mv_hover_note == p_note[_mv_i]) || _mv_rdrag_pad == _mv_i) ? (
+        _mv_side = 0;
+        loop(2,
+          swing_mapping_rng_edge_geom(_mv_i, _mv_side) ? (
+            _mv_hot = (_mv_rdrag_pad == _mv_i && _mv_rdrag_side == _mv_side) ||
+                      (_mv_rdrag_pad < 0 && _mv_redge_pad == _mv_i && _mv_redge_side == _mv_side);
+            _mv_hot ? (
+              gfx_set(1, 1, 1, 0.95);
+              gfx_rect(_mv_ex - 2, _mv_kb_y, 5, _mv_eh);
+            ) : (
+              hsl_to_rgb(p_color[_mv_i], 0.85, 0.62);
+              gfx_set(_hsl_r, _hsl_g, _hsl_b, _mv_has_rng ? 0.9 : 0.55);
+              gfx_rect(_mv_ex - 1, _mv_kb_y, 3, _mv_eh);
+            );
+          );
+          _mv_side += 1;
+        );
+      );
+      _mv_i += 1;
+    );
+    // hovering a grabbable edge: the readout names the pad it resizes
+    _mv_redge_pad >= 0 ? swing_mapping_hovinfo(_mv_redge_pad);
+  );
+
   // ── Pad pins above the keyboard ──────────────────────────────────
   gfx_setfont(1, "Arial", 8, 'b');
   _mv_hit_pin = -1;
@@ -1027,7 +494,28 @@ function swing_mapping_draw() (
     sel_pad = _mv_hit_pin;
     pad_is_playable(_mv_hit_pin) ? launch_voices_for_pad(_mv_hit_pin, p_note[_mv_hit_pin], 110, 8);
   );
-  lmb_down && _mv_hit_pin < 0 && _mv_hover_note >= 0 ? (
+  // Press on a grabbable span edge → start the resize drag (and never
+  // audition — resizing must not retrigger the pad).
+  lmb_down && _mv_redge_pad >= 0 ? (
+    _mv_rdrag_pad = _mv_redge_pad; _mv_rdrag_side = _mv_redge_side;
+    sel_pad = _mv_redge_pad;
+  );
+  // Resize in flight: the hovered key becomes the new edge, clamped at the
+  // root on both sides (no invert) — back to the root collapses the span to
+  // a single note. Same live-write pattern as the RANGE overlay: p_rng write
+  // + mark_dirty_pad (on change only); the tints rebuild next frame.
+  _mv_rdrag_pad >= 0 && LMB && _mv_hover_note >= 0 ? (
+    _mv_rdrag_side ? (
+      _mv_rv = max(0, _mv_hover_note - p_note[_mv_rdrag_pad]);
+      _mv_rv != p_rng_hi[_mv_rdrag_pad] ? ( p_rng_hi[_mv_rdrag_pad] = _mv_rv; mark_dirty_pad(_mv_rdrag_pad); );
+    ) : (
+      _mv_rv = max(0, p_note[_mv_rdrag_pad] - _mv_hover_note);
+      _mv_rv != p_rng_lo[_mv_rdrag_pad] ? ( p_rng_lo[_mv_rdrag_pad] = _mv_rv; mark_dirty_pad(_mv_rdrag_pad); );
+    );
+    swing_mapping_hovinfo(_mv_rdrag_pad);   // live span readout while resizing
+  );
+  _mv_rdrag_pad >= 0 && !LMB ? _mv_rdrag_pad = -1;
+  lmb_down && _mv_hit_pin < 0 && _mv_rdrag_pad < 0 && _mv_hover_note >= 0 ? (
     _mv_j = 0; loop(NUM_PADS,
       p_note[_mv_j] == _mv_hover_note ? (
         sel_pad = _mv_j;
@@ -1061,6 +549,7 @@ function swing_mapping_draw() (
     _mv_j >= 0 ? (
       rng_ov_pad = _mv_j; sel_pad = _mv_j;
       _mv_drag_pad = -1; _mv_drag_moved = 0;   // no ghost drop after rng closes (audit R1)
+      _mv_rdrag_pad = -1;                      // nor a stale edge-resize
     );
   );
   // Drag continuation: ghost chip at the cursor + highlight the target key.

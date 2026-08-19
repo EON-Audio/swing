@@ -1,11 +1,14 @@
-desc:EON FX Return View — pad contributors monitor (Verb / Delay)
-// Read-only monitor that sits on an EON Verb/Delay Return track and shows WHICH
+desc:EON FX Return View — pad contributors monitor (Verb / Delay / Smash)
+// Read-only monitor that sits on an EON Verb/Delay/Smash Return track and shows WHICH
 // pads are feeding the bus: a vertical bar list of each contributing pad's send
 // level + a live "hitting" glow, inside a classic-rack hardware faceplate
-// (Lexicon-homage skin for the verb bus, Eventide-homage for the delay bus).
+// (Lexicon-homage skin for the verb bus, Eventide-homage for the delay bus,
+// EON 76 skin for the smash bus — whose deck drives the EON 76 comp in the
+// same FX chain over the GS_BC_LINK gmem band).
 //
 // Data is READ from the per-instance strip band in gmem (published by
-// Swing_ReaKit.jsfx). This plugin never writes gmem and does NOT process audio
+// Swing_ReaKit.jsfx); edits go OUT through the strip CMD mailbox (sends, bus
+// params) and the GS_BC_LINK row (smash deck). Does NOT process audio
 // (no @sample → samples pass through untouched). The owning Swing instance's
 // registry slot is pushed into link_slot by EON_Swing_Strip_Sync.lua (slots are
 // session-volatile, so it can't be baked at build time); bus_id is set by the
@@ -16,18 +19,24 @@ options:gmem=Swing_Media_Transfer
 // Hidden/internal — driven by the bridge (bus_id) and the strip-sync companion
 // (link_slot). Not meant for the user.
 slider1:link_slot=-1<-1,64,1>-Linked registry slot (internal; Lua-pushed)
-slider2:bus_id=0<0,1,1>-Bus (0 = Reverb, 1 = Delay) (internal)
+slider2:bus_id=0<0,2,1>-Bus (0 = Reverb, 1 = Delay, 2 = Smash) (internal)
 
 in_pin:left input
 in_pin:right input
 out_pin:left output
 out_pin:right output
 
+// House control libs (both ship with Swing): knobs (FL knob + rotary selector)
+// for the delay deck, vertical-groove faders for the reverb deck.
+import libs/knobs_kbsg.jsfx-inc
+import libs/sliders_kbsg.jsfx-inc
+
 @init
 ext_noinit = 1.0;
 gfx_ext_retina == 0 ? gfx_ext_retina = 1;
 // Embed support — bit 0x100 MUST be set in @init (no effect later; REAPER 7.45+).
-gfx_ext_flags |= 0x100;
+// 0x400 = suppress REAPER's hover tooltip over the MCP embed (7.79+; older ignores).
+gfx_ext_flags |= 0x100 | 0x400;
 
 // ── gmem strip-band layout — MUST match Swing_ReaKit.jsfx / rk_lua_core.lua ──
 GS_STRIP_BASE       = 26050000;
@@ -36,6 +45,7 @@ GS_STRIP_PADS       = 8;
 GS_STRIP_PAD_STRIDE = 32;
 FX_PID_SND_DLY      = 15;
 FX_PID_SND_RVB      = 16;
+FX_PID_SND_SMASH    = 27;
 PAD_OFF_PEAK        = 23;
 PAD_OFF_HUE         = 24;
 NUM_PADS            = 16;
@@ -52,12 +62,62 @@ INST_PADNAME_LEN    = 32;
 // strip-equipped pad the companion's strip-authoritative sync can still override.
 CMD_SEQ = 4; CMD_PAD = 5; CMD_PID = 6; CMD_VAL = 7;
 
+// ── Bus-param control deck ──────────────────────────────────────────────────
+// The deck edits Swing's global verb/delay bus params through the same CMD
+// mailbox (pad ignored). Param ids and the published echo base MUST match
+// Swing_ReaKit.jsfx (FX_PID_BUS_* / GS_STRIP_OFF_BUS_BASE): k = pid − 64
+// indexes bus_val[] and the echo. Order:
+//   0 rvb_size · 1 rvb_damp · 2 rvb_width · 3 rvb_predelay · 4 rvb_hpf ·
+//   5 rvb_mix · 6 dly_div · 7 dly_fb · 8 dly_hpf_hz · 9 dly_lpf_hz ·
+//   10 dly_ping · 11 dly_mix
+FX_PID_BUS_BASE       = 64;
+GS_STRIP_OFF_BUS_BASE = 610;
+DK_HOLD_S             = 0.30;   // adopt hold-off after a local edit (s)
+// Knob dbl-click defaults (normalized 0..1), from Swing's kit defaults.
+DK_DEF_FB   = 0.35 / 0.95;
+DK_DEF_HPFN = log(80 / 20) / log(2000 / 20);
+DK_DEF_LPFN = log(8000 / 1000) / log(20000 / 1000);
+tau = 2 * $pi;   // knobs_kbsg contract (BirdBird style only, but honour it)
+
 // Per-pad snapshot + smoothed glow (frame-rate decay of the live-hit overlay).
 freemem  = 0;
 m_send   = freemem; freemem += NUM_PADS;
 m_peak   = freemem; freemem += NUM_PADS;
 m_hue    = freemem; freemem += NUM_PADS;
 m_glow   = freemem; freemem += NUM_PADS;
+// Control-deck state: local echo of the 12 bus params, per-param adopt
+// hold-off deadlines, knob interact memory (16 slots each), fader memory
+// (lib-managed via slider_init, which returns the bumped pointer).
+bus_val  = freemem; freemem += 12;
+dk_hold  = freemem; freemem += 12;
+dk_kmem  = freemem; freemem += 6 * 16;
+freemem  = slider_init(freemem, 6);
+// Smash deck (bus 2): local echo + adopt hold-off for the EON 76's params,
+// linked over the GS_BC_LINK band (row per registry slot; MUST match
+// EON_76.jsfx). +0 hb · +1..8 echo (thr,rat,atk,rel,knee,mkp,mix,byp) ·
+// +9 GR dB · +16 cmd_seq · +17 cmd_param(1..8) · +18 cmd_val (seq LAST).
+GS_BC_LINK_BASE   = 26170000;
+GS_BC_LINK_STRIDE = 24;
+bc_val  = freemem; freemem += 8;
+bc_hold = freemem; freemem += 8;
+bc_seq  = 0;   // our cmd counter (bumped per write; 76 consumes on change)
+
+// Push one comp-param edit to the linked EON 76 (param 1..8, real units).
+function bc_write(p, v) local(_row) (
+  _row = GS_BC_LINK_BASE + (max(0, link_slot) | 0) * GS_BC_LINK_STRIDE;
+  gmem[_row + 17] = p;
+  gmem[_row + 18] = v;
+  bc_seq += 1;
+  gmem[_row + 16] = bc_seq;   // bump LAST — the 76 consumes in @block
+);
+// Optimistic local echo + mailbox push + adopt hold (mirrors dk_commit).
+function bc_commit(k, v) (
+  linked ? (
+    bc_val[k] = v;
+    bc_hold[k] = time_precise() + DK_HOLD_S;
+    bc_write(k + 1, v);
+  );
+);
 
 // Drag state (persist across @gfx frames).
 drag_pad = -1;   // pad currently being dragged, -1 = none
@@ -100,15 +160,76 @@ function draw_padlabel(i) local(c, ch, nb) (
   );
 );
 
-// Push one send edit to Swing via the viewer mailbox (pid is the current bus's
-// send id, set in @gfx). SEQ bumped LAST so Swing consumes exactly once.
-function vcmd_write(pad, v) local(vb) (
+// Push one edit to Swing via the viewer mailbox with an explicit param id.
+// SEQ bumped LAST so Swing consumes exactly once.
+function vcmd_write_pid(pad, pidv, v) local(vb) (
   vb = GS_STRIP_BASE + (max(0, link_slot) | 0) * GS_STRIP_STRIDE;
   gmem[vb + CMD_PAD] = pad;
-  gmem[vb + CMD_PID] = pid;
+  gmem[vb + CMD_PID] = pidv;
   gmem[vb + CMD_VAL] = v;
   vcmd_seq += 1;
   gmem[vb + CMD_SEQ] = vcmd_seq;   // bump LAST → the live Swing strip-CMD consume applies it
+);
+
+// Send-bar variant (pid is the current bus's send id, set in @gfx).
+function vcmd_write(pad, v) ( vcmd_write_pid(pad, pid, v); );
+
+// Commit one bus-param edit from the deck: optimistic local echo + mailbox
+// push + a short adopt hold-off so Swing's throttled echo can't fight the
+// gesture (publish cadence is every 4th @block). Inert until linked.
+function dk_commit(k, v) (
+  linked ? (
+    bus_val[k] = v;
+    dk_hold[k] = time_precise() + DK_HOLD_S;
+    vcmd_write_pid(0, FX_PID_BUS_BASE + k, v);
+  );
+);
+
+// Sync-division name (matches rk_delay.jsfx-inc's 16-entry table) → #dk_val.
+function dk_div_name(d) (
+  d = d | 0;
+  d == 0  ? strcpy(#dk_val, "OFF")   :
+  d == 1  ? strcpy(#dk_val, "1/4")   :
+  d == 2  ? strcpy(#dk_val, "1/4T")  :
+  d == 3  ? strcpy(#dk_val, "1/4D")  :
+  d == 4  ? strcpy(#dk_val, "1/8")   :
+  d == 5  ? strcpy(#dk_val, "1/8T")  :
+  d == 6  ? strcpy(#dk_val, "1/8D")  :
+  d == 7  ? strcpy(#dk_val, "1/16")  :
+  d == 8  ? strcpy(#dk_val, "1/16T") :
+  d == 9  ? strcpy(#dk_val, "1/16D") :
+  d == 10 ? strcpy(#dk_val, "1/32")  :
+  d == 11 ? strcpy(#dk_val, "1/32T") :
+  d == 12 ? strcpy(#dk_val, "1/32D") :
+  d == 13 ? strcpy(#dk_val, "1/64")  :
+  d == 14 ? strcpy(#dk_val, "1/64T") :
+            strcpy(#dk_val, "1/64D");
+);
+
+// Recessed LED value window, centred on cx (draws #dk_val in the phosphor).
+function dk_readout(cx, ry) local(rw, rh, tw, th) (
+  rw = floor(54 * sc); rh = floor(15 * sc);
+  gfx_set(0, 0, 0, 0.55);
+  gfx_rect(cx - rw * 0.5, ry, rw, rh);
+  gfx_set(phr, phg, phb, 0.22);
+  gfx_line(cx - rw * 0.5,      ry,          cx + rw * 0.5, ry);
+  gfx_line(cx - rw * 0.5,      ry + rh - 1, cx + rw * 0.5, ry + rh - 1);
+  gfx_line(cx - rw * 0.5,      ry,          cx - rw * 0.5, ry + rh - 1);
+  gfx_line(cx + rw * 0.5,      ry,          cx + rw * 0.5, ry + rh - 1);
+  gfx_setfont(6, "Arial", max(8, floor(10 * sc)), 'b');
+  gfx_measurestr(#dk_val, tw, th);
+  gfx_set(phr, phg, phb, 0.95);
+  gfx_x = cx - tw * 0.5; gfx_y = ry + floor((rh - th) * 0.5);
+  gfx_drawstr(#dk_val);
+);
+
+// Engraved control label, centred on cx (draws #dk_lab).
+function dk_label(cx, ly) local(tw, th) (
+  gfx_setfont(5, "Arial", max(7, floor(9 * sc)), 'b');
+  gfx_measurestr(#dk_lab, tw, th);
+  gfx_set(0.60, 0.63, 0.68, 0.85);
+  gfx_x = cx - tw * 0.5; gfx_y = ly;
+  gfx_drawstr(#dk_lab);
 );
 
 @gfx 440 560
@@ -116,7 +237,9 @@ ret   = max(1, gfx_ext_retina);
 micro = gfx_ext_flags & 1;
 W = gfx_w; H = gfx_h;
 sc = micro ? ret : max(0.7, min(W / 440, H / 560));
-verb = bus_id < 0.5;
+rv_bus = max(0, min(2, bus_id | 0));
+verb  = rv_bus == 0;
+smash = rv_bus == 2;
 
 // Mouse (drag to edit). Clear the embed click-through bit now; re-arm it at the
 // END of @gfx only when the cursor is NOT over a draggable bar — so a drag is
@@ -126,16 +249,33 @@ mx = mouse_x; my = mouse_y; lmb = mouse_cap & 1;
 // the cursor is off the bars — that caused a big jump on the next hover).
 wheel = mouse_wheel; mouse_wheel = 0;
 micro ? gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
+// Embedded wheel events arrive with a STALE/zero mouse position — every hover
+// test (rows AND deck knobs) misses on the wheel frame. Remember the cursor on
+// normal frames, reuse it on wheel frames (Drum Strip's user-verified fix).
+micro ? (
+  wheel == 0 ? ( rv_hmx = mx; rv_hmy = my; ) : ( mx = rv_hmx; my = rv_hmy; );
+);
 over_bar = 0;
 !lmb ? drag_pad = -1;                   // release ends the drag
+// ── Deck frame globals (knobs_kbsg / sliders_kbsg caller contract) ─────────
+// EEL2 identifiers are case-insensitive: the libs' LMB *is* this file's lmb —
+// do not add a separate LMB line.
+lmb_down = lmb && !plmb;
+CTRL  = mouse_cap & 4;
+SHIFT = mouse_cap & 8;
+dt = min(time_precise() - dk_lt, 0.05); dk_lt = time_precise();
+hv_speed = 11;
+frame_wheel = 0;    // armed inside the deck block once its rect is known
 
 // Phosphor (display) colour — fixed per unit type, NOT theme-driven (hardware).
-verb ? ( phr = 0.36; phg = 1.00; phb = 0.60; ) : ( phr = 1.00; phg = 0.56; phb = 0.18; );
+verb  ? ( phr = 0.36; phg = 1.00; phb = 0.60; ) :
+smash ? ( phr = 1.00; phg = 0.42; phb = 0.37; ) :
+        ( phr = 1.00; phg = 0.56; phb = 0.18; );
 
 // ── Read the per-pad contribution snapshot from the strip band ─────────────
 linked = link_slot >= 0;
 pb  = GS_STRIP_BASE + (max(0, link_slot) | 0) * GS_STRIP_STRIDE + GS_STRIP_PADS;
-pid = verb ? FX_PID_SND_RVB : FX_PID_SND_DLY;
+pid = verb ? FX_PID_SND_RVB : smash ? FX_PID_SND_SMASH : FX_PID_SND_DLY;
 count = 0;
 i = 0; loop(NUM_PADS,
   linked ? (
@@ -153,7 +293,9 @@ i = 0; loop(NUM_PADS,
 );
 
 // ── Faceplate chrome ───────────────────────────────────────────────────────
-verb ? ( plr = 0.16; plg = 0.17; plb = 0.19; ) : ( plr = 0.075; plg = 0.08; plb = 0.095; );
+verb  ? ( plr = 0.16;  plg = 0.17;  plb = 0.19;  ) :
+smash ? ( plr = 0.063; plg = 0.067; plb = 0.078; ) :
+        ( plr = 0.075; plg = 0.08;  plb = 0.095; );
 gfx_set(plr, plg, plb, 1); gfx_rect(0, 0, W, H);
 // brushed sheen: a soft lighter band across the upper third
 gfx_set(1, 1, 1, 0.04); gfx_rect(0, 0, W, floor(H * 0.34));
@@ -164,15 +306,18 @@ top = show_chrome ? floor(30 * sc) : floor(2 * sc);
 show_chrome ? (
   // brand block (amber on verb, orange on delay) + model sub-label
   gfx_setfont(3, "Arial", max(11, floor(17 * sc)), 'b');
-  verb ? gfx_set(1.0, 0.72, 0.32, 1) : gfx_set(1.0, 0.55, 0.16, 1);
+  verb  ? gfx_set(1.0, 0.72, 0.32, 1) :
+  smash ? gfx_set(0.93, 0.94, 0.95, 1) :
+          gfx_set(1.0, 0.55, 0.16, 1);
   gfx_x = floor(14 * sc); gfx_y = floor(7 * sc);
-  gfx_drawstr(verb ? "EON 480" : "EON H9");
+  gfx_drawstr(verb ? "EON 480" : smash ? "EON 76" : "EON H9");
   gfx_setfont(4, "Arial", max(8, floor(10 * sc)));
   gfx_set(0.58, 0.60, 0.64, 0.9);
-  gfx_drawstr(verb ? "   DIGITAL REVERB" : "   HARMONIZED DELAY");
+  gfx_drawstr(verb ? "   DIGITAL REVERB" : smash ? "   BUS COMPRESSOR" : "   HARMONIZED DELAY");
   // unit tag on the right
   gfx_x = W - floor(96 * sc); gfx_y = floor(9 * sc);
-  gfx_set(0.40, 0.42, 0.46, 0.8); gfx_drawstr(verb ? "RETURN · RV" : "RETURN · DL");
+  gfx_set(0.40, 0.42, 0.46, 0.8);
+  gfx_drawstr(verb ? "RETURN · RV" : smash ? "RETURN · SM" : "RETURN · DL");
   // rack-ear screws
   screw(floor(9 * sc),     floor(10 * sc),     floor(4 * sc));
   screw(W - floor(9 * sc), floor(10 * sc),     floor(4 * sc));
@@ -186,8 +331,18 @@ dx = mgn; dy = top; dw = W - 2 * mgn; dh = H - top - mgn;
 // Skinny MCP strip (e.g. a 2-channel return) → compact layout: short header,
 // no % gutter, so the pad name + bar get the width.
 narrow = dw < floor(220 * ret);
+// ── Control deck: carve its height off the display when there is room ──────
+// (same tiering idea as show_chrome — a short/skinny embed keeps today's
+// full-height contributor list untouched).
+dk_h  = floor(150 * sc);
+dk_gap = floor(6 * sc);
+show_deck = !narrow && H >= floor(300 * ret);
+show_deck ? dh -= dk_h + dk_gap;
+dk_y = dy + dh + dk_gap;
 gfx_set(0, 0, 0, 1); gfx_rect(dx - 1, dy - 1, dw + 2, dh + 2);        // bezel
-verb ? gfx_set(0.02, 0.07, 0.04, 1) : gfx_set(0.06, 0.035, 0.0, 1);  // screen bg
+verb  ? gfx_set(0.02, 0.07, 0.04, 1) :
+smash ? gfx_set(0.075, 0.028, 0.022, 1) :
+        gfx_set(0.06, 0.035, 0.0, 1);  // screen bg
 gfx_rect(dx, dy, dw, dh);
 // faint scanlines for the hardware read
 gfx_set(0, 0, 0, 0.18);
@@ -197,8 +352,9 @@ _ly = dy + 2; loop(floor(dh / 3), gfx_line(dx, _ly, dx + dw, _ly); _ly += 3;);
 gfx_setfont(1, "Arial", max(8, floor(11 * sc)), 'b');
 gfx_set(phr, phg, phb, 0.92);
 gfx_x = dx + floor(6 * sc); gfx_y = dy + floor(4 * sc);
-gfx_drawstr(narrow ? (verb ? "REVERB" : "DELAY")
-                   : (verb ? "REVERB — CONTRIBUTORS" : "DELAY — CONTRIBUTORS"));
+gfx_drawstr(narrow ? (verb ? "REVERB" : smash ? "SMASH" : "DELAY")
+                   : (verb ? "REVERB — CONTRIBUTORS" :
+                      smash ? "SMASH — CONTRIBUTORS" : "DELAY — CONTRIBUTORS"));
 
 listy = dy + floor(20 * sc);
 listh = dh - floor(24 * sc);
@@ -277,9 +433,231 @@ listh = dh - floor(24 * sc);
   );
 );
 
+// ═══ Control deck — hardware bottom panel ═══════════════════════════════════
+// Verb = Lexicon RC 24/48 homage: six vertical-groove faders. Delay = Eventide
+// CrushStation homage: LED value windows over a rotary sync selector, FL-style
+// knobs and an illuminated ping toggle. Edits go through dk_commit → the CMD
+// mailbox; values echo back via GS_STRIP_OFF_BUS_BASE on Swing's publish tick.
+// Smash = EON 76 deck: six knobs driving the EON 76 in this same FX chain over
+// the GS_BC_LINK band (bc_commit; echo + heartbeat published by its @block).
+over_deck = 0;
+dk_drag   = 0;
+show_deck ? (
+  !smash ? (
+    // Adopt the published echo, except for params inside their edit hold-off.
+    _db = GS_STRIP_BASE + (max(0, link_slot) | 0) * GS_STRIP_STRIDE + GS_STRIP_OFF_BUS_BASE;
+    _di = 0; loop(12,
+      (linked && time_precise() > dk_hold[_di]) ? bus_val[_di] = gmem[_db + _di];
+      _di += 1;
+    );
+  ) : (
+    // BC link: adopt the EON 76's param echo (hold-off guarded) + health-check
+    // its @block heartbeat — stale for >1s ⇒ no comp in the chain (NO COMP).
+    _db = GS_BC_LINK_BASE + (max(0, link_slot) | 0) * GS_BC_LINK_STRIDE;
+    _di = 0; loop(8,
+      (linked && time_precise() > bc_hold[_di]) ? bc_val[_di] = gmem[_db + 1 + _di];
+      _di += 1;
+    );
+    _hb = gmem[_db];
+    _hb != bc_hb_last ? ( bc_hb_last = _hb; bc_hb_t = time_precise(); );
+    bc_alive = linked && (time_precise() - bc_hb_t) < 1.0;
+  );
+  over_deck = my >= dk_y;
+  frame_wheel = over_deck ? wheel / 120 : 0;
+
+  // Recessed sub-panel.
+  gfx_set(plr * 0.72, plg * 0.72, plb * 0.72, 1);
+  gfx_rect(dx, dk_y, dw, dk_h);
+  gfx_set(1, 1, 1, 0.07); gfx_rect(dx, dk_y, dw, 1);
+  gfx_set(0, 0, 0, 0.50); gfx_rect(dx, dk_y + dk_h - 1, dw, 1);
+
+  dk_pitch = dw / 6;
+  verb ? (
+    // ── EON 480: six faders — PRE · SIZE · DAMP · WIDTH · HPF · MIX ──
+    sld_set_accent(phr, phg, phb);
+    sld_set_track(0.10, 0.105, 0.12);
+    dk_fw = min(floor(40 * sc), floor(dk_pitch * 0.72));
+    dk_fy = dk_y + floor(22 * sc);
+    dk_fh = dk_h - floor(52 * sc);
+    _di = 0; loop(6,
+      // deck position → bus index k (0 size · 1 damp · 2 width · 3 pre · 4 hpf · 5 mix)
+      _k  = _di == 0 ? 3 : _di == 1 ? 0 : _di == 2 ? 1 : _di == 3 ? 2 : _di == 4 ? 4 : 5;
+      _hi = _k == 3 ? 250 : _k == 4 ? 500 : 1;
+      _fc = dx + floor((_di + 0.5) * dk_pitch);
+      _fx = _fc - floor(dk_fw * 0.5);
+      _nrm = max(0, min(1, bus_val[_k] / _hi));
+      _nv  = sld_vgroove_interact(sld_base + _di * 16, _fx, dk_fy, dk_fw, dk_fh, _nrm);
+      _nv != _nrm ? dk_commit(_k, _nv * _hi);
+      sld_vgroove_draw(_fx, dk_fy, dk_fw, dk_fh,
+                       max(0, min(1, bus_val[_k] / _hi)), sld_base + _di * 16);
+      // phosphor value above the throw
+      _k == 3 ? sprintf(#dk_val, "%dms", bus_val[3] | 0) :
+      _k == 0 ? ( bus_val[0] <= 0.001 ? strcpy(#dk_val, "OFF")
+                                      : sprintf(#dk_val, "%d%%", floor(bus_val[0] * 100 + 0.5)) ) :
+      _k == 4 ? ( bus_val[4] < 20 ? strcpy(#dk_val, "OFF")
+                                  : sprintf(#dk_val, "%dHz", bus_val[4] | 0) ) :
+                sprintf(#dk_val, "%d%%", floor(bus_val[_k] * 100 + 0.5));
+      gfx_setfont(6, "Arial", max(8, floor(10 * sc)), 'b');
+      gfx_measurestr(#dk_val, _tw, _th);
+      gfx_set(phr, phg, phb, 0.95);
+      gfx_x = _fc - _tw * 0.5; gfx_y = dk_y + floor(5 * sc);
+      gfx_drawstr(#dk_val);
+      // engraved label below
+      _di == 0 ? strcpy(#dk_lab, "PRE")   : _di == 1 ? strcpy(#dk_lab, "SIZE") :
+      _di == 2 ? strcpy(#dk_lab, "DAMP")  : _di == 3 ? strcpy(#dk_lab, "WIDTH") :
+      _di == 4 ? strcpy(#dk_lab, "HPF")   :            strcpy(#dk_lab, "MIX");
+      dk_label(_fc, dk_y + dk_h - floor(14 * sc));
+      _di += 1;
+    );
+  ) : smash ? (
+    // ── EON 76 deck: THR · RAT · ATK · REL · MKP · MIX → the comp in this chain ──
+    !bc_alive ? (
+      // No EON 76 heartbeat on this slot's link row — comp missing/offline.
+      gfx_setfont(6, "Arial", max(9, floor(12 * sc)), 'b');
+      gfx_set(phr, phg, phb, 0.45);
+      gfx_measurestr("NO COMP", _tw, _th);
+      gfx_x = dx + (dw - _tw) * 0.5; gfx_y = dk_y + (dk_h - _th) * 0.5;
+      gfx_drawstr("NO COMP");
+    ) : (
+      dk_r   = min(floor(24 * sc), floor(dk_pitch * 0.36));
+      dk_kcy = dk_y + floor(dk_h * 0.55);
+      dk_ry  = dk_y + floor(6 * sc);
+      _di = 0; loop(6,
+        _fc = dx + floor((_di + 0.5) * dk_pitch);
+        // deck position → echo index k (0 thr · 1 rat · 2 atk · 3 rel · 5 mkp · 6 mix;
+        // knee 4 and bypass 7 stay on the EON 76 itself)
+        _k = _di <= 3 ? _di : _di == 4 ? 5 : 6;
+        // normalized 0..1 domain (log not needed — comp ranges are linear)
+        _nrm = _k == 0 ? (bc_val[0] + 40) / 40 :
+               _k == 1 ? (bc_val[1] - 1) / 19 :
+               _k == 2 ? (bc_val[2] - 0.1) / 99.9 :
+               _k == 3 ? (bc_val[3] - 10) / 990 :
+               _k == 5 ? (bc_val[5] + 12) / 24 :
+                         bc_val[6];
+        _nrm = max(0, min(1, _nrm));
+        // dbl-click defaults = the smash-context defaults
+        _def = _k == 0 ? (-25 + 40) / 40 : _k == 1 ? (10 - 1) / 19 :
+               _k == 2 ? (3 - 0.1) / 99.9 : _k == 3 ? (120 - 10) / 990 :
+               _k == 5 ? (8 + 12) / 24 : 1;
+        _nv = ssl_knob_interact(dk_kmem + _di * 16, _fc, dk_kcy, dk_r, _nrm, 0, 1, _def, 0);
+        _nv != _nrm ? (
+          bc_commit(_k,
+            _k == 0 ? _nv * 40 - 40 :
+            _k == 1 ? 1 + _nv * 19 :
+            _k == 2 ? 0.1 + _nv * 99.9 :
+            _k == 3 ? 10 + _nv * 990 :
+            _k == 5 ? _nv * 24 - 12 :
+                      _nv);
+        );
+        _nrm = _k == 0 ? (bc_val[0] + 40) / 40 :
+               _k == 1 ? (bc_val[1] - 1) / 19 :
+               _k == 2 ? (bc_val[2] - 0.1) / 99.9 :
+               _k == 3 ? (bc_val[3] - 10) / 990 :
+               _k == 5 ? (bc_val[5] + 12) / 24 :
+                         bc_val[6];
+        rk_knob_draw(14, _fc, dk_kcy, dk_r, max(0, min(1, _nrm)), 0, 1, _k == 5,
+                     (dk_kmem + _di * 16)[0], phr, phg, phb, 0, 0.32, 0.33, 0.37);
+        _k == 0 ? sprintf(#dk_val, "%.0fdB", bc_val[0]) :
+        _k == 1 ? ( bc_val[1] >= 20 ? strcpy(#dk_val, "LIM")
+                                    : sprintf(#dk_val, "%.1f:1", bc_val[1]) ) :
+        _k == 2 ? sprintf(#dk_val, "%.1fms", bc_val[2]) :
+        _k == 3 ? sprintf(#dk_val, "%.0fms", bc_val[3]) :
+        _k == 5 ? sprintf(#dk_val, "%+.0fdB", bc_val[5]) :
+                  sprintf(#dk_val, "%d%%", floor(bc_val[6] * 100 + 0.5));
+        _di == 0 ? strcpy(#dk_lab, "THR") : _di == 1 ? strcpy(#dk_lab, "RAT") :
+        _di == 2 ? strcpy(#dk_lab, "ATK") : _di == 3 ? strcpy(#dk_lab, "REL") :
+        _di == 4 ? strcpy(#dk_lab, "MKP") :            strcpy(#dk_lab, "MIX");
+        dk_readout(_fc, dk_ry);
+        dk_label(_fc, dk_y + dk_h - floor(14 * sc));
+        _di += 1;
+      );
+    );
+  ) : (
+    // ── EON H9: SYNC selector · FB · HPF · LPF knobs · PING toggle · MIX ──
+    dk_r   = min(floor(24 * sc), floor(dk_pitch * 0.36));
+    dk_kcy = dk_y + floor(dk_h * 0.55);
+    dk_ry  = dk_y + floor(6 * sc);
+    _di = 0; loop(6,
+      _fc = dx + floor((_di + 0.5) * dk_pitch);
+      _di == 0 ? (
+        // SYNC — stepped rotary through the 16 divisions (0 = OFF)
+        _pos = max(0, min(15, bus_val[6] | 0));
+        _np  = rotsel_interact(dk_kmem, _fc, dk_kcy, dk_r, _pos, 16);
+        _np != _pos ? dk_commit(6, _np);
+        rotsel_knob_draw(_fc, dk_kcy, dk_r, max(0, min(15, bus_val[6] | 0)), 16,
+                         dk_kmem[0], phr, phg, phb, 0.32, 0.33, 0.37);
+        dk_div_name(bus_val[6]);
+        strcpy(#dk_lab, "SYNC");
+      ) :
+      _di == 4 ? (
+        // PING — illuminated toggle
+        _on  = bus_val[10] >= 0.5;
+        _hov = abs(mx - _fc) <= floor(20 * sc) &&
+               my >= dk_kcy - floor(15 * sc) && my <= dk_kcy + floor(15 * sc);
+        _hov && lmb_down ? dk_commit(10, _on ? 0 : 1);
+        _on = bus_val[10] >= 0.5;
+        gfx_set(0.09, 0.09, 0.11, 1);
+        gfx_rect(_fc - floor(20 * sc), dk_kcy - floor(15 * sc), floor(40 * sc), floor(30 * sc));
+        gfx_set(0.27, 0.27, 0.31, 1);
+        gfx_rect(_fc - floor(20 * sc), dk_kcy - floor(15 * sc), floor(40 * sc), 1);
+        gfx_rect(_fc - floor(20 * sc), dk_kcy + floor(15 * sc) - 1, floor(40 * sc), 1);
+        gfx_rect(_fc - floor(20 * sc), dk_kcy - floor(15 * sc), 1, floor(30 * sc));
+        gfx_rect(_fc + floor(20 * sc) - 1, dk_kcy - floor(15 * sc), 1, floor(30 * sc));
+        _on ? ( gfx_set(phr, phg, phb, 0.18); gfx_circle(_fc, dk_kcy, floor(14 * sc), 1, 1); );
+        _on ? gfx_set(phr, phg, phb, 0.90) : gfx_set(0.16, 0.16, 0.19, 1);
+        gfx_circle(_fc, dk_kcy, floor(9 * sc), 1, 1);
+        gfx_set(0.42, 0.42, 0.48, 0.8); gfx_circle(_fc, dk_kcy, floor(9 * sc), 0);
+        _on ? ( gfx_set(1, 1, 0.95, 0.6); gfx_circle(_fc, dk_kcy, floor(4 * sc), 1, 1); );
+        _on ? strcpy(#dk_val, "ON") : strcpy(#dk_val, "OFF");
+        strcpy(#dk_lab, "PING");
+      ) : (
+        // FB / HPF / LPF / MIX — FL-style knobs in normalized 0..1 domain
+        _k = _di == 1 ? 7 : _di == 2 ? 8 : _di == 3 ? 9 : 11;
+        _nrm = _k == 7  ? bus_val[7] / 0.95 :
+               _k == 8  ? log(max(20, bus_val[8]) / 20) / log(2000 / 20) :
+               _k == 9  ? log(max(1000, bus_val[9]) / 1000) / log(20000 / 1000) :
+                          bus_val[11];
+        _nrm = max(0, min(1, _nrm));
+        _def = _k == 7 ? DK_DEF_FB : _k == 8 ? DK_DEF_HPFN : _k == 9 ? DK_DEF_LPFN : 0.5;
+        _nv = ssl_knob_interact(dk_kmem + _di * 16, _fc, dk_kcy, dk_r, _nrm, 0, 1, _def, 0);
+        _nv != _nrm ? (
+          dk_commit(_k,
+            _k == 7 ? _nv * 0.95 :
+            _k == 8 ? exp(log(20)   + _nv * (log(2000)  - log(20))) :
+            _k == 9 ? exp(log(1000) + _nv * (log(20000) - log(1000))) :
+                      _nv);
+        );
+        _nrm = _k == 7  ? bus_val[7] / 0.95 :
+               _k == 8  ? log(max(20, bus_val[8]) / 20) / log(2000 / 20) :
+               _k == 9  ? log(max(1000, bus_val[9]) / 1000) / log(20000 / 1000) :
+                          bus_val[11];
+        rk_knob_draw(14, _fc, dk_kcy, dk_r, max(0, min(1, _nrm)), 0, 1, 0,
+                     (dk_kmem + _di * 16)[0], phr, phg, phb, 0, 0.32, 0.33, 0.37);
+        _k == 7  ? sprintf(#dk_val, "%d%%", floor(bus_val[7] * 100 + 0.5)) :
+        _k == 8  ? sprintf(#dk_val, "%dHz", bus_val[8] | 0) :
+        _k == 9  ? ( bus_val[9] >= 19500 ? strcpy(#dk_val, "OFF")
+                                         : sprintf(#dk_val, "%.1fk", bus_val[9] / 1000) ) :
+                   sprintf(#dk_val, "%d%%", floor(bus_val[11] * 100 + 0.5));
+        _di == 1 ? strcpy(#dk_lab, "FB")  : _di == 2 ? strcpy(#dk_lab, "HPF") :
+        _di == 3 ? strcpy(#dk_lab, "LPF") :            strcpy(#dk_lab, "MIX");
+      );
+      dk_readout(_fc, dk_ry);
+      dk_label(_fc, dk_y + dk_h - floor(14 * sc));
+      _di += 1;
+    );
+  );
+  // any control mid-drag keeps the embed click-through cleared
+  _di = 0; loop(6,
+    (dk_kmem + _di * 16)[1] ? dk_drag = 1;
+    (sld_base + _di * 16)[1] ? dk_drag = 1;
+    _di += 1;
+  );
+);
+
 // ── End of frame: re-arm embed click-through unless hovering a bar ──────────
-// When embedded, leave 0x200 cleared over a bar so the drag is handled inline;
-// elsewhere set it so a click opens the floating window (Drum Strip pattern).
-micro && !over_bar && drag_pad < 0 ? gfx_ext_flags |= 0x200;
+// When embedded, leave 0x200 cleared over a bar or the deck so the gesture is
+// handled inline; elsewhere set it so a click opens the floating window
+// (Drum Strip pattern).
+micro && !over_bar && !over_deck && !dk_drag && drag_pad < 0 ? gfx_ext_flags |= 0x200;
 plmb = lmb;
 

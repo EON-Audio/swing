@@ -86,6 +86,7 @@ local PID_TO_STRIP = {
   [G.FX_PID_DRV_MODE]     = "Drive Mode",
   [G.FX_PID_SND_DLY]      = "Delay Send",
   [G.FX_PID_SND_RVB]      = "Reverb Send",
+  [G.FX_PID_SND_SMASH]    = "Smash Send",
 }
 
 -- ⚠️ These used to derive the add-name from SCRIPT_DIR's parent + "/Swing/",
@@ -148,6 +149,7 @@ local STRIP_DEFAULT = {
   [G.FX_PID_DRV_MODE]     = 0,
   [G.FX_PID_SND_DLY]      = 0,
   [G.FX_PID_SND_RVB]      = 0,
+  [G.FX_PID_SND_SMASH]    = 0,
 }
 local DEF_EPS = 1e-3   -- defaults are exact; loose enough for quantized freqs
 
@@ -236,7 +238,8 @@ local function push_return_viewers(inst)
     if dt then
       local _, vt = reaper.GetSetMediaTrackInfo_String(dt, "P_EXT:EON_VERB_RETURN", "", false)
       local _, dd = reaper.GetSetMediaTrackInfo_String(dt, "P_EXT:EON_DELAY_RETURN", "", false)
-      local bus = (vt == "1") and 0 or ((dd == "1") and 1 or nil)
+      local _, sm = reaper.GetSetMediaTrackInfo_String(dt, "P_EXT:EON_SMASH_RETURN", "", false)
+      local bus = (vt == "1") and 0 or ((dd == "1") and 1 or ((sm == "1") and 2 or nil))
       if bus then
         local vfx = _find_viewer_fx(dt)
         if vfx < 0 then
@@ -247,6 +250,19 @@ local function push_return_viewers(inst)
         if vfx >= 0 then
           _set_param_named(dt, vfx, "Linked registry slot", inst.slot)
           _set_param_named(dt, vfx, "Bus", bus)
+        end
+        if bus == 2 then
+          -- Smash return: also hand the EON 76 its registry slot so the viewer
+          -- deck and the comp meet on the same GS_BC_LINK row. Never pushed to
+          -- the drum-bus instance (stays -1 → band-inert). Insert-if-absent is
+          -- the BRIDGE's job at build; here we only re-link an existing one.
+          for fx = 0, reaper.TrackFX_GetCount(dt) - 1 do
+            local _, fn = reaper.TrackFX_GetFXName(dt, fx, "")
+            if fn and fn:find("EON 76") then
+              _set_param_named(dt, fx, "Link Slot", inst.slot)
+              break
+            end
+          end
         end
       end
     end

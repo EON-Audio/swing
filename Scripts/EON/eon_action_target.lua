@@ -24,6 +24,11 @@ local CMD  = 26090300  -- v1 header relocated 2026-07-09 (cells 0..35 dead)
 local COMP = 1710
 local COMPT = 2250     -- companion TARGET (instance id; 0 = broadcast)
 local LOCK = 97
+-- GS_CMD_LUA_POST (rk_lua_core): "posted from Lua, no armed consumer" stamp.
+-- A Lua-posted op's completion code has no JSFX waiting on it; the bridge
+-- tracks this stamp and releases an orphan 98 immediately instead of letting
+-- it block the bus for the watchdog's 5s fuse. Written BEFORE CMD.
+local LUAPOST = 26090342
 
 -- Mirror of Swing_Kit_Bridge.lua is_swing_fx(): fx_ident is the reliable key,
 -- with JS: display-name fallbacks for older/unidentified instances.

@@ -271,6 +271,9 @@ kit_export_state == 11 ? (
     gmem[_mb + 24] = fx_bc_bits[_ki];
     gmem[_mb + 25] = fx_snd_dly[_ki];
     gmem[_mb + 26] = fx_snd_rvb[_ki];
+    // Smash send rides its own overflow band — META's 80-float stride is full
+    // (see the GS_PAD_OFFSET_BASE note below).
+    gmem[GS_PAD_SMASH_BASE + _ki] = fx_snd_smash[_ki];
     gmem[_mb + 27] = fx_eq_lo_freq[_ki];
     gmem[_mb + 28] = fx_eq_mid_freq[_ki];
     gmem[_mb + 29] = fx_eq_hi_freq[_ki];
@@ -483,6 +486,7 @@ function swing_kit_preserve_snapshot() (
   memcpy(sv_fx_bc_bits,    fx_bc_bits,    NUM_PADS);
   memcpy(sv_fx_snd_dly,    fx_snd_dly,    NUM_PADS);
   memcpy(sv_fx_snd_rvb,    fx_snd_rvb,    NUM_PADS);
+  memcpy(sv_fx_snd_smash,  fx_snd_smash,  NUM_PADS);
   memcpy(sv_fx_eq_lo_freq, fx_eq_lo_freq, NUM_PADS);
   memcpy(sv_fx_eq_mid_freq,fx_eq_mid_freq,NUM_PADS);
   memcpy(sv_fx_eq_mid2_freq,fx_eq_mid2_freq,NUM_PADS);
@@ -553,6 +557,7 @@ function swing_kit_preserve_restore() (
   memcpy(fx_bc_bits,    sv_fx_bc_bits,    NUM_PADS);
   memcpy(fx_snd_dly,    sv_fx_snd_dly,    NUM_PADS);
   memcpy(fx_snd_rvb,    sv_fx_snd_rvb,    NUM_PADS);
+  memcpy(fx_snd_smash,  sv_fx_snd_smash,  NUM_PADS);
   memcpy(fx_eq_lo_freq, sv_fx_eq_lo_freq, NUM_PADS);
   memcpy(fx_eq_mid_freq,sv_fx_eq_mid_freq,NUM_PADS);
   memcpy(fx_eq_mid2_freq,sv_fx_eq_mid2_freq,NUM_PADS);
@@ -644,8 +649,10 @@ kit_import_state == 1 ? (
   // echo -epoch so the bridge classifies the dispatch as failed instead of
   // inferring success from CMD leaving 3 (kit-load transaction band,
   // Phase 1 2026-07-17). Payload cells first, ack flag LAST.
-  // 99 = load landed. A freshly loaded kit matches its file ⇒ not dirty.
-  gmem[KIT_GMEM_CMD] == 99 ? ( kit_stage_ready = 0; kit_import_state = 0; kit_busy = 0; kit_dirty = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0;
+  // kit_dirty stays lit through both: these consumes ABORT the armed load —
+  // the previous kit, unsaved edits included, is still the live state. The
+  // success clear is at the end of state 4.
+  gmem[KIT_GMEM_CMD] == 99 ? ( kit_stage_ready = 0; kit_import_state = 0; kit_busy = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0;
     gmem[GS_LOAD_ACK_INST] = instance_id; gmem[GS_LOAD_ACK_FAILBITS] = 0; gmem[GS_LOAD_ACK] = -gmem[GS_LOAD_EPOCH]; );  // live epoch (see state 4)
   gmem[KIT_GMEM_CMD] == 98 ? ( kit_stage_ready = 0; kit_import_state = 0; kit_busy = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0;
     gmem[GS_LOAD_ACK_INST] = instance_id; gmem[GS_LOAD_ACK_FAILBITS] = 0; gmem[GS_LOAD_ACK] = -gmem[GS_LOAD_EPOCH]; );  // live epoch (see state 4)
@@ -783,6 +790,7 @@ kit_import_state == 2 ? (
     fx_bc_bits[_ki]  = gmem[_mb + 24];
     fx_snd_dly[_ki]  = gmem[_mb + 25];
     fx_snd_rvb[_ki]  = gmem[_mb + 26];
+    fx_snd_smash[_ki] = gmem[GS_PAD_SMASH_BASE + _ki];
     fx_eq_lo_freq[_ki]  = gmem[_mb + 27];
     fx_eq_mid_freq[_ki] = gmem[_mb + 28];
     fx_eq_hi_freq[_ki]  = gmem[_mb + 29];
@@ -1384,6 +1392,12 @@ kit_import_state == 4 ? (
   kit_busy = 0;
   gmem[KIT_GMEM_LOCK] = 0;
   !_was_preserve ? mark_dirty_pad(_undo_pad);
+  // A freshly loaded kit matches its file — the SAVE dot goes out. Must run
+  // AFTER the mark_dirty_pad above (kit_busy is already 0 on these lines, so a
+  // pad index left in _undo_pad would re-light it), and never for preserve-live
+  // reloads: the bridge just restored live params, which may BE the unsaved
+  // edits the dot is reporting.
+  !_was_preserve ? kit_dirty = 0;
   sync_note_names();
 );
 );
