@@ -89,6 +89,7 @@ if not any_swing_exists() then
     return
   end
   reaper.TrackFX_Show(tr, fx, 3)  -- float → @gfx → instance heartbeats/registers
+  core.fx_embed_mcp(tr, "Swing_ReaKit")  -- house default: embedded in the MCP too
   reaper.Undo_EndBlock("Import RS5k Rack: new Swing instance", -1)
   wait = 20  -- ~20 defer cycles for the fresh instance to register
 end

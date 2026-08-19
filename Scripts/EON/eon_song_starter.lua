@@ -142,6 +142,9 @@ local function add_swing(tr)
     return nil
   end
   local fx = reaper.TrackFX_AddByName(tr, name, false, -1)
+  -- House default: EON JSFX open embedded in the MCP. Safe as a chunk flip
+  -- here — the instance is seconds old, no kit loaded, chunk is tiny.
+  if fx >= 0 then core.fx_embed_mcp(tr, "Swing_ReaKit") end
   return fx >= 0 and fx or nil
 end
 

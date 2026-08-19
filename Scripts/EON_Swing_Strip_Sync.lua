@@ -245,7 +245,11 @@ local function push_return_viewers(inst)
         if vfx < 0 then
           -- Find-or-add, same pattern the strips use (query 0 → insert 1).
           local vname = viewer_addname(tr, 0)
-          if vname then vfx = reaper.TrackFX_AddByName(dt, vname, false, 1) end
+          if vname then
+            vfx = reaper.TrackFX_AddByName(dt, vname, false, 1)
+            -- House default: fresh viewers open embedded in the MCP.
+            if vfx >= 0 then core.fx_embed_mcp(dt, "EON_FX_Return_View") end
+          end
         end
         if vfx >= 0 then
           _set_param_named(dt, vfx, "Linked registry slot", inst.slot)
@@ -318,6 +322,9 @@ local function ensure_strip(tr)
       fxidx = reaper.TrackFX_AddByName(tr, sname, false, 1) -- insert new
       if fxidx < 0 then return nil, "AddByName failed (" .. sname .. ")" end
       was_new = true
+      -- House default: EON JSFX open embedded in the MCP. Fresh inserts only —
+      -- an adopted/re-found strip keeps whatever the user set.
+      core.fx_embed_mcp(tr, "EON_Drum_Strip")
     end
     reaper.GetSetMediaTrackInfo_String(tr, "P_EXT:eon_strip_guid",
       reaper.TrackFX_GetFXGUID(tr, fxidx) or "", true)

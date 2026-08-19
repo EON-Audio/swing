@@ -9625,10 +9625,19 @@ function rk_ops.do_build_multiout(opts)
       if is_swing_fx(swing_track, fi) then sw_idx = fi; break end
       fi = fi + 1
     end
+    local dst = seq_idx
     if sw_idx >= 0 and seq_idx > sw_idx then
       reaper.TrackFX_CopyToTrack(swing_track, seq_idx, swing_track, sw_idx, true)
+      dst = sw_idx
     end
-    core.fx_embed_mcp(swing_track, "EON_StepSeq")
+    -- Embed in the MCP via the house action path (focus + "Show last focused
+    -- FX embedded UI in MCP") — a chunk rewrite on the Swing track would
+    -- re-instantiate a loaded multi-MB kit. Chunk flip only as the SWS-less
+    -- fallback, where that cost is accepted.
+    reaper.TrackFX_SetNamedConfigParm(swing_track, dst, "focused", "1")
+    if not eon_embed_last_focused(false) then
+      core.fx_embed_mcp(swing_track, "EON_StepSeq")
+    end
   end
 
   -- Find-or-insert an EON 76 on a track. Fresh inserts get the context
@@ -15540,6 +15549,10 @@ local function poll()
             reaper.TrackFX_CopyToTrack(seq_tr, seq_idx, seq_tr, sw_idx, true)   -- move (is_move = true)
             seq_idx = sw_idx
           end
+          -- House default: fresh inserts open embedded in the MCP (action
+          -- path — no chunk rewrite on a kit-loaded Swing track).
+          reaper.TrackFX_SetNamedConfigParm(seq_tr, seq_idx, "focused", "1")
+          eon_embed_last_focused(false)
         end
       end
       if seq_idx and seq_idx >= 0 then
