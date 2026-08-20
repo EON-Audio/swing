@@ -16,8 +16,8 @@ Alongside its sample layers — or instead of them — each pad carries a
 synthesised drum voice. Nine families, thirty voice types: kicks, snares, hats,
 claps, toms, rides, rims, cowbells, shakers.
 
-These are ported from hardware-measured references, not approximated, so the
-classic voices behave the way the machines they came from actually behaved.
+These are ported from hardware-measured references, so the classic voices
+behave the way the machines they came from actually behaved.
 
 A synth pad is a full pad. It plays from MIDI and the sequencer, takes the
 per-pad EQ, FX, chokes and sends, saves into kits, and undoes normally.
@@ -43,13 +43,13 @@ kit change — load a new kit and your playable pad is still playable.
 Tempo-repeat follows the key you're actually holding, so held-note rolls track
 the melody instead of hammering the pad's root.
 
-Key ranges work in Repitch today. Tuned and Stretch are still to come, and Swing
-says so in the range editor rather than leaving you guessing.
+Key ranges work in Repitch today. Tuned and Stretch are still to come, and
+Swing says so in the range editor.
 
 ## Run as many Swings as you like
 
 Each instance keeps its own pitch state, mute/solo, colours and note names, and
-stays in sync with the Drum Matrix both ways. No cross-talk.
+stays in sync with the Drum Matrix both ways.
 
 ## Ctrl+Z can't wipe a kit any more
 
@@ -64,7 +64,7 @@ out of REAPER's global undo.
 
 ### Step Sequencer
 
-A full step sequencer built for Swing, not bolted on.
+A full step sequencer built for Swing.
 
 - **Groove system** — swing and groove engine with `.rgt` import *and* export,
   plus groove import straight from a MIDI file
@@ -74,8 +74,8 @@ A full step sequencer built for Swing, not bolted on.
 
 ### Drum Matrix
 
-Your patterns as a grid in the arrange window, working directly on REAPER MIDI
-items rather than a private format.
+Your patterns as a grid in the arrange window, working directly on REAPER
+MIDI items.
 
 - **Live two-way sync with the sequencer** — a region is a pattern, edit either
   end and the other follows, ratchets included
@@ -96,8 +96,7 @@ a fader.
 ### EON Lens
 
 A kit-artwork card for the track panel. Your kit's cover, living on the track,
-pulsing with the audio. A kit without a cover gets a generated monogram, so
-the card never sits blank.
+pulsing with the audio. A kit without a cover gets a generated monogram.
 
 ### Per-pad FX and multi-out returns
 
@@ -119,21 +118,20 @@ per-pad SMASH send sitting next to DLY and RVB.
 Kits now carry a cover image inside the `.swing` file itself, so it travels with
 the kit wherever the kit goes. Drag an image onto the KIT tab tile to attach
 one. All thirteen factory kits ship with machine-portrait covers, and a kit
-without one draws a matching vector portrait instead of sitting blank.
+without one draws a matching vector portrait.
 
 ### Kit categories, with LOCK and ADAPT
 
 Each pad carries a category glyph in place of its number, picked from a grid of
 46. **LOCK** keeps a pad exactly as it is through kit loads. **ADAPT** re-aims
-your existing patterns at the new kit rather than leaving them pointing at the
-old one, and a change map shows you what moved.
+your existing patterns at the new kit, and a change map shows you what moved.
 
 ### Themes, knobs and icons
 
-14 console themes and 18 knob styles, and the Lua panels now draw the
-same knobs as the plugin so nothing looks bolted on. The icon system was reworked
-to 46 solid-silhouette categories with hue-tinted variants that follow your pad
-colour out to track colours and sequencer lanes.
+14 console themes and 18 knob styles, and the Lua panels now draw the same
+knobs as the plugin. The icon system was reworked to 46 solid-silhouette
+categories with hue-tinted variants that follow your pad colour out to track
+colours and sequencer lanes.
 
 ### SFZ and RS5k
 
@@ -152,7 +150,7 @@ handles velocity, round-robin and containers.
 - **Drag samples straight onto pads** — including onto a Swing embedded in the
   track panel or mixer. Multi-file drags fill consecutive pads.
 - **When samples go missing, Swing helps.** You get a banner offering to relink
-  the folder, instead of silent pads.
+  the folder.
 - **Pads no longer come back blank** when you reopen a project.
 - **A save-corruption bug when cloning a pad or track is fixed.** If you have
   ever cloned a Swing track, this one matters.
@@ -188,7 +186,7 @@ These are the changes most likely to have you hunting for something.
   knowing.
 - **Tuned and Stretch need the EON engine.** Repitch is pure JSFX and needs
   nothing extra. Without the engine, both play back as Repitch — and Swing
-  tells you so rather than quietly sounding wrong.
+  tells you so.
 
 ---
 

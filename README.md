@@ -26,8 +26,8 @@ One install, one ecosystem:
   round-robin, sum), per-pad FX chains, ADSR, choke groups, key ranges,
   16 stereo outputs.
 - **The Drum Synth** *(new in 3.0)* — nine engine families, thirty voices,
-  ports of hardware-measured references. No samples required: eleven of the
-  thirteen factory kits are pure synth and load instantly.
+  ports of hardware-measured references. Eleven of the thirteen factory kits
+  are pure synth and load instantly.
 - **Steppa** — the step sequencer. Groove import/export (`.rgt` and straight
   from MIDI files), 824 factory patterns browsable by role and genre, song
   mode.
@@ -44,8 +44,8 @@ One install, one ecosystem:
   living on the track, pulsing with the audio.
 
 Plus: 14 console themes, 18 knob styles, kit cover art, multiple instances
-per project with zero cross-talk, and Swing's own undo engine — Ctrl+Z can't
-wipe a kit anymore.
+per project, and Swing's own undo engine — Ctrl+Z can't wipe a kit
+anymore.
 
 ## In pictures
 
