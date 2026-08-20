@@ -12,7 +12,7 @@ project like it belongs there. Because it does.
 
 ## 📖 The Manual
 
-**[Swing 3.0 Manual — PDF, 48 pages](Swing_3.0_Manual.pdf)** — quickstart to
+**[Swing 3.0 Manual — PDF, 51 pages](Swing_3.0_Manual.pdf)** — quickstart to
 recipes, every view illustrated. GitHub renders it right in your browser.
 
 **Coming from Swing 2.1?** Read **[What's new in 3.0](WHATS_NEW.md)** — the

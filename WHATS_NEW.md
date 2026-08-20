@@ -31,7 +31,8 @@ The grid now doubles as a full-window canvas. Mapping (a piano-roll note map
 with a proper choke lane), Colors, Outputs, Kits and the Synth editor — plus the
 mixer console and full-size EQ, delay, reverb and compressor pages.
 
-All eleven views bind to keys and toolbar buttons.
+All ten views bind to keys and toolbar buttons — plus an action that closes
+whichever is open.
 
 ## Play a pad across the keyboard
 
@@ -185,9 +186,9 @@ These are the changes most likely to have you hunting for something.
   removed so the store doesn't grow forever. It never touches kits, projects or
   your own sample files — but it does delete from your disk, so it's worth
   knowing.
-- **Stretch needs the EON engine.** Repitch and Tuned are pure JSFX and need
-  nothing extra. If the engine isn't installed, Swing now tells you rather than
-  quietly playing Stretch back as Repitch.
+- **Tuned and Stretch need the EON engine.** Repitch is pure JSFX and needs
+  nothing extra. Without the engine, both play back as Repitch — and Swing
+  tells you so rather than quietly sounding wrong.
 
 ---
 
