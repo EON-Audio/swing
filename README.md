@@ -15,6 +15,9 @@ project like it belongs there. Because it does.
 **[Swing 3.0 Manual — PDF, 48 pages](Swing_3.0_Manual.pdf)** — quickstart to
 recipes, every view illustrated. GitHub renders it right in your browser.
 
+**Coming from Swing 2.1?** Read **[What's new in 3.0](WHATS_NEW.md)** — the
+short tour of everything that changed, and the few things that moved.
+
 ## What's in the box
 
 One install, one ecosystem:
@@ -43,6 +46,23 @@ One install, one ecosystem:
 Plus: 14 console themes, 18 knob styles, kit cover art, multiple instances
 per project with zero cross-talk, and Swing's own undo engine — Ctrl+Z can't
 wipe a kit anymore.
+
+## In pictures
+
+![The Swing workspace — 16 pads with synth voices, per-pad mixer, kit artwork](screenshots/01_pads.png)
+
+*The workspace: 16 pads, synth or sample per pad, mixer meters, kit art,
+master drive.*
+
+| | |
+|---|---|
+| ![The Drum Synth editor — a 3D drum above the voice controls](screenshots/06_synth.png)<br>*The Drum Synth — nine families, thirty voices, and a 3D drum that moves as you tune it.* | ![The key-range editor — drag a pad across the keyboard](screenshots/13_range.png)<br>*Key ranges — drag a pad's edges and it plays melodically across the keys.* |
+| ![Steppa — lanes with pad names, icons and colors](screenshots/34_stepseq.png)<br>*Steppa — your pads' names, icons and colors carried straight into the sequencer.* | ![The Drum Strip — VU meter, EQ nodes, SSL-style knobs](screenshots/35_drumstrip.png)<br>*Drum Strip — a channel per drum: VU, EQ nodes, drive, comp, sends.* |
+
+![REAPER's mixer with sixteen drum channels, each carrying an embedded Drum Strip](screenshots/hand_mixer.png)
+
+*Hit MULTI: sixteen named, colored channels in REAPER's own mixer, a Drum
+Strip embedded on every one, returns included.*
 
 ## Install (ReaPack, all platforms)
 
