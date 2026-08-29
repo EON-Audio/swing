@@ -15732,12 +15732,19 @@ local function poll()
     end
     reaper.gmem_write(G.CMD, 0)
 
-  elseif cmd == 79 then
-    -- MERGED (build menu): one track per drum — the pad's pattern item moves
-    -- onto its existing multi-out audio track. EON_DM_BuildMerged's own
-    -- dialogs handle the missing-multi-out and classic-lanes-exist cases.
-    run_dm_script("EON_DM_BuildMerged.lua")
-    reaper.gmem_write(G.CMD, 0)
+  elseif cmd == 83 then
+    -- MERGED (Swing's build menu and the EON Build menu): audio multi-outs FIRST, then
+    -- fold each pad's pattern item onto its own audio track. Merged mode adopts
+    -- the multi-out tracks rather than creating any, so without them there is
+    -- nothing to merge onto and the audio build has to run first — which is why
+    -- this chains exactly the way CMD 74 ("Build Both") does.
+    -- Same async seam as 74: do NOT write CMD=0 here. The FX-returns prompt
+    -- inside do_build_multiout is a house dialog on the defer loop, so the call
+    -- can return with CMD parked at 97; the 98/99 the build eventually writes is
+    -- the completion code the JSFX consumes to clear kit_busy.
+    rk_ops.do_build_multiout({ on_done = function(ok)
+      if ok then run_dm_script("EON_DM_BuildMerged.lua") end
+    end })
 
   elseif cmd == 73 then
     -- MULTI (left-panel half-button / build menu): build the classic Drum
