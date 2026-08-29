@@ -975,6 +975,45 @@ do
   end
 end
 
+-- EON: merged-mode trigger mirror (folded in the same way the courier above was).
+-- Merged mode puts each pad's pattern item on the pad's own multi-out AUDIO
+-- track. Such a track cannot send its MIDI to Swing — it already receives audio
+-- from Swing, and a track that is both upstream and downstream of another is a
+-- routing cycle REAPER culls (the silent ADAPT attempt noted at
+-- EON_DM_Build.lua:495). The notes therefore reach Swing through ONE hidden
+-- trigger track, and this keeps that track equal to the lanes. Living in the
+-- bridge is what makes merged mode work with no second script to launch;
+-- EON_DM_MergedMirror.lua self-disables when it sees the bridge alive.
+-- Stays nil on bare-Swing installs (no Drum Matrix tree = no merged mode).
+eon_merged_mirror = nil
+do
+  local p = eon_dm_lib_path("merged_mirror.lua")
+  local f = io.open(p, "r")
+  if f then
+    f:close()
+    local ok, m = pcall(dofile, p)
+    if ok and type(m) == "table" and m.Sync then eon_merged_mirror = m end
+  end
+  if reaper.GetExtState("EON_Bridge", "debug_startup") == "1" then
+    reaper.ShowConsoleMsg(eon_merged_mirror
+      and "[bridge] Merged-mode trigger mirror: ACTIVE\n"
+      or  "[bridge] Merged-mode trigger mirror: inactive (DM libs not found)\n")
+  end
+end
+
+-- Merged-mirror tick. Runs at a fraction of the poll rate: the work is a digest
+-- string compare per merged kit, and a rebuild only when that digest moves, so
+-- an idle project costs one P_EXT read per track per pass. Module-GLOBAL (no
+-- `local`) for the ~200-local ceiling; the poll loop pcall-guards it.
+function eon_merged_mirror_tick()
+  local M = eon_merged_mirror
+  if not M then return end
+  eon_mm_tick = (eon_mm_tick or 0) + 1
+  if eon_mm_tick % 8 ~= 0 then return end
+  local list = M.MergedInstances()
+  for i = 1, #list do M.Sync(list[i]) end
+end
+
 -- Courier tick — ported verbatim from the former standalone defer script. Helpers
 -- are locals INSIDE the fn (it runs at the bridge poll rate; the closures are cheap
 -- and this keeps the only new module-global the fn itself, not five of them). gmem
@@ -15693,6 +15732,13 @@ local function poll()
     end
     reaper.gmem_write(G.CMD, 0)
 
+  elseif cmd == 79 then
+    -- MERGED (build menu): one track per drum — the pad's pattern item moves
+    -- onto its existing multi-out audio track. EON_DM_BuildMerged's own
+    -- dialogs handle the missing-multi-out and classic-lanes-exist cases.
+    run_dm_script("EON_DM_BuildMerged.lua")
+    reaper.gmem_write(G.CMD, 0)
+
   elseif cmd == 73 then
     -- MULTI (left-panel half-button / build menu): build the classic Drum
     -- Matrix MIDI lanes (EON_DM_Build's own dialogs handle rebuild/parallel
@@ -16287,6 +16333,9 @@ local function poll()
   -- never stall the bridge poll loop.
   eon_perf_mark("tail")
   if eon_courier then pcall(eon_courier_tick) end
+  -- EON: merged-mode trigger mirror (folded in; see loader near top). Same
+  -- pcall guard — a mirror fault must never stall the bridge poll loop.
+  if eon_merged_mirror then pcall(eon_merged_mirror_tick) end
 
   -- AP-2: StepSeq custom-preset apply menu (scroll-audition). Independent of the courier
   -- (works on bare Swing); pcall-guarded so a fault can't stall the poll loop.

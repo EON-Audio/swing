@@ -366,9 +366,7 @@ local function do_build(slot)
     msg = string.format(
       'Merged mode ready for "%s".\n\n' ..
       '  %d pad track(s) now carry their own pattern item (%d seeded).\n' ..
-      '  Trigger MIDI leaves via one hidden track.\n\n' ..
-      'Run "EON DM Merged Mirror" to keep the trigger track following your\n' ..
-      'edits — add it to REAPER\'s startup actions to have it always on.',
+      '  Trigger MIDI leaves via one hidden track, kept in step by the bridge.',
       kit_name, tagged, seeded)
   end
   r.ShowMessageBox(msg, 'EON DM Build Merged', 0)

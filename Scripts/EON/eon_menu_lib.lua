@@ -60,6 +60,10 @@ M.CAT.build = {
   { "MIDI Lanes",  "EON_Swing_BuildMidiLanes.lua" },
   { "Both",        "EON_Swing_BuildBoth.lua" },
   { "Stereo Grid", "EON_Swing_BuildStereo.lua" },
+  -- Merged folds the MIDI-lane half INTO the multi-out tracks (one track per
+  -- drum carrying both), so it needs Multi-Out first and replaces MIDI Lanes,
+  -- not Multi-Out. Listed last so the three classic layouts keep their order.
+  { "Merged (1 track/drum)", "EON_Swing_BuildMerged.lua" },
 }
 
 M.CAT.kit = {

@@ -11,11 +11,13 @@
 -- REAPER's own MIDI hash plus item geometry into one signature and the rebuild
 -- only runs when it moves. Idle projects cost effectively nothing.
 --
--- Standalone by design, exactly like EON_StepSeq_Sync_Courier.lua was before
--- its bridge fold-in: it touches no existing code path, so a merged project
--- that never runs it still loads, plays its audio and edits normally — only
--- the trigger track goes stale. Folding this into Swing_Kit_Bridge's always-on
--- tick is the natural follow-up (see the courier's Phase 2 note).
+-- This mirror now lives INSIDE the always-on bridge (Swing_Kit_Bridge.lua,
+-- eon_merged_mirror_tick), folded in the same way EON_StepSeq_Sync_Courier.lua
+-- was. Running this standalone copy at the same time would rebuild the same
+-- trigger track from the same lanes twice a pass, and the two would take turns
+-- invalidating each other's digest cache — so if the bridge is alive, this
+-- self-disables and lets the bridge own it. The standalone only matters now as
+-- a bare-DM fallback for someone running the Drum Matrix without the bridge.
 
 local r = reaper
 
@@ -26,6 +28,19 @@ local safety = dofile(SCRIPT_DIR .. 'lib/safety.lua')
 local mirror = dofile(SCRIPT_DIR .. 'lib/merged_mirror.lua')
 if not (mirror and mirror.Sync) then
   r.ShowMessageBox('lib/merged_mirror.lua missing or invalid.', 'EON DM Merged Mirror', 0)
+  return
+end
+
+-- Bridge ownership check — same test the StepSeq courier uses (the bridge
+-- writes os.time() to gmem[99] = KIT_GMEM_BRIDGE_ALIVE while it runs, 0 on
+-- exit). Done before anything else so the toggle state is never touched.
+r.gmem_attach('Swing_Media_Transfer')
+if (r.gmem_read(99) or 0) > 0 then
+  r.ShowMessageBox(
+    'The Swing Kit Bridge is running, and it already keeps merged mode\'s\n' ..
+    'trigger track up to date. This standalone mirror is not needed.\n\n' ..
+    'It only exists as a fallback for running the Drum Matrix without the bridge.',
+    'EON DM Merged Mirror', 0)
   return
 end
 
