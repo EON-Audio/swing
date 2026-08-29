@@ -555,8 +555,12 @@ local function find_existing_take_at(track, time)
     local e = s + reaper.GetMediaItemInfo_Value(item, 'D_LENGTH')
     if time >= s and time < e then
       local take = reaper.GetActiveTake(item)
+      -- Keep scanning past a non-MIDI item instead of bailing here. A merged-
+      -- mode lane track carries AUDIO items alongside its pattern item by
+      -- design, and an audio item overlapping this time would otherwise mask
+      -- the MIDI item behind it and silently disable erase. Classic and stereo
+      -- lanes only ever hold MIDI, so this is a no-op for them.
       if take and reaper.TakeIsMIDI(take) then return take end
-      return nil
     end
   end
   return nil

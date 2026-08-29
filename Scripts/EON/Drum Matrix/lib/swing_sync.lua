@@ -431,6 +431,12 @@ local function do_sync(snapshot, lanes, policy)
       -- name/color are owned by the bridge (renaming it "01 <pad>" here would
       -- clobber the Swing track), and FollowNoteRemap must never transpose a
       -- multi-pitch pattern. Range updates are static in v1 — skip entirely.
+    elseif lane.lane_info.merged == true then
+      -- Merged-mode lane: the tag rides one of Swing's multi-out AUDIO tracks,
+      -- whose name, colour and icon belong to the Kit Bridge (sync_lane would
+      -- rename it "01 <pad>" and then fight make_track_name on every pass).
+      -- Same ownership reasoning as the stereo lane above, so skip entirely;
+      -- a changed pad pitch is picked up by re-running EON_DM_BuildMerged.
     elseif not lane_diff(lane, snapshot, policy) then
       -- nothing to do for this lane
     elseif lane.lane_info.locked == true then
