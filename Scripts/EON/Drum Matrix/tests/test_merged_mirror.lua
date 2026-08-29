@@ -196,5 +196,32 @@ do
   ok(M.Sync("{NOT-A-KIT}") == false, "unknown guid is a safe no-op")
 end
 
+-- T9 ── track mute stops the notes, not just the audio ----------------------
+-- On a classic lane, muting the track stopped its MIDI send outright. A merged
+-- lane is an audio track, so REAPER's own mute would only silence the return
+-- while the pad kept triggering (spending a voice, choking its group). The
+-- mirror has to drop a muted lane to preserve the old meaning.
+print("T9 track mute")
+do
+  local swing, M = fresh()
+  local a = add_lane(1, 36)
+  local b = add_lane(2, 38)
+  P.additem(a, { pos = 0.0, len = 2.0, notes = { { s = 0,   e = 240, ch = 0, pitch = 36, vel = 100 } } })
+  P.additem(b, { pos = 0.0, len = 2.0, notes = { { s = 960, e = 1200, ch = 0, pitch = 38, vel = 100 } } })
+  M.EnsureTrigger(swing, GUID, "Kit")
+  M.Sync(GUID)
+  ok(#(trigger_notes(M)) == 2, "both lanes mirrored while unmuted")
+
+  a.vals["B_MUTE"] = 1                                   -- user mutes the kick
+  ok(M.Sync(GUID) == true, "muting a lane track forces a rebuild")
+  local n = trigger_notes(M)
+  ok(#n == 1, "muted lane contributes no notes (got " .. #n .. ")")
+  if n[1] then ok(n[1].pitch == 38, "the surviving note is the unmuted lane's") end
+
+  a.vals["B_MUTE"] = 0                                   -- and back
+  ok(M.Sync(GUID) == true, "unmuting rebuilds again")
+  ok(#(trigger_notes(M)) == 2, "both lanes back after unmute")
+end
+
 print(string.format("\n%d passed, %d failed", pass, fail))
 os.exit(fail == 0 and 0 or 1)

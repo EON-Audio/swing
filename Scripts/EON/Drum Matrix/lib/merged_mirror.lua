@@ -146,7 +146,8 @@ end
 function M.Digest(lanes)
   local parts = {}
   for _, L in ipairs(lanes) do
-    parts[#parts + 1] = reaper.GetTrackGUID(L.track) or '?'
+    parts[#parts + 1] = string.format('%s#%.0f', reaper.GetTrackGUID(L.track) or '?',
+                                      reaper.GetMediaTrackInfo_Value(L.track, 'B_MUTE'))
     for i = 0, reaper.CountTrackMediaItems(L.track) - 1 do
       local item = reaper.GetTrackMediaItem(L.track, i)
       local take = item and reaper.GetActiveTake(item)
@@ -231,11 +232,18 @@ end
 function M.Collect(lanes)
   local out = {}
   for _, L in ipairs(lanes) do
-    for i = 0, reaper.CountTrackMediaItems(L.track) - 1 do
-      local item = reaper.GetTrackMediaItem(L.track, i)
-      -- Merged tracks legitimately carry AUDIO items too (that is the whole
-      -- point of the mode) — collect_item skips any take that isn't MIDI.
-      if item then collect_item(item, out) end
+    -- A muted track contributes nothing. This matters: on a classic lane, mute
+    -- stopped the track's MIDI send and the pad never fired at all. A merged
+    -- lane is an AUDIO track, so REAPER's mute only silences the return — the
+    -- pad would still trigger, still spend a voice and still choke its group.
+    -- Dropping the lane here keeps mute meaning what it meant before.
+    if reaper.GetMediaTrackInfo_Value(L.track, 'B_MUTE') ~= 1 then
+      for i = 0, reaper.CountTrackMediaItems(L.track) - 1 do
+        local item = reaper.GetTrackMediaItem(L.track, i)
+        -- Merged tracks legitimately carry AUDIO items too (that is the whole
+        -- point of the mode) — collect_item skips any take that isn't MIDI.
+        if item then collect_item(item, out) end
+      end
     end
   end
   return out

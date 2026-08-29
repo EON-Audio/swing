@@ -675,7 +675,11 @@ function M.ZoomToAllItemsOnDMLanes()
       local n = reaper.CountTrackMediaItems(lane.track)
       for i = 0, n - 1 do
         local item = reaper.GetTrackMediaItem(lane.track, i)
-        if item then
+        -- MIDI only: a merged lane rides an audio track and carries audio items
+        -- by design, which would otherwise stretch the zoom to cover them.
+        -- No-op for classic and stereo lanes (MIDI is all they hold).
+        local tk = item and reaper.GetActiveTake(item)
+        if tk and reaper.TakeIsMIDI(tk) then
           local pos = reaper.GetMediaItemInfo_Value(item, 'D_POSITION') or 0
           local len = reaper.GetMediaItemInfo_Value(item, 'D_LENGTH')   or 0
           if pos < min_start          then min_start = pos          end
@@ -1261,10 +1265,16 @@ function M.CommitPatternToItem()
     local nit = reaper.CountTrackMediaItems(lane.track)
     for i = 0, nit - 1 do
       local item = reaper.GetTrackMediaItem(lane.track, i)
-      local s = reaper.GetMediaItemInfo_Value(item, 'D_POSITION')
-      local e = s + reaper.GetMediaItemInfo_Value(item, 'D_LENGTH')
-      if s < t0 then t0 = s end
-      if e > t1 then t1 = e end
+      -- MIDI only — see ZoomToAllItemsOnDMLanes. An audio item on a merged lane
+      -- would widen the committed pattern span to cover audio that is not part
+      -- of the pattern at all.
+      local tk = item and reaper.GetActiveTake(item)
+      if tk and reaper.TakeIsMIDI(tk) then
+        local s = reaper.GetMediaItemInfo_Value(item, 'D_POSITION')
+        local e = s + reaper.GetMediaItemInfo_Value(item, 'D_LENGTH')
+        if s < t0 then t0 = s end
+        if e > t1 then t1 = e end
+      end
     end
   end
   if t1 <= t0 then status('EON DM: lanes are empty — nothing to commit'); return false end
