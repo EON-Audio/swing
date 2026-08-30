@@ -1,17 +1,24 @@
 # Spec — EON Sum (the summing box)
 
 **Status:** design, no code written.
-**Scope:** a summing stage for Swing's multi-out drum bus, modelling a **drum
-machine's mix bus** rather than a mixing console's. EON's own DSP.
+**Scope:** a summing stage in two circuits (**drum machine** and **console**)
+and two hosts (a **Swing feature** and a **standalone box**), from one
+plugin. EON's own DSP.
 **Companion docs:** `Spec_EON_Lens.md`, `.refs/swing_gmem_bridge_protocol.md`
 (neither is in the package checkout — this doc belongs beside them).
 
+> **Rev 3** — both circuits and both hosts are now in scope (§2). They are one
+> codebase: the circuit switch changes which cross-channel mechanism is live,
+> and the host difference is *only* the identity layer. One thing has to be
+> decided now rather than later — generalizing that identity layer from the
+> first commit (§2.3). Shipping order stays staged (§2.4): the switches exist
+> from day one, the second voicing and second host ship when they earn it.
+>
 > **Rev 2** — the model was originally console summing, seeded by the forum
-> thread. Changed to drum-machine circuit after review: Swing is a drum
-> machine, and the two bus topologies are genuinely different (§2). Console
-> behaviour survives as a secondary mode. The architecture, the post-fader
-> analysis (§4) and the rejection of an invertible pair (§5) are unchanged —
-> they were never console-specific.
+> thread. Changed to lead with the drum-machine circuit: Swing is a drum
+> machine, and the two bus topologies are genuinely different. The
+> architecture, the post-fader analysis (§4) and the rejection of an
+> invertible pair (§5) were never console-specific and are unchanged.
 
 ---
 
@@ -34,7 +41,19 @@ stage and a bus stage rather than one plugin on the master.
 
 ---
 
-## 2. Drum machine, not console
+## 2. Two circuits, two hosts, one codebase
+
+Two independent axes, and it is worth keeping them apart:
+
+| | | |
+|---|---|---|
+| **Circuit** | `MACHINE` — shared supply rail | `CONSOLE` — active virtual-earth summing |
+| **Host** | Swing feature — built by the multi-out builder | Standalone box — works on any tracks |
+
+Four combinations, one plugin, one band protocol. Both axes are worth having,
+and they cost very different amounts (§2.4).
+
+### 2.1 The circuits
 
 Both are "summing", and they are not the same circuit.
 
@@ -58,7 +77,7 @@ The differences that matter for us:
 - **One output amp.** Sixteen voices through a single op-amp on a modest rail.
   Its clipping *is* the "loud" sound of the machine.
 
-### Why this is the right call for Swing
+#### Why MACHINE leads
 
 1. **Swing is a drum machine.** Sixteen pads, one bus, per-pad voices. The
    drum-machine topology is a literal description of what already exists in
@@ -75,7 +94,91 @@ The differences that matter for us:
    just another saturator adds nothing. The cross-channel behaviour is the
    only thing here that cannot be got any other way.
 
-### What we do *not* do
+`CONSOLE` is not a downgrade, it is a different mechanism — active summing,
+almost no rail interaction, inter-strip crosstalk instead. Some users are
+putting Swing's drums into a live-kit mix where that is exactly what they
+want, and the standalone box (§2.2) is *mostly* going to be used on
+non-drum material.
+
+**How much of the plugin is shared?** Nearly all of it:
+
+| Shared by both circuits | `MACHINE` only | `CONSOLE` only |
+|---|---|---|
+| Fader compensation (§4) | Rail sag engine | Virtual-earth bus loading |
+| Voice/channel sag curve (§6.1) | Passive resistor-network loading | Inter-strip crosstalk (BLEED) |
+| CAP, DRIFT, AMP, TRIM | | Wider DRIFT |
+| Band protocol, identity, UI shell | | |
+
+So the circuit switch changes *which cross-channel mechanism is live*. It is
+an honest switch between two real topologies, not a flavour knob — and the
+marginal DSP work for the second one is small.
+
+### 2.2 The hosts
+
+The standalone box is the same plugin with a different setup path. What
+actually differs is **only the identity layer** — four bindings:
+
+| | Swing feature | Standalone box |
+|---|---|---|
+| Group id | Swing's instance registry slot (`GS_INST_REG`, 16 slots, heartbeat-keyed) | allocated from a free pool at build, stamped on the tracks |
+| Channel index | `P_EXT:EON_PAD_IDX` | assigned at build, stamped `P_EXT:EON_SUM_CH` |
+| Fader / pan for §4 | pushed by `EON_Swing_Strip_Sync`'s existing tie tick — free | a small generic poller reading `D_VOL`/`D_PAN` per member track |
+| Deck names + colours | pad names and colours from the strip band | track names and colours from the poller; falls back to numbers |
+
+Everything below the identity layer — the DSP, the band protocol, the
+faceplate, the theme, the metering — is identical.
+
+#### The standalone box beats the thread's script, for free
+
+studiokozak's builder has to create a SUMMING track per source group to get a
+post-fader position. Ours does not: it reads the fader and compensates (§4).
+So the standalone builder creates **no tracks at all** — select some tracks,
+it inserts a channel instance on each and a bus instance on their destination,
+stamps the group, done. No pin-mapping, no `I_NCHAN`, no track-count
+explosion, and it works on a folder you have already built.
+
+That is the product pitch, and it falls straight out of the work §4 already
+requires.
+
+### 2.3 The one decision that has to be made now
+
+**Generalize the identity layer from day one**, even while only the Swing path
+ships.
+
+Group id, channel index, and the fader/pan source should be *inputs* to the
+plugin from the first commit, with Swing's registry slot and `EON_PAD_IDX` as
+one implementation of them. That costs almost nothing now — three sliders and
+a lookup instead of two hard-coded reads.
+
+Retrofitting it later is the expensive path: identity threads through the band
+protocol, the deck's data source, the fader compensation, and every
+`ensure_*` call site. Doing it Swing-specific and generalizing in a second
+pass means touching all of that twice.
+
+Everything else can be deferred safely. This cannot.
+
+### 2.4 Shipping order
+
+Both axes in the architecture from the start; **not both shipped at once.**
+
+The bottleneck on a nonlinear model is not the code, it is the listening —
+tuning until it sounds right is where the weeks go. Two circuits doubles that
+work, and a half-tuned `CONSOLE` sitting next to a well-tuned `MACHINE` makes
+the product look worse, not better. Same for the hosts: the Swing path already
+has a builder to hang off, the standalone one needs a new script and a new
+poller.
+
+So:
+
+1. `MACHINE` + Swing — the DSP proves itself where the plumbing already exists.
+2. `CONSOLE` — ships when it is actually tuned, not when it compiles.
+3. Standalone box — ships once the DSP is settled, so the new builder and
+   poller are the only unknowns.
+
+The switches exist from commit one. Nothing gets retrofitted; the second
+voicing and the second host ship when they earn it.
+
+### 2.5 What we do *not* do
 
 - **No named machine.** Model the class of circuit, not a specific product.
   Controls are named after what they physically are — RAIL, CAP, AMP — not
@@ -84,7 +187,27 @@ The differences that matter for us:
 - **No converter or bit modelling.** The Drum Strip already owns crush and
   drive. Duplicating them here would be two stages fighting over the same
   sound.
-- **Console mode is secondary**, not the headline (§6.4).
+- **No third "CLEAN" circuit.** `k = 0` with the rail off is already
+  mathematically identity (§6.1) — it is a position on the existing controls,
+  not a mode.
+
+### 2.6 Packaging — your call, not mine
+
+The ReaPack index currently ships **one package**, `Swing_ReaKit.jsfx`, with
+every file as a `<source>` under one `EON/Swing` category. Two options:
+
+- **Both in the Swing package** *(simplest)*. `EON_Sum.jsfx` plus both builder
+  scripts ship together. The "summing box" is then a Swing-package feature
+  that happens to work on any tracks. One file to maintain, no ReaPack
+  collision, and every Swing owner gets it.
+- **Split into the FX-suite index** *(if it needs to sell separately)*. Then
+  the JSFX lives in one index and the other depends on it — two packages must
+  never provide the same file path, or ReaPack conflicts. Swing must not be
+  made to depend on the FX suite, so the JSFX would have to ship from Swing
+  and the FX suite reference it, or ship twice under different filenames.
+
+Technically the first is clearly better. Whether the box is a separate product
+is a business question and yours.
 
 ---
 
@@ -331,15 +454,21 @@ Resolution: **split the model by time constant.**
 
 Block-size sensitivity still needs measuring across 64–1024 (§9).
 
-### 6.4 Console mode
+### 6.4 CONSOLE circuit
 
-The console topology is one slider away, and worth keeping: it is the same
-architecture with the rail engine off, the summing behaviour switched from
-passive-resistive to active virtual-earth, and the per-channel stage retuned.
-Some users will be putting Swing's drums into a live-kit mix where console
-glue is what they want.
+Same architecture, different cross-channel mechanism (§2.1): rail engine off,
+summing switched from passive-resistive to active virtual-earth, plus
+inter-strip crosstalk (BLEED) — a 6 dB/oct HF-tilted L↔R leak in the −60 dB
+region, which is the dominant real crosstalk term and the cheapest to place
+honestly. DRIFT runs wider, because a console's channels are further apart in
+component tolerance than sixteen voices on one board.
 
-Secondary, though. It is the alternate voicing, not the product.
+Bus loading here replaces rail sag: a console's summing amp holds its node
+near zero volts, so channels barely interact through it. What remains is the
+node's finite transimpedance under load — much subtler than a rail sag, and
+correctly so.
+
+Ships second (§2.4), when it is tuned.
 
 ### 6.5 The side-channel contract
 
@@ -430,12 +559,18 @@ All of this rides the existing path — `rk_ops.do_build_multiout`
   TRIM. `rk_theme` chip, so it follows the suite's fourteen themes.
 - **CHANNEL** — effectively headless. A nameplate and a draw LED. No embed,
   minimal `@gfx`.
-- One file, `Swing/EON_Sum.jsfx`, with a `MODE` slider (CHANNEL/BUS). Two
-  files could version-skew between deploys; the two halves of one machine must
-  not. One entry in `index.xml`, one deploy.
-- Naming: **EON Sum**, `desc:EON Sum — Drum Machine Bus`. Fits EON 76 / EON
-  Lens / EON Smash. *(Alternatives: EON Rail — which names the actual
-  mechanism — or EON Bus.)*
+- **Deck data source** — pad names and colours come free from the strip band
+  under Swing. Standalone, the poller pushes track names and colours; with
+  neither, the deck falls back to channel numbers and still works. The
+  faceplate never depends on identity being resolvable.
+- One file, `Swing/EON_Sum.jsfx`, carrying both axes as sliders: `MODE`
+  (CHANNEL/BUS) and `CIRCUIT` (MACHINE/CONSOLE). Two files could version-skew
+  between deploys; the two halves of one machine must not. One entry in
+  `index.xml`, one deploy.
+- Naming: **EON Sum**, `desc:EON Sum — Summing Box`. Fits EON 76 / EON Lens /
+  EON Smash, and stays accurate across both circuits — which a
+  drum-machine-specific name would not. *(Alternative: EON Rail, which names
+  the MACHINE mechanism but mis-sells CONSOLE.)*
 
 ---
 
@@ -452,29 +587,47 @@ All of this rides the existing path — `rk_ops.do_build_multiout`
 | **`strip_takeover` off** | No companion → no `D_VOL` mirroring → the pad fader is back inside Swing → compensation should be *disabled*, not defaulted to 1. The channel stage needs to know which regime it is in, not just what `g` is. |
 | **Stray track in the folder** | Benign, but the bus deck can spot it: compare Σ of published draw against received audio and light an advisory. |
 | **Frozen pad tracks** | A frozen track keeps its FX chain baked; the bus then sees an already-processed signal with no live heartbeat, and that voice's current draw vanishes from the rail. The fallback covers it — worth an explicit test. |
+| **Group id collision** | New with the standalone host. Swing allocates group ids from its instance registry; the standalone builder allocates from a free pool. They must not hand out the same id, or one console's kick ducks another's hats. One allocator, one claim protocol, heartbeat-expired slots reclaimed — not two schemes that happen to agree. |
+| **A track in two groups** | Nothing stops a user running the standalone builder over tracks that are already in a Swing console. The channel instance can only publish to one group. Detect at build time and refuse with a clear message, rather than silently re-stamping. |
+| **Tuning cost, not code cost** | The real budget for a second circuit is listening, not implementation (§2.4). Ship `CONSOLE` when it is tuned. A half-voiced second mode is worse than no second mode. |
+| **Standalone poller cost** | The Swing path gets fader compensation free off an existing tick. The standalone one needs its own timer polling `D_VOL`/`D_PAN` per member track. Cheap per track, but it is a new always-running script — it needs the same heartbeat-and-die discipline as the strip sync. |
 
 ---
 
 ## 11. Suggested order of work
 
-1. **`EON_Sum.jsfx`, BUS mode only**, no side-channel — rail driven from
-   `|Σ|` of the sum. Drop it on the Audio parent by hand. Auditionable in an
-   afternoon, and it settles whether the pump is musical before any plumbing
-   exists.
+Both axes are in the architecture from step 1. Only one combination ships at
+a time (§2.4).
+
+1. **`EON_Sum.jsfx`, BUS mode, MACHINE circuit**, no side-channel — rail
+   driven from `|Σ|` of the sum. Drop it on the Audio parent by hand.
+   Auditionable in an afternoon, and it settles whether the pump is musical
+   before any plumbing exists.
 2. **CHANNEL mode**, inserted by hand: CAP, voice sag, current publish, and
    the per-channel half of the rail. A/B against step 1 — this is the
    experiment that proves per-channel application is worth sixteen instances.
    **If it is not audibly better than step 1, stop and ship step 1 alone.**
-3. **Fader compensation** in the sync companion. Verify against §4: sweep a
-   pad fader and confirm both the harmonic signature and the pump depth hold
-   still.
-4. **Link band** — publish, rail state, deck metering.
-5. **Build integration** — the fourth checkbox, `ensure_sum`, preserve.
-6. **DRIFT, BUS network, console mode**, last. Seasoning, and the easiest to
-   overdo.
+3. **Identity layer, generic** (§2.3) — group id, channel index and fader/pan
+   as plugin inputs, with Swing's registry slot and `EON_PAD_IDX` as the first
+   implementation. Do this before the band, not after: it is what the band
+   keys on.
+4. **Link band** — publish, rail state, deck metering. Sized for N groups × M
+   channels from the start, not 1 × 19.
+5. **Fader compensation** in the strip-sync companion. Verify against §4:
+   sweep a pad fader and confirm both the harmonic signature and the pump
+   depth hold still.
+6. **Swing build integration** — the fourth checkbox, `ensure_sum`, preserve
+   on rebuild. *Ship here: `MACHINE` + Swing is a complete product.*
+7. **DRIFT and the passive bus network** — seasoning, easiest to overdo.
+8. **`CONSOLE` circuit** — the second cross-channel mechanism. Ships when
+   tuned, not when it compiles.
+9. **Standalone box** — the builder script (no tracks created) and the
+   generic `D_VOL`/`D_PAN` poller. The DSP is already settled by this point,
+   so these two are the only unknowns.
 
 Steps 1–2 answer the only question that actually matters, and neither
-requires touching `Swing_Kit_Bridge.lua`.
+requires touching `Swing_Kit_Bridge.lua`. Step 3 is the cheap-now,
+expensive-later one.
 
 ---
 
