@@ -7,6 +7,16 @@ plugin. EON's own DSP.
 **Companion docs:** `Spec_EON_Lens.md`, `.refs/swing_gmem_bridge_protocol.md`
 (neither is in the package checkout — this doc belongs beside them).
 
+> **Rev 5** — ⚠️ **TAM's source read; it is proprietary (§3.6).** "All rights
+> reserved… creating derivative works is prohibited." Implement from the
+> physics, never from that file; the git history already proves independent
+> derivation and must not be rewritten. Reading it also sharpened the
+> competitive picture: **TAM's rail modulates only the slew-limiter
+> threshold** — the headroom half of a sagging supply is unmodelled, which is
+> the more audible half on drums (§3.2, point 2). That is now the strongest
+> reason to build this, and the first one that is about the sound rather than
+> the workflow.
+>
 > **Rev 4** — ⚠️ **prior art found (§3.1).** Punchipum's *The Analog Molecule*
 > already ships the shared-power-rail mechanism, free, mature, eight months of
 > development. The DSP idea is not novel and this spec no longer claims it is.
@@ -222,6 +232,13 @@ is a business question and yours.
 
 ## 3. Prior art
 
+> ## ⚠️ Licence first — read §3.6 before writing a line of DSP
+>
+> TAM's source header reads *"All rights reserved. Modification, copying,
+> redistribution, or creating derivative works is prohibited."* It is **not**
+> open source. Its source has been read in this project's history; the posture
+> that keeps us clean is in **§3.6**, and it is not optional.
+
 ### 3.1 The Analog Molecule — the rail idea is already shipping
 
 **Read this before writing any code.** Punchipum's *The Analog Molecule*
@@ -255,7 +272,23 @@ Ranked honestly, strongest first:
    the track — rather than a random seed that collides on copy. That is the
    difference between a checkbox and twenty minutes of admin, and it is
    something no general-purpose plugin can offer.
-2. **Post-fader load.** TAM instructs first-insert placement, which is the
+2. **TAM's rail moves slew rate, not headroom.** From the source: the network
+   value is smoothed into `buffered_rail`, converted to `shared_sag =
+   1/(1 + buffered_rail·0.04)`, and that term is used in exactly one place —
+   scaling the Interstage slew-limiter threshold. Nothing else in the audio
+   path reads it.
+
+   That is a real and defensible model: an amplifier's slew rate is set by
+   available current, so a sagging rail does slow it down. But a sagging rail
+   *also* costs output swing, and **that half is unmodelled.** Our §6.3 —
+   per-voice headroom loss at each voice's own level — is not a re-tread of
+   TAM's rail; it is the component TAM leaves out, and on drums (huge
+   transients, small supply) it is the more audible half.
+
+   This is the sharpest differentiation on the list, and the only one that is
+   about the *sound* rather than the workflow.
+
+3. **Post-fader load.** TAM instructs first-insert placement, which is the
    most pre-fader position there is. That is defensible for the channel's
    *input* electronics, which genuinely sit before the fader and draw what
    they draw. But the *summing bus* is loaded by post-fader current, and in a
@@ -264,12 +297,12 @@ Ranked honestly, strongest first:
    20 dB in TAM and that channel still loads the rail identically. §4's
    compensation is what fixes that, and it only works because
    `EON_Swing_Strip_Sync` already knows the fader value.
-3. **A different circuit.** TAM is explicitly large-format console — 180
+4. **A different circuit.** TAM is explicitly large-format console — 180
    channels, ribbon cables, transformer bus. Nobody is modelling a drum
    machine's mix bus: sixteen voices, one small supply, a passive resistor
    network. Real, but be honest that much of the difference is tuning —
    time constants and depth — not topology.
-4. **Isolation that already works.** TAM's documented fix for REAPER sharing
+5. **Isolation that already works.** TAM's documented fix for REAPER sharing
    gmem across project tabs is *duplicate the .jsfx file and rename its gmem
    namespace by hand*. Swing already has a heartbeat-keyed instance registry
    and targeted (not broadcast) commands, so per-instance isolation is
@@ -306,11 +339,67 @@ Taking all of it:
 | **v3.4 shifted slider indexes**, silently changing old sessions. The author had to tell users not to update mid-project. | Already immune: the house resolves params by name (`EON_Drum_Strip.jsfx:23` — *"slider names are stable API — do not rename casually"*), and `EON_Swing_Strip_Sync` maps by label. Keep that discipline and never renumber. |
 | **Global crosstalk is the CPU hog** — several users report spikes; one had it lock up. | Field evidence for the choice already in §6.4: keep BLEED *local* (per-channel L↔R) rather than a shared crosstalk bus. The expensive version is the one that bites. |
 | **Three separate render bugs** (v2.9 stuttering, v3.3 offline full-speed phase error, v4.5 XT on render). | This is exactly where a gmem-coupled audio path fails, and it validates §6.5: sliders canonical, gmem a convenience, always a local fallback. Offline render must be tested first, not last. |
-| **Auto-bypass on silence** materially helps CPU. | Worth stealing outright for the sixteen channel instances. |
+| **Auto-bypass on silence** materially helps CPU. | Worth doing for the sixteen channel instances — the idea, not the implementation (§3.6). |
+| **Rail decay depends on one instance existing.** The accumulator is decayed only by the Master (`t_topo == 2`); channels only ever add to it. With no Master placed, nothing appears to decay — the UI warns, but the audio path still reads the value. | **Never make decay the property of one instance.** Our bus owns the rail, but the accumulator must self-decay (timestamped, or decayed by whoever reads it) so a missing, bypassed, muted or offline bus degrades to "no sag", never to a runaway. This belongs in the §6.5 fallback contract. |
+| **Denormals** needed a dedicated pass (v2.5) to stop CPU spikes in silence. | Flush every filter and envelope state. Cheap to do from the start, tedious to retrofit. |
+
+**One implementation note worth carrying over**, and it is a documented JSFX
+primitive rather than anything of theirs: cross-instance accumulation must use
+`atomic_add()`, not `gmem[x] += y`. Sixteen instances on different threads
+summing current draw is exactly the race that needs it.
 
 ---
 
-## 3.5 Where the builder idea comes from
+### 3.6 Licensing — the constraint on how we build
+
+**TAM is proprietary.** Its header:
+
+> `Copyright (c) 2025 DocShadrach — All rights reserved.`
+> `Licensed for use inside REAPER for personal or professional projects only.`
+> `Modification, copying, redistribution, or creating derivative works is prohibited.`
+
+(It embeds Airwindows *Interstage* and *Console9* under MIT, credited to Chris
+Johnson — so the MIT parts are MIT wherever you get them from Airwindows
+directly. The wrapper, the network architecture and everything else in that
+file are not.)
+
+Its source has been read in the course of this design. That is not a problem
+in itself — reading a competitor is normal — but it changes what "careful"
+looks like from here.
+
+**The posture:**
+
+1. **Implement from the physics, not from that file.** Rail sag is how power
+   supplies behave; it is not anyone's property. A specific implementation
+   is. Do not open TAM's source while writing `EON_Sum.jsfx`, and do not
+   transcribe its constants, its structure, its gmem layout or its
+   variable-for-variable shape.
+2. **The git history is the evidence, and it is good.** `a9dea44` — *"Spec
+   rev 2: model a drum machine's mix bus, not a console's"* — designed the
+   shared-rail model, the sag curve and the `Σ|I|` side-channel **before** TAM
+   was known to this project. `1c0912c` records the moment it was found, and
+   this section records the source being read. That ordering is worth
+   preserving; do not rewrite it.
+3. **Airwindows is a legitimate source, TAM is not.** If any Console-family
+   maths is ever wanted, take it from Chris Johnson's MIT releases directly
+   and credit it in `THIRD_PARTY_NOTICES.md` in the house style — never
+   second-hand through TAM's file.
+4. **What §3.4 takes is behaviour, not code.** "Denormals need flushing",
+   "decay must not depend on one instance", "test offline render early",
+   "crosstalk is the CPU hog" are observations about how this class of plugin
+   fails. Facts about behaviour are not derivative works. Their solutions to
+   those problems are theirs.
+5. **`atomic_add`, double-buffering and false-sharing padding are standard
+   technique**, documented in the JSFX reference and general concurrency
+   practice. Using them is not copying; copying their specific cluster/bank
+   arithmetic would be.
+
+None of this is legal advice, and if EON Sum ever ships commercially it is
+worth ten minutes of someone who does give legal advice.
+
+---
+
+### 3.7 Where the builder idea comes from
 
 studiokozak's **SK AW Console Builder**
 ([thread 310907](https://forums.cockos.com/showthread.php?t=310907)) automates
