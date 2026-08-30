@@ -7,6 +7,14 @@ plugin. EON's own DSP.
 **Companion docs:** `Spec_EON_Lens.md`, `.refs/swing_gmem_bridge_protocol.md`
 (neither is in the package checkout — this doc belongs beside them).
 
+> **Rev 4** — ⚠️ **prior art found (§3.1).** Punchipum's *The Analog Molecule*
+> already ships the shared-power-rail mechanism, free, mature, eight months of
+> development. The DSP idea is not novel and this spec no longer claims it is.
+> What survives is integration, post-fader load, the drum-machine circuit and
+> per-instance isolation (§3.2) — enough for a Swing feature, not enough for a
+> standalone product, so the box is demoted from staged to unlikely (§3.3).
+> TAM's bug history is taken wholesale as a test plan (§3.4).
+>
 > **Rev 3** — both circuits and both hosts are now in scope (§2). They are one
 > codebase: the circuit switch changes which cross-channel mechanism is live,
 > and the host difference is *only* the identity layer. One thing has to be
@@ -172,11 +180,12 @@ So:
 
 1. `MACHINE` + Swing — the DSP proves itself where the plumbing already exists.
 2. `CONSOLE` — ships when it is actually tuned, not when it compiles.
-3. Standalone box — ships once the DSP is settled, so the new builder and
-   poller are the only unknowns.
+3. ~~Standalone box~~ — **demoted in rev 4 (§3.3).** TAM already occupies that
+   market, free. Keep the identity layer generic anyway (§2.3), but do not
+   plan a release around it.
 
 The switches exist from commit one. Nothing gets retrofitted; the second
-voicing and the second host ship when they earn it.
+voicing ships when it earns it.
 
 ### 2.5 What we do *not* do
 
@@ -211,7 +220,97 @@ is a business question and yours.
 
 ---
 
-## 3. Where the idea comes from
+## 3. Prior art
+
+### 3.1 The Analog Molecule — the rail idea is already shipping
+
+**Read this before writing any code.** Punchipum's *The Analog Molecule*
+(TAM), [thread 315xxx, Dec 2025 → v4.5](https://forums.cockos.com/showthread.php?t=310907),
+free on ReaPack, twelve pages of thread, active development for eight months
+— already implements the headline mechanism in §6.3:
+
+> *"When a Kick drum hits hard on Channel 1, it draws current from the global
+> rail. The instance on your Vocal track (Channel 20) 'feels' this energy
+> demand. The voltage doesn't drop instantly; it 'sags' with a natural,
+> organic inertia, just like a real capacitor discharging."*
+
+It is a shared-gmem power rail across up to 180 instances, with per-instance
+seed IDs for phase decorrelation (our DRIFT), a global crosstalk network (our
+BLEED, but shared rather than local), Channel / Bus / Master topologies (our
+MODE), and two engines. Users compare it favourably to Sonimus and N-Console.
+
+**So the mechanism is not novel, and the spec should stop implying it is.**
+If the pitch for EON Sum is "shared power rail glue", we are second to market
+behind a free, mature, well-liked plugin.
+
+### 3.2 What actually survives as differentiation
+
+Ranked honestly, strongest first:
+
+1. **It is already set up, and set up correctly.** TAM's quick-start asks the
+   user to place an instance on every track, set the topology per track,
+   guarantee exactly one Master, and press *Reshuffle All IDs* after any
+   track duplication. Swing's builder does all of that from one checkbox, and
+   channel identity comes from `P_EXT:EON_PAD_IDX` — a real, stable fact about
+   the track — rather than a random seed that collides on copy. That is the
+   difference between a checkbox and twenty minutes of admin, and it is
+   something no general-purpose plugin can offer.
+2. **Post-fader load.** TAM instructs first-insert placement, which is the
+   most pre-fader position there is. That is defensible for the channel's
+   *input* electronics, which genuinely sit before the fader and draw what
+   they draw. But the *summing bus* is loaded by post-fader current, and in a
+   drum machine the level pot sits between the voice and the mix bus — so
+   post-pot is the physically correct place to measure draw. Pull a fader
+   20 dB in TAM and that channel still loads the rail identically. §4's
+   compensation is what fixes that, and it only works because
+   `EON_Swing_Strip_Sync` already knows the fader value.
+3. **A different circuit.** TAM is explicitly large-format console — 180
+   channels, ribbon cables, transformer bus. Nobody is modelling a drum
+   machine's mix bus: sixteen voices, one small supply, a passive resistor
+   network. Real, but be honest that much of the difference is tuning —
+   time constants and depth — not topology.
+4. **Isolation that already works.** TAM's documented fix for REAPER sharing
+   gmem across project tabs is *duplicate the .jsfx file and rename its gmem
+   namespace by hand*. Swing already has a heartbeat-keyed instance registry
+   and targeted (not broadcast) commands, so per-instance isolation is
+   existing machinery rather than a user-facing wart.
+
+### 3.3 What this kills
+
+**The standalone box, mostly.** §2.2 pitched it as beating studiokozak's
+script by creating no tracks. That is still true, but it would ship into a
+market where TAM is free, mature, handles 180 channels, and has an audience.
+Competing there on the same mechanism is a bad trade.
+
+The Swing-integrated feature is barely affected: it competes on integration
+and correctness, not on having the idea. **Revised recommendation — build the
+Swing feature; treat the standalone box as unlikely, not staged.** Keep the
+identity layer generic anyway (§2.3): it is still cheap, it still buys
+per-instance isolation, and it keeps the door open.
+
+Also worth checking before shipping: a user may run **both**. TAM on the drum
+tracks plus EON Sum on the same tracks is two rail models stacking. Not our
+bug, but worth one line in the manual. Namespaces do not collide —
+TAM is `gmem=AnalogMoleculeHybrid`, Swing is `gmem=Swing_Media_Transfer`
+(verified).
+
+### 3.4 Eight months of TAM's bugs, for free
+
+TAM's changelog and thread are a map of where this class of plugin breaks.
+Taking all of it:
+
+| TAM's problem | What we do |
+|---|---|
+| **gmem is shared across project tabs** — two open projects sum each other's crosstalk and rail. Fix is a manual file-duplicate-and-rename. | Key every band row on the instance registry slot, and scope the rail to the group, never the namespace. Cross-tab is a harder case than the multi-instance one already in §10 — two *projects*, not two Swings. Must be tested with two tabs open. |
+| **Duplicate IDs on track copy** — needs a *Reshuffle All IDs* button. | `P_EXT:EON_PAD_IDX` copies with a duplicated track too, so we have the same bug in a different coat. The bus must detect two channels claiming one index and re-stamp or refuse, without a user-facing button. |
+| **v3.4 shifted slider indexes**, silently changing old sessions. The author had to tell users not to update mid-project. | Already immune: the house resolves params by name (`EON_Drum_Strip.jsfx:23` — *"slider names are stable API — do not rename casually"*), and `EON_Swing_Strip_Sync` maps by label. Keep that discipline and never renumber. |
+| **Global crosstalk is the CPU hog** — several users report spikes; one had it lock up. | Field evidence for the choice already in §6.4: keep BLEED *local* (per-channel L↔R) rather than a shared crosstalk bus. The expensive version is the one that bites. |
+| **Three separate render bugs** (v2.9 stuttering, v3.3 offline full-speed phase error, v4.5 XT on render). | This is exactly where a gmem-coupled audio path fails, and it validates §6.5: sliders canonical, gmem a convenience, always a local fallback. Offline render must be tested first, not last. |
+| **Auto-bypass on silence** materially helps CPU. | Worth stealing outright for the sixteen channel instances. |
+
+---
+
+## 3.5 Where the builder idea comes from
 
 studiokozak's **SK AW Console Builder**
 ([thread 310907](https://forums.cockos.com/showthread.php?t=310907)) automates
@@ -587,8 +686,9 @@ All of this rides the existing path — `rk_ops.do_build_multiout`
 | **`strip_takeover` off** | No companion → no `D_VOL` mirroring → the pad fader is back inside Swing → compensation should be *disabled*, not defaulted to 1. The channel stage needs to know which regime it is in, not just what `g` is. |
 | **Stray track in the folder** | Benign, but the bus deck can spot it: compare Σ of published draw against received audio and light an advisory. |
 | **Frozen pad tracks** | A frozen track keeps its FX chain baked; the bus then sees an already-processed signal with no live heartbeat, and that voice's current draw vanishes from the rail. The fallback covers it — worth an explicit test. |
-| **Group id collision** | New with the standalone host. Swing allocates group ids from its instance registry; the standalone builder allocates from a free pool. They must not hand out the same id, or one console's kick ducks another's hats. One allocator, one claim protocol, heartbeat-expired slots reclaimed — not two schemes that happen to agree. |
-| **A track in two groups** | Nothing stops a user running the standalone builder over tracks that are already in a Swing console. The channel instance can only publish to one group. Detect at build time and refuse with a clear message, rather than silently re-stamping. |
+| **Two project tabs open** | ⚠️ **The one TAM could not solve cleanly (§3.4).** REAPER shares gmem across the whole application, so two projects each holding a Swing will sum into each other's rail unless every band row is registry-slot-keyed and the rail is scoped to the group. TAM's answer is telling users to duplicate the plugin file by hand. Ours must not be. Test with two tabs before anything else. |
+| **Duplicated pad track** | `P_EXT:EON_PAD_IDX` copies along with the track, so two channels claim one index — the same bug TAM needs its *Reshuffle All IDs* button for. The bus detects the collision and re-stamps or refuses; no user-facing button. |
+| **Group id collision** | Only if the standalone host is ever built (§3.3). Two allocators must not hand out the same id, or one console's kick ducks another's hats. One allocator, one claim protocol, heartbeat-expired slots reclaimed. |
 | **Tuning cost, not code cost** | The real budget for a second circuit is listening, not implementation (§2.4). Ship `CONSOLE` when it is tuned. A half-voiced second mode is worse than no second mode. |
 | **Standalone poller cost** | The Swing path gets fader compensation free off an existing tick. The standalone one needs its own timer polling `D_VOL`/`D_PAN` per member track. Cheap per track, but it is a new always-running script — it needs the same heartbeat-and-die discipline as the strip sync. |
 
@@ -621,9 +721,15 @@ a time (§2.4).
 7. **DRIFT and the passive bus network** — seasoning, easiest to overdo.
 8. **`CONSOLE` circuit** — the second cross-channel mechanism. Ships when
    tuned, not when it compiles.
-9. **Standalone box** — the builder script (no tracks created) and the
-   generic `D_VOL`/`D_PAN` poller. The DSP is already settled by this point,
-   so these two are the only unknowns.
+9. ~~Standalone box~~ — demoted (§3.3). Only if there is a reason to compete
+   with TAM head-on, which there currently is not.
+
+**Before step 1**, sit with TAM for an evening. It is free, it ships the
+mechanism, and the honest question this spec now has to answer is not "does
+rail sag work" — it does, TAM proves it — but **"is the built-in, correctly
+levelled, drum-tuned version enough better than a free plugin the user could
+just install?"** If the answer is no, that is worth finding out in an evening
+rather than after step 6.
 
 Steps 1–2 answer the only question that actually matters, and neither
 requires touching `Swing_Kit_Bridge.lua`. Step 3 is the cheap-now,
