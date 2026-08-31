@@ -1,0 +1,328 @@
+// ============================================================================
+// rk_ui_motion.jsfx-inc — ReaKit motion & timing widgets: the XY pad, the
+//   envelope editor, and tempo-sync divisions (chip + the maths behind it).
+//
+//   (c) EON Studios. Part of ReaKit, released under the MIT License — see
+//   ReaKit/LICENSE.
+//
+//   REQUIRES: rk_ui_core.jsfx-inc, then rk_ui_widgets.jsfx-inc.
+//
+//   These are the controls a modulation section needs and a knob library
+//   cannot give it: two parameters under one finger, a shape you edit by
+//   dragging it, and a musical time value that follows the host tempo.
+//
+//   The sync table matches rk_delay.jsfx-inc exactly (0 = free, then 1/4 down
+//   to 1/64, each straight / triplet / dotted), so a UI division index can be
+//   handed straight to the delay engine with no translation layer.
+// ============================================================================
+
+@init
+
+__rk_ui_motion_loaded = 1;
+
+RK_DIV_N = 16;   // 0 = free/off, 1..15 = the musical values
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SYNC DIVISIONS — the maths. All four take the same 0..15 index.
+//   rk_div_beats(d)    length in quarter-note beats (0 when free)
+//   rk_div_seconds(d)  the same length in seconds at the host tempo
+//   rk_div_hz(d)       that length as a rate, for an LFO
+//   rk_div_name(d, s)  writes the label ("1/8T") into string s
+// ─────────────────────────────────────────────────────────────────────────────
+
+function rk_div_beats(d) local(base, mult) (
+  d < 1 ? (
+    0;
+  ) : (
+    // 1..3 = 1/4 family, 4..6 = 1/8, 7..9 = 1/16, 10..12 = 1/32, 13..15 = 1/64
+    base = pow(0.5, floor((d - 1) / 3));
+    mult = ((d - 1) % 3) == 1 ? (2.0 / 3.0) : ((d - 1) % 3) == 2 ? 1.5 : 1.0;
+    base * mult;
+  );
+);
+
+function rk_div_seconds(d) ( rk_div_beats(d) * 60.0 / max(20, tempo); );
+
+function rk_div_hz(d) local(s) (
+  s = rk_div_seconds(d);
+  s > 0 ? ( 1.0 / s; ) : ( 0; );
+);
+
+function rk_div_name(d, dst) local(fam, kind) (
+  d < 1 ? (
+    strcpy(dst, "FREE");
+  ) : (
+    fam  = floor((d - 1) / 3);
+    kind = (d - 1) % 3;
+    fam == 0 ? ( strcpy(dst, "1/4");  ) :
+    fam == 1 ? ( strcpy(dst, "1/8");  ) :
+    fam == 2 ? ( strcpy(dst, "1/16"); ) :
+    fam == 3 ? ( strcpy(dst, "1/32"); ) :
+               ( strcpy(dst, "1/64"); );
+    kind == 1 ? ( strcat(dst, "T"); );
+    kind == 2 ? ( strcat(dst, "."); );
+  );
+  dst;
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DIVISION CHIP — the compact sync selector: label in the middle, arrows at the
+// edges, wheel to step, double-click back to the default. Deliberately not a
+// dropdown: sixteen rows is a lot of panel to cover, and stepping through
+// musical values is how people actually audition them.
+//
+//   nv = rk_div_chip(d_dly, x, y, w, h, dly_div, 4);   // 4 = 1/8 default
+//   nv != dly_div ? ( dly_div = nv; rk_automate(11); dly_recalc(); );
+// ─────────────────────────────────────────────────────────────────────────────
+
+#rk_div_lbl = "";
+
+function rk_div_chip(mem, x, y, w, h, cur, vdef)
+local(over, ht, nv, aw, over_l, over_r, now) (
+  over = rk_live && rk_hit(x, y, w, h);
+  ht = rk_hover(mem, over);
+  rk_claim(over);
+  nv = cur;
+  aw = max(rk_px(9), w * 0.18);
+  over_l = rk_hit(x, y, aw, h);
+  over_r = rk_hit(x + w - aw, y, aw, h);
+
+  over && lmb_down ? (
+    now = time_precise();
+    (now - mem[4] < 0.3) ? (
+      nv = vdef;                                   // double-click -> default
+    ) : (
+      over_l ? ( nv = max(0, cur - 1); ) :
+      over_r ? ( nv = min(RK_DIV_N - 1, cur + 1); );
+    );
+    mem[4] = now;
+  );
+  over && frame_wheel != 0 ? (
+    nv = rk_clamp(cur + (frame_wheel > 0 ? 1 : -1), 0, RK_DIV_N - 1);
+  );
+
+  rk_btn_body(x, y, w, h, ht, 0, 0);
+  // Arrows dim until the pointer is over their half.
+  rk_col(3, over_l ? 1.0 : 0.45);
+  gfx_triangle(x + aw * 0.65, y + h * 0.5 - rk_px(3),
+               x + aw * 0.65, y + h * 0.5 + rk_px(3),
+               x + aw * 0.30, y + h * 0.5);
+  rk_col(3, over_r ? 1.0 : 0.45);
+  gfx_triangle(x + w - aw * 0.65, y + h * 0.5 - rk_px(3),
+               x + w - aw * 0.65, y + h * 0.5 + rk_px(3),
+               x + w - aw * 0.30, y + h * 0.5);
+  rk_div_name(cur, #rk_div_lbl);
+  rk_font(10, 1);
+  cur < 1 ? ( rk_col(3, 0.80); ) : ( rk_pal_get(4); gfx_set(rk_cr, rk_cg, rk_cb, 0.95); );
+  rk_text_box(x, y, w, h, #rk_div_lbl);
+  nv;
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// XY PAD — two parameters under one finger. The motion control.
+//
+// Returns 1 on any frame the position changed; the new values arrive in
+// rk_xy_vx / rk_xy_vy (EEL2 functions return one number, and a pad moves two):
+//
+//   rk_xy(m_mot, x, y, w, h, mot_x, mot_y, 0, 1, 0, 1, 0.5, 0.5) ? (
+//     mot_x = rk_xy_vx; mot_y = rk_xy_vy;
+//     rk_automate_mask(2^(7-1) | 2^(8-1));      // both parameters, one write
+//   );
+//
+// Click jumps to the pointer, drag follows, CTRL drags fine from where you
+// grabbed, double-click returns both axes to their defaults. Y is drawn the
+// way people read graphs — ymax at the TOP.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function rk_xy(mem, x, y, w, h, cur_x, cur_y, xmin, xmax, ymin, ymax, xdef, ydef)
+local(over, ht, nvx, nvy, tx, ty, px, py, now, i, gx, gy, rad, changed) (
+  over = rk_live && rk_hit(x, y, w, h);
+  ht = rk_hover(mem, over);
+  rk_claim(over || mem[1]);
+  nvx = cur_x; nvy = cur_y;
+
+  over && lmb_down ? (
+    now = time_precise();
+    (now - mem[4] < 0.3) ? (
+      nvx = xdef; nvy = ydef; mem[1] = 0;
+    ) : (
+      mem[1] = 1;
+      mem[2] = mx; mem[3] = my;                    // grab point (for CTRL fine)
+      mem[8] = cur_x; mem[9] = cur_y;              // value at grab
+      !CTRL ? (                                    // coarse: jump to the pointer
+        nvx = rk_denorm(rk_clamp((mx - x) / max(1, w), 0, 1), xmin, xmax);
+        nvy = rk_denorm(1 - rk_clamp((my - y) / max(1, h), 0, 1), ymin, ymax);
+      );
+    );
+    mem[4] = now;
+  );
+  mem[1] && LMB ? (
+    CTRL ? (
+      nvx = rk_clamp(mem[8] + (mx - mem[2]) / max(1, w) * (xmax - xmin) * 0.25, xmin, xmax);
+      nvy = rk_clamp(mem[9] - (my - mem[3]) / max(1, h) * (ymax - ymin) * 0.25, ymin, ymax);
+    ) : (
+      nvx = rk_denorm(rk_clamp((mx - x) / max(1, w), 0, 1), xmin, xmax);
+      nvy = rk_denorm(1 - rk_clamp((my - y) / max(1, h), 0, 1), ymin, ymax);
+    );
+  );
+  mem[1] && !LMB ? ( mem[1] = 0; mem[5] = 1; );
+
+  // Well
+  rk_col_lift(1, -0.42, 1);
+  gfx_rect(x, y, w, h);
+  i = 1;
+  loop(3,                                          // quarter grid
+    gx = x + w * i * 0.25; gy = y + h * i * 0.25;
+    gfx_set(1, 1, 1, i == 2 ? 0.09 : 0.05);
+    gfx_rect(gx, y, 1, h);
+    gfx_rect(x, gy, w, 1);
+    i += 1;
+  );
+  rk_col(7, 0.55);
+  gfx_rect(x, y, w, h, 0);
+
+  // Puck
+  tx = rk_clamp(rk_norm(nvx, xmin, xmax), 0, 1);
+  ty = rk_clamp(rk_norm(nvy, ymin, ymax), 0, 1);
+  px = x + tx * w;
+  py = y + (1 - ty) * h;
+  rk_pal_get(4);
+  gfx_set(rk_cr, rk_cg, rk_cb, 0.22 + 0.20 * ht);  // crosshair
+  gfx_rect(x, py, w, 1);
+  gfx_rect(px, y, 1, h);
+  rad = max(rk_px(4), min(w, h) * 0.055);
+  mem[1] ? ( rad = rad * 1.15; );
+  gfx_set(0, 0, 0, 0.45);
+  gfx_circle(px + 1, py + 2, rad, 1, 1);
+  gfx_set(rk_cr, rk_cg, rk_cb, 0.30 + 0.35 * ht);  // halo
+  gfx_circle(px, py, rad + rk_px(3) * ht, 0, 1);
+  gfx_set(rk_cr, rk_cg, rk_cb, 1);
+  gfx_circle(px, py, rad, 1, 1);
+  gfx_set(1, 1, 1, 0.45);
+  gfx_circle(px - rad * 0.28, py - rad * 0.28, rad * 0.34, 1, 1);
+
+  rk_xy_vx = nvx; rk_xy_vy = nvy;
+  changed = (nvx != cur_x) || (nvy != cur_y);
+  changed;
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENVELOPE — an ADSR you edit by dragging its own corners. Set sustain's range
+// to 0 and it reads as the AD contour a grain or a percussive layer wants.
+//
+// Times are in whatever unit you keep them in (ms is usual); a_max/d_max/r_max
+// are the full-scale values that map a stage to its share of the width.
+// Returns 1 when anything moved; results land in rk_env_a / _d / _s / _r.
+//
+//   rk_env(m_env, x, y, w, h, g_atk, g_dec, g_sus, g_rel, 500, 2000, 1, 2000) ? (
+//     g_atk = rk_env_a; g_dec = rk_env_d; g_sus = rk_env_s; g_rel = rk_env_r;
+//     rk_automate_mask(2^(2-1) | 2^(3-1) | 2^(4-1) | 2^(5-1));
+//   );
+//
+// Handles: A is the peak, D/S is the corner (drag it sideways for decay, up and
+// down for sustain), R is the tail. The one on top is the one nearest the
+// pointer, so overlapping stages at short times stay reachable.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function _rk_env_handle(hx, hy, rad, lit) (
+  gfx_set(0, 0, 0, 0.45);
+  gfx_circle(hx + 1, hy + 1, rad, 1, 1);
+  rk_pal_get(4);
+  gfx_set(rk_cr, rk_cg, rk_cb, 0.30 * lit);
+  gfx_circle(hx, hy, rad + rk_px(3) * lit, 0, 1);
+  gfx_set(rk_cr, rk_cg, rk_cb, 1);
+  gfx_circle(hx, hy, rad, 1, 1);
+  gfx_set(1, 1, 1, 0.40);
+  gfx_circle(hx - rad * 0.3, hy - rad * 0.3, rad * 0.3, 1, 1);
+);
+
+function rk_env(mem, x, y, w, h, a, d, s, r, a_max, d_max, s_max, r_max)
+local(over, ht, na, nd, ns, nr, seg, xa, xd, xs, xr, ys, rad,
+      da, dd, dr, best, bd, hy, i, gx) (
+  over = rk_live && rk_hit(x, y, w, h);
+  ht = rk_hover(mem, over);
+  rk_claim(over || mem[1]);
+  na = a; nd = d; ns = s; nr = r;
+
+  seg = w * 0.30;                       // each timed stage gets up to 30% ...
+  xa = x + seg * rk_clamp(a / max(0.0001, a_max), 0, 1);
+  xd = xa + seg * rk_clamp(d / max(0.0001, d_max), 0, 1);
+  xs = xd + w * 0.10;                   // ... and the plateau a fixed tenth
+  xr = xs + seg * rk_clamp(r / max(0.0001, r_max), 0, 1);
+  ys = y + h - h * rk_clamp(s / max(0.0001, s_max), 0, 1);
+  rad = max(rk_px(4), min(w, h) * 0.045);
+
+  // Pick a handle on press: nearest within reach, so short stages stacked at
+  // the left edge are still individually grabbable.
+  over && lmb_down && !mem[1] ? (
+    da = abs(mx - xa) + abs(my - y);
+    dd = abs(mx - xd) + abs(my - ys);
+    dr = abs(mx - xr) + abs(my - (y + h));
+    best = 1; bd = da;
+    dd < bd ? ( best = 2; bd = dd; );
+    dr < bd ? ( best = 3; bd = dr; );
+    bd < rad * 6 ? ( mem[1] = best; );
+  );
+  mem[1] && !LMB ? ( mem[1] = 0; mem[5] = 1; );
+
+  mem[1] == 1 ? (
+    na = rk_clamp((mx - x) / max(1, seg), 0, 1) * a_max;
+  );
+  mem[1] == 2 ? (
+    nd = rk_clamp((mx - xa) / max(1, seg), 0, 1) * d_max;
+    ns = rk_clamp((y + h - my) / max(1, h), 0, 1) * s_max;
+  );
+  mem[1] == 3 ? (
+    nr = rk_clamp((mx - xs) / max(1, seg), 0, 1) * r_max;
+  );
+  // Re-solve the geometry from the dragged values so the shape tracks the
+  // pointer in the same frame instead of a frame behind it.
+  mem[1] ? (
+    xa = x + seg * rk_clamp(na / max(0.0001, a_max), 0, 1);
+    xd = xa + seg * rk_clamp(nd / max(0.0001, d_max), 0, 1);
+    xs = xd + w * 0.10;
+    xr = xs + seg * rk_clamp(nr / max(0.0001, r_max), 0, 1);
+    ys = y + h - h * rk_clamp(ns / max(0.0001, s_max), 0, 1);
+  );
+
+  // Well + grid
+  rk_col_lift(1, -0.42, 1);
+  gfx_rect(x, y, w, h);
+  i = 1;
+  loop(3,
+    gx = x + w * i * 0.25;
+    gfx_set(1, 1, 1, 0.05);
+    gfx_rect(gx, y, 1, h);
+    gfx_rect(x, y + h * i * 0.25, w, 1);
+    i += 1;
+  );
+
+  // Shaded body under the contour: one triangle per stage, cheap and exact.
+  rk_pal_get(4);
+  gfx_set(rk_cr, rk_cg, rk_cb, 0.16);
+  gfx_triangle(x, y + h, xa, y, xa, y + h);
+  gfx_triangle(xa, y, xd, ys, xa, y + h);
+  gfx_triangle(xa, y + h, xd, ys, xd, y + h);
+  gfx_triangle(xd, ys, xs, ys, xd, y + h);
+  gfx_triangle(xs, ys, xs, y + h, xd, y + h);
+  gfx_triangle(xs, ys, xr, y + h, xs, y + h);
+
+  // Contour
+  gfx_set(rk_cr, rk_cg, rk_cb, 0.95);
+  gfx_line(x, y + h, xa, y);
+  gfx_line(xa, y, xd, ys);
+  gfx_line(xd, ys, xs, ys);
+  gfx_line(xs, ys, xr, y + h);
+  gfx_set(rk_cr, rk_cg, rk_cb, 0.35);
+  gfx_line(xr, y + h, x + w, y + h);    // silence after release
+
+  rk_col(7, 0.55);
+  gfx_rect(x, y, w, h, 0);
+
+  _rk_env_handle(xa, y, rad, mem[1] == 1 ? 1 : ht * 0.6);
+  _rk_env_handle(xd, ys, rad, mem[1] == 2 ? 1 : ht * 0.6);
+  _rk_env_handle(xr, y + h, rad, mem[1] == 3 ? 1 : ht * 0.6);
+
+  rk_env_a = na; rk_env_d = nd; rk_env_s = ns; rk_env_r = nr;
+  (na != a) || (nd != d) || (ns != s) || (nr != r);
+);

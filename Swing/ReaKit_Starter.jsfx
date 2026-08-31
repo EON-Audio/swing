@@ -1,0 +1,446 @@
+desc:ReaKit Starter — GUI skeleton (grain / pitch / motion / reverb / delay)
+author:EON Studios
+version:1.0
+about:
+  A working ReaKit interface you can copy. Five sections, every widget family
+  wired to a real parameter with automation-safe writes, plus a hand-drawn
+  visualiser panel to show custom graphics living next to kit widgets.
+
+  The DSP here is a deliberate passthrough with an output gain: this file is a
+  GUI skeleton, not an effect. Replace @sample with your engine and keep the
+  @gfx block.
+
+  Part of ReaKit, MIT licensed — see ReaKit/README.md for the guide.
+
+// ── Grain ───────────────────────────────────────────────────────────────────
+slider1:g_size=40<1,500,0.1>Grain Size (ms)
+slider2:g_dens=12<0.5,80,0.1>Grain Density (Hz)
+slider3:g_spray=15<0,100,0.1>Spray (%)
+slider4:g_pos=50<0,100,0.1>Position (%)
+slider5:g_dir=0<0,2,1{Forward,Reverse,Alternate}>Direction
+// ── Pitch ───────────────────────────────────────────────────────────────────
+slider6:p_semi=0<-24,24,1>Pitch (semitones)
+slider7:p_fine=0<-100,100,0.1>Fine (cents)
+slider8:p_mode=0<0,2,1{Repitch,Tuned,Stretch}>Pitch Mode
+slider26:p_scale=0<0,6,1{Chromatic,Major,Minor,Dorian,Phrygian,Lydian,Mixolydian}>Scale
+// ── Motion ──────────────────────────────────────────────────────────────────
+slider9:m_x=0.5<0,1,0.001>Motion X
+slider10:m_y=0.5<0,1,0.001>Motion Y
+slider11:m_div=6<0,15,1>Motion Rate (division)
+slider12:m_on=1<0,1,1>Motion On
+// ── Grain envelope ──────────────────────────────────────────────────────────
+slider13:e_a=20<0,500,0.1>Env Attack (ms)
+slider14:e_d=180<0,2000,0.1>Env Decay (ms)
+slider15:e_s=0.6<0,1,0.001>Env Sustain
+slider16:e_r=300<0,2000,0.1>Env Release (ms)
+// ── Reverb ──────────────────────────────────────────────────────────────────
+slider17:r_size=0.45<0,1,0.001>Reverb Size
+slider18:r_damp=0.35<0,1,0.001>Reverb Damping
+slider19:r_mix=0.25<0,1,0.001>Reverb Mix
+slider20:r_freeze=0<0,1,1>Reverb Freeze
+// ── Delay ───────────────────────────────────────────────────────────────────
+slider21:d_div=7<0,15,1>Delay Division
+slider22:d_fb=0.35<0,0.95,0.001>Delay Feedback
+slider23:d_mix=0.20<0,1,0.001>Delay Mix
+slider24:d_ping=0<0,1,1>Ping-Pong
+// ── Output ──────────────────────────────────────────────────────────────────
+slider25:out_db=0<-24,12,0.1>Output (dB)
+
+import libs/rk_ui_core.jsfx-inc
+import libs/knobs_kbsg.jsfx-inc
+import libs/rk_ui_widgets.jsfx-inc
+import libs/rk_ui_motion.jsfx-inc
+
+@init
+
+// ── Memory ──────────────────────────────────────────────────────────────────
+// One allocator, one cursor. rk_mem_init takes the kit's own block first and
+// hands back the new top; everything after it is yours.
+freemem = 0;
+freemem = rk_mem_init(freemem);
+
+// A state block per interactive control, allocated ONCE. Allocating in @gfx
+// would hand out fresh memory every frame and no control would remember that
+// it was mid-drag.
+m_gsize  = rk_widget_mem();  m_gdens = rk_widget_mem();
+m_gspray = rk_widget_mem();  m_gpos  = rk_widget_mem();
+m_gdir   = rk_widget_mem();
+m_psemi  = rk_widget_mem();  m_pfine = rk_widget_mem();
+m_pmode  = rk_widget_mem();
+m_xy     = rk_widget_mem();  m_mdiv  = rk_widget_mem();
+m_mon    = rk_widget_mem();
+m_env    = rk_widget_mem();
+m_rsize  = rk_widget_mem();  m_rdamp = rk_widget_mem();
+m_rmix   = rk_widget_mem();  m_rfrz  = rk_widget_mem();
+m_ddiv   = rk_widget_mem();  m_dfb   = rk_widget_mem();
+m_dmix   = rk_widget_mem();  m_dping = rk_widget_mem();
+m_out    = rk_widget_mem();  m_meter = rk_widget_mem();
+m_style  = rk_widget_mem();  m_scale = rk_widget_mem();
+
+// The visualiser's own memory — a peak-envelope ring plus a fixed spray table,
+// so grain markers sit still between frames instead of jittering.
+HIST_N = 480;
+hist = rk_alloc(HIST_N);
+SPRAY_N = 64;
+spray = rk_alloc(SPRAY_N);
+_i = 0;
+loop(SPRAY_N, spray[_i] = rand(2) - 1; _i += 1; );
+
+hist_w = 0; hist_acc = 0; hist_n = 0;
+meter_pk = 0;
+
+knob_style = 1;   // 1 = SSL. The header stepper walks all 20 (see knobs_kbsg).
+
+// EEL2 has no string arrays, so a list is a function that writes the label it
+// is asked for. Cheap, and it keeps the strings next to the meanings.
+function scale_name(i, dst) (
+  i == 0 ? ( strcpy(dst, "Chromatic");  ) :
+  i == 1 ? ( strcpy(dst, "Major");      ) :
+  i == 2 ? ( strcpy(dst, "Minor");      ) :
+  i == 3 ? ( strcpy(dst, "Dorian");     ) :
+  i == 4 ? ( strcpy(dst, "Phrygian");   ) :
+  i == 5 ? ( strcpy(dst, "Lydian");     ) :
+           ( strcpy(dst, "Mixolydian"); );
+  dst;
+);
+
+// ── Local composition: one call that draws a ReaKit knob the house way ──────
+// This is the function worth copying. It bolts knobs_kbsg's interact+draw to
+// the core's chrome and tooltip layer, so every knob in the plugin gets the
+// same label, the same readout, the same hover behaviour — and the caller is
+// left with the one line that matters: compare, assign, automate.
+// The knob and the readout are both drawn from `cur` — the value as it stands
+// coming into the frame — never from the freshly-interacted `nv`. Drawing the
+// arc from nv while the caller's text still says cur would let the pointer and
+// the number disagree mid-drag, which reads as a bug. They commit together on
+// the next frame instead.
+function ui_knob(mem, cx, cy, rad, cur, vmin, vmax, vdef, ndet, sym, label, txt)
+local(nv) (
+  nv = rk_knob_interact(knob_style, mem, cx, cy, rad, cur, vmin, vmax, vdef, ndet);
+  rk_pal_get(4);
+  rk_knob_draw(knob_style, cx, cy, rad, cur, vmin, vmax, sym, mem[0],
+               rk_cr, rk_cg, rk_cb, ndet, pn_r, pn_g, pn_b);
+  rk_readout_a(cx, cy - rad - rk_px(17), rk_px(52), rk_px(13), txt);
+  rk_font(9, 1);
+  rk_col(3, 0.90);
+  rk_text_c(cx, cy + rad + rk_px(5), label);
+  rk_tip(cx - rad, cy - rad, rad * 2, rad * 2, label);
+  rk_claim(mem[6]);
+  nv;
+);
+
+@slider
+
+out_lin = pow(10, out_db / 20);
+
+@block
+
+// Sync values follow the host tempo, so they are resolved per block, not per
+// frame: the UI reads what the engine will actually use.
+m_hz    = rk_div_hz(m_div);
+d_secs  = rk_div_seconds(d_div);
+
+@sample
+
+// Passthrough + output gain. Your engine goes here.
+spl0 *= out_lin;
+spl1 *= out_lin;
+
+// Peak follower for the meter, and a decimated peak envelope for the visualiser.
+_pk = max(abs(spl0), abs(spl1));
+meter_pk = max(meter_pk * 0.9999, _pk);
+hist_acc = max(hist_acc, _pk);
+hist_n += 1;
+hist_n >= (srate / 120) ? (
+  hist[hist_w] = hist_acc;
+  hist_w = (hist_w + 1) % HIST_N;
+  hist_acc = 0;
+  hist_n = 0;
+);
+
+@gfx 720 560
+
+rk_frame_begin(720, 560);
+rk_pal_adopt();          // takes the live EON theme when its bridge is running
+rk_backdrop();
+
+rk_pal_get(1); pn_r = rk_cr; pn_g = rk_cg; pn_b = rk_cb;
+
+// ── Header ──────────────────────────────────────────────────────────────────
+rk_font(17, 1);
+rk_col(2, 1);
+rk_text(rk_px(16), rk_px(11), "ReaKit Starter");
+rk_font(9, 0);
+rk_col(3, 0.85);
+rk_text(rk_px(16) + rk_px(112), rk_px(17), "GUI SKELETON");
+
+// Knob-style stepper — 20 console looks, one shared feel. Drag or wheel it and
+// every knob on the panel changes together; the interaction never does.
+sprintf(#s, "KNOB %d", knob_style);
+_nv = rk_field(m_style, rk_W - rk_px(96), rk_px(12), rk_px(80), rk_px(18),
+               knob_style, 1, 20, 1, 1, #s);
+_nv != knob_style ? ( knob_style = floor(_nv + 0.5); );
+rk_tip(rk_W - rk_px(96), rk_px(12), rk_px(80), rk_px(18),
+       "Knob style — drag, wheel, or double-click for SSL");
+
+rk_sep_h(rk_px(14), rk_px(38), rk_W - rk_px(28));
+
+// ── Layout grid ─────────────────────────────────────────────────────────────
+col_w = (rk_W - rk_px(42)) * 0.5;
+col_l = rk_px(14);
+col_r = col_l + col_w + rk_px(14);
+row_y = rk_px(48);
+sec_h1 = rk_px(120);    // grain / pitch  (readout + knob + label + selector)
+sec_h2 = rk_px(132);    // motion / envelope
+sec_h3 = rk_px(112);    // reverb / delay
+
+// ═══ GRAIN ══════════════════════════════════════════════════════════════════
+cy = rk_section(col_l, row_y, col_w, sec_h1, "GRAIN", 10);
+kr = rk_px(19);
+kx = col_l + col_w * 0.16;
+ky = cy + rk_px(37);
+kp = col_w * 0.225;
+
+sprintf(#s, "%.0f ms", g_size);
+_nv = ui_knob(m_gsize, kx, ky, kr, g_size, 1, 500, 40, 0, 0, "SIZE", #s);
+_nv != g_size ? ( g_size = _nv; rk_automate(1); );
+
+sprintf(#s, "%.1f Hz", g_dens);
+_nv = ui_knob(m_gdens, kx + kp, ky, kr, g_dens, 0.5, 80, 12, 0, 0, "DENSITY", #s);
+_nv != g_dens ? ( g_dens = _nv; rk_automate(2); );
+
+sprintf(#s, "%.0f %%", g_spray);
+_nv = ui_knob(m_gspray, kx + kp * 2, ky, kr, g_spray, 0, 100, 15, 0, 0, "SPRAY", #s);
+_nv != g_spray ? ( g_spray = _nv; rk_automate(3); );
+
+sprintf(#s, "%.0f %%", g_pos);
+_nv = ui_knob(m_gpos, kx + kp * 3, ky, kr, g_pos, 0, 100, 50, 0, 0, "POSITION", #s);
+_nv != g_pos ? ( g_pos = _nv; rk_automate(4); );
+
+// Segmented selector: mutually exclusive, wheel-steppable, one automate site.
+_sx = col_l + rk_px(10);
+_sy = row_y + sec_h1 - rk_px(24);
+_nv = rk_seg_begin(m_gdir, _sx, _sy, col_w - rk_px(20), rk_px(18), 3, g_dir);
+rk_seg_item(0, "FORWARD")   ? ( _nv = 0; );
+rk_seg_item(1, "REVERSE")   ? ( _nv = 1; );
+rk_seg_item(2, "ALTERNATE") ? ( _nv = 2; );
+_nv != g_dir ? ( g_dir = _nv; rk_automate(5); );
+
+// ═══ PITCH ══════════════════════════════════════════════════════════════════
+cy = rk_section(col_r, row_y, col_w, sec_h1, "PITCH", 10);
+kx = col_r + col_w * 0.22;
+ky = cy + rk_px(37);
+
+// Detented knob: 49 stops across -24..+24 makes every semitone a click.
+sprintf(#s, "%+d st", p_semi);
+_nv = ui_knob(m_psemi, kx, ky, kr, p_semi, -24, 24, 0, 49, 1, "SEMITONES", #s);
+_nv != p_semi ? ( p_semi = floor(_nv + 0.5); rk_automate(6); );
+
+sprintf(#s, "%+.0f ct", p_fine);
+_nv = ui_knob(m_pfine, kx + col_w * 0.30, ky, kr, p_fine, -100, 100, 0, 0, 1, "FINE", #s);
+_nv != p_fine ? ( p_fine = _nv; rk_automate(7); );
+
+// The scale list is drawn at the very end of the frame (see below); all this
+// section does is reserve where its chip goes.
+sc_w = rk_px(84); sc_h = rk_px(18);
+sc_x = col_r + col_w - sc_w - rk_px(10);
+sc_y = cy + rk_px(2);
+rk_font(8, 0);
+rk_col(3, 0.75);
+rk_text_r(sc_x - rk_px(5), sc_y + rk_px(4), "SCALE");
+
+// No guard needed here: the open scale list covers this row and the envelope
+// below it, and every ReaKit control hit-tests against rk_live — so both stand
+// down on their own while the list is up. Only widgets from other libraries
+// (knobs_kbsg, sliders_kbsg) need a caller-side !rk_modal gate.
+_sx = col_r + rk_px(10);
+_nv = rk_seg_begin(m_pmode, _sx, _sy, col_w - rk_px(20), rk_px(18), 3, p_mode);
+rk_seg_item(0, "REPITCH") ? ( _nv = 0; );
+rk_seg_item(1, "TUNED")   ? ( _nv = 1; );
+rk_seg_item(2, "STRETCH") ? ( _nv = 2; );
+_nv != p_mode ? ( p_mode = _nv; rk_automate(8); );
+
+// ═══ MOTION ═════════════════════════════════════════════════════════════════
+row_y = row_y + sec_h1 + rk_px(10);
+cy = rk_section(col_l, row_y, col_w, sec_h2, "MOTION", 10);
+
+pad_s = min(col_w * 0.52, sec_h2 - rk_px(46));
+pad_x = col_l + rk_px(12);
+pad_y = cy + rk_px(4);
+
+// Two parameters, one grab. rk_xy publishes both and returns 1 when either
+// moved, so the pair is written — and automated — together.
+rk_xy(m_xy, pad_x, pad_y, pad_s, pad_s, m_x, m_y, 0, 1, 0, 1, 0.5, 0.5) ? (
+  m_x = rk_xy_vx; m_y = rk_xy_vy;
+  rk_automate_mask(2 ^ (9 - 1) | 2 ^ (10 - 1));
+);
+rk_tip(pad_x, pad_y, pad_s, pad_s, "Motion path — drag; CTRL for fine");
+
+_rx = pad_x + pad_s + rk_px(14);
+_rw = col_l + col_w - _rx - rk_px(12);
+
+rk_font(9, 1);
+rk_col(3, 0.90);
+rk_text(_rx, pad_y + rk_px(2), "RATE");
+_nv = rk_div_chip(m_mdiv, _rx, pad_y + rk_px(14), _rw, rk_px(20), m_div, 6);
+_nv != m_div ? ( m_div = _nv; rk_automate(11); );
+rk_tip(_rx, pad_y + rk_px(14), _rw, rk_px(20),
+       "Tempo-synced rate — wheel to step, double-click for 1/8");
+
+_nv = rk_toggle_led(m_mon, _rx, pad_y + rk_px(42), _rw, rk_px(20), "RUN", m_on);
+_nv != m_on ? ( m_on = _nv; rk_automate(12); );
+
+// The resolved rate, shown in the units a musician checks against: Hz.
+sprintf(#s, "%.2f Hz", rk_div_hz(m_div));
+rk_readout_a(_rx + _rw * 0.5, pad_y + rk_px(70), _rw, rk_px(15), #s);
+rk_font(8, 0);
+rk_col(3, 0.75);
+rk_text_c(_rx + _rw * 0.5, pad_y + rk_px(88), "AT HOST TEMPO");
+
+// ═══ ENVELOPE ═══════════════════════════════════════════════════════════════
+cy = rk_section(col_r, row_y, col_w, sec_h2, "GRAIN ENVELOPE", 10);
+env_x = col_r + rk_px(12);
+env_w = col_w - rk_px(24);
+env_h = sec_h2 - rk_px(52);
+
+rk_env(m_env, env_x, cy + rk_px(4), env_w, env_h,
+       e_a, e_d, e_s, e_r, 500, 2000, 1, 2000) ? (
+  e_a = rk_env_a; e_d = rk_env_d; e_s = rk_env_s; e_r = rk_env_r;
+  rk_automate_mask(2 ^ (13 - 1) | 2 ^ (14 - 1) | 2 ^ (15 - 1) | 2 ^ (16 - 1));
+);
+rk_tip(env_x, cy + rk_px(4), env_w, env_h,
+       "Drag the corners — peak, decay/sustain, release");
+
+rk_font(8, 0);
+rk_col(3, 0.80);
+sprintf(#s, "A %.0f    D %.0f    S %.2f    R %.0f", e_a, e_d, e_s, e_r);
+rk_text_c(col_r + col_w * 0.5, cy + rk_px(10) + env_h, #s);
+
+// ═══ REVERB ═════════════════════════════════════════════════════════════════
+row_y = row_y + sec_h2 + rk_px(10);
+cy = rk_section(col_l, row_y, col_w, sec_h3, "REVERB", 10);
+kx = col_l + col_w * 0.17;
+ky = cy + rk_px(37);
+kp = col_w * 0.22;
+
+sprintf(#s, "%.0f %%", r_size * 100);
+_nv = ui_knob(m_rsize, kx, ky, kr, r_size, 0, 1, 0.45, 0, 0, "SIZE", #s);
+_nv != r_size ? ( r_size = _nv; rk_automate(17); );
+
+sprintf(#s, "%.0f %%", r_damp * 100);
+_nv = ui_knob(m_rdamp, kx + kp, ky, kr, r_damp, 0, 1, 0.35, 0, 0, "DAMP", #s);
+_nv != r_damp ? ( r_damp = _nv; rk_automate(18); );
+
+sprintf(#s, "%.0f %%", r_mix * 100);
+_nv = ui_knob(m_rmix, kx + kp * 2, ky, kr, r_mix, 0, 1, 0.25, 0, 0, "MIX", #s);
+_nv != r_mix ? ( r_mix = _nv; rk_automate(19); );
+
+_nv = rk_toggle_led(m_rfrz, col_l + col_w - rk_px(78), ky - rk_px(10),
+                    rk_px(66), rk_px(20), "FREEZE", r_freeze);
+_nv != r_freeze ? ( r_freeze = _nv; rk_automate(20); );
+
+// ═══ DELAY ══════════════════════════════════════════════════════════════════
+cy = rk_section(col_r, row_y, col_w, sec_h3, "DELAY", 10);
+kx = col_r + col_w * 0.19;
+ky = cy + rk_px(37);
+
+sprintf(#s, "%.0f %%", d_fb * 100);
+_nv = ui_knob(m_dfb, kx, ky, kr, d_fb, 0, 0.95, 0.35, 0, 0, "FEEDBACK", #s);
+_nv != d_fb ? ( d_fb = _nv; rk_automate(22); );
+
+sprintf(#s, "%.0f %%", d_mix * 100);
+_nv = ui_knob(m_dmix, kx + kp, ky, kr, d_mix, 0, 1, 0.20, 0, 0, "MIX", #s);
+_nv != d_mix ? ( d_mix = _nv; rk_automate(23); );
+
+_dx = col_r + col_w * 0.52;
+_dw = col_w * 0.40;
+_nv = rk_div_chip(m_ddiv, _dx, ky - rk_px(18), _dw, rk_px(20), d_div, 7);
+_nv != d_div ? ( d_div = _nv; rk_automate(21); );
+
+// The same division, in the milliseconds an engineer thinks in.
+sprintf(#s, d_div < 1 ? "FREE" : "%.0f ms", rk_div_seconds(d_div) * 1000);
+rk_readout_a(_dx + _dw * 0.5, ky + rk_px(6), _dw, rk_px(14), #s);
+
+_nv = rk_toggle(m_dping, _dx, ky + rk_px(24), _dw, rk_px(18), "PING-PONG", d_ping);
+_nv != d_ping ? ( d_ping = _nv; rk_automate(24); );
+
+// ═══ VISUALISER + OUTPUT ════════════════════════════════════════════════════
+// The part ReaKit deliberately does NOT own. Your instrument's own graphics
+// live here, drawn straight to gfx_* against the same palette, sharing the
+// frame's mouse state. Nothing above knows or cares what this panel draws.
+row_y = row_y + sec_h3 + rk_px(10);
+viz_h = rk_H - row_y - rk_px(14);
+viz_w = rk_W - rk_px(28) - rk_px(38);
+viz_x = rk_px(14);
+
+rk_panel(viz_x, row_y, viz_w, viz_h, rk_px(4));
+
+_ix = viz_x + 2;
+_iy = row_y + 2;
+_iw = viz_w - 4;
+_ih = viz_h - 4;
+gfx_set(0, 0, 0, 0.35);
+gfx_rect(_ix, _iy, _iw, _ih);
+
+// Peak envelope, oldest at the left.
+rk_pal_get(4);
+i = 0;
+loop(HIST_N,
+  _v = hist[(hist_w + i) % HIST_N];
+  _bx = _ix + i / HIST_N * _iw;
+  _bh = min(_ih * 0.5, _v * _ih * 0.5);
+  gfx_set(rk_cr, rk_cg, rk_cb, 0.55);
+  gfx_rect(_bx, _iy + _ih * 0.5 - _bh, max(1, _iw / HIST_N), _bh * 2);
+  i += 1;
+);
+
+// Grain markers: density sets the spacing, spray the scatter, position the
+// playhead. Reading the parameters, not the audio — which is the point: the
+// custom view stays in step with the kit's controls for free.
+_gn = min(48, max(2, floor(g_dens)));
+i = 0;
+loop(_gn,
+  _t = i / _gn + spray[i % SPRAY_N] * g_spray * 0.0008;
+  _t = _t - floor(_t);
+  _gx = _ix + _t * _iw;
+  gfx_set(1, 1, 1, 0.16);
+  gfx_rect(_gx, _iy + _ih * 0.5 - rk_px(5), 1, rk_px(10));
+  i += 1;
+);
+_px = _ix + g_pos * 0.01 * _iw;
+rk_pal_get(5);
+gfx_set(rk_cr, rk_cg, rk_cb, 0.9);
+gfx_rect(_px, _iy, 1, _ih);
+gfx_circle(_px, _iy + rk_px(4), rk_px(3), 1, 1);
+
+rk_font(8, 0);
+rk_col(3, 0.65);
+rk_text(_ix + rk_px(6), _iy + rk_px(4), "YOUR VISUALISATION — plain gfx_*, kit palette");
+
+// Output: fader + meter, the only place the starter touches audio.
+_ox = rk_W - rk_px(38);
+sprintf(#s, "%+.1f", out_db);
+_nv = rk_field(m_out, _ox, row_y, rk_px(24), rk_px(16), out_db, -24, 12, 0, 0.5, #s);
+_nv != out_db ? ( out_db = _nv; rk_automate(25); out_lin = pow(10, out_db / 20); );
+rk_meter_v(m_meter, _ox, row_y + rk_px(20), rk_px(24), viz_h - rk_px(20),
+           rk_db(meter_pk), -48, 6);
+rk_tip(_ox, row_y, rk_px(24), viz_h, "Output level — drag the field, watch the meter");
+
+// ═══ OVERLAY ════════════════════════════════════════════════════════════════
+// A dropdown paints its open list immediately, so it goes LAST — after every
+// panel it might cover. rk_frame_end() still puts tooltips above it.
+scale_name(p_scale, #s);
+_nv = p_scale;
+rk_combo_begin(m_scale, sc_x, sc_y, sc_w, sc_h, p_scale, #s) ? (
+  rk_combo_item(0, "Chromatic")  ? ( _nv = 0; );
+  rk_combo_item(1, "Major")      ? ( _nv = 1; );
+  rk_combo_item(2, "Minor")      ? ( _nv = 2; );
+  rk_combo_item(3, "Dorian")     ? ( _nv = 3; );
+  rk_combo_item(4, "Phrygian")   ? ( _nv = 4; );
+  rk_combo_item(5, "Lydian")     ? ( _nv = 5; );
+  rk_combo_item(6, "Mixolydian") ? ( _nv = 6; );
+  rk_combo_end();
+);
+_nv != p_scale ? ( p_scale = _nv; rk_automate(26); );
+
+rk_frame_end();

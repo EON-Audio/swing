@@ -1,0 +1,418 @@
+// ============================================================================
+// rk_ui_widgets.jsfx-inc — ReaKit controls that aren't knobs or faders:
+//   buttons, toggles, LED pills, segmented selectors, dropdowns, drag-fields
+//   and level meters.
+//
+//   (c) EON Studios. Part of ReaKit, released under the MIT License — see
+//   ReaKit/LICENSE.
+//
+//   REQUIRES: rk_ui_core.jsfx-inc (imported first — the frame contract, the
+//   palette and the state allocator all live there).
+//
+//   EVERY control here follows the same three rules as knobs_kbsg:
+//     1. It never writes a parameter. It RETURNS a value; you compare, assign
+//        and call rk_automate(n). See rk_ui_core's AUTOMATION-SAFE WRITES.
+//     2. It takes a 16-slot state block from rk_widget_mem(), allocated once
+//        in @init.
+//     3. CTRL = fine, double-click = default, wheel = step, hover animates at
+//        hv_speed. A user who learns one ReaKit control has learned all of them.
+//
+//   Why these and not more knobs: a synth section is mostly not knobs. It is
+//   mode switches, sync divisions, on/off states and a meter — and those were
+//   exactly the parts every plugin used to hand-roll.
+// ============================================================================
+
+@init
+
+__rk_ui_widgets_loaded = 1;
+
+// 1 while a dropdown list is open. Every ReaKit control hit-tests against
+// rk_live (which rk_frame_begin() derives from this), so controls the open list
+// covers stand down on their own — no caller bookkeeping. Widgets from OTHER
+// libraries don't know about it, so gate those yourself:
+//   !rk_modal ? ( ... knobs_kbsg / sliders_kbsg input ... );
+// A combo is drawn LAST (see the ordering rule below), so it reports itself
+// through rk_modal_acc and rk_frame_end() publishes that into rk_modal for the
+// next frame — which is the frame whose input needs gating.
+rk_modal = 0;
+rk_modal_acc = 0;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LED — the indicator every hardware panel uses to say "this is on".
+// on_t is 0..1 so you can fade it (a toggle's hover_t, an envelope follower,
+// a gate's open amount) instead of blinking it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function rk_led(cx, cy, rad, on_t, r, g, b) (
+  gfx_set(0, 0, 0, 0.55);                       // bezel
+  gfx_circle(cx, cy, rad + 1, 1, 1);
+  gfx_set(r * 0.22, g * 0.22, b * 0.22, 1);     // dark glass when off
+  gfx_circle(cx, cy, rad, 1, 1);
+  on_t > 0.01 ? (
+    gfx_set(r, g, b, on_t);
+    gfx_circle(cx, cy, rad, 1, 1);
+    gfx_set(r, g, b, 0.22 * on_t);              // bloom
+    gfx_circle(cx, cy, rad + 1, 0, 1);
+    gfx_circle(cx, cy, rad + 2, 0, 1);
+    gfx_set(1, 1, 1, 0.35 * on_t);              // hot centre
+    gfx_circle(cx - rad * 0.25, cy - rad * 0.25, rad * 0.32, 1, 1);
+  );
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BUTTON BODY — the shared look. Drawn by every button/toggle/segment cell so
+// a row of mixed controls reads as one row of hardware.
+//   press: 0 = raised, 1 = pushed in
+//   on:    0..1 = how "lit" the body is (a toggle's state, animated)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function rk_btn_body(x, y, w, h, hover_t, press, on) local(rad, lift) (
+  rad = max(2, floor(min(w, h) * 0.18));
+  gfx_set(0, 0, 0, press ? 0.15 : 0.30);
+  rk_fill_round(x + 1, y + (press ? 1 : 2), w, h, rad);
+  on > 0.01 ? (
+    rk_pal_get(4);
+    gfx_set(rk_cr * (0.30 + 0.45 * on), rk_cg * (0.30 + 0.45 * on),
+            rk_cb * (0.30 + 0.45 * on), 1);
+  ) : (
+    lift = press ? -0.18 : 0.06 * hover_t;
+    rk_col_lift(1, lift, 1);
+  );
+  rk_fill_round(x, y, w, h, rad);
+  !press ? (                                     // top bevel
+    gfx_set(1, 1, 1, 0.10 + 0.06 * hover_t);
+    gfx_line(x + rad, y + 1, x + w - rad - 1, y + 1);
+  );
+  on > 0.01 ? ( rk_pal_get(4); gfx_set(rk_cr, rk_cg, rk_cb, 0.55 + 0.35 * on); )
+            : ( rk_col(7, 0.50 + 0.35 * hover_t); );
+  gfx_roundrect(floor(x), floor(y), floor(w) - 1, floor(h) - 1, rad, 1);
+);
+
+// Momentary button. Returns 1 on the frame it is pressed.
+//   rk_button(b_load, x, y, w, h, "LOAD") ? ( do_the_thing(); );
+function rk_button(mem, x, y, w, h, label) local(over, ht, clicked) (
+  over = rk_live && rk_hit(x, y, w, h);
+  ht = rk_hover(mem, over);
+  rk_claim(over);
+  clicked = over && lmb_down;
+  clicked ? ( mem[1] = 1; );
+  !LMB ? ( mem[1] = 0; );
+  rk_btn_body(x, y, w, h, ht, mem[1] && over, 0);
+  rk_font(9, 1);
+  rk_col(2, 0.70 + 0.30 * ht);
+  rk_text_box(x, y + (mem[1] && over ? 1 : 0), w, h, label);
+  clicked;
+);
+
+// Toggle. Returns the new state — compare against the old one:
+//   nv = rk_toggle(t_sync, x, y, w, h, "SYNC", dly_sync);
+//   nv != dly_sync ? ( dly_sync = nv; rk_automate(9); );
+function rk_toggle(mem, x, y, w, h, label, state) local(over, ht, nv) (
+  over = rk_live && rk_hit(x, y, w, h);
+  ht = rk_hover(mem, over);
+  rk_claim(over);
+  nv = state;
+  over && lmb_down ? ( nv = state ? 0 : 1; );
+  // mem[7] eases the lit state so a toggle glows on instead of snapping.
+  mem[7] = nv ? min(mem[7] + dt * hv_speed, 1) : max(mem[7] - dt * hv_speed, 0);
+  rk_btn_body(x, y, w, h, ht, 0, mem[7]);
+  rk_font(9, 1);
+  mem[7] > 0.5 ? ( rk_col(2, 0.95); ) : ( rk_col(3, 0.75 + 0.25 * ht); );
+  rk_text_box(x, y, w, h, label);
+  nv;
+);
+
+// Toggle with an LED in the left margin — the BYPASS / FREEZE / PING-PONG pill.
+// Same return contract as rk_toggle.
+function rk_toggle_led(mem, x, y, w, h, label, state) local(over, ht, nv, lr) (
+  over = rk_live && rk_hit(x, y, w, h);
+  ht = rk_hover(mem, over);
+  rk_claim(over);
+  nv = state;
+  over && lmb_down ? ( nv = state ? 0 : 1; );
+  mem[7] = nv ? min(mem[7] + dt * hv_speed, 1) : max(mem[7] - dt * hv_speed, 0);
+  rk_btn_body(x, y, w, h, ht, 0, 0);
+  lr = max(2, floor(h * 0.18));
+  rk_pal_get(4);
+  rk_led(x + lr * 2.2, y + h * 0.5, lr, mem[7], rk_cr, rk_cg, rk_cb);
+  rk_font(9, 1);
+  mem[7] > 0.5 ? ( rk_col(2, 0.95); ) : ( rk_col(3, 0.72 + 0.28 * ht); );
+  rk_text_box(x + lr * 3, y, w - lr * 3, h, label);
+  nv;
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SEGMENTED SELECTOR — a row of mutually exclusive cells (grain direction,
+// filter mode, delay routing). EEL2 has no string arrays, so the control is
+// opened, filled cell by cell, and closed:
+//
+//   nv = rk_seg_begin(seg_dir, x, y, w, h, 3, gr_dir);   // wheel over the row
+//   rk_seg_item(0, "FWD") ? ( nv = 0; );
+//   rk_seg_item(1, "REV") ? ( nv = 1; );
+//   rk_seg_item(2, "ALT") ? ( nv = 2; );
+//   nv != gr_dir ? ( gr_dir = nv; rk_automate(6); );
+// ─────────────────────────────────────────────────────────────────────────────
+
+function rk_seg_begin(mem, x, y, w, h, n, cur) local(over, nv) (
+  rk_seg_x = x; rk_seg_y = y; rk_seg_h = h; rk_seg_n = max(1, n);
+  rk_seg_cw = w / max(1, n);
+  rk_seg_cur = cur;
+  over = rk_live && rk_hit(x, y, w, h);
+  rk_hover(mem, over);
+  rk_claim(over);
+  nv = cur;
+  // Wheel anywhere over the row steps through the cells — the same gesture
+  // that steps a detented knob.
+  over && frame_wheel != 0 ? (
+    nv = rk_clamp(cur + (frame_wheel > 0 ? 1 : -1), 0, rk_seg_n - 1);
+  );
+  // Recessed housing behind the cells.
+  rk_col_lift(1, -0.30, 1);
+  rk_fill_round(x, y, w, h, max(2, floor(h * 0.18)));
+  nv;
+);
+
+// Draws cell i. Returns 1 on the frame it is clicked.
+function rk_seg_item(i, label) local(cx, over, sel, clicked, pad) (
+  pad = max(1, floor(rk_seg_cw * 0.03));
+  cx = rk_seg_x + i * rk_seg_cw;
+  over = rk_live && rk_hit(cx, rk_seg_y, rk_seg_cw, rk_seg_h);
+  sel = (i == rk_seg_cur);
+  clicked = over && lmb_down;
+  sel ? (
+    rk_pal_get(4);
+    gfx_set(rk_cr * 0.55, rk_cg * 0.55, rk_cb * 0.55, 1);
+    rk_fill_round(cx + pad, rk_seg_y + pad, rk_seg_cw - pad * 2, rk_seg_h - pad * 2,
+                  max(2, floor(rk_seg_h * 0.16)));
+    gfx_set(rk_cr, rk_cg, rk_cb, 0.85);
+    gfx_roundrect(floor(cx + pad), floor(rk_seg_y + pad),
+                  floor(rk_seg_cw - pad * 2) - 1, floor(rk_seg_h - pad * 2) - 1,
+                  max(2, floor(rk_seg_h * 0.16)), 1);
+  ) : (
+    over ? (
+      rk_col_lift(1, 0.10, 1);
+      rk_fill_round(cx + pad, rk_seg_y + pad, rk_seg_cw - pad * 2, rk_seg_h - pad * 2,
+                    max(2, floor(rk_seg_h * 0.16)));
+    );
+  );
+  rk_font(9, 1);
+  sel ? ( rk_col(2, 0.98); ) : ( rk_col(3, over ? 0.95 : 0.72); );
+  rk_text_box(cx, rk_seg_y, rk_seg_cw, rk_seg_h, label);
+  clicked;
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DROPDOWN — for lists too long for a segmented row (scales, LFO shapes,
+// routing targets). Same open/item/close shape as the segmented selector.
+//
+//   ORDERING RULE: the open list paints immediately, so draw a combo AFTER the
+//   controls it may overlap — in practice, last in your @gfx (but before
+//   rk_frame_end(), which puts tooltips on top). While a list is open rk_modal
+//   is 1: gate your other input on it.
+//
+//   rk_combo_begin(c_scale, x, y, w, h, scale_idx, "Dorian") ? (
+//     rk_combo_item(0, "Chromatic") ? ( nv = 0; );
+//     rk_combo_item(1, "Dorian")    ? ( nv = 1; );
+//     ...
+//     rk_combo_end();
+//   );
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Draws the closed chip; returns 1 while the list is open (so the caller can
+// skip building rows that nobody can see).
+function rk_combo_begin(mem, x, y, w, h, cur, cur_label) local(over, ht) (
+  // Deliberately NOT gated on rk_live: the combo is the overlay that clears it.
+  over = rk_hit(x, y, w, h);
+  ht = rk_hover(mem, over);
+  rk_claim(over);
+  over && lmb_down ? ( mem[1] = mem[1] ? 0 : 1; mem[8] = 0; );
+  rk_combo_x = x; rk_combo_y = y; rk_combo_w = w; rk_combo_h = h;
+  rk_combo_open = mem[1];
+  rk_combo_cur = cur;
+  rk_combo_mem = mem;
+  rk_combo_pick = -1;
+  rk_combo_rows = 0;
+  rk_combo_open ? ( rk_modal_acc = 1; );
+
+  rk_btn_body(x, y, w, h, ht, rk_combo_open, 0);
+  rk_font(9, 0);
+  rk_col(2, 0.75 + 0.25 * ht);
+  rk_text(x + rk_px(6), y + (h - rk_px(9)) * 0.5 - 1, cur_label);
+  rk_col(3, 0.85);                                   // caret
+  gfx_triangle(x + w - rk_px(12), y + h * 0.5 - rk_px(2),
+               x + w - rk_px(4),  y + h * 0.5 - rk_px(2),
+               x + w - rk_px(8),  y + h * 0.5 + rk_px(3));
+  rk_combo_open;
+);
+
+// One row. Returns 1 on the frame it is chosen. Rows stack downward from the
+// chip; the panel is painted behind them by the first row.
+function rk_combo_item(i, label) local(ry, over, picked) (
+  ry = rk_combo_y + rk_combo_h + 2 + i * rk_combo_h;
+  rk_combo_rows = i + 1;
+  over = rk_hit(rk_combo_x, ry, rk_combo_w, rk_combo_h);
+  picked = over && lmb_down;
+  over ? (
+    rk_pal_get(4);
+    gfx_set(rk_cr * 0.45, rk_cg * 0.45, rk_cb * 0.45, 1);
+  ) : (
+    rk_col_lift(1, 0.04, 1);
+  );
+  gfx_rect(rk_combo_x, ry, rk_combo_w, rk_combo_h);
+  i == rk_combo_cur ? (
+    rk_pal_get(4);
+    gfx_set(rk_cr, rk_cg, rk_cb, 1);
+    gfx_circle(rk_combo_x + rk_px(6), ry + rk_combo_h * 0.5, rk_px(2), 1, 1);
+  );
+  rk_font(9, 0);
+  (i == rk_combo_cur || over) ? ( rk_col(2, 0.98); ) : ( rk_col(3, 0.80); );
+  rk_text(rk_combo_x + rk_px(13), ry + (rk_combo_h - rk_px(9)) * 0.5 - 1, label);
+  picked ? ( rk_combo_pick = i; );
+  picked;
+);
+
+// Closes the list frame. Any click (inside or out) dismisses it, so a stray
+// click can never leave a list stranded over the panel.
+function rk_combo_end() local(ly, lh) (
+  ly = rk_combo_y + rk_combo_h + 2;
+  lh = rk_combo_rows * rk_combo_h;
+  gfx_set(0, 0, 0, 0.35);                              // shadow, outside edges
+  gfx_rect(rk_combo_x + rk_combo_w, ly + 2, 2, lh);
+  gfx_rect(rk_combo_x + 2, ly + lh, rk_combo_w, 2);
+  rk_col(7, 0.85);
+  gfx_rect(rk_combo_x, ly, rk_combo_w, lh, 0);
+  lmb_down && !rk_hit(rk_combo_x, rk_combo_y, rk_combo_w, rk_combo_h) ? (
+    rk_combo_mem[1] = 0;
+  );
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DRAG FIELD — a number you grab. For values a knob would flatter but not
+// serve: grain counts, semitones, milliseconds you actually read.
+// Drag vertically (CTRL fine), wheel to step, double-click for the default.
+// Returns the new value; the caller formats and supplies the text.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function rk_field(mem, x, y, w, h, cur, vmin, vmax, vdef, step, txt)
+local(over, ht, nv, now, fine) (
+  over = rk_live && rk_hit(x, y, w, h);
+  ht = rk_hover(mem, over);
+  rk_claim(over || mem[1]);
+  nv = cur;
+  mem[5] = 0;
+
+  over && lmb_down ? (                                // double-click -> default
+    now = time_precise();
+    (now - mem[4] < 0.3) ? ( nv = vdef; mem[5] = 1; );
+    mem[4] = now;
+  );
+  lmb_down && over && !mem[1] && !mem[5] ? (          // start drag
+    mem[1] = 1; mem[2] = my; mem[3] = cur;
+  );
+  mem[1] && LMB ? (                                   // 200px = full range
+    fine = CTRL ? 0.1 : 1;
+    nv = rk_clamp(mem[3] + (mem[2] - my) / 200 * (vmax - vmin) * fine, vmin, vmax);
+  );
+  mem[1] && !LMB ? ( mem[1] = 0; mem[5] = 1; );
+  over && frame_wheel != 0 ? (
+    nv = rk_clamp(cur + frame_wheel * step * (CTRL ? 0.25 : 1), vmin, vmax);
+    mem[5] = 1;
+  );
+
+  // Recessed slot, brighter as you hover, accent-framed while dragging.
+  rk_col_lift(1, -0.35, 1);
+  rk_fill_round(x, y, w, h, max(2, floor(h * 0.16)));
+  mem[1] ? ( rk_pal_get(4); gfx_set(rk_cr, rk_cg, rk_cb, 0.75); )
+         : ( rk_col(7, 0.40 + 0.35 * ht); );
+  gfx_roundrect(floor(x), floor(y), floor(w) - 1, floor(h) - 1,
+                max(2, floor(h * 0.16)), 1);
+  rk_font(max(8, h / rk_sc * 0.55), 1);
+  rk_col(2, 0.80 + 0.20 * ht);
+  rk_text_box(x, y, w, h, txt);
+  nv;
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// METERS — segmented level bars.
+//
+// Deliberately NOT vu_kbsg: that library is a faithful port of three hardware
+// VUs and owns a fixed memory block (addresses 0-437) plus a gmem theme hookup,
+// which is fine inside an EON plugin and hostile inside anyone else's. These
+// take no fixed memory, no theme bridge and no physics — you feed them dB.
+//
+// Peak hold lives in the widget's own block: mem[8] = held dB, mem[9] = timer.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function rk_db(x) ( 20 * log10(max(x, 0.0000000001)); );
+
+function _rk_meter_hold(mem, db, hold_s) (
+  db >= mem[8] ? ( mem[8] = db; mem[9] = hold_s; )
+               : ( mem[9] -= dt;
+                   mem[9] <= 0 ? ( mem[8] = max(db, mem[8] - dt * 24); ); );
+);
+
+// Vertical segmented meter. db_lo/db_hi bound the scale (e.g. -60, +6).
+function rk_meter_v(mem, x, y, w, h, db, db_lo, db_hi)
+local(i, n, sh, t, lit, sy, seg_t) (
+  _rk_meter_hold(mem, db, 1.2);
+  gfx_set(0, 0, 0, 0.55);
+  gfx_rect(x, y, w, h);
+  n = max(6, floor(h / max(3, rk_px(4))));
+  sh = h / n;
+  t = rk_clamp(rk_norm(db, db_lo, db_hi), 0, 1);
+  lit = t * n;
+  i = 0;
+  loop(n,
+    sy = y + h - (i + 1) * sh;
+    seg_t = i / max(1, n - 1);
+    i < lit ? (
+      // Green body, amber shoulder, red top — read at a glance, no legend.
+      seg_t > 0.92 ? ( rk_col(6, 1); ) :
+      seg_t > 0.78 ? ( gfx_set(0.95, 0.72, 0.20, 1); ) :
+                     ( rk_pal_get(4); gfx_set(rk_cr, rk_cg, rk_cb, 1); );
+    ) : (
+      gfx_set(1, 1, 1, 0.05);
+    );
+    gfx_rect(x + 1, sy + 1, w - 2, sh - 1);
+    i += 1;
+  );
+  // Peak-hold tick.
+  mem[8] > db_lo ? (
+    rk_col(2, 0.85);
+    gfx_rect(x + 1, y + h - rk_clamp(rk_norm(mem[8], db_lo, db_hi), 0, 1) * h, w - 2, 1);
+  );
+  rk_col(7, 0.60);
+  gfx_rect(x, y, w, h, 0);
+);
+
+// Horizontal segmented meter — same scale, same peak hold.
+function rk_meter_h(mem, x, y, w, h, db, db_lo, db_hi)
+local(i, n, sw, t, lit, sx, seg_t) (
+  _rk_meter_hold(mem, db, 1.2);
+  gfx_set(0, 0, 0, 0.55);
+  gfx_rect(x, y, w, h);
+  n = max(6, floor(w / max(3, rk_px(4))));
+  sw = w / n;
+  t = rk_clamp(rk_norm(db, db_lo, db_hi), 0, 1);
+  lit = t * n;
+  i = 0;
+  loop(n,
+    sx = x + i * sw;
+    seg_t = i / max(1, n - 1);
+    i < lit ? (
+      seg_t > 0.92 ? ( rk_col(6, 1); ) :
+      seg_t > 0.78 ? ( gfx_set(0.95, 0.72, 0.20, 1); ) :
+                     ( rk_pal_get(4); gfx_set(rk_cr, rk_cg, rk_cb, 1); );
+    ) : (
+      gfx_set(1, 1, 1, 0.05);
+    );
+    gfx_rect(sx + 1, y + 1, sw - 1, h - 2);
+    i += 1;
+  );
+  mem[8] > db_lo ? (
+    rk_col(2, 0.85);
+    gfx_rect(x + rk_clamp(rk_norm(mem[8], db_lo, db_hi), 0, 1) * w, y + 1, 1, h - 2);
+  );
+  rk_col(7, 0.60);
+  gfx_rect(x, y, w, h, 0);
+);
