@@ -652,6 +652,20 @@ core.GMEM = {
   -- the free gap above the band (2674..2699; StepSeq M/S starts at 2700).
   GS_THEME_REQ  = 2674,   -- JSFX→bridge: 0 = none; 1..N theme index (REAPER modes are separate entries)
   GS_THEME_CUR  = 2675,   -- bridge→JSFX: active theme index for selector highlight
+  -- JSFX→bridge: dock-rig layout pick from Swing's wordmark menu — 1-based
+  -- index into EON Dock Layout.lua's LAYOUTS table (consume-to-0, same
+  -- request pattern as GS_THEME_REQ). Single never-used cell between the
+  -- retired old FX pub band (2626–2644) and FX action (2646–2648).
+  GS_DOCK_LAYOUT_REQ = 2645,
+  -- Dock-rig pop-out / redock relay (2026-08-26). POP cells are consumed by
+  -- the pane scripts; REDOCK cells by the bridge (eon_redock_tick), payload
+  -- cell written before its REQ bump.
+  GS_POP_REQ_SWING     = 2627,
+  GS_POP_REQ_STEPPA    = 2628,
+  GS_REDOCK_REQ_SWING  = 2629,
+  GS_REDOCK_ID_SWING   = 2630,
+  GS_REDOCK_REQ_STEPPA = 2631,
+  GS_REDOCK_SLOT_STEPPA= 2632,
   -- JSFX→bridge knob-STYLE request (Swing's "KNOB" button). 0 = none; else
   -- (style_index + 1), so 1 = style 0 (Default/clear), 2 = style 1 (SSL) … 19 =
   -- style 18 (Roland). Bridge writes ExtState "eon_knob_<theme>" + clears it; the
@@ -1119,6 +1133,133 @@ core.GMEM = {
   REB_SLOT_STRIDE   = 8,
 }
 
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- EON_SWBROWSE — the in-JSFX mini file browser's exchange band
+-- Declared in .refs/gmem_regions_supplement.tsv (26607616..26673151).
+-- Protocol modelled 1:1 on EON_FXPICK: the bridge enumerates and publishes, the
+-- face draws, and the face sends a row INDEX back rather than a path — so a
+-- non-ASCII path still loads even though the wire is ASCII-folded for display.
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+core.SWBROWSE = {
+  BASE   = 26607616,   -- 406 * 65536, block-aligned (NSEEL allocates gmem lazily)
+  STRIDE = 4096,
+  SLOTS  = 16,
+
+  -- response half (bridge writes, face reads) — PUB_SEQ written LAST
+  PUB_SEQ  = 0,   -- seqlock: odd = mid-write, even = stable
+  GEN      = 1,   -- bumped per publish; face re-snapshots on change
+  ANS_REQ  = 2,   -- echo of the REQ_SEQ this page answers
+  TOTAL    = 3,   -- entries in the current folder after filtering
+  WIN_OFF  = 4,
+  WIN_N    = 5,
+  FLAGS    = 6,   -- bit0 scanning, bit1 folder unreadable, bit2 at root
+  HB       = 7,   -- liveness COUNTER, not a clock — the face has no wall clock
+  FMT_VER  = 8,
+  NDIRS    = 9,   -- folders sort first, so rows 0..NDIRS-1 are the folders
+  CWD_LEN  = 10,
+
+  -- request half (face writes) — REQ_SEQ / ACT_SEQ written LAST
+  REQ_SEQ  = 32,
+  REQ_OFF  = 33,
+  REQ_N    = 34,
+  REQ_VERB = 35,  -- 1 = enter folder, 2 = go up, 3 = load row to pad
+  REQ_RIDX = 36,  -- row handle from FR_RIDX
+  REQ_PAD  = 37,  -- target pad for verb 3
+  FACE_HB  = 38,  -- face-written counter; moving = a face is watching
+  REQ_INST  = 39,  -- face's own instance_id; CMD 63 is IGNORED without it
+  REQ_LAYER = 40,  -- verb 7 only: target layer for the CMD 64 stack
+  REQ_COUNT   = 41,  -- verb 8 only: how many consecutive rows to load
+  REQ_RECURSE = 42,  -- 1 = walk subfolders on the next scan
+  REQ_GROW    = 43,  -- px of extra CANVAS width the face wants; 0 = none.
+                     -- The bridge widens the floating FX window by this much
+                     -- instead of letting the strip take width off the pads.
+                     -- Measured safe by .dev_tests/fbwin_probe.lua (2026-08-29):
+                     -- the canvas takes every pixel, @gfx is a starting size
+                     -- and not an aspect lock.
+  REQ_GFXW    = 44,  -- the face's CURRENT gfx_w. The bridge resizes in SCREEN
+                     -- pixels and the face asks in CANVAS pixels; those are the
+                     -- same thing only while Swing stays off gfx_ext_retina
+                     -- (it does today, its siblings do not). Publishing gfx_w
+                     -- lets the bridge MEASURE the ratio instead of assuming it.
+  REQ_AUD     = 46,  -- 1 = also load the PREVIEW voice on this click
+  REQ_FILT_LEN = 192,  -- verb 9: filter text length...
+  REQ_FILT     = 193,  -- ...and its chars, +193..240
+  REQ_FILT_MAX = 48,
+
+  -- waveform peaks for the SELECTED row, its own band (a row record is 60
+  -- cells; 256 could never ride along). Declared in the supplement tsv.
+  PK_BASE   = 26673152,   -- 407 * 65536
+  PK_STRIDE = 512,        -- L max, L min, R max, R min -- 4 * PK_N
+  PK_N      = 128,        -- columns: sized to the status strip, not the file
+
+  CWD      = 64,  -- current folder, 128 chars for display only
+  CWD_MAX  = 128,
+
+  ROWS     = 256,
+  REC      = 60,
+  REC_MAX  = 64,  -- 256 + 64*60 = 4096, exactly the stride
+
+  -- row record
+  FR_LEN     = 0,   -- name length; 0 = empty row
+  FR_NAME    = 1,   -- 48 chars
+  FR_NAME_MAX= 48,
+  FR_KIND    = 49,  -- 0 file, 1 folder, 2 parent ".."
+  FR_EXT     = 50,  -- EXT_CODE below
+  FR_RIDX    = 51,  -- index into the bridge's unfiltered listing = pick handle
+  FR_SIZE_KB = 52,
+  FR_SR      = 53,
+  FR_CH      = 54,
+  FR_MS      = 55,
+  FR_PLKIND  = 56,  -- places only: 1 starred, 2 recent, 3 drive
+}
+
+-- Extension → wire code. 0 = unknown/other. Keep in sync with the JSFX face,
+-- which uses these to pick a row glyph. SFZ is deliberately last and distinct:
+-- it is a KIT import (parse_sfz → 16 pads by pitch zone), not a pad load, so
+-- the face must be able to tell it apart and offer a different gesture.
+core.SWBROWSE_EXT = {
+  wav = 1, aif = 2, aiff = 2, flac = 3, mp3 = 4, ogg = 5,
+  bwf = 6, w64 = 7, wv = 8, caf = 9, sfz = 10,
+}
+
+-- EON_SWBTREE — the mini browser's FOLDER TREE, published beside the file list.
+-- Its own band because the two are on screen together and SWBROWSE's stride is
+-- full to the byte (256 header + 64*60 rows = 4096).
+core.SWBTREE = {
+  BASE   = 26738688,   -- 408 * 65536, block-aligned
+  STRIDE = 4096,
+  SLOTS  = 16,
+
+  PUB_SEQ = 0,   -- seqlock: odd = mid-write
+  GEN     = 1,
+  TOTAL   = 2,   -- visible nodes
+  WIN_OFF = 3,
+  WIN_N   = 4,
+  FLAGS   = 5,   -- bit0 = a folder is being expanded
+  SEL     = 6,   -- visible index that IS the file list's cwd, -1 for none
+  HB      = 7,
+
+  REQ_SEQ  = 32,
+  REQ_OFF  = 33,
+  REQ_N    = 34,
+  REQ_VERB = 35,  -- 1 toggle expand · 2 select (point the file list here)
+                  -- 3 rebuild from the file list's cwd
+  REQ_TIDX = 36,
+  FACE_HB  = 38,
+
+  ROWS = 256,
+  REC  = 60,
+  REC_MAX = 64,
+
+  TR_LEN      = 0,
+  TR_NAME     = 1,
+  TR_NAME_MAX = 48,
+  TR_DEPTH    = 49,
+  TR_FLAGS    = 50,   -- bit0 expanded · bit1 is cwd · bit2 loaded and childless
+  TR_TIDX     = 51,
+}
+
 core.GMEM_NAME = "Swing_Media_Transfer"
 
 -- ═══════════════════════════════════════════════════════════════════════════════
@@ -1209,7 +1350,10 @@ function core.fx_embed_mcp(tr, frag)
   local ok, chunk = reaper.GetTrackStateChunk(tr, "", false)
   if not ok or not chunk then return false end
   local out, inhit, done = {}, false, false
-  for line in (chunk .. string.char(10)):gmatch("(.-)" .. string.char(10)) do
+  -- Copied out of the control variable because the WAK rewrite below assigns to
+  -- it, and from Lua 5.5 a for control variable is const.
+  for raw_line in (chunk .. string.char(10)):gmatch("(.-)" .. string.char(10)) do
+    local line = raw_line
     if not done then
       if line:find("<JS ", 1, true) or line:find("<VST ", 1, true) then
         inhit = line:find(frag, 1, true) ~= nil

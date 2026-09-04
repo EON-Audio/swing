@@ -75,16 +75,24 @@ if reaper.GetExtState("Swing", "browser_running") == "1" then
   end
 end
 
--- Browser not running → register Swing_Browser.lua as a temporary REAPER
--- action, fire it, then unregister so it doesn't add a duplicate
--- "Script: Swing_Browser" entry to the action list every time we run.
--- The browser itself owns its defer loop — Main_OnCommand returns
+-- Browser not running → register Swing_Browser.lua as a REAPER action and
+-- fire it. The browser itself owns its defer loop — Main_OnCommand returns
 -- immediately and the loop keeps spinning in its own context until the
 -- user closes the window (or this script is run again to toggle).
+--
+-- Deliberately NOT unregistered afterwards. AddRemoveReaScript(false, path)
+-- removes the action for that PATH no matter who registered it — so the old
+-- register-run-unregister dance here silently stripped any permanent
+-- registration the user held of Swing_Browser.lua itself (it works standalone
+-- as a generic media browser, so loading it straight into the Action List is
+-- plausible; the same bug class killed the user's Dock View action on
+-- 2026-08-26). Registering is idempotent — the same path always yields the
+-- same _RS command id, no duplicates — so the worst cost of leaving it is one
+-- stable Action List entry, which is also exactly what keeps shortcuts and
+-- menu buttons on that id alive.
 local cmd_id = reaper.AddRemoveReaScript(true, 0, browser_path, true)
 if cmd_id and cmd_id > 0 then
   reaper.Main_OnCommand(cmd_id, 0)
-  reaper.AddRemoveReaScript(false, 0, browser_path, true)
 else
   reaper.MB(
     "REAPER could not register Swing_Browser.lua.\n\n" ..

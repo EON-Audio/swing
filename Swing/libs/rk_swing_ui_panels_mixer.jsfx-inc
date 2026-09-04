@@ -15,34 +15,1010 @@ function swing_panels_mix_p2g(_mp) ( 2.0 * _mp * _mp * _mp );
 function swing_panels_mix_g2p(_mg) ( (_mg * 0.5) ^ 0.3333333333 );
 MIX_UNITY_P = 0.7937005;  // swing_panels_mix_g2p(1.0) — 0 dB reference height
 
+// Etched inset bevel for the compact page's mini-slider bars: inner shadow on
+// the top + left edges, lit bottom edge — the fader slot's recipe, so the flat
+// bars sit with the chrome cap below them. Drawn over the fill so the fill
+// reads as recessed; alphas low enough that its colour still shows through.
+function swing_panels_mix_bevel(_bx, _by, _bw, _bh) (
+  gfx_set(0, 0, 0, 0.45);
+  gfx_rect(_bx, _by, _bw, 1);
+  gfx_rect(_bx, _by, 1, _bh);
+  gfx_set(1, 1, 1, 0.10);
+  gfx_rect(_bx, _by + _bh - 1, _bw, 1);
+);
+
+// ─── Console inserts: read the bridge's summary ───────────────────────────
+// Seqlock. Odd = the bridge is mid-write, so the frame is skipped entirely
+// rather than drawn from half a picture. The seq is re-read AFTER the copy:
+// if it moved, the bridge wrote straight through us and the snapshot is torn,
+// so it is dropped and the next frame takes a fresh one. Cheap — the bridge
+// only republishes when a chain actually changes.
+function swing_panels_conins_read() local(_b, _s, _p, _q, _pad, _k, _hb) (
+  _b = EON_CONINS_BASE
+     + max(0, min(EON_CONINS_SLOTS - 1, _reg_my_slot)) * EON_CONINS_STRIDE;
+
+  // ── Is the bridge actually there? ────────────────────────────────────────
+  // ⚠️ Without this, a bridge that is not running is INDISTINGUISHABLE from
+  // sixteen pads that own no track: both leave the band drawing dead dashes,
+  // and the interface states a fact ("no inserts here") that it does not know.
+  //
+  // The beat is a COUNTER, not a clock — the face has no wall clock to compare
+  // the bridge's against. All that matters is whether it moved, so a movement
+  // is timestamped locally and staleness measured from that.
+  // Flags: bit0 multi-out present, bit1 could not look up (no SWS).
+  _conins_flags = gmem[_b + CI_FLAGS] | 0;
+  _hb = gmem[_b + CI_HB];
+  _hb != _conins_hb ? ( _conins_hb = _hb; _conins_hb_t = time_precise(); );
+  // 2 s against a 0.5 s publish: three missed beats before crying wolf.
+  _conins_stale = (_conins_hb <= 0) || (time_precise() - _conins_hb_t > 2.0);
+  // ⭐ A LIVE BRIDGE RUNNING THE OLD LAYOUT is worse than a dead one: it
+  // publishes confidently into a record that has since moved, and the face
+  // draws the wreckage as if it were data. Twice today that surfaced as a
+  // mystery (blank cards, then garbled names) rather than as a message.
+  _conins_oldfmt = !_conins_stale && gmem[_b + CI_FMT] != CI_FMT_VER;
+
+  _s = gmem[_b + CI_SEQ];
+  (_s & 1) == 0 && _s != _conins_seq && _s > 0 ? (
+    // 17 uniform records — pads 0..15 then the MASTER at 16. It used to be
+    // a header special case; making it a record means one copy loop, one
+    // draw call and one decode, so none of them can drift from the others.
+    _conins_maxn = 0;
+    _pad = 0;
+    loop(CI_RECS,
+      _p = _b + CI_HDR + _pad * CI_PREC;
+      _q = _conins_buf + _pad * CIF_REC;
+      _q[CI_COUNT] = gmem[_p + CI_COUNT];
+      _k = 0;
+      loop(CI_CARD - CI_SLOT,   // slots + names + hashes
+        _q[CI_SLOT + _k] = gmem[_p + CI_SLOT + _k];
+        _k += 1;
+      );
+      // Resolve each slot's CARD once, here. Same trick the chain snapshot
+      // uses: hashing 17 x 8 names every frame just to draw them would be
+      // absurd, and the answer only changes when a publish lands.
+      _k = 0;
+      loop(CI_NSLOT,
+        // ⭐ Look up from the BRIDGE's hash of the FULL name. Hashing the
+        // truncated name here found nothing for anything longer than the
+        // field -- which is most plugins, and would have made the Drum Strip
+        // card invisible on the very strips it was drawn for.
+        _q[CI_CARD + _k] = _q[CI_HASH + _k] > 0
+          ? swing_fxcard_lookup(_q[CI_HASH + _k]) : -1;
+        _k += 1;
+      );
+      // The FULLEST channel decides how many slots every strip draws --
+      // per-strip counts would give per-strip heights, which is the one
+      // thing the desk cannot have.
+      _q[CI_COUNT] > _conins_maxn ? _conins_maxn = _q[CI_COUNT];
+      _pad += 1;
+    );
+    gmem[_b + CI_SEQ] == _s ? _conins_seq = _s;
+  );
+);
+
+// Category colour for a slot word. Same vocabulary the picker's rail uses, so
+// a plugin is the same colour wherever you meet it.
+function swing_panels_ins_col(_cat, _a) (
+  _cat == 0 ? gfx_set(0.86, 0.35, 0.31, _a) :   // dynamics
+  _cat == 1 ? gfx_set(0.43, 0.79, 0.43, _a) :   // EQ
+  _cat == 2 ? gfx_set(0.88, 0.54, 0.16, _a) :   // saturation / drive
+  _cat == 3 ? gfx_set(0.35, 0.60, 0.86, _a) :   // delay
+  _cat == 4 ? gfx_set(0.60, 0.42, 0.85, _a) :   // reverb
+  _cat == 5 ? gfx_set(0.85, 0.72, 0.25, _a) :   // limiter
+  _cat == 6 ? gfx_set(0.30, 0.74, 0.74, _a) :   // modulation
+  _cat == 7 ? gfx_set(0.80, 0.45, 0.62, _a) :   // pitch / vocal
+              gfx_set(0.55, 0.60, 0.66, _a);    // everything else
+);
+
+// One strip's insert column.
+//
+// ⚠️ A pad only owns a REAPER track in MULTI-OUT. Every other pad plays through
+// Swing's own chain and has nowhere to put a plugin, so its slots are drawn
+// DEAD — a fainter dash, no + — rather than as empty add-boxes. An inviting
+// +box on a pad that cannot take one is a lie the interface would be telling.
+// Point the picker at one chain slot and open it. Payload first, seq LAST —
+// the bridge is edge-triggered on the seq, so the target has to be in place
+// before the seq announces it.
+//
+// _pad: 0..15 for a pad's own track, 16 for the master/bus (sent as -1, which
+// is what the bridge's record numbering calls it).
+function swing_panels_ins_aim(_pad, _slot, _filled) local(_b) (
+  _b = EON_FXPICK_BASE
+     + max(0, min(EON_FXPICK_SLOTS - 1, _reg_my_slot)) * EON_FXPICK_STRIDE;
+  gmem[_b + FXP_TGT_PAD]  = _pad >= 16 ? -1 : _pad;
+  gmem[_b + FXP_TGT_SLOT] = _slot;
+  gmem[_b + FXP_TGT_SEQ]  = gmem[_b + FXP_TGT_SEQ] + 1;   // SEQ LAST
+  // ⭐ Tell the PICKER what a pick should mean, directly -- both live in this
+  // same JSFX, so this needs no protocol and cannot arrive a frame late.
+  // A FILLED slot is a SWAP of that slot; an EMPTY one is an INSERT, which
+  // is what makes clicking an empty slot actually ADD a plugin instead of
+  // opening a picker that then does something else.
+  _fxv_csel = _filled ? _slot : -1;
+);
+
+// Aim AND navigate. Split from the aim above because a menu action has to
+// point the bridge at a chain WITHOUT walking the user off the console --
+// bypassing a plugin should leave you looking at the desk.
+function swing_panels_ins_target(_pad, _slot, _filled) (
+  swing_panels_ins_aim(_pad, _slot, _filled);
+  swing_bigview_open(VIEW_FXPICK);
+);
+
+// Lift one slot's published name into #_ins_name. Length-prefixed, so there
+// is no terminator to hunt for and a name cannot run off the end of the
+// record. Same convention as lens_read_path and the kit tile.
+function swing_panels_ins_name(_pi, _k) local(_np, _n2, _i) (
+  strcpy(#_ins_name, "");
+  _np = _conins_buf + _pi * CIF_REC + CI_NAME + _k * CI_NAMEW;
+  _n2 = min(CI_NCHAR, max(0, _np[0] | 0));
+  _n2 > 0 ? (
+    _i = 0;
+    loop(_n2, str_setchar(#_ins_name, _i, _np[1 + _i] | 0); _i += 1; );
+    str_setlen(#_ins_name, _n2);
+  );
+  _n2;
+);
+
+function swing_panels_ins_band(_pi, _bx, _by, _bw, _n, _sh, _full)
+         local(_q, _cnt, _k, _ks, _w, _cat, _byp, _off, _sy, _dx, _cx2, _shown,
+               _hov, _ins_card) (
+  _q = _conins_buf + _pi * CIF_REC;
+  _cnt = _q[0];
+
+  _full ? (
+    _k = 0;
+    loop(_n,
+      _sy = _by + _k * (_sh + 2);
+      // _k is the SCREEN row; _ks is the slot it shows. The viewport offset
+      // (con_ins_scroll) is GLOBAL — all sixteen strips scroll together,
+      // because per-strip scroll would give per-strip rows, the one thing
+      // the desk cannot have. Everything that names a slot uses _ks.
+      _ks = _k + con_ins_scroll;
+      _w = _ks < CI_NSLOT ? _q[CI_SLOT + _ks] : -1;
+      // Decode ONCE, here, so the tooltip, the menu and the paint below all
+      // read the same answer. Each used to decode separately, which is how
+      // two views of one slot start disagreeing.
+      _off = _w >= 128; _cat = _w - _off * 128;
+      _byp = _cat >= 64; _cat = _cat - _byp * 64;
+
+      // A slot is only a control when the pad owns a track. Dead slots take no
+      // hover and no click — the whole point of drawing them dead is that they
+      // are not offering anything.
+      // UNKNOWN outranks everything: with no bridge we do not know what is
+      // in this slot, and a slot we cannot read is not a slot you can click.
+      _hov = !_conins_stale && _cnt >= 0 && mx >= _bx && mx <= _bx + _bw
+                            && my >= _sy && my <= _sy + _sh;
+      // A dead slot took no hover at all, so it could not even say WHY it
+      // was dead. It is not clickable, but it is explainable.
+      _cnt < 0 && !_conins_stale && mx >= _bx && mx <= _bx + _bw
+               && my >= _sy && my <= _sy + _sh ?
+        swing_tooltip_check(1097,
+          "This pad has no REAPER track, so it has nowhere to put a plugin. "
+          "Build multi-out tracks to give it inserts.");
+      _conins_stale && mx >= _bx && mx <= _bx + _bw
+                    && my >= _sy && my <= _sy + _sh ?
+        swing_tooltip_check(1098,
+          "Insert state unknown — the FX Picker bridge is not running. "
+          "Run the 'EON: FX Picker bridge' action.");
+      _hov ? (
+        _w < 0 ? (
+          swing_tooltip_check(1100 + _pi * 8 + _ks,
+            "Empty insert slot — click to add a plugin here.");
+        ) : (
+          // Name it. The bridge publishes a truncated display name per slot,
+          // so the tooltip can say WHICH plugin rather than only what kind.
+          swing_panels_ins_name(_pi, _ks);
+          strcpy(#_ins_tip, #_ins_name);
+          strlen(#_ins_tip) < 1 ? strcpy(#_ins_tip, "Insert");
+          _off ? strcat(#_ins_tip, " — offline") :
+          _byp ? strcat(#_ins_tip, " — bypassed") :
+                 strcat(#_ins_tip, "");
+          strcat(#_ins_tip, ". Click to open · right-click for options.");
+          swing_tooltip_check(1100 + _pi * 8 + _ks, #_ins_tip);
+        );
+      );
+      // ⭐ A FILLED slot FLOATS its plugin; an empty one opens the picker.
+      // Click used to always open the picker, which is the SWAP affordance
+      // rather than what clicking a plugin means anywhere else. Aim first
+      // either way, so the bridge acts on THIS pad's chain.
+      //
+      // A press on a FILLED slot LATCHES rather than acting: 4 px of
+      // vertical travel makes it a reorder drag, release without travel is
+      // the float click. Right-click stays the menu — float-on-right-click
+      // was rejected because clicking a plugin to open it is the DAW
+      // convention.
+      _hov && lmb_down && active_id == -1 ? (
+        // ⚠️ _insd_live IS THE LATCH, not active_id -- see the continuation in
+        // swing_panels_draw_mixer for why the id cannot carry a gesture whose
+        // meaning is decided on the RELEASE frame. 308, not 295: 295 is the
+        // pad overlay's own slider.
+        _w >= 0 ? ( active_id = 308; _insd_live = 1;
+                    _insd_pad = _pi; _insd_slot = _ks;
+                    _insd_y0 = my; _insd_on = 0; )
+                : (
+          // COMPACT picker, over the desk -- not the full-window one that
+          // replaces it. Aim first so the bridge is pointed at this pad's
+          // chain before the list is asked for.
+          swing_panels_ins_aim(_pi, _ks, 0);
+          con_pick_open = 1; con_pick_pad = _pi; con_pick_slot = _ks;
+          con_pick_fill = 0; con_pick_scroll = 0;
+          con_pick_x = _bx; con_pick_y = _sy;
+          // ⭐ CLEAR THE STALE QUERY, AND TELL THE BRIDGE. The query cells
+          // survive from the big view's last search and request() alone never
+          // resends them — so a picker opened after a big-view search was
+          // silently filtered by text this face had nowhere to show. q_send
+          // pushes the now-empty query AND the bank; the follow-up request
+          // sizes the page for THIS window, because q_send's own ask is
+          // scaled by _fxv_want, which is still 0 until the big view has
+          // opened once — a 2-row page that read as "most plugins missing".
+          swing_fxview_q_clear();
+          swing_fxview_q_send();
+          swing_fxview_request(0, 24);
+          _cpk_qfoc = !is_embedded;   // type-to-filter from the first frame
+          active_id = -1;             // ⚠️ picker path only — a filled slot
+                                      // just latched the drag on active_id
+        );
+      );
+      // RIGHT-CLICK: the slot's own menu. Remembers WHICH slot on the way in,
+      // because the popup answers on a later frame by which time the pointer
+      // has moved and _pi/_ks are long gone. ⚠️ The SLOT (_ks), not the screen
+      // row: scrolled, a row-numbered menu would bypass or delete a plugin
+      // you were not pointing at.
+      _hov && rmb_down && active_id == -1 ? (
+        _ins_menu_pad = _pi; _ins_menu_slot = _ks;
+        _ins_menu_filled = _w >= 0;
+        // Bypass and Offline are READ BACK, so they carry real ticks.
+        // ⚠️ Embed cannot: REAPER exposes no way to ask whether an FX is
+        // embedded, in either direction. It is drawn as an ACTION, and a tick
+        // there would be a guess that goes wrong the first time someone embeds
+        // from REAPER's own FX chain instead.
+        _w >= 0 ? (
+          strcpy(#_ins_menu, "#INSERT SLOT|Float plugin window|");
+          strcat(#_ins_menu, "Open in FX picker|");
+          strcat(#_ins_menu, "Embed UI in TCP|Embed UI in MCP||");
+          strcat(#_ins_menu, _byp ? "!Bypass|" : "Bypass|");
+          strcat(#_ins_menu, _off ? "!Offline||" : "Offline||");
+          strcat(#_ins_menu, "^r Delete");
+        ) : (
+          strcpy(#_ins_menu, "#EMPTY SLOT|Add FX here...");
+        );
+        swing_popup_open(mx, my, #_ins_menu, SP_POPUP_CALLER_INS_SLOT);
+      );
+
+      _conins_stale ? (
+        // UNKNOWN: no bridge, so no claim. Amber and hatched, so it reads
+        // as "cannot say" rather than as the confident grey of "nothing
+        // here" — the two must never look alike. Darker amber on the light
+        // desk; same hue, so the vocabulary holds across finishes.
+        _mix_ink ? gfx_set(0.55, 0.40, 0.08, 0.75) : gfx_set(0.72, 0.55, 0.18, 0.45);
+        gfx_rect(_bx, _sy, _bw, 1); gfx_rect(_bx, _sy + _sh - 1, _bw, 1);
+        gfx_rect(_bx, _sy, 1, _sh); gfx_rect(_bx + _bw - 1, _sy, 1, _sh);
+        _mix_ink ? gfx_set(0.55, 0.40, 0.08, 0.35) : gfx_set(0.72, 0.55, 0.18, 0.22);
+        gfx_line(_bx + 1, _sy + _sh - 2, _bx + _bw - 2, _sy + 1);
+      ) : _cnt < 0 ? (
+        // DEAD: pad owns no track.
+        gfx_set(0.30, 0.34, 0.39, _mix_ink ? 0.55 : 0.30);
+        gfx_rect(_bx, _sy, _bw, 1); gfx_rect(_bx, _sy + _sh - 1, _bw, 1);
+        gfx_rect(_bx, _sy, 1, _sh); gfx_rect(_bx + _bw - 1, _sy, 1, _sh);
+      ) : _w < 0 ? (
+        // EMPTY but live: an add-box, and it means it. The outline colour sat
+        // between the dark desks and the light one — on grey it all but
+        // vanished, so the light desk gets a darker box.
+        _mix_ink ? gfx_set(0.26, 0.31, 0.37, 0.75) : gfx_set(0.45, 0.52, 0.58, 0.55);
+        gfx_rect(_bx, _sy, _bw, 1); gfx_rect(_bx, _sy + _sh - 1, _bw, 1);
+        gfx_rect(_bx, _sy, 1, _sh); gfx_rect(_bx + _bw - 1, _sy, 1, _sh);
+        gfx_rect(_bx + ((_bw / 2)|0) - 3, _sy + ((_sh / 2)|0), 7, 1);
+        gfx_rect(_bx + ((_bw / 2)|0), _sy + ((_sh / 2)|0) - 3, 1, 7);
+      ) : (
+        // FILLED. Decoded by ARITHMETIC — see the band comment in the main
+        // .jsfx for why this is not a shift.
+        // A real card where the deck has one, the category colour where it
+        // does not -- which also shows coverage at a glance: a flat block
+        // means no art for that plugin.
+        _ins_card = _q[CI_CARD + _ks];
+        _ins_card > 0 ? (
+          gfx_a = _off ? 0.22 : (_byp ? 0.42 : 1);
+          swing_fxcard_draw(_bx, _sy, _bw, _sh, _ins_card);
+          gfx_a = 1;
+        ) : (
+          swing_panels_ins_col(_cat, _off ? 0.20 : (_byp ? 0.35 : 0.92));
+          gfx_rect(_bx, _sy, _bw, _sh);
+        );
+        gfx_set(0, 0, 0, 0.45);
+        gfx_rect(_bx, _sy, _bw, 1); gfx_rect(_bx, _sy + _sh - 1, _bw, 1);
+        // Bypassed reads as struck through, not merely dimmer: dimmer alone
+        // is indistinguishable from a darker category colour.
+        _byp ? ( gfx_set(0.95, 0.95, 0.95, 0.75);
+                 gfx_rect(_bx + 2, _sy + ((_sh / 2)|0), _bw - 4, 1); );
+      );
+      // Hover wash LAST so it sits over the slot rather than under it.
+      // Dark wash on the light desk — a white wash over grey is no wash.
+      _hov ? (
+        _mix_ink ? gfx_set(0, 0, 0, 0.10) : gfx_set(1, 1, 1, 0.13);
+        gfx_rect(_bx, _sy, _bw, _sh);
+      );
+      // Reorder drag, this strip: the grabbed slot dims, the drop target
+      // wears the accent outline. The target tracks the POINTER, clamped to
+      // slots the chain actually owns — dropping past the last plugin is a
+      // move to the end, not a move into empty air.
+      _insd_live && _insd_on && _insd_pad == _pi ? (
+        _ks == _insd_slot ? (
+          gfx_set(0, 0, 0, 0.35); gfx_rect(_bx, _sy, _bw, _sh);
+        );
+        // Screen row under the pointer, lifted into SLOT space by the same
+        // viewport offset the rows were drawn with, then clamped to slots
+        // the chain owns. Must match the drop's own arithmetic exactly --
+        // an outline that promises a different slot than the drop takes is
+        // worse than no outline.
+        _ks == max(0, min(max(0, _cnt - 1),
+                 (((my - _by) / (_sh + 2)) | 0) + con_ins_scroll)) ? (
+          gfx_set(0.45, 0.80, 0.90, 0.95);
+          gfx_rect(_bx, _sy, _bw, 1); gfx_rect(_bx, _sy + _sh - 1, _bw, 1);
+          gfx_rect(_bx, _sy, 1, _sh); gfx_rect(_bx + _bw - 1, _sy, 1, _sh);
+        );
+      );
+      _k += 1;
+    );
+  ) : (
+    // Summary bar: up to five pips and a count. Still says which slots are
+    // filled and roughly what they are, which is all a folded band owes you.
+    gfx_set(0, 0, 0, _mix_ink ? 0.50 : 0.32);
+    gfx_rect(_bx, _by, _bw, 16);
+    gfx_set(0.30, 0.62, 0.70, 0.18);
+    gfx_rect(_bx, _by, _bw, 1); gfx_rect(_bx, _by + 15, _bw, 1);
+    // Folded, the bar is still the way in: it opens the chain at slot 1
+    // rather than at a slot you cannot see to pick.
+    _hov = !_conins_stale && _cnt >= 0 && mx >= _bx && mx <= _bx + _bw
+                          && my >= _by && my <= _by + 16;
+    _hov ? swing_tooltip_check(1099,
+      "Inserts, folded. Click to open this channel's chain in the FX picker.");
+    _hov && lmb_down && active_id == -1 ? (
+      swing_panels_ins_target(_pi, 0, 1); active_id = -1; );
+    _conins_stale ? (
+      gfx_setfont(1, "Arial", 11, 'b');
+      gfx_set(0.82, 0.63, 0.22, 0.95);
+      gfx_measurestr("?", tw, th);
+      gfx_x = _bx + ((_bw - tw) / 2)|0; gfx_y = _by + 4;
+      gfx_drawstr("?");
+    ) : _cnt < 0 ? (
+      gfx_setfont(1, "Arial", 11, 'b');
+      gfx_set(0.48, 0.54, 0.60, 0.7);
+      gfx_measurestr("--", tw, th);
+      gfx_x = _bx + ((_bw - tw) / 2)|0; gfx_y = _by + 4;
+      gfx_drawstr("--");
+    ) : (
+      _shown = min(5, max(1, _n));
+      _dx = max(5, min(9, ((_bw - 8) / _shown)|0));
+      _cx2 = _bx + ((_bw - _dx * _shown) / 2)|0;
+      _k = 0;
+      loop(_shown,
+        _w = _k < CI_NSLOT ? _q[CI_SLOT + _k] : -1;
+        _w < 0 ? gfx_set(0.16, 0.18, 0.21, 1) : (
+          _off = _w >= 128; _w = _w - _off * 128;
+          _byp = _w >= 64;  _cat = _w - _byp * 64;
+          swing_panels_ins_col(_cat, _byp || _off ? 0.35 : 1);
+        );
+        gfx_rect(_cx2 + _k * _dx + 1, _by + 5, _dx - 2, 6);
+        _k += 1;
+      );
+    );
+    _hov ? (
+      _mix_ink ? gfx_set(0, 0, 0, 0.08) : gfx_set(1, 1, 1, 0.10);
+      gfx_rect(_bx, _by, _bw, 16);
+    );
+  );
+);
+
+// ─── Master strip ─────────────────────────────────────────────────────────
+// ⭐ WHAT IT SHOWS FOLLOWS THE ROUTING, not a preference:
+//   stereo out  — the pads summed INSIDE Swing, so the master is Swing's own
+//                 output: master_db, its meter, and the bus compressor.
+//   multi-out   — the pads left as 16 separate outputs and sum on their PARENT
+//                 track in REAPER. That folder is the desk's master, and
+//                 Swing's internal master gain is no longer where mixing
+//                 happens.
+// Same rule the insert slots already follow. It is one strip either way, and
+// the scribble line names which one you are looking at, so it is never
+// ambiguous — MASTER when Swing sums, BUS when REAPER does.
+//
+// ⛔ REAPER's PROJECT master is deliberately NOT an option. Swing does not own
+// it, REAPER's own mixer already shows it, and two faders for one gain have no
+// answer for which is right when they disagree.
+//
+// It is NOT a seventeenth channel: no sends, no pan, no pad colour, and its
+// dynamics section is ONE compressor rather than the six pad stages — drawing
+// six lamps there would imply six independent stages that do not exist.
+function swing_panels_master_band(_bx, _by, _bw, _bh, _full)
+         local(_gr, _h) (
+  // Backing alpha was tuned against a near-black desk; on the light finish
+  // 0.20 black over grey leaves the labels inside nothing to stand on.
+  gfx_set(0, 0, 0, _mix_ink ? 0.45 : 0.20);
+  gfx_rect(_bx, _by, _bw, _bh);
+  gfx_set(0.42, 0.62, 0.72, 0.22);
+  gfx_rect(_bx, _by, _bw, 1);
+  gfx_rect(_bx, _by + _bh - 1, _bw, 1);
+
+  // Gain reduction, display-smoothed, drawn downward from the top like every
+  // GR meter ever built. cmp_gr_smooth is negative dB.
+  _gr = min(20, max(0, -cmp_gr_smooth));
+
+  _full ? (
+    gfx_setfont(1, "Arial", 11, 'b');
+    !cmp_bypass ? gfx_set(0.72, 0.86, 0.92, 1) : gfx_set(0.48, 0.54, 0.60, 0.85);
+    gfx_measurestr("WELD", tw, th);
+    gfx_x = _bx + ((_bw - tw) / 2)|0; gfx_y = _by + 2;
+    gfx_drawstr("WELD");
+    // GR bar
+    gfx_set(0.05, 0.06, 0.08, 0.9);
+    gfx_rect(_bx + 4, _by + 13, _bw - 8, _bh - 17);
+    _h = ((_bh - 19) * (_gr / 20))|0;
+    !cmp_bypass && _h > 0 ? (
+      gfx_set(0.86, 0.55, 0.28, 0.9);
+      gfx_rect(_bx + 5, _by + 14, _bw - 10, _h);
+    );
+    gfx_setfont(1, "Arial", 10, 'b');
+    gfx_set(0.72, 0.80, 0.86, 0.95);
+    sprintf(#_mst_gr, "%.0f", _gr);
+    gfx_measurestr(#_mst_gr, tw, th);
+    gfx_x = _bx + ((_bw - tw) / 2)|0; gfx_y = _by + _bh - 10;
+    gfx_drawstr(#_mst_gr);
+  ) : (
+    !cmp_bypass ? gfx_set(0.86, 0.55, 0.28, _gr > 0.2 ? 1 : 0.45)
+                : gfx_set(0.16, 0.18, 0.21, 1);
+    gfx_circle(_bx + ((_bw / 2)|0), _by + ((_bh / 2)|0), 2.6, 1, 1);
+  );
+);
+
+// ─── Swing's own chain, as a band on the strip ────────────────────────────
+// HPF · LPF · EQ · CMP · BIT · DRV — the SAME six, in that order, always
+// (rk_drumkit_fx.jsfx-inc). Drawn as fixed rows rather than chips because
+// chips promise slots you can add, remove and reorder, and none of that is
+// possible here; someone would have tried.
+//
+// On a console this is NOT an insert. It is the channel's own EQ/dynamics
+// section, which on a desk sits in the MIDDLE of the strip — below the insert
+// point, above the sends.
+//
+// "Engaged" is per stage, and each has its own off-value rather than a flag:
+//   HPF 20 Hz (below audible) · LPF 20000 (above it) · the rest are zero.
+// Reading the parameter instead of a separate enable bit means the lamp can
+// never disagree with what the audio is doing.
+function swing_panels_sw_lit(_pi, _st) (
+  _st == 0 ? fx_hpf_freq[_pi] > 20.5 :
+  _st == 1 ? fx_lpf_freq[_pi] < 19999 :
+  _st == 2 ? (abs(fx_eq_lo[_pi]) + abs(fx_eq_mid[_pi])
+            + abs(fx_eq_mid2[_pi]) + abs(fx_eq_hi[_pi])) > 0.05 :
+  _st == 3 ? fx_cmp_amt[_pi] > 0.001 :
+  _st == 4 ? (fx_bc_rate[_pi] > 0.001 || fx_bc_bits[_pi] < 15.5) :
+             fx_sat_drv[_pi] > 0.001;
+);
+
+// Stage colour. Filter stages share a hue on purpose — they are one section of
+// the circuit, and giving LPF its own colour would imply otherwise.
+function swing_panels_sw_col(_st, _a) (
+  _st <= 1 ? gfx_set(0.35, 0.60, 0.86, _a) :   // HPF / LPF
+  _st == 2 ? gfx_set(0.43, 0.79, 0.43, _a) :   // EQ
+  _st == 3 ? gfx_set(0.86, 0.35, 0.31, _a) :   // CMP
+  _st == 4 ? gfx_set(0.69, 0.48, 0.82, _a) :   // BIT
+             gfx_set(0.88, 0.54, 0.16, _a);    // DRV
+);
+
+function swing_panels_sw_name(_st) (
+  _st == 0 ? "HPF" : _st == 1 ? "LPF" : _st == 2 ? "EQ" :
+  _st == 3 ? "CMP" : _st == 4 ? "BIT" : "DRV";
+);
+
+// Stage colour as THREE NUMBERS. swing_panels_sw_col sets the pen, which is
+// what a lamp needs; a knob is handed its colour as arguments, so the same
+// palette has to be reachable both ways or the lamps and the knobs drift apart.
+function swing_panels_sw_rgb(_st) (
+  _st <= 1 ? ( _swk_r = 0.35; _swk_g = 0.60; _swk_b = 0.86; ) :   // HPF/LPF/RESO
+  _st == 2 ? ( _swk_r = 0.43; _swk_g = 0.79; _swk_b = 0.43; ) :   // EQ
+  _st == 3 ? ( _swk_r = 0.86; _swk_g = 0.35; _swk_b = 0.31; ) :   // CMP
+  _st == 4 ? ( _swk_r = 0.69; _swk_g = 0.48; _swk_b = 0.82; ) :   // BIT
+             ( _swk_r = 0.85; _swk_g = 0.62; _swk_b = 0.30; );    // DRV
+);
+
+// One knob's seat in the grid, by index. ROW-major: column-major would put HPF
+// and RATE side by side, and the pad page's reading order -- filters, then the
+// FX section -- is the whole point of aligning the two.
+function swing_panels_swk_at(_bx, _by, _ix) local(_cw) (
+  _cw = (_mix_bar_w / _mix_sw_cols)|0;
+  _swk_cx = _bx + _cw * (_ix % _mix_sw_cols) + (_cw / 2)|0;
+  _swk_cy = _by + 13 + ((_ix / _mix_sw_cols)|0) * _mix_sw_cellh + _mix_sw_krr + 1;
+);
+
+// The cap under a knob: its NAME normally, its VALUE while the pointer is on
+// it. Both at once needs a row per knob the strip has not got, and a value you
+// can only see by hovering is still a value you can see -- whereas a knob with
+// no name is a knob you have to remember.
+function swing_panels_swk_cap(_lbl, _hot) local(_tw, _th) (
+  gfx_setfont(1, "Arial", 8, 'b');
+  gfx_set(0.70, 0.74, 0.78, _hot ? 1 : 0.8);
+  gfx_measurestr(_lbl, _tw, _th);
+  gfx_x = _swk_cx - (_tw / 2)|0;
+  gfx_y = _swk_cy + _mix_sw_krr + 1;
+  gfx_drawstr(_lbl);
+);
+
+function swing_panels_swk_val(_hot) local(_tw, _th) (
+  _hot ? (
+    gfx_setfont(1, "Arial", 8, 'b');
+    gfx_set(0.92, 0.95, 0.98, 1);
+    gfx_measurestr(#swk_v, _tw, _th);
+    gfx_x = _swk_cx - (_tw / 2)|0;
+    gfx_y = _swk_cy + _mix_sw_krr + 1;
+    gfx_drawstr(#swk_v);
+  );
+);
+
+// _full: the seven knobs the pad FX page has, in its order. Otherwise a 16 px
+// summary bar -- six pips, lit = engaged, which is the whole of what the bar
+// has to say. The BAR keeps its EQ pip: a summary is exactly where a four-band
+// curve can honestly be one lamp.
+function swing_panels_sw_band(_pi, _bx, _by, _bw, _bh, _full, _rh)
+         local(_st, _dx, _cx2, _hot, _km, _nv, _lg) (
+  // Same light-desk deepening as the master band -- the labels keep their
+  // dark-ground colours because the backing gives them their ground back.
+  gfx_set(0, 0, 0, _mix_ink ? 0.45 : 0.20);
+  gfx_rect(_bx, _by, _bw, _bh);
+  gfx_set(0.30, 0.62, 0.70, 0.18);
+  gfx_rect(_bx, _by, _bw, 1);
+  gfx_rect(_bx, _by + _bh - 1, _bw, 1);
+
+  _full ? (
+    gfx_setfont(1, "Arial", 9, 'b');
+    gfx_set(0.50, 0.60, 0.66, 0.9);
+    gfx_measurestr("SWING", tw, th);
+    gfx_x = _bx + ((_bw - tw) / 2)|0; gfx_y = _by + 2;
+    gfx_drawstr("SWING");
+    // ⚠️⚠️  THE EQ LAMP, in the header rather than the grid. The pad page draws
+    // EQ as a CURVE, so a knob here would invent a control that does not exist
+    // over there -- and the lamp is still the only way the desk can say the EQ
+    // is doing something.
+    swing_panels_sw_lit(_pi, 2) ? swing_panels_sw_col(2, 1)
+                                : gfx_set(0.16, 0.18, 0.21, 1);
+    gfx_circle(_bx + 5, _by + 6, 2.8, 1, 1);
+    mx >= _bx + 1 && mx <= _bx + 10 && my >= _by + 1 && my <= _by + 12 ?
+      swing_tooltip_check(880 + _pi,
+        "This pad's EQ is doing something. The curve itself lives on the pad's FX page.");
+
+    // -- HPF -- log domain and the 25 Hz snap are the pad page's own:
+    // 20 Hz reads as OFF, so the knob must not be able to sit just above it.
+    swing_panels_swk_at(_bx, _by, 0);
+    _hot = dist(mx, my, _swk_cx, _swk_cy) <= _mix_sw_krr + 2;
+    _km  = km_console + (_pi * KM_CON_PER_PAD + 4) * KS;
+    _lg  = log10(max(20, fx_hpf_freq[_pi]));
+    swing_panels_sw_rgb(0);
+    rk_knob_draw(_mix_kstyle, _swk_cx, _swk_cy, _mix_sw_krr, _lg,
+                 log10(20), log10(8000), 0, _km[0],
+                 _swk_r, _swk_g, _swk_b, 0, 0.36, 0.34, 0.32);
+    _nv = ssl_knob_interact(_km, _swk_cx, _swk_cy, _mix_sw_krr, _lg,
+                            log10(20), log10(8000), log10(20), 0);
+    _nv != _lg ? (
+      fx_hpf_freq[_pi] = pow(10, _nv);
+      fx_hpf_freq[_pi] <= 25 ? fx_hpf_freq[_pi] = 20;
+      recalc_fx(_pi); mark_dirty_pad(_pi);
+    );
+    fx_hpf_freq[_pi] > 25 ?
+      ( fx_hpf_freq[_pi] >= 1000 ? sprintf(#swk_v, "%.1fk", fx_hpf_freq[_pi] / 1000)
+                                 : sprintf(#swk_v, "%.0f", fx_hpf_freq[_pi]); )
+      : strcpy(#swk_v, "OFF");
+    _hot ? swing_panels_swk_val(1) : swing_panels_swk_cap("HPF", 0);
+
+    // -- LPF --
+    swing_panels_swk_at(_bx, _by, 1);
+    _hot = dist(mx, my, _swk_cx, _swk_cy) <= _mix_sw_krr + 2;
+    _km  = km_console + (_pi * KM_CON_PER_PAD + 5) * KS;
+    _lg  = log10(max(200, fx_lpf_freq[_pi]));
+    swing_panels_sw_rgb(1);
+    rk_knob_draw(_mix_kstyle, _swk_cx, _swk_cy, _mix_sw_krr, _lg,
+                 log10(200), log10(20000), 0, _km[0],
+                 _swk_r, _swk_g, _swk_b, 0, 0.36, 0.34, 0.32);
+    _nv = ssl_knob_interact(_km, _swk_cx, _swk_cy, _mix_sw_krr, _lg,
+                            log10(200), log10(20000), log10(20000), 0);
+    _nv != _lg ? (
+      fx_lpf_freq[_pi] = pow(10, _nv);
+      fx_lpf_freq[_pi] >= 19500 ? fx_lpf_freq[_pi] = 20000;
+      recalc_fx(_pi); mark_dirty_pad(_pi);
+    );
+    fx_lpf_freq[_pi] < 19500 ?
+      ( fx_lpf_freq[_pi] >= 1000 ? sprintf(#swk_v, "%.1fk", fx_lpf_freq[_pi] / 1000)
+                                 : sprintf(#swk_v, "%.0f", fx_lpf_freq[_pi]); )
+      : strcpy(#swk_v, "OFF");
+    _hot ? swing_panels_swk_val(1) : swing_panels_swk_cap("LPF", 0);
+
+    // -- RESO -- the filter section's third control, and the one the
+    // desk was missing outright -- there was never even a lamp for it.
+    swing_panels_swk_at(_bx, _by, 2);
+    _hot = dist(mx, my, _swk_cx, _swk_cy) <= _mix_sw_krr + 2;
+    _km  = km_console + (_pi * KM_CON_PER_PAD + 6) * KS;
+    swing_panels_sw_rgb(0);
+    rk_knob_draw(_mix_kstyle, _swk_cx, _swk_cy, _mix_sw_krr, fx_reso[_pi],
+                 0.707, 12.0, 0, _km[0],
+                 _swk_r, _swk_g, _swk_b, 0, 0.36, 0.34, 0.32);
+    _nv = ssl_knob_interact(_km, _swk_cx, _swk_cy, _mix_sw_krr, fx_reso[_pi],
+                            0.707, 12.0, 0.707, 0);
+    _nv != fx_reso[_pi] ? ( fx_reso[_pi] = _nv; recalc_fx(_pi); mark_dirty_pad(_pi); );
+    fx_reso[_pi] > 0.75 ? sprintf(#swk_v, "%.1f", fx_reso[_pi])
+                        : strcpy(#swk_v, "FLAT");
+    _hot ? swing_panels_swk_val(1) : swing_panels_swk_cap("RESO", 0);
+
+    // -- RATE -- half of what used to be the single BIT lamp.
+    swing_panels_swk_at(_bx, _by, 3);
+    _hot = dist(mx, my, _swk_cx, _swk_cy) <= _mix_sw_krr + 2;
+    _km  = km_console + (_pi * KM_CON_PER_PAD + 7) * KS;
+    swing_panels_sw_rgb(4);
+    rk_knob_draw(_mix_kstyle, _swk_cx, _swk_cy, _mix_sw_krr, fx_bc_rate[_pi],
+                 0, 1.0, 0, _km[0],
+                 _swk_r, _swk_g, _swk_b, 0, 0.36, 0.34, 0.32);
+    _nv = ssl_knob_interact(_km, _swk_cx, _swk_cy, _mix_sw_krr, fx_bc_rate[_pi],
+                            0, 1.0, 0, 0);
+    _nv != fx_bc_rate[_pi] ? ( fx_bc_rate[_pi] = _nv; recalc_fx(_pi); mark_dirty_pad(_pi); );
+    sprintf(#swk_v, "%.0f%%", fx_bc_rate[_pi] * 100);
+    _hot ? swing_panels_swk_val(1) : swing_panels_swk_cap("RATE", 0);
+
+    // -- BITS -- the other half. Quantised on the way in, same as the
+    // pad page: a bit depth of 11.4 is not a thing.
+    swing_panels_swk_at(_bx, _by, 4);
+    _hot = dist(mx, my, _swk_cx, _swk_cy) <= _mix_sw_krr + 2;
+    _km  = km_console + (_pi * KM_CON_PER_PAD + 8) * KS;
+    swing_panels_sw_rgb(4);
+    rk_knob_draw(_mix_kstyle, _swk_cx, _swk_cy, _mix_sw_krr, fx_bc_bits[_pi],
+                 1, 16, 0, _km[0],
+                 _swk_r, _swk_g, _swk_b, 0, 0.36, 0.34, 0.32);
+    _nv = ssl_knob_interact(_km, _swk_cx, _swk_cy, _mix_sw_krr, fx_bc_bits[_pi],
+                            1, 16, 16, 0);
+    _nv != fx_bc_bits[_pi] ? (
+      fx_bc_bits[_pi] = floor(_nv + 0.5); recalc_fx(_pi); mark_dirty_pad(_pi);
+    );
+    fx_bc_bits[_pi] < 15.5 ? sprintf(#swk_v, "%.0f", fx_bc_bits[_pi])
+                           : strcpy(#swk_v, "16");
+    _hot ? swing_panels_swk_val(1) : swing_panels_swk_cap("BITS", 0);
+
+    // -- DRIVE -- ⚠️⚠️ NO recalc_fx. The saturator reads its drive straight
+    // in @sample, exactly as the pad page has it. Adding a recalc here would be
+    // the two views disagreeing about the engine, which is the whole thing this
+    // alignment exists to stop.
+    swing_panels_swk_at(_bx, _by, 5);
+    _hot = dist(mx, my, _swk_cx, _swk_cy) <= _mix_sw_krr + 2;
+    _km  = km_console + (_pi * KM_CON_PER_PAD + 9) * KS;
+    swing_panels_sw_rgb(5);
+    rk_knob_draw(_mix_kstyle, _swk_cx, _swk_cy, _mix_sw_krr, fx_sat_drv[_pi],
+                 0, 1.0, 0, _km[0],
+                 _swk_r, _swk_g, _swk_b, 0, 0.36, 0.34, 0.32);
+    _nv = ssl_knob_interact(_km, _swk_cx, _swk_cy, _mix_sw_krr, fx_sat_drv[_pi],
+                            0, 1.0, 0, 0);
+    _nv != fx_sat_drv[_pi] ? ( fx_sat_drv[_pi] = _nv; mark_dirty_pad(_pi); );
+    sprintf(#swk_v, "%.0f%%", fx_sat_drv[_pi] * 100);
+    _hot ? swing_panels_swk_val(1) : swing_panels_swk_cap("DRIVE", 0);
+
+    // -- COMP --
+    swing_panels_swk_at(_bx, _by, 6);
+    _hot = dist(mx, my, _swk_cx, _swk_cy) <= _mix_sw_krr + 2;
+    _km  = km_console + (_pi * KM_CON_PER_PAD + 10) * KS;
+    swing_panels_sw_rgb(3);
+    rk_knob_draw(_mix_kstyle, _swk_cx, _swk_cy, _mix_sw_krr, fx_cmp_amt[_pi],
+                 0, 1.0, 0, _km[0],
+                 _swk_r, _swk_g, _swk_b, 0, 0.36, 0.34, 0.32);
+    _nv = ssl_knob_interact(_km, _swk_cx, _swk_cy, _mix_sw_krr, fx_cmp_amt[_pi],
+                            0, 1.0, 0, 0);
+    _nv != fx_cmp_amt[_pi] ? ( fx_cmp_amt[_pi] = _nv; recalc_fx(_pi); mark_dirty_pad(_pi); );
+    sprintf(#swk_v, "%.0f%%", fx_cmp_amt[_pi] * 100);
+    _hot ? swing_panels_swk_val(1) : swing_panels_swk_cap("COMP", 0);
+  ) : (
+    // Six pips across the bar, spaced from the bar's own width so the row
+    // stays centred at any strip size.
+    _dx = max(5, min(9, ((_bw - 6) / 6)|0));
+    _cx2 = _bx + ((_bw - _dx * 6) / 2)|0;
+    _st = 0;
+    loop(6,
+      swing_panels_sw_lit(_pi, _st) ? swing_panels_sw_col(_st, 1)
+                                    : gfx_set(0.16, 0.18, 0.21, 1);
+      gfx_circle(_cx2 + _st * _dx + ((_dx / 2)|0), _by + ((_bh / 2)|0), 2.6, 1, 1);
+      _st += 1;
+    );
+  );
+);
+
+// Is ANY pad soloed? A pad that is not soloed while another is has gone
+// silent without being muted, and a desk that does not show that is lying
+// about fifteen channels at once.
+function swing_panels_any_solo() local(_i, _r) (
+  _r = 0; _i = 0;
+  loop(16, p_solo[_i] ? _r = 1; _i += 1; );
+  _r;
+);
+
+// Desk finish for the console ground (con_bg). Sets gfx colour; no state.
+// Kept as one function so the panel, its swatches, and anything later that
+// needs to sit flush against the desk cannot drift apart.
+// ⚠️ Defined ABOVE the mixer, not just above the sections panel: the mixer's
+// own chrome reads the ink below, and EEL2 resolves top-down — a call to a
+// function defined later is a compile error, not a forward reference. (That
+// placement is exactly how the first light-grey build shipped an ink function
+// that nothing could reach.)
+function swing_panels_console_bg(_a) (
+  con_bg == 1 ? gfx_set(0.149, 0.165, 0.188, _a) :   // graphite
+  con_bg == 2 ? gfx_set(0.030, 0.032, 0.036, _a) :   // black
+  con_bg == 3 ? gfx_set(0.200, 0.220, 0.250, _a) :   // slate
+  con_bg == 4 ? gfx_set(0.130, 0.112, 0.096, _a) :   // walnut
+  con_bg == 5 ? gfx_set(0.780, 0.790, 0.800, _a) :   // light grey
+                gfx_set(0.045, 0.075, 0.100, _a);    // 0 = blue (the original)
+);
+
+// ⚠️ A LIGHT ground cannot keep dark-ground chrome. Every label, hairline
+// and title in this panel was picked against a near-black desk; on light
+// grey the pale ones vanish entirely. One flag, read wherever the console
+// paints its OWN chrome -- the strips are self-coloured hardware and stay
+// as they are, exactly as real hardware does on any desk.
+function swing_panels_console_ink(_a) (
+  con_bg == 5 ? gfx_set(0.12, 0.14, 0.17, _a) : gfx_set(0.60, 0.90, 0.95, _a);
+);
+
+// Row-label ink for the gutter. The four colours ARE the vocabulary — green
+// pan, blue delay, purple reverb, red smash — and the hue has to survive every
+// finish. But they were chosen against a near-black desk, and PAN's green and
+// DLY's blue sit close to light grey's own luma, which is exactly where they
+// went muddy.
+// ⭐ DARKENED, NOT OUTLINED. Scaling toward black keeps the hue EXACTLY while
+// buying real contrast; a 1 px outline at 11 px bold eats the letterforms and
+// turns four crisp labels into four smudges. Full alpha on light too — 0.85
+// over a pale ground throws away contrast that was just paid for.
+function swing_panels_row_ink(_r, _g, _b) (
+  _mix_ink ? gfx_set(_r * 0.52, _g * 0.52, _b * 0.52, 1)
+           : gfx_set(_r, _g, _b, 0.85);
+);
+
 function swing_panels_draw_mixer() (
     // Guard: skip drawing if LCD content area isn't valid yet
     _lcd_cw > 20 && _lcd_ch > 20 ? (
     // CONSOLE mode: the same function renders both the compact LCD page and
     // the full-size overlay (swing_panels_draw_mixer_big re-points _lcd_c*
-    // at the pad-grid rect). Tall content scales the mini-slider rows,
-    // fonts, and adds dB readouts.
+    // at the pad-grid rect). The big view gets real console hardware: four
+    // rotary knobs (PAN / DLY / RVB / SMS) stacked per strip above a capped
+    // fader, bigger fonts and a dB readout row. Knob radius is bounded by
+    // the strip width so neighbours never touch (~11 px at the default
+    // window — the pad mini-knob size). The compact LCD page keeps its flat
+    // mini-sliders for the four rows (_mix_kr / _mix_db_h collapse to 0 there)
+    // but gets the same capped fader, scaled down to its strip size.
     _mix_big = _lcd_ch > 260;
-    _mix_bw = max(1, (_lcd_cw - 20) / 16);
-    _mix_sl_h = _mix_big ? 12 : 5;    // height of each horizontal mini-slider
-    _mix_sl_gap = _mix_big ? 2 : 1;   // gap between mini-sliders
-    _mix_top_h = _mix_sl_h * 4 + _mix_sl_gap * 3 + 2;  // 4 sliders + gaps + padding
-    _mix_vol_y = _lcd_cy + 12 + _mix_top_h;
-    _mix_vol_h = max(10, _lcd_ch - 18 - _mix_top_h);
+    // Dark ink this frame? Only when the CONSOLE view is what re-pointed us
+    // here — the compact LCD page draws on the LCD's own dark ground no
+    // matter what finish the desk wears, so con_bg must not reach it.
+    _mix_ink = big_view_id == VIEW_CONSOLE && con_bg == 5;
+    _mix_gut = _mix_big ? 30 : 10;   // left gutter: row labels (spelled out in the big view)
+    // FOCUS STRIP: the selected channel drawn wide. This is the ONE per-strip
+    // exception to the band rule, and it is allowed precisely because it
+    // spends WIDTH. Height carries fader calibration -- two strips of
+    // different height get faders of different throw, so the same mouse
+    // travel is a different number of dB on each. Width costs only room, so
+    // every strip keeps one zero and one throw.
+    //
+    // What wide BUYS: the pad name stops truncating, the Swing band's labels
+    // have room, and the send knobs can carry a readout. What it cannot buy
+    // is a section its neighbours have closed -- that would be height.
+    // Column count, not a constant: the master strip is a 17th column when
+    // it is on, and everything narrows to pay for it.
+    _mix_g_mst = _mix_big && con_master;
+    _mix_ncol = 16 + (_mix_g_mst ? 1 : 0);
+    _mix_wtot = _lcd_cw - _mix_gut - 10;
+    _mix_fpad = (_mix_big && con_focus) ? max(0, min(15, sel_pad | 0)) : -1;
+    _mix_bwf  = _mix_fpad >= 0 ? ((_mix_wtot / _mix_ncol) * 22 / 10)|0 : 0;
+    _mix_bw   = max(1, _mix_fpad >= 0
+                    ? ((_mix_wtot - _mix_bwf) / (_mix_ncol - 1))|0
+                    : (_mix_wtot / _mix_ncol));
+    // A focus strip no wider than a normal one would be a lie; fall back.
+    _mix_fpad >= 0 && _mix_bwf <= _mix_bw ? (
+      _mix_fpad = -1; _mix_bwf = 0;
+      _mix_bw = max(1, _mix_wtot / _mix_ncol); );
+    _mix_kr = _mix_big ? max(6, min(11, ((_mix_bw - 4) / 2)|0)) : 0;
+    _mix_sl_h = _mix_big ? _mix_kr * 2 + 3 : 5;   // row height: knob diameter + pad / mini-slider height
+    _mix_sl_gap = _mix_big ? 2 : 1;               // gap between rows
+
+    // ── Section gates (con_*, ser_ver 58) ────────────────────────────────
+    // The compact LCD page IGNORES them: these are settings for the DESK, and
+    // the LCD page is not the desk. Everything downstream reads the _mix_g_*
+    // gate, never con_* directly, so that exemption lives in exactly one place.
+    _mix_g_pan   = !_mix_big || con_pan;
+    _mix_g_sends = !_mix_big || con_sends;
+    _mix_g_cut   = !_mix_big || con_cut;
+    _mix_g_fader = !_mix_big || con_fader;
+    _mix_g_meter = !_mix_big || con_meter;
+    _mix_g_dbsc  = !_mix_big || con_dbsc;
+    _mix_g_name  = !_mix_big || con_name;
+
+    // Knob rows are PAN + three sends, and either group can be switched off,
+    // so a row's y comes from how many rows precede it — not from a fixed
+    // index. Drop PAN and the sends slide up into the space.
+    _mix_nr_pan = _mix_g_pan   ? 1 : 0;
+    _mix_nr_snd = _mix_g_sends ? 3 : 0;
+    _mix_nrows  = _mix_nr_pan + _mix_nr_snd;
+    // The divider only means something when there is a PAN above it and sends
+    // below it; with either gone it is a line separating nothing.
+    _mix_sep_h = (_mix_big && _mix_g_pan && _mix_g_sends) ? 7 : 0;
+    _mix_top_h = _mix_nrows > 0
+      ? (_mix_sl_h * _mix_nrows + _mix_sl_gap * (_mix_nrows - 1) + 2 + _mix_sep_h)
+      : 0;
+    // Everything above the fader well, so _mix_vol_y lands under the band too.
+    // Set AFTER _mix_sw_h exists — see the band block a few lines down; this is
+    // re-assigned there rather than reordered, because _mix_sep_h and the row
+    // count have to be known first.
     _mix_ind_y = _lcd_cy + 13;  // top indicator area start
+
+    // Swing's own chain band. Console only — the compact LCD page has no room
+    // for it, and unlike the knob rows there is no smaller form that would
+    // still say anything.
+    _mix_g_sw   = _mix_big && con_sw;
+    // Row pitch follows the type: 11 px labels in a 12 px row is text with
+    // no room to be read. Bumped with the ladder rather than left behind.
+    _mix_sw_rh  = 14;                       // row pitch in FULL
+    // ⭐⭐ FULL IS SEVEN KNOBS NOW, matching the pad FX page one for one:
+    // HPF LPF RESO | RATE BITS DRIVE COMP. It used to be six read-only lamps,
+    // which disagreed with the pad page in three ways at once -- RESO was
+    // missing entirely, BIT was one lamp over two separate parameters (rate
+    // and bits), and EQ was a lamp for something the pad page draws as a
+    // CURVE, not a knob. The desk and the pad page are two views of one
+    // channel and they must not disagree about what the channel has.
+    //
+    // ⚠️ EQ therefore leaves the knob grid and stays a LAMP in the band
+    // header -- it is still the only place the desk can say the EQ is doing
+    // something, and inventing a knob for a four-band curve would be a worse
+    // lie than the lamp was.
+    //
+    // Two columns when a strip can seat two usable knobs, one when it cannot.
+    // The band's height FOLLOWS that, so a narrow desk gets a tall thin band
+    // rather than knobs too small to grab.
+    _mix_sw_cols = _mix_bw >= 46 ? 2 : 1;
+    _mix_sw_krr  = max(5, min(9, (((_mix_bw - 2) / _mix_sw_cols - 6) / 2) | 0));
+    _mix_sw_nrow = _mix_sw_cols == 2 ? 4 : 7;
+    _mix_sw_cellh = _mix_sw_krr * 2 + 11;   // knob + its cap
+    _mix_sw_h   = _mix_g_sw ? (con_sw_full ? (13 + _mix_sw_nrow * _mix_sw_cellh + 3) : 16) : 0;
+    _mix_sw_gap = _mix_sw_h > 0 ? 5 : 0;
+
+    // ── INSERTS band ────────────────────────────────────────────────────
+    // Top of the strip, above Swing's own chain: on a console the insert
+    // point comes FIRST, and Swing's fixed chain is the channel's own
+    // EQ/dynamics section sitting below it.
+    //
+    // FIT is worked out from what the other sections have already taken,
+    // which is why it is computed HERE and not with the rest of the gates —
+    // it needs _mix_sw_h and the row height to exist first. 130 is the
+    // fader's floor: a console whose slots ate the fader is not a console.
+    // Snapshot ONCE per frame, before any strip draws — sixteen strips
+    // reading the seqlock independently could each land on a different
+    // version of the same publish.
+    _mix_big && con_ins ? swing_panels_conins_read();
+    _mix_g_ins  = _mix_big && con_ins;
+    // Slot height follows the CARD's own 1.714:1 aspect off the strip width,
+    // instead of a flat 14. At a 44 px strip that is ~26 px: the art gets a
+    // card-shaped hole to sit in rather than a letterbox. Capped so a very
+    // wide window does not turn eight slots into the whole strip, and FIT
+    // (computed just below) absorbs the rest.
+    // Cut row: real S and M buttons, not just the red mute stripe that was
+    // there before. ⚠️ Set HERE, above the insert sizing, because that
+    // sizing SUBTRACTS it -- computed after, it would have been reading
+    // last frame's value and the band would settle a frame behind every
+    // time you toggled cut/solo.
+    _mix_cut_h = (_mix_big && _mix_g_cut) ? 17 : 0;
+
+    // Name PILL row: the pad's name at the TOP of the strip, click to rename.
+    // Rides the NAME toggle — with names off, no names anywhere. Big view
+    // only; the compact page's strip has no row to give.
+    _mix_pill_h   = (_mix_big && _mix_g_name) ? 15 : 0;
+    _mix_pill_gap = _mix_pill_h > 0 ? 3 : 0;
+
+    // ⭐ THE BAND GROWS WITH WHAT IS IN IT, AND THE CARDS GROW WITH THE ROOM.
+    // The first version fixed the slot height and the slot COUNT, so collapsing
+    // Swing FX only ever bought you MORE slots -- never bigger cards. That was
+    // backwards: the point of being able to fold a section is to give the
+    // remaining ones room, and a card is the thing that wants room.
+    //
+    // So: how many slots is driven by what is actually THERE (the fullest
+    // channel, plus one empty slot to drop into), and the height left over is
+    // divided between them. Two plugins on a tall window means two big cards,
+    // not two small ones and six empty boxes.
+    _mix_ins_rows_h = _mix_nrows > 0
+      ? (_mix_sl_h * _mix_nrows + _mix_sl_gap * (_mix_nrows - 1) + 2 + _mix_sep_h)
+      : 0;
+    // What the band may spend: everything the other sections do not want, less
+    // the fader's floor. A console whose slots ate the fader is not a console.
+    // ⭐ THE WELL IS SHARED FURNITURE: the fader rides IN it and the meter
+    // is drawn INSIDE it, so it survives while EITHER is on -- switching the
+    // fader off must not take the meter's ground away. With BOTH off nothing
+    // lives there, and a decorative well would be the largest block on the
+    // strip; it collapses and the 130 px floor it reserved goes to the cards,
+    // which is the same rule folding any other section follows.
+    _mix_well_on = _mix_g_fader || _mix_g_meter;
+    _mix_ins_avail = max(20, _lcd_ch - 18 - _mix_sw_h - _mix_sw_gap
+                             - _mix_ins_rows_h - _mix_cut_h
+                             - _mix_pill_h - _mix_pill_gap
+                             - ((_mix_big && _mix_g_fader) ? 13 : 0)
+                             - (_mix_well_on ? 130 : 0));
+    // +1 for the empty slot you drop the next plugin into. con_slots is the
+    // user's CEILING now, not a fixed count -- FIT (0) means "no ceiling".
+    _mix_ins_want = min(CI_NSLOT, max(1, _conins_maxn + 1));
+    // ⭐⭐ SLOTS MEANS SLOTS. It used to be a CEILING taken against "the
+    // fullest channel plus one", so picking 8 showed 8 only if some channel
+    // already held seven plugins -- the number on the button was almost never
+    // the number of rows you got, and that reads as broken rather than as
+    // clever. Now: a number means SHOW THAT MANY, and FIT (0) is where the
+    // adaptive "as many as the chain needs" behaviour lives. Both are
+    // available and the user picks; neither is imposed.
+    _mix_ins_tot  = con_slots == 0 ? _mix_ins_want
+                                   : min(CI_NSLOT, max(1, con_slots | 0));
+    // ⭐ THE VIEWPORT. A card has a floor height (its own 1.714:1 aspect off
+    // the strip width); how many of those the budget holds is how many rows
+    // the band can honestly draw. Beyond that the band SCROLLS instead of
+    // squashing -- shrinking cards below the floor is how a deck of eight
+    // becomes eight letterboxes.
+    _mix_ins_shf = _mix_big ? max(16, (_mix_bw / 1.714) | 0) : 14;
+    _mix_ins_vis = max(1, (_mix_ins_avail / (_mix_ins_shf + 2)) | 0);
+    _mix_ins_n   = min(_mix_ins_tot, _mix_ins_vis);
+    // ⚠️ ONE offset for all sixteen strips -- never per strip. Per-strip
+    // scroll gives per-strip heights, and equal height is what makes every
+    // fader share one zero and one throw. Clamped here, where the totals are
+    // known, so nothing downstream can read a stale window.
+    con_ins_scroll = max(0, min(max(0, _mix_ins_tot - _mix_ins_n),
+                                con_ins_scroll | 0));
+    // Card aspect is the FLOOR, the strip width is the ceiling: a lone card can
+    // grow to square but not beyond, or one plugin would swallow the strip.
+    _mix_ins_sh = _mix_big
+      ? max(_mix_ins_shf,
+            min(_mix_bw, ((_mix_ins_avail / _mix_ins_n) | 0) - 2))
+      : 14;
+    _mix_ins_h  = _mix_g_ins
+      ? (con_ins_full ? (_mix_ins_n * (_mix_ins_sh + 2) - 2) : 16) : 0;
+    _mix_pill_y  = _mix_ind_y;
+    _mix_ins_y   = _mix_ind_y + _mix_pill_h + _mix_pill_gap;
+    _mix_ins_gap = _mix_ins_h > 0 ? 5 : 0;
+
+    _mix_sw_y   = _mix_ins_y + _mix_ins_h + _mix_ins_gap;
+
+    // The knob rows start BELOW both bands: on a desk the channel's own
+    // EQ/dynamics sits above the aux sends, not beside them.
+    _mix_rows_y = _mix_sw_y + _mix_sw_h + _mix_sw_gap;
+    _mix_y_pan = _mix_rows_y;
+    _mix_y_dly = _mix_rows_y + _mix_nr_pan * (_mix_sl_h + _mix_sl_gap) + _mix_sep_h;
+    _mix_y_rvb = _mix_y_dly + (_mix_sl_h + _mix_sl_gap);
+    _mix_y_sms = _mix_y_rvb + (_mix_sl_h + _mix_sl_gap);
+    // Now that both bands' heights are known, fold them into the stack the
+    // fader well measures itself against.
+    _mix_top_h = _mix_top_h + _mix_sw_h + _mix_sw_gap
+                            + _mix_ins_h + _mix_ins_gap
+                            + _mix_pill_h + _mix_pill_gap;
+
+    // The dB readout is the FADER's number, so it goes when the fader goes.
+    _mix_db_h = (_mix_big && _mix_g_fader) ? 13 : 0;
+    _mix_cut_y = _lcd_cy + 12 + _mix_top_h;
+    _mix_vol_y = _lcd_cy + 12 + _mix_top_h + _mix_cut_h + _mix_db_h;
+    // 0 when nothing lives in the well — every draw below is sized from this,
+    // so the well, its fill and its scale all vanish from one number.
+    _mix_vol_h = _mix_well_on
+      ? max(10, _lcd_ch - 18 - _mix_top_h - _mix_cut_h - _mix_db_h) : 0;
+    // Fader travel: the cap CENTRE runs _mix_fy .. _mix_fy + _mix_fh, inset by
+    // half a cap so the cap never overhangs the well. Fill, meter, unity tick,
+    // click and drag all share this one map. Both pages get the capped fader;
+    // the compact LCD page scales it down (smaller cap, 3 px slot, shorter
+    // ticks and only every other one).
+    _mix_cap_h = _mix_big ? max(16, min(28, (_mix_vol_h / 16)|0)) : max(10, min(14, (_mix_vol_h / 4)|0));
+    _mix_slot_w = _mix_big ? 4 : 3;
+    _mix_tl = _mix_big ? 4 : 2;       // scale tick length (unity tick is _mix_tl + 2)
+    _mix_fy = _mix_vol_y + ((_mix_cap_h / 2)|0);
+    _mix_fh = max(1, _mix_vol_h - _mix_cap_h);
+    // Console knobs follow the pad PAN knob style (theme knob when unset) so
+    // pan looks the same here as on the pad grid.
+    _mix_kstyle = pad_pan_style > 0 ? pad_pan_style : sk_kp;
+    _mix_lbl_dy = _mix_big ? (((_mix_sl_h - 10) / 2)|0) : -1;  // row labels: centred on the knob row / old letter offset
 
     // Expand button (compact LCD page only): opens the full-size console
     // overlay over the pad grid. Drawn as an outlined box with a filled
     // top-right corner — no font-glyph dependency.
     big_view_id != VIEW_CONSOLE ? (
+      // Shared art — swing_lcd_expand_btn. The FX page uses the same mark in
+      // the same corner, so the two cannot drift into different gestures.
       _mix_exb_x = _lcd_cx + _lcd_cw - 13; _mix_exb_y = _lcd_cy + 1;
-      _mix_exb_hov = mx >= _mix_exb_x - 2 && mx <= _mix_exb_x + 13 && my >= _mix_exb_y - 2 && my <= _mix_exb_y + 11;
-      gfx_set(0.60, 0.85, 0.95, _mix_exb_hov ? 0.95 : 0.55);
-      gfx_rect(_mix_exb_x, _mix_exb_y, 11, 1);
-      gfx_rect(_mix_exb_x, _mix_exb_y + 8, 11, 1);
-      gfx_rect(_mix_exb_x, _mix_exb_y, 1, 9);
-      gfx_rect(_mix_exb_x + 10, _mix_exb_y, 1, 9);
-      gfx_rect(_mix_exb_x + 6, _mix_exb_y, 5, 4);
+      _mix_exb_hov = swing_lcd_expand_btn(_mix_exb_x, _mix_exb_y);
       _mix_exb_hov ? swing_tooltip_check(1050, "Open the full-size console view over the pad grid.");
       _mix_exb_hov && lmb_down && active_id == -1 ? (
         swing_bigview_open(VIEW_CONSOLE);  // sets id + zeros stale _ov_* gate saves
@@ -50,21 +1026,77 @@ function swing_panels_draw_mixer() (
       );
     );
 
-    // Column headers (tiny, left side)
-    gfx_setfont(1, "Arial", _mix_big ? 12 : 8, 0);
-    gfx_set(0.30, 0.85, 0.45, 0.7);
-    gfx_x = _lcd_cx + 1; gfx_y = _mix_ind_y - 1;  gfx_drawstr("P");
-    gfx_set(0.35, 0.65, 0.90, 0.7);
-    gfx_x = _lcd_cx + 1; gfx_y = _mix_ind_y + _mix_sl_h + _mix_sl_gap - 1;  gfx_drawstr("D");
-    gfx_set(0.55, 0.35, 0.85, 0.7);
-    gfx_x = _lcd_cx + 1; gfx_y = _mix_ind_y + (_mix_sl_h + _mix_sl_gap) * 2 - 1;  gfx_drawstr("R");
-    gfx_set(0.90, 0.38, 0.32, 0.7);
-    gfx_x = _lcd_cx + 1; gfx_y = _mix_ind_y + (_mix_sl_h + _mix_sl_gap) * 3 - 1;  gfx_drawstr("S");
+    // Row labels. Compact page: single letters in the 10 px gutter. Big view:
+    // the gutter widens and the rows are spelled out with the pad FX overlay's
+    // own names (PAN / DLY / RVB / SMSH), right-aligned against the knob column
+    // — "S" on its own read as saturation. Any overflow goes left into the
+    // panel padding, never into strip 1.
+    _mix_big ? (
+      gfx_setfont(1, "Arial", 11, 'b');
+      _mix_lbl_x = _lcd_cx + _mix_gut - 4;   // right edge of the labels
+      // ⚠️ A label for a row that is not DRAWN is a label for nothing — but a
+      // FOLDED row is still drawn, and it was losing its name. INS and FX were
+      // gated on their FULL flags, so switching either band to BAR left a
+      // labelled gutter with an unlabelled 16 px bar sitting in it.
+      _mix_g_ins ? (
+        _conins_stale ? (_mix_ink ? gfx_set(0.55, 0.40, 0.08, 0.95)
+                                  : gfx_set(0.72, 0.55, 0.18, 0.9))
+                      : (_mix_ink ? swing_panels_console_ink(0.75)
+                                  : gfx_set(0.55, 0.66, 0.72, 0.85));
+        gfx_measurestr("INS", tw, th);
+        gfx_x = _mix_lbl_x - tw; gfx_y = _mix_ins_y + 3;  gfx_drawstr("INS");
+      );
+      _mix_g_sw ? (
+        _mix_ink ? swing_panels_console_ink(0.75) : gfx_set(0.50, 0.60, 0.66, 0.85);
+        gfx_measurestr("FX", tw, th);
+        gfx_x = _mix_lbl_x - tw; gfx_y = _mix_sw_y + 2;  gfx_drawstr("FX");
+      );
+      _mix_g_pan ? (
+        swing_panels_row_ink(0.30, 0.85, 0.45);
+        gfx_measurestr("PAN", tw, th);
+        gfx_x = _mix_lbl_x - tw; gfx_y = _mix_y_pan + _mix_lbl_dy;  gfx_drawstr("PAN");
+      );
+      _mix_g_sends ? (
+        swing_panels_row_ink(0.35, 0.65, 0.90);
+        gfx_measurestr("DLY", tw, th);
+        gfx_x = _mix_lbl_x - tw; gfx_y = _mix_y_dly + _mix_lbl_dy;  gfx_drawstr("DLY");
+        swing_panels_row_ink(0.55, 0.35, 0.85);
+        gfx_measurestr("RVB", tw, th);
+        gfx_x = _mix_lbl_x - tw; gfx_y = _mix_y_rvb + _mix_lbl_dy;  gfx_drawstr("RVB");
+        swing_panels_row_ink(0.90, 0.38, 0.32);
+        gfx_measurestr("SMSH", tw, th);
+        gfx_x = _mix_lbl_x - tw; gfx_y = _mix_y_sms + _mix_lbl_dy;  gfx_drawstr("SMSH");
+      );
+    ) : (
+      gfx_setfont(1, "Arial", 10, 0);
+      gfx_set(0.30, 0.85, 0.45, 0.7);
+      gfx_x = _lcd_cx + 1; gfx_y = _mix_y_pan + _mix_lbl_dy;  gfx_drawstr("P");
+      gfx_set(0.35, 0.65, 0.90, 0.7);
+      gfx_x = _lcd_cx + 1; gfx_y = _mix_y_dly + _mix_lbl_dy;  gfx_drawstr("D");
+      gfx_set(0.55, 0.35, 0.85, 0.7);
+      gfx_x = _lcd_cx + 1; gfx_y = _mix_y_rvb + _mix_lbl_dy;  gfx_drawstr("R");
+      gfx_set(0.90, 0.38, 0.32, 0.7);
+      gfx_x = _lcd_cx + 1; gfx_y = _mix_y_sms + _mix_lbl_dy;  gfx_drawstr("S");
+    );
+
+    // Divider under PAN (big view): an etched line across labels + strips,
+    // centred in the extra _mix_sep_h gap, so the sends read as a group.
+    // _mix_sep_h is 0 unless BOTH pan and sends are drawn, so this gate also
+    // covers "one of them is switched off" without naming either.
+    _mix_big && _mix_sep_h > 0 ? (
+      _mix_sep_y = _mix_y_dly - _mix_sep_h + ((_mix_sep_h / 2)|0);
+      gfx_set(0, 0, 0, 0.5);
+      gfx_rect(_lcd_cx, _mix_sep_y, _mix_gut + _mix_bw * 16 - 2, 1);
+      gfx_set(1, 1, 1, 0.14);
+      gfx_rect(_lcd_cx, _mix_sep_y + 1, _mix_gut + _mix_bw * 16 - 2, 1);
+    );
 
     // ── Drag continuations for all 4 types ──
-    // VOL drag (vertical, fader-law taper)
+    // VOL drag (vertical, fader-law taper). _mix_drag_off = cap-grab offset
+    // set on the press (big view only) so a grabbed cap follows the pointer
+    // without jumping; 0 when the press landed in the open well.
     active_id == 290 ? ( LMB ? (
-      _mix_nv = swing_panels_mix_p2g(max(0, min(1.0, 1.0 - (my - _mix_vol_y) / _mix_vol_h)));
+      _mix_nv = swing_panels_mix_p2g(max(0, min(1.0, 1.0 - (my - _mix_drag_off - _mix_fy) / _mix_fh)));
       p_gain[_mix_drag_pad] = _mix_nv;
       s_dirty[_mix_drag_pad] = 1;
       mark_dirty_pad(pi);
@@ -72,7 +1104,7 @@ function swing_panels_draw_mixer() (
 
     // PAN drag (horizontal)
     active_id == 291 ? ( LMB ? (
-      _mix_dx = _lcd_cx + 10 + _mix_drag_pad * _mix_bw;
+      _mix_dx = _lcd_cx + _mix_gut + _mix_drag_pad * _mix_bw;
       _mix_dbw = _mix_bw - 2;
       p_pan[_mix_drag_pad] = max(-1.0, min(1.0, ((mx - _mix_dx) / _mix_dbw) * 2.0 - 1.0));
       p_panL[_mix_drag_pad] = 1.0 - max(0.0, p_pan[_mix_drag_pad]);
@@ -82,7 +1114,7 @@ function swing_panels_draw_mixer() (
 
     // DLY send drag (horizontal)
     active_id == 292 ? ( LMB ? (
-      _mix_dx = _lcd_cx + 10 + _mix_drag_pad * _mix_bw;
+      _mix_dx = _lcd_cx + _mix_gut + _mix_drag_pad * _mix_bw;
       _mix_dbw = _mix_bw - 2;
       fx_snd_dly[_mix_drag_pad] = max(0, min(1.0, (mx - _mix_dx) / _mix_dbw));
       mark_dirty_pad(pi);
@@ -90,7 +1122,7 @@ function swing_panels_draw_mixer() (
 
     // RVB send drag (horizontal)
     active_id == 293 ? ( LMB ? (
-      _mix_dx = _lcd_cx + 10 + _mix_drag_pad * _mix_bw;
+      _mix_dx = _lcd_cx + _mix_gut + _mix_drag_pad * _mix_bw;
       _mix_dbw = _mix_bw - 2;
       fx_snd_rvb[_mix_drag_pad] = max(0, min(1.0, (mx - _mix_dx) / _mix_dbw));
       mark_dirty_pad(pi);
@@ -98,189 +1130,482 @@ function swing_panels_draw_mixer() (
 
     // SMS send drag (horizontal)
     active_id == 294 ? ( LMB ? (
-      _mix_dx = _lcd_cx + 10 + _mix_drag_pad * _mix_bw;
+      _mix_dx = _lcd_cx + _mix_gut + _mix_drag_pad * _mix_bw;
       _mix_dbw = _mix_bw - 2;
       fx_snd_smash[_mix_drag_pad] = max(0, min(1.0, (mx - _mix_dx) / _mix_dbw));
       mark_dirty_pad(pi);
     ) : active_id = -1; );
 
+    // INSERT slot: latched on the press, decided on the release. Travel past
+    // 4 px makes it a REORDER drag (FXA_MOVE — the bridge's best-evidenced
+    // verb); release without travel is the float click. One gesture, two
+    // meanings, and the menu stays on the right button.
+    // ⚠️ _insd_live, and the mouse-up EDGE. active_id cannot carry this: the
+    // frame globals run `!LMB && active_id >= 0 ? active_id = -1;` near the top
+    // of @gfx while this page draws near the bottom, so on the release frame
+    // the id was already gone and neither the float nor the reorder ever fired.
+    // prev_LMB still holds last frame's state here (written at the end of
+    // @gfx), so !LMB && prev_LMB is the release itself rather than "the button
+    // happens to be up", which would fire a stale latch on some later frame.
+    _insd_live ? (
+      LMB ? (
+        abs(my - _insd_y0) > 4 ? _insd_on = 1;
+      ) : (
+        prev_LMB ? (
+        _insd_on ? (
+          // Target from the pointer, clamped to slots the chain OWNS —
+          // count is the band's own published record for this pad.
+          _insd_cnt = _conins_buf[_insd_pad * CIF_REC] | 0;
+          _insd_tgt = max(0, min(max(0, _insd_cnt - 1),
+                        (((my - _mix_ins_y) / (_mix_ins_sh + 2)) | 0)
+                        + con_ins_scroll));
+          _insd_tgt != _insd_slot ? (
+            swing_panels_ins_aim(_insd_pad, _insd_slot, 1);
+            swing_fxview_act(FXA_MOVE, _insd_slot, _insd_tgt);
+          );
+        ) : (
+          swing_panels_ins_aim(_insd_pad, _insd_slot, 1);
+          swing_fxview_act(FXA_FLOAT, _insd_slot, -1);
+        );
+        );
+        _insd_live = 0;
+        // Only ours to clear -- the frame globals may already have released it.
+        active_id == 308 ? active_id = -1;
+      );
+    );
+
+    // ═══ INSERT VIEWPORT: the wheel, and the bar that says where you are ═══
+    // ⚠️ ALL SIXTEEN STRIPS TOGETHER. The offset is one number for the whole
+    // desk, so scrolling never changes a strip's height relative to its
+    // neighbours -- equal height is what makes every fader share one zero and
+    // one throw. A per-strip viewport would break that on the first notch.
+    _mix_g_ins && con_ins_full && _mix_ins_tot > _mix_ins_n ? (
+      _insv_hov = mx >= _lcd_cx + _mix_gut - 6 &&
+                  mx <= _lcd_cx + _mix_gut + _mix_wtot &&
+                  my >= _mix_ins_y && my <= _mix_ins_y + _mix_ins_h;
+      _insv_hov && frame_wheel != 0 ? (
+        con_ins_scroll = max(0, min(_mix_ins_tot - _mix_ins_n,
+                             con_ins_scroll - (frame_wheel > 0 ? 1 : -1)));
+        frame_wheel = 0;                       // consumed
+      );
+      // A bar in the gutter, not a number: the gutter is 30 px and "INS"
+      // already owns most of it. It reads as position, which is the whole
+      // question a viewport raises.
+      _insv_th = max(6, (_mix_ins_h * _mix_ins_n / _mix_ins_tot) | 0);
+      _insv_ty = ((_mix_ins_h - _insv_th) * con_ins_scroll
+                  / max(1, _mix_ins_tot - _mix_ins_n)) | 0;
+      gfx_set(0, 0, 0, 0.28);
+      gfx_rect(_lcd_cx + _mix_gut - 5, _mix_ins_y, 3, _mix_ins_h);
+      _mix_ink ? gfx_set(0.20, 0.24, 0.30, 0.9) : gfx_set(0.45, 0.72, 0.82, 0.8);
+      gfx_rect(_lcd_cx + _mix_gut - 5, _mix_ins_y + _insv_ty, 3, _insv_th);
+      // No silent truncation -- say which slots these are and how to move.
+      _insv_hov ? (
+        strcpy(#_insv_tip, "Insert slots ");
+        sprintf(#_insv_n, "%d", con_ins_scroll + 1);
+        strcat(#_insv_tip, #_insv_n);
+        strcat(#_insv_tip, "–");
+        sprintf(#_insv_n, "%d", con_ins_scroll + _mix_ins_n);
+        strcat(#_insv_tip, #_insv_n);
+        strcat(#_insv_tip, " of ");
+        sprintf(#_insv_n, "%d", _mix_ins_tot);
+        strcat(#_insv_tip, #_insv_n);
+        strcat(#_insv_tip, " — the wheel scrolls every strip together.");
+        swing_tooltip_check(1096, #_insv_tip);
+      );
+    ) : con_ins_scroll = 0;   // nothing to scroll: never hold a stale window
+
     _mix_i = 0;
     loop(16,
-      _mix_x = _lcd_cx + 10 + _mix_i * _mix_bw;
-      _mix_bar_w = _mix_bw - 2;
+      _mix_x = _lcd_cx + _mix_gut + _mix_i * _mix_bw
+             + ((_mix_fpad >= 0 && _mix_i > _mix_fpad) ? (_mix_bwf - _mix_bw) : 0);
+      _mix_bar_w = (_mix_i == _mix_fpad ? _mix_bwf : _mix_bw) - 2;
+      // ⚠️⚠️ THE KNOB COLUMN BELONGS TO THE STRIP, NOT TO THE PAN ROW.
+      // This was assigned ONLY inside the `_mix_g_pan` block, and DLY / RVB /
+      // SMSH read it while setting nothing but their own y. Switch PAN off and
+      // it was never written for any strip this frame, so all three send knobs
+      // on all sixteen strips drew at one stale x -- and dist(mx,my,_mix_kcx,..)
+      // made them unclickable too. It read as "PAN removes the send knobs".
+      _mix_kcx = _mix_x + ((_mix_bar_w / 2)|0);
+
+      // Focus backing: a faint wash and a hairline top and bottom, so the
+      // wide channel reads as chosen rather than as a layout accident.
+      _mix_i == _mix_fpad ? (
+        gfx_set(0.30, 0.75, 0.85, 0.055);
+        gfx_rect(_mix_x - 2, _mix_ind_y - 4, _mix_bar_w + 4,
+                 _mix_vol_y + _mix_vol_h + 14 - _mix_ind_y);
+        gfx_set(0.40, 0.82, 0.90, 0.32);
+        gfx_rect(_mix_x - 2, _mix_ind_y - 4, _mix_bar_w + 4, 1);
+        gfx_rect(_mix_x - 2, _mix_vol_y + _mix_vol_h + 9, _mix_bar_w + 4, 1);
+      );
       // Empty pads grey out the entire strip so it matches the pad grid's
       // empty-pad appearance. Playable = sample OR enabled synth.
       _mix_has_audio = pad_is_playable(_mix_i);
 
-      // ═══ PAN mini-slider (green, horizontal, center-referenced) ═══
-      _pan_sy = _mix_ind_y;
-      _pan_norm = (p_pan[_mix_i] + 1.0) / 2.0;  // 0..1
-      _pan_mid = _mix_x + _mix_bar_w / 2;
-      _pan_px = (_mix_x + _pan_norm * _mix_bar_w)|0;
-      // Background
-      gfx_set(0.12, 0.14, 0.18, 0.6);
-      gfx_rect(_mix_x, _pan_sy, _mix_bar_w, _mix_sl_h);
-      // Center tick
-      gfx_set(0.30, 0.32, 0.35, 0.7);
-      gfx_rect(_pan_mid, _pan_sy, 1, _mix_sl_h);
-      // Fill from center to position
-      _pan_fill_x = min(_pan_mid, _pan_px);
-      _pan_fill_w = abs(_pan_px - _pan_mid);
-      _pan_fill_w > 0 ? (
-        _mix_has_audio ? gfx_set(0.25, 0.70, 0.38, 0.7) : gfx_set(0.42, 0.40, 0.38, 0.55);
-        gfx_rect(_pan_fill_x, _pan_sy, _pan_fill_w, _mix_sl_h);
-      );
-      // Thumb (bright green dot, greyed if empty)
-      _mix_has_audio ? gfx_set(0.30, 0.90, 0.50, 1.0) : gfx_set(0.50, 0.48, 0.46, 0.85);
-      gfx_rect(max(_mix_x, min(_mix_x + _mix_bar_w - 2, _pan_px - 1)), _pan_sy, 3, _mix_sl_h);
-
-      // PAN interaction
-      _in_pan = mx >= _mix_x && mx <= _mix_x + _mix_bar_w && my >= _pan_sy && my <= _pan_sy + _mix_sl_h;
-      _in_pan ? swing_tooltip_check(800 + _mix_i, "Pad pan in mixer view — drag, scroll, or double-click to center.");
-      active_id == -1 && lmb_down && _in_pan ? (
-        _mix_now = time_precise();
-        _mix_dbl_id == (100 + _mix_i) && (_mix_now - _mix_dbl_time) < DBL_CLICK_T ? (
-          p_pan[_mix_i] = 0;
-          p_panL[_mix_i] = 1.0; p_panR[_mix_i] = 1.0;
-          mark_dirty_pad(pi); _mix_dbl_id = -1;
+      // ═══ NAME PILL: the pad's name, editable, top of the strip ═══
+      // ONE name per pad, everywhere: this edits the PAD through the same
+      // in-place editor the pad grid uses (rk_swing_padname_edit) — no
+      // console-only label, no second edit path.
+      _mix_pill_h > 0 ? (
+        pne_pad == _mix_i && pne_host_con ? (
+          // This pill is the editor's seat: publish the box geometry — wider
+          // than a 44 px strip and clamped inside the console, because the
+          // box scrolls horizontally but typing wants room — and let
+          // swing_pne_draw paint it over everything later this frame.
+          pne_pw = max(90, _mix_bar_w);
+          pne_px = max(_con_x + 4, min(_con_x + _con_w - pne_pw - 4,
+                       _mix_x + (((_mix_bar_w - pne_pw) / 2) | 0)));
+          pne_py = _mix_pill_y - 1;
+          pne_geom_ok = 1;
         ) : (
-          active_id = 291; _mix_drag_pad = _mix_i;
-          p_pan[_mix_i] = max(-1.0, min(1.0, ((mx - _mix_x) / _mix_bar_w) * 2.0 - 1.0));
+          _pill_hv = mx >= _mix_x && mx <= _mix_x + _mix_bar_w &&
+                     my >= _mix_pill_y && my <= _mix_pill_y + _mix_pill_h - 1;
+          // ⭐ THE PILL WEARS THE PAD'S COLOUR, filled. That is what a scribble
+          // strip looks like on a real desk, and it ties the name to the cap
+          // inlay and the well further down the same channel. An empty pad has
+          // no colour to wear, so it keeps the dark seat.
+          _mix_has_audio ? (
+            _cb = _mix_i * 3;
+            gfx_set(col_rgba[_cb], col_rgba[_cb+1], col_rgba[_cb+2],
+                    _pill_hv ? 1 : 0.88);
+          ) : (
+            gfx_set(0.05, 0.06, 0.08, _pill_hv ? 0.95 : 0.8);
+          );
+          gfx_rect(_mix_x, _mix_pill_y, _mix_bar_w, _mix_pill_h - 1);
+          gfx_set(0, 0, 0, 0.30);
+          gfx_rect(_mix_x, _mix_pill_y + _mix_pill_h - 2, _mix_bar_w, 1);
+          gfx_set(1, 1, 1, _pill_hv ? 0.30 : 0.14);
+          gfx_rect(_mix_x, _mix_pill_y, _mix_bar_w, 1);
+          // Name: custom → sample → number, the scribble's own ladder.
+          _cn = get_cname_slot(_mix_i);
+          strlen(_cn) == 0 ? _cn = get_name_slot(_mix_i);
+          strlen(_cn) == 0 || !_mix_has_audio ? (
+            sprintf(#_mn, "%d", _mix_i + 1); _cn = #_mn;
+          );
+          // ⚠️ The scribble's size-12 lesson: "COWBEL" is ~42 px in a 44 px
+          // strip. The pill SOLVES it — measure at 10, drop to 8 when it
+          // clips, clip what still overflows: the full name is one hover
+          // away (tooltip) and the rename one click away (the editor).
+          gfx_setfont(1, "Arial", 10, 'b');
+          gfx_measurestr(_cn, tw, th);
+          tw > _mix_bar_w - 6 ? (
+            gfx_setfont(1, "Arial", 8, 'b'); gfx_measurestr(_cn, tw, th);
+          );
+          _pill_tx = _mix_x + max(3, ((_mix_bar_w - tw) / 2) | 0);
+          _pill_ty = _mix_pill_y + (((_mix_pill_h - th) / 2) | 0);
+          // ⚠️ ONE INK ACROSS SIXTEEN COLOURS. This is `rk_ink_label`'s rule
+          // and its exact idiom -- a per-pad black/white flip would make the
+          // name row read as sixteen unrelated labels instead of one strip.
+          // Inlined only because the helper takes no clip bounds, and a long
+          // name must stop at the strip edge rather than run into its
+          // neighbour.
+          gfx_set(0, 0, 0, 0.72);
+          gfx_x = _pill_tx + 1; gfx_y = _pill_ty + 1;
+          gfx_drawstr(_cn, 0, _mix_x + _mix_bar_w - 2, _mix_pill_y + _mix_pill_h);
+          gfx_set(0.96, 0.96, 0.97, _mix_has_audio ? 1 : 0.55);
+          gfx_x = _pill_tx; gfx_y = _pill_ty;
+          gfx_drawstr(_cn, 0, _mix_x + _mix_bar_w - 2, _mix_pill_y + _mix_pill_h);
+          _pill_hv ? (
+            strcpy(#_cpk_tip, _cn);
+            strcat(#_cpk_tip, " — click to rename the pad (everywhere).");
+            swing_tooltip_check(1300 + _mix_i, #_cpk_tip);
+          );
+          _pill_hv && lmb_down && active_id == -1 ? (
+            swing_pne_open(_mix_i) ? pne_host_con = 1;
+            lmb_down = 0; LMB = 0;      // the pill owns this click
+          );
+        );
+      );
+
+      // ═══ INSERTS: the pad's own REAPER track chain ═══
+      // Drawn per strip, but when NOTHING can own a track the band says so
+      // ONCE (below the loop) instead of 128 dead boxes explaining nothing.
+      _mix_g_ins && ((_conins_flags & 1) || _conins_stale) && !_conins_oldfmt ?
+        swing_panels_ins_band(_mix_i, _mix_x, _mix_ins_y,
+                       _mix_bar_w, _mix_ins_n, _mix_ins_sh, con_ins_full);
+
+      // ═══ SWING chain band: the channel's own EQ/dynamics section ═══
+      _mix_g_sw ? swing_panels_sw_band(_mix_i, _mix_x, _mix_sw_y, _mix_bar_w,
+                                       _mix_sw_h, con_sw_full, _mix_sw_rh);
+
+      // ═══ PAN: rotary knob (big view) / green centre-referenced mini-slider (LCD page) ═══
+      // Gated by the section toggle (ser_ver 58). _mix_g_* already folds in
+      // the "compact LCD page ignores console settings" exemption.
+      _mix_g_pan ? (
+      _pan_sy = _mix_y_pan;
+      _mix_big ? (
+        // Faint strip backing ties the four knobs to the fader below as one channel.
+        _mix_ink ? gfx_set(0, 0, 0, 0.05) : gfx_set(1, 1, 1, 0.035);
+        gfx_rect(_mix_x, _mix_ind_y, _mix_bar_w, _mix_top_h - 2);
+        _mix_kcy = _pan_sy + ((_mix_sl_h / 2)|0);   // _mix_kcx: strip loop head
+        _mix_km = km_console + (_mix_i * KM_CON_PER_PAD + 0) * KS;
+        _mix_has_audio ? ( _mix_kc_r = 0.30; _mix_kc_g = 0.90; _mix_kc_b = 0.50; )
+                       : ( _mix_kc_r = 0.50; _mix_kc_g = 0.48; _mix_kc_b = 0.46; );
+        rk_knob_draw(_mix_kstyle, _mix_kcx, _mix_kcy, _mix_kr, p_pan[_mix_i], -1.0, 1.0, 1, _mix_km[0],
+                     _mix_kc_r, _mix_kc_g, _mix_kc_b, 0, 0.36, 0.34, 0.32);
+        dist(mx, my, _mix_kcx, _mix_kcy) <= _mix_kr + 2 ?
+          swing_tooltip_check(800 + _mix_i, "Pad pan in mixer view — drag, scroll, or double-click to center.");
+        // Same feel as the pad-grid knobs: vertical drag, CTRL = fine, wheel,
+        // double-click = centre. The knob lib owns its drag state (mem[1]), so
+        // active_id stays -1 — nothing else in the console starts on a held
+        // button, and the click-outside close only fires on a fresh press.
+        _mix_knv = ssl_knob_interact(_mix_km, _mix_kcx, _mix_kcy, _mix_kr, p_pan[_mix_i], -1.0, 1.0, 0, 0);
+        _mix_knv != p_pan[_mix_i] ? (
+          p_pan[_mix_i] = _mix_knv;
+          p_panL[_mix_i] = 1.0 - max(0.0, _mix_knv); p_panR[_mix_i] = 1.0 + min(0.0, _mix_knv);
+          mark_dirty_pad(pi);
+        );
+      ) : (
+        _pan_norm = (p_pan[_mix_i] + 1.0) / 2.0;  // 0..1
+        _pan_mid = _mix_x + _mix_bar_w / 2;
+        _pan_px = (_mix_x + _pan_norm * _mix_bar_w)|0;
+        // Background
+        gfx_set(0.12, 0.14, 0.18, 0.6);
+        gfx_rect(_mix_x, _pan_sy, _mix_bar_w, _mix_sl_h);
+        // Center tick
+        gfx_set(0.30, 0.32, 0.35, 0.7);
+        gfx_rect(_pan_mid, _pan_sy, 1, _mix_sl_h);
+        // Fill from center to position
+        _pan_fill_x = min(_pan_mid, _pan_px);
+        _pan_fill_w = abs(_pan_px - _pan_mid);
+        _pan_fill_w > 0 ? (
+          _mix_has_audio ? gfx_set(0.25, 0.70, 0.38, 0.7) : gfx_set(0.42, 0.40, 0.38, 0.55);
+          gfx_rect(_pan_fill_x, _pan_sy, _pan_fill_w, _mix_sl_h);
+        );
+        // Thumb (bright green dot, greyed if empty)
+        _mix_has_audio ? gfx_set(0.30, 0.90, 0.50, 1.0) : gfx_set(0.50, 0.48, 0.46, 0.85);
+        gfx_rect(max(_mix_x, min(_mix_x + _mix_bar_w - 2, _pan_px - 1)), _pan_sy, 3, _mix_sl_h);
+        swing_panels_mix_bevel(_mix_x, _pan_sy, _mix_bar_w, _mix_sl_h);
+
+        // PAN interaction
+        _in_pan = mx >= _mix_x && mx <= _mix_x + _mix_bar_w && my >= _pan_sy && my <= _pan_sy + _mix_sl_h;
+        _in_pan ? swing_tooltip_check(800 + _mix_i, "Pad pan in mixer view — drag, scroll, or double-click to center.");
+        active_id == -1 && lmb_down && _in_pan ? (
+          _mix_now = time_precise();
+          _mix_dbl_id == (100 + _mix_i) && (_mix_now - _mix_dbl_time) < DBL_CLICK_T ? (
+            p_pan[_mix_i] = 0;
+            p_panL[_mix_i] = 1.0; p_panR[_mix_i] = 1.0;
+            mark_dirty_pad(pi); _mix_dbl_id = -1;
+          ) : (
+            active_id = 291; _mix_drag_pad = _mix_i;
+            p_pan[_mix_i] = max(-1.0, min(1.0, ((mx - _mix_x) / _mix_bar_w) * 2.0 - 1.0));
+            p_panL[_mix_i] = 1.0 - max(0.0, p_pan[_mix_i]);
+            p_panR[_mix_i] = 1.0 + min(0.0, p_pan[_mix_i]);
+            mark_dirty_pad(pi);
+            _mix_dbl_time = _mix_now; _mix_dbl_id = 100 + _mix_i;
+          );
+        );
+        _in_pan && frame_wheel != 0 ? (
+          p_pan[_mix_i] = max(-1.0, min(1.0, p_pan[_mix_i] + frame_wheel * 0.05));
           p_panL[_mix_i] = 1.0 - max(0.0, p_pan[_mix_i]);
           p_panR[_mix_i] = 1.0 + min(0.0, p_pan[_mix_i]);
           mark_dirty_pad(pi);
-          _mix_dbl_time = _mix_now; _mix_dbl_id = 100 + _mix_i;
         );
       );
-      _in_pan && frame_wheel != 0 ? (
-        p_pan[_mix_i] = max(-1.0, min(1.0, p_pan[_mix_i] + frame_wheel * 0.05));
-        p_panL[_mix_i] = 1.0 - max(0.0, p_pan[_mix_i]);
-        p_panR[_mix_i] = 1.0 + min(0.0, p_pan[_mix_i]);
-        mark_dirty_pad(pi);
       );
 
-      // ═══ DLY send mini-slider (blue, horizontal fill) ═══
-      _dly_sy = _mix_ind_y + _mix_sl_h + _mix_sl_gap;
-      // Background
-      gfx_set(0.08, 0.10, 0.16, 0.6);
-      gfx_rect(_mix_x, _dly_sy, _mix_bar_w, _mix_sl_h);
-      // Fill
-      fx_snd_dly[_mix_i] > 0.005 ? (
-        _dly_fill = max(1, (fx_snd_dly[_mix_i] * _mix_bar_w)|0);
-        _mix_has_audio ? gfx_set(0.30, 0.60, 0.90, 0.85) : gfx_set(0.42, 0.40, 0.38, 0.55);
-        gfx_rect(_mix_x, _dly_sy, _dly_fill, _mix_sl_h);
-        // Thumb (greyed if empty)
-        _mix_has_audio ? gfx_set(0.45, 0.75, 1.0, 1.0) : gfx_set(0.50, 0.48, 0.46, 0.85);
-        gfx_rect(_mix_x + _dly_fill - 1, _dly_sy, 2, _mix_sl_h);
-      );
+      // ═══ DLY send: rotary knob (big view) / blue fill mini-slider (LCD page) ═══
+      // Gated by the section toggle (ser_ver 58). _mix_g_* already folds in
+      // the "compact LCD page ignores console settings" exemption.
+      _mix_g_sends ? (
+      _dly_sy = _mix_y_dly;
+      _mix_big ? (
+        _mix_kcy = _dly_sy + ((_mix_sl_h / 2)|0);
+        _mix_km = km_console + (_mix_i * KM_CON_PER_PAD + 1) * KS;
+        _mix_has_audio ? ( _mix_kc_r = 0.45; _mix_kc_g = 0.75; _mix_kc_b = 1.0; )
+                       : ( _mix_kc_r = 0.50; _mix_kc_g = 0.48; _mix_kc_b = 0.46; );
+        rk_knob_draw(_mix_kstyle, _mix_kcx, _mix_kcy, _mix_kr, fx_snd_dly[_mix_i], 0, 1.0, 0, _mix_km[0],
+                     _mix_kc_r, _mix_kc_g, _mix_kc_b, 0, 0.36, 0.34, 0.32);
+        dist(mx, my, _mix_kcx, _mix_kcy) <= _mix_kr + 2 ?
+          swing_tooltip_check(900 + _mix_i, "Pad delay send amount — controls how much of this pad feeds the master delay bus.");
+        _mix_knv = ssl_knob_interact(_mix_km, _mix_kcx, _mix_kcy, _mix_kr, fx_snd_dly[_mix_i], 0, 1.0, 0, 0);
+        _mix_knv != fx_snd_dly[_mix_i] ? ( fx_snd_dly[_mix_i] = _mix_knv; mark_dirty_pad(pi); );
+      ) : (
+        // Background
+        gfx_set(0.08, 0.10, 0.16, 0.6);
+        gfx_rect(_mix_x, _dly_sy, _mix_bar_w, _mix_sl_h);
+        // Fill
+        fx_snd_dly[_mix_i] > 0.005 ? (
+          _dly_fill = max(1, (fx_snd_dly[_mix_i] * _mix_bar_w)|0);
+          _mix_has_audio ? gfx_set(0.30, 0.60, 0.90, 0.85) : gfx_set(0.42, 0.40, 0.38, 0.55);
+          gfx_rect(_mix_x, _dly_sy, _dly_fill, _mix_sl_h);
+          // Thumb (greyed if empty)
+          _mix_has_audio ? gfx_set(0.45, 0.75, 1.0, 1.0) : gfx_set(0.50, 0.48, 0.46, 0.85);
+          gfx_rect(_mix_x + _dly_fill - 1, _dly_sy, 2, _mix_sl_h);
+        );
+        swing_panels_mix_bevel(_mix_x, _dly_sy, _mix_bar_w, _mix_sl_h);
 
-      // DLY interaction
-      _in_dly = mx >= _mix_x && mx <= _mix_x + _mix_bar_w && my >= _dly_sy && my <= _dly_sy + _mix_sl_h;
-      _in_dly ? swing_tooltip_check(900 + _mix_i, "Pad delay send amount — controls how much of this pad feeds the master delay bus.");
-      active_id == -1 && lmb_down && _in_dly ? (
-        _mix_now = time_precise();
-        _mix_dbl_id == (200 + _mix_i) && (_mix_now - _mix_dbl_time) < DBL_CLICK_T ? (
-          fx_snd_dly[_mix_i] = 0; mark_dirty_pad(pi); _mix_dbl_id = -1;
-        ) : (
-          active_id = 292; _mix_drag_pad = _mix_i;
-          fx_snd_dly[_mix_i] = max(0, min(1.0, (mx - _mix_x) / _mix_bar_w));
+        // DLY interaction
+        _in_dly = mx >= _mix_x && mx <= _mix_x + _mix_bar_w && my >= _dly_sy && my <= _dly_sy + _mix_sl_h;
+        _in_dly ? swing_tooltip_check(900 + _mix_i, "Pad delay send amount — controls how much of this pad feeds the master delay bus.");
+        active_id == -1 && lmb_down && _in_dly ? (
+          _mix_now = time_precise();
+          _mix_dbl_id == (200 + _mix_i) && (_mix_now - _mix_dbl_time) < DBL_CLICK_T ? (
+            fx_snd_dly[_mix_i] = 0; mark_dirty_pad(pi); _mix_dbl_id = -1;
+          ) : (
+            active_id = 292; _mix_drag_pad = _mix_i;
+            fx_snd_dly[_mix_i] = max(0, min(1.0, (mx - _mix_x) / _mix_bar_w));
+            mark_dirty_pad(pi);
+            _mix_dbl_time = _mix_now; _mix_dbl_id = 200 + _mix_i;
+          );
+        );
+        _in_dly && frame_wheel != 0 ? (
+          fx_snd_dly[_mix_i] = max(0, min(1.0, fx_snd_dly[_mix_i] + frame_wheel * 0.05));
           mark_dirty_pad(pi);
-          _mix_dbl_time = _mix_now; _mix_dbl_id = 200 + _mix_i;
         );
       );
-      _in_dly && frame_wheel != 0 ? (
-        fx_snd_dly[_mix_i] = max(0, min(1.0, fx_snd_dly[_mix_i] + frame_wheel * 0.05));
-        mark_dirty_pad(pi);
       );
 
-      // ═══ RVB send mini-slider (purple, horizontal fill) ═══
-      _rvb_sy = _mix_ind_y + (_mix_sl_h + _mix_sl_gap) * 2;
-      // Background
-      gfx_set(0.10, 0.08, 0.16, 0.6);
-      gfx_rect(_mix_x, _rvb_sy, _mix_bar_w, _mix_sl_h);
-      // Fill
-      fx_snd_rvb[_mix_i] > 0.005 ? (
-        _rvb_fill = max(1, (fx_snd_rvb[_mix_i] * _mix_bar_w)|0);
-        _mix_has_audio ? gfx_set(0.50, 0.30, 0.80, 0.85) : gfx_set(0.42, 0.40, 0.38, 0.55);
-        gfx_rect(_mix_x, _rvb_sy, _rvb_fill, _mix_sl_h);
-        // Thumb (greyed if empty)
-        _mix_has_audio ? gfx_set(0.70, 0.45, 1.0, 1.0) : gfx_set(0.50, 0.48, 0.46, 0.85);
-        gfx_rect(_mix_x + _rvb_fill - 1, _rvb_sy, 2, _mix_sl_h);
-      );
+      // ═══ RVB send: rotary knob (big view) / purple fill mini-slider (LCD page) ═══
+      // Gated by the section toggle (ser_ver 58). _mix_g_* already folds in
+      // the "compact LCD page ignores console settings" exemption.
+      _mix_g_sends ? (
+      _rvb_sy = _mix_y_rvb;
+      _mix_big ? (
+        _mix_kcy = _rvb_sy + ((_mix_sl_h / 2)|0);
+        _mix_km = km_console + (_mix_i * KM_CON_PER_PAD + 2) * KS;
+        _mix_has_audio ? ( _mix_kc_r = 0.70; _mix_kc_g = 0.45; _mix_kc_b = 1.0; )
+                       : ( _mix_kc_r = 0.50; _mix_kc_g = 0.48; _mix_kc_b = 0.46; );
+        rk_knob_draw(_mix_kstyle, _mix_kcx, _mix_kcy, _mix_kr, fx_snd_rvb[_mix_i], 0, 1.0, 0, _mix_km[0],
+                     _mix_kc_r, _mix_kc_g, _mix_kc_b, 0, 0.36, 0.34, 0.32);
+        dist(mx, my, _mix_kcx, _mix_kcy) <= _mix_kr + 2 ?
+          swing_tooltip_check(1000 + _mix_i, "Pad reverb send amount — controls how much of this pad feeds the master reverb bus.");
+        _mix_knv = ssl_knob_interact(_mix_km, _mix_kcx, _mix_kcy, _mix_kr, fx_snd_rvb[_mix_i], 0, 1.0, 0, 0);
+        _mix_knv != fx_snd_rvb[_mix_i] ? ( fx_snd_rvb[_mix_i] = _mix_knv; mark_dirty_pad(pi); );
+      ) : (
+        // Background
+        gfx_set(0.10, 0.08, 0.16, 0.6);
+        gfx_rect(_mix_x, _rvb_sy, _mix_bar_w, _mix_sl_h);
+        // Fill
+        fx_snd_rvb[_mix_i] > 0.005 ? (
+          _rvb_fill = max(1, (fx_snd_rvb[_mix_i] * _mix_bar_w)|0);
+          _mix_has_audio ? gfx_set(0.50, 0.30, 0.80, 0.85) : gfx_set(0.42, 0.40, 0.38, 0.55);
+          gfx_rect(_mix_x, _rvb_sy, _rvb_fill, _mix_sl_h);
+          // Thumb (greyed if empty)
+          _mix_has_audio ? gfx_set(0.70, 0.45, 1.0, 1.0) : gfx_set(0.50, 0.48, 0.46, 0.85);
+          gfx_rect(_mix_x + _rvb_fill - 1, _rvb_sy, 2, _mix_sl_h);
+        );
+        swing_panels_mix_bevel(_mix_x, _rvb_sy, _mix_bar_w, _mix_sl_h);
 
-      // RVB interaction
-      _in_rvb = mx >= _mix_x && mx <= _mix_x + _mix_bar_w && my >= _rvb_sy && my <= _rvb_sy + _mix_sl_h;
-      _in_rvb ? swing_tooltip_check(1000 + _mix_i, "Pad reverb send amount — controls how much of this pad feeds the master reverb bus.");
-      active_id == -1 && lmb_down && _in_rvb ? (
-        _mix_now = time_precise();
-        _mix_dbl_id == (300 + _mix_i) && (_mix_now - _mix_dbl_time) < DBL_CLICK_T ? (
-          fx_snd_rvb[_mix_i] = 0; mark_dirty_pad(pi); _mix_dbl_id = -1;
-        ) : (
-          active_id = 293; _mix_drag_pad = _mix_i;
-          fx_snd_rvb[_mix_i] = max(0, min(1.0, (mx - _mix_x) / _mix_bar_w));
+        // RVB interaction
+        _in_rvb = mx >= _mix_x && mx <= _mix_x + _mix_bar_w && my >= _rvb_sy && my <= _rvb_sy + _mix_sl_h;
+        _in_rvb ? swing_tooltip_check(1000 + _mix_i, "Pad reverb send amount — controls how much of this pad feeds the master reverb bus.");
+        active_id == -1 && lmb_down && _in_rvb ? (
+          _mix_now = time_precise();
+          _mix_dbl_id == (300 + _mix_i) && (_mix_now - _mix_dbl_time) < DBL_CLICK_T ? (
+            fx_snd_rvb[_mix_i] = 0; mark_dirty_pad(pi); _mix_dbl_id = -1;
+          ) : (
+            active_id = 293; _mix_drag_pad = _mix_i;
+            fx_snd_rvb[_mix_i] = max(0, min(1.0, (mx - _mix_x) / _mix_bar_w));
+            mark_dirty_pad(pi);
+            _mix_dbl_time = _mix_now; _mix_dbl_id = 300 + _mix_i;
+          );
+        );
+        _in_rvb && frame_wheel != 0 ? (
+          fx_snd_rvb[_mix_i] = max(0, min(1.0, fx_snd_rvb[_mix_i] + frame_wheel * 0.05));
           mark_dirty_pad(pi);
-          _mix_dbl_time = _mix_now; _mix_dbl_id = 300 + _mix_i;
         );
       );
-      _in_rvb && frame_wheel != 0 ? (
-        fx_snd_rvb[_mix_i] = max(0, min(1.0, fx_snd_rvb[_mix_i] + frame_wheel * 0.05));
-        mark_dirty_pad(pi);
       );
 
-      // ═══ SMS send mini-slider (red, horizontal fill — smash/parallel-comp bus) ═══
-      _sms_sy = _mix_ind_y + (_mix_sl_h + _mix_sl_gap) * 3;
-      // Background
-      gfx_set(0.14, 0.08, 0.08, 0.6);
-      gfx_rect(_mix_x, _sms_sy, _mix_bar_w, _mix_sl_h);
-      // Fill
-      fx_snd_smash[_mix_i] > 0.005 ? (
-        _sms_fill = max(1, (fx_snd_smash[_mix_i] * _mix_bar_w)|0);
-        _mix_has_audio ? gfx_set(0.85, 0.32, 0.28, 0.85) : gfx_set(0.42, 0.40, 0.38, 0.55);
-        gfx_rect(_mix_x, _sms_sy, _sms_fill, _mix_sl_h);
-        // Thumb (greyed if empty)
-        _mix_has_audio ? gfx_set(1.0, 0.50, 0.45, 1.0) : gfx_set(0.50, 0.48, 0.46, 0.85);
-        gfx_rect(_mix_x + _sms_fill - 1, _sms_sy, 2, _mix_sl_h);
-      );
+      // ═══ SMS send: rotary knob (big view) / red fill mini-slider (LCD page) — smash/parallel-comp bus ═══
+      // Gated by the section toggle (ser_ver 58). _mix_g_* already folds in
+      // the "compact LCD page ignores console settings" exemption.
+      _mix_g_sends ? (
+      _sms_sy = _mix_y_sms;
+      _mix_big ? (
+        _mix_kcy = _sms_sy + ((_mix_sl_h / 2)|0);
+        _mix_km = km_console + (_mix_i * KM_CON_PER_PAD + 3) * KS;
+        _mix_has_audio ? ( _mix_kc_r = 1.0; _mix_kc_g = 0.50; _mix_kc_b = 0.45; )
+                       : ( _mix_kc_r = 0.50; _mix_kc_g = 0.48; _mix_kc_b = 0.46; );
+        rk_knob_draw(_mix_kstyle, _mix_kcx, _mix_kcy, _mix_kr, fx_snd_smash[_mix_i], 0, 1.0, 0, _mix_km[0],
+                     _mix_kc_r, _mix_kc_g, _mix_kc_b, 0, 0.36, 0.34, 0.32);
+        dist(mx, my, _mix_kcx, _mix_kcy) <= _mix_kr + 2 ?
+          swing_tooltip_check(1100 + _mix_i, "Pad smash send amount — feeds the parallel-compression bus (EON Smash Return; multi-out + FX returns only).");
+        _mix_knv = ssl_knob_interact(_mix_km, _mix_kcx, _mix_kcy, _mix_kr, fx_snd_smash[_mix_i], 0, 1.0, 0, 0);
+        _mix_knv != fx_snd_smash[_mix_i] ? ( fx_snd_smash[_mix_i] = _mix_knv; mark_dirty_pad(pi); );
+      ) : (
+        // Background
+        gfx_set(0.14, 0.08, 0.08, 0.6);
+        gfx_rect(_mix_x, _sms_sy, _mix_bar_w, _mix_sl_h);
+        // Fill
+        fx_snd_smash[_mix_i] > 0.005 ? (
+          _sms_fill = max(1, (fx_snd_smash[_mix_i] * _mix_bar_w)|0);
+          _mix_has_audio ? gfx_set(0.85, 0.32, 0.28, 0.85) : gfx_set(0.42, 0.40, 0.38, 0.55);
+          gfx_rect(_mix_x, _sms_sy, _sms_fill, _mix_sl_h);
+          // Thumb (greyed if empty)
+          _mix_has_audio ? gfx_set(1.0, 0.50, 0.45, 1.0) : gfx_set(0.50, 0.48, 0.46, 0.85);
+          gfx_rect(_mix_x + _sms_fill - 1, _sms_sy, 2, _mix_sl_h);
+        );
+        swing_panels_mix_bevel(_mix_x, _sms_sy, _mix_bar_w, _mix_sl_h);
 
-      // SMS interaction
-      _in_sms = mx >= _mix_x && mx <= _mix_x + _mix_bar_w && my >= _sms_sy && my <= _sms_sy + _mix_sl_h;
-      _in_sms ? swing_tooltip_check(1100 + _mix_i, "Pad smash send amount — feeds the parallel-compression bus (EON Smash Return; multi-out + FX returns only).");
-      active_id == -1 && lmb_down && _in_sms ? (
-        _mix_now = time_precise();
-        _mix_dbl_id == (400 + _mix_i) && (_mix_now - _mix_dbl_time) < DBL_CLICK_T ? (
-          fx_snd_smash[_mix_i] = 0; mark_dirty_pad(pi); _mix_dbl_id = -1;
-        ) : (
-          active_id = 294; _mix_drag_pad = _mix_i;
-          fx_snd_smash[_mix_i] = max(0, min(1.0, (mx - _mix_x) / _mix_bar_w));
+        // SMS interaction
+        _in_sms = mx >= _mix_x && mx <= _mix_x + _mix_bar_w && my >= _sms_sy && my <= _sms_sy + _mix_sl_h;
+        _in_sms ? swing_tooltip_check(1100 + _mix_i, "Pad smash send amount — feeds the parallel-compression bus (EON Smash Return; multi-out + FX returns only).");
+        active_id == -1 && lmb_down && _in_sms ? (
+          _mix_now = time_precise();
+          _mix_dbl_id == (400 + _mix_i) && (_mix_now - _mix_dbl_time) < DBL_CLICK_T ? (
+            fx_snd_smash[_mix_i] = 0; mark_dirty_pad(pi); _mix_dbl_id = -1;
+          ) : (
+            active_id = 294; _mix_drag_pad = _mix_i;
+            fx_snd_smash[_mix_i] = max(0, min(1.0, (mx - _mix_x) / _mix_bar_w));
+            mark_dirty_pad(pi);
+            _mix_dbl_time = _mix_now; _mix_dbl_id = 400 + _mix_i;
+          );
+        );
+        _in_sms && frame_wheel != 0 ? (
+          fx_snd_smash[_mix_i] = max(0, min(1.0, fx_snd_smash[_mix_i] + frame_wheel * 0.05));
           mark_dirty_pad(pi);
-          _mix_dbl_time = _mix_now; _mix_dbl_id = 400 + _mix_i;
         );
       );
-      _in_sms && frame_wheel != 0 ? (
-        fx_snd_smash[_mix_i] = max(0, min(1.0, fx_snd_smash[_mix_i] + frame_wheel * 0.05));
-        mark_dirty_pad(pi);
       );
 
-      // ═══ Volume bar (main vertical fader) ═══
-      // Background
-      gfx_set(0.06, 0.16, 0.20, 0.6);
-      gfx_rect(_mix_x, _mix_vol_y, _mix_bar_w, _mix_vol_h);
+      // ═══ Volume strip: fader well + meter (big view adds the slot + cap) ═══
+      _cb = _mix_i * 3;
+      _mix_wb = _mix_vol_y + _mix_vol_h;   // well bottom
+      // Background — the well itself, present while EITHER the fader or the
+      // meter needs it.
+      _mix_well_on ? (
+        gfx_set(0.06, 0.16, 0.20, 0.6);
+        gfx_rect(_mix_x, _mix_vol_y, _mix_bar_w, _mix_vol_h);
+      );
 
-      // 0 dB reference tick (unity on the fader-law scale, ~79% up)
-      gfx_set(1, 1, 1, 0.22);
-      gfx_rect(_mix_x, (_mix_vol_y + _mix_vol_h * (1.0 - MIX_UNITY_P))|0, _mix_bar_w, 1);
+      // 0 dB reference tick. The FADER's zero, so it follows the fader: with
+      // no fader it was marking unity on a control that is not there.
+      _mix_g_fader ? (
+        gfx_set(1, 1, 1, 0.22);
+        gfx_rect(_mix_x, (_mix_fy + _mix_fh * (1.0 - MIX_UNITY_P))|0, _mix_bar_w, 1);
+      );
 
-      // Volume level fill — greyed when pad is empty to match pad grid behavior
+      // Gain position → fader line (= cap centre in the big view). The level
+      // fill runs from the line down to the well bottom — greyed when the pad
+      // is empty to match pad grid behavior.
       _mix_gain_norm = min(1.0, swing_panels_mix_g2p(p_gain[_mix_i]));
-      _mix_gain_fill = (_mix_gain_norm * _mix_vol_h)|0;
-      _mix_gain_fill > 0 ? (
-        _cb = _mix_i * 3;
+      _mix_gain_fill = (_mix_gain_norm * _mix_fh)|0;
+      _mix_gain_line_y = (_mix_fy + _mix_fh - _mix_gain_fill)|0;
+      // con_wf: how much colour the well wears — 0 the full floor-to-cap slab,
+      // 1 a thin colour edge either side, 2 none (colour survives in the cap
+      // inlay and the meter). Console view only: the compact page's 26 px
+      // strips never had a slab to complain about. This is PAINT ONLY — the
+      // fader's throw and zero are calibration and are not touched here.
+      // ⚠️ AND it follows the FADER: the slab is the fader's own readout, so
+      // with the fader switched off it was a colour band reporting a gain you
+      // could neither see the control for nor change.
+      _mix_wf = big_view_id == VIEW_CONSOLE ? con_wf : 0;
+      _mix_g_fader && _mix_gain_fill > 0 && _mix_wf != 2 ? (
         _mix_has_audio ? (
-          gfx_set(col_rgba[_cb] * 0.6, col_rgba[_cb+1] * 0.6, col_rgba[_cb+2] * 0.6, 0.65);
+          gfx_set(col_rgba[_cb] * 0.6, col_rgba[_cb+1] * 0.6, col_rgba[_cb+2] * 0.6,
+                  _mix_wf == 1 ? 0.9 : 0.65);
         ) : (
-          gfx_set(0.42, 0.40, 0.38, 0.55);
+          gfx_set(0.42, 0.40, 0.38, _mix_wf == 1 ? 0.8 : 0.55);
         );
-        gfx_rect(_mix_x, _mix_vol_y + _mix_vol_h - _mix_gain_fill, _mix_bar_w, _mix_gain_fill);
+        _mix_wf == 1 ? (
+          // Two 2 px rails, floor to the cap line: the position cue without
+          // the slab. More alpha than the fill — thin needs bright.
+          gfx_rect(_mix_x, _mix_gain_line_y, 2, _mix_wb - _mix_gain_line_y);
+          gfx_rect(_mix_x + _mix_bar_w - 2, _mix_gain_line_y, 2, _mix_wb - _mix_gain_line_y);
+        ) : (
+          gfx_rect(_mix_x, _mix_gain_line_y, _mix_bar_w, _mix_wb - _mix_gain_line_y);
+        );
       );
 
       // Meter overlay (live activity) — only ever non-zero if pad has audio,
@@ -289,37 +1614,174 @@ function swing_panels_draw_mixer() (
       // NOT in the internal audio path — the child fader carries it — so the
       // activity glow drops the factor there to stay honest.
       _mix_meter = min(1.0, max(pad_meterL[_mix_i], pad_meterR[_mix_i]) * (strip_takeover ? 1.0 : p_gain[_mix_i]));
-      _mix_meter_fill = (_mix_meter * _mix_vol_h)|0;
-      _mix_meter_fill > 0 && _mix_has_audio ? (
-        _cb = _mix_i * 3;
+      _mix_meter_fill = (_mix_meter * _mix_fh)|0;
+      _mix_meter_fill > 0 && _mix_has_audio && _mix_g_meter ? (
         gfx_set(col_rgba[_cb], col_rgba[_cb+1], col_rgba[_cb+2], 0.95);
-        gfx_rect(_mix_x, _mix_vol_y + _mix_vol_h - _mix_meter_fill, _mix_bar_w, _mix_meter_fill);
+        gfx_rect(_mix_x, _mix_fy + _mix_fh - _mix_meter_fill, _mix_bar_w, _mix_wb - (_mix_fy + _mix_fh - _mix_meter_fill));
       );
 
-      // Gain line marker
-      _mix_gain_line_y = (_mix_vol_y + _mix_vol_h - _mix_gain_fill)|0;
-      gfx_set(1, 1, 1, 0.7);
-      gfx_rect(_mix_x, _mix_gain_line_y, _mix_bar_w, 1);
-
-      // dB readout (full-size console only; log() is @gfx — never @sample)
-      _mix_big ? (
-        gfx_setfont(1, "Arial", 10, 0);
-        p_gain[_mix_i] > 0.001 ? (
-          sprintf(#_mix_dbs, "%+.1f", 8.6858896381 * log(p_gain[_mix_i]));
-        ) : (
-          strcpy(#_mix_dbs, "-inf");
+      (  // Slot + scale + cap: both pages, sized by _mix_cap_h / _mix_slot_w / _mix_tl
+        // _mix_gx is computed OUTSIDE the fader gate on purpose — the dB
+        // scale hangs off it, and the scale can be on with the fader off.
+        _mix_gx = _mix_x + ((_mix_bar_w / 2)|0) - ((_mix_slot_w / 2)|0);
+        // ── Fader slot: a recessed channel cut through the meter, inner
+        // shadow on the left, lit edge on the right.
+        _mix_g_fader ? (
+        gfx_set(0.02, 0.03, 0.04, 0.92);
+        gfx_rect(_mix_gx, _mix_fy, _mix_slot_w, _mix_fh);
+        gfx_set(0, 0, 0, 0.6);
+        gfx_rect(_mix_gx, _mix_fy, 1, _mix_fh);
+        gfx_set(1, 1, 1, 0.09);
+        gfx_rect(_mix_gx + _mix_slot_w, _mix_fy, 1, _mix_fh);
         );
-        gfx_measurestr(#_mix_dbs, tw, th);
-        gfx_set(1, 1, 1, 0.55);
-        gfx_x = _mix_x + (_mix_bar_w - tw) / 2;
-        gfx_y = _mix_vol_y + 3;
-        gfx_drawstr(#_mix_dbs);
+
+        // ── dB scale left of the slot, on the fader-law taper (positions are
+        // swing_panels_mix_g2p of +6 +3 0 -3 -6 -10 -20 -40 dB, then -inf).
+        // Unity gets the long bright tick.
+        _mix_g_dbsc ? (
+        _mix_tk = 0;
+        loop(9,
+          _mix_tp = _mix_tk == 0 ? 1.0    : _mix_tk == 1 ? 0.8906 : _mix_tk == 2 ? MIX_UNITY_P :
+                    _mix_tk == 3 ? 0.7071 : _mix_tk == 4 ? 0.6300 : _mix_tk == 5 ? 0.5405 :
+                    _mix_tk == 6 ? 0.3684 : _mix_tk == 7 ? 0.1710 : 0.0;
+          _mix_ty = (_mix_fy + _mix_fh * (1.0 - _mix_tp))|0;
+          _mix_tk == 2 ? (
+            _mix_ink ? gfx_set(0.10, 0.12, 0.15, 0.85) : gfx_set(0.85, 0.88, 0.92, 0.8);
+            gfx_rect(_mix_gx - 3 - _mix_tl, _mix_ty, _mix_tl + 2, 1);
+          ) : (_mix_big || (_mix_tk & 1) == 0) ? (   // compact page: every other tick
+            _mix_ink ? gfx_set(0.16, 0.18, 0.22, 0.55) : gfx_set(0.70, 0.73, 0.78, 0.45);
+            gfx_rect(_mix_gx - 1 - _mix_tl, _mix_ty, _mix_tl, 1);
+          );
+          _mix_tk += 1;
+        );
+        );
+
+        // The cap is the fader. Gated with it.
+        _mix_g_fader ? (
+        // ── Cap: tall chrome fine-ribbed cap (the ReaKit "Console 4K" fader
+        // cap, scaled to the strip) riding in the slot, narrower than the
+        // strip so the meter shows either side. Five chrome bands top→bottom,
+        // fine ribs everywhere except the centre band, which carries a
+        // recessed pad-coloured indicator with a soft glow.
+        _mix_cap_w = max(7, _mix_bar_w - (_mix_big ? 6 : 4));
+        _mix_cap_x = _mix_x + (((_mix_bar_w - _mix_cap_w) / 2)|0);
+        _mix_cap_y = _mix_gain_line_y - ((_mix_cap_h / 2)|0);
+        _mix_b5 = ceil(_mix_cap_h / 5);
+        gfx_set(0, 0, 0, 0.45);
+        gfx_rect(_mix_cap_x + 2, _mix_cap_y + 2, _mix_cap_w, _mix_cap_h);
+        gfx_set(0.73, 0.76, 0.80, 1);
+        gfx_rect(_mix_cap_x, _mix_cap_y, _mix_cap_w, _mix_b5);
+        gfx_set(0.88, 0.90, 0.93, 1);
+        gfx_rect(_mix_cap_x, _mix_cap_y + _mix_b5, _mix_cap_w, _mix_b5);
+        gfx_set(0.60, 0.62, 0.66, 1);
+        gfx_rect(_mix_cap_x, _mix_cap_y + _mix_b5 * 2, _mix_cap_w, _mix_b5);
+        gfx_set(0.85, 0.87, 0.90, 1);
+        gfx_rect(_mix_cap_x, _mix_cap_y + _mix_b5 * 3, _mix_cap_w, _mix_b5);
+        gfx_set(0.50, 0.53, 0.58, 1);
+        gfx_rect(_mix_cap_x, _mix_cap_y + _mix_b5 * 4, _mix_cap_w, _mix_cap_h - _mix_b5 * 4);
+        // Fine ribs (dark + lit line pairs every 3 px), skipping the centre band
+        _mix_ry = _mix_cap_y + 2;
+        while (_mix_ry < _mix_cap_y + _mix_cap_h - 2) (
+          abs(_mix_ry - _mix_gain_line_y) > 3 ? (
+            gfx_set(0.20, 0.22, 0.26, 0.5);
+            gfx_rect(_mix_cap_x + 1, _mix_ry, _mix_cap_w - 2, 1);
+            gfx_set(1, 1, 1, 0.55);
+            gfx_rect(_mix_cap_x + 1, _mix_ry + 1, _mix_cap_w - 2, 1);
+          );
+          _mix_ry += 3;
+        );
+        // Outline + lit bottom edge
+        gfx_set(0.08, 0.09, 0.11, 0.8);
+        gfx_rect(_mix_cap_x, _mix_cap_y, _mix_cap_w, _mix_cap_h, 0);
+        gfx_set(1, 1, 1, 0.10);
+        gfx_rect(_mix_cap_x + 1, _mix_cap_y + _mix_cap_h, _mix_cap_w - 2, 1);
+        // Centre indicator: recessed groove, soft glow, pad-coloured inlay
+        _mix_has_audio ? ( _mix_cc_r = col_rgba[_cb]; _mix_cc_g = col_rgba[_cb+1]; _mix_cc_b = col_rgba[_cb+2]; )
+                       : ( _mix_cc_r = 0.55; _mix_cc_g = 0.53; _mix_cc_b = 0.50; );
+        gfx_set(0.10, 0.11, 0.13, 0.85);
+        gfx_rect(_mix_cap_x + 2, _mix_gain_line_y - 2, _mix_cap_w - 4, 4);
+        gfx_set(_mix_cc_r, _mix_cc_g, _mix_cc_b, 0.28);
+        gfx_rect(_mix_cap_x + 2, _mix_gain_line_y - 3, _mix_cap_w - 4, 6);
+        gfx_set(_mix_cc_r, _mix_cc_g, _mix_cc_b, 1.0);
+        gfx_rect(_mix_cap_x + 3, _mix_gain_line_y - 1, _mix_cap_w - 6, 2);
+        // Hover / drag lift: a faint wash over the cap so it answers the pointer
+        (active_id == 290 && _mix_drag_pad == _mix_i) ||
+        (mx >= _mix_x && mx <= _mix_x + _mix_bar_w && my >= _mix_vol_y && my <= _mix_wb) ? (
+          gfx_set(1, 1, 1, 0.10);
+          gfx_rect(_mix_cap_x, _mix_cap_y, _mix_cap_w, _mix_cap_h);
+        );
+        );
+
+        // dB readout on its own row above the well (big view only — the
+        // compact page has no row for it; log() is @gfx — never @sample).
+        // Follows the FADER gate: _mix_db_h is already 0 when the fader is
+        // off, so drawing here would land on top of the well.
+        _mix_big && _mix_g_fader ? (
+          gfx_setfont(1, "Arial", 11, 0);
+          p_gain[_mix_i] > 0.001 ? (
+            sprintf(#_mix_dbs, "%+.1f", 8.6858896381 * log(p_gain[_mix_i]));
+          ) : (
+            strcpy(#_mix_dbs, "-inf");
+          );
+          gfx_measurestr(#_mix_dbs, tw, th);
+          _mix_ink ? gfx_set(0.10, 0.12, 0.15, 0.75) : gfx_set(1, 1, 1, 0.55);
+          gfx_x = _mix_x + (_mix_bar_w - tw) / 2;
+          gfx_y = _mix_vol_y - _mix_db_h + 1;
+          gfx_drawstr(#_mix_dbs);
+        );
       );
 
-      // Mute indicator (red bar)
-      p_mute[_mix_i] ? (
-        gfx_set(0.9, 0.2, 0.2, 0.85);
-        gfx_rect(_mix_x, _mix_vol_y, _mix_bar_w, 2);
+      // ═══ S / M: real buttons, not the passive red stripe this used to be ═══
+      // p_solo and p_mute already exist per pad and the pad grid already
+      // toggles them with mark_dirty_pad -- the console simply never offered
+      // a way to reach them, so a desk had no cut buttons.
+      _mix_cut_h > 0 ? (
+        _mix_btn_w = ((_mix_bar_w - 3) / 2) | 0;
+        // SOLO
+        _mix_bh = mx >= _mix_x && mx < _mix_x + _mix_btn_w &&
+                  my >= _mix_cut_y && my <= _mix_cut_y + 15;
+        p_solo[_mix_i] ? gfx_set(0.79, 0.64, 0.15, 1)
+                       : (_mix_bh ? gfx_set(0.20, 0.24, 0.29, 1)
+                                  : gfx_set(0.126, 0.141, 0.165, 1));
+        gfx_rect(_mix_x, _mix_cut_y, _mix_btn_w, 15);
+        gfx_set(0, 0, 0, 0.5);
+        gfx_rect(_mix_x, _mix_cut_y, _mix_btn_w, 1);
+        gfx_setfont(1, "Arial", 11, 'b');
+        p_solo[_mix_i] ? gfx_set(0.10, 0.10, 0.10, 1)
+                       : gfx_set(0.55, 0.61, 0.67, 1);
+        gfx_measurestr("S", tw, th);
+        gfx_x = _mix_x + ((_mix_btn_w - tw) / 2) | 0;
+        gfx_y = _mix_cut_y + 2; gfx_drawstr("S");
+        _mix_bh ? swing_tooltip_check(1060 + _mix_i, "Solo this pad.");
+        _mix_bh && lmb_down && active_id == -1 ? (
+          p_solo[_mix_i] = !p_solo[_mix_i]; mark_dirty_pad(pi);
+        );
+        // MUTE
+        _mix_bx2 = _mix_x + _mix_btn_w + 3;
+        _mix_bh = mx >= _mix_bx2 && mx < _mix_bx2 + _mix_btn_w &&
+                  my >= _mix_cut_y && my <= _mix_cut_y + 15;
+        p_mute[_mix_i] ? gfx_set(0.78, 0.31, 0.25, 1)
+                       : (_mix_bh ? gfx_set(0.20, 0.24, 0.29, 1)
+                                  : gfx_set(0.126, 0.141, 0.165, 1));
+        gfx_rect(_mix_bx2, _mix_cut_y, _mix_btn_w, 15);
+        gfx_set(0, 0, 0, 0.5);
+        gfx_rect(_mix_bx2, _mix_cut_y, _mix_btn_w, 1);
+        p_mute[_mix_i] ? gfx_set(0.96, 0.91, 0.90, 1)
+                       : gfx_set(0.55, 0.61, 0.67, 1);
+        gfx_measurestr("M", tw, th);
+        gfx_x = _mix_bx2 + ((_mix_btn_w - tw) / 2) | 0;
+        gfx_y = _mix_cut_y + 2; gfx_drawstr("M");
+        _mix_bh ? swing_tooltip_check(1076 + _mix_i, "Mute this pad.");
+        _mix_bh && lmb_down && active_id == -1 ? (
+          p_mute[_mix_i] = !p_mute[_mix_i]; mark_dirty_pad(pi);
+        );
+        // ⚠️ A pad silenced by SOMEONE ELSE's solo is not muted, but it is not
+        // being heard either. Without saying so, soloing one pad makes the
+        // other fifteen look live while producing nothing.
+        !p_mute[_mix_i] && p_solo[_mix_i] == 0 && swing_panels_any_solo() ? (
+          gfx_set(0.78, 0.31, 0.25, 0.30);
+          gfx_rect(_mix_bx2, _mix_cut_y, _mix_btn_w, 15);
+        );
       );
 
       // Pad name: custom name → sample name → pad number.
@@ -327,11 +1789,18 @@ function swing_panels_draw_mixer() (
       // branch even if a stale name string lingers, so an empty pad reads
       // as empty in the mixer — matching the greyed-out meters above and
       // the empty-pad look in the pad grid.
+      // ⚠️ BIG VIEW ALREADY HAS THE NAME, in the editable pill at the top of
+      // the strip — drawing it here too put the same name on the channel
+      // twice. The compact LCD page has no pill, so it keeps its scribble.
+      _mix_g_name && !(_mix_big && _mix_pill_h > 0) ? (
       _cn = get_cname_slot(_mix_i);
       strlen(_cn) == 0 ? _cn = get_name_slot(_mix_i);
       _mix_has_audio && strlen(_cn) > 0 ? (
         gfx_setfont(1, "Arial", _mix_big ? 12 : 9, 'b');
-        gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 0.95);
+        // The scribble is desk chrome, not strip hardware: lcd_tx is the
+        // LCD's pale ink and it vanishes on the light finish.
+        _mix_ink ? swing_panels_console_ink(0.95)
+                 : gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 0.95);
         gfx_measurestr(_cn, tw, th);
         // Clip name to bar width
         tw > _mix_bar_w ? (
@@ -344,15 +1813,19 @@ function swing_panels_draw_mixer() (
         );
       ) : (
         gfx_setfont(1, "Arial", _mix_big ? 12 : 9, 'b');
-        gfx_set(lcd_tx_r * 0.85, lcd_tx_g * 0.85, lcd_tx_b * 0.85, 0.9);
+        _mix_ink ? swing_panels_console_ink(0.55)
+                 : gfx_set(lcd_tx_r * 0.85, lcd_tx_g * 0.85, lcd_tx_b * 0.85, 0.9);
         sprintf(#_mn, "%d", _mix_i + 1);
         gfx_measurestr(#_mn, tw, th);
         gfx_x = _mix_x + (_mix_bar_w - tw) / 2; gfx_y = _mix_vol_y + _mix_vol_h + 1;
         gfx_drawstr(#_mn);
       );
+      );
 
-      // VOL interaction
-      _in_mix_bar = mx >= _mix_x && mx <= _mix_x + _mix_bar_w && my >= _mix_vol_y && my <= _mix_vol_y + _mix_vol_h;
+      // VOL interaction. Gated on the FADER: with it switched off the well
+      // is not a control any more, and a click that silently changed gain
+      // on something the user cannot see is the worst kind of hit target.
+      _in_mix_bar = _mix_g_fader && mx >= _mix_x && mx <= _mix_x + _mix_bar_w && my >= _mix_vol_y && my <= _mix_vol_y + _mix_vol_h;
       _in_mix_bar ? swing_tooltip_check(700 + _mix_i, "Pad output volume in mixer view — drag for fine, scroll wheel for coarse, double-click to reset to 0 dB.");
       active_id == -1 && lmb_down && _in_mix_bar ? (
         _mix_now = time_precise();
@@ -361,7 +1834,10 @@ function swing_panels_draw_mixer() (
           mark_dirty_pad(pi); _mix_dbl_id = -1;
         ) : (
           active_id = 290; _mix_drag_pad = _mix_i;
-          p_gain[_mix_i] = swing_panels_mix_p2g(max(0, min(1.0, 1.0 - (my - _mix_vol_y) / _mix_vol_h)));
+          // A press ON the cap grabs it (relative drag, no jump); anywhere
+          // else in the well jumps the fader to the pointer.
+          _mix_drag_off = abs(my - _mix_gain_line_y) <= _mix_cap_h * 0.5 ? my - _mix_gain_line_y : 0;
+          p_gain[_mix_i] = swing_panels_mix_p2g(max(0, min(1.0, 1.0 - (my - _mix_drag_off - _mix_fy) / _mix_fh)));
           s_dirty[_mix_i] = 1; mark_dirty_pad(pi);
           _mix_dbl_time = _mix_now; _mix_dbl_id = _mix_i;
         );
@@ -376,6 +1852,97 @@ function swing_panels_draw_mixer() (
 
       _mix_i += 1;
     );
+
+    // ── Why the insert band is empty, said ONCE ─────────────────────────
+    // ⚠️ This is the bug the screenshot showed: sixteen columns of dead
+    // boxes and no way to know whether that meant "not in multi-out",
+    // "SWS missing" or "broken". A row of blanks is not an answer.
+    _mix_g_ins && !_conins_stale && (_conins_oldfmt || !(_conins_flags & 1)) ? (
+      gfx_set(0.06, 0.09, 0.12, 0.55);
+      gfx_rect(_lcd_cx + _mix_gut, _mix_ins_y, _mix_wtot, _mix_ins_h);
+      gfx_set(0.62, 0.70, 0.76, 0.9);
+      gfx_setfont(1, "Arial", 12, 'b');
+      _mix_msg = _conins_oldfmt
+        ? "The FX Picker bridge is out of date — stop and restart that action."
+        : (_conins_flags & 2)
+        ? "Insert slots need the SWS extension."
+        : "Pads have no tracks of their own yet — build MULTI-OUT tracks to give them inserts.";
+      gfx_measurestr(_mix_msg, tw, th);
+      gfx_x = _lcd_cx + _mix_gut + ((_mix_wtot - tw) / 2)|0;
+      gfx_y = _mix_ins_y + ((_mix_ins_h - th) / 2)|0;
+      gfx_drawstr(_mix_msg);
+    );
+
+    // ═══ MASTER STRIP ═══════════════════════════════════════════════════
+    // Sits right of channel 16, after the loop, because it is not one of
+    // them: no sends, no pan, no pad colour, and a compressor where a pad
+    // has six stages. Its sections still follow the same switches, so its
+    // fader shares the desk's zero and throw like everything else.
+    _mix_g_mst ? (
+      _mst_x = _lcd_cx + _mix_gut + 16 * _mix_bw
+             + (_mix_fpad >= 0 ? (_mix_bwf - _mix_bw) : 0) + 4;
+      _mst_w = _mix_bw - 2;
+
+      gfx_set(1, 1, 1, 0.035);
+      gfx_rect(_mst_x - 3, _mix_ind_y - 4, _mst_w + 6,
+               _mix_vol_y + _mix_vol_h + 14 - _mix_ind_y);
+      gfx_set(0.42, 0.62, 0.72, 0.28);
+      gfx_rect(_mst_x - 4, _mix_ind_y - 4, 1,
+               _mix_vol_y + _mix_vol_h + 14 - _mix_ind_y);
+
+      // Inserts: the chain Swing's summed output actually passes through.
+      // The bridge already decided WHICH track that is from the routing.
+      _mix_g_ins ? swing_panels_ins_band(16, _mst_x, _mix_ins_y, _mst_w,
+                     _mix_ins_n, _mix_ins_sh, con_ins_full);
+      _mix_g_sw ? swing_panels_master_band(_mst_x, _mix_sw_y, _mst_w,
+                                           _mix_sw_h, con_sw_full);
+
+      // Fader + meter. master_db is a dB slider (-48..+12), not the pads'
+      // 0..2 gain, so it gets its own position map rather than borrowing
+      // swing_panels_mix_g2p — a shared taper here would put unity in the
+      // wrong place on one of the two.
+      (_mix_g_fader || _mix_g_meter) ? (
+        _mst_p = max(0, min(1, (master_db + 48) / 60));
+        _mst_wb = _mix_vol_y + _mix_vol_h;
+        gfx_set(0.06, 0.16, 0.20, 0.6);
+        gfx_rect(_mst_x, _mix_vol_y, _mst_w, _mix_vol_h);
+        _mix_g_meter ? (
+          _mst_m = min(1.0, max(master_meterL, master_meterR));
+          _mst_mh = (_mst_m * _mix_vol_h)|0;
+          _mst_mh > 0 ? (
+            gfx_set(0.55, 0.72, 0.80, 0.85);
+            gfx_rect(_mst_x, _mst_wb - _mst_mh, _mst_w, _mst_mh);
+          );
+        );
+        _mix_g_fader ? (
+          _mst_gx = _mst_x + ((_mst_w / 2)|0) - ((_mix_slot_w / 2)|0);
+          gfx_set(0.02, 0.03, 0.04, 0.92);
+          gfx_rect(_mst_gx, _mix_fy, _mix_slot_w, _mix_fh);
+          _mst_cy = (_mix_fy + _mix_fh * (1 - _mst_p))|0;
+          gfx_set(0.88, 0.90, 0.92, 1);
+          gfx_rect(_mst_x + 2, _mst_cy - ((_mix_cap_h / 2)|0),
+                   _mst_w - 4, _mix_cap_h);
+          gfx_set(0.35, 0.38, 0.42, 1);
+          gfx_rect(_mst_x + 2, _mst_cy - 1, _mst_w - 4, 2);
+        );
+      );
+
+      // Scribble: names WHICH master this is, so the routing is never a guess.
+      _mix_g_name ? (
+        gfx_setfont(1, "Arial", _mix_big ? 12 : 9, 'b');
+        _mix_ink ? swing_panels_console_ink(0.95) : gfx_set(0.72, 0.84, 0.90, 0.95);
+        _mst_nm = multi_out ? "BUS" : "MASTER";
+        gfx_measurestr(_mst_nm, tw, th);
+        gfx_x = _mst_x + (_mst_w - tw) / 2; gfx_y = _mix_vol_y + _mix_vol_h + 1;
+        gfx_drawstr(_mst_nm);
+      );
+
+      mx >= _mst_x && mx <= _mst_x + _mst_w &&
+      my >= _mix_ind_y && my <= _mix_vol_y + _mix_vol_h ?
+        swing_tooltip_check(1052, multi_out
+          ? "BUS — the pads leave Swing separately and sum on their parent track. That folder is this desk's master."
+          : "MASTER — Swing's own summed output, through its bus compressor.");
+    );
   ); // end _lcd_cw guard
 );
 
@@ -387,42 +1954,696 @@ function swing_panels_draw_mixer() (
 // re-suppress before returning so nothing drawn after us sees live input.
 // Close = X button or a click outside the panel. grid_x/y/w/h are current:
 // swing_grid_draw_pads() ran earlier this same frame.
-function swing_panels_draw_mixer_big() (
-  lmb_down = _ov_lmb_down; LMB = _ov_LMB; frame_wheel = _ov_wheel;
+// ─── Sections panel: one checkbox row ─────────────────────────────────────
+// Returns 1 when this row was clicked this frame. _ind indents sub-rows.
+function swing_panels_copt_row(_rx, _ry, _rw, _on, _lbl, _ind) local(_hov, _bx) (
+  _hov = mx >= _rx && mx <= _rx + _rw && my >= _ry && my <= _ry + 18;
+  _hov ? ( gfx_set(1, 1, 1, 0.05); gfx_rect(_rx, _ry, _rw, 16); );
+  // ⚠️ ON must be SOLID. The first version drew a light box with a dark 5×5
+  // centre for on and a grey box with a dark 7×7 centre for off — at 9 px both
+  // read as an empty outline and the panel looked entirely unchecked. Fill the
+  // whole box and stamp a tick; off is an outline with nothing in it.
+  _bx = _rx + 5 + _ind;
+  _on ? (
+    gfx_set(0.62, 0.88, 0.92, 1); gfx_rect(_bx, _ry + 4, 9, 9);
+    gfx_set(0.05, 0.13, 0.16, 1);
+    gfx_line(_bx + 2, _ry + 8, _bx + 4, _ry + 10);
+    gfx_line(_bx + 4, _ry + 10, _bx + 7, _ry + 6);
+    gfx_line(_bx + 2, _ry + 9, _bx + 4, _ry + 11);
+    gfx_line(_bx + 4, _ry + 11, _bx + 7, _ry + 7);
+  ) : (
+    gfx_set(0.09, 0.10, 0.12, 1);   gfx_rect(_bx, _ry + 4, 9, 9);
+    gfx_set(0.40, 0.46, 0.52, 0.9);
+    gfx_rect(_bx, _ry + 4, 9, 1); gfx_rect(_bx, _ry + 12, 9, 1);
+    gfx_rect(_bx, _ry + 4, 1, 9); gfx_rect(_bx + 8, _ry + 4, 1, 9);
+  );
+  gfx_setfont(1, "Arial", 11, 'b');
+  gfx_set(0.82, 0.89, 0.93, _on ? 1 : 0.62);
+  gfx_x = _bx + 15; gfx_y = _ry + 4;
+  gfx_drawstr(_lbl);
+  _hov && lmb_down;
+);
 
-  // Dim everything below the header, then the console panel over the grid.
+// A small segmented button (FULL / BAR, 4 / 6 / 8 / FIT). Same contract.
+function swing_panels_copt_seg(_sx, _sy, _sw, _on, _lbl) local(_hov) (
+  _hov = mx >= _sx && mx <= _sx + _sw && my >= _sy && my <= _sy + 12;
+  _on ? gfx_set(0.25, 0.42, 0.47, 1) :
+        (_hov ? gfx_set(0.16, 0.19, 0.22, 1) : gfx_set(0.10, 0.12, 0.14, 1));
+  gfx_rect(_sx, _sy, _sw, 12);
+  gfx_set(0.35, 0.45, 0.50, 0.7);
+  gfx_rect(_sx, _sy, _sw, 1); gfx_rect(_sx, _sy + 11, _sw, 1);
+  gfx_rect(_sx, _sy, 1, 12);  gfx_rect(_sx + _sw - 1, _sy, 1, 12);
+  gfx_setfont(1, "Arial", 10, 'b');
+  gfx_set(0.85, 0.93, 0.96, _on ? 1 : 0.62);
+  gfx_measurestr(_lbl, tw, th);
+  gfx_x = _sx + (((_sw - tw) / 2) | 0); gfx_y = _sy + 2;
+  gfx_drawstr(_lbl);
+  _hov && lmb_down;
+);
+
+// ─── Sections panel ───────────────────────────────────────────────────────
+// Drawn over the strips, after them, so it describes what is underneath.
+// Returns 1 if it consumed this frame's click — the caller MUST honour that
+// or every tick in here also dismisses the console behind it.
+// Panel geometry, split out of the draw because the CALLER needs the rect
+// BEFORE the mixer draws. The panel is painted last so it sits over the strips
+// it describes — which means by the time it runs, the mixer has already
+// consumed the click. Knowing the rect early is what lets the caller mask the
+// mixer's input instead. Height is content-dependent but entirely predictable,
+// so it costs nothing to know it up front.
+function swing_panels_console_opts_rect(_cx, _cy, _cw) (
+  _copt_pw = 200;
+  _copt_px = _cx + _cw - _copt_pw - 10;
+  _copt_py = _cy + 20;
+  _copt_ph = 24 + 16 * 9 + (con_ins && con_ins_full ? 16 : 0)
+                + 22 + 16 * 2 + 22 + 20 + 18 + 8;
+);
+
+function swing_panels_console_opts(_cx, _cy, _cw)
+         local(_px, _py, _pw, _ph, _y, _ate, _i, _sx, _sw, _n) (
+  swing_panels_console_opts_rect(_cx, _cy, _cw);
+  _pw = _copt_pw; _px = _copt_px; _py = _copt_py; _ph = _copt_ph;
+
+  // Translucent GROUND, opaque CONTROLS. The panel has to be readable and
+  // the strips behind it have to stay judgeable; two passes get both, where
+  // one alpha over everything would have to pick a loser. Painted twice so
+  // the ground is dark enough for 9 px text without hiding what is under it.
+  gfx_set(0.055, 0.065, 0.080, 0.62); gfx_rect(_px, _py, _pw, _ph);
+  gfx_set(0.10, 0.115, 0.135, 0.42);  gfx_rect(_px, _py, _pw, _ph);
+  gfx_set(0.30, 0.62, 0.70, 0.75);
+  gfx_rect(_px, _py, _pw, 1); gfx_rect(_px, _py + _ph - 1, _pw, 1);
+  gfx_rect(_px, _py, 1, _ph); gfx_rect(_px + _pw - 1, _py, 1, _ph);
+
+  _ate = 0;
+  gfx_setfont(1, "Arial", 11, 'b');
+  gfx_set(0.62, 0.75, 0.82, 1);
+  gfx_x = _px + 6; gfx_y = _py + 6; gfx_drawstr("STRIP SECTIONS");
+  _y = _py + 20;
+
+  // INSERTS — the only row with both a mode and a count.
+  // ⚠️⚠️ THE ROW MUST STOP SHORT OF ITS OWN BUTTONS. At full width the row's
+  // 18 px hit rect covered the FULL/BAR segments sitting inside it, and the
+  // row is tested FIRST -- so clicking FULL toggled the section OFF, and the
+  // segments then sat behind `con_ins ?` and were never evaluated at all.
+  // FULL and BAR were not merely hard to hit, they were unreachable.
+  swing_panels_copt_row(_px, _y, con_ins ? _pw - 78 : _pw,
+                        con_ins, "INSERTS", 0) ?
+    ( con_ins = !con_ins; mark_dirty(); _ate = 1; );
+  con_ins ? (
+    swing_panels_copt_seg(_px + _pw - 74, _y + 2, 34, con_ins_full, "FULL") ?
+      ( con_ins_full = 1; mark_dirty(); _ate = 1; );
+    swing_panels_copt_seg(_px + _pw - 38, _y + 2, 32, !con_ins_full, "BAR") ?
+      ( con_ins_full = 0; mark_dirty(); _ate = 1; );
+  );
+  _y += 16;
+  con_ins && con_ins_full ? (
+    gfx_setfont(1, "Arial", 10);
+    gfx_set(0.52, 0.58, 0.63, 0.8);
+    gfx_x = _px + 20; gfx_y = _y + 3; gfx_drawstr("SLOTS");
+    _sw = 28; _sx = _px + _pw - 6 - _sw * 4 - 6;
+    _i = 0;
+    loop(4,
+      _n = _i == 0 ? 4 : _i == 1 ? 6 : _i == 2 ? 8 : 0;
+      swing_panels_copt_seg(_sx + _i * (_sw + 2), _y + 1, _sw, con_slots == _n,
+                     _n == 0 ? "FIT" : _n == 4 ? "4" : _n == 6 ? "6" : "8") ?
+        ( con_slots = _n; mark_dirty(); _ate = 1; );
+      _i += 1;
+    );
+    _y += 16;
+  );
+
+  // Same reserved zone as INSERTS — see the note there.
+  swing_panels_copt_row(_px, _y, con_sw ? _pw - 78 : _pw,
+                        con_sw, "SWING FX", 0) ?
+    ( con_sw = !con_sw; mark_dirty(); _ate = 1; );
+  con_sw ? (
+    swing_panels_copt_seg(_px + _pw - 74, _y + 2, 34, con_sw_full, "FULL") ?
+      ( con_sw_full = 1; mark_dirty(); _ate = 1; );
+    swing_panels_copt_seg(_px + _pw - 38, _y + 2, 32, !con_sw_full, "BAR") ?
+      ( con_sw_full = 0; mark_dirty(); _ate = 1; );
+  );
+  _y += 16;
+
+  swing_panels_copt_row(_px, _y, _pw, con_sends, "SENDS", 0) ?
+    ( con_sends = !con_sends; mark_dirty(); _ate = 1; ); _y += 16;
+  swing_panels_copt_row(_px, _y, _pw, con_pan, "PAN", 0) ?
+    ( con_pan = !con_pan; mark_dirty(); _ate = 1; ); _y += 16;
+  swing_panels_copt_row(_px, _y, _pw, con_cut, "CUT / SOLO", 0) ?
+    ( con_cut = !con_cut; mark_dirty(); _ate = 1; ); _y += 16;
+  swing_panels_copt_row(_px, _y, _pw, con_fader, "FADER", 0) ?
+    ( con_fader = !con_fader; mark_dirty(); _ate = 1; ); _y += 16;
+  swing_panels_copt_row(_px, _y, _pw, con_meter, "METER", 0) ?
+    ( con_meter = !con_meter; mark_dirty(); _ate = 1; ); _y += 16;
+  swing_panels_copt_row(_px, _y, _pw, con_dbsc, "dB SCALE", 12) ?
+    ( con_dbsc = !con_dbsc; mark_dirty(); _ate = 1; ); _y += 16;
+  swing_panels_copt_row(_px, _y, _pw, con_name, "NAME", 0) ?
+    ( con_name = !con_name; mark_dirty(); _ate = 1; ); _y += 16;
+
+  gfx_setfont(1, "Arial", 10, 'b');
+  gfx_set(0.50, 0.62, 0.68, 0.95);
+  gfx_x = _px + 6; gfx_y = _y + 7; gfx_drawstr("LAYOUT");
+  gfx_set(0.30, 0.45, 0.50, 0.4); gfx_rect(_px + 4, _y + 3, _pw - 8, 1);
+  _y += 22;
+  swing_panels_copt_row(_px, _y, _pw, con_focus, "FOCUS STRIP", 0) ?
+    ( con_focus = !con_focus; mark_dirty(); _ate = 1; ); _y += 16;
+  swing_panels_copt_row(_px, _y, _pw, con_master, "MASTER STRIP", 0) ?
+    ( con_master = !con_master; mark_dirty(); _ate = 1; ); _y += 16;
+
+  gfx_setfont(1, "Arial", 10, 'b');
+  gfx_set(0.50, 0.62, 0.68, 0.95);
+  gfx_x = _px + 6; gfx_y = _y + 7; gfx_drawstr("FINISH");
+  gfx_set(0.30, 0.45, 0.50, 0.4); gfx_rect(_px + 4, _y + 3, _pw - 8, 1);
+  _y += 22;
+  // Swatches painted by the same function that paints the desk, so the chip
+  // cannot promise a colour the console does not then use.
+  _sw = 28; _sx = _px + 6; _i = 0;
+  loop(6,
+    _n = con_bg; con_bg = _i; swing_panels_console_bg(1); con_bg = _n;
+    gfx_rect(_sx + _i * (_sw + 3), _y, _sw, 16);
+    con_bg == _i ? gfx_set(0.75, 0.92, 0.95, 1) : gfx_set(0.35, 0.42, 0.47, 0.7);
+    gfx_rect(_sx + _i * (_sw + 3), _y, _sw, 1);
+    gfx_rect(_sx + _i * (_sw + 3), _y + 15, _sw, 1);
+    gfx_rect(_sx + _i * (_sw + 3), _y, 1, 16);
+    gfx_rect(_sx + _i * (_sw + 3) + _sw - 1, _y, 1, 16);
+    mx >= _sx + _i * (_sw + 3) && mx <= _sx + _i * (_sw + 3) + _sw &&
+    my >= _y && my <= _y + 16 && lmb_down ?
+      ( con_bg = _i; mark_dirty(); _ate = 1; );
+    _i += 1;
+  );
+  _y += 20;
+
+  // Fader fill: how much pad colour the well wears. At full-window height the
+  // floor-to-cap fill is a SLAB, and sixteen of them is most of what the eye
+  // sees — so it is a choice, next to the finish it sits on. Paint only:
+  // the fader's throw and zero are calibration, never options.
+  gfx_setfont(1, "Arial", 10, 'b');
+  gfx_set(0.50, 0.62, 0.68, 0.95);
+  gfx_x = _px + 6; gfx_y = _y + 2; gfx_drawstr("FADER FILL");
+  swing_panels_copt_seg(_px + _pw - 110, _y, 34, con_wf == 0, "FULL") ?
+    ( con_wf = 0; mark_dirty(); _ate = 1; );
+  swing_panels_copt_seg(_px + _pw - 74, _y, 34, con_wf == 1, "EDGE") ?
+    ( con_wf = 1; mark_dirty(); _ate = 1; );
+  swing_panels_copt_seg(_px + _pw - 38, _y, 32, con_wf == 2, "OFF") ?
+    ( con_wf = 2; mark_dirty(); _ate = 1; );
+
+  // Any click anywhere inside the panel belongs to the panel, whether or not
+  // it landed on a control — otherwise a miss falls through to "outside the
+  // console" and closes the whole view.
+  mx >= _px && mx <= _px + _pw && my >= _py && my <= _py + _ph && lmb_down ?
+    _ate = 1;
+  _ate;
+);
+
+// ─── Compact FX picker, over the console ──────────────────────────────────
+// Geometry lives in its own function because the CALLER needs the rect before
+// the strips draw -- the same lesson the sections panel taught: a panel that
+// only knows where it is once it paints has already let the click through.
+function swing_panels_pick_rect(_cx, _cy, _cw, _ch) (
+  _cpk_w = 320;
+  _cpk_h = min(_ch - 40, 398);   // +18 over the first cut: the search row's cost
+  // Anchored to the slot you clicked, then clamped inside the console so it
+  // never hangs off the edge on channel 1 or 16.
+  _cpk_x = max(_cx + 6, min(_cx + _cw - _cpk_w - 6, con_pick_x - 40));
+  _cpk_y = max(_cy + 22, min(_cy + _ch - _cpk_h - 6, con_pick_y));
+);
+
+// Returns 1 if it consumed this frame's click.
+function swing_panels_pick_draw(_cx, _cy, _cw, _ch)
+         local(_x, _y, _w, _h, _ate, _i, _ry, _rh, _n, _p, _hov, _len, _j,
+               _vis, _card, _cx2, _cy2, _cw2, _crow, _more, _bp, _blen,
+               _bsel, _chh) (
+  swing_panels_pick_rect(_cx, _cy, _cw, _ch);
+  _x = _cpk_x; _y = _cpk_y; _w = _cpk_w; _h = _cpk_h;
+
+  // ⚠️ TAKE THE SNAPSHOT OURSELVES. _fxv_rows is only refreshed by the BIG
+  // view's draw, which is not running -- the console is. Without this the
+  // picker reads whatever page was last published to some other view, or
+  // nothing at all, and looks empty for no visible reason.
+  swing_fxview_snapshot();
+  // ⚠️ AND THE BANKS. swing_fxview_banks_snap() is called from exactly one
+  // other place -- inside the BIG view's draw -- so without this the chip
+  // row is empty and nothing anywhere says why. Same shape as the row
+  // snapshot above, which had the identical hole.
+  swing_fxview_banks_snap();
+  // Same escape hatch the LCD tabs needed: the ack timeout only counts up
+  // in the big view's draw, so a lost ack would latch actions off here too.
+  _fxv_await += 1;
+
+  // ESC: clear the search first if there is one, then close — the big
+  // view's order. A modal you cannot dismiss with the key everything else
+  // uses is one people click around rather than close.
+  _char == 27 ? (
+    _fxv_qn > 0 ? (
+      swing_fxview_q_clear(); swing_fxview_q_send();
+      con_pick_scroll = 0; swing_fxview_request(0, 24);
+    ) : con_pick_open = 0;
+    _char = 0;                                       // consumed either way
+  );
+  _ate = 0;
+  _rh = 30;
+
+  // Ground: solid, unlike the sections panel. That one is translucent because
+  // you are judging the strips THROUGH it; this one you are reading, and a
+  // plugin list over a moving meter is unreadable.
+  gfx_set(0.055, 0.065, 0.080, 0.98); gfx_rect(_x, _y, _w, _h);
+  gfx_set(0.30, 0.62, 0.70, 0.75);
+  gfx_rect(_x, _y, _w, 1); gfx_rect(_x, _y + _h - 1, _w, 1);
+  gfx_rect(_x, _y, 1, _h); gfx_rect(_x + _w - 1, _y, 1, _h);
+
+  // Header says WHERE the pick will land. A picker that does not name its
+  // target is one you have to remember the state of.
+  gfx_setfont(1, "Arial", 11, 'b');
+  gfx_set(0.62, 0.75, 0.82, 1);
+  gfx_x = _x + 8; gfx_y = _y + 6;
+  gfx_drawstr(con_pick_fill ? "REPLACE  " : "ADD TO  ");
+  gfx_set(0.85, 0.92, 0.96, 1);
+  con_pick_pad >= 16 ? gfx_drawstr("MASTER") : (
+    gfx_drawstr("PAD "); gfx_drawnumber(con_pick_pad + 1, 0);
+  );
+  gfx_drawstr("  ·  SLOT "); gfx_drawnumber(con_pick_slot + 1, 0);
+
+  // The TOTAL, right-aligned before the X — a windowed list must never be
+  // able to read as "all there is". This is the filtered total, straight
+  // off the published page.
+  gfx_setfont(1, "Arial", 10, 0);
+  gfx_set(0.55, 0.62, 0.68, 0.9);
+  sprintf(#_cpk_tot, "%d FX", _fxv_total | 0);
+  gfx_measurestr(#_cpk_tot, tw, th);
+  gfx_x = _x + _w - 28 - tw; gfx_y = _y + 7;
+  gfx_drawstr(#_cpk_tot);
+
+  // Close X
+  _hov = mx >= _x + _w - 20 && mx <= _x + _w - 4 &&
+         my >= _y + 3 && my <= _y + 19;
+  gfx_setfont(1, "Arial", 12, 'b');
+  gfx_set(1, 1, 1, _hov ? 0.95 : 0.5);
+  gfx_x = _x + _w - 16; gfx_y = _y + 5; gfx_drawstr("X");
+  _hov && lmb_down ? ( con_pick_open = 0; _ate = 1; );
+
+  // ── Search, reusing the big view's ONE query engine ─────────────────────
+  // Same buffer, same send — there is no second filter path to drift. The
+  // box exists here because the filter it feeds was invisible before: a
+  // query left behind by the big view kept shaping this list with nothing
+  // on screen to say so.
+  _cpk_qy = _y + 22;
+  gfx_set(0.03, 0.04, 0.05, 0.9);
+  gfx_rect(_x + 6, _cpk_qy, _w - 12, 18);
+  _cpk_qfoc && !is_embedded ? (
+    gfx_set(0.35, 0.60, 0.85, 0.75);
+    gfx_rect(_x + 6, _cpk_qy, _w - 12, 1);
+    gfx_rect(_x + 6, _cpk_qy + 17, _w - 12, 1);
+  );
+  _hov = mx >= _x + 6 && mx <= _x + _w - 6 &&
+         my >= _cpk_qy && my <= _cpk_qy + 18;
+  !is_embedded && lmb_down && _hov ? ( _cpk_qfoc = 1; _fxv_qc = _fxv_qn; _ate = 1; );
+  !is_embedded && lmb_down && !_hov ? _cpk_qfoc = 0;
+  gfx_setfont(1, "Arial", 11, 0);
+  _fxv_qn > 0 ? (
+    gfx_set(0.88, 0.92, 0.96, 1);
+    gfx_x = _x + 12; gfx_y = _cpk_qy + 3;
+    _j = 0; tw = gfx_x;
+    loop(_fxv_qn,
+      _j == _fxv_qc ? tw = gfx_x;
+      gfx_drawchar(_fxv_q[_j] | 0);
+      _j += 1;
+    );
+    _fxv_qc >= _fxv_qn ? tw = gfx_x;
+    // x clears — never an exit path that depends only on a key.
+    gfx_setfont(1, "Arial", 12, 'b');
+    gfx_set(0.75, 0.45, 0.42,
+            mx >= _x + _w - 24 && mx <= _x + _w - 6 &&
+            my >= _cpk_qy && my <= _cpk_qy + 18 ? 1 : 0.55);
+    gfx_x = _x + _w - 20; gfx_y = _cpk_qy + 2; gfx_drawstr("x");
+    lmb_down && mx >= _x + _w - 24 && mx <= _x + _w - 6 &&
+      my >= _cpk_qy && my <= _cpk_qy + 18 ? (
+      swing_fxview_q_clear(); swing_fxview_q_send();
+      con_pick_scroll = 0; swing_fxview_request(0, 24);
+      _ate = 1;
+    );
+  ) : (
+    gfx_set(0.38, 0.44, 0.50, 0.9);
+    gfx_x = _x + 12; gfx_y = _cpk_qy + 3;
+    gfx_drawstr(is_embedded ? "search needs the floating window" : "search…");
+    tw = _x + 12;
+  );
+  // Caret. ⚠️ Fractional part taken explicitly — EEL2 % truncates BOTH
+  // operands, so t % 1.0 is always 0 and the caret never blinks, silently.
+  _cpk_qfoc && !is_embedded ? (
+    _cpk_t = time_precise();
+    _cpk_t - (_cpk_t | 0) < 0.62 ? (
+      gfx_set(0.99, 1, 1, 0.9);
+      gfx_rect(tw, _cpk_qy + 2, 1, 13);
+    );
+  );
+  // Keys, only while focused: chars and backspace, CONSUMED so nothing
+  // behind the box acts on them. ESC was handled above.
+  _cpk_qfoc && !is_embedded && _char != 0 ? (
+    _char == 8 ? (
+      swing_fxview_q_del(_fxv_qc - 1);
+      _fxv_qc > 0 ? _fxv_qc -= 1;
+      _cpk_qdirty = 1; _char = 0;
+    ) : _char >= 32 && _char <= 126 ? (
+      swing_fxview_q_ins(_char);
+      _cpk_qdirty = 1; _char = 0;
+    );
+  );
+  _cpk_qdirty ? (
+    _cpk_qdirty = 0;
+    con_pick_scroll = 0;
+    swing_fxview_q_send();
+    // q_send's own ask is scaled by the BIG view's window (_fxv_want);
+    // re-ask sized for this one. The bridge answers the latest request.
+    swing_fxview_request(0, 24);
+  );
+
+  // ── Category chips ────────────────────────────────────────────────────
+  // The bridge already publishes the bank list -- ALL, RECENT, the user's FX
+  // folders, then categories by member count -- and apply_query already
+  // filters by it. So this sets _fxv_bank and re-asks; it is NOT a second
+  // filter path, and a second one would drift from the big view's.
+  //
+  // Chips, not a rail: at 320 px a left rail costs a third of the width, and
+  // the width is what the plugin NAMES need.
+  _cy2 = _y + 42; _cx2 = _x + 6; _crow = 0; _more = 0;   // 42: header + search row
+  gfx_setfont(1, "Arial", 11, 'b');
+  _i = -1;
+  loop(_fxv_bn + 1,
+    // -1 is the ALL chip, which is "no bank" rather than a published row --
+    // the rail expresses that as _fxv_bank == -1 and so does this.
+    _i < 0 ? (
+      strcpy(#_cpk_nm, "ALL");
+      _bsel = _fxv_bank < 0;
+    ) : (
+      _bp = _fxv_banks + _i * FXP_TREC;
+      _blen = min(24, _bp[FXP_TB_LEN] | 0);
+      strcpy(#_cpk_nm, "");
+      _j = 0;
+      loop(_blen, str_setchar(#_cpk_nm, _j, _bp[FXP_TB_NAME + _j] | 0); _j += 1; );
+      str_setlen(#_cpk_nm, _blen);
+      _bsel = _fxv_bank == _i;
+    );
+    gfx_measurestr(#_cpk_nm, tw, th);
+    _cw2 = tw + 12;
+    // Wrap to a second row, then stop: two rows is the most this can spend
+    // before it is taller than the list it filters.
+    _cx2 + _cw2 > _x + _w - 6 ? ( _crow += 1; _cx2 = _x + 6; );
+    _crow > 1 ? ( _more += 1; ) : (
+      _ry = _cy2 + _crow * 17;
+      _hov = mx >= _cx2 && mx <= _cx2 + _cw2 && my >= _ry && my <= _ry + 14;
+      _i >= 0 && (_fxv_banks + _i * FXP_TREC)[FXP_TB_KIND] == 3 ? (
+        // Categories carry the ONE colour vocabulary the cards, pips and rail
+        // already share -- a category must not be a different colour here.
+        swing_fxview_bucket_col((_fxv_banks + _i * FXP_TREC)[FXP_TB_BUCK] | 0);
+        gfx_a = _bsel ? 0.95 : (_hov ? 0.55 : 0.30);
+      ) : (
+        _bsel ? gfx_set(0.30, 0.52, 0.62, 0.95)
+              : (_hov ? gfx_set(0.22, 0.30, 0.38, 0.9)
+                      : gfx_set(0.14, 0.17, 0.21, 0.9));
+      );
+      gfx_rect(_cx2, _ry, _cw2, 14);
+      gfx_a = 1;
+      gfx_set(0.92, 0.96, 0.99, _bsel ? 1 : 0.78);
+      gfx_x = _cx2 + 6; gfx_y = _ry + 2;
+      gfx_drawstr(#_cpk_nm);
+      _hov && lmb_down ? (
+        // Same commit the rail makes: a different bank is a different result
+        // set, so the scroll resets rather than holding a meaningless place.
+        _fxv_bank = (_i < 0 || _fxv_bank == _i) ? -1 : _i;
+        con_pick_scroll = 0;
+        swing_fxview_q_send();
+        // ⭐ Re-ask sized for THIS window. q_send's ask is _fxv_want*2, and
+        // _fxv_want is 0 until the big view has ever opened — the bridge
+        // answered a bank click with a TWO-row page, which on this face
+        // looked like the bank held two plugins.
+        swing_fxview_request(0, 24);
+        _ate = 1;
+      );
+      _cx2 += _cw2 + 3;
+    );
+    _i += 1;
+  );
+  // No silent truncation: say how many did not fit.
+  _more > 0 ? (
+    gfx_setfont(1, "Arial", 10, 0);
+    gfx_set(0.55, 0.60, 0.66, 0.8);
+    gfx_x = _x + _w - 30; gfx_y = _cy2 + 20;
+    gfx_drawstr("+"); gfx_drawnumber(_more, 0);
+  );
+
+  // Rows, straight off the page the bridge already published for this slot --
+  // the same snapshot the big view reads, so there is no second result set to
+  // keep in step.
+  _chh = 42 + (min(1, _crow) + 1) * 17;
+  _vis = ((_h - 6 - _chh) / _rh) | 0;
+  _n = min(_fxv_n, _vis);
+  _fxv_n < 1 ? (
+    gfx_setfont(1, "Arial", 11, 0);
+    gfx_set(0.55, 0.60, 0.66, 0.8);
+    gfx_x = _x + 10; gfx_y = _y + _chh + 8;
+    gfx_drawstr(_conins_stale ? "No bridge — the FX list is unavailable."
+              : _fxv_qn > 0  ? "No matches — x or ESC clears the search."
+                             : "No plugins to show yet…");
+  );
+  _i = 0;
+  loop(_n,
+    _ry = _y + _chh + _i * _rh;
+    _p = _fxv_rows + _i * FXP_REC;
+    _len = min(40, _p[FXP_R_LEN] | 0);
+    _hov = mx >= _x + 2 && mx <= _x + _w - 2 && my >= _ry && my < _ry + _rh;
+    _hov ? (
+      gfx_set(0.16, 0.26, 0.34, 0.95); gfx_rect(_x + 2, _ry, _w - 4, _rh - 1);
+      // Full name in the tooltip — the row clips at 40 chars and then again
+      // at the panel edge, and a picker that cannot say which "Tape…" this
+      // is makes you click to find out.
+      strcpy(#_cpk_tip, "");
+      _j = 0;
+      loop(_len, str_setchar(#_cpk_tip, _j, _p[FXP_R_NAME + _j] | 0); _j += 1; );
+      str_setlen(#_cpk_tip, _len);
+      swing_tooltip_check(1240 + _i, #_cpk_tip);
+    );
+    _card = _p[FXP_R_CARD];
+    _card > 0 ? swing_fxcard_draw(_x + 6, _ry + 3, 40, 23, _card)
+              : swing_fxview_blank_card(_x + 6, _ry + 3, 40, 23,
+                  swing_fxview_bucket_hex(_p[FXP_R_BUCKET] | 0),
+                  _p[FXP_R_RIDX], _p[FXP_R_BUCKET] | 0);
+    gfx_setfont(1, "Arial", 12, _hov ? 'b' : 0);
+    gfx_set(0.86, 0.91, 0.95, _hov ? 1 : 0.85);
+    gfx_x = _x + 52; gfx_y = _ry + 8;
+    _j = 0;
+    loop(_len,
+      gfx_x <= _x + _w - 12 ? gfx_drawchar(_p[FXP_R_NAME + _j] | 0);
+      _j += 1;
+    );
+    // ⭐ Picking CLOSES it. The whole reason this exists is that the
+    // full-window picker left you in the browser after the pick, with the
+    // desk you were working on hidden behind it.
+    _hov && lmb_down ? (
+      swing_fxview_act(con_pick_fill ? FXA_SWAP : FXA_INSERT,
+                       con_pick_slot, _p[FXP_R_RIDX] | 0);
+      con_pick_open = 0;
+      _ate = 1;
+    );
+    _i += 1;
+  );
+
+  // Wheel pages the published window rather than scrolling a local list: the
+  // face only ever holds one page, so "scrolling" IS asking for a different
+  // one. Clamped to the tail so the last page can't scroll off into blank.
+  mx >= _x && mx <= _x + _w && my >= _y && my <= _y + _h && frame_wheel ? (
+    con_pick_scroll = max(0, min(max(0, _fxv_total - _vis),
+                       con_pick_scroll - (frame_wheel > 0 ? 3 : -3)));
+    swing_fxview_request(con_pick_scroll, _vis);
+    _ate = 1;
+  );
+
+  // Scrollbar: honest, from the PUBLISHED window (_fxv_off), so it shows
+  // where the bridge actually is, not where the last ask hoped to be.
+  // Wheel is the gesture; the bar is the position.
+  _fxv_total > _vis && _vis > 0 ? (
+    _cpk_sy = _y + _chh; _cpk_sh = _vis * _rh - 4;
+    gfx_set(1, 1, 1, 0.07);
+    gfx_rect(_x + _w - 5, _cpk_sy, 3, _cpk_sh);
+    _cpk_th = max(8, (_cpk_sh * _vis / _fxv_total) | 0);
+    _cpk_ty = ((_cpk_sh - _cpk_th) *
+               max(0, min(1, _fxv_off / max(1, _fxv_total - _vis)))) | 0;
+    gfx_set(0.45, 0.62, 0.72, 0.85);
+    gfx_rect(_x + _w - 5, _cpk_sy + _cpk_ty, 3, _cpk_th);
+  );
+
+  // Anything inside belongs to the picker, hit or miss -- otherwise a miss
+  // falls through and closes the console behind it.
+  mx >= _x && mx <= _x + _w && my >= _y && my <= _y + _h && lmb_down ? _ate = 1;
+  _ate;
+);
+
+// ─── Full-window console ───────────────────────────────────────────────────
+// The console used to paint into the pad-grid rect, which is what forced a
+// 26 px strip. It never had to: the modal gate already dims the whole window
+// below the header, so the panel can own all of it. Four numbers, and a strip
+// goes 26 px → 44 px at 16 channels.
+function swing_panels_draw_mixer_big() (
+  // ⚠️ RMB too. The modal gate has always SAVED the right button, and this
+  // function has always forgotten to restore it -- which is the entire
+  // reason right-click never reached a console strip. One line.
+  lmb_down = _ov_lmb_down; LMB = _ov_LMB; frame_wheel = _ov_wheel;
+  rmb_down = _ov_rmb_down; RMB = _ov_RMB;
+
+  // ── Console-hosted pad-name edit: route input the tick could not see ──
+  // swing_pne_tick runs before the modal gate's saves are restored, so while
+  // the console hosts an edit the tick is blind to the mouse. Same contract
+  // as the tick's own handling: inside the box = caret placement and the box
+  // owns the click; outside = commit, and the click stays live so whatever
+  // it landed on responds normally.
+  pne_pad >= 0 && pne_host_con && !is_embedded ? (
+    lmb_down || rmb_down ? (
+      swing_pne_mouse_in_box() ? (
+        lmb_down ? swing_pne_click_caret(mx);
+        lmb_down = 0; LMB = 0; rmb_down = 0; RMB = 0;
+      ) : swing_pne_commit();
+    );
+    swing_pne_mouse_in_box() ? frame_wheel = 0;
+  );
+
+  // ── Insert-slot menu result ──────────────────────────────────────────────
+  // The popup answers on a LATER frame, by which time the pointer has moved
+  // and the slot that was clicked is long gone — hence _ins_menu_pad/_slot,
+  // latched when the menu opened.
+  //
+  // Result numbers follow gfx_showmenu exactly: headers count, separators do
+  // not. Filled: 1 header, 2 open, 3 TCP, 4 MCP, 5 bypass, 6 offline,
+  // 7 delete. Empty: 1 header, 2 add.
+  //
+  // Every action AIMS first. The bridge resolves a verb against whatever the
+  // target says, and aiming is what makes "delete slot 3" mean this pad's
+  // slot 3 rather than whatever REAPER last touched.
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_INS_SLOT ? (
+    _insm_r = swing_popup_result;
+    swing_panels_ins_aim(_ins_menu_pad, _ins_menu_slot, _ins_menu_filled);
+    _ins_menu_filled ? (
+      // Renumbered when Float was added at 2 -- headers count, separators
+      // do not, so every row below it shifted by one.
+      _insm_r == 2 ? swing_fxview_act(FXA_FLOAT,     _ins_menu_slot, -1) :
+      _insm_r == 3 ? swing_bigview_open(VIEW_FXPICK) :
+      _insm_r == 4 ? swing_fxview_act(FXA_EMBED_TCP, _ins_menu_slot, -1) :
+      _insm_r == 5 ? swing_fxview_act(FXA_EMBED_MCP, _ins_menu_slot, -1) :
+      _insm_r == 6 ? swing_fxview_act(FXA_ENABLE,    _ins_menu_slot, -1) :
+      _insm_r == 7 ? swing_fxview_act(FXA_OFFLINE,   _ins_menu_slot, -1) :
+      _insm_r == 8 ? swing_fxview_act(FXA_REMOVE,    _ins_menu_slot, -1);
+    ) : (
+      _insm_r == 2 ? swing_bigview_open(VIEW_FXPICK);
+    );
+    swing_popup_result = 0;   // consumed — the caller's half of the contract
+  );
+
+  _con_x = 8; _con_y = 34;
+  _con_w = max(120, gfx_w - 16);
+  _con_h = max(120, gfx_h - 42);
+
+  // Dim everything below the header, then the console panel over all of it.
   gfx_set(0, 0, 0, 0.45);
   gfx_rect(0, 28, gfx_w, gfx_h - 28);
-  gfx_set(0.045, 0.075, 0.10, 0.98);
-  gfx_rect(grid_x, grid_y, grid_w, grid_h);
-  gfx_set(0.30, 0.75, 0.85, 0.5);
-  gfx_rect(grid_x, grid_y, grid_w, 1);
-  gfx_rect(grid_x, grid_y + grid_h - 1, grid_w, 1);
-  gfx_rect(grid_x, grid_y, 1, grid_h);
-  gfx_rect(grid_x + grid_w - 1, grid_y, 1, grid_h);
+  swing_panels_console_bg(0.98);
+  gfx_rect(_con_x, _con_y, _con_w, _con_h);
+  con_bg == 5 ? gfx_set(0.35, 0.38, 0.42, 0.7) : gfx_set(0.30, 0.75, 0.85, 0.5);
+  gfx_rect(_con_x, _con_y, _con_w, 1);
+  gfx_rect(_con_x, _con_y + _con_h - 1, _con_w, 1);
+  gfx_rect(_con_x, _con_y, 1, _con_h);
+  gfx_rect(_con_x + _con_w - 1, _con_y, 1, _con_h);
 
-  // Title + close X
+  // Title + close X — through the ink, which is the entire reason the ink
+  // function exists. (Its dark-desk side IS this cyan, so the dark finishes
+  // are pixel-identical to what they were.)
   gfx_setfont(1, "Arial", 12, 'b');
-  gfx_set(0.60, 0.90, 0.95, 0.9);
-  gfx_x = grid_x + 8; gfx_y = grid_y + 4;
+  swing_panels_console_ink(0.9);
+  gfx_x = _con_x + 8; gfx_y = _con_y + 4;
   gfx_drawstr("CONSOLE");
-  _mixb_cx = grid_x + grid_w - 20; _mixb_cy = grid_y + 3;
+  _mixb_cx = _con_x + _con_w - 20; _mixb_cy = _con_y + 3;
   _mixb_chov = mx >= _mixb_cx - 3 && mx <= _mixb_cx + 17 && my >= _mixb_cy - 2 && my <= _mixb_cy + 15;
   gfx_setfont(1, "Arial", 13, 'b');
-  gfx_set(1, 1, 1, _mixb_chov ? 0.95 : 0.55);
+  con_bg == 5 ? gfx_set(0.10, 0.12, 0.15, _mixb_chov ? 0.95 : 0.60)
+              : gfx_set(1, 1, 1, _mixb_chov ? 0.95 : 0.55);
   gfx_x = _mixb_cx + 3; gfx_y = _mixb_cy;
   gfx_drawstr("X");
 
+  // Gear: opens the strip-sections panel. Sits left of the X, drawn as a
+  // bracketed dot rather than a glyph — the console cannot depend on a font
+  // having ⚙, and a missing glyph is an invisible button.
+  _mixb_gx = _con_x + _con_w - 42; _mixb_gy = _con_y + 3;
+  _mixb_ghov = mx >= _mixb_gx - 3 && mx <= _mixb_gx + 15 && my >= _mixb_gy - 2 && my <= _mixb_gy + 15;
+  swing_panels_console_ink(con_opt_open ? 0.95 : (_mixb_ghov ? 0.85 : 0.5));
+  gfx_rect(_mixb_gx, _mixb_gy + 2, 2, 10);
+  gfx_rect(_mixb_gx + 10, _mixb_gy + 2, 2, 10);
+  gfx_rect(_mixb_gx + 4, _mixb_gy + 5, 4, 4);
+  _mixb_ghov ? swing_tooltip_check(1051, "Strip sections: choose what every channel shows.");
+
   // Re-point the LCD content rect at the panel interior and reuse the mixer.
   _mixb_sx = _lcd_cx; _mixb_sy = _lcd_cy; _mixb_sw = _lcd_cw; _mixb_sh = _lcd_ch;
-  _lcd_cx = grid_x + 8;  _lcd_cy = grid_y + 20;
-  _lcd_cw = grid_w - 16; _lcd_ch = grid_h - 28;
+  _lcd_cx = _con_x + 8;  _lcd_cy = _con_y + 20;
+  // The panel FLOATS over the strips rather than pushing them narrower.
+  // Squeezing 16 channels to make room changed the very thing you were
+  // trying to judge — every strip got thinner the moment you opened the
+  // settings, so you were never looking at the layout you were editing.
+  // It is translucent instead: see swing_panels_console_opts.
+  _lcd_cw = _con_w - 16;
+  _lcd_ch = _con_h - 28;
+
+  // ⚠️ INPUT MASK — the panel is painted AFTER the strips so it sits over what
+  // it describes, which means the mixer has already handled the click by the
+  // time the panel gets a look at it. Returning "I ate that" afterwards is too
+  // late: the knob under the checkbox has already moved. So the pointer is
+  // moved off-screen and the buttons cleared for the mixer's whole pass, and
+  // restored immediately after. Off-screen rather than just clearing the
+  // buttons, because hover states, tooltips and drag-starts all read mx/my.
+  //
+  // Only while active_id == -1: a fader drag that STARTED outside the panel
+  // must keep tracking when the pointer wanders under it. You cannot begin a
+  // gesture through the panel; you can finish one.
+  swing_panels_console_opts_rect(_con_x, _con_y, _con_w);
+  swing_panels_pick_rect(_con_x, _con_y, _con_w, _con_h);
+  _copt_mask = active_id == -1 && (
+    (con_opt_open &&
+     ((mx >= _copt_px && mx <= _copt_px + _copt_pw &&
+       my >= _copt_py && my <= _copt_py + _copt_ph) || _mixb_ghov))
+    // The compact picker needs the SAME protection the sections panel does:
+    // it floats over live strips, and a click landing on a plugin row must
+    // not also move the fader beneath it.
+    || (con_pick_open &&
+        mx >= _cpk_x && mx <= _cpk_x + _cpk_w &&
+        my >= _cpk_y && my <= _cpk_y + _cpk_h));
+  _copt_mask ? (
+    _copt_smx = mx; _copt_smy = my;
+    _copt_slmb = lmb_down; _copt_slm2 = LMB; _copt_swh = frame_wheel;
+    mx = -10000; my = -10000;
+    lmb_down = 0; LMB = 0; frame_wheel = 0;
+  );
+
   swing_panels_draw_mixer();
+
+  _copt_mask ? (
+    mx = _copt_smx; my = _copt_smy;
+    lmb_down = _copt_slmb; LMB = _copt_slm2; frame_wheel = _copt_swh;
+  );
   _lcd_cx = _mixb_sx; _lcd_cy = _mixb_sy; _lcd_cw = _mixb_sw; _lcd_ch = _mixb_sh;
+
+  // Sections panel LAST, so it sits over the strips it is describing. It
+  // consumes its own clicks and reports back whether it swallowed this one.
+  _mixb_opt_ate = con_opt_open ? swing_panels_console_opts(_con_x, _con_y, _con_w) : 0;
+  // Picker LAST: it is the newest thing on screen and the most modal.
+  con_pick_open ?
+    _mixb_opt_ate = swing_panels_pick_draw(_con_x, _con_y, _con_w, _con_h)
+                    || _mixb_opt_ate;
+
+  _mixb_ghov && lmb_down && active_id == -1 ? (
+    con_opt_open = !con_opt_open;
+    _mixb_opt_ate = 1;
+  );
 
   // Close: X click, or click outside the panel (only when no drag is active
   // so releasing a fader drag outside the rect can't dismiss the console).
-  _mixb_out = mx < grid_x || mx > grid_x + grid_w || my < grid_y || my > grid_y + grid_h;
+  // The sections panel gets first refusal on the click — without that, every
+  // checkbox tick would also close the console behind it.
+  _mixb_out = mx < _con_x || mx > _con_x + _con_w || my < _con_y || my > _con_y + _con_h;
+  _mixb_opt_ate ? ( _mixb_chov = 0; _mixb_out = 0; );
   lmb_down && (_mixb_chov || (_mixb_out && active_id == -1)) ? (
     swing_bigview_close();
     active_id = -1;

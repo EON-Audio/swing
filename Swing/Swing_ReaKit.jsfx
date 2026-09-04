@@ -51,6 +51,24 @@ slider28:pad_vol_appear=0<0,9,1>-Pad VOL Knob Colour (internal; 0=theme 1..6=pre
 slider29:pad_pan_style=0<0,18,1>-Pad PAN Knob Style (internal; 0=follow theme; persists via FX chunk, no @serialize touch)
 slider30:pad_pan_appear=0<0,9,1>-Pad PAN Knob Colour (internal; 0=theme 1..6=preset 7=follow pad 8=black 9=white; persists via FX chunk, no @serialize touch)
 slider31:adsr_3node=0<0,1,1>-ADSR 3-Node Display (internal; hides the S node, D node carries sustain on its Y axis; display-only — all four engine params stay live; persists via FX chunk, no @serialize touch)
+// Kit macros (Spec_Swing_Macro_System §1). Hidden from the slider UI per
+// house rule but full host params: automatable, MIDI-learnable, hardware-
+// mappable. "Macro 1".."Macro 8" are the STABLE host-param API — display
+// names live in the mapping model, never here. Resolve BY NAME on any
+// external path (sparse-slider hazard). Values 0..1; each mapping scales
+// into its target's native units. macro_morph/macro_sel are inert until the
+// snapshot slice lands.
+slider32:macro1=0<0,1,0.001>-Macro 1
+slider33:macro2=0<0,1,0.001>-Macro 2
+slider34:macro3=0<0,1,0.001>-Macro 3
+slider35:macro4=0<0,1,0.001>-Macro 4
+slider36:macro5=0<0,1,0.001>-Macro 5
+slider37:macro6=0<0,1,0.001>-Macro 6
+slider38:macro7=0<0,1,0.001>-Macro 7
+slider39:macro8=0<0,1,0.001>-Macro 8
+slider40:macro_morph=0<0,7,0.001>-Macro Morph
+slider41:macro_sel=0<0,7,1>-Macro Select (internal; strip/editor focus; persists via FX chunk, no @serialize touch)
+slider42:0<0,1,1{Free,Docked}>--EON Rig Docked (set by the dock rig script, not by hand; only honoured while GS_RIG_ALIVE is fresh)
 
 // options:gmem=Swing_Media_Transfer is REQUIRED — the Lua bridge plus
 // a dozen Drum Matrix / Sample Browser scripts all call
@@ -106,17 +124,29 @@ import libs/rk_swing_warnings.jsfx-inc
 import libs/rk_swing_tooltips.jsfx-inc
 import libs/rk_swing_browser_load.jsfx-inc
 import libs/rk_theme.jsfx-inc
+import libs/rk_swing_ui_minibrowser.jsfx-inc
 import libs/rk_swing_ui_state.jsfx-inc
 // AFTER state (uses swing_bigview_open/close), BEFORE panels_controls (its
 // LOAD button calls swing_kitsview_open) — EEL resolves fn refs at def-time.
+// ⚠️ ORDER MATTERS, twice over.
+// Within the block: renderer, then the table sized from its constants, then
+// the face that draws with both -- EEL2 resolves calls at PARSE time.
+// And the block sits AFTER rk_swing_ui_state, which defines
+// swing_bigview_open/close that the face calls. It cannot also sit before
+// rk_swing_lcd, so the FX rack page is dispatched from @gfx below rather
+// than from inside rk_swing_lcd -- see swing_fxview_rack's call site.
+import libs/rk_swing_fxcard.jsfx-inc
+import libs/rk_swing_fxcard_data.jsfx-inc
+import libs/rk_swing_ui_fxview.jsfx-inc
 import libs/rk_swing_ui_kitsview.jsfx-inc
 import libs/rk_swing_ui_panels_lcd.jsfx-inc
-import libs/rk_swing_ui_panels_mixer.jsfx-inc
-import libs/rk_swing_ui_panels_controls.jsfx-inc
-// BEFORE grid_pads — its name-pill click handler calls swing_pne_open, and
-// EEL resolves fn refs at def-time. (Uses core's get_cname_slot/
+// BEFORE panels_mixer — the console's strip name pills call swing_pne_open/
+// commit/click_caret, and BEFORE grid_pads for the same reason (its pill
+// does too). EEL resolves fn refs at def-time. (Uses core's get_cname_slot/
 // mark_dirty_pad/sync_note_names, all imported far above.)
 import libs/rk_swing_padname_edit.jsfx-inc
+import libs/rk_swing_ui_panels_mixer.jsfx-inc
+import libs/rk_swing_ui_panels_controls.jsfx-inc
 import libs/rk_swing_ui_grid_pads.jsfx-inc
 import libs/rk_swing_ui_drum3d.jsfx-inc
 import libs/rk_swing_ui_overlay_syn.jsfx-inc
@@ -128,6 +158,7 @@ import libs/rk_swing_ui_synthview.jsfx-inc
 import libs/rk_swing_ui_range.jsfx-inc
 import libs/rk_swing_ui_notepick.jsfx-inc
 import libs/rk_swing_ui_category.jsfx-inc
+import libs/rk_swing_ui_macroed.jsfx-inc
 import libs/rk_swing_ui_colors.jsfx-inc
 import libs/rk_swing_ui_outputs.jsfx-inc
 import libs/rk_swing_block.jsfx-inc
@@ -252,6 +283,10 @@ KS          = 16;       // knob memory slots
 SILENCE_T   = 10;
 END_FADE    = 256;
 DENORM_THR  = 0.00000000000000000001;  // 1e-20
+BUS_TAIL_FLOOR = 0.000001;  // -120 dBFS: a send bus switched OFF is considered
+                            // finished once its wet sits under this. Far above
+                            // DENORM_THR on purpose - denorm is "the number is
+                            // garbage", this is "the tail is inaudible".
 DBL_CLICK_T = 0.35;     // double-click detection window (seconds)
 MAX_LAYERS  = 4;
 LAYER_SIZE  = 1000000;  // SLOT_SIZE / MAX_LAYERS = samples per layer (interleaved stereo)
@@ -395,6 +430,8 @@ v_startpos  = freemem; freemem += MAX_VOICES + 1;  // saved start pos for loose 
 v_decay_ct  = freemem; freemem += MAX_VOICES + 1;
 v_sg        = freemem; freemem += MAX_VOICES + 1;  // sample gain (norm or pad gain)
 v_layer     = freemem; freemem += MAX_VOICES + 1;  // which layer the voice is playing
+v_quiet     = freemem; freemem += MAX_VOICES + 1;  // SYN: consecutive samples
+                                                   // the engine has been silent
 
 // ─── SYN slot: per-pad synth layer (Spec_Swing_Synth_Layer §2) ────────────
 // ser_ver 52 block. Macros live as 8 SEPARATE per-pad arrays (undo/swap/
@@ -424,6 +461,89 @@ v_syn_state = freemem; freemem += (MAX_VOICES + 1) * RK_SYN_STATE_SIZE; // per-v
 _syn_mac_scratch = freemem; freemem += RK_SYN_MACROS;                   // trigger-time gather
 freemem = rk_syn_init(freemem);                                         // engine LUTs (once)
 freemem = swing_drum3d_init(freemem);                                   // SYN panel 3D meshes
+freemem = swing_synprev_init(freemem);  // pad editor's synth voice preview
+
+// ─── Kit-macro tables (slice 1, Spec_Swing_Macro_System §2) ──────────────
+// Session-volatile until the ser_ver 54 gate lands (slice 5). STATIC
+// bounds: KMAC_N macros × KMAC_MAX_MAP mappings each. kmac_pad: -2 = every
+// pad, -1 = selected pad, 0..15 absolute. kmac_curve: shape exponent
+// (1 = linear), negative = inverted response at |curve|. Engine =
+// kmac_tick() in @block, applying through swing_fx_set (value + recalc,
+// NEVER mark_dirty — macro motion is performance, not an edit; spec §3).
+// ⚠️ These are KIT macros — unrelated to the synth layer's per-pad
+// ps_mac0..7 above, which are DD-101 engine knobs.
+KMAC_N       = 8;
+KMAC_MAX_MAP = 8;
+KMAC_NSNAP   = 4;              // snapshot slots I..IV (spec §4; room for 8 later)
+// Virtual CORE-param pids (2026-08-21): macro targets beyond the FX_PID_*
+// vocabulary — pad tune / pan / envelope, the params WIDTH·PITCH·DECAY
+// presets need. 100+ stays clear of real pids (0..27) and the bus range
+// (64..75); these NEVER touch the strip publish band (its layout is pid-
+// indexed 0..31) and they are core VOICE params, so they stay audible in
+// multi-out takeover (the strips carry FX only).
+// Kit-transfer band (flat, CMD-serialized kit window): +0 = bridge→JSFX
+// staged flag · +1 model ver · +2..9 values · +10..17 nmap · +18..25 scope
+// · +26..33 color · +34..97 pad · +98..161 pid · +162..225 lo · +226..289
+// hi · +290..353 curve · +354..385 snap · +386..389 snap_has · +390
+// snap_act. Publisher = ui_state export phase; consumer = ui_state kit
+// adopt; bridge packs/stages it as v4 tail tag 2. MUST match
+// Swing_Kit_Bridge.lua eon_kmac_pack/eon_kmac_stage and the gmem map.
+KMAC_KIT_BASE = 26090640;
+KMAC_PID_CORE_BASE = 100;
+KMAC_PID_TUNE   = 100;   // p_tune  ±24 semis  → recalc_pad
+KMAC_PID_PAN    = 101;   // p_pan   -1..1      → p_panL/p_panR (no recalc)
+KMAC_PID_DECAY  = 102;   // p_decay 1..2000 ms → recalc_pad
+KMAC_PID_ATTACK = 103;   // p_attack 0..500 ms → recalc_pad
+// The pad's OWN DD-101 engine knobs (ps_mac0..7), +0..+7. Which knob each
+// index means depends on the pad's FAMILY — kick 2 is A.DEC, everything
+// else's 1 is DECAY — so surfaces label them via _syn_macro_label(engine, k)
+// rather than a fixed table.
+//
+// ⭐ WHY THESE EXIST: a synth pad's real decay lives here and NOWHERE else.
+// The pad ADSR (KMAC_PID_DECAY) can only ever ATTENUATE what the engine
+// already rendered, and its decay stage is exponential — measured against the
+// engine's own envelope it costs a long voice a third to a half of its tail
+// before a knob is even touched (8T8's SUB: 55% left at the range maximum).
+// Writing the engine knob instead is inert at rest and goes BOTH directions.
+// ⛔ Do not "simplify" a synth DECAY macro back onto the pad ADSR.
+KMAC_PID_SYN_BASE = 110;
+KMAC_PID_SYN_N    = 8;
+KMAC_NAME_LEN   = 12;    // custom macro-name cap (kit block v2 char cells)
+// Last-touched assign target (editor "+ LAST" + right-click menus): set by
+// swing_fx_apply (PadFX panel / strip / viewer edits) and the LCD PAD-tab
+// TUNE/PAN knobs. -1 = nothing touched yet this session.
+kmac_lt_pad = -1;
+kmac_lt_pid = -1;
+kmac_lt_t   = 0;
+// sliderchange mask covering the 8 macro sliders (32..39 = bits 31..38).
+// Pow arithmetic, never (1<<n) — these bits sit past the 32-bit shift range
+// (feedback_eel2_shift_32bit).
+KMAC_SLMASK  = 2^39 - 2^31;
+kmac_nmap  = freemem; freemem += KMAC_N;
+kmac_scope = freemem; freemem += KMAC_N;                 // reserved (per-mapping -1 covers PAD-follow in v1)
+kmac_color = freemem; freemem += KMAC_N;                 // identity palette idx (UI slice)
+kmac_val   = freemem; freemem += KMAC_N;                 // gathered slider values (@block)
+kmac_last  = freemem; freemem += KMAC_N;                 // change detection (@block)
+kmac_pad   = freemem; freemem += KMAC_N * KMAC_MAX_MAP;
+kmac_pid   = freemem; freemem += KMAC_N * KMAC_MAX_MAP;
+kmac_lo    = freemem; freemem += KMAC_N * KMAC_MAX_MAP;
+kmac_hi    = freemem; freemem += KMAC_N * KMAC_MAX_MAP;
+kmac_curve = freemem; freemem += KMAC_N * KMAC_MAX_MAP;
+kmac_snap     = freemem; freemem += KMAC_NSNAP * KMAC_N;  // snapshot values, slot*8+k
+kmac_snap_has = freemem; freemem += KMAC_NSNAP;           // 1 = slot captured (empty
+                                                          // slots never recall/morph)
+// kmac_snap_act (armed snapshot slot) is SERIALIZED at ser_ver 54 — no
+// @init assignment (EEL2 zero-init covers fresh instances; the serialize
+// rule bars @init resets of serialized scalars).
+kmac_primed = 0;
+kmac_force  = 0;
+// Recalc owed per pad by the macro pass, as bits (1 = fx, 2 = pad). Written
+// and cleared ONLY inside kmac_tick/kmac_apply, both @block -- deliberately
+// not a "defer recalc" flag on swing_fx_set, which @gfx also calls: a shared
+// flag would let a UI edit landing mid-pass have its recalc swallowed.
+kmac_rcp = freemem; freemem += NUM_PADS;
+// (Slice-1 test mapping is seeded further down in @init, AFTER the
+// FX_PID_* constants are assigned — they are 0 at this point in the run.)
 
 // Waveform thumbnail cache: WV_RES points per pad. Two caches for stereo
 // display: wv_cache holds the L-channel sample at each step, wv_cache_R
@@ -605,6 +725,15 @@ km_lim_rel  = freemem; freemem += KS;
 // ─── Master VOL knob memory ──────────────────────────────────────────
 km_master_vol = freemem; freemem += KS;
 
+// ─── Console big-view knob memory (16 strips × PAN/DLY/RVB/SMS) ─────────
+// rk_swing_ui_panels_mixer.jsfx-inc — the full-size console draws real
+// rotary knobs for the four send rows; each needs a KS-slot hover/drag block.
+// 4 was PAN + the three sends. 11 adds the SWING band's seven knobs -- HPF,
+// LPF, RESO, RATE, BITS, DRIVE, COMP. ⚠️ Each knob needs its OWN slot: the lib
+// keeps drag state in the slot, so two knobs sharing one would grab together.
+KM_CON_PER_PAD = 11;
+km_console  = freemem; freemem += NUM_PADS * KM_CON_PER_PAD * KS;
+
 // ─── Send bus accumulators (cleared each sample) ────────────────────────
 snd_dly_accL = freemem; freemem += 1;
 snd_dly_accR = freemem; freemem += 1;
@@ -721,7 +850,311 @@ memset(_syn_cat_pend, -100, NUM_PADS);
 // would write over memory[0..15] — the head of the very first freemem block.
 _syn_cat_src = freemem; freemem += NUM_PADS;
 memset(_syn_cat_src, -1, NUM_PADS);
+// (This block used to sit ~500 lines below, with the other gmem bands. It
+//  had to move UP here: swing_fxview_init sizes its buffer as
+//  FXP_REC_MAX * FXP_REC, and an EEL2 name that has not been assigned yet
+//  reads 0 -- so the picker reserved ZERO cells, freemem did not advance,
+//  and swing_color_init below was handed the very same address. The
+//  published plugin list then landed on top of col_rgba, which is why
+//  opening the picker recoloured every pad in the instrument. A constant
+//  must be defined ABOVE any allocation that sizes itself from it;
+//  nothing warns, the arithmetic just quietly comes out 0.)
+// ── EON_FXPICK: the FX picker's JSFX <-> Lua exchange ──────────────────────
+// Declared in .refs/gmem_regions_supplement.tsv BEFORE any gmem[] touched it;
+// the audit fails on undeclared access. 26345472 = 402 * 65536, block-aligned.
+//
+// TWO INDEPENDENT SEQUENCES, and the split is the whole design:
+//   REQ_SEQ carries VIEW STATE (scroll, query, filters). Coalescing is CORRECT
+//     here -- dropping intermediate scroll positions is what makes a live-typed
+//     search box affordable.
+//   ACT_SEQ carries MUTATIONS (swap, insert, delete). These must never be
+//     dropped, so the face posts one and waits for ACT_ACK before the next.
+// One mailbox for both would lose a swap the moment a fast scroll coalesced
+// past it.
+//
+// Every write is PAYLOAD FIRST, SEQ LAST -- the reader is edge-triggered on the
+// seq, so the data has to be in place before the seq announces it. Response
+// seq is a seqlock: odd = mid-write, even = stable.
+EON_FXPICK_BASE   = 26345472;
+EON_FXPICK_STRIDE = 4096;
+EON_FXPICK_SLOTS  = 16;          // matches the instance registry cap
+EON_FXPICK_TBL    = 26411008;    // 403 * 65536 -- flat shared string tables
+EON_FXPICK_TBL_N  = 8192;
+
+// ── EON_CONSOLE_INS: what is in each PAD's own track chain ───────────────
+// The picker band above publishes ONE chain for ONE target. A console strip
+// wants sixteen at once and only a SUMMARY of each -- enough to draw a lit
+// slot in its category colour. Names stay in the hover popover; they were
+// never going to fit on a 44 px strip.
+//
+// Declared in .refs/gmem_regions_supplement.tsv before this line existed.
+// 26476544 = 404 * 65536, block-aligned and prefaulted below.
+//
+// ⚠️ A slot word packs three things and is decoded by ARITHMETIC, never by
+// shifts: EEL2 << is 32-bit with the count masked mod 32, and the offline
+// bit sits high enough to make that a real hazard rather than a theoretical
+// one (.docs/wiki/01, the StepSeq 49-lane near-miss).
+//     -1        = slot empty
+//     cat       = 0..31  category index, drives the colour
+//     +64       = bypassed
+//     +128      = offline
+EON_CONINS_BASE   = 26542080;   // 405 * 65536
+EON_CONINS_STRIDE = 2048;
+EON_CONINS_SLOTS  = 16;
+CI_SEQ    = 0;    // seqlock, even = stable, written LAST
+CI_HB     = 1;    // COUNTER, not a clock: the face has no wall clock to
+                  // compare against and only needs to know it moved
+CI_FLAGS  = 2;    // bit0: multi-out tracks · bit1: could not look them up
+// ⭐ LAYOUT VERSION. The bridge is a running script: every record change I make
+// only takes effect when it is restarted, and until then it keeps writing the
+// OLD shape into the new one. That has now silently produced two mysteries --
+// blank cards once, garbled names once -- where the face was faithfully
+// drawing whatever the stale bridge left. Bump this whenever the record moves,
+// and the face SAYS SO instead of rendering the wreckage.
+CI_FMT    = 3;    // published layout version
+CI_FMT_VER = 2;   // what THIS face understands
+CI_HDR    = 32;   // first record
+CI_PREC   = 118;  // words per record
+CI_NSLOT  = 8;    // slots per record
+CI_COUNT  = 0;    // -1 = owns no REAPER track
+CI_SLOT   = 1;    // +1..+8  category + bypass/offline, one word each
+CI_NAME   = 9;    // +9..+104 eight names, CI_NAMEW words each
+CI_NAMEW  = 12;   // per name: length, then CI_NCHAR characters
+CI_NCHAR  = 11;   // ⚠️ TRUNCATED, and DISPLAY ONLY -- the tooltip, nothing else.
+// ⭐ THE CARD COMES FROM A HASH THE BRIDGE COMPUTES OVER THE FULL NAME, not
+// from the truncated one above. Hashing 11 characters of "EON Drum Strip"
+// finds nothing: the deck is keyed on the whole name, so a truncated hash
+// silently misses every plugin whose name is longer than the field -- which
+// is most of them, and was about to make the Drum Strip card I just drew
+// invisible. One published word beats widening every name field instead.
+CI_HASH   = 105;  // +105..+112, one card-name hash per slot
+CI_RECS   = 17;   // 16 pads, then the MASTER as record 16
+// Face-side only, past everything the bridge publishes: the resolved card per
+// slot, looked up once per publish rather than per frame.
+CI_CARD   = CI_HASH + CI_NSLOT;              // 105 + 8 = 113
+CIF_REC   = CI_CARD + CI_NSLOT;              // 113 + 8 = 121
+
+// response half (bridge writes, face reads)
+FXP_PUB_SEQ  = 0;    // seqlock, even = stable, written LAST
+FXP_GEN      = 1;    // bumped per publish; the face re-snapshots on change
+FXP_ANS_REQ  = 2;    // echo of the REQ_SEQ this page answers
+FXP_TOTAL    = 5;    // rows matching the current query
+FXP_WIN_OFF  = 6;
+FXP_WIN_N    = 7;
+FXP_FLAGS    = 15;   // bit0 frozen, bit1 no EnumInstalledFX, bit2 no target
+FXP_HB       = 16;   // bridge liveness, os.time()
+FXP_FMT_VER  = 17;
+
+// request half (face writes, bridge reads)
+FXP_REQ_SEQ  = 64;
+FXP_REQ_OFF  = 69;
+FXP_REQ_N    = 70;
+
+// row block: 48 records of 64 cells at +192
+// ⚠️⚠️ THE BLOCK MUST LAND EXACTLY ON FXP_CHAIN (3264) AND IT STILL DOES:
+// 192 + 48*64 = 3264, where it used to be 192 + 64*48. Vendor needed 16 more
+// words per row and the record was FULL, so the width was bought back out of
+// the row COUNT rather than by growing the band -- growing it would have
+// pushed the chain area over a stride boundary and moved a second thing.
+// 48 rows is still far more than any page asks for: the list shows ~20 and
+// asks for double that.
+FXP_ROWS     = 192;
+FXP_REC      = 64;
+FXP_REC_MAX  = 48;
+FXP_R_LEN    = 0;    // name length; 0 = empty row
+FXP_R_NAME   = 1;    // 40 chars, one per cell
+FXP_R_FMT    = 42;   // format code
+FXP_R_BUCKET = 43;   // bucket index into M.BUCKETS
+FXP_R_KIND   = 44;
+FXP_R_RIDX   = 45;   // index into the engine's unfiltered enumeration = the pick handle
+FXP_R_CARD   = 46;
+// Word 47, CHAINS mode only: a preview of what is INSIDE a chain file.
+// ⚠️ ONE word, because the row record is full -- 192 + 64*48 lands exactly on
+// the chain area at 3264, so the record cannot grow without moving that too.
+// Four category indices and a count, packed by MULTIPLICATION and unpacked by
+// division: EEL2 shifts are 32-bit with the count masked mod 32, and this
+// value reaches ~32.5M. gmem cells are doubles, so the precision is there.
+//   w = c1 + 32*c2 + 1024*c3 + 32768*c4 + 1048576*n
+FXP_R_CHSTK  = 47;
+// Vendor, words 48..63: length then 15 chars. The registry has PARSED it since
+// P1 (rk_lua_fxpicker's parse_name returns name, vendor, fmt, path) and threw
+// it away at the wire -- nothing new is being worked out, only carried.
+// 15 chars covers what matters: Cockos, Waves, u-he, Tokyo Dawn, Valhalla.
+FXP_R_VLEN   = 48;
+FXP_R_VEND   = 49;   // 15 chars, 49..63
+FXP_VEND_MAX = 15;
+// ── chain half (bridge writes, face reads) ──
+// Its OWN seqlock: the chain moves when the user touches another track
+// or edits FX in REAPER's window, which never bumps REQ_SEQ. Sharing the
+// row page's PUB_SEQ would re-snapshot 3072 row cells on every chain poll.
+FXP_CH_SEQ   = 3;    // seqlock, even = stable, written LAST
+FXP_CH_N     = 18;   // slots on the target track
+FXP_CH_SEL   = 19;   // focused slot, -1 = none
+FXP_TGT_LEN  = 20;   // target track name length
+FXP_TGT_NAME = 21;   // 32 chars, 21..52
+// REAPER's own track number (IP_TRACKNUMBER, 1-based; 0 = no target). The
+// bridge already read this to build the "Track 12" FALLBACK name, but threw it
+// away whenever the track HAD a name -- so the one thing that tells two
+// identically-named tracks apart was never published. Word 53: the first free
+// cell above the name it belongs to (54..63 remain free; Q starts at 77).
+FXP_TGT_NUM  = 53;
+// The target track's own colour, packed r*65536 + g*256 + b; -1 = the track has
+// no custom colour and REAPER is drawing it in the theme default.
+// ⚠️ The track ICON is deliberately NOT here. P_ICON is an absolute PATH, up to
+// 255 characters, and this band has 8 free words before the query starts -- a
+// path needs its own channel, plus an image slot and a load that never runs per
+// frame. The colour is one word and carries most of the same "which track am I
+// on" answer, so it lands first and the icon stays a separate job.
+FXP_TGT_COL  = 56;
+// Face→bridge: 1 = HOLD this target, stop following REAPER's last-touched
+// track. Word 54 (55..63 still free). Written every frame the FX page draws,
+// so the face and the bridge cannot disagree after a restart of either.
+FXP_TGT_PIN  = 54;
+// Face→bridge kind filter, word 55: 0 = FX only (everything that is NOT an
+// instrument) · 1 = instruments only · 2 = both. ⭐ The registry ALREADY knows
+// which is which -- rk_lua_fx_recipes tags every row fx/instrument/midi/other
+// and the bridge publishes it as FXP_R_KIND -- the picker simply never offered
+// the filter. 2 is the default because it is what the list has always shown.
+FXP_KINDF    = 55;
+// 32 records of 24 at +3264 -- exactly where the row block ends
+// (192 + 48*64 = 3264), running to 4032 inside the 4096 stride.
+FXP_CHAIN     = 3264;
+// ⚠️ 25, not 24. FXP_C_OFF (offline, published) and FXP_C_CARD (the face's
+// locally-resolved card) BOTH landed on word 23: the snapshot copies gmem
+// in, then the face writes the card over the top, and offline silently read
+// as always-false. Two owners, one word, no warning. The chain area is
+// 32*25 = 800 at offset 3264, ending 4063 -- still inside the 4096 stride.
+FXP_CREC      = 25;
+FXP_CHAIN_MAX = 32;
+FXP_C_LEN    = 0;    // name length; 0 = empty slot
+FXP_C_NAME   = 1;    // 20 chars
+FXP_C_ON     = 21;   // 1 = enabled, 0 = bypassed
+FXP_C_FMT    = 22;
+FXP_C_OFF    = 23;   // 1 = OFFLINE. Distinct from bypassed: bypassed still
+                     // loads and passes audio, offline is unloaded entirely.
+FXP_C_CARD   = 24;   // FACE-LOCAL resolved card, as FXP_R_CARD. Must stay
+                     // ABOVE every published word -- it is written over the
+                     // snapshot after the copy.
+
+// ── action mailbox ──
+// SEPARATE from REQ_SEQ and deliberately NOT coalescing. REQ_SEQ drops
+// intermediate values, which is right for a scroll position and fatal
+// for a swap. The face posts one action and waits for ACT_ACK.
+FXP_ACT_ACK  = 4;    // response half: bridge echoes the seq it ran
+FXP_ACT_SEQ  = 72;   // request half, written LAST
+FXP_ACT_VERB = 73;
+FXP_ACT_A    = 74;   // chain slot, or -1
+FXP_ACT_B    = 75;   // registry row index (FXP_R_RIDX)
+FXA_SWAP     = 1;    // replace slot A with registry row B
+FXA_INSERT   = 2;    // insert row B after slot A (-1 = append)
+FXA_ENABLE   = 3;    // toggle bypass on slot A
+FXA_REMOVE   = 4;    // delete slot A
+// Console strip menu verbs. EMBED is an ACTION, never a toggle: REAPER
+// exposes no way to read back whether an FX is embedded, so the face cannot
+// know which way a toggle should go. OFFLINE is a real toggle -- the bridge
+// reads that one back.
+FXA_EMBED_TCP = 6;   // show slot A embedded in the track control panel
+FXA_EMBED_MCP = 7;   // ...or the mixer control panel
+FXA_OFFLINE   = 8;   // toggle offline on slot A
+FXA_MOVE     = 5;    // move slot A to index B
+// query, request half. 63 chars at +77 -- ends at 139, well clear of
+// the row block at 192.
+FXP_Q_LEN    = 76;
+FXP_Q        = 77;
+FXP_Q_MAX    = 63;
+FXP_BANK     = 141;  // selected rail row, -1 = ALL
+
+// ── Console -> picker targeting (request half, +142..144) ────────────────
+// Clicking an insert slot on a console strip has to say WHICH chain the
+// picker should now be looking at. Until this existed the bridge used
+// GetLastTouchedTrack(), which is right for "open the picker on whatever I
+// just clicked in REAPER" and useless for "this pad, that slot".
+//
+// Seq-gated like every other request: payload first, seq LAST. Coalescing is
+// CORRECT here -- if two clicks land in one bridge tick, the second one is
+// the one you meant.
+FXP_TGT_SEQ  = 142;  // bumped by the face, written LAST
+FXP_TGT_PAD  = 143;  // 0..15 = that pad's track · -1 = the master/bus track
+FXP_TGT_SLOT = 144;  // chain slot to focus, -1 = none
+
+// ── CHAINS mode (request half, +145..186) ────────────────────────────────
+// ⭐ Chains ride the SAME rows channel as plugins. A chain file is just a row
+// that happens to be a file, so paging, scrolling, the publish path and the
+// row renderer all work unchanged -- a parallel channel would have been a
+// second copy of every one of those.
+//
+// The rail becomes the FXChains/ folder tree. ONE level at a time plus a
+// breadcrumb, not a recursive walk with expand triangles (spec §2), which is
+// also why the request carries a relative path rather than a tree state.
+FXP_CHMODE   = 145;  // 0 = plugin registry · 1 = FXChains listing
+FXP_CHREL_LEN = 146; // length of the relative folder path, 0 = root
+FXP_CHREL    = 147;  // +147..186, 40 chars
+FXP_CHREL_MAX = 40;
+// Row kinds the bridge sends back in CHAINS mode. 0..3 are plugin kinds
+// (fx / instrument / midi / other), so these continue the same space rather
+// than overloading one of them.
+FXK_CHAIN    = 4;    // a .RfxChain file
+FXK_FOLDER   = 5;    // a subfolder — clicking it navigates
+// Chain actions.
+FXA_CHAIN_APPLY = 9; // replace the target chain with row B
+FXA_CHAIN_SAVE  = 10;// save the target chain as a new .RfxChain
+// ⭐ FLOAT is what a click on a plugin is EXPECTED to do. Opening the picker
+// is the SWAP affordance -- useful, but not what "click the thing" means in
+// any DAW. TrackFX_Show(tr, fx, 3) floats the plugin's own window.
+FXA_FLOAT       = 11;// float slot A's own plugin window
+
+// ── bank table, in the SHARED table block ──
+// Registry-global: the same list for every Swing, so it does not belong
+// in a per-instance band. Its own seqlock -- banks change when the user
+// edits REAPER's FX folders, which no other sequence knows about.
+FXP_TB_N     = 0;
+FXP_TB_SEQ   = 1;    // even = stable, written LAST
+FXP_TB       = 16;
+FXP_TREC     = 40;
+FXP_TB_MAX   = 48;
+FXP_TB_LEN   = 0;
+FXP_TB_NAME  = 1;    // 24 chars
+FXP_TB_KIND  = 25;   // 0 all, 1 recent, 2 folder, 3 category
+FXP_TB_BUCK  = 26;   // bucket index for kind 3, else -1
+FXP_TB_COUNT = 27;
+   // FACE-LOCAL: resolved card record, or -1. Not part of
+                     // the wire protocol -- the bridge never writes it; the
+                     // face fills it once per published page so the name
+                     // hash is not recomputed every frame for every row.
+
+// ⚠️ PREFAULT — force NSEEL to allocate both blocks.
+// REAPER allocates named-gmem in lazy 65536-slot blocks, and .docs/wiki/
+// 05-memory-and-gmem.md says only a JSFX write triggers it. Whether
+// reaper.gmem_write does is UNTESTED, and every existing bridge-published band
+// happens to share its block with a cell the JSFX also writes -- so none of
+// them proves the Lua-only case. If Lua writes do NOT allocate, the picker's
+// whole publish drops on the floor and the list is silently, permanently
+// empty. Two writes make the question moot. Same fix as the stretch rings
+// (rk_swing_block_pitch.jsfx-inc:183).
+gmem[EON_FXPICK_BASE + EON_FXPICK_STRIDE * EON_FXPICK_SLOTS - 1] = 0;  // block 402
+gmem[EON_FXPICK_TBL + EON_FXPICK_TBL_N - 1] = 0;                       // block 403
+gmem[EON_CONINS_BASE + EON_CONINS_STRIDE * EON_CONINS_SLOTS - 1] = 0;  // block 405
+
+// Console insert snapshot: 16 pads x (count + 8 slot words). Copied out of
+// gmem under the seqlock so the strip draws from a stable picture -- the
+// bridge republishes on its own clock and a half-written chain would blink
+// slots in and out mid-frame.
+_conins_buf = freemem; freemem += CI_RECS * (CI_NAME + CI_NSLOT * CI_NAMEW);
+                       // 17 records x (count + 8 slot words + 8 names)
+_conins_seq = -1;      // last seqlock value consumed
+_conins_hb    = -1;    // last heartbeat COUNTER seen from the bridge
+_conins_hb_t  = 0;     // time_precise() when it last moved
+_conins_maxn  = 0;     // FX on the fullest channel -- drives how many slots
+                       // every strip draws, and therefore how big a card gets
+_conins_stale = 1;     // 1 = the bridge is not answering; start pessimistic,
+                       // because "no data yet" and "no bridge" look the same
+                       // and only one of them is safe to draw as fact.
+
 freemem = swing_kitsview_init(freemem);   // kits-view roster snapshot buffers
+freemem = swing_fxview_init(freemem);     // FX picker published-page buffer
+freemem = swing_fb_init(freemem);         // mini browser published-page buffer
+freemem = swing_fb_prv_init(freemem);     // browser preview voice (~11 s)
+freemem = swing_fxcard_data_init(freemem); // 145 card recipes + name keys
 
 // Color system (pre-computed RGBA)
 freemem = swing_color_init(freemem);
@@ -823,6 +1256,18 @@ _coll_hb_prev = freemem; freemem += 16;
 // Audio buffers
 s_audio_start = freemem;
 // freemem += NUM_PADS * SLOT_SIZE;  -- do not advance; REAPER manages rest
+
+// ⚠️⚠️ HEADROOM GUARD. Everything allocated ABOVE this line shares one budget:
+// maxmem is 72,000,000 and the audio region below needs NUM_PADS * SLOT_SIZE
+// (64M) plus SLOT_SIZE for the undo slot (4M), so s_audio_start has to stay
+// under 4,000,000. Nothing enforced that -- _udo_ready checked only the undo
+// slot -- so any new allocation up here can push the last pads' audio past
+// 72M, where the maxmem note says writes land in a phantom page: same-frame
+// readbacks succeed and NOTHING PERSISTS. That does not crash and does not
+// warn. It presents as "kits stopped loading".
+_mem_need = s_audio_start + NUM_PADS * SLOT_SIZE + SLOT_SIZE;
+_mem_head = __memtop() - _mem_need;
+_mem_fits = _mem_head >= 0 ? 1 : 0;
 
 // ─── Init per-pad defaults ────────────────────────────────────────────────
 i = 0; loop(NUM_PADS,
@@ -940,7 +1385,7 @@ i = 0; loop(NUM_PADS,
   i += 1;
 );
 
-i = 0; loop(MAX_VOICES + 1, v_pos[i] = -1; v_slot[i] = 0; v_stage[i] = 0; v_layer[i] = 0; v_kind[i] = 0; i += 1;);
+i = 0; loop(MAX_VOICES + 1, v_pos[i] = -1; v_slot[i] = 0; v_stage[i] = 0; v_layer[i] = 0; v_kind[i] = 0; v_quiet[i] = 0; i += 1;);
 memset(pad_flash, 0, NUM_PADS);
 memset(p_peak, 0, NUM_PADS);
 memset(p_peak_hold, 0, NUM_PADS);
@@ -949,9 +1394,21 @@ memset(p_held, 0, NUM_PADS);
 memset(p_held_vel, 0, NUM_PADS);
 memset(_retrig_cd, 0, NUM_PADS);
 memset(km_pad_vol_pan, 0, NUM_PADS * KM_PAD_MINI * KS);
+memset(km_console, 0, NUM_PADS * KM_CON_PER_PAD * KS);
 
 // Precomputed steal ramp (5ms fast fade) — computed once at init, valid for session
 steal_coeff = exp(-1.0 / max(1, 0.005 * srate));
+// SYN voice retirement. A synth voice has no sample end, and on a kit whose
+// pads carry no `sustain` the ADSR never falls -- so the ONLY thing retiring
+// it was the 3 s age cap, holding a slot for ~2.8 s after the drum went
+// silent. With 16 slots, 16 hits in 3 s exhausted the pool and every hit
+// after that stole an older voice. Retire on ACTUAL silence instead.
+// Threshold is deliberately far below audibility and the hold deliberately
+// long: a clap is several bursts with gaps, and cutting one short would be a
+// far worse bug than a slot freed late. An engine that never decays below the
+// threshold still falls back to the age cap.
+SYN_QUIET_T = 0.00001;              // -100 dB
+syn_quiet_n = 0.06 * srate;         // 60 ms of continuous silence
 // Precomputed smoothing coefficients (sample-rate-independent)
 _pad_meter_decay = exp(-1.0 / max(1, 0.090 * srate));   // ~90ms pad meter fall
 _mst_meter_decay = exp(-1.0 / max(1, 0.450 * srate));   // ~450ms master meter fall
@@ -969,6 +1426,7 @@ _coll_last_check = time_precise();  // avoid spurious reconciliation on first @b
 // ─── GUI state ────────────────────────────────────────────────────────────
 overlay_pad  = -1;   // which pad has the per-pad EDITOR open (-1 = none, 0..NUM_PADS-1)
 rng_ov_pad   = -1;   // which pad has the KEY-RANGE overlay open (right-click RANGE pill; -1 = none)
+kmac_ed_open = 0;    // kit-macro EDITOR overlay (MACRO tab EDIT ▸ chip; 0 = closed)
 pk_ov_pad    = -1;   // which pad has the NOTE picker open (click the NOTE pill; -1 = none)
 pk_reframe   = 0;    // 1 = an opener wants the per-KIT open framing recomputed (see notepick)
 cat_ov_pad   = -1;   // which pad has the CATEGORY glyph-grid overlay open (§9c; badge/pill RMB; -1 = none)
@@ -990,8 +1448,111 @@ VIEW_REVERB  = 7;    // full-size reverb page (swing_panels_draw_fx_big 3)
 VIEW_COMP    = 8;    // full-size compressor page (swing_panels_draw_fx_big 5)
 VIEW_KITS    = 9;    // LOAD-button kit browser (rk_swing_ui_kitsview.jsfx-inc)
 VIEW_SYNTH   = 10;   // per-pad drum-synth editor (rk_swing_ui_synthview.jsfx-inc)
+VIEW_FXPICK  = 11;   // FX picker, full-window (rk_swing_ui_fxview.jsfx-inc)
+                     // ⚠️ ADDING A VIEW? Four sites, and the third is SILENT:
+                     //   1. this constant
+                     //   2. the dispatch chain in @gfx
+                     //   3. the EON_VIEW_REQ ceiling (~:5210) — it drops any id
+                     //      above it with NO error, so the view opens by click
+                     //      and stays invisible to Lua, actions and the toolbar.
+                     //      Raise it in the SAME commit as the id.
+                     //   4. a Scripts/EON_View_*.lua calling T.view(id)
 big_view_id  = VIEW_NONE;
 syn_view_pad = 0;    // SYNTH view's edit target (session-transient)
+
+// ─── Console strip sections (P5) ───────────────────────────────────────────
+// Which bands the console draws, and how tall each one is. The FADER is the
+// only flex element in the strip — every other section is a fixed height, so
+// whatever is switched off the fader absorbs. That is what makes these cheap.
+//
+// ⚠️ Every toggle is a BAND across all 16 strips, never per-strip. Sections
+// change strip HEIGHT, and two strips of different height get faders of
+// different LENGTH — the same mouse travel would be a different number of dB
+// on each channel and 0 dB would sit at a different height on every one. The
+// focus strip is the deliberate exception and it only spends WIDTH.
+//
+// Defaults are state "B" (the FX rack): inserts open at 8 slots, Swing's fixed
+// chain folded to its summary bar, everything else on.
+//
+// ⚠️ ONE-SHOT GUARD, not a plain assignment. These are serialized, and a
+// sample-rate change re-runs @init WITHOUT re-running @serialize — so a bare
+// `con_ins = 1` here would silently reset every one of the user's choices the
+// moment they changed the project SR. The guard is zero-init on genuine first
+// load and 1 forever after, so:
+//   new instance   → defaults below stand
+//   project load   → defaults, then @serialize read overwrites them
+//   SR change      → skipped entirely, the loaded values survive
+// The backfill in the ser_ver 58 gate covers pre-58 projects separately; it
+// cannot cover a brand new instance, which is why both exist.
+_con_defaults_done ? 0 : (
+  con_ins      = 1;  // inserts band present
+  con_ins_full = 1;  // 1 = slot cards · 0 = one-line summary bar
+  con_slots    = 8;  // 4 / 6 / 8, or 0 = FIT (as many as the column allows)
+  con_sw       = 1;  // Swing's own HPF/LPF/EQ/CMP/BIT/DRV band present
+  con_sw_full  = 0;  // 1 = six labelled rows · 0 = summary bar
+  con_sends    = 1;  // DLY / RVB / SMS rotaries
+  con_pan      = 1;
+  con_cut      = 1;  // solo / mute / rec row
+  con_fader    = 1;
+  con_meter    = 1;
+  con_dbsc     = 1;  // dB scale inside the fader well
+  con_name     = 1;  // scribble strip
+  con_focus    = 0;  // selected channel drawn WIDE (not taller) -- same
+                     // height and same sections as every other strip, so
+                     // the faders still share one zero and one throw.
+  con_master   = 0;  // master strip on the right
+  // Desk finish. 0 = the blue the console has always been, so zero-init IS
+  // the old look. Finishes, not a colour picker: a desk has a finish, and 16
+  // strips of hardware read as one object only while the ground behind them
+  // stays a single considered surface.
+  con_bg       = 0;  // 0 blue · 1 graphite · 2 black · 3 slate · 4 walnut· 5 light
+  con_wf       = 0;  // fader well fill: 0 full slab · 1 thin colour edge · 2 off
+  // Insert-band viewport offset, ONE for all sixteen strips. Deliberately NOT
+  // serialized: it is where you are looking, not what the project is. It is
+  // re-clamped every frame against the band that actually fits, and reset to
+  // 0 whenever there is nothing to scroll.
+  con_ins_scroll = 0;
+  // FX LCD: show REAPER's track number beside the target name. Lives here
+  // rather than at @init because it is SERIALIZED — the one-time guard is what
+  // stops a sample-rate change (which re-runs @init) from wiping the choice.
+  // The ser_ver < 60 backfill covers OLD projects; this covers NEW instances,
+  // which no backfill can reach.
+  fxv_tnum_on = 1;
+  fxv_vend_on = 1;   // same two-defaults rule as fxv_tnum_on above
+  fxv_cats_open = 1; // rail categories start OPEN -- a fresh install must not
+                     // look like the categories are missing
+  // ⭐ REAPER's group starts FOLDED, and ours does not. Both open is a very
+  // long rail, and ours is the vocabulary this instrument is built around --
+  // REAPER's is the second opinion you go looking for. Folded is not hidden:
+  // the header is right there with its count on it.
+  fxv_rcat_open = 0;
+  fxv_fold_open = 1; // YOUR folders start open -- they are the shortest group
+  // No group starts hidden: hiding is a choice you make, never a default you
+  // have to discover and undo.
+  fxv_g2_off = 0; fxv_g3_off = 0; fxv_g4_off = 0;
+                     // and the most personal, so folding them by default would
+                     // hide the thing you made on purpose
+  _con_defaults_done = 1;
+);
+// ─── Compact FX picker, over the console ─────────────────────────────────
+// Clicking an empty insert slot used to open the FULL-WINDOW picker, which
+// replaced the desk: you picked a plugin and were left in the browser, having
+// to close it to get back to the channel you were working on. For "add one
+// plugin to channel 7" that is a large context switch for a small act.
+//
+// This opens OVER the console instead, anchored near the slot you clicked, and
+// closes itself on the pick. Session-transient -- a picker that was open when
+// you saved should not be open when you load.
+con_pick_open  = 0;  // 1 = the compact picker is up
+con_pick_pad   = 0;  // pad it is aimed at (16 = the master strip)
+con_pick_slot  = 0;  // chain slot it will land in
+con_pick_fill  = 0;  // was that slot FILLED? swap if so, insert if not
+con_pick_x     = 0;  // anchored to the slot, clamped inside the console
+con_pick_y     = 0;
+con_pick_scroll = 0;
+
+con_opt_open = 0;    // gear panel — session-transient, NOT serialized, and
+                     // deliberately unguarded: an SR change should close it.
 tau = 2 * $pi;       // constant for arc/knob drawing
 overlay_layer = 0;   // which layer is being displayed in overlay
 active_id    = -1;
@@ -1008,6 +1569,16 @@ swing_apply_defaults_modes();
 swing_apply_defaults_fx();
 midi_learn_pad = -1; // pad waiting for MIDI learn (-1 = off)
 gui_held_pad   = -1; // pad held by mouse click (-1 = none)
+// SYN view: the 3D drum's strike animation. A TIMESTAMP + velocity, not a
+// per-frame decay -- a frame-counted one ran at whatever rate the FX window
+// redrew (0.28 s at 60 fps, 0.85 s at 20) and froze mid-decay whenever the
+// view closed. Not p_held: see rk_swing_ui_synthview (a held repeat would drag
+// the sample layer into a synth-only hit).
+sv_d3_hit_t    = 0;  // time_precise() of the last strike
+sv_d3_hit_v    = 0;  // its velocity, 0..1
+SV_D3_HIT_SEC  = 0.10;  // squash envelope length
+SV_D3_LIT_SEC  = 0.05;  // batter-head flash: SHORTER, because `lit` is a hard
+                        // boolean in the renderer and cannot ease out
 drag_src_pad   = -1; // source pad for drag-swap (-1 = no drag)
 drag_active    = 0;  // 1 = currently dragging a pad
 xdrag_last_stamp = 0;  // EON_DRAG: last request stamp seen from the browser
@@ -1202,6 +1773,11 @@ EON_PADCAT_REQ         = 26004500;
 // click handlers — so nothing could drive Swing through its own screens. Added
 // for the manual-capture generator; equally the hook a loader/controller would
 // want. Band declared in .refs/gmem_regions_supplement.tsv.
+// ── EON_FXPICK ──  moved UP to the freemem allocator (search for
+// "EON_FXPICK: the FX picker's"), because swing_fxview_init sizes itself
+// from FXP_REC_MAX and so the constants must precede the call. The band is
+// still declared in .refs/gmem_regions_supplement.tsv.
+
 EON_VIEW_REQ           = 26004520;
 _view_req_last         = -1;   // seq echo; -1 = not yet baselined
 // Lua → JSFX modal-surface request: +0 = seq (written LAST), +1 = target
@@ -1406,6 +1982,37 @@ GS_THEME_KNOB_REQ = 2696; // KNOB button → bridge: 0 none; else (style_index+1
 GS_DM_PAINT = 2697; // bridge → JSFX: Drum Matrix paint-mode state (1=on) mirrored from ExtState EON_DRUM_MATRIX/paint_mode; PAINT button reads it for its lit state
 GS_DM_OVERLAY = 2698; // bridge → JSFX: Drum Matrix overlay running (1=singleton lock fresh); GRID button reads it for its lit state
 GS_TOOLBAR_OPEN = 2699; // bridge → JSFX: EON toolbar open (1=open); header TOOLBAR chip reads it for its lit colour
+GS_DOCK_LAYOUT_REQ = 2645; // wordmark menu → bridge: dock-rig layout pick, 1-based index into EON Dock Layout.lua's LAYOUTS (consume-to-0, GS_THEME_REQ pattern)
+// ── DOCK RIG LIVENESS ───────────────────────────────────────────────────────
+// GS_RIG_ALIVE: the pane scripts (EON Swing Dock.lua / EON Steppa Dock.lua)
+// stamp time_precise() here every tick while they are running. Claimed 2026-08-26
+// out of the retired 2626-2644 run (old FX pub, moved to 26090000).
+//
+// It exists to gate the PER-INSTANCE flag, not to carry it. The pane script sets
+// a slider on the exact FX whose canvas it captured, which is the only signal
+// that can distinguish "this instance is in the dock" from "some instance is" --
+// but a slider lives in the FX chunk, so a REAPER crash mid-capture would leave
+// a floated window pinned to the dock face forever. Honouring that flag only
+// while the rig is demonstrably alive makes the stale case impossible: no
+// script, no heartbeat, no dock face.
+GS_RIG_ALIVE = 2626;
+// ⚠️ ...except 2626 means "SOME pane is up" -- the Steppa pane stamps it too.
+// So the stale case above was NOT impossible: with Steppa's pane running and
+// ours not, a slider42 left at 1 read as docked, the wordmark posted POP to a
+// pane that was not there, and the click did nothing at all (2026-08-30, from
+// an EON Dock Debug trace carrying only Steppa lines). GS_RIG_ALIVE_SWING is
+// stamped ONLY by EON Swing Dock.lua, so it answers "is OUR pane up". Every
+// slider42 gate reads this one; 2626 keeps its documented meaning.
+// Protocol row 2633, claimed 2026-08-30 out of the retired 2635-2644 run.
+GS_RIG_ALIVE_SWING = 2633;
+// Dock toggle relay (2026-08-26; .refs protocol doc rows 2627-2632). POP is
+// consumed by EON Swing Dock.lua (it just re-shows our float; its handoff
+// watcher restores the canvas and closes the pane); REDOCK by the bridge
+// (eon_redock_tick), which selects our track and launches/reuses the pane.
+// The ID payload is written BEFORE the REQ bump (mailbox rule).
+GS_POP_REQ_SWING    = 2627;
+GS_REDOCK_REQ_SWING = 2629;
+GS_REDOCK_ID_SWING  = 2630;
 GS_SSWIN_BASE   = 26030000; // StepSeq courier SYNC band base (shared gmem map with EON_StepSeq.jsfx)
 GS_SSWIN_STRIDE = 64;       //   per registry slot; field 52 = bridge-published "this track's StepSeq
 GS_SSWIN_OPEN   = 52;       //   float window is open" — the STEP SEQ button reads it for its lit state
@@ -1699,63 +2306,273 @@ FX_PID_BUS_DLY_HPF      = 72;
 FX_PID_BUS_DLY_LPF      = 73;
 FX_PID_BUS_DLY_PING     = 74;
 FX_PID_BUS_DLY_MIX      = 75;
+// Bus enables (ser_ver 57). Appended AFTER the existing 64..75 block so the
+// FX-return viewer's k = pid - 64 indexing keeps working unchanged.
+FX_PID_BUS_RVB_ON       = 76;
+FX_PID_BUS_DLY_ON       = 77;
 // Published bus-param echo for the viewer deck (band offsets: pad region ends
-// at 519, 600 = VU_REQ, 601 = TIE_VER; 610..621 free until now). Order = the
-// FX_PID_BUS_* ids above minus 64. MUST match EON_FX_Return_View.jsfx.
+// at 519, 600 = VU_REQ, 601 = TIE_VER; 610..623 claimed, stride is 1024).
+// Order = the FX_PID_BUS_* ids above minus 64, so the two enables echo at
+// 622/623. MUST match EON_FX_Return_View.jsfx.
 GS_STRIP_OFF_BUS_BASE = 610;
+
+// Set one per-pad FX param + rebuild coefficients — the value half of an
+// edit, WITHOUT mark_dirty. Callers: swing_fx_apply (adds the dirty = a
+// real user edit) and the kit-macro engine (kmac_apply — macro motion is
+// performance/automation and must never create undo points or dirty the
+// kit; Spec_Swing_Macro_System §3). Pad must be pre-validated 0..NUM_PADS-1.
+// Value-only FX write. Split out of swing_fx_set so a macro pass can write
+// many targets and recalc each PAD once, instead of once per mapping.
+//
+// Now an ELSE-CHAIN. It used to be 24 separate statements, so every pid
+// comparison ran on every call however early the match; a macro move paid all
+// 24 per target write. Behaviour is identical -- the pids are mutually
+// exclusive -- it just stops after the hit.
+//
+// Returns the recalc the write needs, as a BIT so callers can OR several
+// together: 1 = recalc_fx. Unknown pid returns 0 and writes nothing, which is
+// also how a foreign kit's junk pid lands here harmlessly.
+function swing_fx_setv(_fa_pad, _fa_pid, _fa_val) (
+  _fa_pid == FX_PID_HPF_FREQ    ? ( fx_hpf_freq[_fa_pad]    = _fa_val; 1; ) :
+  _fa_pid == FX_PID_LPF_FREQ    ? ( fx_lpf_freq[_fa_pad]    = _fa_val; 1; ) :
+  _fa_pid == FX_PID_RESO        ? ( fx_reso[_fa_pad]        = _fa_val; 1; ) :
+  _fa_pid == FX_PID_EQ_LO       ? ( fx_eq_lo[_fa_pad]       = _fa_val; 1; ) :
+  _fa_pid == FX_PID_EQ_MID      ? ( fx_eq_mid[_fa_pad]      = _fa_val; 1; ) :
+  _fa_pid == FX_PID_EQ_HI       ? ( fx_eq_hi[_fa_pad]       = _fa_val; 1; ) :
+  _fa_pid == FX_PID_EQ_LO_FREQ  ? ( fx_eq_lo_freq[_fa_pad]  = _fa_val; 1; ) :
+  _fa_pid == FX_PID_EQ_MID_FREQ ? ( fx_eq_mid_freq[_fa_pad] = _fa_val; 1; ) :
+  _fa_pid == FX_PID_EQ_HI_FREQ  ? ( fx_eq_hi_freq[_fa_pad]  = _fa_val; 1; ) :
+  _fa_pid == FX_PID_CMP_AMT     ? ( fx_cmp_amt[_fa_pad]     = _fa_val; 1; ) :
+  _fa_pid == FX_PID_CMP_MODE    ? ( fx_cmp_mode[_fa_pad]    = (_fa_val | 0); 1; ) :
+  _fa_pid == FX_PID_BC_RATE     ? ( fx_bc_rate[_fa_pad]     = _fa_val; 1; ) :
+  _fa_pid == FX_PID_BC_BITS     ? ( fx_bc_bits[_fa_pad]     = floor(_fa_val + 0.5); 1; ) :
+  _fa_pid == FX_PID_SAT_DRV     ? ( fx_sat_drv[_fa_pad]     = _fa_val; 1; ) :
+  _fa_pid == FX_PID_DRV_MODE    ? ( fx_drv_mode[_fa_pad]    = (_fa_val | 0); 1; ) :
+  _fa_pid == FX_PID_SND_DLY     ? ( fx_snd_dly[_fa_pad]     = _fa_val; 1; ) :
+  _fa_pid == FX_PID_SND_RVB     ? ( fx_snd_rvb[_fa_pad]     = _fa_val; 1; ) :
+  _fa_pid == FX_PID_SND_SMASH   ? ( fx_snd_smash[_fa_pad]   = _fa_val; 1; ) :
+  _fa_pid == FX_PID_EQ_MID2      ? ( fx_eq_mid2[_fa_pad]      = _fa_val; 1; ) :
+  _fa_pid == FX_PID_EQ_MID2_FREQ ? ( fx_eq_mid2_freq[_fa_pad] = _fa_val; 1; ) :
+  _fa_pid == FX_PID_EQ_MID_Q     ? ( fx_eq_mid_q[_fa_pad]     = _fa_val; 1; ) :
+  _fa_pid == FX_PID_EQ_MID2_Q    ? ( fx_eq_mid2_q[_fa_pad]    = _fa_val; 1; ) :
+  _fa_pid == FX_PID_EQ_LO_Q      ? ( fx_eq_lo_q[_fa_pad]      = _fa_val; 1; ) :
+  _fa_pid == FX_PID_EQ_HI_Q      ? ( fx_eq_hi_q[_fa_pad]      = _fa_val; 1; );
+  0;   // nothing matched: no value changed, so no recalc is owed either.
+       // (The old code ran one regardless.) Each arm reports for ITSELF --
+       // a contiguous-pid-range test would silently drop a recalc the day
+       // someone inserts a pid out of order.
+);
+
+// Value + coefficients, the shape every existing caller expects.
+function swing_fx_set(_fa_pad, _fa_pid, _fa_val) (
+  swing_fx_setv(_fa_pad, _fa_pid, _fa_val) ? recalc_fx(_fa_pad);
+);
 
 // Apply one (pad, pid, value) FX edit exactly like the overlay's own edits:
 // set the array value, rebuild coefficients, mark the pad dirty (undo +
 // @serialize persistence). Shared by the Pad FX panel consumer and the
-// strip-sync mailbox consumer (both @block).
+// strip-sync mailbox consumer (both @block). Per-pad value+recalc now lives
+// in swing_fx_set above; this adds the dirty marking of a real edit.
 function swing_fx_apply(_fa_pad, _fa_pid, _fa_val) (
   // Bus-global params (pad ignored) — from the FX-return viewer's deck. Clamps
   // and recalc pairing mirror the LCD FX panel exactly: rvb recalcs all but MIX;
   // dly recalcs only DIV/HPF/LPF (FB/PING/MIX are read live by the DSP).
-  _fa_pid >= FX_PID_BUS_RVB_SIZE && _fa_pid <= FX_PID_BUS_DLY_MIX ? (
+  _fa_pid >= FX_PID_BUS_RVB_SIZE && _fa_pid <= FX_PID_BUS_DLY_ON ? (
     _fa_pid == FX_PID_BUS_RVB_SIZE     ? ( rvb_size     = max(0, min(1, _fa_val));       rvb_recalc(); );
     _fa_pid == FX_PID_BUS_RVB_DAMP     ? ( rvb_damp     = max(0, min(1, _fa_val));       rvb_recalc(); );
     _fa_pid == FX_PID_BUS_RVB_WIDTH    ? ( rvb_width    = max(0, min(1, _fa_val));       rvb_recalc(); );
     _fa_pid == FX_PID_BUS_RVB_PREDELAY ? ( rvb_predelay = max(0, min(250, _fa_val));     rvb_recalc(); );
     _fa_pid == FX_PID_BUS_RVB_HPF      ? ( rvb_hpf      = max(0, min(500, _fa_val));     rvb_recalc(); );
     _fa_pid == FX_PID_BUS_RVB_MIX      ? ( rvb_mix      = max(0, min(1, _fa_val)); );
-    _fa_pid == FX_PID_BUS_DLY_DIV      ? ( dly_div      = max(0, min(RPT_NUM_DIVS, _fa_val | 0)); dly_recalc(); );
+    _fa_pid == FX_PID_BUS_DLY_DIV      ? ( dly_div      = max(1, min(RPT_NUM_DIVS, _fa_val | 0)); dly_recalc(); );
     _fa_pid == FX_PID_BUS_DLY_FB       ? ( dly_fb       = max(0, min(0.95, _fa_val)); );
     _fa_pid == FX_PID_BUS_DLY_HPF      ? ( dly_hpf_hz   = max(20, min(2000, _fa_val));   dly_recalc(); );
     _fa_pid == FX_PID_BUS_DLY_LPF      ? ( dly_lpf_hz   = max(1000, min(20000, _fa_val)); dly_recalc(); );
     _fa_pid == FX_PID_BUS_DLY_PING     ? ( dly_ping     = _fa_val >= 0.5; );
     _fa_pid == FX_PID_BUS_DLY_MIX      ? ( dly_mix      = max(0, min(1, _fa_val)); );
+    _fa_pid == FX_PID_BUS_RVB_ON       ? ( rvb_on       = _fa_val >= 0.5; );
+    _fa_pid == FX_PID_BUS_DLY_ON       ? ( dly_on       = _fa_val >= 0.5; );
     mark_dirty_kit();
   ) :
   _fa_pad >= 0 && _fa_pad < NUM_PADS ? (
-    _fa_pid == FX_PID_HPF_FREQ    ? ( fx_hpf_freq[_fa_pad]    = _fa_val; );
-    _fa_pid == FX_PID_LPF_FREQ    ? ( fx_lpf_freq[_fa_pad]    = _fa_val; );
-    _fa_pid == FX_PID_RESO        ? ( fx_reso[_fa_pad]        = _fa_val; );
-    _fa_pid == FX_PID_EQ_LO       ? ( fx_eq_lo[_fa_pad]       = _fa_val; );
-    _fa_pid == FX_PID_EQ_MID      ? ( fx_eq_mid[_fa_pad]      = _fa_val; );
-    _fa_pid == FX_PID_EQ_HI       ? ( fx_eq_hi[_fa_pad]       = _fa_val; );
-    _fa_pid == FX_PID_EQ_LO_FREQ  ? ( fx_eq_lo_freq[_fa_pad]  = _fa_val; );
-    _fa_pid == FX_PID_EQ_MID_FREQ ? ( fx_eq_mid_freq[_fa_pad] = _fa_val; );
-    _fa_pid == FX_PID_EQ_HI_FREQ  ? ( fx_eq_hi_freq[_fa_pad]  = _fa_val; );
-    _fa_pid == FX_PID_CMP_AMT     ? ( fx_cmp_amt[_fa_pad]     = _fa_val; );
-    _fa_pid == FX_PID_CMP_MODE    ? ( fx_cmp_mode[_fa_pad]    = (_fa_val | 0); );
-    _fa_pid == FX_PID_BC_RATE     ? ( fx_bc_rate[_fa_pad]     = _fa_val; );
-    _fa_pid == FX_PID_BC_BITS     ? ( fx_bc_bits[_fa_pad]     = floor(_fa_val + 0.5); );
-    _fa_pid == FX_PID_SAT_DRV     ? ( fx_sat_drv[_fa_pad]     = _fa_val; );
-    _fa_pid == FX_PID_DRV_MODE    ? ( fx_drv_mode[_fa_pad]    = (_fa_val | 0); );
-    _fa_pid == FX_PID_SND_DLY     ? ( fx_snd_dly[_fa_pad]     = _fa_val; );
-    _fa_pid == FX_PID_SND_RVB     ? ( fx_snd_rvb[_fa_pad]     = _fa_val; );
-    _fa_pid == FX_PID_SND_SMASH   ? ( fx_snd_smash[_fa_pad]   = _fa_val; );
-    _fa_pid == FX_PID_EQ_MID2      ? ( fx_eq_mid2[_fa_pad]      = _fa_val; );
-    _fa_pid == FX_PID_EQ_MID2_FREQ ? ( fx_eq_mid2_freq[_fa_pad] = _fa_val; );
-    _fa_pid == FX_PID_EQ_MID_Q     ? ( fx_eq_mid_q[_fa_pad]     = _fa_val; );
-    _fa_pid == FX_PID_EQ_MID2_Q    ? ( fx_eq_mid2_q[_fa_pad]    = _fa_val; );
-    _fa_pid == FX_PID_EQ_LO_Q      ? ( fx_eq_lo_q[_fa_pad]      = _fa_val; );
-    _fa_pid == FX_PID_EQ_HI_Q      ? ( fx_eq_hi_q[_fa_pad]      = _fa_val; );
-    recalc_fx(_fa_pad);
+    swing_fx_set(_fa_pad, _fa_pid, _fa_val);
     mark_dirty_pad(_fa_pad);
+    // last-touched tap for the macro assign shortcuts — this funnel carries
+    // every PadFX-panel, strip and viewer edit with its (pad, pid).
+    kmac_lt_pad = _fa_pad; kmac_lt_pid = _fa_pid; kmac_lt_t = time_precise();
   );
 );
+
+// ─── Kit-macro engine (slice 1, Spec_Swing_Macro_System §3) ───────────────
+// Shape one macro value through a mapping's curve. Negative curve inverts
+// the response (1-v) at |curve|; exponent 1 short-circuits to linear so
+// trivial mappings pay nothing. pow is @block-only — never @sample.
+function kmac_shape(_kmc_v, _kmc_c) local(_kmc_e) (
+  _kmc_c < 0 ? ( _kmc_v = 1 - _kmc_v; );
+  _kmc_e = abs(_kmc_c);
+  _kmc_e > 0 && _kmc_e != 1 ? ( _kmc_v = pow(_kmc_v, _kmc_e); );
+  _kmc_v;
+);
+
+// Core-param setter — the macro-safe write path for virtual pids ≥100.
+// Each case mirrors the corresponding LCD PAD-tab knob exactly (value
+// write + the SAME recalc that knob runs); clamps are the knob ranges.
+// No mark_dirty, same contract as swing_fx_set.
+function swing_kmac_core_setv(_kc_pad, _kc_pid, _kc_val) (
+  _kc_pid == KMAC_PID_TUNE ? (
+    p_tune[_kc_pad] = max(-24, min(24, _kc_val)); 2;
+  ) :
+  _kc_pid == KMAC_PID_PAN ? (
+    _kc_val = max(-1, min(1, _kc_val));
+    p_pan[_kc_pad]  = _kc_val;
+    p_panL[_kc_pad] = min(1.0, 1.0 - _kc_val);
+    p_panR[_kc_pad] = min(1.0, 1.0 + _kc_val);
+    0;                        // pan writes its own coefficients above
+  ) :
+  _kc_pid == KMAC_PID_DECAY ? (
+    p_decay[_kc_pad] = max(1, min(2000, _kc_val)); 2;
+  ) :
+  _kc_pid == KMAC_PID_ATTACK ? (
+    p_attack[_kc_pad] = max(0, min(500, _kc_val)); 2;
+  ) :
+  // Engine knobs: no recalc at all -- rk_syn_reset reads ps_mac* at TRIGGER,
+  // so a move shapes the next hit and leaves ringing voices alone. That is how
+  // a real drum machine's decay knob behaves, and it means a macro sweep can
+  // never glitch a note already sounding.
+  _kc_pid >= KMAC_PID_SYN_BASE && _kc_pid < KMAC_PID_SYN_BASE + KMAC_PID_SYN_N ? (
+    _syn_mac_set(_kc_pad, _kc_pid - KMAC_PID_SYN_BASE, max(0, min(1, _kc_val))); 0;
+  ) : 0;
+);
+
+// NOTE: swing_kmac_core_set / swing_kmac_target_set -- the "write one target
+// and recalc immediately" pair -- were removed when kmac_apply moved to the
+// _setv + per-pad-settle path below and left them with no callers at all.
+// (swing_fx_set survives: swing_fx_apply still uses it.) If something ever
+// wants that shape back it is two lines -- call the _setv and act on the bits
+// it returns.
+
+// Value-only dispatch. Returns the recalc owed as BITS -- 1 = recalc_fx,
+// 2 = recalc_pad -- so a macro pass can OR them per pad and settle up once.
+function swing_kmac_target_setv(_kt_pad, _kt_pid, _kt_val) (
+  _kt_pid >= KMAC_PID_CORE_BASE ? swing_kmac_core_setv(_kt_pad, _kt_pid, _kt_val)
+                                : swing_fx_setv(_kt_pad, _kt_pid, _kt_val);
+);
+
+// Apply macro _kmc_m at value _kmc_v (0..1) to every one of its mappings:
+// target = lo + (hi-lo) * shape(v). Absolute-within-range — the macro OWNS
+// a mapped param while mapped (a manual edit holds only until the next
+// macro move). Writes go through swing_fx_set: same value+recalc as a real
+// edit, no dirty, no undo.
+function kmac_apply(_kmc_m, _kmc_v) local(_kmc_j _kmc_b _kmc_pad _kmc_val _kmc_p) (
+  _kmc_b = _kmc_m * KMAC_MAX_MAP;
+  _kmc_j = 0;
+  loop(min(kmac_nmap[_kmc_m], KMAC_MAX_MAP),
+    _kmc_val = kmac_lo[_kmc_b + _kmc_j]
+             + (kmac_hi[_kmc_b + _kmc_j] - kmac_lo[_kmc_b + _kmc_j])
+               * kmac_shape(_kmc_v, kmac_curve[_kmc_b + _kmc_j]);
+    _kmc_pad = kmac_pad[_kmc_b + _kmc_j];
+    _kmc_pad == -2 ? (
+      _kmc_p = 0;
+      loop(NUM_PADS,
+        kmac_rcp[_kmc_p] |= swing_kmac_target_setv(_kmc_p, kmac_pid[_kmc_b + _kmc_j], _kmc_val);
+        _kmc_p += 1;
+      );
+    ) : (
+      _kmc_pad == -1 ? ( _kmc_pad = sel_pad; );
+      _kmc_pad >= 0 && _kmc_pad < NUM_PADS ? (
+        kmac_rcp[_kmc_pad] |= swing_kmac_target_setv(_kmc_pad, kmac_pid[_kmc_b + _kmc_j], _kmc_val);
+      );
+    );
+    _kmc_j += 1;
+  );
+);
+
+// @block tick: gather the 8 macro sliders, change-detect, apply movers.
+// The FIRST block only primes the last-value snapshot — a project open or
+// kit load applies nothing until the user actually moves a macro, so a
+// mapped kit never has its saved FX state silently overwritten at load.
+// kmac_force = one-shot full re-apply for later slices (mapping edits,
+// factory-macro kit loads).
+function kmac_tick() local(_kmc_k, _kmc_f, _kmc_fr, _kmc_g, _kmc_p) (
+  // ── morph engine (slice 4, spec §4) ── macro_morph is THE automatable
+  // morph param. When it moves, lerp the 8 values along the snapshot chain
+  // (integer part = "from" slot, fraction = blend to the next) and write
+  // them as the macro values; knobs move COSMETICALLY via sliderchange —
+  // no automation events, so a READ-mode lane on macro_morph never fights
+  // the 8 knobs (the researched write-back trap). Gated on BOTH chain ends
+  // being captured — an empty snapshot never zeroes a performance.
+  // ⭐The lerp runs on MACRO POSITIONS (0..1, unitless), never on target
+  // values, so the dB-collapse hazard (spec §4 gain-domain rule) is
+  // structurally impossible here: a morph is the same trajectory as
+  // turning the knob by hand. Anyone rearchitecting this to blend TARGET
+  // values must read that spec section first.
+  kmac_primed && macro_morph != kmac_morph_last ? (
+    kmac_morph_last = macro_morph;
+    _kmc_f  = max(0, min(KMAC_NSNAP - 1, macro_morph));
+    _kmc_fr = _kmc_f - (_kmc_f | 0);
+    _kmc_f  = _kmc_f | 0;
+    _kmc_g  = min(KMAC_NSNAP - 1, _kmc_f + 1);
+    kmac_snap_has[_kmc_f] && kmac_snap_has[_kmc_g] ? (
+      _kmc_f = _kmc_f * KMAC_N; _kmc_g = _kmc_g * KMAC_N;
+      macro1 = kmac_snap[_kmc_f + 0] + (kmac_snap[_kmc_g + 0] - kmac_snap[_kmc_f + 0]) * _kmc_fr;
+      macro2 = kmac_snap[_kmc_f + 1] + (kmac_snap[_kmc_g + 1] - kmac_snap[_kmc_f + 1]) * _kmc_fr;
+      macro3 = kmac_snap[_kmc_f + 2] + (kmac_snap[_kmc_g + 2] - kmac_snap[_kmc_f + 2]) * _kmc_fr;
+      macro4 = kmac_snap[_kmc_f + 3] + (kmac_snap[_kmc_g + 3] - kmac_snap[_kmc_f + 3]) * _kmc_fr;
+      macro5 = kmac_snap[_kmc_f + 4] + (kmac_snap[_kmc_g + 4] - kmac_snap[_kmc_f + 4]) * _kmc_fr;
+      macro6 = kmac_snap[_kmc_f + 5] + (kmac_snap[_kmc_g + 5] - kmac_snap[_kmc_f + 5]) * _kmc_fr;
+      macro7 = kmac_snap[_kmc_f + 6] + (kmac_snap[_kmc_g + 6] - kmac_snap[_kmc_f + 6]) * _kmc_fr;
+      macro8 = kmac_snap[_kmc_f + 7] + (kmac_snap[_kmc_g + 7] - kmac_snap[_kmc_f + 7]) * _kmc_fr;
+      sliderchange(KMAC_SLMASK);
+    );
+  );
+
+  kmac_val[0] = macro1; kmac_val[1] = macro2;
+  kmac_val[2] = macro3; kmac_val[3] = macro4;
+  kmac_val[4] = macro5; kmac_val[5] = macro6;
+  kmac_val[6] = macro7; kmac_val[7] = macro8;
+  kmac_primed ? (
+    _kmc_k = 0;
+    loop(KMAC_N,
+      (kmac_val[_kmc_k] != kmac_last[_kmc_k] || kmac_force) ? (
+        kmac_last[_kmc_k] = kmac_val[_kmc_k];
+        kmac_nmap[_kmc_k] > 0 ? ( kmac_apply(_kmc_k, kmac_val[_kmc_k]); );
+      );
+      _kmc_k += 1;
+    );
+    // ── settle the recalcs, once per PAD ────────────────────────────────
+    // Was once per MAPPING: a morph on 9T9 ran 150 recalc_fx a block where 16
+    // pads exist, because several mappings land on the same pad and each one
+    // rebuilt all six of its filters. Deduping ACROSS macros too, not just
+    // within one, since a morph moves all eight at once.
+    // Cheap to run unconditionally -- 16 iterations of a mask test.
+    _kmc_p = 0;
+    loop(NUM_PADS,
+      kmac_rcp[_kmc_p] ? (
+        kmac_rcp[_kmc_p] & 1 ? recalc_fx(_kmc_p);
+        kmac_rcp[_kmc_p] & 2 ? recalc_pad(_kmc_p);
+        kmac_rcp[_kmc_p] = 0;
+      );
+      _kmc_p += 1;
+    );
+    kmac_force = 0;
+  ) : (
+    _kmc_k = 0;
+    loop(KMAC_N, kmac_last[_kmc_k] = kmac_val[_kmc_k]; _kmc_k += 1;);
+    kmac_morph_last = macro_morph;  // never morph-apply on the prime frame —
+                                    // a project restoring morph≠0 must not
+                                    // stomp the knobs at open (same contract
+                                    // as the value prime above).
+    kmac_primed = 1;
+  );
+);
+
+// Identity-palette defaults: macro k wears palette colour k. The MACRO tab
+// reads kmac_color (not k) so per-macro recolouring later is a data change.
+// A ser_ver >= 54 read overwrites these with the saved colours.
+// (The slice-1 TEMP test mapping that lived here was RETIRED when the
+// assign UI + persistence landed — fresh instances start with 8 empty
+// macros; factory mappings arrive with kits, not @init.)
+_kmc_i = 0; loop(KMAC_N, kmac_color[_kmc_i] = _kmc_i; _kmc_i += 1;);
 
 // SP_PITCH_* protocol constants + heartbeat state + @block worker now live
 // in libs/rk_swing_block_pitch.jsfx-inc (imported at file top). Per-pad
@@ -1862,6 +2679,20 @@ dly_recalc();
 rvb_recalc();
 cmp_recalc();
 
+// ─── Send-bus enable: gate glide + tail ring-out state ──────────────────
+// rvb_on / dly_on are the real on/off (kit state, ser_ver 57). OFF does NOT
+// hard-gate the engine - that chops the tail mid-decay, which is the click
+// the old `rvb_size > 0.001` / `dly_div > 0` gates produced. Instead OFF
+// glides the INPUT to zero and lets the tail ring out, then stands the
+// engine down once the wet has been under BUS_TAIL_FLOOR for _bus_tail_hold
+// consecutive samples. Pulling the send is what "off" should sound like.
+// srate-fixed, like dly_sm_c above: ext_noinit = 1.0 makes @init one-shot.
+_bus_gate_c    = exp(-1 / (0.008 * srate));  // 8 ms TIME CONSTANT (~55 ms to
+                                             // -60 dB) on the input mute
+_bus_tail_hold = (0.5 * srate) | 0;          // 500 ms of proven silence
+_rvb_gate = 1; _dly_gate = 1;                // start open (both buses default ON)
+_rvb_tail_n = 0; _dly_tail_n = 0;
+
 // Command-undo: one-pad audio backup buffer (one SLOT_SIZE). Full-slot copy on
 // a per-pad structural op; restored to that pad only on undo. ⚠ ORDER MATTERS:
 // this buffer must PERSIST across frames, so it sits BEFORE the swap scratch —
@@ -1919,7 +2750,7 @@ strcpy(#note_menu, "");
 _nmi = 0;
 loop(128,
   _nms = _nmi % 12;
-  _oct = (_nmi / 12)|0 - 1;
+  _oct = (_nmi / 12 | 0) - 1;
   _nms==0?strcpy(#_nm_tmp,"C"):_nms==1?strcpy(#_nm_tmp,"C#"):
   _nms==2?strcpy(#_nm_tmp,"D"):_nms==3?strcpy(#_nm_tmp,"D#"):
   _nms==4?strcpy(#_nm_tmp,"E"):_nms==5?strcpy(#_nm_tmp,"F"):
@@ -2013,6 +2844,7 @@ global_vol = master_db <= -48 ? 0 : exp(master_db * 0.11512925465);
 root_note != _last_root || global_vol != _last_gvol ? (
   i = 0; loop(NUM_PADS, recalc_pad(i); recalc_fx(i); i += 1;);
   steal_coeff = exp(-1.0 / max(1, 0.005 * srate));
+  syn_quiet_n = 0.06 * srate;
 
   recalc_global_fx();
   _last_root = root_note;
@@ -2083,6 +2915,12 @@ swing_block_sync_fx_params();
 // Reverb block-rate LFO update
 rvb_tick();
 
+// Delay block-rate tempo follow. ⚠️ Without this the send delay keeps whatever
+// tempo was current the last time a delay parameter moved — dly_recalc() reads
+// `tempo` but was only ever called from the param handlers and @init, so a
+// project tempo change silently left the delay mistimed (fixed 2026-08-26).
+dly_tick();
+
 // Recompute any_solo
 any_solo = 0;
 i = 0; loop(NUM_PADS, p_solo[i] ? any_solo = 1; i += 1;);
@@ -2131,9 +2969,21 @@ _prev_play_state = play_state;
 // Only used for voice cleanup, NOT as a note-on gate.
 _retrig_lockout = max(samplesblock * 2, (srate * 0.01)|0);
 
+// 2C "chance" controller: Steppa writes its probability lane into the item as CC 119
+// (the last undefined controller) on the step, ahead of that step's notes. One CC =
+// one roll, shared by every note-on at the same sample offset -- Steppa's own die is
+// per STEP, not per pad, and this matches it. Consumed here; never forwarded. Reset
+// per block so a stale roll can never reach a later block's notes.
+_prob_off = -1;
+
 while(midirecv(offset, msg1, msg2, msg3)) (
   status = msg1 & 0xF0;
   _midi_consumed = 0;  // track whether Swing eats this event
+  status == 0xB0 && msg2 == 119 ? (
+    _prob_off  = offset;
+    _prob_skip = rand(127) > msg3;   // Steppa plays a step when rand(127) <= its value
+    _midi_consumed = 1;
+  );
   status == 0x90 && msg3 > 0 ? (
     // MIDI learn: assign note to pad. The learned note becomes the pad's ROOT;
     // the range offsets (p_rng_lo/hi) are relative to it, so the range
@@ -2166,7 +3016,8 @@ while(midirecv(offset, msg1, msg2, msg3)) (
       _midi_consumed = 1;  // this note belongs to a Swing pad — eat it
       _blk_last_off[pad] = 0;  // last event for this pad this block is now a note-ON (held)
       // Playable, not audio: an enabled SYN slot triggers from MIDI too
-      blocked = p_mute[pad] || (any_solo && !p_solo[pad]) || !pad_is_playable(pad) || s_skip[pad];
+      blocked = p_mute[pad] || (any_solo && !p_solo[pad]) || !pad_is_playable(pad) || s_skip[pad]
+                || (_prob_off == offset && _prob_skip);   // 2C: this step's chance roll said no
       // Dedup: _blk_trig prevents same-block duplicates.
       // Cross-block duplicates handled by duplicate-kill inside launch_voices_for_pad.
       !blocked && !_blk_trig[pad] ? (
@@ -2238,6 +3089,12 @@ _is_browser_target() ? (
     gmem[GS_FX_ACTION_PAD] = -1;  // consume
   );
 );
+
+// ─── Kit-macro engine tick (slice 1) ──────────────────────────────────────
+// After the Pad-FX mailbox consume, before strip publish, so a macro move
+// lands in this block's strip mirror. Change-detected inside — idle cost is
+// eight compares. See kmac_* in @init.
+kmac_tick();
 
 // ─── Strip-sync (Path B): publish, mailbox, takeover ──────────────────────
 // Per-instance band at GS_STRIP_BASE + slot*STRIDE (see @init for layout).
@@ -2353,6 +3210,8 @@ strip_pub_div >= 4 ? (
   gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 9]  = dly_lpf_hz;
   gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 10] = dly_ping;
   gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 11] = dly_mix;
+  gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 12] = rvb_on;
+  gmem[_strip_b + GS_STRIP_OFF_BUS_BASE + 13] = dly_on;
   gmem[_strip_b + GS_STRIP_OFF_SEQ] += 1;
 );
 ) : (
@@ -2442,6 +3301,31 @@ atomic_set(gmem[GS_SWING_ALIVE], heartbeat_counter);
 _bl_blkctr += 1;
 gmem[KIT_GMEM_CMD] == 63 && !kit_busy && !_bl_inflight ? swing_browser_load_pad();
 gmem[KIT_GMEM_CMD] == 64 && !kit_busy && !_bl_inflight ? swing_browser_load_layer();
+
+// CMD 69 — the mini browser's PREVIEW load. @block ONLY: it reads a file, and
+// the twin dispatch in @gfx must never do that. Gated on the same instance
+// check as 63/64, and it clears the command itself because nothing downstream
+// knows about it.
+gmem[KIT_GMEM_CMD] == 69 && !kit_busy && !_bl_inflight ? (
+  gmem[KIT_GMEM_INSTANCE] == instance_id ? (
+    _prv_pl = gmem[GS_BROWSER_PATH_LEN] | 0;
+    _prv_pl > 0 && _prv_pl < GS_BROWSER_PATH_MAX ? (
+      strcpy(#_prv_path, "");
+      _prv_ci = 0;
+      loop(_prv_pl, str_setchar(#_prv_path, _prv_ci, gmem[GS_BROWSER_PATH + _prv_ci]); _prv_ci += 1;);
+      str_setlen(#_prv_path, _prv_pl);
+      swing_fb_prv_load(#_prv_path);
+      // Audition means "let me hear it" -- loading one IS the request to play.
+      _prv_len > 0 ? ( _prv_pos = 0; _prv_on = 1; );
+    );
+    gmem[KIT_GMEM_CMD] = 0;
+  );
+);
+
+// Face -> engine transport. @gfx must not own the read position, so it asks
+// here and @block sets the state that @sample reads.
+fb_prv_cmd == 1 ? ( _prv_len > 0 ? ( _prv_pos = 0; _prv_on = 1; ); fb_prv_cmd = 0; ) :
+fb_prv_cmd == 2 ? ( _prv_on = 0; fb_prv_cmd = 0; );
 gmem[KIT_GMEM_CMD] == 65 && _reg_my_slot == gmem[GS_PENDING_PITCH_INST] && !kit_busy && !_bl_inflight ? swing_pad_audio_swap();  // !kit_busy: defer Tuned bake while a kit-import restore is populating pad buffers (blank-pads race)
 gmem[KIT_GMEM_CMD] == 66 && _reg_my_slot == gmem[GS_PENDING_PITCH_INST] && !kit_busy && !_bl_inflight ? swing_pad_audio_export();  // !kit_busy (Phase 3): 66 writes KIT_GMEM_AUDIO offset 0, where VER-201 stages pad 0 path string
 gmem[KIT_GMEM_CMD] == 67 && _reg_my_slot == gmem[GS_PENDING_PITCH_INST] && !kit_busy && !_bl_inflight ? swing_pad_layer_audio_swap();  // !kit_busy (Phase 3): same shared-band defer as CMD 65
@@ -3355,10 +4239,21 @@ vi = 0; loop(MAX_VOICES + 1,
 
     v_kind[vi] ? (
       // ── SYN voice: engine renders mono; pad ADSR gates on top (spec §1).
-      // Percussive tails + a hard 3 s age cap force release so the slot
-      // recycles even with sustain > 0 (synths have no sample end).
+      // A synth has no sample end, so something else has to retire the slot.
+      // The 3 s age cap used to be that something — and on a kit whose pads
+      // carry no `sustain` the ADSR never falls, so EVERY hit sat on a slot
+      // for ~2.8 s after going silent. 16 slots, so 16 hits in 3 s emptied
+      // the pool and everything after that stole a live voice.
+      // Retire on measured silence instead, and keep the age cap as the
+      // backstop for an engine that never decays that far.
+      // Post-gain, so a quiet voice retires sooner than a loud one; hold and
+      // threshold are both generous because a clap is several bursts with
+      // gaps between them, and truncating one would be far worse than
+      // freeing a slot late.
       sL = sR = rk_syn_tick(v_syn_state + vi * RK_SYN_STATE_SIZE);
-      v_age[vi] > 3 * srate && v_stage[vi] < 4 ? v_stage[vi] = 4;
+      abs(sL * g) < SYN_QUIET_T ? ( v_quiet[vi] += 1; ) : ( v_quiet[vi] = 0; );
+      (v_quiet[vi] > syn_quiet_n || v_age[vi] > 3 * srate) && v_stage[vi] < 4 ?
+        v_stage[vi] = 4;
     ) : (
     // Linear interpolation playback
     idx  = v_pos[vi]|0; idx -= idx & 1;
@@ -3491,7 +4386,7 @@ _pi = 0; loop(NUM_PADS,
 snd_dly_accL[0] = 0; snd_dly_accR[0] = 0;
 snd_rvb_accL[0] = 0; snd_rvb_accR[0] = 0;
 snd_sms_accL[0] = 0; snd_sms_accR[0] = 0;
-// Smash is returns-only (the compressor lives ON the return track as EON 76 —
+// Smash is returns-only (the compressor lives ON the return track as EON Weld —
 // with no return there is no effect, and folding the dry send into Main would
 // just be a per-pad volume boost). Hoisted here so the pad loop can skip the
 // accumulate entirely outside multi-out+returns.
@@ -3536,12 +4431,21 @@ _pi = 0; loop(NUM_PADS,
 // tracks instead of leaking into the Main bus / child-track 0. Otherwise the
 // returns mix into the Main stereo bus (spl 0/1) exactly as before.
 // (_fx_ret_pins hoisted above the pad loop — the smash accumulate needs it.)
-// Delay
-dly_div > 0 ? (
-  dly_process(snd_dly_accL[0], snd_dly_accR[0]);
+// Delay - gated by dly_on (the bus enable), NOT by dly_div. The division is
+// kit state you get back when you switch the bus on again; the old
+// `dly_div > 0` gate made "off" mean "throw the division away", and it cut
+// the repeats dead mid-tail. OFF now glides the input shut and rings out.
+_dly_gate += ((dly_on ? 1 : 0) - _dly_gate) * (1 - _bus_gate_c);
+_dly_gate < BUS_TAIL_FLOOR ? _dly_gate = 0;
+(dly_on || _dly_tail_n < _bus_tail_hold) ? (
+  dly_process(snd_dly_accL[0] * _dly_gate, snd_dly_accR[0] * _dly_gate);
   // Denormal protection on delay tail
   abs(dly_outL) < DENORM_THR ? dly_outL = 0;
   abs(dly_outR) < DENORM_THR ? dly_outR = 0;
+  // Ring-out bookkeeping: ON keeps the counter parked at 0; OFF counts only
+  // CONSECUTIVE sub-floor samples, so a still-audible repeat resets it.
+  dly_on ? _dly_tail_n = 0 :
+    (abs(dly_outL) + abs(dly_outR) < BUS_TAIL_FLOOR ? _dly_tail_n += 1 : _dly_tail_n = 0);
   _fx_ret_pins ? (
     spl(34) += dly_outL * dly_mix;
     spl(35) += dly_outR * dly_mix;
@@ -3549,14 +4453,29 @@ dly_div > 0 ? (
     spl(0) += dly_outL * dly_mix;
     spl(1) += dly_outR * dly_mix;
   );
+) : (
+  // Stood down. Keep the write head moving and lay zeros behind it: a frozen
+  // head leaves the ring buffer holding the old tail, and switching the bus
+  // back on would replay it as a burst of stale audio. Four ops a sample buys
+  // a buffer that is always clean by the time it is read again.
+  dly_bufL[dly_wpos] = 0; dly_bufR[dly_wpos] = 0;
+  dly_wpos += 1; dly_wpos >= DLY_BUF_MAX ? dly_wpos = 0;
+  dly_outL = 0; dly_outR = 0;
 );
 
-// Reverb
-rvb_size > 0.001 ? (
-  rvb_process(snd_rvb_accL[0], snd_rvb_accR[0]);
+// Reverb - gated by rvb_on, NOT by rvb_size. Same reasoning as the delay: the
+// old `rvb_size > 0.001` gate made "off" mean "destroy the SIZE you want back",
+// and crossing the threshold on a drag chopped the tail. rvb_recalc handles
+// size 0 fine (scale floors at 0.35x), so the engine is happy to run there.
+_rvb_gate += ((rvb_on ? 1 : 0) - _rvb_gate) * (1 - _bus_gate_c);
+_rvb_gate < BUS_TAIL_FLOOR ? _rvb_gate = 0;
+(rvb_on || _rvb_tail_n < _bus_tail_hold) ? (
+  rvb_process(snd_rvb_accL[0] * _rvb_gate, snd_rvb_accR[0] * _rvb_gate);
   // Denormal protection on reverb tail
   abs(rvb_outL) < DENORM_THR ? rvb_outL = 0;
   abs(rvb_outR) < DENORM_THR ? rvb_outR = 0;
+  rvb_on ? _rvb_tail_n = 0 :
+    (abs(rvb_outL) + abs(rvb_outR) < BUS_TAIL_FLOOR ? _rvb_tail_n += 1 : _rvb_tail_n = 0);
   _fx_ret_pins ? (
     spl(32) += rvb_outL * rvb_mix;
     spl(33) += rvb_outR * rvb_mix;
@@ -3564,10 +4483,12 @@ rvb_size > 0.001 ? (
     spl(0) += rvb_outL * rvb_mix;
     spl(1) += rvb_outR * rvb_mix;
   );
+) : (
+  rvb_outL = 0; rvb_outR = 0;
 );
 
 // Smash (parallel-comp send) — RAW summed sends out to the return pair; the
-// EON 76 on the return track does the compression and the return fader is the
+// EON Weld on the return track does the compression and the return fader is the
 // blend. No else-fold and no mix scale: outside multi-out+returns the
 // accumulate above never ran (returns-only by design).
 _fx_ret_pins ? (
@@ -3614,12 +4535,47 @@ _sat_drv_sm > 0.01 ? (
   cmp_process(_gL, _gR);
   _gL = cmp_outL;
   _gR = cmp_outR;
+) : (
+  // Bypassed master comp costs nothing — but a re-engage must start from
+  // CLEAN state, not a stale capacitor charge (audit 2026-08-24). One
+  // compare per sample while bypassed; reset fires once, then both caps
+  // read zero and the branch is inert.
+  (cmp_v1 || cmp_v2) ? cmp_reset();
 );
 
 // ─── Master volume (BEFORE limiter so limiter sees final level) ──────
 _vol_sm += (global_vol - _vol_sm) * _sm_coeff;
 _gL *= _vol_sm;
 _gR *= _vol_sm;
+
+// ─── Mini-browser preview voice ─────────────────────────────────────────
+// Mixed in AFTER master volume and BEFORE the limiter: an audition is not part
+// of the instrument, so it skips the pad chain entirely, but it still gets peak
+// protection and a level of its own. Linear interpolation only -- @sample
+// forbids transcendentals and this needs none.
+_prv_on && _prv_len > 0 ? (
+  _prv_i = _prv_pos | 0;
+  _prv_i >= _prv_len - 1 ? (
+    fb_prv_loop ? ( _prv_pos = 0; _prv_i = 0; ) : ( _prv_on = 0; );
+  );
+  _prv_on ? (
+    _prv_f = _prv_pos - _prv_i;
+    _prv_ch == 2 ? (
+      _prv_a = _prv_buf[_prv_i * 2];
+      _prv_b = _prv_buf[_prv_i * 2 + 2];
+      _gL += (_prv_a + (_prv_b - _prv_a) * _prv_f) * fb_prv_gain;
+      _prv_a = _prv_buf[_prv_i * 2 + 1];
+      _prv_b = _prv_buf[_prv_i * 2 + 3];
+      _gR += (_prv_a + (_prv_b - _prv_a) * _prv_f) * fb_prv_gain;
+    ) : (
+      _prv_a = _prv_buf[_prv_i];
+      _prv_b = _prv_buf[_prv_i + 1];
+      _prv_s = (_prv_a + (_prv_b - _prv_a) * _prv_f) * fb_prv_gain;
+      _gL += _prv_s; _gR += _prv_s;
+    );
+    _prv_pos += _prv_rate;
+  );
+);
 
 // ─── Master limiter (feed-forward, instant attack, auto-release) ────────
 gfx_lim_on ? (
@@ -3677,7 +4633,18 @@ _moR > master_meterR ? master_meterR = _moR : master_meterR *= _mst_meter_decay;
 // below as a harmless idempotent re-set).
 is_read = file_avail(0) >= 0;
 // Version tag for forward-compat
-ser_ver = 53;
+ser_ver = 69;   // 69 = dock_want: the wordmark's "dock me" intent, so a closed
+                // and reopened Swing goes back to its pane.
+                // 68 = the rail/list SPLITTER width, as an offset from 150.
+                // 67 = mini browser FOLDER TREE rail. 66 = strip state (open / subfolders / LCD skin /
+                // font). 54 = kit macros (mappings + snapshots) · 55 = macro custom
+                // NAMES · 56 = dock-face view override · 57 = reverb/delay bus
+                // enables · 58 = console strip sections · 59 = fader well
+                // fill · 60 = FX LCD track-number display · 61 = picker vendor
+                // column · 62 = rail categories folded · 63 = REAPER's
+                // category group folded · 64 = folders group folded. Gates
+                // land in SHIP order — the parked transient shaper moves
+                // to 65.
 file_var(0, ser_ver);
 file_var(0, multi_out);
 
@@ -3794,6 +4761,191 @@ is_read && ser_ver < 52 ? (
     ps_mac4[_srz_ps] = 0.5; ps_mac5[_srz_ps] = 0.5; ps_mac6[_srz_ps] = 0.5; ps_mac7[_srz_ps] = 0.5;
     _srz_ps += 1;
   );
+);
+
+// ver 54: KIT MACROS (Spec_Swing_Macro_System §7; gate claimed by user
+// decision 2026-08-20). The complete model: per-macro meta, the 8×8
+// mapping table, snapshots, armed slot. STATIC bounds only — never
+// file_avail inside the stream (feedback_jsfx_file_avail_serialize).
+// Macro slider VALUES (macro1..8, morph, sel) ride slider state for free.
+// ⛔ IMMUTABLE once shipped: additions (names, more snapshots) take gate
+// 55+, never an append here (feedback_serialize_gate_immutable).
+ser_ver >= 54 ? (
+  file_mem(0, kmac_nmap,  KMAC_N);
+  file_mem(0, kmac_scope, KMAC_N);
+  file_mem(0, kmac_color, KMAC_N);
+  file_mem(0, kmac_pad,   KMAC_N * KMAC_MAX_MAP);
+  file_mem(0, kmac_pid,   KMAC_N * KMAC_MAX_MAP);
+  file_mem(0, kmac_lo,    KMAC_N * KMAC_MAX_MAP);
+  file_mem(0, kmac_hi,    KMAC_N * KMAC_MAX_MAP);
+  file_mem(0, kmac_curve, KMAC_N * KMAC_MAX_MAP);
+  file_mem(0, kmac_snap,     KMAC_NSNAP * KMAC_N);
+  file_mem(0, kmac_snap_has, KMAC_NSNAP);
+  file_var(0, kmac_snap_act);
+);
+is_read && ser_ver < 54 ? (
+  // pre-54 chunks: 8 empty macros, identity colours, no snapshots. The
+  // fx_* arrays those projects saved are already their final values, so
+  // nothing needs re-applying (and the tick's prime pass applies nothing).
+  _srz_km = 0;
+  loop(KMAC_N,
+    kmac_nmap[_srz_km] = 0; kmac_scope[_srz_km] = 0; kmac_color[_srz_km] = _srz_km;
+    _srz_km += 1;
+  );
+  _srz_km = 0; loop(KMAC_NSNAP, kmac_snap_has[_srz_km] = 0; _srz_km += 1;);
+  kmac_snap_act = 0;
+);
+
+// ver 55: kit-macro custom NAMES (≤ KMAC_NAME_LEN chars; empty = house
+// default label). Fresh gate per the immutability rule — nothing appended
+// to 54. Strings via file_string, the #kit_name idiom.
+ser_ver >= 55 ? (
+  file_string(0, #kmac_name0); file_string(0, #kmac_name1);
+  file_string(0, #kmac_name2); file_string(0, #kmac_name3);
+  file_string(0, #kmac_name4); file_string(0, #kmac_name5);
+  file_string(0, #kmac_name6); file_string(0, #kmac_name7);
+);
+is_read && ser_ver < 55 ? (
+  strcpy(#kmac_name0, ""); strcpy(#kmac_name1, "");
+  strcpy(#kmac_name2, ""); strcpy(#kmac_name3, "");
+  strcpy(#kmac_name4, ""); strcpy(#kmac_name5, "");
+  strcpy(#kmac_name6, ""); strcpy(#kmac_name7, "");
+);
+
+// ver 56: dock-face view override (Spec_Swing_Dock_Mode.md) — 0 Auto (the
+// aspect trigger decides) · 1 Full UI always · 2 Rack face always. Fresh
+// gate per the immutability rule. Default 0 needs no backfill: pre-56
+// chunks leave the zero-init, which IS Auto, and the variable is never
+// assigned in @init. Clamp on read so an out-of-range value degrades to a
+// legal mode instead of leaking a garbage float into the == tests.
+ser_ver >= 56 ? (
+  file_var(0, dock_face_mode);
+  is_read ? dock_face_mode = max(0, min(2, dock_face_mode | 0));
+);
+
+// ver 57: reverb / delay bus enables. FRESH gate — 56 has shipped.
+// Migration matters here: before 57 "off" was encoded IN a parameter
+// (rvb_size == 0, dly_div == 0), so a straight zero-init read would turn
+// every old project's buses off. Read the old encoding, then hand the
+// parameter back a usable value so switching the bus on gives you a reverb
+// instead of a null one — which is the whole point of a non-destructive off.
+ser_ver >= 57 ? (
+  file_var(0, rvb_on);
+  file_var(0, dly_on);
+);
+// (the <57 migration lives with the other backfills, AFTER the v15 gate that
+// restores dly_div / rvb_size — it reads them.)
+
+// ver 58: console strip sections. FRESH gate — 57 has shipped, and appending
+// to a shipped gate is how you desync every project written by it (§3.4).
+//
+// Eleven of the fourteen default to 1, and EEL2 zero-init is 0, so a project
+// written before 58 would load with the console almost entirely blank without
+// the backfill below. It restores the pre-58 console exactly: every section a
+// 57-era build drew is on, and the two things 58 adds (the inserts band and
+// the focus strip) start off — an old project should look like it did, not
+// like it grew features while it was closed.
+ser_ver >= 58 ? (
+  file_var(0, con_ins);   file_var(0, con_ins_full); file_var(0, con_slots);
+  file_var(0, con_sw);    file_var(0, con_sw_full);
+  file_var(0, con_sends); file_var(0, con_pan);      file_var(0, con_cut);
+  file_var(0, con_fader); file_var(0, con_meter);    file_var(0, con_dbsc);
+  file_var(0, con_name);
+  file_var(0, con_focus);
+  file_var(0, con_master);
+  file_var(0, con_bg);
+  // Clamp on read: these drive layout arithmetic and a garbage float would
+  // land as a strip height. con_slots is the only non-boolean (0 = FIT).
+  is_read ? (
+    con_ins   = con_ins   ? 1 : 0;  con_ins_full = con_ins_full ? 1 : 0;
+    con_sw    = con_sw    ? 1 : 0;  con_sw_full  = con_sw_full  ? 1 : 0;
+    con_sends = con_sends ? 1 : 0;  con_pan      = con_pan      ? 1 : 0;
+    con_cut   = con_cut   ? 1 : 0;  con_fader    = con_fader    ? 1 : 0;
+    con_meter = con_meter ? 1 : 0;  con_dbsc     = con_dbsc     ? 1 : 0;
+    con_name  = con_name  ? 1 : 0;  con_focus    = con_focus    ? 1 : 0;
+    con_master = con_master ? 1 : 0;
+    con_slots = max(0, min(8, con_slots | 0));
+    con_slots != 0 && con_slots != 4 && con_slots != 6 && con_slots != 8 ?
+      con_slots = 8;
+    con_bg = max(0, min(5, con_bg | 0));   // 5 = light grey
+  );
+);
+// ver 59: fader well fill (0 full · 1 edge · 2 off). Zero-init = 0 = the
+// full slab every earlier build drew, so pre-59 projects need no backfill.
+ser_ver >= 59 ? (
+  file_var(0, con_wf);
+  is_read ? con_wf = max(0, min(2, con_wf | 0));
+);
+// ver 60: FX LCD track-number display. Zero-init would be OFF, but the option
+// exists because the number was ASKED for, so a project that predates the flag
+// gets it ON — the backfill below, not an @init assignment (a sample-rate
+// change re-runs @init and would wipe the user's choice every time).
+ser_ver >= 60 ? (
+  file_var(0, fxv_tnum_on);
+  is_read ? fxv_tnum_on = fxv_tnum_on ? 1 : 0;
+);
+is_read && ser_ver < 60 ? fxv_tnum_on = 1;
+// ver 61: picker vendor column. ⛔ A SEPARATE GATE, not an extension of 60 --
+// projects have already been written at 60, and widening a gate that has been
+// written shifts every field after it in those files.
+ser_ver >= 61 ? (
+  file_var(0, fxv_vend_on);
+  is_read ? fxv_vend_on = fxv_vend_on ? 1 : 0;
+);
+is_read && ser_ver < 61 ? fxv_vend_on = 1;
+// ver 62: rail categories folded or open. Its own gate, same reason as 61.
+ser_ver >= 62 ? (
+  file_var(0, fxv_cats_open);
+  is_read ? fxv_cats_open = fxv_cats_open ? 1 : 0;
+);
+is_read && ser_ver < 62 ? fxv_cats_open = 1;
+// ver 63: REAPER's category group folded or open. Its own gate -- 62 has been
+// written to projects already and widening a written gate shifts every field
+// after it in those files.
+ser_ver >= 63 ? (
+  file_var(0, fxv_rcat_open);
+  is_read ? fxv_rcat_open = fxv_rcat_open ? 1 : 0;
+);
+is_read && ser_ver < 63 ? fxv_rcat_open = 0;
+// ver 64: the FOLDERS group folded or open. Its own gate, same reason as 63.
+ser_ver >= 64 ? (
+  file_var(0, fxv_fold_open);
+  is_read ? fxv_fold_open = fxv_fold_open ? 1 : 0;
+);
+is_read && ser_ver < 64 ? fxv_fold_open = 1;
+// ver 65: which rail groups are SWITCHED OFF. Hidden is not folded -- a folded
+// group keeps its header so you can unfold it, a hidden one is gone until the
+// restore row brings it back. Its own gate, same reason as 64.
+// ⚠️ All three in ONE gate because they are one decision written at one time;
+// a project holding 65 holds all three or none, so there is no half-read.
+ser_ver >= 65 ? (
+  file_var(0, fxv_g2_off);
+  file_var(0, fxv_g3_off);
+  file_var(0, fxv_g4_off);
+  is_read ? (
+    fxv_g2_off = fxv_g2_off ? 1 : 0;
+    fxv_g3_off = fxv_g3_off ? 1 : 0;
+    fxv_g4_off = fxv_g4_off ? 1 : 0;
+  );
+);
+// ⭐ NOTHING hidden for a project that predates the control. An addition must
+// not take a group away from a project that never asked to lose one.
+is_read && ser_ver < 65 ? ( fxv_g2_off = 0; fxv_g3_off = 0; fxv_g4_off = 0; );
+is_read && ser_ver < 58 ? (
+  // ⚠️ ON, not off. The first version set this to 0 reasoning that "an old
+  // project should look like it did" -- which is right for a change and WRONG
+  // for an addition. The inserts band takes nothing away and alters no
+  // behaviour; it adds a row of information. Defaulting it off meant the
+  // feature was invisible in every project anyone had ever saved, which is
+  // every project. Reported as "inserts don't do anything" and that is
+  // exactly what it looked like: the band simply never drew.
+  con_ins = 1; con_ins_full = 1; con_slots = 8;
+  con_sw = 1;  con_sw_full = 1;                      // 57 drew no Swing band,
+                                                     // but full is its honest
+                                                     // shape once it exists
+  con_sends = 1; con_pan = 1; con_cut = 1;
+  con_fader = 1; con_meter = 1; con_dbsc = 1; con_name = 1;
+  con_focus = 0; con_master = 0;
 );
 
 // ver 44: color overhaul — Folder auto-color mode removed, Rainbow
@@ -3961,6 +5113,25 @@ is_read && ser_ver < 15 ? (
   rvb_size = 0.5; rvb_damp = 0.5; rvb_mix = 0.4; rvb_width = 1.0;
 );
 is_read && ser_ver >= 15 ? ( dly_recalc(); rvb_recalc(); );
+// ver 57 backfill — MUST sit below the v15 gate above: before 57 "off" was
+// encoded IN a parameter (rvb_size == 0, dly_div == 0), so the migration has
+// to read the values the stream just restored. Zero-init would otherwise load
+// every pre-57 project with both buses off. Hand the parameter back a usable
+// value too, so switching the bus on gives a reverb rather than a null one.
+is_read && ser_ver < 57 ? (
+  rvb_on = rvb_size > 0.001;
+  dly_on = dly_div > 0;
+  !rvb_on ? ( rvb_size = 0.5; rvb_recalc(); );  // kit-default SIZE
+  !dly_on ? ( dly_div  = 2;   dly_recalc(); );  // kit-default 1/4T
+);
+// Land the gate glide on the restored state instead of fading in from the
+// @init defaults, and park the ring-out counter so a bus restored OFF stands
+// down on the first sample rather than idling an engine for 500 ms.
+is_read ? (
+  _rvb_gate = rvb_on ? 1 : 0; _dly_gate = dly_on ? 1 : 0;
+  _rvb_tail_n = rvb_on ? 0 : _bus_tail_hold;
+  _dly_tail_n = dly_on ? 0 : _bus_tail_hold;
+);
 is_read && ser_ver < 16 ? (
   gfx_eq_lo = 0; gfx_eq_mid = 0; gfx_eq_hi = 0;
   gfx_lim_on = 1; gfx_lim_thr = 1.0; gfx_lim_rel = 100;
@@ -4480,8 +5651,9 @@ is_read ? (
   // the previous waveform — making Ctrl+Z look like it did nothing
   // even when the underlying audio buffer DID revert.
   _srz_i = 0; loop(NUM_PADS, s_dirty[_srz_i] = 1; _srz_i += 1;);
-  // Reset compressor envelope
-  cmp_env = 0; cmp_gr_db = 0; cmp_outL = 0; cmp_outR = 0;
+  // Reset compressor state (circuit engine: two cap voltages, not an
+  // envelope -- poke nothing directly, the inc owns its internals)
+  cmp_reset();
   // Reset limiter envelope
   gfx_lim_env = 1.0; gfx_lim_gr = 1.0;
   // Start output crossfade: blend from last output (saved in _xf_prev) to new DSP.
@@ -4556,6 +5728,44 @@ is_read ? (
   paths_gen += 1;
 );
 
+// ── ver 66: mini browser strip state ────────────────────────────────────────
+// The strip used to reset on every load, and that is wrong twice over. It
+// forgets how you left it — and because REAPER restores a floating FX window
+// at its last SIZE, a window that had been GROWN for an open strip came back
+// wide with the strip shut. A live bridge hides that (it gives back exactly
+// what it added), but a bridge restart ADOPTS the wide window as the new
+// baseline and the next open grows it again. Persisting fb_open keeps the
+// window and the strip telling the same story.
+//
+// ⚠️ Every var here has a ZERO default and is assigned nowhere in @init. That
+// is not tidiness, it is the requirement: @init can run AFTER @serialize (see
+// the _reb_restore_gen note above), so an @init assignment would stamp the
+// restored value back. multi_out and embed_mode follow the same rule.
+// fb_fsz / fb_preview / fb_autoload are absent for exactly that reason —
+// non-zero defaults need an offset form, which is a use-site refactor.
+ser_ver >= 66 ? (
+  file_var(0, fb_open);
+  file_var(0, fb_subfolders);
+  file_var(0, fb_lcd);
+  file_var(0, fb_font);
+);
+// ver 67: the FOLDER TREE rail. Same rule as above -- zero default, assigned
+// nowhere in @init.
+ser_ver >= 67 ? file_var(0, fb_tree);
+// ver 68: where the user dragged the seam between the rail and the file list.
+// ⭐ Stored as an OFFSET FROM FB_TREE_W (150), which is what lets it obey the
+// zero-default rule above -- 0 reads as "the default width", so an old project
+// and a fresh instance land in the same place. This is the offset form the
+// comment above says fb_fsz / fb_preview / fb_autoload are still waiting for.
+ser_ver >= 68 ? file_var(0, fb_tw_off);
+// ver 69: the wordmark's DOCK intent. Set by the "return to the dock" click,
+// cleared only by the "pop out" click -- NOT by the pane releasing the canvas,
+// which is what slider42 tracks and why slider42 could not carry this: the
+// pane clears it when the user closes the dock tab, and the reopened window
+// floated with nobody remembering it had been docked. Zero default, assigned
+// nowhere in @init, same rule as everything above.
+ser_ver >= 69 ? file_var(0, dock_want);
+
 // ─── Graphics ─────────────────────────────────────────────────────────────
 // Default height 720 -> 780: at 720 the master section overflowed the window.
 // The left column is a fixed stack (LCD 130 + KIT/SOUND/PLAY/SAMPLES/TOOLS
@@ -4566,7 +5776,17 @@ is_read ? (
 // margin that absorbs font-metric variance across DPI settings.
 @gfx 780 780
 
-gfx_clear = 214 + 207*256 + 194*65536;  // warm cream (matches bg_r/g/b)
+// Letterbox / margin colour. REAPER clears the backbuffer with this BEFORE it
+// calls @gfx, so what we set here lands on the next frame — imperceptible, and
+// it means the margins can follow the theme instead of staying cream while the
+// body goes dark. bg_r is set by swing_ui_set_colors() further down @gfx, so on
+// the very first frame it is still 0: fall back to the cream until it is real,
+// or the plugin opens with one black frame.
+// +0.5 before the truncate, so the EON default body reproduces the old constant
+// EXACTLY (0.84/0.81/0.76 * 255 = 214.2/206.6/193.8 — a bare |0 gives 214,206,193
+// and shifts the margins a point off the body they are supposed to match).
+gfx_clear = bg_r > 0 ? ((bg_r * 255 + 0.5) | 0) + ((bg_g * 255 + 0.5) | 0) * 256 + ((bg_b * 255 + 0.5) | 0) * 65536
+                     : 214 + 207*256 + 194*65536;  // warm cream (the EON default body)
 // Embed mouse routing (REAPER 7.45+ verified): 0x200 SET = passthrough (click goes
 // to the track), CLEAR = capture inline. Swing's embedded view is interactive (pad
 // triggers + VOL knobs), so default to CAPTURE — clear 0x200 — or every click passes
@@ -4667,7 +5887,7 @@ _reg_my_slot >= 0 ? (
       (gmem[EON_VIEW_REQ + 1]|0) == _reg_my_slot ? (
         _view_req_id = gmem[EON_VIEW_REQ + 2]|0;
         _view_req_id == VIEW_NONE ? swing_bigview_close() :
-          (_view_req_id > 0 && _view_req_id <= VIEW_SYNTH ?
+          (_view_req_id > 0 && _view_req_id <= VIEW_FXPICK ?
             swing_bigview_open(_view_req_id));
       );
     );
@@ -4699,7 +5919,7 @@ _reg_my_slot >= 0 ? (
         // zero closes the card without firing either branch. A capture must
         // never leave a selection behind.
         _popup_req_kind == 0 ? (
-          swing_popup_close(0); cat_ov_pad = -1; rng_ov_pad = -1; pk_ov_pad = -1; _mv_drag_pad = -1;
+          swing_popup_close(0); cat_ov_pad = -1; rng_ov_pad = -1; pk_ov_pad = -1; kmac_ed_open = 0; _mv_drag_pad = -1;
           kdd_open = KDD_MODE_NONE;
           // Clear the demo banner too: a capture must never leave a "samples
           // missing" warning standing over a session where nothing is missing.
@@ -4847,6 +6067,10 @@ _reg_my_slot >= 0 ? (
 
 // ── Overlay modal gate ──
 swing_ui_modal_gate();
+// Mini browser input claim. MUST run here, before any pane draws: the strip
+// paints last, so this is the only point at which it can stop a click reaching
+// whatever is underneath its column.
+swing_fb_gate();
 
 // ── In-place pad-name editor input (rk_swing_padname_edit.jsfx-inc) ──
 // Right after the modal gate: its click-swallow (box owns clicks inside
@@ -5121,16 +6345,126 @@ is_embedded ? (
   // per instance (perf sweep 2026-08-06; the duplicate predated the header
   // being extracted into its own function).
 
+  // ── Re-dock hello ───────────────────────────────────────────────────────
+  // A Swing the user docked from the wordmark, then closed, comes back as a
+  // plain float: the pane script exits when its tab closes and clears slider42
+  // on the way out, and every GS_REDOCK_REQ_SWING bump lives behind a click.
+  // dock_want (ser_ver 69) survives that, so the first frame of a fresh window
+  // session that finds itself wanting the dock and not in it re-posts exactly
+  // what the click would have -- the bridge's eon_redock_tick then selects our
+  // track and launches or reuses the pane. Same shape as the mini browser's
+  // hello (5481a65): persisting a state that used to be reachable only by a
+  // gesture silently dropped what that gesture also did.
+  //
+  // "Fresh window session" = a gap in @gfx frames. @gfx only runs while the
+  // window is showing, so a >1 s gap is the window having been closed; the
+  // first frame ever qualifies too (_dock_gfx_t starts at 0). ONE ask per
+  // session on purpose: a pane that cannot launch (Hub present, script
+  // missing) already tells the user so once, and a retry loop would make that
+  // a message-box storm. It waits for a live bridge rather than spending the
+  // ask on a dead one.
+  _dock_now = time_precise();
+  _dock_now - _dock_gfx_t > 1 ? _dock_hello = 0;
+  _dock_gfx_t = _dock_now;
+  dock_want && !_dock_hello && gmem[KIT_GMEM_BRIDGE_ALIVE] > 0
+    && !((_dock_now - gmem[GS_RIG_ALIVE_SWING]) < 2 && slider42 > 0.5) ? (
+    _dock_hello = 1;
+    gmem[GS_REDOCK_ID_SWING]  = instance_id;
+    gmem[GS_REDOCK_REQ_SWING] = (gmem[GS_REDOCK_REQ_SWING]|0) + 1;
+  );
+
+  // ── Dock rack face trigger (Spec_Swing_Dock_Mode.md) ────────────────────
+  // Purely geometric: a canvas much wider than tall (the bottom-strip dock
+  // rig reparents the jsfx_gfx canvas into a short wide pane) draws a slim
+  // header + the full-size pad grid, nothing else. Enter just past 4:3 —
+  // anything wider than that squeezes the full UI's 38% left panel below
+  // legibility, so the rack takes over well before the pane gets short
+  // (first-eyeball tune 2026-08-25: the spec's ~1.7 made the user drag the
+  // pane "too low" before the rack appeared). The 1.35 / 1.2 gap is
+  // hysteresis so resizing across the boundary can't flicker between the two
+  // layouts. Same geometry-branched precedent as the Console big view vs LCD
+  // MIX collapse (rk_swing_ui_panels_mixer.jsfx-inc _mix_big). No slider, no
+  // pref beyond the serialized override — float the window and the full UI
+  // is back. dock_face_mode (0 Auto · 1 Full · 2 Rack; set by right-clicking
+  // the SWING wordmark, swing_ui_viewmode_click) pins a face outright; only
+  // Auto consults the geometry.
+  _df_prev = dock_face;
+  dock_face_mode == 1 ? ( dock_face = 0; ) :
+  dock_face_mode == 2 ? ( dock_face = 1; ) : (
+    // AUTO. The dock rig, while it is running, knows which FX's canvas it
+    // captured and sets slider42 on that exact instance -- a real per-instance
+    // answer where the window shape only correlates with one. Gated on the
+    // GS_RIG_ALIVE_SWING heartbeat so a flag left at 1 by a crash cannot pin a
+    // floated window: no script running, no rack face. With the rig down the
+    // shape trigger takes over completely unchanged, so nothing regresses for
+    // anyone who never opens the dock.
+    // ⚠️ _SWING, not the shared GS_RIG_ALIVE: 2626 is stamped by EITHER pane, so
+    // gating on it let Steppa's pane vouch for ours (see the declaration note).
+    (time_precise() - gmem[GS_RIG_ALIVE_SWING]) < 2 ? (
+      // ONE-DIRECTIONAL (user rule 2026-08-26: the view must never change on
+      // its own): capture switches TO the rack face -- that is docking doing
+      // its job -- but release/pop-out changes NOTHING. The face you pop out
+      // with is the face you keep, until you pick otherwise from the wordmark
+      // menu. So no `: dock_face = 0` here, on purpose.
+      slider42 > 0.5 ? dock_face = 1;
+    ) : (
+      dock_face ? (
+        gfx_w < gfx_h * 1.2 ? dock_face = 0;
+      ) : (
+        gfx_w > gfx_h * 1.35 ? dock_face = 1;
+      );
+    );
+  );
+  // Entering the rack face closes the theme dropdown: its opener + input
+  // (rkth_input) live in the full header, which does not draw here — an open
+  // list would keep painting from the shared tail with no way to close it.
+  dock_face && !_df_prev ? rkth_open = 0;
+
   // ── Cover artwork poll ──
-  // Before the LCD draws, since swing_lcd_draw_kit blits whatever this leaves in
-  // kc_img. Reloads only when the bridge bumps the publish seq — gfx_loadimg
-  // reads the disk, so it must never run per frame.
+  // Before the LCD (or the rack header's kit card) draws, since both blit
+  // whatever this leaves in kc_img. Reloads only when the bridge bumps the
+  // publish seq — gfx_loadimg reads the disk, so it must never run per frame.
   swing_kitcover_tick();
+
+  // Always reset GR meter each frame — @sample min-accumulates into it, and
+  // the big COMP view (shared tail) can be open in either face.
+  gfx_lim_gr = 1.0;
+
+  dock_face ? (
+  // ═══ RACK FACE — slim header + the pad grid, nothing else ═══
+  // Mixer strips, sidebar, LCD, tab rows and footer deliberately do not draw:
+  // in the dock rig those jobs live one pane over (Browser / Pad FX panes).
+  // Modal overlays, popups, tooltips and the pad-name editor still run in the
+  // shared tail below — hiding them would wedge the input gate
+  // (swing_ui_modal_gate zeroes mouse state while any of them is open).
+  swing_ui_draw_rack_header();
+  swing_grid_draw_pads();
+  // Browser drag-over highlight — must follow the pad draw (it reuses the
+  // grid geometry that call recomputes, and paints over the pad faces).
+  swing_grid_extdrag();
+
+  // Mini browser strip in the RACK face too. Same rule, different top edge:
+  // the rack has rack_hdr_h where the full UI has a 28 px header.
+  // Snapshot ALWAYS (it carries FACE_HB and the width request), but skip the
+  // DRAW under a full-window big view -- it would be painted over a moment
+  // later. swing_fb_gate already refuses to claim input in that case.
+  swing_fb_snapshot();
+  big_view_id == VIEW_NONE ?
+    swing_fb_draw(gfx_w - swing_fb_width(), rack_hdr_h, swing_fb_width(), gfx_h - rack_hdr_h);
+
+  ) : (
+  // ═══ FULL UI ═══
 
   // ── Header + layout + LCD frame ──
   swing_ui_draw_header();
   swing_ui_calc_layout();
   swing_lcd_draw(right_x, 28, right_w, LCD_BAR_H);
+
+  // The FX rack page is drawn HERE, not inside rk_swing_lcd, because it calls
+  // swing_bigview_open -- which is defined in rk_swing_ui_state, imported
+  // AFTER rk_swing_lcd. rk_swing_lcd publishes the content rect instead.
+  lcd_right_tab == 3 ? swing_fxview_rack(_fxv_rack_x, _fxv_rack_y,
+                                         _fxv_rack_w, _fxv_rack_h);
   swing_ui_draw_lcd_frame();
 
   // ── LCD content pages ── (skip the compact page whose big view is open,
@@ -5139,12 +6473,11 @@ is_embedded ? (
   lcd_mode == 2 && big_view_id != VIEW_DELAY ? swing_panels_draw_delay();
   lcd_mode == 3 && big_view_id != VIEW_REVERB ? swing_panels_draw_reverb();
   lcd_mode == 5 && big_view_id != VIEW_COMP ? swing_panels_draw_comp();
-  // Always reset GR meter each frame
-  gfx_lim_gr = 1.0;
   // Skip the compact LCD page while the full-size console is open: it runs
   // with gated (zeroed) mouse input, and its drag-continuation would cancel
   // active_id every frame, killing the console's own fader drags.
   lcd_mode == 4 && big_view_id != VIEW_CONSOLE ? swing_panels_draw_mixer();
+  lcd_mode == 6 && big_view_id != VIEW_FXPICK ? swing_fxview_lcd();
 
   // ── Left panel controls + master ──
   swing_panels_draw_controls();
@@ -5156,6 +6489,22 @@ is_embedded ? (
   // Browser drag-over highlight — must follow the pad draw (it reuses the
   // grid geometry that call recomputes, and paints over the pad faces).
   swing_grid_extdrag();
+
+  // ── Mini browser strip ──
+  // LAST in the full-UI branch, and that position is load-bearing. The pane
+  // content above lays pills out left-to-right with NO right-edge clamp
+  // (rk_swing_lcd's `_info_x += _pw + _pill_gap` chain, 10 sites) -- so when
+  // calc_layout narrows the pane, the MACROS pill runs straight past it. That
+  // is a latent bug a narrow enough window would always have shown; painting
+  // last means the strip owns its own column regardless. Verified safe for
+  // INPUT too: those pills are paint-only, nothing in that row hit-tests.
+  // Inside the branch, not after it, so the rack face (which never calls
+  // swing_ui_calc_layout and reserves no width) does not get a strip.
+  swing_fb_snapshot();
+  big_view_id == VIEW_NONE ?
+    swing_fb_draw(gfx_w - swing_fb_width(), left_y, swing_fb_width(), left_h);
+
+  ); // end rack-face / full-UI split
 
   // ── KIT-tab NOTE MAP dropdown ──
   // Paints here and nowhere else: after the pads (it floats over them) but
@@ -5169,6 +6518,7 @@ is_embedded ? (
   // as views land (e.g. big_view_id == VIEW_MAPPING ? swing_mapping_draw()).
   // Kept inline (not a fn) because view-draw refs resolve at definition-time,
   // and this is the one site imported after every view-draw lib.
+  kmac_ed_open ? swing_macroed_draw() :
   rng_ov_pad >= 0 ? swing_range_ov_draw() :
   cat_ov_pad >= 0 ? swing_catov_draw() :
   pk_ov_pad >= 0 ? swing_notepick_draw() :
@@ -5182,6 +6532,7 @@ is_embedded ? (
   big_view_id == VIEW_COMP ? swing_panels_draw_fx_big(5) :
   big_view_id == VIEW_KITS ? swing_kitsview_draw() :
   big_view_id == VIEW_SYNTH ? swing_synthview_draw() :
+  big_view_id == VIEW_FXPICK ? swing_fxview_draw() :
   overlay_pad >= 0 ? swing_grid_draw_overlay();
 
   // ── Tooltip overlay (renders on top of everything else) ──
@@ -5194,6 +6545,99 @@ is_embedded ? (
   //    below popups/theme dropdown. Geometry was published by the grid
   //    pass this frame (pne_geom_ok). No-op when inactive.
   swing_pne_draw();
+
+  // ── Right-click macro assign result (caller 35) ──
+  // The menu was opened by swing_lcd_kmac_open_assign with the pending
+  // target in kmac_asn_pad/pid; result 1..8 = the picked macro. Default
+  // range = [current value .. full-scale end] (spec §2), same as ADD.
+  swing_popup_result > 0 && swing_popup_result <= KMAC_N &&
+  swing_popup_caller_id == SP_POPUP_CALLER_MACRO_ASSIGN ? (
+    kmac_nmap[swing_popup_result - 1] < KMAC_MAX_MAP ? (
+      swing_macroed_pid_range(kmac_asn_pid);
+      swing_macroed_add_map(swing_popup_result - 1, kmac_asn_pad, kmac_asn_pid,
+        swing_macroed_get(max(0, kmac_asn_pad), kmac_asn_pid), kmac_ed_pmax);
+      macro_sel = swing_popup_result - 1; slider_automate(2^40);
+      mark_dirty_kit();
+      kmac_force = 1;
+    );
+    swing_popup_result = 0;  // mark consumed
+  );
+
+  // ── Rack-header popup results: SAVE menu + MULTI build menu ─────────────
+  // The rack face opens these from swing_ui_draw_rack_header; the results
+  // are consumed HERE — after every import — so swing_panels_multiout_prep
+  // resolves at definition time and the picks work in BOTH faces. In the
+  // full UI, rk_swing_ui_panels_controls' identical consumers run earlier in
+  // the frame and zero the result before this point. KEEP the two sites IN
+  // STEP with rk_swing_ui_panels_controls (SAVE_KIT ~:372, DM_BUILD ~:1364).
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_SAVE_KIT ? (
+    resp = swing_popup_result;
+    swing_popup_result = 0;
+    (kit_busy || gmem[KIT_GMEM_CMD] != 0 || gmem[GS_KIT_LOAD_REQ] == 2) ? (
+      kit_bridge_warn = 1;
+      resp = 0;
+    );
+    resp == 1 ? (
+      gmem[KIT_GMEM_LOCK] = instance_id;
+      gmem[KIT_GMEM_CMD]  = 10;
+      kit_export_state = 10;
+      kit_busy = 1;
+    );
+    resp == 2 ? (
+      gmem[KIT_GMEM_LOCK] = instance_id;
+      gmem[KIT_GMEM_CMD]  = 15;
+      kit_export_state = 10;
+      kit_busy = 1;
+    );
+    resp == 3 ? (
+      gmem[KIT_GMEM_LOCK] = instance_id;
+      gmem[KIT_GMEM_CMD]  = 19;
+      kit_export_state = 10;
+      kit_busy = 1;
+    );
+    resp == 4 ? (
+      gmem[KIT_GMEM_LOCK] = instance_id;
+      gmem[KIT_GMEM_CMD]  = 21;
+      kit_export_state = 10;
+      kit_busy = 1;
+    );
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_SAVE_KIT ? (
+    swing_popup_result = 0;
+  );
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_DM_BUILD ? (
+    resp = swing_popup_result;
+    swing_popup_result = 0;
+    resp == 1 ? (
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+        gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_CMD] = 77; );
+      ) : ( kit_bridge_warn = 1; );
+    );
+    resp == 2 ? (
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+        gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_CMD] = 73; );
+      ) : ( kit_bridge_warn = 1; );
+    );
+    resp == 3 ? (
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+        gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id ? (
+          swing_panels_multiout_prep();
+          gmem[KIT_GMEM_CMD] = 40; kit_import_state = 1; kit_busy = 1;
+        ) : ( kit_bridge_warn = 2; );
+      ) : ( kit_bridge_warn = 1; );
+    );
+    resp == 4 ? (
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+        gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id ? (
+          swing_panels_multiout_prep();
+          gmem[KIT_GMEM_CMD] = 74; kit_import_state = 1; kit_busy = 1;
+        ) : ( kit_bridge_warn = 2; );
+      ) : ( kit_bridge_warn = 1; );
+    );
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_DM_BUILD ? (
+    swing_popup_result = 0;
+  );
 
   // ── Custom popup menu (rk_swing_popup.jsfx-inc) ──
   // Drawn LAST so it sits above everything else, including the tooltip.

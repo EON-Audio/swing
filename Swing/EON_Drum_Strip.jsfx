@@ -26,7 +26,7 @@ options:gfx_hz=60 gfx_idle gmem=Swing_Media_Transfer
 import libs/rk_svf.jsfx-inc
 import libs/knobs_kbsg.jsfx-inc
 import libs/rk_theme.jsfx-inc
-import libs/vu_kbsg.jsfx-inc
+import libs/rk_vu.jsfx-inc
 
 slider1:strip_hpf=20<20,20000,1>-HPF Freq (Hz)
 slider2:strip_lpf=20000<20,20000,1>-LPF Freq (Hz)
@@ -62,7 +62,7 @@ slider24:strip_vu_ref=-18<-30,0,0.5>-VU 0dB Reference (dBFS)
 slider25:strip_view_bcast=0<0,4,1>-View Broadcast
 slider26:strip_view_set=0<0,4,1>-View Push
 slider27:strip_view_lock=0<0,1,1>-View Lock
-slider28:strip_vu_set=0<0,12,1>-VU Set
+slider28:strip_vu_set=0<0,21,1>-VU Set
 // Per-pad SENDS — remote controls (no local DSP). Names MUST match the
 // FX_PID → slider-name map in EON_Swing_Strip_Sync.lua. The companion relays
 // edits to Swing's swing_fx_apply (FX_PID_SND_DLY=15 / SND_RVB=16) and mirrors
@@ -166,9 +166,8 @@ function strip_svf_glide() ( svf_glide_coeff = 1.0 - exp(-1.0 / max(1, STRIP_GLI
 // value is the per-pole time constant (effective settle ~2x). STRIP_GLIDE_MS
 // remains the one-pole fallback (Swing keeps the default one-pole).
 STRIP_SMOOTH_MS = 15;
-// vu_kbsg.jsfx-inc (the house VU library shared with 1175 / ChannelTool)
-// reserves memory addresses 0-437 for its scale + theme tables, so our own
-// freemem allocations must start at 440 (same convention as 1175).
+// Base kept at 440 from the vu_kbsg days (it reserved 0-437; rk_vu claims
+// nothing) so nothing below moves -- same convention as 1175.
 freemem = 440;
 strip_svf = freemem; freemem += STRIP_NUM_SVF * SVF_STEREO_SIZE;
 
@@ -177,6 +176,16 @@ strip_svf = freemem; freemem += STRIP_NUM_SVF * SVF_STEREO_SIZE;
 KS = 16;
 STRIP_NUM_KNOBS = 11;  // HPF LPF RESO | RATE BITS DRIVE COMP | OUT | DLY RVB SMSH (sends)
 strip_km = freemem; freemem += STRIP_NUM_KNOBS * KS;
+
+// EQ-graph response cache: one dB value per graph column. The curve only changes
+// when a filter parameter, the graph width or srate changes, yet it was evaluated
+// per pixel per frame (pow + log10 + six svf_mag_at, each a cos+sin) — ~600k
+// transcendentals/s on a 700 px window while nothing moved. @gfx compares the 15
+// filter params + width + srate against the cached copies (strip_cv_p*) and
+// recomputes only on a change; graphs wider than the cache fall back to live.
+STRIP_CV_MAX = 2048;
+strip_cv = freemem; freemem += STRIP_CV_MAX;
+strip_cv_n = -1;   // columns cached (-1 = nothing yet)
 
 // Denormal guard for the compressor envelope (matches Swing's FX_CMP_DENORM)
 STRIP_CMP_DENORM = pow(10, -30);
@@ -276,13 +285,10 @@ local(_mode, _amt, _atk_ms, _rel_ms, _ratio, _knee, _max_thresh, _thresh, _sr, _
   // settling on a cold re-engage.
   strip_ss_step = 1.0 / max(1, 0.025 * _sr);
 
-  // ── Analog VU: the ballistics live in the vu_kbsg spring-mass physics
-  // (strip_vu.vu_sample, verbatim ZenoMOD/Tukan). Here we only set the input
-  // calibration trim so a sine at strip_vu_ref dBFS reads ~0 VU. The library's
-  // native 0 VU sits near -7 dBFS, so vu_ref_gain shifts the input level to the
-  // user's chosen reference (the ballistic dynamics stay verbatim).
+  // ── Analog VU: rk_vu, the ReaKit house meter. 0 VU = a sine at strip_vu_ref
+  // dBFS, set on the instance; a reference change does not reset the movement.
   (strip_vu_ref < -30 || strip_vu_ref > 0) ? strip_vu_ref = -18;
-  vu_ref_gain = exp((-7 - strip_vu_ref) * 0.11512925465);
+  strip_vu.rk_vu_set_ref(strip_vu_ref);
 );
 
 // ─── Drive curves (verbatim from Swing's drive_process) ──────────────────
@@ -495,10 +501,9 @@ local(_aL, _aR, _svf, _bc_hold,
 
   // GUI peak meter (decayed in @gfx at frame rate)
   strip_mtr = max(strip_mtr, max(abs(spl0), abs(spl1)));
-  // House VU: feed the post-process output (mono avg, calibrated by vu_ref_gain)
-  // into the vu_kbsg spring-mass meter. vu_sample is pure mult/add (verbatim
-  // ZenoMOD physics) — no @sample transcendentals.
-  strip_vu.vu_sample((abs(spl0) + abs(spl1)) * 0.5 * vu_ref_gain);
+  // House VU: the post-process output, mono-summed (L+R)/2, into rk_vu. The
+  // rectifier and the reference live in the meter; no @sample transcendentals.
+  strip_vu.rk_vu_sample((spl0 + spl1) * 0.5);
 );
 
 // ─── One knob: interact + draw + label/value/pill, shared by the floating
@@ -509,7 +514,7 @@ local(_aL, _aR, _svf, _bc_hold,
 // Vertical layout right-aligns the value to the global strip_col_x2.
 function strip_knob(ki, cx, cy, r, lay)
 local(fkm, nv, on, dv, dmin, dmax, dsym, iv, imin, imax, idef, kn_s,
-      lx, tw, th, plx, ply, plw, plh, hit, pdir)
+      lx, tw, th, plx, ply, plw, plh, hit, pdir, fk)
 (
   fkm = strip_km + ki * KS;
   kn_s = lay == 0 ? sc : ret;
@@ -631,11 +636,17 @@ local(fkm, nv, on, dv, dmin, dmax, dsym, iv, imin, imax, idef, kn_s,
   // label + value, positioned per layout. lay 2 = MINI (knob only, no text) —
   // for compact mixer-strip embeds where there's no room for labels.
   lay == 0 ? (
-    gfx_setfont(1, "Arial", _uf8, 'b'); _th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.70, 0.72, 0.75, 1);
-    gfx_measurestr(#sk_lbl, tw, th); gfx_x = cx - tw/2; gfx_y = cy + r + floor(2*sc); gfx_drawstr(#sk_lbl);
-    gfx_measurestr(#sk_val, tw, th); _th_live ? setcolor_band(3, 255, 1.0) : gfx_set(0.55, 0.57, 0.60, 1);
-    gfx_x = cx - tw/2; gfx_y = cy + r + floor(10*sc); gfx_drawstr(#sk_val);
-    plx = cx - tw/2 - 3; ply = cy + r + floor(19*sc);
+    // DECK (floating / wide embed): label + value stacked below the knob, pill
+    // under those. Font follows the knob radius (capped), so the deck's text grows
+    // with its knobs instead of sitting on the old fixed 8 px floor. HPF/LPF labels
+    // take their cap colour (blue / red) so the filters read apart.
+    fk = max(9, min(floor(r * 0.62), 14));
+    gfx_setfont(1, "Arial", fk, 'b');
+    (ki == 0 || ki == 1) ? gfx_set(sk_kbr, sk_kbg, sk_kbb, 1) : (_th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.78, 0.80, 0.84, 1));
+    gfx_measurestr(#sk_lbl, tw, th); gfx_x = cx - tw/2; gfx_y = cy + r + 2; gfx_drawstr(#sk_lbl);
+    _th_live ? setcolor_band(3, 255, 1.0) : gfx_set(0.58, 0.60, 0.64, 1);
+    gfx_measurestr(#sk_val, tw, th); gfx_x = cx - tw/2; gfx_y = cy + r + 2 + th; gfx_drawstr(#sk_val);
+    plx = cx - tw/2 - 3; ply = cy + r + 4 + 2 * th;
   ) : lay == 1 ? (
     lx = cx + r + floor(6*kn_s);
     gfx_setfont(1, "Arial", max(8, floor(9*kn_s)), 'b'); _th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.70, 0.72, 0.75, 1);
@@ -665,7 +676,7 @@ local(fkm, nv, on, dv, dmin, dmax, dsym, iv, imin, imax, idef, kn_s,
   // floating window — that was why embedded pills "didn't work". The pill sits
   // below (lay 0/3) or right of (lay 1) the knob, outside its hover radius.
   (lay < 2 || lay == 3) && sk_has_pill ? (
-    gfx_setfont(1, "Arial", lay == 0 ? _uf7 : max(7, floor(7*kn_s)), 'b');
+    gfx_setfont(1, "Arial", lay == 0 ? max(8, fk - 2) : max(7, floor(7*kn_s)), 'b');
     gfx_measurestr(#sk_pill, tw, th); plw = tw + 6; plh = th + 2;
     (lay == 0 || lay == 3) ? plx = cx - tw/2 - 3;
     hit = mx >= plx && mx <= plx + plw && my >= ply && my <= ply + plh;
@@ -689,40 +700,41 @@ local(fkm, nv, on, dv, dmin, dmax, dsym, iv, imin, imax, idef, kn_s,
   );
 );
 
-// ─── Map the active One Rack theme (gmem GS_THEME_CUR, 1..14) → a vu_kbsg face
-// theme index (zm_theme 0..10) so the house VU follows the suite theme: light
-// themes get cream/ivory faces, dark themes get dark faces.
+// ─── Map the active One Rack theme (gmem GS_THEME_CUR, 1..14) → an rk_vu face
+// (0..19) so the house VU follows the suite theme. The console themes now land
+// on their own faces (SSL, Neve, API, Ableton, FL); light themes get cream or
+// ivory, dark themes get dark faces.
 function strip_vu_theme() local(t) (
   t = gmem[GS_THEME_CUR] | 0;
-  t == 1  ? 0  :    // EON cream → Classic
-  t == 2  ? 1  :    // Dark → Knight
-  t == 3  ? 6  :    // Light → Ivory
-  t == 7  ? 7  :    // SSL → Trooper
-  t == 8  ? 5  :    // Neve → Warm
-  t == 9  ? 1  :    // API → Knight
-  t == 10 ? 5  :    // Tube → Warm
-  t == 11 ? 6  :    // Ableton → Ivory
-  t == 12 ? 1  :    // FL → Knight
-  t == 13 ? 1  :    // Pro Tools → Knight
-  t == 14 ? 6  :    // PT Light → Ivory
-  0;                // REAPER modes / idle → Classic
+  t == 1  ? 0  :    // EON cream → Cream
+  t == 2  ? 1  :    // Dark → Dark Studio
+  t == 3  ? 8  :    // Light → Ivory
+  t == 7  ? 10 :    // SSL → SSL
+  t == 8  ? 11 :    // Neve → Neve
+  t == 9  ? 12 :    // API → API
+  t == 10 ? 6  :    // Tube → Vintage Amber
+  t == 11 ? 13 :    // Ableton → Ableton
+  t == 12 ? 14 :    // FL → FL Studio
+  t == 13 ? 1  :    // Pro Tools → Dark Studio
+  t == 14 ? 3  :    // PT Light → Modern White
+  0;                // REAPER modes / idle → Cream
 );
 
-// VU face name for the header chip + dropdown (-1 = AUTO, 0..10 = vu_kbsg faces).
+// VU face name for the header chip + dropdown (-1 = AUTO, 0..19 = rk_vu faces;
+// the names MIRROR rk_vu_theme_name and must stay in step with it).
 // Writes #sk_vuname and returns it.
 function strip_vu_name(idx) (
-  idx <  0 ? strcpy(#sk_vuname, "AUTO")     :
-  idx == 0 ? strcpy(#sk_vuname, "Classic")  :
-  idx == 1 ? strcpy(#sk_vuname, "Knight")   :
-  idx == 2 ? strcpy(#sk_vuname, "Purple")   :
-  idx == 3 ? strcpy(#sk_vuname, "Moss")     :
-  idx == 4 ? strcpy(#sk_vuname, "Moo")      :
-  idx == 5 ? strcpy(#sk_vuname, "Warm")     :
-  idx == 6 ? strcpy(#sk_vuname, "Ivory")    :
-  idx == 7 ? strcpy(#sk_vuname, "Trooper")  :
-  idx == 8 ? strcpy(#sk_vuname, "Ultimate") :
-  idx == 9 ? strcpy(#sk_vuname, "Mooncake") :
-             strcpy(#sk_vuname, "Black");
+  idx <  0  ? strcpy(#sk_vuname, "AUTO")          :
+  idx == 0  ? strcpy(#sk_vuname, "Cream")         : idx == 1  ? strcpy(#sk_vuname, "Dark Studio")   :
+  idx == 2  ? strcpy(#sk_vuname, "Black & Gold")  : idx == 3  ? strcpy(#sk_vuname, "Modern White")  :
+  idx == 4  ? strcpy(#sk_vuname, "Broadcast")     : idx == 5  ? strcpy(#sk_vuname, "Midnight")      :
+  idx == 6  ? strcpy(#sk_vuname, "Vintage Amber") : idx == 7  ? strcpy(#sk_vuname, "Olive")         :
+  idx == 8  ? strcpy(#sk_vuname, "Ivory")         : idx == 9  ? strcpy(#sk_vuname, "Blackface")     :
+  idx == 10 ? strcpy(#sk_vuname, "SSL")           : idx == 11 ? strcpy(#sk_vuname, "Neve")          :
+  idx == 12 ? strcpy(#sk_vuname, "API")           : idx == 13 ? strcpy(#sk_vuname, "Ableton")       :
+  idx == 14 ? strcpy(#sk_vuname, "FL Studio")     : idx == 15 ? strcpy(#sk_vuname, "Red")           :
+  idx == 16 ? strcpy(#sk_vuname, "Yellow")        : idx == 17 ? strcpy(#sk_vuname, "Orange")        :
+  idx == 18 ? strcpy(#sk_vuname, "Emerald")       : strcpy(#sk_vuname, "Cobalt");
 );
 
 // Knob-style helpers — same IDs/order as Swing's header KNOB selector
@@ -750,6 +762,28 @@ function strip_kn_name(_id) (
 function strip_kn_next(_id) ( _id >= 18 ? 0 : (_id == 8 || _id == 9) ? 10 : _id + 1; );
 function strip_kn_prev(_id) ( _id <= 0 ? 18 : (_id == 10 || _id == 9) ? 8 : _id - 1; );
 
+// ── Reflow deck cards (floating window / wide embeds). Four group cards, each a
+// frame + header + its knobs in one row: 0 FILTERS (HPF LPF RESO) · 1 FX (RATE
+// BITS DRIVE COMP) · 2 OUT (TRIM) · 3 SENDS (DLY RVB SMSH). Cards are weighted by
+// knob count so every cell in a row is the same width; the deck's ONE radius (kr)
+// and card padding / header height (cp, ch_hdr, ch_fh) are set by the layout.
+function strip_card_nk(c) ( c == 0 ? 3 : c == 1 ? 4 : c == 2 ? 1 : 3; );
+function strip_card_k0(c) ( c == 0 ? 0 : c == 1 ? 3 : c == 2 ? 7 : 8; );
+function strip_card(c, x, y, w, h) local(nk, k0, cell, ck, cy) (
+  _th_live ? setcolor_band(1, 255, 1.0) : gfx_set(0.10, 0.11, 0.135, 1);
+  gfx_rect(x, y, w, h);
+  _th_live ? setcolor_band(7, 204, 1.0) : gfx_set(0.22, 0.23, 0.28, 0.8);
+  gfx_rect(x, y, w, h, 0);
+  gfx_setfont(1, "Arial", ch_fh, 'b');
+  _th_live ? setcolor_band(3, 230, 1.0) : gfx_set(0.58, 0.60, 0.68, 0.9);
+  c == 0 ? strcpy(#secn, "FILTERS") : c == 1 ? strcpy(#secn, "FX") : c == 2 ? strcpy(#secn, "OUT") : strcpy(#secn, "SENDS");
+  gfx_x = x + cp + 1; gfx_y = y + cp; gfx_drawstr(#secn);
+  nk = strip_card_nk(c); k0 = strip_card_k0(c);
+  cell = (w - 2 * cp) / nk;
+  cy = y + cp + ch_hdr + kr;
+  ck = 0; loop(nk, strip_knob(k0 + ck, x + cp + cell * (ck + 0.5), cy, kr, 0); ck += 1;);
+);
+
 // ── House dropdown (replaces the native gfx_showmenu on the VIEW / VU / KNOB
 // chips). Row labels by kind: 1 = view mode, 2 = VU face (row 0 = AUTO, then
 // styles 0..10 at row-1), 3 = knob style (row -> id skips the mem-only bb=9:
@@ -762,11 +796,8 @@ function ds_dd_lbl(dest, kind, r) (
                  r == 2 ? "Strip + VU" : "Full Strip");
   ) :
   kind == 2 ? (
-    strcpy(dest, r == 0 ? "AUTO (follow theme)" :
-      r == 1 ? "Classic" : r == 2 ? "Knight"   : r == 3  ? "Purple"   :
-      r == 4 ? "Moss"    : r == 5 ? "Moo"      : r == 6  ? "Warm"     :
-      r == 7 ? "Ivory"   : r == 8 ? "Trooper"  : r == 9  ? "Ultimate" :
-      r == 10 ? "Mooncake" : "Black");
+    r == 0 ? strcpy(dest, "AUTO (follow theme)")
+           : ( strip_vu_name(r - 1); strcpy(dest, #sk_vuname); );
   ) : (
     strcpy(dest,
       r == 0  ? "Default"   : r == 1  ? "SSL"     : r == 2  ? "Vari-Mu"   :
@@ -801,8 +832,8 @@ function ds_dd_openat(kind, n, ax, ay, rh) local(_di, _dw, _dh) (
 
 // ─── Init: reset state, compute coefficients, snap (no ramp-in on load) ──
 // `_ini_i`, not the global `i` — @init re-runs on a samplerate change, which can
-// happen while the GUI is open, and vu_kbsg's zm_draw_3D / zm_draw_arcs /
-// zm_draw_arcs_gr declare NO local() list at all, so their `i = 0..4` loops write
+// happen while the GUI is open, and imported GUI code has been known to declare
+// NO local() list at all (vu_kbsg's arc loops did), so an `i = 0..4` loop writes
 // the GLOBAL `i` from @gfx. A stomp mid-loop hands svf_init a pointer to the
 // wrong filter. (Same hazard as the @block loops, which use _blk_i.)
 _ini_i = 0; loop(STRIP_NUM_SVF,
@@ -815,21 +846,22 @@ strip_cmp_last_lin = 1.0;
 strip_cmp_prime = 1;   // first engaged sample seeds the envelope from live signal
 strip_bc_cnt = 0; strip_bc_holdL = 0; strip_bc_holdR = 0; strip_bc_prime = 1;
 strip_mtr = 0;
-// House analog VU (vu_kbsg, shared with 1175/ChannelTool): verbatim ZenoMOD/
-// Tukan spring-mass ballistics. 61 = classic VU needle speed. zm_theme is set
-// each frame from the One Rack theme (strip_vu_theme) so the face follows it.
-strip_vu.vu_init(61);
-zm_theme = 0; zm_force_floating = 0;
+// House analog VU: rk_vu (clean-room, 300 ms movement), 0 VU at strip_vu_ref.
+// zm_theme is the face index, set each frame from the user's pick or the One
+// Rack theme (strip_vu_theme) so the face follows it.
+strip_vu.rk_vu_init(strip_vu_ref);
+zm_theme = 0;
 // Fresh instances default to STRIP+VU so the tall embed shows the full strip.
 // Guarded by strip_dv_seen (runtime flag) so it is NOT reset on a samplerate
 // change, and @serialize (which runs AFTER @init on load) overrides it with the
 // saved value — keeps serialize_safety (no unconditional reset of a saved var).
 strip_dv_seen ? 0 : ( strip_view_mode = 2; strip_dv_seen = 1; );
-// VU face: -1 = AUTO (follow the One Rack theme), 0..10 = explicit vu_kbsg face.
+// VU face: -1 = AUTO (follow the One Rack theme), 0..19 = explicit rk_vu face.
 // Guarded like strip_view_mode so a samplerate-change @init never clobbers a
 // loaded/chosen value; @serialize (after @init) overrides on project load.
 strip_vu_seen ? 0 : ( strip_vu_style = -1; strip_vu_seen = 1; );
-// Controls-row (row 2) COLLAPSED by default; guarded so SR-change @init doesn't reset it.
+// Legacy (v3 gate): the old two-row header's expand state. The header is one row
+// now; the value is still read/written so the written @serialize gate stays intact.
 strip_hdr_seen ? 0 : ( strip_hdr_open = 0; strip_hdr_seen = 1; );
 strip_recalc();
 // Snap the smoothed output gains to their targets on load (no fade-in).
@@ -862,8 +894,8 @@ strip_recalc();
 
 @block
 // ⚠️ Loop counters here are `_blk_i`, NOT the global `i`. @block runs CONCURRENT
-// with @gfx, and the GUI libraries we import (vu_kbsg's scale/needle drawing)
-// write the global `i` freely. A stomped `i` mid-loop would hand svf_snap an
+// with @gfx, and imported GUI libraries have written the global `i` freely
+// (vu_kbsg's scale/needle drawing did). A stomped `i` mid-loop would hand svf_snap an
 // arbitrary pointer — it writes 23 slots of coefficients wherever that lands and
 // reads garbage back as g/k/a1..a3, which is another route to the runaway the
 // blow-up guard in rk_svf now catches. (feedback_jsfx_gfx_block_concurrency)
@@ -892,9 +924,10 @@ strip_process();
 @gfx 300 700
 // ═══ EON house GUI — Swing's per-pad FX section as a channel strip ═══════
 // Default size is PORTRAIT (tall) so REAPER gives the MCP/TCP embed a tall area
-// (it sizes embeds to this aspect — same trick as 1175's @gfx 580 1050). The
-// layout is aspect-responsive (vert below): tall/narrow → vertical channel strip
-// (VU on top, EQ graph, 2-col knob grid); wide → the original horizontal layout.
+// (it sizes embeds to this aspect — same trick as 1175's @gfx 580 1050). An
+// embedded portrait strip gets the channel-strip views (VU · graph · knob grid /
+// full column); the floating window (any aspect) and wide embeds get the reflow
+// DECK: one layout whose card columns follow the width (see "Layout" below).
 // SSL knobs + mode pills from libs/knobs_kbsg.jsfx-inc (consumed, never
 // edited); EQ graph drawn from the LIVE SVF targets via svf_mag_at, with
 // the overlay's node UX (drag = freq+gain, wheel = bell Q, dbl-click reset).
@@ -903,9 +936,12 @@ strip_process();
 // ── Frame globals (required by knobs_kbsg — mirrors Swing's harness) ──
 // Embed detection: bit test, never == / != (bit 2 = idle coexists).
 micro_view = gfx_ext_flags & 1;
-// Aspect-responsive: portrait (tall/narrow — the mixer embed, or a narrowed
-// floating window) → vertical channel strip; landscape (wide) → horizontal.
+// Portrait test — used ONLY to route an embedded (TCP/MCP) strip to its channel-
+// strip views. The floating window no longer switches layout families on aspect:
+// it runs the reflow deck at every size (columns come from WIDTH, the graph takes
+// the HEIGHT that is left), so a drag never adds, removes or restyles a control.
 vert = gfx_h >= gfx_w * 1.2;
+emb_strip = micro_view && vert;
 // Floating-window modifier freshness (no effect embedded — keyboard input
 // is dead in TCP/MCP embeds, forum t=263900; all embedded interactions
 // below are modifier-free by design).
@@ -914,6 +950,9 @@ ret = max(1, gfx_ext_retina);
 mx = mouse_x; my = mouse_y;
 LMB = mouse_cap & 1;
 lmb_down = LMB && !prev_LMB;
+// Face sheet open (rk_vu_picker, called last): widgets drawn before it must
+// not see this click. Stash the press edge; the picker call restores it.
+_svu_pk_lmb = lmb_down; !micro_view && strip_vu.pk_open ? lmb_down = 0;
 RMB = mouse_cap & 2;
 rmb_down = RMB && !prev_RMB;
 CTRL  = mouse_cap & 4;
@@ -922,6 +961,33 @@ dt = min(time_precise() - sk_last_t, 0.05);
 sk_last_t = time_precise();
 hv_speed = 11;
 frame_wheel = mouse_wheel / 120;
+
+// ── EON theme band + GUI scale (before the early handlers, which need sc) ──
+// JSFX can't SetExtState -> the gear menu writes GS_THEME_REQ / GS_THEME_KNOB_REQ;
+// the Swing bridge applies + republishes so every EON surface re-skins in sync.
+_th_live = gmem[GS_THEME_ID] > 0;
+// Active theme's PRIMARY knob style (idle -> 1 = SSL).
+sk_kp = (_th_live && gmem[GS_THEME_KNOB_P] >= 1) ? (gmem[GS_THEME_KNOB_P] | 0) : 1;
+// Free-GUI scale from WIDTH alone. (The old min(w/480, h/240) was a landscape
+// design ratio, so the default 300x700 portrait window opened at sc 0.625 with
+// every header font on its floor.) Knobs size from their deck cells, not from sc.
+sc = micro_view ? 1 : max(0.8, min(gfx_w / 480, 2.0));
+// sk_pb* = the theme PANEL (knob body/backdrop for the arc + flat-disc styles — the
+// Ableton macro knob uses it as its theme-adaptive body); dark fallback when idle.
+_th_live ? ( sk_pbr = gmem[GS_THEME_BASE+3]; sk_pbg = gmem[GS_THEME_BASE+4]; sk_pbb = gmem[GS_THEME_BASE+5]; ) : ( sk_pbr = 0.16; sk_pbg = 0.17; sk_pbb = 0.20; );
+// Fonts scale with the GUI too (floored so they stay readable); embed -> sc=1.
+_uf12 = max(10, floor(12 * sc)); _uf10 = max(8, floor(10 * sc));
+_uf9 = max(8, floor(9 * sc)); _uf8 = max(8, floor(8 * sc)); _uf7 = max(7, floor(7 * sc));
+// Header (floating only): ONE row — brand · GR / OUT meters · gear. Floored at
+// scale 1 so it never collapses under its own chrome at small windows.
+hdr_h  = micro_view ? 0 : floor(24 * max(1, sc));
+gear_s = floor(16 * max(1, sc));
+gear_x = gfx_w - gear_s - floor(5 * sc); gear_y = floor((hdr_h - gear_s) * 0.5);
+// Gear panel (the set-and-forget selectors): THEME · KNOB · VU FACE · EMBED VIEW ·
+// SYNC ALL, one row each, hanging under the gear. Geometry each frame so a resize
+// can't strand it; state gp_open persists across frames only.
+gp_n = 5; gp_rh = floor(18 * max(1, sc)); gp_w = floor(200 * sc);
+gp_x = max(2, gfx_w - gp_w - floor(4 * sc)); gp_y = hdr_h + 2; gp_h = gp_n * gp_rh + 2;
 
 // ── House dropdown interaction (VIEW / VU / KNOB): FIRST, so an open panel
 // swallows the click before anything underneath it — including the chip that
@@ -946,7 +1012,7 @@ frame_wheel = mouse_wheel / 120;
       ds_dd_kind == 1 ? (
         strip_view_mode = ds_dd_hrow;    // plain global — read live by the embedded view
         strip_view_touch += 1; slider_automate(2^22);
-        strip_view_lock > 0.5 ? ( strip_view_bcast = (strip_view_mode | 0) + 1; slider_automate(2^24); _abflash = 1; );
+        strip_view_lock > 0.5 ? ( strip_view_bcast = (strip_view_mode | 0) + 1; slider_automate(2^24); );
       ) :
       ds_dd_kind == 2 ? (
         strip_vu_style = ds_dd_hrow - 1;               // row 0 = AUTO = -1
@@ -965,6 +1031,56 @@ frame_wheel = mouse_wheel / 120;
 micro_view ? ( frame_wheel == 0 ? ( _hov_mx = mx; _hov_my = my; ) : ( mx = _hov_mx; my = _hov_my; ); );
 !LMB ? sk_node_active = 0;
 
+// ── Gear panel interaction (floating only): AFTER the house dropdown, so an open
+// list swallows first. Row 0 hosts the shared THEME picker: rk_theme's list opens
+// under the row and paints last (rkth_overlay_draw). Rows 1-3 open the house
+// dropdown (knob / VU face / embed view); row 4 latches ">ALL" (SYNC). Hover-wheel
+// on any row cycles its value, as the old header chips did. A click outside the
+// panel, its lists and the gear closes everything and is swallowed.
+!micro_view && gp_open ? (
+  gp_in = mx >= gp_x && mx < gp_x + gp_w && my >= gp_y && my < gp_y + gp_h;
+  gp_row = gp_in ? ((my - gp_y - 1) / gp_rh)|0 : -1;
+  gp_row >= gp_n ? gp_row = -1;
+  // THEME: the widget takes the row as its "chip", but click + wheel are withheld
+  // while hovering the row (a chip left-click would CYCLE the theme; here a click
+  // OPENS the list), so only list clicks / list scroll reach it.
+  rkth_input(gp_x, gp_y + 1, gp_w, gp_rh, mx, my, gp_row == 0 ? 0 : lmb_down, 0, gp_row == 0 ? 0 : frame_wheel, floor(16 * sc)) ? ( lmb_down = 0; frame_wheel = 0; mouse_wheel = 0; );
+  gp_row >= 0 && frame_wheel != 0 ? (
+    gp_row == 0 ? ( gmem[GS_THEME_REQ] = ((rkth_cur() - 1 + (frame_wheel > 0 ? 1 : -1) + RKTH_N) % RKTH_N) + 1; ) :
+    gp_row == 1 ? ( gmem[GS_THEME_KNOB_REQ] = (frame_wheel > 0 ? strip_kn_next(gmem[GS_THEME_KNOB_P] | 0) : strip_kn_prev(gmem[GS_THEME_KNOB_P] | 0)) + 1; ) :
+    gp_row == 2 ? (
+      strip_vu_style = (strip_vu_style | 0) + (frame_wheel > 0 ? 1 : -1);
+      strip_vu_style > 19 ? strip_vu_style = -1 : strip_vu_style < -1 ? strip_vu_style = 19;
+      strip_view_touch += 1; slider_automate(2^22);
+    ) :
+    gp_row == 3 ? (
+      strip_view_mode = ((strip_view_mode | 0) + (frame_wheel > 0 ? 1 : -1) + 4) % 4;
+      strip_view_touch += 1; slider_automate(2^22);
+      strip_view_lock > 0.5 ? ( strip_view_bcast = (strip_view_mode | 0) + 1; slider_automate(2^24); );
+    ) : 0;
+    frame_wheel = 0; mouse_wheel = 0;
+  );
+  lmb_down && gp_row >= 0 ? (
+    _gry = gp_y + 1 + gp_row * gp_rh;
+    gp_row == 0 ? ( rkth_open = 1 - rkth_open; rkth_sc = 0; ) :
+    gp_row == 1 ? ( ds_dd_openat(3, 18, gp_x, _gry + gp_rh + 1, gp_rh); ) :
+    gp_row == 2 ? ( ds_dd_openat(2, 21, gp_x, _gry + gp_rh + 1, gp_rh); ) :
+    gp_row == 3 ? ( ds_dd_openat(1, 4, gp_x, _gry + gp_rh + 1, gp_rh); ) :
+    (
+      // SYNC ALL: latching. While ON every view change here is pushed to all Drum
+      // Strips on the SAME Swing instance (EON_Swing_Strip_Sync relays it);
+      // switching it ON broadcasts the current view immediately.
+      _ablock = strip_view_lock > 0.5;
+      strip_view_lock = _ablock ? 0 : 1; slider_automate(2^26);
+      !_ablock ? ( strip_view_bcast = (strip_view_mode | 0) + 1; slider_automate(2^24); );
+    );
+    lmb_down = 0;
+  );
+  lmb_down && !gp_in && !(mx >= gear_x && mx < gear_x + gear_s && my >= gear_y && my < gear_y + gear_s) ? (
+    gp_open = 0; rkth_open = 0; ds_dd_open = 0; lmb_down = 0;
+  );
+) : micro_view ? 0 : ( gp_in = 0; gp_row = -1; rkth_open = 0; );
+
 // ── Embedded-view broadcast adopt: the EON_Swing_Strip_Sync companion pushes the
 // Swing instance's shared view here (strip_view_set = mode+1) when a sibling
 // clicks ">ALL". Edge-triggered on change. The first frame only SYNCS the marker
@@ -980,12 +1096,12 @@ strip_view_set != strip_view_set_last ? (
 );
 
 // ── VU-face broadcast adopt: the companion pushes the Swing kit's shared VU face
-// here (strip_vu_set = style+2, so 1=AUTO .. 12=Black; 0 = idle/no-push) when the
+// here (strip_vu_set = style+2, so 1=AUTO .. 21=Cobalt; 0 = idle/no-push) when the
 // Swing header VU selector changes. Same edge-trigger + first-frame guard. ──
 strip_vu_set_seen == 0 ? ( strip_vu_set_last = strip_vu_set; strip_vu_set_seen = 1; );
 strip_vu_set != strip_vu_set_last ? (
   strip_vu_set >= 0.5 ? (
-    strip_vu_style = max(-1, min(10, (strip_vu_set | 0) - 2));
+    strip_vu_style = max(-1, min(19, (strip_vu_set | 0) - 2));
     strip_view_touch += 1; slider_automate(2^22);   // persist/undo the adopted face
   );
   strip_vu_set_last = strip_vu_set;
@@ -1011,265 +1127,80 @@ strip_gfx_primed == 0 ? (
   strip_gfx_primed = 1;
 );
 
-// ── EON theme: read the live band + handle the floating-only THEME picker ──
-// Click logic runs BEFORE the EQ-node / knob grabbing below, so a dropdown
-// click never falls through to an EQ node (any consumed click zeroes lmb_down).
-// The chip is drawn in the header block; the dropdown is drawn last (on top).
-// JSFX can't SetExtState -> write GS_THEME_REQ; the Swing bridge applies it and
-// republishes so Swing/StepSeq/Browser/Pad-FX re-skin in sync.
-_th_live = gmem[GS_THEME_ID] > 0;
-// Active theme's PRIMARY knob style (idle -> 1 = SSL). Free-GUI scale: floating
-// scales uniformly from the 480x240 design; embedded keeps its own ret sizing.
-// sk_pb* = the theme PANEL (knob body/backdrop for the arc + flat-disc styles — the
-// Ableton macro knob uses it as its theme-adaptive body); dark fallback when idle.
-sk_kp = (_th_live && gmem[GS_THEME_KNOB_P] >= 1) ? (gmem[GS_THEME_KNOB_P] | 0) : 1;
-sc = micro_view ? 1 : max(0.6, min(gfx_w / 480, gfx_h / 240));
-_th_live ? ( sk_pbr = gmem[GS_THEME_BASE+3]; sk_pbg = gmem[GS_THEME_BASE+4]; sk_pbb = gmem[GS_THEME_BASE+5]; ) : ( sk_pbr = 0.16; sk_pbg = 0.17; sk_pbb = 0.20; );
-// Fonts scale with the GUI too (floored so they stay readable); embed -> sc=1.
-_uf12 = max(10, floor(12 * sc)); _uf10 = max(8, floor(10 * sc));
-_uf9 = max(8, floor(9 * sc)); _uf8 = max(8, floor(8 * sc)); _uf7 = max(7, floor(7 * sc));
-// Header is TWO rows (floating): row 1 = brand + GR/OUT meters; row 2 = the
-// labelled selector cluster (THEME · VIEW · SYNC · VU · KNOB), starting at the
-// left edge with a category label over each chip. Vertical positions use
-// max(1,sc) so the rows don't collapse into each other at small scales.
-sk_thw = floor(58 * sc); sk_thh = floor(15 * sc); sk_thx = floor(10 * sc); sk_thy = floor(27 * max(1, sc));
-// Theme picker is the shared rk_theme_picker.jsfx-inc: rkth_chip (drawn + fully
-// handled in the header block below) does click/cycle/hover-wheel + the scrollable
-// dropdown; rkth_overlay_draw paints the open list last (on top).
-
 // ── Background + header (header chrome is floating-only) ──
 _th_live ? setcolor_band(0, 255, 1.0) : gfx_set(0.085, 0.09, 0.11, 1);
 gfx_rect(0, 0, gfx_w, gfx_h);
 !micro_view ? (
-gfx_setfont(1, "Arial", _uf12, 'b');
-gfx_set(0.95, 0.62, 0.12, 1);
-gfx_x = floor(10 * sc); gfx_y = floor(3 * sc); gfx_drawstr("EON ");
-_th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.80, 0.82, 0.86, 1);
-gfx_drawstr("STRIP");
-
-// ── CONTROLS toggle (row 1) — collapses / expands the row-2 selector cluster so the
-// graph reclaims the space when the controls aren't needed. State persisted (v3). ──
-gfx_setfont(1, "Arial", max(9, floor(11 * sc)), 'b');
-_tgl_x = gfx_x + floor(7 * sc); _tgl_y = floor(2 * sc);
-_tgl_w = floor(15 * sc); _tgl_h = floor(13 * sc);
-_tglhov = mx >= _tgl_x && mx <= _tgl_x + _tgl_w && my >= _tgl_y && my <= _tgl_y + _tgl_h;
-_th_live ? setcolor_band(1, 255, _tglhov ? 1.0 : 0.85) : gfx_set(0.16, 0.17, 0.20, _tglhov ? 1 : 0.7);
-gfx_rect(_tgl_x, _tgl_y, _tgl_w, _tgl_h);
-_th_live ? setcolor_band(7, 200, 1.0) : gfx_set(0.40, 0.42, 0.48, 0.8);
-gfx_rect(_tgl_x, _tgl_y, _tgl_w, 1); gfx_rect(_tgl_x, _tgl_y + _tgl_h - 1, _tgl_w, 1);
-gfx_rect(_tgl_x, _tgl_y, 1, _tgl_h); gfx_rect(_tgl_x + _tgl_w - 1, _tgl_y, 1, _tgl_h);
-_th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.80, 0.82, 0.86, 1);
-gfx_x = _tgl_x + floor(4 * sc); gfx_y = _tgl_y + floor(1 * sc); gfx_drawstr(strip_hdr_open ? "▾" : "▸");
-lmb_down && _tglhov ? ( strip_hdr_open = strip_hdr_open ? 0 : 1; strip_view_touch += 1; slider_automate(2^22); lmb_down = 0; );
-
-// Row-2 selector cluster (THEME · VIEW · SYNC · VU · KNOB) — drawn only when the
-// CONTROLS toggle is expanded. Collapsed, the graph reclaims the row (top_off).
-strip_hdr_open ? (
-// Layout pre-pass: lay the row-2 chips out as two groups —
-//   APPEARANCE [ THEME · KNOB · VU ]   |   VIEW [ VIEW · SYNC ]
-// The chips draw in a fixed code order (THEME, VIEW, SYNC, VU, KNOB), so we measure
-// each here and assign its grouped x up front; the draw blocks below just consume it.
-gfx_setfont(1, "Arial", _uf8, 'b');
-_hgap = floor(6 * sc); _hgrp = floor(16 * sc);
-strip_kn_name(gmem[GS_THEME_KNOB_P] | 0);            gfx_measurestr(#sk_knname, _w1, _w2); kn_bw = _w1 + floor(10 * sc);
-strip_vu_name(max(-1, min(10, strip_vu_style | 0))); gfx_measurestr(#sk_vuname, _w1, _w2); vu_bw = _w1 + floor(10 * sc);
-_vm = max(0, min(3, strip_view_mode | 0));
-_vm == 0 ? strcpy(#vmode, "GRAPH") : _vm == 1 ? strcpy(#vmode, "STRIP") : _vm == 2 ? strcpy(#vmode, "STRIP+VU") : strcpy(#vmode, "FULL");
-gfx_measurestr(#vmode, _w1, _w2); vb_w = _w1 + floor(10 * sc);
-kn_bx = sk_thx + sk_thw + _hgap;        // appearance group: THEME · KNOB · VU
-vu_bx = kn_bx + kn_bw + _hgap;
-vb_x  = vu_bx + vu_bw + _hgrp;          // divider gap, then view group: VIEW · SYNC
-ab_x  = vb_x + vb_w + _hgap;
-// THEME picker (shared widget): draws the chip + handles click/cycle/hover-wheel +
-// the scrollable dropdown. Consumes the mouse -> zero lmb_down/frame_wheel so the EQ
-// graph below never reacts. The dropdown panel is drawn last (rkth_overlay_draw).
-rkth_chip(sk_thx, sk_thy, sk_thw, sk_thh, mx, my, lmb_down, rmb_down, frame_wheel, floor(16 * sc), _uf9) ? ( lmb_down = 0; frame_wheel = 0; mouse_wheel = 0; );
-
-// VIEW button: sets how the EMBEDDED (TCP/MCP) view renders — graph-only /
-// channel strip / strip + VU. Click cycles; consumes the click so the EQ graph
-// below never reacts. Drawn here in the floating header next to the theme chip.
-_vm = max(0, min(3, strip_view_mode | 0));
-_vm == 0 ? strcpy(#vmode, "GRAPH") : _vm == 1 ? strcpy(#vmode, "STRIP") : _vm == 2 ? strcpy(#vmode, "STRIP+VU") : strcpy(#vmode, "FULL");
-gfx_setfont(1, "Arial", _uf8, 'b');
-gfx_measurestr(#vmode, _vmw, _vmh);
-vb_y = sk_thy;   // vb_x set in the layout pre-pass (grouped order)
-vb_w = _vmw + floor(10 * sc); vb_h = sk_thh;
-_vmhov = mx >= vb_x && mx <= vb_x + vb_w && my >= vb_y && my <= vb_y + vb_h;
-_th_live ? setcolor_band(1, 255, _vmhov ? 1.0 : 0.92) : gfx_set(0.16, 0.17, 0.20, _vmhov ? 1 : 0.85);
-gfx_rect(vb_x, vb_y, vb_w, vb_h);
-_th_live ? setcolor_band(7, 200, 1.0) : gfx_set(0.40, 0.42, 0.48, 0.8);
-gfx_rect(vb_x, vb_y, vb_w, 1); gfx_rect(vb_x, vb_y + vb_h - 1, vb_w, 1);
-gfx_rect(vb_x, vb_y, 1, vb_h); gfx_rect(vb_x + vb_w - 1, vb_y, 1, vb_h);
-_th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.80, 0.82, 0.86, 1);
-gfx_x = vb_x + floor(5 * sc); gfx_y = vb_y + floor(2 * sc); gfx_drawstr(#vmode);
-// Click opens a dropdown to pick the EMBEDDED (TCP/MCP) view — same UX as
-// Swing's EMBED button. Current option is checkmarked. gfx_showmenu is fine in
-// the floating window. Sets strip_view_mode; the embedded view reads it.
-lmb_down && _vmhov ? (
-  ds_dd_openat(1, 4, vb_x, vb_y + vb_h + 1, vb_h);   // house dropdown; apply in the early block
-  lmb_down = 0;
-);
-// Hover-wheel cycles the view (suite selector convention, like the THEME chip;
-// wraps 0..3). Consume the wheel so the EQ graph below doesn't react. When the
-// ">ALL" latch is on, each step is broadcast so the siblings follow live.
-_vmhov && frame_wheel != 0 ? (
-  strip_view_mode = ((strip_view_mode | 0) + (frame_wheel > 0 ? 1 : -1) + 4) % 4;
-  strip_view_touch += 1; slider_automate(2^22);
-  strip_view_lock > 0.5 ? ( strip_view_bcast = (strip_view_mode | 0) + 1; slider_automate(2^24); _abflash = 1; );
-  frame_wheel = 0; mouse_wheel = 0;
-);
-
-// ">ALL" button: a LATCHING toggle. While engaged (lit), every change to THIS
-// strip's view is broadcast to all Drum Strips on the SAME Swing instance — so you
-// can wheel through views and watch the siblings follow live. Toggling it ON also
-// broadcasts the current view immediately. The EON_Swing_Strip_Sync companion
-// pushes the mode to the siblings. Floating-only (embeds have no header chrome).
-_ablock = strip_view_lock > 0.5;
-strcpy(#vall, ">ALL");
-gfx_measurestr(#vall, _abw, _abh);
-ab_y = vb_y;   // ab_x set in the layout pre-pass
-ab_w = _abw + floor(10 * sc); ab_h = vb_h;
-_abhov = mx >= ab_x && mx <= ab_x + ab_w && my >= ab_y && my <= ab_y + ab_h;
-_abflash = max(0, _abflash - dt * 3);
-// Lit (amber) while latched OR mid-flash; otherwise the normal panel chip.
-(_abflash > 0 || _ablock) ?
-    (_th_live ? setcolor_band(4, 255, _abflash > 0 ? 1.0 : 0.9) : gfx_set(0.95, 0.65, 0.15, _abflash > 0 ? 1.0 : 0.85))
-  : (_th_live ? setcolor_band(1, 255, _abhov ? 1.0 : 0.92) : gfx_set(0.16, 0.17, 0.20, _abhov ? 1 : 0.85));
-gfx_rect(ab_x, ab_y, ab_w, ab_h);
-_th_live ? setcolor_band(7, 200, 1.0) : gfx_set(0.40, 0.42, 0.48, 0.8);
-gfx_rect(ab_x, ab_y, ab_w, 1); gfx_rect(ab_x, ab_y + ab_h - 1, ab_w, 1);
-gfx_rect(ab_x, ab_y, 1, ab_h); gfx_rect(ab_x + ab_w - 1, ab_y, 1, ab_h);
-(_abflash > 0 || _ablock) ? gfx_set(0.10, 0.10, 0.12, 1) : (_th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.80, 0.82, 0.86, 1));
-gfx_x = ab_x + floor(5 * sc); gfx_y = ab_y + floor(2 * sc); gfx_drawstr(#vall);
-lmb_down && _abhov ? (
-  strip_view_lock = _ablock ? 0 : 1;              // toggle the latch
-  slider_automate(2^26);
-  !_ablock ? ( strip_view_bcast = (strip_view_mode | 0) + 1; slider_automate(2^24); );  // enabling → broadcast now
-  _abflash = 1;
-  lmb_down = 0;
-);
-
-// ── VU FACE selector — pick the analog VU meter face. AUTO follows the One Rack
-// theme; or choose one of the 11 vu_kbsg faces. Mirrors the VIEW button: click
-// opens a check-marked dropdown, hover-wheel cycles. Floating-only (the embedded
-// meter just reflects strip_vu_style). Sized to the current name to stay compact.
-gfx_setfont(1, "Arial", _uf8, 'b');
-strip_vu_name(max(-1, min(10, strip_vu_style | 0)));   // -> #sk_vuname
-gfx_measurestr(#sk_vuname, _vuw, _vuh);
-vu_by = vb_y;   // vu_bx set in the layout pre-pass
-vu_bw = _vuw + floor(10 * sc); vu_bh = vb_h;
-_vuhov = mx >= vu_bx && mx <= vu_bx + vu_bw && my >= vu_by && my <= vu_by + vu_bh;
-_th_live ? setcolor_band(1, 255, _vuhov ? 1.0 : 0.92) : gfx_set(0.16, 0.17, 0.20, _vuhov ? 1 : 0.85);
-gfx_rect(vu_bx, vu_by, vu_bw, vu_bh);
-_th_live ? setcolor_band(7, 200, 1.0) : gfx_set(0.40, 0.42, 0.48, 0.8);
-gfx_rect(vu_bx, vu_by, vu_bw, 1); gfx_rect(vu_bx, vu_by + vu_bh - 1, vu_bw, 1);
-gfx_rect(vu_bx, vu_by, 1, vu_bh); gfx_rect(vu_bx + vu_bw - 1, vu_by, 1, vu_bh);
-_th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.80, 0.82, 0.86, 1);
-gfx_x = vu_bx + floor(5 * sc); gfx_y = vu_by + floor(2 * sc); gfx_drawstr(#sk_vuname);
-// Click → house dropdown (current item dotted). Apply lives in the early block.
-lmb_down && _vuhov ? (
-  ds_dd_openat(2, 12, vu_bx, vu_by + vu_bh + 1, vu_bh);
-  lmb_down = 0;
-);
-// Hover-wheel cycles AUTO(-1) .. Black(10) with wrap.
-_vuhov && frame_wheel != 0 ? (
-  strip_vu_style = (strip_vu_style | 0) + (frame_wheel > 0 ? 1 : -1);
-  strip_vu_style > 10 ? strip_vu_style = -1 : strip_vu_style < -1 ? strip_vu_style = 10;
-  strip_view_touch += 1; slider_automate(2^22);
-  frame_wheel = 0; mouse_wheel = 0;
-);
-
-// ── KNOB-style selector — sets the theme's knob style for ALL EON tools (writes
-// GS_THEME_KNOB_REQ; the bridge applies it + republishes GS_THEME_KNOB_P, so every
-// surface re-skins). Sized to the current name to stay compact. Click → check-marked
-// dropdown; hover-wheel cycles (skips the mem-only bb=9). ──
-_kncur = gmem[GS_THEME_KNOB_P] | 0;
-gfx_setfont(1, "Arial", _uf8, 'b');
-strip_kn_name(_kncur);                                  // -> #sk_knname
-gfx_measurestr(#sk_knname, _knw, _knh);
-kn_by = vb_y;   // kn_bx set in the layout pre-pass
-kn_bw = _knw + floor(10 * sc); kn_bh = vb_h;
-_knhov = mx >= kn_bx && mx <= kn_bx + kn_bw && my >= kn_by && my <= kn_by + kn_bh;
-_th_live ? setcolor_band(1, 255, _knhov ? 1.0 : 0.92) : gfx_set(0.16, 0.17, 0.20, _knhov ? 1 : 0.85);
-gfx_rect(kn_bx, kn_by, kn_bw, kn_bh);
-_th_live ? setcolor_band(7, 200, 1.0) : gfx_set(0.40, 0.42, 0.48, 0.8);
-gfx_rect(kn_bx, kn_by, kn_bw, 1); gfx_rect(kn_bx, kn_by + kn_bh - 1, kn_bw, 1);
-gfx_rect(kn_bx, kn_by, 1, kn_bh); gfx_rect(kn_bx + kn_bw - 1, kn_by, 1, kn_bh);
-_th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.80, 0.82, 0.86, 1);
-gfx_x = kn_bx + floor(5 * sc); gfx_y = kn_by + floor(2 * sc); gfx_drawstr(#sk_knname);
-// Click → house dropdown (current item dotted; row → id skips bb=9). Apply in
-// the early block.
-lmb_down && _knhov ? (
-  ds_dd_openat(3, 18, kn_bx, kn_by + kn_bh + 1, kn_bh);
-  lmb_down = 0;
-);
-// Hover-wheel cycles the style (skips bb=9, wraps).
-_knhov && frame_wheel != 0 ? (
-  gmem[GS_THEME_KNOB_REQ] = (frame_wheel > 0 ? strip_kn_next(_kncur) : strip_kn_prev(_kncur)) + 1;
-  frame_wheel = 0; mouse_wheel = 0;
-);
-
-// ── Category labels over each row-2 chip (drawn last, so every chip's x/width is
-// known). Small + dim; the chip below shows the value. ">ALL" is labelled SYNC. ──
-gfx_setfont(1, "Arial", _uf7, 'b');
-_th_live ? setcolor_band(3, 200, 1.0) : gfx_set(0.55, 0.57, 0.62, 0.9);
-_hly = floor(16 * max(1, sc));
-gfx_measurestr("THEME", _hlw, _hlh); gfx_x = sk_thx + (sk_thw - _hlw) * 0.5; gfx_y = _hly; gfx_drawstr("THEME");
-gfx_measurestr("VIEW",  _hlw, _hlh); gfx_x = vb_x   + (vb_w   - _hlw) * 0.5; gfx_y = _hly; gfx_drawstr("VIEW");
-gfx_measurestr("SYNC",  _hlw, _hlh); gfx_x = ab_x   + (ab_w   - _hlw) * 0.5; gfx_y = _hly; gfx_drawstr("SYNC");
-gfx_measurestr("VU",    _hlw, _hlh); gfx_x = vu_bx  + (vu_bw  - _hlw) * 0.5; gfx_y = _hly; gfx_drawstr("VU");
-gfx_measurestr("KNOB",  _hlw, _hlh); gfx_x = kn_bx  + (kn_bw  - _hlw) * 0.5; gfx_y = _hly; gfx_drawstr("KNOB");
-// Faint divider between the APPEARANCE and VIEW groups.
-_divx = floor((vu_bx + vu_bw + vb_x) * 0.5);
-_th_live ? setcolor_band(7, 140, 1.0) : gfx_set(0.40, 0.42, 0.48, 0.45);
-gfx_rect(_divx, _hly, 1, sk_thy + sk_thh - _hly);
-);  // strip_hdr_open (row-2 cluster)
-
-// GR meter (header right): 0..-24 dB, amber fill grows with reduction
-sk_gr = strip_cmp_amt > 0.01 ? min(24, -strip_cmp_gr_vis) : 0;
-gfx_setfont(1, "Arial", _uf8, 'b');
-_th_live ? setcolor_band(3, 255, 1.0) : gfx_set(0.55, 0.57, 0.60, 1);
-gfx_x = gfx_w - floor(160 * sc); gfx_y = floor(5 * sc); gfx_drawstr("GR");
-gfx_set(0.16, 0.17, 0.20, 1);
-gfx_rect(gfx_w - floor(144 * sc), floor(6 * sc), floor(70 * sc), floor(7 * sc));
-gfx_set(0.95, 0.65, 0.15, 0.9);
-gfx_rect(gfx_w - floor(144 * sc), floor(6 * sc), floor(70 * sc) * sk_gr / 24, floor(7 * sc));
-// Output peak (decays at frame rate)
-_th_live ? setcolor_band(3, 255, 1.0) : gfx_set(0.55, 0.57, 0.60, 1);
-gfx_x = gfx_w - floor(64 * sc); gfx_y = floor(5 * sc); gfx_drawstr("OUT");
-gfx_set(0.16, 0.17, 0.20, 1);
-gfx_rect(gfx_w - floor(42 * sc), floor(6 * sc), floor(34 * sc), floor(7 * sc));
-sk_pk = min(1, strip_mtr);
-strip_mtr > 1 ? gfx_set(0.90, 0.25, 0.20, 1) : gfx_set(0.30, 0.80, 0.40, 0.9);
-gfx_rect(gfx_w - floor(42 * sc), floor(6 * sc), floor(34 * sc) * sk_pk, floor(7 * sc));
+  // Brand, vertically centred in the row.
+  gfx_setfont(1, "Arial", _uf12, 'b');
+  gfx_measurestr("EON STRIP", _bw, _bh);
+  gfx_set(0.95, 0.62, 0.12, 1);
+  gfx_x = floor(8 * sc); gfx_y = floor((hdr_h - _bh) * 0.5); gfx_drawstr("EON ");
+  _th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.80, 0.82, 0.86, 1);
+  gfx_drawstr("STRIP");
+  _brand_end = gfx_x;
+  // Gear button (ring + four ticks — no glyph font needed). Click toggles the
+  // panel; closing it also closes any list it opened.
+  _gear_hov = mx >= gear_x && mx < gear_x + gear_s && my >= gear_y && my < gear_y + gear_s;
+  (gp_open || _gear_hov) ? (_th_live ? setcolor_band(1, 255, 1.0) : gfx_set(0.16, 0.17, 0.20, 1))
+                         : (_th_live ? setcolor_band(1, 255, 0.85) : gfx_set(0.16, 0.17, 0.20, 0.7));
+  gfx_rect(gear_x, gear_y, gear_s, gear_s);
+  _th_live ? setcolor_band(7, 200, 1.0) : gfx_set(0.40, 0.42, 0.48, 0.8);
+  gfx_rect(gear_x, gear_y, gear_s, gear_s, 0);
+  gp_open ? gfx_set(0.95, 0.65, 0.15, 1) : (_th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.80, 0.82, 0.86, 1));
+  _gcx = gear_x + gear_s * 0.5; _gcy = gear_y + gear_s * 0.5; _ggr = gear_s * 0.2;
+  gfx_circle(_gcx, _gcy, _ggr, 0, 1);
+  gfx_line(_gcx - _ggr * 1.9, _gcy, _gcx - _ggr * 1.2, _gcy); gfx_line(_gcx + _ggr * 1.2, _gcy, _gcx + _ggr * 1.9, _gcy);
+  gfx_line(_gcx, _gcy - _ggr * 1.9, _gcx, _gcy - _ggr * 1.2); gfx_line(_gcx, _gcy + _ggr * 1.2, _gcx, _gcy + _ggr * 1.9);
+  lmb_down && _gear_hov ? (
+    gp_open = gp_open ? 0 : 1;
+    gp_open ? 0 : ( rkth_open = 0; ds_dd_open = 0; );
+    lmb_down = 0;
+  );
+  // GR + OUT meters share the space between the brand and the gear: label, then a
+  // bar that grows with the window (capped) instead of the old fixed 7 px strips.
+  gfx_setfont(1, "Arial", _uf8, 'b');
+  _mb_h = max(7, floor(hdr_h * 0.38));
+  _mb_y = floor((hdr_h - _mb_h) * 0.5);
+  _m_gap = floor(10 * sc);
+  gfx_measurestr("OUT", _lw, _lh);
+  _m_avail = gear_x - _m_gap - (_brand_end + _m_gap);
+  _mb_w = max(24, min(floor(110 * sc), floor((_m_avail - 2 * (_lw + 4) - _m_gap) * 0.5)));
+  _ox = gear_x - _m_gap - _mb_w;
+  _th_live ? setcolor_band(3, 255, 1.0) : gfx_set(0.55, 0.57, 0.60, 1);
+  gfx_x = _ox - _lw - 4; gfx_y = floor((hdr_h - _lh) * 0.5); gfx_drawstr("OUT");
+  gfx_set(0.16, 0.17, 0.20, 1); gfx_rect(_ox, _mb_y, _mb_w, _mb_h);
+  sk_pk = min(1, strip_mtr);
+  strip_mtr > 1 ? gfx_set(0.90, 0.25, 0.20, 1) : gfx_set(0.30, 0.80, 0.40, 0.9);
+  gfx_rect(_ox, _mb_y, _mb_w * sk_pk, _mb_h);
+  // GR: 0..-24 dB, amber fill grows with reduction.
+  sk_gr = strip_cmp_amt > 0.01 ? min(24, -strip_cmp_gr_vis) : 0;
+  gfx_measurestr("GR", _lw2, _lh);
+  _gx = _ox - _lw - 4 - _m_gap - _mb_w;
+  _th_live ? setcolor_band(3, 255, 1.0) : gfx_set(0.55, 0.57, 0.60, 1);
+  gfx_x = _gx - _lw2 - 4; gfx_y = floor((hdr_h - _lh) * 0.5); gfx_drawstr("GR");
+  gfx_set(0.16, 0.17, 0.20, 1); gfx_rect(_gx, _mb_y, _mb_w, _mb_h);
+  gfx_set(0.95, 0.65, 0.15, 0.9); gfx_rect(_gx, _mb_y, _mb_w * sk_gr / 24, _mb_h);
 );  // !micro_view header
 strip_mtr = strip_mtr * exp(-dt * 4);
 
-// ── House VU: needle dB from the spring-mass position (verbatim ZenoMOD:
-// db = nd_pos*23 - 20); the vu_kbsg face is fed this directly. zm_theme follows
-// the One Rack theme so the meter re-skins with the suite.
-strip_vu_db = strip_vu.nd_pos * 23 - 20;
-// User-chosen VU face wins; AUTO (-1) falls back to the theme-derived face.
+// ── House VU face: the user's pick wins; AUTO (-1) follows the One Rack theme
+// so the meter re-skins with the suite.
 zm_theme = strip_vu_style >= 0 ? (strip_vu_style | 0) : strip_vu_theme();
 
-// ── EQ graph ─────────────────────────────────────────────────────────────
-// Embedded (Tukan Inline-Channel model): the graph IS the view — it fills
-// the panel minus a thin footer (GR/OUT meters), which is dropped along
-// with the node labels below ~64px height (Saike label-suppression).
-// Layout. Floating = header + EQ graph + horizontal knob row (unchanged).
-// Embedded = a user-selectable channel strip (slider23, right-click to cycle):
-//   0 graph-only · 1 strip (graph + vertical knob column) · 2 strip + analog VU
-// on top. Each region is reserved top-down; the graph takes the middle.
-vert ? (
+// ── Layout ───────────────────────────────────────────────────────────────
+// Embedded PORTRAIT (the TCP/MCP strip): the user-selectable channel strip views,
+// unchanged — 0 graph-only · 1 strip (graph + 3x3 knob grid) · 2 strip + analog VU
+// on top · 3 full single-column strip. Regions are reserved top-down.
+// Everything else (the floating window at ANY aspect, and wide embeds): the reflow
+// DECK — header · [VU] · EQ graph · four group cards (FILTERS · FX · OUT · SENDS)
+// that sit 4-across, 2x2 or stacked depending on WIDTH only; height just decides
+// how tall the graph gets. Every knob exists at every size.
+emb_strip ? (
   // ── PORTRAIT — vertical channel strip (the mixer/TCP embed, or a narrowed
   // floating window). Top→bottom: [VU mode2] · EQ graph · 2-col×4-row knob grid.
   emb_mode = max(0, min(3, strip_view_mode | 0));
-  // Header reserve (floating only). The header chrome (brand text, theme chip,
-  // VIEW button) is floored at minimum font/button sizes, so its height does NOT
-  // shrink below ~20 px — but floor(22*sc) DOES shrink with sc, and at small
-  // windows (sc~0.6) the reserve dropped under the chrome height and the VU rode
-  // up over the menu. Floor the scale at 1 so the reserve never goes below 22 px.
-  top_off  = !micro_view ? (strip_hdr_open ? floor(45 * max(1, sc)) : floor(22 * max(1, sc))) : 0;   // 2-row when controls expanded, else just the title row
+  top_off  = 0;   // embed: no header chrome
   _avail   = gfx_h - top_off;
   // VU on top (mode 2): the analog house meter; thin level bar if too short.
   vu_show = (emb_mode == 2 || emb_mode == 3) && _avail >= 100 * ret && gfx_w >= 70 * ret;
@@ -1282,8 +1213,9 @@ vert ? (
   // the dial. Still capped at ~45% of height so short panels keep graph+knob room.
   vu_h    = vu_show ? max(floor(52 * ret), min(floor((gfx_w - floor(6 * ret)) * 0.53), floor(_avail * 0.45)))
           : vu_bar  ? floor(6 * ret) : 0;
-  eq_knobs = 0; eq_foot = 0;
+  eq_knobs = 0; deck_rows = 0;
   eq_dx = floor(3 * ret); eq_dw = gfx_w - floor(6 * ret);
+  vu_x = eq_dx; vu_y = top_off + 1; vu_w = eq_dw;   // VU band across the top
   emb_mode == 3 ? (
     // FULL: single-column strip — thin "EON STRIP" band, compact EQ graph, then
     // an 8-knob column (FILTERS/FX/OUT). The band is embed-only (the floating
@@ -1305,35 +1237,89 @@ vert ? (
     eq_show_labels = gfx_h >= 170 * ret;
   );
 ) : (
-  // ── LANDSCAPE — the original horizontal layout (wide floating window),
-  // unchanged: header + EQ graph + horizontal knob row.
-  // Single-column FULL (mode 3) is portrait-only; a wide window falls back here.
-  emb_mode = 1; vu_show = 0; vu_bar = 0; vu_h = 0; top_off = 0; kgrid_show = 0; kgrid_h = 0;
-  fullcol = 0; strip_band_h = 0;
-  // Same min-size-header reserve as the portrait branch (floor scale at 1).
-  eq_dx = floor(10 * sc); eq_dy = floor(22 * max(1, sc)); eq_dw = gfx_w - 2 * eq_dx;
-  eq_dh = gfx_h - floor(108 * sc);   // graph fills height; ~108*sc reserved for header + knob row
-  eq_show_labels = 1;
-  eq_knobs = 1;
-  eq_foot = 0;
+  // ── REFLOW DECK ──
+  emb_mode = max(0, min(3, strip_view_mode | 0));
+  kgrid_show = 0; kgrid_h = 0; fullcol = 0; strip_band_h = 0; vu_bar = 0;
+  top_off = hdr_h;
+  _m = floor(6 * sc); _gap = floor(4 * sc); cp = floor(4 * sc);
+  ch_fh = max(8, floor(9 * sc)); ch_hdr = ch_fh + 4;
+  // Column count from width, with a hysteresis band so a drag that hovers around a
+  // threshold can't flicker between two arrangements.
+  // Each threshold shifts DOWN by the band while the wider arrangement is current
+  // (so it is kept until the width clearly drops) and UP while the narrower one is
+  // current. One expression, no rule ordering.
+  _up2 = strip_ncol >= 2 ? 400 - 24 : 400 + 24;
+  _up4 = strip_ncol >= 4 ? 640 - 24 : 640 + 24;
+  strip_ncol = gfx_w >= _up4 ? 4 : gfx_w >= _up2 ? 2 : 1;
+  // Rows: 4-col = [F X O S] · 2-col = [F X] [O S] · 1-col = [F] [X] [O S].
+  // A wide EMBED in GRAPH mode keeps the graph alone (its view setting still rules).
+  deck_rows = (micro_view && emb_mode == 0) ? 0 : strip_ncol == 4 ? 1 : strip_ncol == 2 ? 2 : 3;
+  _dw = gfx_w - 2 * _m;
+  // The narrowest cell of any row sets the deck's one radius (cards weighted 3:4:1:3).
+  cell_w = strip_ncol == 4 ? (_dw - 3 * _gap - 8 * cp) / 11
+         : strip_ncol == 2 ? (_dw - _gap - 4 * cp) / 7
+         :                   (_dw - _gap - 4 * cp) / 4;
+  r_w = cell_w * 0.34;
+  // Height budget: the graph keeps at least graph_min (a quarter of the body, or
+  // 70*sc); the deck gets the rest, shrinking its knobs (floor 9 px) before the
+  // graph ever drops below that. Card height ≈ 2 cp + header + 2 r + text (lay 0 ≈
+  // 2.2 r + 10), so r solves at ~4.4 r per row.
+  vu_show = emb_mode >= 2 && gfx_w >= 120;
+  _body_h = gfx_h - top_off - 2 * _m;
+  graph_min = max(floor(70 * sc), floor(_body_h * 0.25));
+  // Stacked (1-col): the VU face sits above the graph — but only when the body is
+  // tall enough to hold face + graph + three deck rows. A short narrow window gets
+  // the thin level bar instead (the embed's vu_bar), so the face can't collapse the
+  // graph to its floor and pin the knobs at 9 px (seen at 423x360).
+  vu_top  = vu_show && strip_ncol == 1 && _body_h >= 440 * max(1, sc);
+  vu_bar  = vu_show && strip_ncol == 1 && !vu_top;
+  _vu_top_h = vu_top ? min(floor(_dw * 0.53), floor(_body_h * 0.40)) : vu_bar ? floor(6 * sc) : 0;
+  _deck_avail = _body_h - graph_min - _vu_top_h - ((vu_top || vu_bar) ? _gap : 0)
+              - (deck_rows > 0 ? _gap : 0) - max(0, deck_rows - 1) * _gap;
+  r_h = deck_rows > 0 ? (_deck_avail / deck_rows - 2 * cp - ch_hdr - 10) / 4.4 : 99;
+  kr = max(9, min(floor(min(r_w, r_h)), floor(30 * max(1, sc))));
+  // Card height from the MEASURED text height at the deck's label font (lay 0 stacks
+  // label + value + pill = 3 lines under the knob), never from a font-size estimate —
+  // the estimate clipped the bottom row's values at every size.
+  _fk = max(9, min(floor(kr * 0.62), 14));
+  gfx_setfont(1, "Arial", _fk, 'b'); gfx_measurestr("Xy", _tw0, _th0);
+  card_h = deck_rows > 0 ? floor(2 * cp + ch_hdr + 2 * kr + 3 * _th0 + 10) : 0;
+  deck_h = deck_rows * card_h + max(0, deck_rows - 1) * _gap;
+  deck_y = gfx_h - _m - deck_h;
+  // Graph (and VU) take what remains between the header and the deck.
+  _lgy = top_off + _m;
+  _lgh = max(floor(16 * ret), deck_y - (deck_rows > 0 ? _gap : 0) - _lgy - _vu_top_h - ((vu_top || vu_bar) ? _gap : 0));
+  eq_dx = _m; eq_dw = _dw; eq_dy = _lgy + _vu_top_h + ((vu_top || vu_bar) ? _gap : 0); eq_dh = _lgh;
+  vu_h = 0;
+  (vu_top || vu_bar) ? ( vu_x = _m; vu_y = _lgy; vu_w = _dw; vu_h = _vu_top_h; );
+  vu_show && !vu_top && !vu_bar ? (
+    // Beside the graph: the face is ~0.53 x its width tall, so the width follows
+    // the graph height, capped at 40% of the row.
+    vu_w = min(floor(_lgh / 0.53), floor(_dw * 0.40)); vu_h = _lgh;
+    vu_x = _m + _dw - vu_w; vu_y = _lgy;
+    eq_dw = _dw - vu_w - _gap;
+  );
+  eq_show_labels = eq_dh >= 60;
+  eq_knobs = deck_rows > 0;
 );
-// VU (portrait mode 2) at the top of the strip — analog house meter with full
-// geometry (zm_force_floating, like 1175); thin level bar if the strip is short.
-vu_show ? (
-  // Match the meter's frame (bezel) fill to the strip background so it blends in
-  // instead of drawing a coloured box around the dial (vu_kbsg zm_frame_* override).
-  _th_live ? ( zm_frame_r = gmem[GS_THEME_BASE]; zm_frame_g = gmem[GS_THEME_BASE+1]; zm_frame_b = gmem[GS_THEME_BASE+2]; )
-           : ( zm_frame_r = 0.085; zm_frame_g = 0.09; zm_frame_b = 0.11; );
-  zm_force_floating = 1;
-  mtr_vu_real_mono(eq_dx, top_off + 1, eq_dw, vu_h, strip_vu_db, -21, strip_vu.over_g > 0);
-  zm_force_floating = 0;
+// VU: the analog house meter (rk_vu) with full geometry, like 1175;
+// thin level bar if an embedded strip is too short for the face.
+vu_show && !vu_bar ? (
+  // The face's own theme, then its bezel tinted to the strip background so it
+  // blends in instead of drawing a coloured box around the dial.
+  rk_vu_theme(zm_theme);
+  _th_live ? rk_vu_pal_rgb(2, gmem[GS_THEME_BASE], gmem[GS_THEME_BASE+1], gmem[GS_THEME_BASE+2])
+           : rk_vu_pal_rgb(2, 0.085, 0.09, 0.11);
+  strip_vu.rk_vu_draw(vu_x, vu_y, vu_w, vu_h, 0, -1, "");
+  strip_vu_pk = 1;                              // the picker may run at end of frame
 );
 vu_bar ? (
-  gfx_set(0.10, 0.11, 0.13, 1); gfx_rect(eq_dx, top_off + 1, eq_dw, vu_h);
-  _vbl = min(1, strip_vu.nd_pos);
+  gfx_set(0.10, 0.11, 0.13, 1); gfx_rect(vu_x, vu_y, vu_w, vu_h);
+  _vbl = rk_vu_db2frac(20 * log10(max(strip_vu.pos, 0.0000001)));   // fraction of the VU scale
   _vbl > 0.87 ? gfx_set(0.90, 0.25, 0.20, 1) : _vbl > 0.7 ? gfx_set(0.95, 0.65, 0.15, 1) : gfx_set(0.30, 0.80, 0.40, 1);
-  gfx_rect(eq_dx, top_off + 1, eq_dw * _vbl, vu_h);
+  gfx_rect(vu_x, vu_y, vu_w * _vbl, vu_h);
 );
+// ── EQ graph ─────────────────────────────────────────────────────────────
 eq_fs = max(7, floor(7 * (micro_view ? ret : sc)));
 eq_cy = eq_dy + eq_dh / 2;
 _th_live ? setcolor_band(1, 255, 1.0) : gfx_set(0.10, 0.11, 0.135, 1);
@@ -1386,21 +1372,54 @@ strip_lpf < 19500 ? (
 
 // Combined response curve from the live SVF targets. Bypassed filters
 // publish unity targets (m0=1,m1=m2=0 → mag 1), so no gating is needed.
-_pq_prev_x = -1; _pq_prev_y = -1;
-_pq_px = 0;
 // Per-PIXEL sampling with a solid translucent fill to the 0 dB line —
 // ReEQ's approach (it evaluates svf magnitude per plotted x). The old
 // 78-step sweep left ~6 px gaps between 1 px fill columns (hatching).
-loop(eq_dw - 2,
-  _pq_f = pow(10, _log_lo + (_pq_px / max(1, eq_dw - 3)) * _log_range);
-  _pq_f = min(20000, _pq_f);
-  _pq_mag = svf_mag_at(strip_svf + SVFI_HPF  * SVF_STEREO_SIZE, _pq_f)
-          * svf_mag_at(strip_svf + SVFI_LPF  * SVF_STEREO_SIZE, _pq_f)
-          * svf_mag_at(strip_svf + SVFI_LO   * SVF_STEREO_SIZE, _pq_f)
-          * svf_mag_at(strip_svf + SVFI_MID  * SVF_STEREO_SIZE, _pq_f)
-          * svf_mag_at(strip_svf + SVFI_MID2 * SVF_STEREO_SIZE, _pq_f)
-          * svf_mag_at(strip_svf + SVFI_HI   * SVF_STEREO_SIZE, _pq_f);
-  _pq_db = _pq_mag > 0.001 ? 20 * log10(_pq_mag) : -eq_dbr;
+// The dB per column comes from the cache (strip_cv, see @init); it is
+// rebuilt only when a filter param / the width / srate differs from the
+// cached copies, so an idle frame does no transcendental math at all.
+_pq_n = eq_dw - 2;
+_cv_live = _pq_n > STRIP_CV_MAX;   // wider than the cache → evaluate live (rare)
+!_cv_live && (
+  _pq_n != strip_cv_n || srate != strip_cv_sr ||
+  strip_hpf != strip_cv_p0 || strip_lpf != strip_cv_p1 || strip_reso != strip_cv_p2 ||
+  strip_eq_lo != strip_cv_p3 || strip_eq_lo_freq != strip_cv_p4 || strip_eq_lo_q != strip_cv_p5 ||
+  strip_eq_mid != strip_cv_p6 || strip_eq_mid_freq != strip_cv_p7 || strip_eq_mid_q != strip_cv_p8 ||
+  strip_eq_mid2 != strip_cv_p9 || strip_eq_mid2_freq != strip_cv_p10 || strip_eq_mid2_q != strip_cv_p11 ||
+  strip_eq_hi != strip_cv_p12 || strip_eq_hi_freq != strip_cv_p13 || strip_eq_hi_q != strip_cv_p14
+) ? (
+  _cv_i = 0;
+  loop(_pq_n,
+    _pq_f = min(20000, pow(10, _log_lo + (_cv_i / max(1, _pq_n - 1)) * _log_range));
+    _pq_mag = svf_mag_at(strip_svf + SVFI_HPF  * SVF_STEREO_SIZE, _pq_f)
+            * svf_mag_at(strip_svf + SVFI_LPF  * SVF_STEREO_SIZE, _pq_f)
+            * svf_mag_at(strip_svf + SVFI_LO   * SVF_STEREO_SIZE, _pq_f)
+            * svf_mag_at(strip_svf + SVFI_MID  * SVF_STEREO_SIZE, _pq_f)
+            * svf_mag_at(strip_svf + SVFI_MID2 * SVF_STEREO_SIZE, _pq_f)
+            * svf_mag_at(strip_svf + SVFI_HI   * SVF_STEREO_SIZE, _pq_f);
+    strip_cv[_cv_i] = _pq_mag > 0.001 ? 20 * log10(_pq_mag) : -eq_dbr;
+    _cv_i += 1;
+  );
+  strip_cv_n = _pq_n; strip_cv_sr = srate;
+  strip_cv_p0 = strip_hpf; strip_cv_p1 = strip_lpf; strip_cv_p2 = strip_reso;
+  strip_cv_p3 = strip_eq_lo; strip_cv_p4 = strip_eq_lo_freq; strip_cv_p5 = strip_eq_lo_q;
+  strip_cv_p6 = strip_eq_mid; strip_cv_p7 = strip_eq_mid_freq; strip_cv_p8 = strip_eq_mid_q;
+  strip_cv_p9 = strip_eq_mid2; strip_cv_p10 = strip_eq_mid2_freq; strip_cv_p11 = strip_eq_mid2_q;
+  strip_cv_p12 = strip_eq_hi; strip_cv_p13 = strip_eq_hi_freq; strip_cv_p14 = strip_eq_hi_q;
+);
+_pq_prev_x = -1; _pq_prev_y = -1;
+_pq_px = 0;
+loop(_pq_n,
+  _cv_live ? (
+    _pq_f = min(20000, pow(10, _log_lo + (_pq_px / max(1, _pq_n - 1)) * _log_range));
+    _pq_mag = svf_mag_at(strip_svf + SVFI_HPF  * SVF_STEREO_SIZE, _pq_f)
+            * svf_mag_at(strip_svf + SVFI_LPF  * SVF_STEREO_SIZE, _pq_f)
+            * svf_mag_at(strip_svf + SVFI_LO   * SVF_STEREO_SIZE, _pq_f)
+            * svf_mag_at(strip_svf + SVFI_MID  * SVF_STEREO_SIZE, _pq_f)
+            * svf_mag_at(strip_svf + SVFI_MID2 * SVF_STEREO_SIZE, _pq_f)
+            * svf_mag_at(strip_svf + SVFI_HI   * SVF_STEREO_SIZE, _pq_f);
+    _pq_db = _pq_mag > 0.001 ? 20 * log10(_pq_mag) : -eq_dbr;
+  ) : _pq_db = strip_cv[_pq_px];
   _pq_db = max(-eq_dbr, min(eq_dbr, _pq_db));
   _pq_cur_x = eq_dx + 1 + _pq_px;
   _pq_cur_y = eq_cy - (_pq_db / eq_dbr) * eq_yr;
@@ -1634,77 +1653,47 @@ strip_eq_hi != 0 ? (
 
 );  // eq_show_labels
 
-// ── Embedded footer: thin GR + OUT meters + brand (skipped when tiny) ────
-micro_view && eq_foot > 0 ? (
-  _fy = gfx_h - eq_foot;
-  gfx_setfont(1, "Arial", max(7, floor(7 * ret)), 'b');
-  gfx_set(0.95, 0.62, 0.12, 0.9); gfx_x = 3; gfx_y = _fy + 1; gfx_drawstr("EON");
-  sk_gr = strip_cmp_amt > 0.01 ? min(24, -strip_cmp_gr_vis) : 0;
-  _fw = floor(gfx_w * 0.28);
-  gfx_set(0.16, 0.17, 0.20, 1);   gfx_rect(gfx_w - 2 * _fw - 8, _fy + 2, _fw, eq_foot - 4);
-  gfx_set(0.95, 0.65, 0.15, 0.9); gfx_rect(gfx_w - 2 * _fw - 8, _fy + 2, _fw * sk_gr / 24, eq_foot - 4);
-  gfx_set(0.16, 0.17, 0.20, 1);   gfx_rect(gfx_w - _fw - 4, _fy + 2, _fw, eq_foot - 4);
-  sk_pk = min(1, strip_mtr);
-  strip_mtr > 1 ? gfx_set(0.90, 0.25, 0.20, 1) : gfx_set(0.30, 0.80, 0.40, 0.9);
-  gfx_rect(gfx_w - _fw - 4, _fy + 2, _fw * sk_pk, eq_foot - 4);
-);
-
-// ── Knob row (floating window, or tall embeds) ──────────────────────────
+// ── Knob DECK (floating window at any aspect, wide embeds) ──────────────
+// Rows of weighted group cards under the graph; strip_card draws each card's frame,
+// header and knobs (lay 0). Geometry (deck_y, card_h, kr, cp, ch_*) comes from the
+// layout block above, so the only decision here is which cards share a row.
 eq_knobs ? (
-// ── Knob row: FILTERS | FX | OUT (SSL knobs, overlay styling) — everything
-// here scales with sc (margin, spacing, radius, fonts) so the floating window
-// grows uniformly on resize. ──
-fxk_r = max(8, floor(12 * sc));
-_fxk_top = eq_dy + eq_dh + floor(6 * sc);
-_mgn = floor(10 * sc);
-_sp = (gfx_w - 2 * _mgn) / 11;   // FILTERS(3) | FX(4) | OUT(1) | SENDS(3)
-gfx_setfont(1, "Arial", _uf9, 'b');
-_th_live ? setcolor_band(3, 230, 1.0) : gfx_set(0.58, 0.60, 0.68, 0.9);
-gfx_measurestr("FILTERS", tw, th);
-gfx_x = _mgn + _sp * 1.5 - tw/2; gfx_y = _fxk_top; gfx_drawstr("FILTERS");
-gfx_measurestr("FX", tw, th);
-gfx_x = _mgn + _sp * 5.0 - tw/2; gfx_y = _fxk_top; gfx_drawstr("FX");
-gfx_measurestr("OUT", tw, th);
-gfx_x = _mgn + _sp * 7.5 - tw/2; gfx_y = _fxk_top; gfx_drawstr("OUT");
-gfx_measurestr("SENDS", tw, th);
-gfx_x = _mgn + _sp * 9.5 - tw/2; gfx_y = _fxk_top; gfx_drawstr("SENDS");
-_fxk_knob_y = _fxk_top + floor(12 * sc);
-fkcy = _fxk_knob_y + fxk_r + floor(2 * sc);
-_th_live ? setcolor_band(6, 128, 1.0) : gfx_set(0.22, 0.23, 0.28, 0.5);
-gfx_rect(_mgn + _sp * 3 - 1, _fxk_top, 2, fxk_r * 2 + floor(44 * sc));
-gfx_rect(_mgn + _sp * 7 - 1, _fxk_top, 2, fxk_r * 2 + floor(44 * sc));
-gfx_rect(_mgn + _sp * 8 - 1, _fxk_top, 2, fxk_r * 2 + floor(44 * sc));
+  _rw = gfx_w - 2 * _m;
+  _ri = 0; _ry = deck_y;
+  loop(deck_rows,
+    strip_ncol == 4 ? ( _c0 = 0; _cn = 4; ) :
+    strip_ncol == 2 ? ( _c0 = _ri * 2; _cn = 2; ) :
+                      ( _ri == 2 ? ( _c0 = 2; _cn = 2; ) : ( _c0 = _ri; _cn = 1; ) );
+    _wsum = 0; _ci = 0; loop(_cn, _wsum += strip_card_nk(_c0 + _ci); _ci += 1;);
+    _cx = _m; _ci = 0;
+    loop(_cn,
+      _cc = _c0 + _ci;
+      // last card in the row absorbs the rounding so the row ends flush
+      _cw = _ci == _cn - 1 ? (_m + _rw - _cx) : floor((_rw - (_cn - 1) * _gap) * strip_card_nk(_cc) / _wsum);
+      strip_card(_cc, _cx, _ry, _cw, card_h);
+      _cx += _cw + _gap; _ci += 1;
+    );
+    _ry += card_h + _gap; _ri += 1;
+  );
+  _kne = 0; loop(STRIP_NUM_KNOBS, _kn_hov |= (strip_km + _kne * KS)[6]; _kne += 1;);   // 0x200 gating (all 11)
+);  // eq_knobs deck
 
-// Knobs via the shared strip_knob() renderer (lay 0 = floating: label/value
-// centred below, pills under DRIVE/COMP). FILTERS | FX | OUT, left to right.
-strip_knob(0, _mgn + _sp * 0.5, fkcy, fxk_r, 0);   // HPF
-strip_knob(1, _mgn + _sp * 1.5, fkcy, fxk_r, 0);   // LPF
-strip_knob(2, _mgn + _sp * 2.5, fkcy, fxk_r, 0);   // RESO
-strip_knob(3, _mgn + _sp * 3.5, fkcy, fxk_r, 0);   // RATE
-strip_knob(4, _mgn + _sp * 4.5, fkcy, fxk_r, 0);   // BITS
-strip_knob(5, _mgn + _sp * 5.5, fkcy, fxk_r, 0);   // DRIVE
-strip_knob(6, _mgn + _sp * 6.5, fkcy, fxk_r, 0);   // COMP
-strip_knob(7, _mgn + _sp * 7.5, fkcy, fxk_r, 0);   // TRIM
-strip_knob(8, _mgn + _sp * 8.5, fkcy, fxk_r, 0);   // DLY send
-strip_knob(9, _mgn + _sp * 9.5, fkcy, fxk_r, 0);   // RVB send
-strip_knob(10, _mgn + _sp * 10.5, fkcy, fxk_r, 0); // SMSH send
-_kne = 0; loop(10, _kn_hov |= (strip_km + _kne * KS)[6]; _kne += 1;);   // 0x200 gating
-
-);  // eq_knobs knob rows
-
-// ── Portrait knob grid (modes 1 & 2): 6 LABELLED knobs (lay 3 = label above,
-// value/mode-pill below, DDC-style) in a 3-column × 2-row grid under the graph.
-// Row 1 = FILTERS (HPF·LPF·RESO), Row 2 = DRIVE·COMP·TRIM (channel-strip order).
+// ── Portrait knob grid (modes 1 & 2): 9 LABELLED knobs (lay 3 = label above,
+// value/mode-pill below, DDC-style) in a 3-column × 3-row grid under the graph.
+// Row 1 = FILTERS (HPF·LPF·RESO), Row 2 = DRIVE·COMP·TRIM (channel-strip
+// order), Row 3 = the sends DLY·RVB·SMSH — the smash send joined 2026-08-25
+// (it always existed on the floating strip; the embed's third-row cell sat
+// empty, and the strip is THE fast path to the smash bus).
 // RATE/BITS are floating-only. Knob radius leaves room for the label + value.
 kgrid_show ? (
   kg_y0   = eq_dy + eq_dh;
   kg_colw = eq_dw / 3;
-  kg_rowh = kgrid_h / 3;   // 3 rows: FILTERS · DRIVE/COMP/TRIM · DLY/RVB (sends)
+  kg_rowh = kgrid_h / 3;   // 3 rows: FILTERS · DRIVE/COMP/TRIM · DLY/RVB/SMSH
   // Reserve ~32 px/row for the (now larger) label-above + value-below text.
   kg_r    = max(6, min(floor(kg_colw * 0.30), floor((kg_rowh - 32 * ret) * 0.5)));
   kg_p    = 0;
-  loop(8,
-    kg_ki = kg_p == 0 ? 0 : kg_p == 1 ? 1 : kg_p == 2 ? 2 : kg_p == 3 ? 5 : kg_p == 4 ? 6 : kg_p == 5 ? 7 : kg_p == 6 ? 8 : 9;
+  loop(9,
+    kg_ki = kg_p == 0 ? 0 : kg_p == 1 ? 1 : kg_p == 2 ? 2 : kg_p == 3 ? 5 : kg_p == 4 ? 6 : kg_p == 5 ? 7 : kg_p == 6 ? 8 : kg_p == 7 ? 9 : 10;
     strip_knob(kg_ki, eq_dx + kg_colw * ((kg_p % 3) + 0.5), kg_y0 + kg_rowh * ((kg_p / 3 | 0) + 0.5), kg_r, 3);
     _kn_hov |= (strip_km + kg_ki * KS)[6];   // KS slot 6 = hover, for 0x200 gating
     kg_p += 1;
@@ -1719,7 +1708,7 @@ kgrid_show ? (
 // legible at normal embed heights. strip_knob() carries all drag / wheel /
 // pill-cycle interaction; this block only lays out the rows + section headers.
 // The value column right-aligns to strip_col_x2. Hover is OR'd into _kn_hov. ──
-(vert && fullcol) ? (
+fullcol ? (   // embedded portrait only (the floating window runs the deck)
   strip_col_x2 = eq_dx + eq_dw - floor(4 * ret);
   // "EON STRIP" brand band (embed-only) just above the compact graph.
   strip_band_h > 0 ? (
@@ -1730,29 +1719,17 @@ kgrid_show ? (
     gfx_set(0.95, 0.62, 0.12, 1); gfx_x = eq_dx + floor(4 * ret); gfx_y = _by + floor(1 * ret); gfx_drawstr("EON ");
     _th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.80, 0.82, 0.86, 1); gfx_drawstr("STRIP");
   );
-  // Knob column under the graph: 3 knob rows + 2 section headers (~0.6 row each),
-  // so total row-units = 3 + 2*0.6 = 4.2. Two presentations:
-  //   embedded (micro_view) → compact knob-left / label-right (lay 1), the
-  //     approved mixer look, left-aligned at a small fixed radius.
-  //   floating              → BIG knobs CENTERED in the column with label/value/
-  //     pill below (lay 0), so the wider floating window doesn't read half-empty.
+  // Knob column under the graph: compact knob-left / label-right (lay 1), the
+  // approved mixer look, left-aligned at a small fixed radius.
   col_y0  = eq_dy + eq_dh + floor(2 * ret);
   col_h   = max(0, gfx_h - col_y0 - floor(2 * ret));
   // 6 knob rows (FX DRIVE·COMP, OUT TRIM, SENDS DLY·RVB·SMSH) + 3 section
   // headers (~0.6 row each) → 6 + 1.8 = 7.8 row-units.
   row_h   = col_h / 7.8;
   hdr_h   = row_h * 0.6;
-  micro_view ? (
-    flay = 1;
-    kr = max(6, min(floor(row_h * 0.42), floor(18 * ret)));
-    knob_cx = eq_dx + floor(6 * ret) + kr;
-  ) : (
-    flay = 0;
-    // Reserve ~40*sc below the knob for the label/value/pill (lay 0 stacks them
-    // there); also bound by column width and an absolute cap.
-    kr = max(10, min(floor((row_h - floor(40 * sc)) * 0.5), min(floor(eq_dw * 0.32), floor(52 * sc))));
-    knob_cx = eq_dx + eq_dw * 0.5;
-  );
+  flay = 1;
+  kr = max(6, min(floor(row_h * 0.42), floor(18 * ret)));
+  knob_cx = eq_dx + floor(6 * ret) + kr;
   _cy = col_y0;
   kp = 0;
   loop(6,
@@ -1760,14 +1737,11 @@ kgrid_show ? (
     // the graph + float row). Sends are remote controls relayed to Swing.
     ki_i = kp == 0 ? 5 : kp == 1 ? 6 : kp == 2 ? 7 : kp == 3 ? 8 : kp == 4 ? 9 : 10;
     // Section header before FX(kp0 = DRIVE), OUT(kp2 = TRIM), SENDS(kp3 = DLY).
-    // Left-aligned when embedded; centred over the knob column when floating.
     (kp == 0 || kp == 2 || kp == 3) ? (
       kp == 0 ? strcpy(#secn, "FX") : kp == 2 ? strcpy(#secn, "OUT") : strcpy(#secn, "SENDS");
-      gfx_setfont(1, "Arial", max(7, floor(micro_view ? 8 * ret : 10 * sc)), 'b');
+      gfx_setfont(1, "Arial", max(7, floor(8 * ret)), 'b');
       _th_live ? setcolor_band(3, 230, 1.0) : gfx_set(0.58, 0.60, 0.68, 0.9);
-      gfx_measurestr(#secn, _shw, _shh);
-      _shx = micro_view ? (eq_dx + floor(4 * ret)) : (eq_dx + eq_dw * 0.5 - _shw * 0.5);
-      gfx_x = _shx; gfx_y = _cy + floor(1 * ret); gfx_drawstr(#secn);
+      gfx_x = eq_dx + floor(4 * ret); gfx_y = _cy + floor(1 * ret); gfx_drawstr(#secn);
       _th_live ? setcolor_band(6, 128, 1.0) : gfx_set(0.22, 0.23, 0.28, 0.5);
       gfx_rect(eq_dx + floor(4 * ret), _cy + hdr_h - floor(1 * ret), eq_dw - floor(8 * ret), 1);
       _cy += hdr_h;
@@ -1776,6 +1750,44 @@ kgrid_show ? (
     _kn_hov |= (strip_km + ki_i * KS)[6];   // KS slot 6 = hover, for 0x200 gating
     _cy += row_h;
     kp += 1;
+  );
+);
+
+// ── Gear panel paint (floating): category left, current value right; the hovered
+// row lights amber with dark ink (the suite's lit-chip idiom). The SYNC ALL value
+// reads amber while latched. Lists it opened paint after this, on top. ──
+!micro_view && gp_open ? (
+  gfx_set(0, 0, 0, 0.35); gfx_rect(gp_x + 3, gp_y + 4, gp_w, gp_h);
+  _th_live ? setcolor_band(1, 255, 0.98) : gfx_set(0.13, 0.14, 0.17, 0.98);
+  gfx_rect(gp_x, gp_y, gp_w, gp_h);
+  _th_live ? setcolor_band(7, 200, 1.0) : gfx_set(0.40, 0.42, 0.48, 0.9);
+  gfx_rect(gp_x, gp_y, gp_w, gp_h, 0);
+  gfx_setfont(1, "Arial", _uf8, 'b');
+  _gpr = 0;
+  loop(gp_n,
+    _gry = gp_y + 1 + _gpr * gp_rh;
+    _ghv = _gpr == gp_row;
+    _ghv ? (
+      _th_live ? setcolor_band(4, 255, 0.95) : gfx_set(0.95, 0.65, 0.15, 0.95);
+      gfx_rect(gp_x + 1, _gry, gp_w - 2, gp_rh);
+    );
+    _gpr == 0 ? strcpy(#gpl, "THEME") : _gpr == 1 ? strcpy(#gpl, "KNOB") : _gpr == 2 ? strcpy(#gpl, "VU FACE") :
+    _gpr == 3 ? strcpy(#gpl, "EMBED VIEW") : strcpy(#gpl, "SYNC ALL");
+    _gpr == 0 ? strcpy(#gpv, rkth_name(rkth_cur() - 1)) :
+    _gpr == 1 ? ( strip_kn_name(gmem[GS_THEME_KNOB_P] | 0); strcpy(#gpv, #sk_knname); ) :
+    _gpr == 2 ? ( strip_vu_name(max(-1, min(19, strip_vu_style | 0))); strcpy(#gpv, #sk_vuname); ) :
+    _gpr == 3 ? (
+      _vm = max(0, min(3, strip_view_mode | 0));
+      _vm == 0 ? strcpy(#gpv, "GRAPH") : _vm == 1 ? strcpy(#gpv, "STRIP") : _vm == 2 ? strcpy(#gpv, "STRIP+VU") : strcpy(#gpv, "FULL");
+    ) : strcpy(#gpv, strip_view_lock > 0.5 ? "ON" : "OFF");
+    _ghv ? gfx_set(0.10, 0.10, 0.12, 1) : (_th_live ? setcolor_band(3, 255, 1.0) : gfx_set(0.55, 0.57, 0.62, 1));
+    gfx_x = gp_x + floor(8 * sc); gfx_y = _gry + floor((gp_rh - _uf8) * 0.5); gfx_drawstr(#gpl);
+    gfx_measurestr(#gpv, _gvw, _gvh);
+    _ghv ? gfx_set(0.10, 0.10, 0.12, 1)
+         : (_gpr == 4 && strip_view_lock > 0.5) ? gfx_set(0.95, 0.65, 0.15, 1)
+         : (_th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.80, 0.82, 0.86, 1));
+    gfx_x = gp_x + gp_w - floor(8 * sc) - _gvw; gfx_y = _gry + floor((gp_rh - _uf8) * 0.5); gfx_drawstr(#gpv);
+    _gpr += 1;
   );
 );
 
@@ -1825,6 +1837,16 @@ kgrid_show ? (
 // so drag + scroll-wheel reach the widget inline (1175 pattern). ──
 micro_view && !_kn_hov && !_pill_hov && _nhov == 0 && sk_node_active == 0 ? gfx_ext_flags |= 0x200;
 
+// ── Face picker on the dial's coil cover: a sheet of live miniatures. LAST,
+// floating only, and only when the dial was drawn this frame. A pick is the
+// user's face override, persisted exactly like a dropdown pick. ──
+!micro_view && strip_vu_pk ? (
+  lmb_down = _svu_pk_lmb;
+  _svu_pk = rk_vu_picker(vu_x, vu_y, vu_w, vu_h, zm_theme);
+  _svu_pk >= 0 ? ( strip_vu_style = _svu_pk; strip_view_touch += 1; slider_automate(2^22); );
+);
+strip_vu_pk = 0;
+
 // ── End-of-frame mouse state ──
 prev_LMB = LMB;
 prev_RMB = RMB;
@@ -1835,12 +1857,17 @@ mouse_wheel = 0;
 // approach — NOT a slider). ser_ver gate for forward-compat. Fresh instances
 // default to 0 (graph only) via zero-init; no @init assignment (which would
 // reset the loaded value on a samplerate change).
-strip_ser_ver = 3;
+strip_ser_ver = 4;
 file_var(0, strip_ser_ver);
 file_var(0, strip_view_mode);
 // v2: persisted VU face override (-1 AUTO). Guarded read so ser_ver-1 projects
 // backfill AUTO instead of reading past the stream. Bumped (never appended to a
 // written gate) per the immutable-gate rule.
 strip_ser_ver >= 2 ? file_var(0, strip_vu_style) : (strip_vu_style = -1);
-// v3: persisted controls-row expand state (1 = open). <3 backfills collapsed.
+// v3: the old controls-row expand state (unused since the one-row header; kept so
+// the written gate is never extended or shortened). <3 backfills 0.
 strip_ser_ver >= 3 ? file_var(0, strip_hdr_open) : (strip_hdr_open = 0);
+// v4: the meter moved from vu_kbsg (11 faces) to rk_vu (20). A persisted face
+// pick from before that means a different face now: map it once, by look. No
+// new field -- the written stream is unchanged, only the version number moved.
+strip_ser_ver < 4 && strip_vu_style >= 0 ? strip_vu_style = rkth_vu_face_migrate(strip_vu_style);

@@ -27,9 +27,125 @@ function _ov_mirror_trim_to_pad(_pad, _li)
   );
 );
 
+// ═══ SYNTH VOICE PREVIEW ═══════════════════════════════════════════════════
+// The pad editor's waveform slot is empty on a synth pad because there is no
+// sample to draw. There IS a voice though, and it is renderable: rk_syn_tick
+// is a pure function over a state block, so @gfx can run the engine into its
+// OWN scratch state and draw the result. Nothing here touches a live voice.
+//
+// ⭐ SPLIT ON PURPOSE — the engine render is cached, the ENVELOPE is not.
+// A full render is tens of thousands of ticks; doing that per frame while
+// someone drags an ADSR node would be unusable. But the pad envelope only
+// MULTIPLIES the engine output, so the two are separable: cache the engine's
+// per-column peaks (rebuilt only when the pad, engine, macros or tune change)
+// and apply the envelope at draw time across 512 columns. Dragging ATK/DEC/
+// SUS is then free, and it still shows the truth.
+//
+// ⭐ FIXED TIME WINDOW, not auto-fit. A fixed window is what makes a decay
+// change VISIBLE — turn the knob and the waveform reaches further across the
+// box. Auto-fitting would rescale the very thing the user is trying to see.
+//
+// Memory is caller-owned (freemem pattern): Swing_ReaKit @init calls
+// swing_synprev_init. An inc must never claim freemem at its own @init —
+// imported @init runs BEFORE the main file's `freemem = 0`.
+SYNPREV_COLS = 512;      // peak columns; redrawn per frame, rebuilt rarely
+SYNPREV_SEC  = 0.80;     // STARTING window. Self-scales from here -- see the
+                         // tail scan in build. A fixed window cannot serve both
+                         // a 30 ms tick and 8T8's SUB, which rings ~1.5 s
+                         // before it even begins to fall and renders as a solid
+                         // block. The scale is DRAWN so it is never a mystery,
+                         // and it only moves when the sound outgrows or
+                         // under-fills the box -- so an ordinary decay tweak
+                         // still shows as the tail reaching further, which is
+                         // the whole point of not auto-fitting every frame.
+// A rebuild is SYNPREV_SEC * srate engine ticks -- ~35k, tens of ms. Fine as a
+// one-off, unusable per frame, and per frame is exactly what happens when the
+// DECAY macro is swept with this editor open (it writes ps_mac, which IS the
+// rebuild key). So rebuilds are throttled: the picture refreshes ~8x a second
+// while something is moving, which reads as live, and settles exact the moment
+// it stops. Staleness can never persist -- @gfx keeps running, so the next
+// frame past the gate rebuilds.
+SYNPREV_MIN_S = 0.12;
+
+function swing_synprev_init(fm) (
+  synp_st  = fm; fm += RK_SYN_STATE_SIZE;   // scratch engine state, ours alone
+  synp_mac = fm; fm += 8;
+  synp_hi  = fm; fm += SYNPREV_COLS;        // |peak| per column, NO envelope
+  synp_key = fm; fm += 12;
+  synp_key[0]  = -1;                         // nothing rendered yet
+  synp_key[9]  = SYNPREV_SEC;                // current window, seconds
+  synp_key[11] = -1000;                      // ...and no throttle to wait on
+                                             // (EEL2 has no 1e9-style literal)
+  fm;
+);
+
+// Has anything the ENGINE render depends on changed? Envelope params are
+// deliberately absent — those are applied at draw time and must not force a
+// rebuild. Stores the new key as a side effect when it reports a change.
+function swing_synprev_stale(_sk_pad) local(_sk_i, _sk_ch) (
+  _sk_ch = synp_key[0] != _sk_pad
+        || synp_key[1] != ps_engine[_sk_pad]
+        || synp_key[10] != p_tune[_sk_pad];
+  _sk_i = 0; loop(8,
+    synp_key[2 + _sk_i] != _syn_mac_get(_sk_pad, _sk_i) ? _sk_ch = 1;
+    _sk_i += 1;
+  );
+  // Throttle: report "not stale" until the gate opens, so the caller simply
+  // keeps drawing the previous picture.
+  _sk_ch && time_precise() - synp_key[11] < SYNPREV_MIN_S ? _sk_ch = 0;
+  _sk_ch ? (
+    synp_key[11] = time_precise();
+    synp_key[0] = _sk_pad;
+    synp_key[1] = ps_engine[_sk_pad];
+    synp_key[10] = p_tune[_sk_pad];
+    _sk_i = 0; loop(8, synp_key[2 + _sk_i] = _syn_mac_get(_sk_pad, _sk_i); _sk_i += 1;);
+  );
+  _sk_ch;
+);
+
+// Run the engine for SYNPREV_SEC and keep the peak per column.
+// Fixed seed so the picture is stable frame to frame — the engines are
+// noise-driven and a fresh seed would make the display crawl.
+function swing_synprev_build(_sp_pad)
+local(_sp_i, _sp_col, _sp_cw, _sp_pk, _sp_y, _sp_last, _sp_win) (
+  _sp_cw = max(1, ((synp_key[9] * srate) | 0) / SYNPREV_COLS) | 0;
+  memset(synp_st, 0, RK_SYN_STATE_SIZE);
+  synp_st[1] = 20261;                        // nonzero seed, as the core does
+  _sp_i = 0; loop(8, synp_mac[_sp_i] = _syn_mac_get(_sp_pad, _sp_i); _sp_i += 1;);
+  rk_syn_reset(ps_engine[_sp_pad] | 0, synp_st, synp_mac, p_tune[_sp_pad], 1.0);
+  _sp_col = 0;
+  loop(SYNPREV_COLS,
+    _sp_pk = 0;
+    _sp_i = 0;
+    loop(_sp_cw,
+      _sp_y = abs(rk_syn_tick(synp_st));
+      _sp_y > _sp_pk ? _sp_pk = _sp_y;
+      _sp_i += 1;
+    );
+    synp_hi[_sp_col] = min(1.0, _sp_pk);
+    _sp_col += 1;
+  );
+  // ── fit the window to the voice ─────────────────────────────────────────
+  // Grow when the sound is still going at the right edge, shrink when it dies
+  // well before it. The two thresholds are deliberately far apart: after a
+  // 1.6x grow the tail lands near 0.58 of the box, comfortably above the 0.45
+  // shrink trigger, so it settles instead of ping-ponging between two scales.
+  // Clearing the key forces one more rebuild, which the throttle paces.
+  _sp_last = 0; _sp_col = 0;
+  loop(SYNPREV_COLS,
+    synp_hi[_sp_col] > 0.03 ? _sp_last = _sp_col;
+    _sp_col += 1;
+  );
+  _sp_win = synp_key[9];
+  _sp_last > SYNPREV_COLS * 0.93 ? _sp_win = min(3.0, _sp_win * 1.6) :
+  _sp_last < SYNPREV_COLS * 0.45 ? _sp_win = max(0.12, _sp_win * 0.625);
+  _sp_win != synp_key[9] ? ( synp_key[9] = _sp_win; synp_key[0] = -1; );
+);
+
 function _ov_draw_waveform_and_adsr()
 local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
-      _wv_use_cache, _wv_cL, _wv_cR, _ci, _sL, _sR)
+      _wv_use_cache, _wv_cL, _wv_cR, _ci, _sL, _sR,
+      _sp_cw, _sp_ac, _sp_dc, _sp_sus, _sp_env, _sp_stg, _sp_col, _sp_x, _sp_y)
 (
     // ── Sample display: waveform + ADSR envelope overlaid ─────────────
     // Waveform positioned below tabs + optional control row
@@ -305,6 +421,77 @@ local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
           wf_scroll = max(0, min(1.0 - _view_w, _scroll_orig - _dx * _view_w));
         ) : _scroll_active = 0;
       );
+    ) : ps_enable[oi] > 0.5 ? (
+      // ── Synth pad: no waveform, and "DRAG SAMPLE HERE" is the wrong thing
+      // to say. It reads as "this pad is empty" when the pad is a working
+      // synth voice, and it is an instruction you do not want followed.
+      // Name what the pad IS instead.
+      //
+      // ⭐ The ADSR drawn over this box is NOT decoration on a synth pad: the
+      // pad envelope GATES the engine (Swing_ReaKit, SYN branch of the voice
+      // render), so attack and decay here shape the synth exactly as they
+      // shape a sample. That is why this slot keeps its envelope rather than
+      // collapsing — the only dead thing here was the waveform.
+      // Label at the top, hint at the bottom, so the envelope curve crosses
+      // the middle without running through either.
+      // _syn_engine_name / _syn_engine_col resolve: rk_swing_ui_overlay_syn
+      // imports at 139, this file at 140.
+      // ── the voice itself, rendered ──────────────────────────────────────
+      // Rebuild only when the ENGINE changed; the envelope is applied below
+      // per column, so dragging ATK/DEC/SUS costs nothing.
+      swing_synprev_stale(oi) ? swing_synprev_build(oi);
+      // Per-COLUMN envelope coefficients: the same stage machine the voice
+      // runs, stepped once per column instead of once per sample. Coarse by
+      // design — this is a picture, and 512 columns is finer than the pixels.
+      _sp_cw  = max(1, ((synp_key[9] * srate) | 0) / SYNPREV_COLS) | 0;
+      _sp_ac  = pow(exp(-5.0 / max(1, p_attack[oi]  * 0.001 * srate)), _sp_cw);
+      _sp_dc  = pow(exp(-5.0 / max(1, p_decay[oi]   * 0.001 * srate)), _sp_cw);
+      _sp_sus = max(0, min(1, p_sustain[oi]));
+      _sp_env = 0; _sp_stg = 1;
+      _syn_engine_col(ps_engine[oi] | 0, 1.0);
+      _sp_col = 0;
+      loop(SYNPREV_COLS,
+        _sp_stg == 1 ? (
+          _sp_env = 1.0 - (1.0 - _sp_env) * _sp_ac;
+          _sp_env >= 0.999 ? ( _sp_env = 1.0; _sp_stg = 2; );
+        ) : _sp_stg == 2 ? (
+          _sp_env = _sp_sus + (_sp_env - _sp_sus) * _sp_dc;
+          _sp_env = max(_sp_sus, _sp_env);
+          _sp_env <= _sp_sus + 0.001 ? ( _sp_env = _sp_sus; _sp_stg = 3; );
+        ) : ( _sp_env = _sp_sus; );
+        _sp_y = synp_hi[_sp_col] * _sp_env * (wf_h * 0.42);
+        _sp_x = wf_x + _sp_col * wf_w / SYNPREV_COLS;
+        // Body then a brighter cap, so a long quiet tail still reads.
+        gfx_set(_syn_ecr, _syn_ecg, _syn_ecb, 0.34);
+        gfx_rect(_sp_x, wf_y + wf_h * 0.5 - _sp_y, max(1, wf_w / SYNPREV_COLS), _sp_y * 2);
+        _sp_y > 0.6 ? (
+          gfx_set(_syn_ecr, _syn_ecg, _syn_ecb, 0.75);
+          gfx_rect(_sp_x, wf_y + wf_h * 0.5 - _sp_y, max(1, wf_w / SYNPREV_COLS), 1);
+          gfx_rect(_sp_x, wf_y + wf_h * 0.5 + _sp_y - 1, max(1, wf_w / SYNPREV_COLS), 1);
+        );
+        _sp_col += 1;
+      );
+      // Window length, TOP-right (the engine name is centred at +10, so the
+      // two never meet). The scale MOVES, so it has to be stated
+      // or a short pad and a long one look identical.
+      gfx_setfont(1, "Arial", 8, 0);
+      gfx_set(0.38, 0.41, 0.46, 1);
+      sprintf(#_ov_syn_lbl, "%.2f s", synp_key[9]);
+      gfx_measurestr(#_ov_syn_lbl, tw, th);
+      gfx_x = wf_x + wf_w - tw - 5; gfx_y = wf_y + 4;
+      gfx_drawstr(#_ov_syn_lbl);
+      gfx_set(_syn_ecr, _syn_ecg, _syn_ecb, 0.70);
+      _syn_engine_name((ps_engine[oi] | 0) % 10);
+      sprintf(#_ov_syn_lbl, "%s  T%d", #_syn_en, (((ps_engine[oi] | 0) * 0.1) | 0) + 1);
+      gfx_setfont(1, "Arial", 13, 'b');
+      gfx_measurestr(#_ov_syn_lbl, tw, th);
+      gfx_x = wf_x + (wf_w - tw) / 2; gfx_y = wf_y + 10;
+      gfx_drawstr(#_ov_syn_lbl);
+      gfx_setfont(1, "Arial", 9, 0);
+      gfx_set(0.40, 0.43, 0.48, 1);
+      gfx_measurestr("ENVELOPE GATES THE ENGINE - DROP A SAMPLE TO LAYER", tw, th);
+      gfx_x = wf_x + (wf_w - tw) / 2; gfx_y = wf_y + wf_h - th - 7;
+      gfx_drawstr("ENVELOPE GATES THE ENGINE - DROP A SAMPLE TO LAYER");
     ) : (
       gfx_set(0.30, 0.32, 0.36, 1);
       gfx_setfont(1, "Arial", 10, 0);

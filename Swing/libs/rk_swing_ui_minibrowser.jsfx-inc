@@ -1,0 +1,2103 @@
+// rk_swing_ui_minibrowser.jsfx-inc
+// Swing mini file browser — the in-canvas sidebar.
+// (c) EON Studios — All Rights Reserved
+//
+// WHY THIS EXISTS: the big Swing_Browser is for "go and find something". This is
+// for "get that sample onto this pad without leaving the instrument". The scope
+// IS the value — there is deliberately no search, no tagging, no column set and
+// no per-row waveform here.
+//
+// The one thing EEL2 cannot do is enumerate a directory, so Swing_Kit_Bridge's
+// eon_fb_tick lists one folder and publishes it into EON_SWBROWSE; this face
+// snapshots that band and draws it. The face sends a row INDEX back, never a
+// path, so a non-ASCII filename still loads even though the wire folds names to
+// '?' for display.
+//
+// ⛔ THE PADS MUST STAY VISIBLE WHENEVER THIS IS OPEN. That is not a nicety —
+// drag-to-pad only works because the list and the grid share ONE @gfx canvas,
+// which is the whole reason this is worth building. So it takes width from the
+// left pane rather than becoming a full-window big view like the FX picker.
+
+@init
+
+// ── band (declared in .refs/gmem_regions_supplement.tsv, 26607616..26673151) ──
+EON_SWBROWSE_BASE   = 26607616;   // 406 * 65536, block-aligned
+EON_SWBROWSE_STRIDE = 4096;
+EON_SWBROWSE_SLOTS  = 16;
+// Waveform peaks for the SELECTED row live in their OWN band: a row record is
+// 60 cells and these are 256, so they could never ride along.
+EON_SWBPK_BASE      = 26673152;   // 407 * 65536
+EON_SWBPK_STRIDE    = 512;   // L max, L min, R max, R min -- 4 * FB_PK_N
+FB_PK_N             = 128;        // columns, sized to the strip not to the file
+
+// ── folder tree band (26738688..26804223, 408 * 65536) ──────────────────────
+// Its own band because the tree and the file list are on screen TOGETHER and
+// EON_SWBROWSE's stride is full to the byte (256 + 64*60 = 4096).
+EON_SWBTREE_BASE   = 26738688;
+EON_SWBTREE_STRIDE = 4096;
+
+FBT_PUB_SEQ  = 0;
+FBT_GEN      = 1;
+FBT_TOTAL    = 2;
+FBT_WIN_OFF  = 3;
+FBT_WIN_N    = 4;
+FBT_FLAGS    = 5;    // bit0 = a folder is being expanded right now
+FBT_SEL      = 6;    // visible index that IS the file list's folder, -1 = none
+FBT_HB       = 7;
+FBT_REQ_SEQ  = 32;   // written LAST
+FBT_REQ_OFF  = 33;
+FBT_REQ_N    = 34;
+FBT_REQ_VERB = 35;   // 0 page · 1 toggle expand · 2 select · 3 rebuild
+FBT_REQ_TIDX = 36;
+FBT_FACE_HB  = 38;
+FBT_ROWS     = 256;
+
+FBT_R_LEN   = 0;
+FBT_R_NAME  = 1;
+FBT_R_DEPTH = 49;
+FBT_R_FLAGS = 50;    // bit0 expanded · bit1 is cwd · bit2 loaded and childless
+FBT_R_TIDX  = 51;
+
+FB_TREE_W   = 150;   // the rail's DEFAULT width. Wide enough for a pack name at
+                     // depth 2 and no wider -- it buys its width back from the
+                     // WINDOW now, but a docked instance still has to live
+                     // inside what it has.
+                     // ⭐ The user can drag the seam between the rail and the
+                     // list; `fb_tw_off` is their OFFSET FROM THIS NUMBER, and
+                     // swing_fb_tree_w() is the only thing that should be read.
+FB_TREE_MIN = 90;    // below this a folder name is not readable at any depth
+FB_TREE_MAX = 420;   // past this the rail is the feature and the list is a hint
+FB_LIST_MIN = 150;   // the file list's floor. The DRAG may never push the list
+                     // under this -- a smaller WINDOW still can, and the rail
+                     // hides itself instead (see the layout block).
+FB_SPLIT_HIT = 4;    // grab radius around the seam, so the target is 8 px wide.
+                     // ⭐ A 1 px divider is not a control. REAPER's own splitters
+                     // are about this, and the gutter chevron went 16 -> 24 for
+                     // the same reason: a line you have to hunt for reads as
+                     // trim, not as something you can move.
+FB_SPLIT_GRIP = 20;  // half the handle's height. 17 -> 20: at 34 px the grip
+                     // read as a smudge on the divider rather than as a part.
+// ⛔ `fb_tw_off` IS DECLARED NOWHERE, ON PURPOSE. It is serialized (ver 68), and
+// the house rule for that is: assigned nowhere in @init, and the default must BE
+// the zero value -- @init can run AFTER @serialize, so an @init assignment would
+// stamp the default back over the restored value. That is exactly why this is an
+// OFFSET and not a width: 0 means 150. fb_open / fb_tree / multi_out / embed_mode
+// all follow the same rule, and fb_fsz / fb_preview / fb_autoload are left
+// unsaved because nobody had done the offset form yet. This is that form.
+
+FB_PUB_SEQ  = 0;    // seqlock: odd = mid-write, even = stable
+FB_GEN      = 1;
+FB_ANS_REQ  = 2;
+FB_TOTAL    = 3;
+FB_WIN_OFF  = 4;
+FB_WIN_N    = 5;
+FB_FLAGS    = 6;    // bit0 scanning, bit1 unreadable/empty, bit2 at root,
+                    // bit3 folder is starred, bit4 showing the PLACES list
+FB_HB       = 7;    // liveness COUNTER, not a clock — this face has no wall clock
+FB_FMT_VER  = 8;
+FB_NDIRS    = 9;
+FB_CWD_LEN  = 10;
+
+FB_REQ_SEQ  = 32;   // written LAST
+FB_REQ_OFF  = 33;
+FB_REQ_N    = 34;
+FB_REQ_VERB = 35;   // 1 enter folder · 2 up · 3 load row to pad
+FB_REQ_RIDX = 36;
+FB_REQ_PAD  = 37;
+FB_REQ_COUNT = 41;  // verb 8 only: how many consecutive rows to load
+FB_REQ_RECURSE  = 42;    // 1 = walk subfolders, 0 = this folder only
+FB_REQ_GFXW     = 44;    // face->bridge: our current gfx_w, so the bridge can
+                         // measure canvas-px per window-px instead of assuming
+                         // 1:1 (true only while Swing stays off gfx_ext_retina)
+FB_REQ_GROW     = 43;    // face->bridge: px of extra CANVAS width wanted, so the
+                         // window WIDENS instead of the strip taking the pads'
+                         // room. JSFX cannot resize its own window -- the @gfx
+                         // line is a hint REAPER reads once -- so the bridge
+                         // does it with JS_Window_Resize. Measured 2026-08-29
+                         // (.dev_tests/fbwin_probe.lua): +200 asked -> canvas
+                         // +200, gfx_w +200, height untouched, restore exact.
+FB_REQ_AUD      = 46;    // 1 = also load the PREVIEW voice on this click
+FB_REQ_FILT_LEN = 192;   // verb 9: filter text length...
+FB_REQ_FILT     = 193;   // ...and its chars, +193..240
+FB_REQ_FILT_MAX = 48;
+FB_REQ_LAYER = 40;  // verb 7 only: which layer to stack onto. CMD 64 needs an
+                    // EXPLICIT index -- it does not pick a free one for you.
+FB_REQ_INST = 39;   // face->bridge: OUR instance_id, so the load is routed to
+                    // THIS Swing and not another one. Swing ignores CMD 63 whose
+                    // KIT_GMEM_INSTANCE does not match its own instance_id -- the
+                    // load silently does nothing without this, which is exactly
+                    // how the first audition build came out silent (2026-08-29).
+FB_FACE_HB  = 38;   // face->bridge: bumped every frame. Lets the bridge tell
+                    // "nobody is looking" from "nothing has changed", and is
+                    // the only outside-visible proof that @gfx ran at all.
+
+FB_CWD      = 64;
+FB_CWD_MAX  = 128;
+
+FB_ROWS     = 256;
+FB_REC      = 60;
+FB_REC_MAX  = 64;
+
+FB_R_LEN      = 0;
+FB_R_NAME     = 1;
+FB_R_NAME_MAX = 48;
+FB_R_KIND     = 49;  // 0 file · 1 folder · 2 parent ".."
+FB_R_EXT      = 50;
+FB_R_RIDX     = 51;
+FB_R_SIZE_KB  = 52;
+FB_R_SR       = 53;
+FB_R_CH       = 54;
+FB_R_MS       = 55;
+FB_R_PLKIND   = 56;  // places only: 1 starred, 2 recent, 3 drive
+
+// ── geometry ────────────────────────────────────────────────────────────────
+// The chevron lives in its OWN gutter on the OUTER edge, so the toggle stays
+// put whether the panel is out or away. A drawer whose handle moves with it is
+// the thing that makes collapsible sidebars feel broken.
+FB_GUTTER_W = 24;   // was 16. A 16 px strip flush against the window's right
+                    // edge is a poor target -- REAPER's own frame and resize
+                    // area eat into it, and it reads as trim rather than as a
+                    // control. 24 px with a visible seam and an arrow is
+                    // unmistakably a button.
+FB_PANEL_W  = 292;   // Poise's width: a name plus TWO narrow columns, not four
+FB_ROW_H    = 22;   // + fb_fsz at use sites, so bigger type still fits
+FB_HDR_H    = 27;    // breadcrumb: up-arrow + the folder you are in
+FB_TOOL_H   = 23;    // button row under the breadcrumb
+FB_STATUS_H = 128;   // name + detail + a WAVEFORM WORTH LOOKING AT + transport
+FB_FILT_H   = 22;    // the filter box
+FB_ARROW_W  = 24;    // the up-arrow's own square at the head of the breadcrumb
+// Type sizes in one place. Everything was a notch small on a real screen.
+// BASE sizes. fb_fsz is the user's offset on top -- the defaults read small on
+// a real screen, so it starts at +2 rather than 0.
+FB_FS_ROW   = 13;
+FB_FS_HDR   = 13;
+FB_FS_BTN   = 11;
+FB_FS_STAT  = 12;
+FB_FONT_N   = 5;
+
+// ══ PREVIEW VOICE ═══════════════════════════════════════════════════════════
+// The browser's OWN player. Auditioning used to BE loading -- the sample landed
+// on a pad and the pad played it -- which is why it fought with AUTOLOAD, why it
+// overwrote the kit, and why a misfire was silence with nothing to point at.
+// This is a real voice instead: previewing never touches a pad, and play/stop/
+// loop become controls that either work or visibly do not.
+//
+// ⭐ SIZE: ~11 s of stereo at 44.1 k. A seventeenth full pad slot would have cost
+// SLOT_SIZE (4,000,000 floats, ~32 MB) for something that only ever holds one
+// sample at a time; this is an eighth of that. Longer files load their first
+// 11 s, which is what an audition needs.
+FB_PRV_MAX = 1000000;
+
+_prv_len  = 0;    // frames actually loaded (0 = nothing)
+_prv_ch   = 0;
+_prv_sr   = 0;
+_prv_pos  = 0;    // fractional read position, owned by @sample
+_prv_on   = 0;    // @block owns this; @sample only reads it
+_prv_rate = 1;
+fb_prv_loop = 0;
+fb_prv_gain = 0.7;
+fb_prv_cmd  = 0;  // @gfx -> @block: 1 = play from the top, 2 = stop
+fb_prv_name = -1; // row handle currently loaded, so the face can show it
+
+function swing_fb_prv_init(mem_start)
+(
+  _prv_buf = mem_start;
+  mem_start + FB_PRV_MAX;
+);
+
+// Load a file into the preview buffer. Runs from @block (file I/O), never @gfx.
+// Mirrors load_from_path's reader, but into our own buffer and with no pad, no
+// undo capture and no kit state touched -- that is the entire point.
+function swing_fb_prv_load(path_str) local(f, nch, fsr, n)
+(
+  _prv_on = 0; _prv_len = 0; _prv_pos = 0;
+  f = file_open(path_str);
+  f >= 0 ? (
+    file_riff(f, nch, fsr);
+    nch > 0 && nch < 3 ? (
+      _prv_ch = nch;
+      _prv_sr = fsr > 0 ? fsr : srate;
+      memset(_prv_buf, 0, FB_PRV_MAX);
+      n = file_mem(f, _prv_buf, FB_PRV_MAX);
+      // file_mem returns INTERLEAVED samples; frames is what the reader wants
+      _prv_len = (n / nch) | 0;
+      _prv_rate = _prv_sr / srate;
+    );
+    file_close(f);
+  );
+  _prv_len > 0;
+);
+// ── state ───────────────────────────────────────────────────────────────────
+// ⚠️⚠️ fb_open is SERIALIZED (@serialize ver 66) and therefore must NOT be
+// assigned here. EEL2 zero-init already gives it 0 = closed, and @init can run
+// AFTER @serialize (see Swing_ReaKit.jsfx's _reb_restore_gen note) -- an @init
+// assignment would quietly stamp a restored "open" back to closed. Same rule
+// the shipping serialized vars follow: multi_out and embed_mode are declared
+// nowhere in @init either. The same applies to fb_lcd, fb_subfolders, fb_font.
+fb_scroll    = 0;
+fb_sel       = -1;   // selected row HANDLE (FB_R_RIDX), NOT a page index:
+                     // scrolling repaginates, and a page-relative index would
+                     // silently move the highlight onto a different file.
+fb_hov       = -1;
+_fb_seen     = -1;   // last FB_PUB_SEQ consumed
+_fb_n        = 0;
+_fb_total    = 0;
+_fb_off      = 0;
+_fb_ndirs    = 0;
+_fb_flags    = 0;
+_fb_hb       = 0;
+_fb_hb_last  = 0;
+_fb_hb_still = 0;    // frames the heartbeat has not moved
+_fb_reqseq   = 0;
+_fb_asked    = 0;    // have we ever asked the bridge for a page?
+_fb_lmb_prev = 0;
+_fb_cmd_stuck = 0;   // frames the shared command channel has been busy
+
+// ── options ─────────────────────────────────────────────────────────────────
+// AUDITION: in a pad sampler, loading IS auditioning -- the file lands on the
+// focused pad and sounds immediately, the way a hardware sampler works. It is
+// ON by default because that is the point of a browser, and it is a BUTTON
+// because it overwrites the focused pad and not everyone wants that.
+// Measured 2026-08-29: a load makes NO REAPER undo point, so walking the list
+// costs nothing in undo history -- but Swing's own undo keeps only ONE level.
+fb_preview = 1;
+// AUTOLOAD: does a plain CLICK put the file on the focused pad, or only select
+// it? Dragging always loads -- that gesture is explicit and says where. This
+// only governs the click, so the list can be walked and read without touching
+// the kit.
+fb_autoload = 1;
+// LCD: paint the strip in the theme's SCREEN colours instead of the pad tray,
+// for the retro-hardware look. Off = it reads as part of the chassis.
+// SUBFOLDERS: list the whole tree under here, not just this folder.
+// Both SERIALIZED (ver 66) and both default OFF, so both rely on zero-init and
+// are deliberately not assigned here — see the note at fb_scroll above.
+
+// ── type options ────────────────────────────────────────────────────────────
+// EEL2 cannot hold a font name in a variable and pass it around, so the family
+// is an INDEX and one helper does the switch. Everything in the strip draws
+// through it, which is also what makes a size offset possible at all.
+// fb_font: 0 Arial - 1 Verdana - 2 Tahoma - 3 Segoe UI - 4 Consolas.
+// SERIALIZED (ver 66), default 0 ⇒ zero-init, not assigned here.
+fb_fsz  = 2;      // -2..+8 on top of the base sizes
+// ⚠️ fb_fsz, fb_preview and fb_autoload are NOT persisted: their defaults are
+// non-zero (2, 1, 1), and this codebase's serialize pattern requires the
+// default to BE the zero value, because @init can run after @serialize and
+// would stamp the restored value back. Persisting them needs an offset form
+// (store value-minus-default) — worth doing, but it is a refactor of every use
+// site, not a one-line gate.
+fb_settings_open = 0;
+
+_fb_tc = 0.9; _fb_tw = 0; _fb_th = 0;   // shared by swing_fb_btn
+
+// ── drag-to-pad ─────────────────────────────────────────────────────────────
+// THE reason this browser is worth building. The list and the pad grid share
+// ONE @gfx canvas, so this is just mouse down/move/up tracked by hand -- no OS
+// drop target, no extension, no ImGui payload. The BIG browser can never have
+// this gesture: it is a separate HWND and an ImGui payload cannot cross.
+// Verified by probe 2 (2026-08-29): the release IS delivered while the cursor
+// is outside the canvas, and mouse_x/y keep reporting true coordinates out
+// there (negatives included) -- so the ghost can follow past the edge and a
+// release away from the grid is a real cancel, not a stuck drag.
+// 0 = idle, 1 = pressed (may still turn out to be a click), 2 = dragging.
+fb_drag_state = 0;
+fb_drag_ridx  = -1;
+fb_drag_row   = -1;   // page row, for the ghost's name
+fb_drag_ext   = 0;
+fb_drag_pad   = -1;   // pad under the cursor, -1 = nothing
+fb_drag_x0    = 0;
+fb_drag_y0    = 0;
+FB_DRAG_SLOP  = 4;    // px before a press becomes a drag rather than a click
+fb_drag_layer = 0;    // resolved at drop time when ALT is held
+fb_drag_count = 1;    // how many rows this drag carries
+// Selection is a RANGE of row handles: fb_sel is the anchor, fb_sel_b the far
+// end. Shift-click moves only the far end, so the anchor survives -- that is
+// what makes a range feel like a range rather than two separate picks.
+fb_sel_b = -1;
+
+// ── filter ──────────────────────────────────────────────────────────────────
+// ⚠️ MEASURED CONTRACT (rk_swing_padname_edit's header, kbprobe 2026-08-04):
+// gfx_getchar() delivers letters/digits/backspace/enter when floating or in a
+// chain; SEVERAL chars can land in ONE frame so the queue must be DRAINED; ESC
+// never arrives at all; and an EMBEDDED instance gets NO keyboard whatsoever --
+// so the box refuses focus there rather than looking editable and eating keys.
+fb_filt_focus = 0;
+fb_filt_len   = 0;
+
+// Returns the bumped pointer, matching every other *_init in the suite.
+function swing_fb_init(mem_start)
+(
+  _fb_rows = mem_start;
+  _fb_cwd  = mem_start + FB_REC_MAX * FB_REC;
+  _fb_knob = _fb_cwd + FB_CWD_MAX + 1;      // jo_knob_interact's own scratch
+  _fb_trows = _fb_knob + 16;                // folder-tree page, same 64x60 shape
+  // PREFAULT: NSEEL allocates gmem lazily on first write, and a face that only
+  // ever READS a never-written block sees zeros forever. The FX picker learned
+  // this the same way. One touch is enough to back the whole 65536 block.
+  gmem[EON_SWBROWSE_BASE + max(0, min(EON_SWBROWSE_SLOTS - 1, _reg_my_slot))
+       * EON_SWBROWSE_STRIDE + FB_REQ_N] = 0;
+  gmem[EON_SWBPK_BASE + max(0, min(EON_SWBROWSE_SLOTS - 1, _reg_my_slot))
+       * EON_SWBPK_STRIDE] = 0;
+  gmem[EON_SWBTREE_BASE + max(0, min(EON_SWBROWSE_SLOTS - 1, _reg_my_slot))
+       * EON_SWBTREE_STRIDE + FBT_REQ_N] = 0;
+  _fb_trows + FB_REC_MAX * FB_REC;
+);
+
+function swing_fb_tree_band()
+(
+  EON_SWBTREE_BASE
+    + max(0, min(EON_SWBROWSE_SLOTS - 1, _reg_my_slot)) * EON_SWBTREE_STRIDE;
+);
+
+// Same seqlock discipline as the file list: read seq, read body, read seq
+// again; odd or changed means discard and try next frame.
+function swing_fb_tree_snapshot()
+  local(b, s1, s2, i, n)
+(
+  b = swing_fb_tree_band();
+  gmem[b + FBT_FACE_HB] = gmem[b + FBT_FACE_HB] + 1;
+  s1 = gmem[b + FBT_PUB_SEQ];
+  (s1 == _fbt_seen || (s1 % 2) == 1) ? (
+    0;
+  ) : (
+    _fbt_total = gmem[b + FBT_TOTAL];
+    _fbt_off   = gmem[b + FBT_WIN_OFF];
+    _fbt_sel   = gmem[b + FBT_SEL];
+    _fbt_flags = gmem[b + FBT_FLAGS];
+    n = max(0, min(FB_REC_MAX, gmem[b + FBT_WIN_N]));
+    // CELL BY CELL -- memcpy cannot cross from gmem into local memory, and with
+    // ~72 MB of local it silently copies pad AUDIO instead of failing.
+    i = 0; loop(n * FB_REC, _fb_trows[i] = gmem[b + FBT_ROWS + i]; i += 1;);
+    s2 = gmem[b + FBT_PUB_SEQ];
+    s2 == s1 ? ( _fbt_seen = s1; _fbt_n = n; 1; ) : 0;
+  );
+);
+
+function swing_fb_tree_request(verb, tidx)
+  local(b)
+(
+  b = swing_fb_tree_band();
+  gmem[b + FBT_REQ_VERB] = verb;
+  gmem[b + FBT_REQ_TIDX] = tidx;
+  gmem[b + FBT_REQ_OFF]  = fbt_scroll;
+  gmem[b + FBT_REQ_N]    = FB_REC_MAX;
+  // Continue from the band, never from 0 -- see swing_fb_request.
+  _fbt_reqseq < gmem[b + FBT_REQ_SEQ] ? _fbt_reqseq = gmem[b + FBT_REQ_SEQ]|0;
+  _fbt_reqseq += 1;
+  gmem[b + FBT_REQ_SEQ]  = _fbt_reqseq;     // written LAST
+);
+
+// The rail's COMMITTED width -- what the user let go of, clamped. This is the
+// one the WINDOW sizes itself to, so it must not move while a drag is in flight:
+// the grow request has to stay a step function.
+//
+// ⚠️⚠️ THAT IS NOT A STYLE POINT. The 2026-08-30 docking regression was the
+// grow request riding `gfx_w`, a per-frame quantity -- the bridge then resized
+// the float on every tick and fought the dock the whole way, in Steppa too,
+// because they share the bridge. A width that changed on every frame of a
+// splitter drag is the SAME BUG with a different source. The live drag value
+// lives in `_fb_tw_live` and never reaches the cap or the request.
+function swing_fb_tree_w()
+(
+  max(FB_TREE_MIN, min(FB_TREE_MAX, FB_TREE_W + fb_tw_off));
+);
+
+// The panel width the strip would LIKE, whether it is open or not.
+// Capped at 45% of the window: the rack/dock face is often only a few hundred
+// px wide, where a fixed panel would leave the pads a sliver -- and the pads
+// staying usable is the whole premise of dropping onto them.
+function swing_fb_cap_w()
+(
+  min(FB_PANEL_W + (fb_tree ? swing_fb_tree_w() : 0), max(150, (gfx_w * 0.45) | 0));
+);
+
+// What the strip occupies RIGHT NOW. Computed once per frame in swing_fb_gate;
+// layout, the input gate, the draw and the growth request all read this.
+function swing_fb_width()
+(
+  fb_w_cur | 0;
+);
+
+function swing_fb_band()
+(
+  EON_SWBROWSE_BASE
+    + max(0, min(EON_SWBROWSE_SLOTS - 1, _reg_my_slot)) * EON_SWBROWSE_STRIDE;
+);
+
+// ── snapshot ────────────────────────────────────────────────────────────────
+// Seqlock: read seq, read body, read seq again. Odd or changed = discard. The
+// face runs at frame rate and the bridge publishes at defer rate, so a
+// collision costs one frame and never a torn row.
+function swing_fb_snapshot()
+  local(b, s1, s2, i, n, cl)
+(
+  b = swing_fb_band();
+  gmem[b + FB_FACE_HB] = gmem[b + FB_FACE_HB] + 1;   // I am here, and drawing
+  // Ask for the window to WIDEN rather than take the width off the pads, and
+  // ask for exactly as much as the strip is CURRENTLY showing -- so the window
+  // grows along the same eased curve the panel opens on. One motion.
+  //
+  // ⚠️ Yes, this is a feedback path: growing raises gfx_w, which raises the 45%
+  // cap, which can raise the target. It CONVERGES and is bounded -- min() caps
+  // it at FB_PANEL_W, and above a ~650 px window the cap is not even in play,
+  // so the target is a constant 292 and there is no loop at all. On a smaller
+  // window it ramps to the same place instead of stepping there twice, which is
+  // what the easing bought. The bridge clamps at 1000 px regardless.
+  //
+  // A window that CANNOT grow (docked, embedded, no js_ReaScriptAPI) still gets
+  // a correct strip: the 45% cap governs what it draws, so it falls back to the
+  // squeeze on its own with nothing extra to write.
+  // ⚠️⚠️ A CONSTANT, NOT swing_fb_cap_w(). The cap is derived from gfx_w, and
+  // gfx_w changes on EVERY FRAME while a window is being docked or undocked --
+  // so the request changed every frame, the bridge resized the floating window
+  // every tick, and it fought the dock operation the whole way. Docking Swing
+  // AND Steppa went stiff, because they share the bridge and the docker.
+  // The request now moves only when fb_open or fb_tree does. The 45% cap still
+  // governs what the strip DRAWS (swing_fb_cap_w, used in the gate), so a small
+  // window is still never swallowed -- it just hands the surplus back to the
+  // panes instead of feeding it into a loop.
+  gmem[b + FB_REQ_GROW] = fb_open ? (FB_PANEL_W + (fb_tree ? swing_fb_tree_w() : 0)) : 0;
+  // The bridge has to know WHOSE window to widen, and growth must work before
+  // the first request has ever been posted.
+  gmem[b + FB_REQ_INST] = instance_id;
+  // Our canvas width, so the bridge can MEASURE canvas-px per window-px rather
+  // than assume 1:1. True today (Swing never sets gfx_ext_retina) -- but EON
+  // Anvil, Drum Strip and FX Return View all DO, so the day someone adds it
+  // here the growth would silently under-deliver on a scaled display.
+  gmem[b + FB_REQ_GFXW] = gfx_w;
+  _fb_hb = gmem[b + FB_HB];
+  s1 = gmem[b + FB_PUB_SEQ];
+  (s1 == _fb_seen || (s1 % 2) == 1) ? (
+    0;
+  ) : (
+    _fb_total = gmem[b + FB_TOTAL];
+    _fb_off   = gmem[b + FB_WIN_OFF];
+    _fb_ndirs = gmem[b + FB_NDIRS];
+    _fb_flags = gmem[b + FB_FLAGS];
+    n = max(0, min(FB_REC_MAX, gmem[b + FB_WIN_N]));
+    // ⚠️ CELL BY CELL. memcpy CANNOT cross from gmem into local memory — they
+    // are separate address spaces, and because Swing's local memory runs to
+    // ~72 MB a memcpy from 26,607,872 silently copies pad AUDIO into the row
+    // buffer instead of failing. That exact mistake in the FX picker showed up
+    // as box glyphs and rows starting two-thirds down the list.
+    i = 0; loop(n * FB_REC, _fb_rows[i] = gmem[b + FB_ROWS + i]; i += 1;);
+    cl = max(0, min(FB_CWD_MAX, gmem[b + FB_CWD_LEN]));
+    i = 0; loop(cl, _fb_cwd[i] = gmem[b + FB_CWD + i]; i += 1;);
+    _fb_cwd_len = cl;
+    s2 = gmem[b + FB_PUB_SEQ];
+    s2 == s1 ? ( _fb_seen = s1; _fb_n = n; 1; ) : 0;   // torn -> discard
+  );
+);
+
+// ── request ─────────────────────────────────────────────────────────────────
+// REQ_SEQ is written LAST so the bridge never reads a half-formed request.
+function swing_fb_request(verb, ridx, pad)
+  local(b)
+(
+  b = swing_fb_band();
+  gmem[b + FB_REQ_VERB] = verb;
+  gmem[b + FB_REQ_RIDX] = ridx;
+  gmem[b + FB_REQ_PAD]  = pad;
+  gmem[b + FB_REQ_OFF]  = fb_scroll;
+  gmem[b + FB_REQ_N]    = FB_REC_MAX;
+  gmem[b + FB_REQ_INST]  = instance_id;   // route the load back to THIS instance
+  gmem[b + FB_REQ_LAYER] = fb_drag_layer;
+  gmem[b + FB_REQ_COUNT] = fb_drag_count;
+  gmem[b + FB_REQ_RECURSE] = fb_subfolders;
+  gmem[b + FB_REQ_AUD]     = fb_preview;
+  // ⭐ CONTINUE FROM THE BAND, NEVER FROM 0. The bridge takes a request only
+  // when its number differs from the last one it saw for this slot, and it
+  // remembers that across OUR reloads: a project switch, an undo that rebuilds
+  // the FX, a chunk restore. This counter restarts at 0 on every one of those
+  // while gmem keeps the old number -- so a reloaded strip whose predecessor
+  // sent exactly one request (a hello and nothing else, i.e. every restored-
+  // open strip) posted 1 on top of a seen 1 and the hello was swallowed. The
+  // heartbeat kept climbing and the OLD listing stayed in the band, which is
+  // why it looked fine (.dev_tests/fbhello_e2e.lua, 2026-09-02: GEN never
+  // moved). Seeding from the band's own REQ_SEQ makes the number monotonic
+  // for the life of the process, whoever held the slot before us.
+  _fb_reqseq < gmem[b + FB_REQ_SEQ] ? _fb_reqseq = gmem[b + FB_REQ_SEQ]|0;
+  _fb_reqseq += 1;
+  gmem[b + FB_REQ_SEQ]  = _fb_reqseq;
+  _fb_asked = 1;
+);
+
+// Width this sidebar takes out of the left pane. The gutter is always there so
+// the chevron never moves; only the panel comes and goes.
+
+// ══ NO CLICK-THROUGHS ═══════════════════════════════════════════════════════
+// The strip PAINTS last so it can cover pane content that overflows its column.
+// But input runs in draw order, so by then every widget underneath has already
+// tested the click. Painting last therefore fixes the picture and NOT the
+// clicks -- a control whose rect reaches into this column would still fire.
+//
+// So input is claimed EARLY and separately, exactly the way swing_ui_modal_gate
+// does it for overlays: stash the real mouse state, zero the shared frame
+// globals so nothing beneath can act, and let the late draw restore its own
+// copies for its own hit tests.
+// Call this from @gfx BEFORE the panes draw. It is cheap and it is the only
+// thing standing between a click on a file row and whatever sits behind it.
+// Can this instance's window actually BE resized? Growth is the whole opening
+// motion, and there are three cases where it is never going to happen: the dock
+// rig has captured our canvas into a pane, REAPER has embedded us in the TCP, or
+// js_ReaScriptAPI is missing so the bridge has nothing to resize with. In all
+// three the strip has to fall back to taking room off the pads.
+//
+// ⛔ NOT `dock_face`. That goes to 1 on a WIDE FLOAT from the aspect-ratio
+// trigger (Swing_ReaKit.jsfx, the AUTO branch), and a wide float grows perfectly
+// well -- gating on it would kill growth for anyone who just likes a wide window.
+// The question is who OWNS the window, not which face we happen to be wearing.
+//
+// ⚠️ slider42 is honoured only while OUR pane's heartbeat is fresh, the same
+// gate Swing's own dock_face logic uses. GS_RIG_ALIVE (2626) is stamped by
+// EITHER pane, so it would let Steppa's pane vouch for ours -- that exact
+// confusion cost a day on 2026-08-30. GS_RIG_ALIVE_SWING is stamped only by
+// EON Swing Dock.lua.
+function swing_fb_can_grow()
+(
+  is_embedded ? 0
+  : ((time_precise() - gmem[GS_RIG_ALIVE_SWING]) < 2 && slider42 > 0.5) ? 0
+  : 1;
+);
+
+function swing_fb_gate()
+  local(_cap, _got, _cangrow)
+(
+  // ══ HOW MUCH WIDTH THE STRIP MAY TAKE, THIS FRAME ═════════════════════════
+  // ⭐⭐ THE RULE: it only ever occupies width the WINDOW HAS ALREADY BEEN GIVEN.
+  // It asks for the whole width at once and takes nothing until that width
+  // arrives -- so the pads never move, and the browser appears in space that did
+  // not exist a frame earlier. It reads as the window extending, because that is
+  // exactly what happens.
+  //
+  // ⛔ The first version EASED the strip's own width instead. For every frame of
+  // that easing the strip was claiming room the window did not have yet, so the
+  // panes squeezed and then un-squeezed as the window caught up -- "it moves
+  // Swing and then the panel opens", which is the very thing the easing was
+  // meant to smooth. There is no animation here now and none is wanted: the
+  // whole open costs one bridge tick.
+  _cap     = swing_fb_cap_w();
+  _cangrow = swing_fb_can_grow();
+
+  // First frame of this instance. A project that LOADS with the strip open gets
+  // a window REAPER already restored at the grown size, so that width is treated
+  // as ALREADY PRESENT rather than asked for again -- the bridge's first-sight
+  // adopt makes the same assumption from the other side.
+  _fb_w_init ? 0 : (
+    _fb_base_w   = fb_open ? (gfx_w - _cap) : gfx_w;
+    _fb_base_set = 1;
+    _fb_w_init   = 1;
+    _fb_growp    = _cangrow;      // seeded here so frame 1 is never a transition
+  );
+
+  // ⚠️⚠️ RE-BASELINE WHEN THE WINDOW CHANGES HANDS -- not only when the strip
+  // closes. `_fb_squeeze` used to be cleared by the close-reset at the bottom of
+  // this function and NOWHERE ELSE, so docking with the strip OPEN latched it:
+  // the pads gave up their width, and undocking did not give it back, because
+  // the reset needed `!fb_open` to fire. The window stayed narrow until you
+  // closed the strip and opened it again, with nothing on screen saying why.
+  // A dock or an undock invalidates the baseline anyway -- gfx_w means something
+  // completely different on the other side of it -- so both directions measure
+  // afresh from here.
+  _fb_growp != _cangrow ? (
+    _fb_growp    = _cangrow;
+    // ⚠️⚠️ RE-BASELINE THE SAME WAY THE FIRST-FRAME ADOPT DOES, and for the same
+    // reason: when the window already CARRIES the panel, gfx_w includes it, and
+    // measuring the baseline as plain gfx_w would treat the grown width as the
+    // new bare width and ask for another 292 on top. An undock is exactly that
+    // case -- REAPER restores a float at the size it had, panel width included.
+    // ⛔ But `fb_open` alone is NOT the test. Open the strip while DOCKED and the
+    // window was never grown at all, so the float comes back its ordinary size;
+    // subtracting the cap there would claim 292 px the pads still need. That is
+    // what `_fb_carry` is for -- it is the last answer measured while the window
+    // was ours to grow, and it is deliberately frozen across the dock.
+    _fb_base_w   = (fb_open && _fb_carry) ? (gfx_w - _cap) : gfx_w;
+    _fb_base_set = 1;
+    _fb_squeeze  = 0;
+    _fb_wait     = 0;
+  );
+
+  fb_open && !_fb_base_set ? ( _fb_base_w = gfx_w; _fb_base_set = 1; _fb_wait = 0; );
+
+  // Width the window has actually gained since the strip was opened.
+  _got = _fb_base_set ? max(0, gfx_w - _fb_base_w) : 0;
+
+  // Is the window carrying the panel's width right now? Updated ONLY while the
+  // window is ours to resize, so it freezes at its last honest value the moment
+  // we dock -- which is what the transition above needs to read on the way back
+  // out. -2 of slack because the grow is measured in window px and read back in
+  // canvas px, and those need not divide evenly.
+  _cangrow && !_fb_squeeze ? _fb_carry = (fb_open && _got >= _cap - 2) ? 1 : 0;
+
+  // Fall back to taking the room off the pads when the window will not grow.
+  // ⭐ TWO ROUTES IN, and the fast one matters. When we can SEE that growth is
+  // impossible (docked or embedded) the squeeze is immediate -- the 20-frame
+  // wait was a third of a second of the chevron visibly doing nothing before the
+  // pads moved, every single time, in the one case we could have predicted.
+  // The timeout stays for the case we CANNOT see: js_ReaScriptAPI missing, or a
+  // Swing living somewhere the bridge's track-FX walk does not reach (a v7
+  // container, take FX, input FX). There the request is posted, nothing answers,
+  // and 20 frames later we stop waiting.
+  fb_open ? (
+    _fb_wait += 1;
+    (!_cangrow || (_fb_wait > 20 && _got < 1)) ? _fb_squeeze = 1;
+  ) : ( _fb_wait = 0; );
+
+  // ⚠️ The cap is applied whether OPEN or CLOSED, deliberately. On a close the
+  // request drops to 0 but the window is still wide for one tick; sizing the
+  // panel from `fb_open` would blank it instantly and let the panes lunge into
+  // space that is about to disappear -- the same reshape, in reverse.
+  fb_w_cur = FB_GUTTER_W + (_fb_squeeze ? (fb_open ? _cap : 0) : min(_cap, _got));
+
+  // Window back where it started: forget the baseline so the next open measures
+  // afresh (the user may have resized it in between).
+  (!fb_open && _got < 1) ? ( _fb_base_set = 0; _fb_squeeze = 0; );
+
+  _fb_gx0 = gfx_w - swing_fb_width();      // the strip owns this column outright
+  // The rack face has no 28 px header -- it has rack_hdr_h. Using 28 there would
+  // leave a live strip of ungated pixels along the top of the panel.
+  _fb_top = dock_face ? rack_hdr_h : 28;
+  // ⛔ A full-window big view (FX picker, console, comp, EQ...) is painted AFTER
+  // the strip and covers the whole canvas, but this gate runs before either of
+  // them. Without the big_view_id test the strip went on claiming its column
+  // while invisible, so the right ~316 px of EVERY big view was click-dead --
+  // a whole column of picker cards, the right-most console strips. Found in the
+  // 2026-08-29 growth audit; the strip has never referenced big_view_id.
+  _fb_over = big_view_id == VIEW_NONE
+          && mouse_x >= _fb_gx0 && mouse_x < gfx_w
+          && mouse_y >= _fb_top && mouse_y < gfx_h;
+  _fb_over ? (
+    // ⚠️ EEL2 identifiers are CASE-INSENSITIVE: _fb_g_lmb and _fb_g_LMB would be
+    // ONE variable, and the second assignment would quietly eat the first.
+    // Spelled out so the two halves of the mouse state cannot collide.
+    _fb_g_lmbdown  = lmb_down;  _fb_g_rmbdown  = rmb_down;
+    _fb_g_lmbclick = LMB;       _fb_g_rmbclick = RMB;
+    _fb_g_wheel    = frame_wheel;
+    lmb_down = 0; rmb_down = 0; frame_wheel = 0; LMB = 0; RMB = 0;
+  ) : (
+    _fb_g_lmbdown = 0; _fb_g_rmbdown = 0;
+    _fb_g_lmbclick = 0; _fb_g_rmbclick = 0; _fb_g_wheel = 0;
+  );
+  // A drag that STARTED in the strip keeps the grid quiet for its whole life,
+  // even once the cursor is out over the pads -- otherwise the drop click would
+  // also register as a pad hit and trigger the pad it landed on.
+  fb_drag_state == 2 ? ( lmb_down = 0; LMB = 0; frame_wheel = 0; );
+  // A splitter drag can wander left over the pads before the button comes up.
+  // Same insurance as above: the press already happened on the seam, so nothing
+  // out there should act on the way past.
+  fb_split_drag ? ( lmb_down = 0; LMB = 0; frame_wheel = 0; );
+);
+
+// Push the filter text over the wire. LEN is written LAST of the payload and
+// REQ_SEQ last of all, same ordering rule as every other request.
+// ══ KEYBOARD ════════════════════════════════════════════════════════════════
+// Walk the list without the mouse. This is the natural partner to the preview
+// voice: arrow down, hear it, arrow down, hear the next one.
+//
+// ⚠️ Swing drains ONE char per frame into `_char` at the top of @gfx
+// (Swing_ReaKit.jsfx, "Frame globals"). A handler that only calls gfx_getchar()
+// therefore misses the first key of every frame -- which is exactly what
+// swing_fb_filter_keys does, and why the filter box drops characters. This one
+// takes `_char` first and then drains the rest.
+//
+// ⚠️ ESC never arrives at all, and an EMBEDDED instance gets no keyboard
+// whatsoever (measured, rk_swing_padname_edit's header).
+FBK_UP    = 30064;        // 'up'
+FBK_DOWN  = 1685026670;   // 'down'
+FBK_LEFT  = 1818584692;   // 'left'
+FBK_RIGHT = 1919379572;   // 'rght'
+FBK_PGUP  = 1885828464;   // 'pgup'
+FBK_PGDN  = 1885824110;   // 'pgdn'
+FBK_HOME  = 1752132965;   // 'home'
+FBK_END   = 6647396;      // 'end'
+
+// Page row holding this handle, or -1.
+function swing_fb_row_of(ridx) local(i, r)
+(
+  r = -1;
+  i = 0;
+  loop(_fb_n, _fb_rows[i * FB_REC + FB_R_RIDX] == ridx ? r = i; i += 1;);
+  r;
+);
+
+// Act on the row at `pr` in the CURRENT page, exactly as a click on it would.
+function swing_fb_kb_select(pr) local(p, kind, ext)
+(
+  p    = _fb_rows + pr * FB_REC;
+  kind = p[FB_R_KIND];
+  ext  = p[FB_R_EXT];
+  fb_sel = p[FB_R_RIDX]; fb_sel_b = fb_sel;
+  kind == 0 ? (
+    // Same three-way the click uses: load, or only audition, or only describe.
+    // SFZ is a 16-pad kit import and is never walked onto a pad.
+    (fb_autoload && ext != 10) ? swing_fb_request(3, fb_sel, sel_pad) :
+    (fb_preview  && ext != 10) ? swing_fb_request(12, fb_sel, -1)
+                               : swing_fb_request(5, fb_sel, -1);
+  ) : swing_fb_request(5, fb_sel, -1);
+);
+
+function swing_fb_kb_move(d, vis) local(pos, np, i)
+(
+  _fb_total < 1 ? 0 : (
+    // Where the selection is in ABSOLUTE terms: its place on this page plus the
+    // window offset. A page index alone would move under us when the list
+    // repaginates -- the same trap the status line hit.
+    pos = -1;
+    i = 0;
+    loop(_fb_n,
+      _fb_rows[i * FB_REC + FB_R_RIDX] == fb_sel ? pos = _fb_off + i;
+      i += 1;
+    );
+    pos < 0 ? pos = _fb_off - 1;                 // nothing selected: start above
+    np = max(0, min(_fb_total - 1, pos + d));
+    // ⚠️⚠️ Against what is ON SCREEN, not against the loaded PAGE. The bridge
+    // publishes up to 64 rows but the list only draws `vis` of them (~15), so
+    // comparing with _fb_n let the selection walk 60 rows down inside the page
+    // while the view never moved -- "page up and page down work but the view
+    // doesn't follow". The visible window is [_fb_off, _fb_off + vis).
+    (np < _fb_off || np >= _fb_off + min(_fb_n, vis)) ? (
+      // Off the loaded page: scroll there and remember which row we were
+      // heading for. ⚠️ One request per frame -- paging AND selecting in the
+      // same frame would overwrite REQ_SEQ and the bridge would see only one.
+      fb_scroll = max(0, min(max(0, _fb_total - vis), np - ((vis / 3) | 0)));
+      _fb_kbwant = np + 1;                       // +1 so 0 can mean "none"
+      swing_fb_request(0, 0, -1);
+    ) : swing_fb_kb_select(np - _fb_off);
+  );
+);
+
+function swing_fb_list_keys(vis) local(c, used, p)
+(
+  // ⚠️⚠️ ONE char, and ONLY the one Swing already drained. gfx_getchar() is
+  // DESTRUCTIVE: a handler that loops on it eats every key in the frame,
+  // including the ones the pad-name editor, the macro rename box and the popups
+  // are waiting for -- so renaming a pad would silently stop working whenever
+  // the strip happened to be open. Reading the shared `_char` and clearing it
+  // only when we actually used it leaves every other handler intact.
+  c = _char;
+  used = 0;
+  c == FBK_DOWN  ? ( swing_fb_kb_move(1, vis);       used = 1; ) :
+  c == FBK_UP    ? ( swing_fb_kb_move(-1, vis);      used = 1; ) :
+  c == FBK_PGDN  ? ( swing_fb_kb_move(vis, vis);     used = 1; ) :
+  c == FBK_PGUP  ? ( swing_fb_kb_move(-vis, vis);    used = 1; ) :
+  c == FBK_HOME  ? ( swing_fb_kb_move(-999999, vis); used = 1; ) :
+  c == FBK_END   ? ( swing_fb_kb_move(999999, vis);  used = 1; ) :
+  (c == FBK_LEFT || c == 8) ? (                // left / backspace = go up
+    fb_scroll = 0; fb_sel = -1; fb_sel_b = -1;
+    swing_fb_request(2, 0, -1); used = 1;
+  ) :
+  (c == FBK_RIGHT || c == 13 || c == 10) ? (
+    // Enter/Right: a folder opens, a file loads onto the focused pad. ALT
+    // stacks it as a LAYER instead -- the same meaning the drag already has.
+    fb_sel >= 0 ? (
+      p = swing_fb_row_of(fb_sel);
+      p >= 0 ? (
+        _fb_rows[p * FB_REC + FB_R_KIND] > 0 ? (
+          fb_scroll = 0; swing_fb_request(1, fb_sel, -1);
+        ) : ALT ? (
+          fb_drag_layer = min(p_layer_cnt[sel_pad], MAX_LAYERS - 1);
+          swing_fb_request(7, fb_sel, sel_pad);
+        ) : swing_fb_request(3, fb_sel, sel_pad);
+      );
+    );
+    used = 1;
+  );
+  used ? _char = 0;                            // ours; hide it from the rest
+);
+
+function swing_fb_send_filter() local(i, n)
+(
+  n = min(FB_REQ_FILT_MAX, strlen(#fb_filt));
+  i = 0; loop(n, gmem[swing_fb_band() + FB_REQ_FILT + i] = str_getchar(#fb_filt, i); i += 1;);
+  gmem[swing_fb_band() + FB_REQ_FILT_LEN] = n;
+  swing_fb_request(9, 0, -1);
+);
+
+// Drain the keyboard queue into the filter box.
+// ⚠️ SEVERAL characters can arrive in ONE @gfx frame (measured 3), so this
+// loops until the queue is empty rather than taking one per frame -- typing
+// fast would otherwise drop letters. _char is consumed so the popup/overlay
+// handlers do not also act on the same keystroke.
+function swing_fb_filter_keys() local(c, changed)
+(
+  changed = 0;
+  c = gfx_getchar();
+  while (c > 0) (
+    c == 8 ? (                                   // backspace
+      strlen(#fb_filt) > 0 ? (
+        strcpy_substr(#fb_filt, #fb_filt, 0, strlen(#fb_filt) - 1);
+        changed = 1;
+      );
+    ) : (c == 13 || c == 10) ? (                 // enter closes the box
+      fb_filt_focus = 0;
+    ) : (c >= 32 && c < 127) ? (
+      strlen(#fb_filt) < FB_REQ_FILT_MAX ? (
+        str_setchar(#fb_filt, strlen(#fb_filt), c);
+        changed = 1;
+      );
+    );
+    c = gfx_getchar();
+  );
+  _char = 0;                                     // consumed
+  fb_filt_len = strlen(#fb_filt);
+  changed ? ( fb_scroll = 0; fb_sel = -1; fb_sel_b = -1; swing_fb_send_filter(); );
+);
+
+// Every piece of type in the strip goes through here: it is the only place the
+// family index becomes a name, and the only place the user's size offset lands.
+function swing_fb_font(sz, bold) local(_s)
+(
+  _s = max(8, min(28, sz + fb_fsz));
+  fb_font == 1 ? gfx_setfont(1, "Verdana",  _s, bold ? 'b' : 0) :
+  fb_font == 2 ? gfx_setfont(1, "Tahoma",   _s, bold ? 'b' : 0) :
+  fb_font == 3 ? gfx_setfont(1, "Segoe UI", _s, bold ? 'b' : 0) :
+  fb_font == 4 ? gfx_setfont(1, "Consolas", _s, bold ? 'b' : 0) :
+                 gfx_setfont(1, "Arial",    _s, bold ? 'b' : 0);
+);
+
+function swing_fb_font_name(i)
+(
+  i == 1 ? "Verdana" : i == 2 ? "Tahoma" : i == 3 ? "Segoe UI" :
+  i == 4 ? "Consolas" : "Arial";
+);
+
+// One row icon, drawn to fit a box of side `s` centred on (cx, cy).
+// kind: 0 file (the `ext` argument then picks waveform vs SFZ) - 1 folder -
+// 2 parent ".." - 3 a PLACES row (`ext` carries the place kind) - 4 open folder.
+// ⚠️ cx,cy is the CENTRE, not the top-left: every branch draws from cx - s/2.
+// Getting that wrong is what buried the folder-tree icons under the twisty.
+// Every row type gets a SHAPE, not a coloured block: at a glance you should be
+// able to tell a sample from a folder from a shortcut without reading a word.
+// ⭐ A wave file gets an actual WAVEFORM -- bars around a centre line. It is the
+// one glyph that says "this is audio" with no label at all.
+function swing_fb_icon(kind, ext, cx, cy, s) local(h, q, i, bh)
+(
+  h = s * 0.5;
+  q = s * 0.25;
+  kind == 2 ? (                       // parent: a folder with the way back out
+    gfx_rect(cx - h, cy - q, s, h * 1.4);
+    gfx_rect(cx - h, cy - h * 0.8, h * 0.7, q * 0.8);
+    gfx_line(cx, cy + q * 0.2, cx, cy - q * 0.6, 1);
+    gfx_line(cx, cy - q * 0.6, cx - q * 0.5, cy - q * 0.1, 1);
+    gfx_line(cx, cy - q * 0.6, cx + q * 0.5, cy - q * 0.1, 1);
+  ) : kind == 1 ? (                   // folder: a tab and a body
+    gfx_rect(cx - h, cy - q, s, h * 1.4);
+    gfx_rect(cx - h, cy - h * 0.8, h * 0.7, q * 0.8);
+  ) : kind == 4 ? (                   // OPEN folder: the one you are standing in
+    // At 11 px an open folder cannot be a perspective drawing -- it just turns
+    // into a shape. It is the same tab-and-body as kind 1 with the front leaf
+    // slid out to the right and dimmed, which reads as open at any size and
+    // still reads as a FOLDER, which is the point.
+    gfx_rect(cx - h, cy - h * 0.8, h * 0.7, q * 0.8);          // tab
+    gfx_rect(cx - h, cy - q, s * 0.74, h * 1.4);               // back leaf
+    gfx_set(gfx_r, gfx_g, gfx_b, gfx_a * 0.5);
+    gfx_rect(cx - h + q * 0.9, cy - q * 0.35, s * 0.78, h * 1.15);   // front leaf
+  ) : kind == 3 ? (
+    // A places row is one of THREE things and they were all the same bookmark,
+    // so the list could not be read at all: a star you chose, a folder you
+    // happened to be in, and a drive are not the same kind of entry.
+    ext == 1 ? (                      // STARRED: a star
+      gfx_line(cx, cy - h, cx + q * 0.5, cy - q * 0.2, 1);
+      gfx_line(cx + q * 0.5, cy - q * 0.2, cx + h, cy - q * 0.1, 1);
+      gfx_line(cx + h, cy - q * 0.1, cx + q * 0.7, cy + q * 0.6, 1);
+      gfx_line(cx + q * 0.7, cy + q * 0.6, cx + q, cy + h, 1);
+      gfx_line(cx + q, cy + h, cx, cy + q * 0.8, 1);
+      gfx_line(cx, cy + q * 0.8, cx - q, cy + h, 1);
+      gfx_line(cx - q, cy + h, cx - q * 0.7, cy + q * 0.6, 1);
+      gfx_line(cx - q * 0.7, cy + q * 0.6, cx - h, cy - q * 0.1, 1);
+      gfx_line(cx - h, cy - q * 0.1, cx - q * 0.5, cy - q * 0.2, 1);
+      gfx_line(cx - q * 0.5, cy - q * 0.2, cx, cy - h, 1);
+    ) : ext == 3 ? (                  // DRIVE: a stacked platter
+      gfx_rect(cx - h, cy - q * 1.1, s, q * 0.9);
+      gfx_rect(cx - h, cy + q * 0.2, s, q * 0.9);
+      gfx_set(gfx_r, gfx_g, gfx_b, gfx_a * 0.45);
+      gfx_rect(cx + q * 0.3, cy - q * 0.85, q * 0.5, q * 0.4);
+      gfx_rect(cx + q * 0.3, cy + q * 0.45, q * 0.5, q * 0.4);
+    ) : (                             // RECENT: a clock wound back
+      gfx_circle(cx, cy, h * 0.9, 0, 1);
+      gfx_line(cx, cy, cx, cy - h * 0.5, 1);
+      gfx_line(cx, cy, cx + h * 0.45, cy + h * 0.15, 1);
+    );
+  ) : ext == 10 ? (                   // SFZ: stacked layers, because it is a KIT
+    gfx_rect(cx - h, cy - q * 1.4, s, q * 0.7);
+    gfx_rect(cx - h, cy - q * 0.2, s, q * 0.7);
+    gfx_rect(cx - h, cy + q,      s, q * 0.7);
+  ) : (                               // AUDIO: a waveform
+    i = 0;
+    loop(7,
+      // a fixed, symmetric envelope -- this is an icon, not the file's own shape
+      bh = (i == 3) ? h : (i == 2 || i == 4) ? h * 0.72
+         : (i == 1 || i == 5) ? h * 0.40 : h * 0.18;
+      gfx_rect(cx - h + i * (s / 7), cy - bh, max(1, s / 11), bh * 2);
+      i += 1;
+    );
+  );
+);
+
+// A button whose face is a GLYPH. Same chrome as the text one so they read as
+// one family. which: 0 star - 1 gear - 2 back - 3 up.
+function swing_fb_iconbtn(bx, by, bw, bh, which, on, dim, edge)
+  local(hot, cx2, cy2, r, i, a)
+(
+  hot = mouse_x >= bx && mouse_x < bx + bw && mouse_y >= by && mouse_y < by + bh;
+  on ? gfx_set(0.30, 0.52, 0.68, hot ? 0.95 : 0.78)
+     : gfx_set(1, 1, 1, hot ? 0.13 : 0.06);
+  gfx_rect(bx, by, bw, bh);
+  cx2 = bx + bw * 0.5; cy2 = by + bh * 0.5;
+  r = min(bw, bh) * 0.32;
+  gfx_set(_fb_tc, _fb_tc, _fb_tc, dim ? 0.22 : (on ? 1 : (hot ? 1 : 0.78)));
+  which == 0 ? (                      // STAR -- five real points, not an asterisk
+    i = 0;
+    loop(5,
+      a = i * 1.2566371 - 1.5707963;                 // 72 deg steps from the top
+      gfx_line(cx2 + cos(a) * r, cy2 + sin(a) * r,
+               cx2 + cos(a + 2.5132741) * r, cy2 + sin(a + 2.5132741) * r, 1);
+      i += 1;
+    );
+    on ? (                                           // filled when starred
+      gfx_circle(cx2, cy2, r * 0.42, 1, 1);
+    );
+  ) : which == 1 ? (                  // GEAR
+    gfx_circle(cx2, cy2, r * 0.92, 0, 1);
+    gfx_circle(cx2, cy2, r * 0.38, 0, 1);
+    i = 0;
+    loop(8,
+      a = i * 0.7853982;
+      gfx_line(cx2 + cos(a) * r * 0.92, cy2 + sin(a) * r * 0.92,
+               cx2 + cos(a) * r * 1.38, cy2 + sin(a) * r * 1.38, 1);
+      i += 1;
+    );
+  ) : which == 2 ? (                  // BACK
+    gfx_triangle(cx2 - r * 0.9, cy2, cx2 + r * 0.3, cy2 - r, cx2 + r * 0.3, cy2 + r);
+    gfx_rect(cx2 + r * 0.3, cy2 - r * 0.34, r * 0.7, r * 0.68);
+  ) : (                               // UP
+    gfx_triangle(cx2, cy2 - r * 0.9, cx2 - r, cy2 + r * 0.3, cx2 + r, cy2 + r * 0.3);
+    gfx_rect(cx2 - r * 0.34, cy2 + r * 0.3, r * 0.68, r * 0.7);
+  );
+  hot && edge && !dim;
+);
+
+// One toolbar button. Returns 1 on the press edge inside it.
+// _fb_tw/_fb_th are GLOBAL on purpose: gfx_measurestr writes through its args,
+// and EEL2 function locals are the wrong shape for that.
+function swing_fb_btn(bx, by, bw, bh, lbl, on, edge) local(hot)
+(
+  hot = mouse_x >= bx && mouse_x < bx + bw && mouse_y >= by && mouse_y < by + bh;
+  on ? gfx_set(0.30, 0.52, 0.68, hot ? 0.95 : 0.78)
+     : gfx_set(1, 1, 1, hot ? 0.13 : 0.06);
+  gfx_rect(bx, by, bw, bh);
+  swing_fb_font(FB_FS_BTN, 1);
+  gfx_measurestr(lbl, _fb_tw, _fb_th);
+  gfx_set(_fb_tc, _fb_tc, _fb_tc, on ? 1 : 0.72);
+  gfx_x = bx + (bw - _fb_tw) * 0.5; gfx_y = by + (bh - _fb_th) * 0.5;
+  gfx_drawstr(lbl);
+  hot && edge;
+);
+
+// ── draw ────────────────────────────────────────────────────────────────────
+// The RAIL's own menu. "How do I get that out of the list?" has to be
+// answerable from the row you are looking at.
+// ⚠️ Only a STARRED root offers Remove -- a drive or a standard place is not
+// ours to take away -- so the index table has TWO shapes and fb_tmenu_rem says
+// which one is on screen.
+function swing_fb_tmenu_open(mx, my)
+(
+  strcpy(#fb_menu, "#");
+  strcat(#fb_menu, #fb_menu_name);
+  // ⚠️⚠️ THE CONDITIONAL ITEM GOES LAST. With Remove in the middle the menu had
+  // two different index tables and the handler had to consult a flag to know
+  // which one was on screen -- so picking Remove could land on Reveal instead,
+  // which is a menu item that appears to do nothing. Last means index 5 can
+  // only ever BE Remove, and only exists when it is offered.
+  //   1 header · 2 show · 3 expand/collapse · 4 reveal · 5 remove (if starred)
+  strcat(#fb_menu, "|Show in the list|Expand / collapse|^g Reveal in Explorer");
+  fb_tmenu_rem ? strcat(#fb_menu, "|^a Remove from this list");
+  swing_popup_open(mx, my, #fb_menu, SP_POPUP_CALLER_FB_TREE);
+);
+
+// ══ THE FOLDER TREE ═════════════════════════════════════════════════════════
+// A rail of folders beside the list. The LIST follows the TREE; the tree does
+// not follow the list, so opening a pack never throws away where you were.
+//
+// ⭐ Every unexpanded folder shows a twisty whether or not it has children, and
+// expanding an empty one just shows nothing. That is deliberate: asking "do you
+// have children?" per visible row is one directory listing per row, and probe 1
+// measured REAPER's listing cache as SINGLE-SLOT -- 40 rows of that during a
+// scan ran 100x slower. A twisty that occasionally opens onto nothing is a far
+// smaller cost than a browser that stalls while you scroll.
+function swing_fb_tree_draw(tx, ty, tw, th, edge)
+  local(i, ry, rh, nlen, ci, hot, dep, fl, tidx, cx, cy, ind, vis, over, rk)
+(
+  swing_fb_tree_snapshot();
+
+  gfx_set(_fb_gr * 0.94, _fb_gg * 0.94, _fb_gb * 0.94, 1);
+  gfx_rect(tx, ty, tw, th);
+  gfx_set(_fb_tc, _fb_tc, _fb_tc, 0.10);
+  gfx_rect(tx + tw - 1, ty, 1, th);              // divider against the list
+
+  rh   = 18 + max(0, fb_fsz);
+  vis  = max(1, ((th - 6) / rh) | 0);
+  over = mouse_x >= tx && mouse_x < tx + tw && mouse_y >= ty && mouse_y < ty + th;
+
+  over && _fb_g_wheel != 0 ? (
+    fbt_scroll = max(0, min(max(0, _fbt_total - vis),
+                            fbt_scroll - (_fb_g_wheel > 0 ? 3 : -3)));
+    _fbt_pagereq != fbt_scroll ? (
+      _fbt_pagereq = fbt_scroll; swing_fb_tree_request(0, 0);
+    );
+    // ⚠️ CONSUME it. The file list reads the same stashed wheel further down and
+    // has no idea the rail exists, so without this one notch over the tree
+    // scrolled BOTH columns at once.
+    _fb_g_wheel = 0;
+  ) : _fbt_sel >= 0 && (_fbt_sel < _fbt_off || _fbt_sel >= _fbt_off + vis) ? (
+    // Follow the folder you are in. _fbt_sel indexes the WHOLE tree, so it is
+    // compared against the published window rather than the local scroll.
+    // Suppressed while the wheel is being used -- otherwise the rail would drag
+    // itself back the moment you scrolled away from the current folder.
+    fbt_scroll = max(0, _fbt_sel - ((vis / 3) | 0));
+    _fbt_pagereq != fbt_scroll ? (
+      _fbt_pagereq = fbt_scroll; swing_fb_tree_request(0, 0);
+    );
+  );
+
+  swing_fb_font(FB_FS_ROW, 0);
+  _fbt_prevk = 0;                 // group tracker, per draw
+  i = 0; ry = ty + 3;
+  while (i < _fbt_n && ry + rh <= ty + th) (
+    nlen = _fb_trows[i * FB_REC + FBT_R_LEN];
+    dep  = _fb_trows[i * FB_REC + FBT_R_DEPTH];
+    fl   = _fb_trows[i * FB_REC + FBT_R_FLAGS];
+    tidx = _fb_trows[i * FB_REC + FBT_R_TIDX];
+    // Indent stops growing at depth 6 -- past that the name has nowhere left
+    // to go and a deep library would push every row off the rail.
+    // ⭐ 9 -> 7 PAYS FOR THE ICON COLUMN. The prefix in front of a name went
+    // from 13 px to 22, and dropping 2 px per level hands most of that back: a
+    // depth-1 row loses 7 px of name, depth 4 loses one, and depth 5 and deeper
+    // come out AHEAD of where they were. Every row gains a folder icon for it.
+    ind  = 4 + min(dep, 6) * 7;
+    hot  = over && mouse_y >= ry && mouse_y < ry + rh;
+    cy   = ry + (rh / 2) | 0;
+
+    (fl & 2) ? (
+      gfx_set(_fb_tc, _fb_tc, _fb_tc, 0.13); gfx_rect(tx + 1, ry, tw - 2, rh);
+    ) : hot ? (
+      gfx_set(_fb_tc, _fb_tc, _fb_tc, 0.06); gfx_rect(tx + 1, ry, tw - 2, rh);
+    );
+
+    // Top level groups itself: your stars, the standard places, then the
+    // drives. A hairline where the kind changes turns eleven rows into three
+    // short lists, and the icon says which is which without a caption.
+    rk = dep == 0 ? ((fl / 8) | 0) & 3 : 0;
+    dep == 0 && rk > 0 ? (
+      rk != _fbt_prevk && _fbt_prevk > 0 ? (
+        gfx_set(_fb_tc, _fb_tc, _fb_tc, 0.13);
+        gfx_rect(tx + 6, ry, tw - 12, 1);
+      );
+      _fbt_prevk = rk;
+    );
+
+    // ── TWISTY COLUMN: tx+ind .. tx+ind+10 ──
+    !(fl & 4) ? (                                  // has, or may have, children
+      cx = tx + ind;
+      gfx_set(_fb_tc, _fb_tc, _fb_tc, 0.55);
+      (fl & 1) ?
+        gfx_triangle(cx, cy - 2, cx + 8, cy - 2, cx + 4, cy + 3) :
+        gfx_triangle(cx + 1, cy - 4, cx + 1, cy + 4, cx + 6, cy);
+    );
+
+    // ── ICON COLUMN: centred on tx+ind+15, so it spans ind+9.5 .. ind+20.5 ──
+    // ⛔⛔ THESE TWO USED TO SHARE ONE COLUMN. The icon was centred at ind+6 --
+    // spanning ind+0.5 to ind+11.5 -- and the twisty drew at ind..ind+8 AFTERWARDS,
+    // straight over the top of it. Every icon in the rail was painted out, so all
+    // eleven rows read as an arrow and a word. And only the ROOTS ever asked for
+    // one: `swing_fb_icon` was called under `dep == 0 && rk > 0`, so no actual
+    // subfolder had an icon to lose in the first place.
+    // Now: a folder on EVERY row, in the FILE LIST's colours so a folder is the
+    // same object in both halves of the strip, and the folder you are standing
+    // in (flags bit1) opens.
+    // ⚠️ A starred root or a drive keeps its own glyph even when it IS the cwd:
+    // the star is what makes that row findable, and the row highlight plus full
+    // alpha already say you are here.
+    rk == 1 ? gfx_set(0.95, 0.78, 0.35, (fl & 2) ? 1 : 0.90) :   // starred
+    rk == 3 ? gfx_set(0.65, 0.70, 0.78, (fl & 2) ? 1 : 0.80)     // drive
+            : gfx_set(0.85, 0.72, 0.40, (fl & 2) ? 1 : 0.85);    // folder
+    rk == 1 ? swing_fb_icon(3, 1, tx + ind + 15, cy, 11) :
+    rk == 3 ? swing_fb_icon(3, 3, tx + ind + 15, cy, 11)
+            : swing_fb_icon((fl & 2) ? 4 : 1, 0, tx + ind + 15, cy, 11);
+
+    gfx_set(_fb_tc, _fb_tc, _fb_tc, (fl & 2) ? 1.0 : 0.82);
+    gfx_x = tx + ind + 22; gfx_y = ry + ((rh - gfx_texth) / 2) | 0;
+    // ⚠️ CLIPPED TO THE RAIL, not to a character count. A fixed 26-char cap is
+    // wrong twice over: proportional fonts make 26 chars any width they like,
+    // and an indented row has less room than a top-level one -- so long library
+    // names ran straight past the divider and painted over the file list.
+    // Drawing until the pen reaches the edge is exact at any depth or font.
+    ci = 0;
+    while (ci < nlen && gfx_x < tx + tw - 5) (
+      gfx_drawchar(_fb_trows[i * FB_REC + FBT_R_NAME + ci]);
+      ci += 1;
+    );
+    // Say so when it did not fit, rather than just stopping mid-word.
+    ci < nlen ? (
+      gfx_set(_fb_tc, _fb_tc, _fb_tc, 0.45);
+      gfx_x = tx + tw - 13; gfx_drawchar($'.'); gfx_drawchar($'.');
+    );
+
+    // The twisty toggles, the ICON AND NAME navigate. Two targets in one row, so
+    // the split has to be somewhere the eye already sees: the glyph's own column.
+    // ⚠️ 12 -> 10, to match the twisty column above. Left at 12 it reached 2 px
+    // into the folder icon, so the left edge of a folder toggled instead of
+    // opening it -- the kind of near-miss that just feels like a missed click.
+    hot && edge ? (
+      mouse_x < tx + ind + 10 && !(fl & 4) ?
+        swing_fb_tree_request(1, tidx) :
+        swing_fb_tree_request(2, tidx);
+    );
+    hot && _fb_g_rmbdown ? (
+      fb_tmenu_tidx = tidx;
+      // ⚠️ Recomputed from `fl` rather than read from the `rk` local. A local in
+      // this file was measured going stale mid-function (the drag promotion),
+      // and this one decides whether the menu OFFERS Remove at all -- a stale
+      // 0 here is a starred folder you cannot get rid of.
+      fb_tmenu_rem  = (dep == 0 && (((fl / 8) | 0) & 3) == 1) ? 1 : 0;
+      strcpy(#fb_menu_name, "");
+      ci = 0; loop(min(nlen, 30),
+        str_setchar(#fb_menu_name, ci, _fb_trows[i * FB_REC + FBT_R_NAME + ci]);
+        ci += 1;);
+      swing_fb_tmenu_open(mouse_x, mouse_y);
+    );
+
+    ry += rh; i += 1;
+  );
+
+  _fbt_n < 1 ? (
+    gfx_set(_fb_tc, _fb_tc, _fb_tc, 0.45);
+    swing_fb_font(FB_FS_STAT, 0);
+    gfx_x = tx + 8; gfx_y = ty + 10;
+    gfx_drawstr((_fbt_flags & 1) ? "Opening..." : "No folders");
+  );
+);
+
+// ══ RIGHT-CLICK MENU ════════════════════════════════════════════════════════
+// Swing-styled popup, not gfx_showmenu -- the rest of the plugin migrated off
+// that deliberately and a native menu here would look imported.
+//
+// ⚠️ Selection is by 1-BASED INDEX and the '#' header counts as item 1, so the
+// labels are display-only and cannot break routing. Keep the numbering below in
+// step with the strings or a menu pick fires the wrong action.
+//
+// The popup has no nested submenus, so "Add as layer" opens a SECOND popup at
+// the same point. Two clicks, and the layer list gets the whole menu to itself
+// rather than four cramped rows -- which is what makes it easy to hit.
+function swing_fb_menu_open(mx, my) local(i)
+(
+  fb_menu_x = mx; fb_menu_y = my;
+  strcpy(#fb_menu, "#");
+  strcat(#fb_menu, #fb_menu_name);
+  fb_menu_kind == 0 ? (
+    //  2 load · 3 layer · 4 preview · 5 reveal · 6 copy · 7 star
+    strcat(#fb_menu, "|Load onto pad|Add as layer...|Preview");
+    strcat(#fb_menu, "|^g Reveal in Explorer|^g Copy path|^a Star this folder");
+  ) : (
+    //  2 open · 3 star
+    strcat(#fb_menu, "|Open|^a Star this folder|^g Reveal in Explorer");
+  );
+  swing_popup_open(mx, my, #fb_menu, SP_POPUP_CALLER_FB_ROW);
+);
+
+function swing_fb_menu_layers() local(i)
+(
+  //  2 next free, then 3.. = layer 1..MAX_LAYERS
+  strcpy(#fb_menu, "#Add as layer|^b Next free layer");
+  i = 0;
+  loop(MAX_LAYERS,
+    strcat(#fb_menu, "|Layer ");
+    strcat(#fb_menu, sprintf(#fb_menu_num, "%d", i + 1));
+    i += 1;
+  );
+  swing_popup_open(fb_menu_x, fb_menu_y, #fb_menu, SP_POPUP_CALLER_FB_LAYER);
+);
+
+// Act on a pick. Split out so the index table lives next to the strings above.
+// ⚠️ Reads swing_popup_result DIRECTLY rather than caching it in a local: a
+// local in this file was measured going stale mid-function (see the drag
+// promotion), and a menu that silently picks the wrong item is the same class
+// of failure as a drag that silently does nothing.
+function swing_fb_menu_result()
+(
+  (swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_FB_ROW) ? (
+    fb_menu_kind == 0 ? (
+      swing_popup_result == 2 ? swing_fb_request(3, fb_menu_ridx, sel_pad) :
+      swing_popup_result == 3 ? swing_fb_menu_layers() :
+      swing_popup_result == 4 ? swing_fb_request(12, fb_menu_ridx, -1) :
+      swing_popup_result == 5 ? swing_fb_request(14, fb_menu_ridx, -1) :
+      swing_popup_result == 6 ? swing_fb_request(15, fb_menu_ridx, -1) :
+      swing_popup_result == 7 ? swing_fb_request(11, 0, -1);
+    ) : (
+      swing_popup_result == 2 ? ( fb_scroll = 0; swing_fb_request(1, fb_menu_ridx, -1); ) :
+      swing_popup_result == 3 ? swing_fb_request(11, 0, -1) :
+      swing_popup_result == 4 ? swing_fb_request(14, fb_menu_ridx, -1);
+    );
+    // ⚠️ NOT consumed when it opened the layer step: swing_fb_menu_layers has
+    // just set a new result/caller pair and clearing here would wipe it.
+    swing_popup_result == 3 && fb_menu_kind == 0 ? 0 : ( swing_popup_result = 0; );
+  ) : (swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_FB_TREE) ? (
+    //  2 show · 3 expand/collapse · [4 remove] · last = reveal
+    swing_popup_result == 2 ? swing_fb_tree_request(2, fb_tmenu_tidx) :
+    swing_popup_result == 3 ? swing_fb_tree_request(1, fb_tmenu_tidx) :
+    swing_popup_result == 5 ? swing_fb_tree_request(4, fb_tmenu_tidx) :
+                              swing_fb_tree_request(5, fb_tmenu_tidx);
+    swing_popup_result = 0;
+  ) : (swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_FB_LAYER) ? (
+    fb_drag_layer = swing_popup_result == 2
+                      ? min(p_layer_cnt[max(0, sel_pad)], MAX_LAYERS - 1)
+                      : min(swing_popup_result - 3, MAX_LAYERS - 1);
+    swing_fb_request(7, fb_menu_ridx, sel_pad);
+    swing_popup_result = 0;
+  );
+);
+
+function swing_fb_draw(x, y, w, h)
+  local(gx, px, pw, i, ry, p, kind, nlen, ci, hot, sel, listy, listh,
+        vis, maxs, alive, cx, cy, lmb, edge, ext, _lum, _tc, _gr, _gg, _gb,
+        _bw, _bx, _dc, _dr, _di, _dcx, _dcy, _dox, _doy, _dpw, _dph,
+        _fy, _rh, _ty, _pkb, _wx, _wy, _ww, _wh, _pi, _pmx, _pmn, _pcx,
+        _pst, _plh, _pc, _ply, _tw, _sx, _shot, _gy, _gi, _gw, _my)
+(
+  // Ground colour is the user's choice. Default takes the pad TRAY, so the strip
+  // reads as part of the chassis. LCD mode takes the theme's SCREEN instead --
+  // that is the retro-hardware look, and on the SSL theme it is a light grey
+  // panel, which is exactly the vibe rather than a bug.
+  fb_lcd ? ( _gr = lcd_bg_r;    _gg = lcd_bg_g;    _gb = lcd_bg_b;    )
+         : ( _gr = pad_well_r;  _gg = pad_well_g;  _gb = pad_well_b;  );
+  // Pick text from measured luminance rather than assuming a dark theme -- this
+  // has to work across all 14 themes AND both ground choices.
+  _lum = _gr * 0.299 + _gg * 0.587 + _gb * 0.114;
+  _tc  = _lum > 0.55 ? 0.12 : 0.90;
+  _fb_tc = _tc;
+  // The tree draws from a function of its own, so the ground has to reach it.
+  _fb_gr = _gr; _fb_gg = _gg; _fb_gb = _gb;
+
+  // Keys first, so a filter change is on the wire before the rows are drawn.
+  swing_fb_menu_result();
+  // ⛔⛔ SAY HELLO. A STRIP THAT COMES BACK OPEN NEVER ASKED FOR ANYTHING.
+  // The bridge marks a slot `active` in ONE place -- eon_fb_handle_req, on the
+  // first REQ_SEQ it has not seen -- and it only writes that slot's heartbeat
+  // while it is active. Every swing_fb_request call site is behind a click, a
+  // key or a drag; the chevron's is the one that used to open the conversation.
+  // Since ser_ver 66 the strip RESTORES open, so on a project reload nobody
+  // clicks anything: no request, no active slot, no heartbeat, and the face
+  // reports "Browser bridge not running" at a bridge that is running perfectly.
+  // ⭐ The tree has the identical bug one band over (ser_ver 67 restores fb_tree,
+  // and only the TREE button posts a rebuild) -- which is why the rail came back
+  // saying "No folders" rather than showing the drive it was left on.
+  //
+  // ⚠️⚠️ GUARDED ON `_reg_my_slot >= 0`. It starts at -1 and @block claims it on
+  // first run, and swing_fb_band() CLAMPS with max(0, ...) -- so asking before
+  // the claim would post this instance's request into SLOT 0, i.e. into another
+  // Swing's mailbox. Waiting a frame costs nothing.
+  fb_open && !_fb_hello && _reg_my_slot >= 0 ? (
+    _fb_hello = 1;
+    swing_fb_request(0, 0, -1);
+    fb_tree ? ( fbt_scroll = 0; _fbt_pagereq = -1; swing_fb_tree_request(3, 0); );
+  );
+
+
+  // Keys: the filter box owns them while it has focus, otherwise the LIST does.
+  // ⚠️ An embedded instance gets no keyboard at all, so neither runs there.
+  !is_embedded ? ( fb_filt_focus ? swing_fb_filter_keys() : _fb_want_keys = 1; );
+
+  // The old pad-triggered audition is GONE. It loaded onto a pad and played the
+  // pad, which is why it fought AUTOLOAD, overwrote the kit, and failed silently
+  // when the length-change it watched for never came. AUDITION now drives the
+  // browser's OWN voice (_prv_*), so it never touches a pad at all.
+
+  // ══ MOUSE EDGES ═══════════════════════════════════════════════════════════
+  // ⚠️⚠️ These went MISSING once already: a slice that removed the old audition
+  // machinery took them with it, and because `edge` and `rel` are declared in
+  // local() they silently read 0 rather than failing to compile. Every control
+  // in the strip died at once -- chevron, AUTOLOAD, AUDITION, PLACES, the star --
+  // while the panel still drew perfectly and still opened when forced. If the
+  // strip ever goes visible-but-dead again, look HERE first.
+  //
+  // ⭐ The press edge comes from SWING, not from a shadow of our own. Swing
+  // computes `lmb_down = LMB && !prev_LMB` once per @gfx pass
+  // (Swing_ReaKit.jsfx:5964) and every widget in the plugin uses it;
+  // swing_fb_gate stashed the real value before zeroing it for this column, so
+  // _fb_g_lmbdown IS that edge, unmodified. A second shadow of the same state
+  // is just a second thing that can be wrong.
+  lmb  = (mouse_cap & 1) ? 1 : 0;
+  edge = _fb_g_lmbdown;
+  // Release has no house equivalent (nothing else needs one), so a shadow stays
+  // for that -- and ONLY for that.
+  // ⚠️⚠️ A GLOBAL, not the `rel` local. `lmb` -- declared in the same local()
+  // list -- was measured reading 0 at the drag test while mouse_cap read 1 at
+  // both ends of the same call, and moving the promotion off that local is what
+  // finally made drag-to-pad promote. The release edge is the other half of the
+  // same gesture and rides on the same kind of variable, so it moves too rather
+  // than waiting to be the next thing that mysteriously does nothing.
+  _fb_rel = (!(mouse_cap & 1) && _fb_lmb_prev) ? 1 : 0;
+  _fb_lmb_prev = (mouse_cap & 1) ? 1 : 0;
+
+  gx = x + w - FB_GUTTER_W;             // gutter PINNED to the window's right edge
+  px = x;                               // panel opens leftward, toward the pads
+  // Derived from the ANIMATED width, not from fb_open: on a close, `fb_open` is
+  // already 0 while the window is still giving the width back, and a panel that
+  // vanishes in one frame while its window keeps shrinking is the other half of
+  // the reshape.
+  pw = max(0, w - FB_GUTTER_W);
+
+  // ── gutter + chevron ──
+  gfx_set(_gr * 0.72, _gg * 0.72, _gb * 0.72, 1);
+  gfx_rect(gx, y, FB_GUTTER_W, h);
+  // A seam on the INNER edge, so the gutter reads as a thing you can press
+  // rather than as the window's margin.
+  gfx_set(0, 0, 0, 0.30); gfx_rect(gx, y, 1, h);
+  gfx_set(1, 1, 1, 0.06);  gfx_rect(gx + 1, y, 1, h);
+  hot = mouse_x >= gx && mouse_x < gx + FB_GUTTER_W && mouse_y >= y && mouse_y < y + h;
+  hot ? ( gfx_set(1, 1, 1, 0.10); gfx_rect(gx, y, FB_GUTTER_W, h); );
+  // A grip in the middle of the run, so the target is findable without hunting
+  // for the arrow.
+  gfx_set(_tc, _tc, _tc, hot ? 0.5 : 0.25);
+  gfx_rect(gx + FB_GUTTER_W * 0.5 - 4, y + h * 0.5 - 30, 1, 22);
+  gfx_rect(gx + FB_GUTTER_W * 0.5 + 3, y + h * 0.5 - 30, 1, 22);
+  gfx_rect(gx + FB_GUTTER_W * 0.5 - 4, y + h * 0.5 + 8,  1, 22);
+  gfx_rect(gx + FB_GUTTER_W * 0.5 + 3, y + h * 0.5 + 8,  1, 22);
+  cx = gx + FB_GUTTER_W * 0.5;
+  cy = y + h * 0.5;
+  gfx_set(0.62, 0.70, 0.82, hot ? 1 : 0.72);
+  // chevron points the way it will MOVE, not the way it is
+  i = 0; loop(5,
+    fb_open ? (
+      gfx_line(cx - 2 + i * 0.5, cy - 5 + i, cx - 2 + i * 0.5, cy + 5 - i);
+    ) : (
+      gfx_line(cx + 2 - i * 0.5, cy - 5 + i, cx + 2 - i * 0.5, cy + 5 - i);
+    );
+    i += 1;
+  );
+  hot && edge ? ( fb_open = !fb_open; fb_open ? swing_fb_request(0, 0, -1); );
+
+  // ── panel body ──
+  // Three states, not two. While the strip is MOVING it draws as a plain
+  // filling ground with a lit leading edge: running a breadcrumb, a toolbar,
+  // 40 rows and a waveform through a dozen widths they hold for one frame each
+  // is what made opening read as a blink instead of an expansion.
+  (pw < 2) ? ( 0; ) : (
+    // ── the folder tree takes the left of the panel ──
+    // Everything below draws from px/pw, so moving them HERE is the whole
+    // integration: breadcrumb, toolbar, list, status strip and every hit test
+    // reflow into what is left without knowing the tree exists.
+    // The width test is the fallback that matters: a docked or embedded
+    // instance cannot grow its window, and a rail that leaves 60 px for
+    // filenames is worse than no rail.
+    // Width the rail is DRAWN at this frame: the live drag value while the
+    // splitter is held, the committed one otherwise -- and never more than the
+    // panel can spare. The clamp is what makes the docked case fall out for
+    // free: there is no window to grow, so a wide rail simply gives the list
+    // its floor back instead of squeezing it to nothing.
+    _tw = max(FB_TREE_MIN,
+              min(fb_split_drag ? _fb_tw_live : swing_fb_tree_w(),
+                  pw - FB_LIST_MIN));
+    fb_tree && pw > _tw + 90 ? (
+      _sx   = px + _tw;                      // the seam, in absolute canvas px
+      _shot = mouse_x >= _sx - FB_SPLIT_HIT && mouse_x < _sx + FB_SPLIT_HIT
+           && mouse_y >= y && mouse_y < y + h;
+
+      // ⚠️⚠️ THE RAIL MUST NOT SEE THE CLICK THAT GRABS THE SEAM. The seam sits
+      // INSIDE the rail's own rect, and a rail row's "select" zone runs all the
+      // way out to it -- so without suppressing the edge here, every grab of the
+      // splitter also jumped the file list to whatever folder you grabbed next
+      // to. Passing 0 costs the row nothing: 3 px is not a row click.
+      swing_fb_tree_draw(px, y, _tw, h, (_shot || fb_split_drag) ? 0 : edge);
+
+      // ⭐⭐ THE HANDLE IS ALWAYS THERE. The first version only lit the seam on
+      // hover, which is backwards: a control you cannot see is a control nobody
+      // knows they have, and at 26% alpha of the TEXT colour it was invisible on
+      // a light theme anyway (SSL's panel is near-white, so _tc goes DARK and a
+      // 2 px line at a quarter alpha disappears into the divider that was
+      // already there). A grip you can see at rest is the whole affordance.
+      //
+      // Three states, and each one has to be obvious at a glance:
+      //   rest  -- a quiet grip, enough to say "this moves"
+      //   hover -- grip and seam brighten, the handle widens
+      //   drag  -- the seam becomes a full-height lit rule
+      //
+      // ⭐ The grip is the GUTTER CHEVRON's idiom (short parallel marks), because
+      // that is already the plugin's word for "grab me" and a second vocabulary
+      // for the same gesture would just be noise.
+      // ⚠️ There is no resize cursor: JSFX has gfx_setcursor but nothing in this
+      // plugin calls it, and introducing it for one seam is its own decision.
+      _gy = y + h * 0.5;
+
+      // ⛔⛔ BUILT FROM LIGHT AND SHADOW, NOT FROM A TINT OF `_tc`. The first two
+      // attempts both drew this as low-alpha `_tc` and both came out too faint to
+      // see -- which is not bad luck, it is the method. `_tc` is chosen to be a
+      // READABLE TEXT colour against the ground, so on the SSL theme it is near
+      // BLACK on near-WHITE; a 1 px shape at half alpha of that lands right on
+      // top of the hairline divider already there and adds nothing. Black and
+      // white hairlines make a GROOVE, and a groove reads on any of the 14
+      // themes because it is the same physics on all of them.
+      gfx_set(0, 0, 0, fb_split_drag ? 0.42 : _shot ? 0.34 : 0.26);
+      gfx_rect(_sx - 1, y, 1, h);
+      gfx_set(1, 1, 1, fb_split_drag ? 0.18 : _shot ? 0.14 : 0.10);
+      gfx_rect(_sx, y, 1, h);
+
+      // Dragging: the whole rule goes to the chevron's blue, so the edge being
+      // PLACED is the brightest thing on screen. Drawn under the grip, not over
+      // it -- the handle has to stay legible while it is the thing you are using.
+      fb_split_drag ? (
+        gfx_set(0.62, 0.70, 0.82, 0.9);
+        gfx_rect(_sx - 1, y, 2, h);
+      );
+
+      // ── the grip: a raised PART, not a smudge ──
+      // The pad takes its contrast from the GROUND's luminance, the same way the
+      // text does -- lifted on a dark theme, sunk on a light one. Either way it
+      // is a different value from what it sits on, which is the only thing that
+      // makes a shape appear.
+      // ⭐⭐ THREE STATES THAT ARE ACTUALLY THREE. The first cut separated them by
+      // one pixel of width and a few points of alpha, which rendered as ONE
+      // state wearing three names -- rest and hover were indistinguishable side
+      // by side. The PAD ITSELF carries the state now:
+      //   rest  -- neutral, a part of the chassis
+      //   hover -- wider, and warmed a quarter of the way to the drag colour, so
+      //            hovering PREVIEWS what grabbing will do
+      //   drag  -- the pad goes fully blue with its marks knocked out dark. The
+      //            handle you are holding is the brightest thing on the strip,
+      //            which is the whole answer to "show me that I am dragging".
+      _gw = (fb_split_drag || _shot) ? 7 : 5;
+      fb_split_drag ? gfx_set(0.62, 0.70, 0.82, 1) :
+      _shot ? (
+        _lum > 0.55 ? gfx_set(_gr * 0.80 + 0.10, _gg * 0.82 + 0.12, _gb * 0.86 + 0.16, 1)
+                    : gfx_set(_gr * 1.20 + 0.14, _gg * 1.22 + 0.16, _gb * 1.26 + 0.21, 1);
+      ) : (
+        _lum > 0.55 ? gfx_set(_gr * 0.86, _gg * 0.86, _gb * 0.88, 1)
+                    : gfx_set(_gr * 1.34 + 0.05, _gg * 1.34 + 0.05, _gb * 1.34 + 0.06, 1);
+      );
+      gfx_rect(_sx - _gw, _gy - FB_SPLIT_GRIP, _gw * 2, FB_SPLIT_GRIP * 2);
+      // bevel: dark on the top/left, light on the bottom/right
+      gfx_set(0, 0, 0, 0.38);
+      gfx_rect(_sx - _gw, _gy - FB_SPLIT_GRIP, 1, FB_SPLIT_GRIP * 2);
+      gfx_rect(_sx - _gw, _gy - FB_SPLIT_GRIP, _gw * 2, 1);
+      gfx_set(1, 1, 1, 0.16);
+      gfx_rect(_sx + _gw - 1, _gy - FB_SPLIT_GRIP, 1, FB_SPLIT_GRIP * 2);
+      gfx_rect(_sx - _gw, _gy + FB_SPLIT_GRIP - 1, _gw * 2, 1);
+
+      // Three EMBOSSED marks: a dark bar with a light one under its lip. 2 px
+      // wide, because a 1 px mark at any alpha is a rounding error on screen.
+      // Spanning -11..+11 so they sit centred in the 40 px pad.
+      _gi = 0;
+      loop(3,
+        _my = _gy - 11 + _gi * 9;
+        gfx_set(0, 0, 0, fb_split_drag ? 0.62 : _shot ? 0.72 : 0.60);
+        gfx_rect(_sx - 3, _my, 2, 4); gfx_rect(_sx + 1, _my, 2, 4);
+        gfx_set(1, 1, 1, fb_split_drag ? 0.34 : 0.28);
+        gfx_rect(_sx - 3, _my + 4, 2, 1); gfx_rect(_sx + 1, _my + 4, 2, 1);
+        _gi += 1;
+      );
+
+      _shot && edge ? ( fb_split_drag = 1; _fb_tw_live = _tw; );
+      fb_split_drag ? (
+        // Clamped against `pw`, the width the panel HAS -- so the drag can only
+        // ever redistribute what is already on screen. Growing the window to
+        // match happens once, on release, when the committed width steps.
+        _fb_tw_live = max(FB_TREE_MIN,
+                          min(min(FB_TREE_MAX, mouse_x - px), pw - FB_LIST_MIN));
+        _fb_rel ? ( fb_tw_off = _fb_tw_live - FB_TREE_W; fb_split_drag = 0; );
+      );
+
+      px += _tw; pw -= _tw;
+    ) : ( fb_split_drag = 0; );
+
+  // ── panel ground ──
+  gfx_set(_gr, _gg, _gb, 1);
+  gfx_rect(px, y, pw, h);
+  gfx_set(0, 0, 0, 0.35);
+  gfx_rect(px, y, 1, h);          // shadow line against the pad grid
+
+  // ── breadcrumb: an up ARROW, then the folder you are in ──
+  gfx_set(_gr * 0.62, _gg * 0.62, _gb * 0.62, 1);
+  gfx_rect(px, y, pw, FB_HDR_H);
+  gfx_set(0, 0, 0, 0.22);
+  gfx_rect(px, y + FB_HDR_H - 1, pw, 1);      // seats the row against the list
+
+  // BACK and UP are different journeys: up walks the TREE, back walks what you
+  // actually DID. Jumping in via PLACES has no parent at all, so up alone leaves
+  // you stranded. Both dim rather than silently doing nothing.
+  swing_fb_iconbtn(px + 2, y + 3, 22, FB_HDR_H - 6, 2, 0, !(_fb_flags & 32), edge)
+    ? ( fb_sel = -1; fb_sel_b = -1; fb_scroll = 0; swing_fb_request(13, 0, -1); );
+  swing_fb_iconbtn(px + 25, y + 3, 22, FB_HDR_H - 6, 3, 0, (_fb_flags & 4), edge)
+    ? ( fb_sel = -1; fb_sel_b = -1; fb_scroll = 0; swing_fb_request(2, 0, -1); );
+
+  // The path itself stays clickable as an "up" target -- same destination,
+  // much bigger than the arrow.
+  hot = mouse_x >= px + 48 && mouse_x < px + pw - 80
+        && mouse_y >= y && mouse_y < y + FB_HDR_H;
+  hot && !(_fb_flags & 4) ? ( gfx_set(1, 1, 1, 0.05); gfx_rect(px + 48, y, pw - 128, FB_HDR_H); );
+  // PLACES sits at the tail of the breadcrumb, where a home button belongs.
+  // Without it the only navigation is up and down, so reaching another library
+  // means walking to the drive root and back down again.
+  swing_fb_btn(px + pw - 52, y + 3, 48, FB_HDR_H - 6, "PLACES", 0, edge)
+    ? ( fb_sel = -1; fb_sel_b = -1; fb_scroll = 0; swing_fb_request(6, 0, -1); );
+  // STAR the folder you are in. Without this, PLACES could only ever SHOW
+  // favourites and never make one -- half a feature. FLAGS bit3 is the bridge
+  // telling us whether this folder is already starred.
+  // A drawn star, not an asterisk -- it fills in when the folder IS starred, so
+  // the button states its own answer instead of just being pressable.
+  swing_fb_iconbtn(px + pw - 78, y + 3, 24, FB_HDR_H - 6, 0,
+                   (_fb_flags & 8) ? 1 : 0, 0, edge)
+    ? swing_fb_request(11, 0, -1);
+
+  swing_fb_font(FB_FS_HDR, 1);
+  gfx_set(_tc, _tc, _tc, 0.92);
+  gfx_x = px + 52; gfx_y = y + (FB_HDR_H - FB_FS_HDR) * 0.5 - 1;
+  // The bridge publishes the TAIL of a long path — the deepest folders are the
+  // half that says where you are.
+  _fb_cwd_len > 0 ? (
+    ci = 0; loop(min(_fb_cwd_len, 24), gfx_drawchar(_fb_cwd[ci]); ci += 1;);
+  ) : gfx_drawstr("(no folder)");
+  hot && edge && !(_fb_flags & 4) ? ( fb_sel = -1; fb_sel_b = -1; fb_scroll = 0; swing_fb_request(2, 0, -1); );
+
+  // ── toolbar ── (UP lives in the breadcrumb now, so four switches fit here)
+  _bw = (pw - 10) / 4;
+  _bx = px + 4;
+  // AUTOLOAD and AUDITION are separate on purpose: one decides whether a click
+  // touches the kit at all, the other whether it makes a noise.
+  swing_fb_btn(_bx,       y + FB_HDR_H + 3, _bw - 2, FB_TOOL_H - 5, "AUTOLOAD", fb_autoload, edge)
+    ? fb_autoload = !fb_autoload;
+  swing_fb_btn(_bx + _bw, y + FB_HDR_H + 3, _bw - 2, FB_TOOL_H - 5, "AUDITION", fb_preview,  edge)
+    ? fb_preview = !fb_preview;
+  // SUBFOLDERS walks the tree instead of the one folder -- the big browser's
+  // own switch. Probe-measured 2026-08-29: a 25,000-file library walks in
+  // 384 ms and the scan is chunked, so it streams in rather than freezing.
+  swing_fb_btn(_bx + _bw * 2, y + FB_HDR_H + 3, _bw - 2, FB_TOOL_H - 5, "SUBFLD", fb_subfolders, edge)
+    ? ( fb_subfolders = !fb_subfolders; fb_scroll = 0; fb_sel = -1; fb_sel_b = -1;
+        swing_fb_request(10, 0, -1); );
+  // TREE and the gear share the fourth slot: a fifth full-width switch would
+  // have squeezed "AUTOLOAD" past the point where it still reads.
+  swing_fb_btn(_bx + _bw * 3, y + FB_HDR_H + 3, (_bw / 2) - 2, FB_TOOL_H - 5,
+               "TREE", fb_tree, edge)
+    ? ( fb_tree = !fb_tree;
+        // Rebuild from wherever the list is standing, so the rail opens around
+        // the folder you are already in rather than somewhere you left days ago.
+        fb_tree ? ( fbt_scroll = 0; _fbt_pagereq = -1; swing_fb_tree_request(3, 0); ); );
+  swing_fb_iconbtn(_bx + _bw * 3 + (_bw / 2), y + FB_HDR_H + 3, (_bw / 2) - 2,
+                   FB_TOOL_H - 5, 1, fb_settings_open, 0, edge)
+    ? fb_settings_open = !fb_settings_open;
+  // ── filter box ──
+  // ⚠️⚠️ `_fy` IS SET BEFORE THE FIRST THING THAT READS IT. RF used to be drawn
+  // four lines ABOVE this assignment, and an EEL2 local() persists between calls
+  // rather than resetting -- so RF was placed from LAST frame's `_fy`: at y=0 on
+  // the first frame the strip ever drew (button and hit box up outside the
+  // panel), and one frame stale on every rack-face <-> normal-face switch, which
+  // passes a different `y` into this function. Same class as the `lmb`/`edge`
+  // locals that killed every control in the strip; validate.py and
+  // eel_unassigned_locals both pass it, because the name IS assigned -- just
+  // later than it is read.
+  _fy = y + FB_HDR_H + FB_TOOL_H;
+  // REFRESH sits beside the filter's clear box: it is a rescan, not a mode.
+  swing_fb_btn(px + pw - 50, _fy + 3, 22, FB_FILT_H - 6, "RF", 0, edge)
+    ? swing_fb_request(4, 0, -1);
+  gfx_set(_gr * 0.5, _gg * 0.5, _gb * 0.5, 1);
+  gfx_rect(px + 4, _fy + 2, pw - 8, FB_FILT_H - 4);
+  hot = mouse_x >= px + 4 && mouse_x < px + pw - 4
+        && mouse_y >= _fy + 2 && mouse_y < _fy + FB_FILT_H - 2;
+  // is_embedded gets no keyboard at all, so never take focus there
+  hot && edge ? fb_filt_focus = is_embedded ? 0 : 1;
+  edge && !hot ? fb_filt_focus = 0;
+  fb_filt_focus ? (
+    gfx_set(0.35, 0.60, 0.85, 0.9);
+    gfx_rect(px + 4, _fy + 2, pw - 8, 1);
+    gfx_rect(px + 4, _fy + FB_FILT_H - 3, pw - 8, 1);
+  );
+  swing_fb_font(FB_FS_ROW, 0);
+  fb_filt_len > 0 ? (
+    gfx_set(_tc, _tc, _tc, 0.95);
+    gfx_x = px + 10; gfx_y = _fy + (FB_FILT_H - FB_FS_ROW) * 0.5 - 1;
+    gfx_drawstr(#fb_filt);
+    // clear
+    swing_fb_btn(px + pw - 26, _fy + 3, 20, FB_FILT_H - 6, "X", 0, edge) ? (
+      strcpy(#fb_filt, ""); fb_filt_len = 0; fb_scroll = 0;
+      swing_fb_send_filter();
+    );
+  ) : (
+    gfx_set(_tc, _tc, _tc, 0.35);
+    gfx_x = px + 10; gfx_y = _fy + (FB_FILT_H - FB_FS_ROW) * 0.5 - 1;
+    gfx_drawstr(is_embedded ? "filter needs a floating window" : "filter...");
+  );
+
+  listy = y + FB_HDR_H + FB_TOOL_H + FB_FILT_H;
+  listh = h - FB_HDR_H - FB_TOOL_H - FB_FILT_H - FB_STATUS_H;
+
+  // PLACES explains itself. It is a jump list -- starred folders, folders you
+  // were in recently, and your drives -- and without a caption it just looks
+  // like a folder full of oddly-named things.
+  (_fb_flags & 16) ? (
+    gfx_set(_gr * 0.6, _gg * 0.6, _gb * 0.6, 1);
+    gfx_rect(px, listy, pw, 30);
+    swing_fb_font(FB_FS_STAT, 1);
+    gfx_set(_tc, _tc, _tc, 0.8);
+    gfx_x = px + 10; gfx_y = listy + 3; gfx_drawstr("JUMP TO");
+    swing_fb_font(10, 0);
+    gfx_set(_tc, _tc, _tc, 0.45);
+    gfx_x = px + 10; gfx_y = listy + 17;
+    gfx_drawstr("starred folders, recent ones, and your drives");
+    listy += 30; listh -= 30;
+  );
+  _rh   = FB_ROW_H + fb_fsz;     // rows grow with the type, or it clips
+  vis   = max(1, (listh / _rh) | 0);
+
+  // ── bridge-not-running state, designed in rather than bolted on ──
+  // The heartbeat is a counter the bridge bumps every tick. If it stops moving
+  // for ~2 seconds of frames, say so plainly instead of showing a stale list
+  // that looks live. (FXP_HB precedent.)
+  _fb_hb == _fb_hb_last ? _fb_hb_still += 1 : _fb_hb_still = 0;
+  _fb_hb_last = _fb_hb;
+  alive = _fb_hb_still < 120;
+
+  // ⭐ AND RE-ARM THE HELLO WHILE IT LOOKS DEAD. A bridge that RESTARTS mid-session
+  // comes back with a fresh slot table -- `active` false again -- so it sits
+  // waiting for a request that will never come. That is the same handshake
+  // failure as a restored-open strip, just from the other end, and without this
+  // the only cure is for the user to go and click something.
+  // ⚠️ It re-asks on a TIMER rather than resetting _fb_hb_still, so a genuinely
+  // dead bridge still reads as dead -- the message stays put and only the
+  // question is repeated.
+  !alive ? ( _fb_reask += 1;
+             _fb_reask > 300 ? ( _fb_reask = 0; _fb_hello = 0; ); )
+         : ( _fb_reask = 0; );
+
+  !alive ? (
+    gfx_set(0.85, 0.6, 0.35, 0.9);
+    swing_fb_font(FB_FS_ROW, 0);
+    gfx_x = px + 10; gfx_y = listy + 14; gfx_drawstr("Browser bridge not running");
+    gfx_set(_tc, _tc, _tc, 0.45);
+    gfx_x = px + 10; gfx_y = listy + 32; gfx_drawstr("Start Swing's bridge script");
+  ) : _fb_n < 1 ? (
+    gfx_set(_tc, _tc, _tc, 0.45);
+    swing_fb_font(FB_FS_ROW, 0);
+    gfx_x = px + 10; gfx_y = listy + 14;
+    gfx_drawstr((_fb_flags & 1) ? "Reading folder..." :
+                (_fb_flags & 2) ? "Nothing playable here" : "...");
+  ) : fb_settings_open ? ( 0; ) : (
+
+    // ── rows ──
+    // Keys here rather than at the top of the function: paging needs `vis`, and
+    // `vis` is not known until the list geometry is.
+    // A keyboard move that ran off the loaded page asked for a new one and
+    // remembered where it was heading; land the selection now the page is here.
+    // ⚠️ Here and not in swing_fb_snapshot: the snapshot sits ABOVE these
+    // functions and EEL2 resolves names at parse time, so calling down from
+    // there is a whole-file compile kill, not a warning.
+    _fb_kbwant > 0 && (_fb_kbwant - 1) >= _fb_off
+                   && (_fb_kbwant - 1) < _fb_off + min(_fb_n, vis) ? (
+      swing_fb_kb_select(_fb_kbwant - 1 - _fb_off);
+      _fb_kbwant = 0;
+    );
+    _fb_want_keys ? ( _fb_want_keys = 0; swing_fb_list_keys(vis); );
+    maxs = max(0, _fb_total - vis);
+    fb_scroll = max(0, min(maxs, fb_scroll));
+    fb_hov = -1;
+    i = 0;
+    loop(min(_fb_n, vis),
+      p    = _fb_rows + i * FB_REC;
+      nlen = p[FB_R_LEN];
+      nlen > 0 ? (
+        ry   = listy + i * _rh;
+        kind = p[FB_R_KIND];   // 0 file, 1 folder, 2 parent, 3 place
+        hot  = mouse_x >= px && mouse_x < px + pw && mouse_y >= ry && mouse_y < ry + _rh;
+        sel  = fb_sel >= 0 && p[FB_R_RIDX] >= min(fb_sel, fb_sel_b)
+                           && p[FB_R_RIDX] <= max(fb_sel, fb_sel_b);
+        hot ? fb_hov = i;
+
+        sel ? (
+          gfx_set(0.20, 0.34, 0.48, 0.95); gfx_rect(px, ry, pw, _rh);
+          gfx_set(0.45, 0.70, 0.92, 1);    gfx_rect(px, ry, 2, _rh);
+        ) : hot ? ( gfx_set(1, 1, 1, 0.05); gfx_rect(px, ry, pw, _rh); );
+
+        // ⚠️ `ext` is read by the icon, by the drag arming and by the click
+        // handler. My icon rewrite dropped this assignment and the
+        // unassigned-local guard caught it immediately -- without it every file
+        // reads as extension 0, so an SFZ would load like a plain sample.
+        ext = p[FB_R_EXT];
+        // Row icon. Colour still carries the TYPE, but the shape carries the
+        // meaning -- a coloured block told you nothing on its own.
+        kind == 3 ? (
+          p[FB_R_PLKIND] == 1 ? gfx_set(0.95, 0.78, 0.35, sel ? 1 : 0.9) :   // starred
+          p[FB_R_PLKIND] == 3 ? gfx_set(0.65, 0.70, 0.78, sel ? 1 : 0.8)     // drive
+                              : gfx_set(0.55, 0.72, 0.92, sel ? 1 : 0.85);   // recent
+        ) :
+        kind >  0 ? gfx_set(0.85, 0.72, 0.40, sel ? 1 : 0.85) :
+        ext == 10 ? gfx_set(0.55, 0.80, 0.55, sel ? 1 : 0.88)
+                  : gfx_set(0.45, 0.68, 0.88, sel ? 1 : 0.82);
+        // For a place row the second argument carries the PLACE kind, not a
+        // file extension -- a place has no extension and the icon needs to know
+        // star from recent from drive.
+        swing_fb_icon(kind, kind == 3 ? p[FB_R_PLKIND] : ext,
+                      px + 13, ry + _rh * 0.5, 13);
+
+        swing_fb_font(FB_FS_ROW, 0);
+        gfx_set(_tc, _tc, _tc, sel ? 1 : (kind > 0 ? 0.88 : 0.80));
+        gfx_x = px + 24; gfx_y = ry + (_rh - FB_FS_ROW - fb_fsz) * 0.5 - 1;
+        ci = 0; loop(min(nlen, 34), gfx_drawchar(p[FB_R_NAME + ci]); ci += 1;);
+
+        // Right-click opens the row menu. Selecting first, so the menu always
+        // acts on the row you actually pointed at.
+        hot && _fb_g_rmbdown ? (
+          fb_menu_ridx = p[FB_R_RIDX]; fb_menu_kind = kind; fb_menu_ext = ext;
+          fb_sel = fb_menu_ridx; fb_sel_b = fb_sel;
+          strcpy(#fb_menu_name, "");
+          ci = 0; loop(min(nlen, 30),
+            str_setchar(#fb_menu_name, ci, p[FB_R_NAME + ci]); ci += 1;);
+          swing_fb_menu_open(mouse_x, mouse_y);
+        );
+
+        hot && edge ? (
+          // SHIFT keeps the anchor and moves the far end: that is a range.
+          // Anything else starts a fresh single-row selection.
+          SHIFT && fb_sel >= 0 && kind == 0 ? fb_sel_b = p[FB_R_RIDX]
+                                            : ( fb_sel = p[FB_R_RIDX]; fb_sel_b = p[FB_R_RIDX]; );
+          kind > 0 ? (
+            // folder or ".." — walk into it and start the list again at the top
+            fb_scroll = 0; fb_sel = -1; fb_sel_b = -1;
+            swing_fb_request(1, p[FB_R_RIDX], -1);
+          ) : (
+            // A press on a file only ARMS. Whether it was a click or a drag is
+            // not knowable yet, so the load waits for the release -- otherwise
+            // every drag would also load onto the focused pad on the way past.
+            fb_drag_state = 1;
+            // Dragging a row that is INSIDE the selection carries the whole
+            // range; dragging any other row carries just that one and resets
+            // the selection to it -- otherwise a stray drag would silently
+            // move files the user had forgotten were still selected.
+            sel ? (
+              fb_drag_ridx  = min(fb_sel, fb_sel_b);
+              fb_drag_count = abs(fb_sel_b - fb_sel) + 1;
+            ) : (
+              fb_drag_ridx  = p[FB_R_RIDX];
+              fb_drag_count = 1;
+            );
+            fb_drag_row   = i;
+            fb_drag_ext   = ext;
+            fb_drag_pad   = -1;
+            fb_drag_x0    = mouse_x;
+            fb_drag_y0    = mouse_y;
+          );
+        );
+      );
+      i += 1;
+    );
+
+    // ── scrollbar, only when it means something ──
+    _fb_total > vis ? (
+      gfx_set(1, 1, 1, 0.05);
+      gfx_rect(px + pw - 4, listy, 3, listh);
+      gfx_set(0.55, 0.65, 0.78, 0.55);
+      gfx_rect(px + pw - 4,
+               listy + (fb_scroll / max(1, _fb_total)) * listh,
+               3, max(14, (vis / max(1, _fb_total)) * listh));
+    );
+
+    // ── wheel: consume it so the pane behind cannot also act on it ──
+    // _fb_g_wheel is the copy the gate took before it zeroed the frame global.
+    // Reading mouse_wheel here would find nothing -- and would ALSO mean the
+    // pane behind had already been free to act on it.
+    _fb_g_wheel != 0 &&
+    mouse_x >= px && mouse_x < px + pw && mouse_y >= listy && mouse_y < listy + listh ? (
+      fb_scroll = max(0, min(maxs, fb_scroll - (_fb_g_wheel > 0 ? 3 : -3)));
+      swing_fb_request(0, 0, -1);
+    );
+  );
+
+  // ── settings ──
+  // Over the list rather than beside it: the strip is 292 px and a second
+  // column would leave neither usable. Things that belong to the STRIP live
+  // here; things you flip while working (autoload, audition, subfolders) stay
+  // out on the toolbar where they can be reached without a detour.
+  fb_settings_open ? (
+    gfx_set(_gr * 0.85, _gg * 0.85, _gb * 0.85, 1);
+    gfx_rect(px, listy, pw, listh);
+    gfx_set(_tc, _tc, _tc, 0.10);
+    gfx_rect(px, listy, pw, 1);
+
+    swing_fb_font(FB_FS_STAT, 1);
+    gfx_set(_tc, _tc, _tc, 0.55);
+    gfx_x = px + 10; gfx_y = listy + 10; gfx_drawstr("TYPEFACE");
+    swing_fb_font(FB_FS_ROW, 0);
+    gfx_set(_tc, _tc, _tc, 0.95);
+    gfx_x = px + 10; gfx_y = listy + 30; gfx_drawstr(swing_fb_font_name(fb_font));
+    swing_fb_btn(px + pw - 70, listy + 26, 28, 20, "<", 0, edge)
+      ? fb_font = (fb_font + FB_FONT_N - 1) % FB_FONT_N;
+    swing_fb_btn(px + pw - 38, listy + 26, 28, 20, ">", 0, edge)
+      ? fb_font = (fb_font + 1) % FB_FONT_N;
+
+    swing_fb_font(FB_FS_STAT, 1);
+    gfx_set(_tc, _tc, _tc, 0.55);
+    gfx_x = px + 10; gfx_y = listy + 62; gfx_drawstr("SIZE");
+    swing_fb_font(FB_FS_ROW, 0);
+    gfx_set(_tc, _tc, _tc, 0.95);
+    gfx_x = px + 10; gfx_y = listy + 82;
+    gfx_drawstr(sprintf(#, "%s%d", fb_fsz >= 0 ? "+" : "", fb_fsz));
+    swing_fb_btn(px + pw - 70, listy + 78, 28, 20, "-", 0, edge)
+      ? fb_fsz = max(-2, fb_fsz - 1);
+    swing_fb_btn(px + pw - 38, listy + 78, 28, 20, "+", 0, edge)
+      ? fb_fsz = min(8, fb_fsz + 1);
+
+    swing_fb_font(FB_FS_STAT, 1);
+    gfx_set(_tc, _tc, _tc, 0.55);
+    gfx_x = px + 10; gfx_y = listy + 114; gfx_drawstr("SKIN");
+    swing_fb_btn(px + 10, listy + 132, 90, 22, "CHASSIS", !fb_lcd, edge) ? fb_lcd = 0;
+    swing_fb_btn(px + 106, listy + 132, 90, 22, "LCD",     fb_lcd,  edge) ? fb_lcd = 1;
+
+    gfx_set(_tc, _tc, _tc, 0.35);
+    swing_fb_font(11, 0);
+    gfx_x = px + 10; gfx_y = listy + 168;
+    gfx_drawstr("LCD paints the strip in the theme's screen");
+    gfx_x = px + 10; gfx_y = listy + 182;
+    gfx_drawstr("colours instead of the pad tray.");
+
+    swing_fb_btn(px + 10, listy + listh - 32, pw - 20, 24, "DONE", 0, edge)
+      ? fb_settings_open = 0;
+  );
+
+  // ── status line: full detail on ONE file beats thin detail on all of them.
+  //    That is what earns this strip its 34 px, and it is why there are no
+  //    per-row columns above.
+  gfx_set(_gr * 0.72, _gg * 0.72, _gb * 0.72, 1);
+  gfx_rect(px, y + h - FB_STATUS_H, pw, FB_STATUS_H);
+  gfx_set(0, 0, 0, 0.25);
+  gfx_rect(px, y + h - FB_STATUS_H, pw, 1);
+  // ── waveform panel: ALWAYS here ──
+  // It holds its place whether or not a row is selected. A panel that appears
+  // and disappears makes the whole strip jump by 26 px every time you click,
+  // and an empty frame reads as "nothing selected" perfectly well on its own.
+  _wx = px + 8; _wy = y + h - 88; _ww = pw - 16; _wh = 58;
+  gfx_set(_gr * 0.45, _gg * 0.45, _gb * 0.45, 1);
+  gfx_rect(_wx, _wy, _ww, _wh);
+  gfx_set(_tc, _tc, _tc, 0.12);
+  gfx_rect(_wx, _wy + _wh * 0.5, _ww, 1);         // zero line, always drawn
+
+  // ── shared command channel watchdog ──
+  // BROWSE, kit loads and every sample load are gated on `gmem[KIT_GMEM_CMD]
+  // == 0` and do NOTHING, silently, when it is not. One stuck command makes
+  // half the instrument look broken with no clue anywhere. Say so instead.
+  gmem[KIT_GMEM_CMD] != 0 ? _fb_cmd_stuck += 1 : _fb_cmd_stuck = 0;
+  _fb_cmd_stuck > 120 ? (
+    gfx_set(0.90, 0.55, 0.30, 1);
+    gfx_rect(px, y + h - FB_STATUS_H, pw, 2);
+    swing_fb_font(FB_FS_STAT, 1);
+    gfx_x = px + 8; gfx_y = y + h - FB_STATUS_H + 5;
+    gfx_drawstr(sprintf(#, "command channel busy (%d) - loads blocked",
+                        gmem[KIT_GMEM_CMD]));
+  ) : (
+
+  swing_fb_font(FB_FS_STAT, 1);
+  gfx_set(_tc, _tc, _tc, 0.78);
+  gfx_x = px + 8; gfx_y = y + h - FB_STATUS_H + 5;
+  // Resolve the handle back to a visible row. If the selection scrolled off the
+  // page there is nothing to describe -- fall through to the item count.
+  p = 0; i = 0;
+  loop(_fb_n,
+    !p && _fb_rows[i * FB_REC + FB_R_LEN] > 0
+       && _fb_rows[i * FB_REC + FB_R_RIDX] == fb_sel ? p = _fb_rows + i * FB_REC;
+    i += 1;
+  );
+  fb_sel >= 0 && p ? (
+    ci = 0; loop(min(p[FB_R_LEN], 36), gfx_drawchar(p[FB_R_NAME + ci]); ci += 1;);
+    gfx_x = px + 8; gfx_y = y + h - FB_STATUS_H + 19;
+    gfx_set(_tc, _tc, _tc, 0.42);
+    // SR / channels / duration are published as 0 for now on purpose: probing
+    // every row would open every file in the folder. They get filled for the
+    // SELECTED row only — that work is not done yet, so say so rather than
+    // print three zeroes and look broken.
+    gfx_drawstr(
+      p[FB_R_KIND] > 0   ? "folder" :
+      p[FB_R_EXT] == 10  ? "SFZ kit - loads across 16 pads" :
+      p[FB_R_SR] > 0     ? sprintf(#, "%d ch  %d Hz  %d ms  %d KB",
+                                   p[FB_R_CH], p[FB_R_SR], p[FB_R_MS], p[FB_R_SIZE_KB])
+                         : "sample");
+
+    // Peaks over the frame drawn above. Fetched once per SELECTION, never per
+    // row -- that is what lets the list itself stay a plain list.
+    p[FB_R_KIND] == 0 && p[FB_R_EXT] != 10 ? (
+      _pkb = EON_SWBPK_BASE + max(0, min(EON_SWBROWSE_SLOTS - 1, _reg_my_slot)) * EON_SWBPK_STRIDE;
+      // ⭐ STEREO DRAWS AS STEREO. A stereo file gets two stacked lanes with a
+      // hairline between them; mono keeps the full height and one lane. Folding
+      // two channels into one hid the very thing you open a stereo sample to
+      // look at -- and the detail line right above already says "2 ch", so a
+      // single trace was actively contradicting it.
+      _pst = p[FB_R_CH] >= 2 ? 1 : 0;
+      _plh = _pst ? (_wh * 0.5 - 1) : _wh;
+      _pc  = 0;
+      loop(_pst ? 2 : 1,
+        _ply = _wy + _pc * (_wh * 0.5 + 1);
+        gfx_set(0.45, 0.72, 0.92, _pc ? 0.80 : 0.95);   // R a shade quieter
+        _pi = 0;
+        loop(FB_PK_N,
+          _pmx = gmem[_pkb + _pc * 2 * FB_PK_N + _pi];
+          _pmn = gmem[_pkb + _pc * 2 * FB_PK_N + FB_PK_N + _pi];
+          _pcx = _wx + (_pi / FB_PK_N) * _ww;
+          // at least a pixel, or a quiet file draws as nothing at all
+          gfx_rect(_pcx, _ply + _plh * 0.5 - max(0.5, _pmx * _plh * 0.5),
+                   max(1, _ww / FB_PK_N),
+                   max(1, (_pmx - _pmn) * _plh * 0.5));
+          _pi += 1;
+        );
+        _pc += 1;
+      );
+      _pst ? (
+        gfx_set(_tc, _tc, _tc, 0.13);
+        gfx_rect(_wx, _wy + _wh * 0.5, _ww, 1);         // the channel split
+      );
+    );
+  ) : (
+    gfx_x = px + 8; gfx_y = y + h - FB_STATUS_H + 12;
+    gfx_drawstr(sprintf(#, "%d items", _fb_total));
+  );
+
+  );   // command-channel watchdog
+
+  // ── transport for the preview voice ──
+  // These are real controls now, not a side effect of loading: the browser has
+  // its own player, so PLAY means play and STOP means stop.
+  _ty = y + h - 26;
+  swing_fb_btn(px + 8,  _ty, 44, 20, _prv_on ? "STOP" : "PLAY", _prv_on, edge) ? (
+    fb_prv_cmd = _prv_on ? 2 : 1;
+  );
+  swing_fb_btn(px + 56, _ty, 44, 20, "LOOP", fb_prv_loop, edge) ? fb_prv_loop = !fb_prv_loop;
+
+  // The house knob so it matches the rest of the instrument.
+  // ⚠️ jo_knob_interact reads lmb_down, which swing_fb_gate ZEROES over this
+  // column -- hand it the copy the gate took, then put the zero back. The strip
+  // paints last, but the overlays after it still read these globals.
+  lmb_down = _fb_g_lmbdown; LMB = _fb_g_lmbclick;
+  fb_prv_gain = jo_knob_interact(_fb_knob, px + pw - 26, _ty + 10, 11, fb_prv_gain);
+  lmb_down = 0; LMB = 0;
+  jo_knob_draw(px + pw - 26, _ty + 10, 11, fb_prv_gain, 0, 0.45, 0.72, 0.92);
+  swing_fb_font(10, 1);
+  gfx_set(_tc, _tc, _tc, 0.5);
+  gfx_x = px + pw - 62; gfx_y = _ty + 5; gfx_drawstr("VOL");
+
+  // ══ drag-to-pad ═══════════════════════════════════════════════════════════
+  // Last in the function, so the ghost and the target highlight land on top of
+  // the pad grid -- the strip as a whole already paints after it.
+
+  // 1 -> 2 once the pointer has actually travelled. Without the slop a shaky
+  // click would register as a drag and drop somewhere the user never aimed.
+  // ⚠️⚠️ READS mouse_cap DIRECTLY, not the `lmb` local set at the top of this
+  // function. Measured 2026-08-29 with an injected-mouse probe: at the top of
+  // the frame mouse_cap was 1 and (mouse_cap & 1) was 1, yet by the time this
+  // line ran `lmb` read 0 -- so a press ARMED (state 1) and then never promoted
+  // to a drag, which is exactly "nothing happens, no ghost". Whatever is
+  // clobbering that local between the two points, the button state is right
+  // here for the asking and a cached copy buys nothing.
+  fb_drag_state == 1 && (mouse_cap & 1) &&
+    (abs(mouse_x - fb_drag_x0) + abs(mouse_y - fb_drag_y0)) > FB_DRAG_SLOP ?
+      fb_drag_state = 2;
+
+  fb_drag_state == 2 ? (
+    // Hit-test the pad grid. Geometry mirrors swing_grid_draw_pads exactly --
+    // same origin, same stride, same face size as swing_grid_extdrag uses for
+    // the big browser's OS drag, so the lit pad is the one that will receive it.
+    fb_drag_pad = -1;
+    _dox = grid_x + 2; _doy = grid_y + 2;
+    _dpw = cell_w - 4; _dph = pad_h;
+    _dr = 0;
+    loop(4,
+      _dc = 0;
+      loop(4,
+        _dcx = _dox + _dc * cell_w;
+        _dcy = _doy + _dr * cell_h;
+        mouse_x >= _dcx && mouse_x <= _dcx + _dpw &&
+        mouse_y >= _dcy && mouse_y <= _dcy + _dph ? fb_drag_pad = (3 - _dr) * 4 + _dc;
+        _dc += 1;
+      );
+      _dr += 1;
+    );
+
+    // Light the landing pad, same treatment the OS-drag path uses so the two
+    // gestures read identically.
+    // Light the landing pad AND the run a multi-drop would fill, so the reach
+    // of the gesture is visible before committing to it. A layer drop stays on
+    // one pad however many files are held -- it stacks, it does not spread.
+    fb_drag_pad >= 0 ? (
+      _di = 0;
+      loop(ALT ? 1 : min(fb_drag_count, NUM_PADS - fb_drag_pad),
+        _dr  = 3 - (((fb_drag_pad + _di) / 4)|0);
+        _dc  = (fb_drag_pad + _di) - ((((fb_drag_pad + _di) / 4)|0) * 4);
+        _dcx = _dox + _dc * cell_w;
+        _dcy = _doy + _dr * cell_h;
+        gfx_set(1, 1, 1, _di == 0 ? 0.28 : 0.14);
+        gfx_rect(_dcx, _dcy, _dpw, _dph);
+        _di == 0 ? (
+          gfx_set(1, 1, 1, 0.85);
+          gfx_roundrect(_dcx - 1, _dcy - 1, _dpw + 2, _dph + 2, 4);
+        );
+        _di += 1;
+      );
+    );
+
+    // Ghost, carrying the name. Follows the cursor even outside the canvas --
+    // probe 2 proved the coordinates stay true out there.
+    _di = _fb_rows + fb_drag_row * FB_REC;
+    swing_fb_font(11, 0);
+    gfx_set(0.10, 0.13, 0.18, 0.88);
+    gfx_rect(mouse_x + 10, mouse_y - 8, 168, 18);
+    // Green = will land. Amber = will land as a LAYER (Alt). Grey = nowhere.
+    fb_drag_pad < 0 ? gfx_set(0.75, 0.78, 0.84, 0.8)
+                    : ALT ? gfx_set(0.95, 0.72, 0.30, 1)
+                          : gfx_set(0.45, 0.85, 0.55, 1);
+    gfx_rect(mouse_x + 10, mouse_y - 8, 3, 18);
+    gfx_set(0.92, 0.94, 0.97, 1);
+    gfx_x = mouse_x + 18; gfx_y = mouse_y - 5;
+    fb_drag_count > 1 ? (
+      gfx_drawstr(sprintf(#, "%d files", fb_drag_count));
+    ) : (
+      _dc = 0; loop(min(_di[FB_R_LEN], 22), gfx_drawchar(_di[FB_R_NAME + _dc]); _dc += 1;);
+    );
+    fb_drag_pad >= 0 && ALT ? (
+      gfx_set(0.95, 0.72, 0.30, 1);
+      gfx_x = mouse_x + 18; gfx_y = mouse_y + 12;
+      gfx_drawstr(sprintf(#, "+ LAYER %d", min(p_layer_cnt[fb_drag_pad], MAX_LAYERS - 1) + 1));
+    );
+  );
+
+  // ── resolve on release ──
+  _fb_rel && fb_drag_state > 0 ? (
+    fb_drag_state == 2 && fb_drag_pad >= 0 && fb_drag_ext != 10 ? (
+      // ALT = stack as a LAYER instead of replacing the pad. Same convention
+      // the big browser already uses (Swing_Browser.lua:4772), so the gesture
+      // means the same thing in both places.
+      // CMD 64 wants an explicit index, so pick the next free layer here --
+      // clamped, because a full pad should stack on the last one rather than
+      // silently do nothing.
+      ALT ? (
+        fb_drag_layer = min(p_layer_cnt[fb_drag_pad], MAX_LAYERS - 1);
+        swing_fb_request(7, fb_drag_ridx, fb_drag_pad);
+      ) : fb_drag_count > 1 ? swing_fb_request(8, fb_drag_ridx, fb_drag_pad)
+                            : swing_fb_request(3, fb_drag_ridx, fb_drag_pad);
+      sel_pad = fb_drag_pad;
+      // No arming here any more: verb 3 carries REQ_AUD, so the bridge queues
+      // the preview load right behind the pad load.
+    ) : fb_drag_state == 1 ? (
+      // Never moved, so it was a CLICK. Whether that touches the kit is the
+      // LOAD switch's business -- a drag always loads because it says where,
+      // but a click should be able to mean "show me this one" and nothing more.
+      // SFZ is never click-loaded either way: it is a 16-pad kit import.
+      (fb_autoload && fb_drag_ext != 10) ? (
+        // verb 3 = load the pad, and (via REQ_AUD) queue the preview behind it
+        swing_fb_request(3, fb_drag_ridx, sel_pad);
+      ) : (fb_preview && fb_drag_ext != 10) ? (
+        // autoload OFF but audition ON: hear it without touching the kit. This
+        // is the pairing the old pad-triggered audition could not express.
+        swing_fb_request(12, fb_drag_ridx, -1);
+      ) : swing_fb_request(5, fb_drag_ridx, -1);   // describe only
+    );
+    // dragged but released off the grid = CANCEL, deliberately doing nothing
+    fb_drag_state = 0; fb_drag_pad = -1;
+  );
+
+  );  // fb_open
+
+  // A drag must not survive the panel closing under it.
+  !fb_open ? ( fb_drag_state = 0; fb_drag_pad = -1; );
+);

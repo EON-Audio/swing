@@ -70,7 +70,8 @@ A full step sequencer built for Swing.
   plus groove import straight from a MIDI file
 - **824 factory patterns in a browser organised by role** — main, fill, build,
   break, perc — with genre chips and live counts
-- **Song mode** — named arrangements that switch at the play-next boundary
+- **Song mode** — named arrangements that switch at the play-next boundary,
+  with a song strip across the top of the sequencer (see the second beta)
 
 ### Drum Matrix
 
@@ -104,10 +105,11 @@ Inside Swing: a dedicated FX panel per pad with an interactive EQ graph, plus
 opt-in delay and reverb **return outputs** for multi-out rigs, and per-pad send
 knobs on the Drum Strip.
 
-New alongside them: **EON 76**, a bus compressor with a real gain-reduction
-needle. Multi-out can drop one on your drum bus for glue, and one always
+New alongside them: **EON Weld**, a bus compressor with a real gain-reduction
+needle. Multi-out puts one on your drum bus for glue, and **EON Anvil** always
 drives the new **Smash** return — parallel compression on a fader, fed by a
-per-pad SMASH send sitting next to DLY and RVB.
+per-pad SMASH send sitting next to DLY and RVB. Both get a section of their
+own under the second beta, below.
 
 ---
 
@@ -133,6 +135,17 @@ knobs as the plugin. The icon system was reworked to 46 solid-silhouette
 categories with hue-tinted variants that follow your pad colour out to track
 colours and sequencer lanes.
 
+### The VU meters
+
+Every needle in the suite runs on one new meter: the Drum Strip, Weld, Anvil,
+1175, ExpressBus, DirtSqueeze, Reelism and ChannelTool. It's built to the VU
+standard — a signal at reference takes 300 milliseconds to land and overshoots
+by about one percent — so it moves the way a hardware VU does and agrees with
+the stock meters on your other tracks. It's quicker than the needle you had.
+Twenty faces, from cream and ivory through the console looks to a few loud
+ones. Click the meter's cover to pick one; a face saved in an older project
+comes back as the nearest of the twenty.
+
 ### SFZ and RS5k
 
 Self-contained **SFZ export** — the WAVs travel with the kit — with import
@@ -145,6 +158,9 @@ handles velocity, round-robin and containers.
 
 - **Sweeping the EQ is silent.** The whole EQ path moved to state-variable
   filters, with a new Hi-Mid band and a Q wheel per bell.
+- **The reverb and delay buses each have their own on/off.** Switching a bus
+  off rings its tail out and keeps size, division, feedback and mix exactly
+  where you left them.
 - **The tune knob responds immediately**, and velocity-layered pads now pitch
   every layer correctly.
 - **Drag samples straight onto pads** — including onto a Swing embedded in the
@@ -166,6 +182,102 @@ handles velocity, round-robin and containers.
   Toolbar** action too.
 
 The full list is in the release notes.
+
+---
+
+## The second beta
+
+Everything above was in the first beta. This is what the second one adds.
+
+### EON Weld
+
+The bus compressor, rebuilt as the circuit. The gain cell, its sidechain and
+the timing network are the drawings of the console classic, and the whole
+thing is fitted to measured hardware traces rather than to a description of
+one. Threshold, ratio, attack, release, makeup and mix on a G-series face,
+light or dark, with an AUTO release and the real GR needle. It sits on the
+drum bus after MULTI, and works anywhere else you put it.
+
+![EON Weld](screenshots/weld.png)
+
+### EON Anvil
+
+A FET limiting amplifier solved from the schematic: the FET with its
+subthreshold tail, the sidechain amplifier, the timing network as drawn. Two
+voices — **Black**, calibrated on the original, and **Blue**, with its extra
+gain inside the loop — plus 4, 8, 12, 20 and the all-buttons trick.
+Input, output, attack, release, an XTRAS drawer, and its own GR needle. It
+drives the Smash return, and the rack build offers it for the bus too.
+
+![EON Anvil](screenshots/anvil.png)
+
+### The Console is a desk now
+
+Open CONSOLE and you get a full window: sixteen strips, an inserts band that
+shows every pad's FX chain as cards, sends, solo and mute, faders and a master
+strip that follows your routing. Click an empty slot and a compact picker
+opens over the desk; right-click a card to open, bypass, offline or embed the
+plugin, drag cards to reorder. Sections you don't need switch off.
+
+![The Console](screenshots/console.png)
+
+![The compact picker over the desk](screenshots/console_picker.png)
+
+### The FX picker
+
+The whole plugin catalogue in one view: banks and folders on the left, your
+plugins as a list or a wall of cards, categories with an icon each, REAPER's
+own categories in the rail, vendor on every row, and the pad's chain on the
+right. A CHAINS mode browses your FXChains and can replace a whole chain.
+The EON line has a drawn card each; the stock REAPER plugins and a good
+hundred others get one too.
+
+![The FX picker](screenshots/fxpicker.png)
+
+### Docking
+
+Click the SWING wordmark and Swing moves into a docker pane, folding into a
+**rack face**: a slim header and the full-size pad grid, built for a pane
+under the arrange. Steppa's wordmark does the same with its own **dock face**,
+one bar plus the lanes and grid. Both remember it — close the project, reopen
+it, and they come back docked. The dock layout picker arranges the EON panes
+around the arrange in a few layouts, or one of your own.
+
+![Swing and Steppa docked](screenshots/dock.png)
+
+### The song strip
+
+Song mode has a face. Your sections run across the top of the sequencer,
+drawn to length, named, coloured, the playhead sweeping through them. Each
+section is its own pattern, all of them stay loaded, and the grid shows the
+one you picked while the engine plays the one under the playhead. Click a
+block for its menu, hold one to listen. Zoom to a section or to the whole
+song from the strip, and the arrange scrolls the kit tracks into view.
+
+![Steppa with the song strip](screenshots/steppa_song.png)
+
+### Kit macros
+
+Eight macro knobs per kit, each mapped to any number of pad and kit
+parameters with its own range. An editor to assign them, DICE to try
+something, snapshots you can morph between, and the mappings travel with the
+kit. All thirteen factory kits carry a macro block.
+
+![The MACRO tab](screenshots/macro_tab.png)
+
+![The macro editor](screenshots/macros_decay.png)
+
+### Smaller things
+
+- A file browser inside Swing: folders in a rail, a splitter you can drag,
+  drop a sound on a pad.
+- The Drum Strip's floating window is a deck that reflows to its width, with
+  a gear menu in the header.
+- The Drum Matrix carries the feel both ways: swing, nudges, ties, accents,
+  CC lanes and step probability all ride the item.
+- The synth voice shows in the pad editor, and the 3D drum strikes on the hit.
+- Swing's send delay runs on the EON Delay engine.
+- Steppa's grid renders once and blits until something moves.
 
 ---
 
@@ -194,7 +306,7 @@ These are the changes most likely to have you hunting for something.
 
 **Keep a copy of any project you might need to open in 2.1.x again.**
 
-The project format moves from `ser_ver` 44 to 54. Your 2.1.x projects and kits
+The project format moves from `ser_ver` 44 to 57. Your 2.1.x projects and kits
 load into 3.0 cleanly — older fields fill in with sensible defaults. But 3.0
 writes per-pad data that 2.1.x has no reader for: synth voices, the new EQ
 bands, key ranges, pitch state. We haven't tested going backwards and we don't

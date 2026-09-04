@@ -365,6 +365,23 @@ function M.ZoomToSong()
   return frame_range(min_s, max_e, 0.05)
 end
 
+-- Loop-select the WHOLE pattern set + repeat on ("loop all patterns", user
+-- 2026-08-26). Same span math as ZoomToSong above -- deliberately no zoom here;
+-- the callers (bridge song-op 12) pair it with op 10 when they want both.
+function M.LoopAll()
+  local list = M.List()
+  if #list == 0 then status('EON DM: no patterns to loop'); return false end
+  local min_s, max_e = math.huge, -math.huge
+  for _, r in ipairs(list) do
+    if r.start < min_s then min_s = r.start end
+    if r.end_  > max_e then max_e = r.end_  end
+  end
+  if max_e <= min_s then return false end
+  reaper.GetSet_LoopTimeRange2(0, true, true, min_s, max_e, false)
+  if reaper.GetSetRepeat(-1) ~= 1 then reaper.GetSetRepeat(1) end
+  return true
+end
+
 -- Stamp an independent copy of the pattern's content at dest_t (nil = play
 -- cursor when rolling, else edit cursor — resolved inside lane_tools). Returns
 -- the number of notes inserted.

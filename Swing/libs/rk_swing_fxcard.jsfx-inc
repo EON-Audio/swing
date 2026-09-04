@@ -1,0 +1,1213 @@
+// rk_swing_fxcard.jsfx-inc — FX picker cards, drawn instead of blitted.
+//
+// Spec: .docs/specs/Spec_FX_Picker.md   Recipes: .refs/fx_picker_card_recipes.md
+// Reference art: .fxcards/out/*.png  (the baked deck — draw AGAINST it)
+//
+// ── WHY DRAWN ───────────────────────────────────────────────────────────────
+// The deck also exists as 145 baked PNGs, and those are a fine reference, but
+// they cannot be the shipping renderer for three reasons that are all about
+// SIZE:
+//
+//   1. The same card has to appear at ~55 px (console insert chips), ~191 px
+//      (the big-view wall) and ~288 px (LCD slot cards) — and every one of
+//      those moves again with the window, because @gfx is an ASPECT hint, not
+//      a pixel size, and once more on a HiDPI display. One raster master
+//      cannot serve that range. The spec already concedes the small end:
+//      "console chips = drawn not images".
+//   2. ReaKit's buffer convention gives slots 0..94 to `filename:` PNGs
+//      (95–126 are cache buffers, 127 is the knob blit — see
+//      .refs/jsfx_custom_gui_reference.md §7). 145 cards do not fit. With ~20
+//      visible and the list scrolling you get constant load-and-evict, and
+//      gfx_loadimg is a disk read plus a decode that must never run per frame.
+//      A drawn card costs zero slots.
+//   3. ~736 installed plugins have no card at all and need a drawn fallback
+//      regardless. Blitting the other 145 means maintaining two renderers.
+//
+// ── AND WHY IT IS SCALE-FREE, UNLIKE THE SOURCE ─────────────────────────────
+// ⚠️ The CSS these are ported from is NOT scale-free, and that is the single
+// biggest trap here. It mixes units: `m-krow` sizes each knob at `width:15%`
+// of the card but spaces the row with `box-shadow: 2.6em` against a hard
+// `font-size:8px`. So the knobs grow with the card while the gaps stay frozen
+// at 20.8 px — correct at the 144 px the sheet happens to render at, a smear
+// at 264. Baking had to pin the card to one width to dodge this.
+//
+// Here EVERY dimension is a fraction of w or h, so there is no correct width
+// and nothing to pin. Each `em` in the source was converted once, against the
+// 144x84 reference: 2.6em at font-size 8px = 20.8 px = 0.14444 w. Those
+// conversions are marked EM> below. Do not reintroduce a pixel constant.
+//
+// (c) EON Studios — All Rights Reserved
+
+// ⚠️ @init IS LOAD-BEARING. A .jsfx-inc without it registers ZERO functions and
+// still lints clean, because nothing was parsed (.docs/wiki/02-file-structure.md).
+@init
+
+// Motif ids — must match the generator in .dev_fxpicker/gen_fxcard_data.py.
+FXC_M_KROW    = 1;
+FXC_M_CURVE   = 2;
+FXC_M_VU      = 3;
+FXC_M_BIGKNOB = 4;
+FXC_M_SLIDERS = 5;
+FXC_M_KPAIR   = 6;
+FXC_M_STRIP   = 7;
+FXC_M_MODULES = 8;
+FXC_M_CURVEMULTI = 9;
+FXC_M_FLAT3      = 10;
+FXC_M_GRAPH      = 11;
+FXC_M_REELS      = 12;
+FXC_M_PROLL      = 13;
+FXC_M_VUTWIN     = 14;
+FXC_M_SPECTRUM   = 15;
+FXC_M_GEQ        = 16;
+FXC_M_WAVE       = 17;
+FXC_M_BANDS      = 18;
+// The stock ReaPlugs faces. Bespoke rather than parameterised: each is one card
+// and they share only a look -- light grey panels, thin sliders, no knobs.
+// ⭐ They are LIGHT (`Rea* family = LIGHT ReaPlugs panels`, recipes DB); an
+// earlier guess made them dark grey and the user corrected it.
+FXC_M_REACOMP    = 19;
+FXC_M_REAXCOMP   = 20;
+FXC_M_REAEQ      = 21;
+FXC_M_REAVERB    = 22;
+FXC_M_REALIMIT   = 23;
+FXC_M_REAGATE    = 24;
+FXC_M_REASURROUND= 25;
+FXC_M_REAPITCH   = 26;
+FXC_M_READELAY   = 27;
+FXC_M_REAINSERT  = 28;
+FXC_M_REAVOICE   = 29;
+FXC_M_SWING      = 30;
+FXC_M_STEPPA     = 31;
+// A camera lens, for the one product that IS one. EON Lens shows a kit's
+// artwork, and it was wearing m-flat3 -- three flat circles borrowed from
+// Valhalla's visual language, which says "reverb" to anyone who knows the
+// vocabulary and says nothing to anyone who does not.
+FXC_M_LENS       = 32;
+
+// Secondary elements, one bit each (the sheet allows at most two per card).
+FXC_E_BTNS   = 1;
+FXC_E_ROCKERS= 2;
+FXC_E_LEDS   = 4;
+FXC_E_RAILS  = 8;
+FXC_E_JEWEL  = 16;
+FXC_E_DISP   = 32;
+FXC_E_RINGS  = 64;
+FXC_E_AKNOB  = 128;
+FXC_E_GRILLE = 256;
+// `jewel` draws a PAIR by default -- right for HG-2's two tubes, wrong for a
+// single lamp. SOLO drops it to one (Decapitator's PUNISH button).
+FXC_E_SOLO   = 512;
+// The analyser skyline. ⚠️ An ELEMENT, not part of any motif -- 7 cards carry
+// it and they span THREE motifs (curvemulti, graph, curve). It was first
+// hardcoded inside curvemulti, which silently left MEqualizer, EON 4-Band EQ
+// and REQ without one. Its colour rides in FXC_ECOL: no card on the sheet
+// carries the analyser AND another coloured element, so the slot is free.
+FXC_E_AN     = 1024;
+
+FXC_V_V2 = 1;            // the sheet's `v2` composition override
+
+// Record layout. One card = FXC_REC cells.
+FXC_MOTIF = 0;
+FXC_B1    = 1;   // panel gradient, top
+FXC_B2    = 2;   // panel gradient, bottom
+FXC_K     = 3;   // knob body
+FXC_K2    = 4;   // knob body, lower stop (0 = reuse K)
+FXC_ACC   = 5;   // accent: top band, ring, module rail (-1 = none)
+FXC_PTR   = 6;   // pointer colour (-1 = no pointer)
+FXC_ECOL  = 7;   // secondary element colour
+FXC_ELEM  = 8;   // bitmask of FXC_E_*
+FXC_VAR   = 9;   // bitmask of FXC_V_*
+FXC_SL    = 10;  // slider-bar colour (-1 = default black wash)
+// curve-multi only: three band nodes, each a colour and a position. The sheet's
+// rule is that no two band-EQs ship the same node layout, so these are per-card
+// data, never defaults.
+FXC_C1    = 11;  FXC_N1X = 14;  FXC_N1Y = 15;
+FXC_C2    = 12;  FXC_N2X = 16;  FXC_N2Y = 17;
+FXC_C3    = 13;  FXC_N3X = 18;  FXC_N3Y = 19;
+// Optional per-card override of a secondary element's box, as left/top/width/
+// height fractions; -1 = use the element's own default. Only 4 of the 23
+// elements on the sheet override anything, but two of those are EchoBoy (whose
+// readout moves to the LEFT side) and Decapitator, so dropping them -- which an
+// earlier version of the extractor did -- puts real parts in the wrong place.
+FXC_EX    = 20;  FXC_EY  = 21;  FXC_EW  = 22;  FXC_EH  = 23;
+FXC_REC   = 24;
+
+// ── colour helpers ──────────────────────────────────────────────────────────
+// Colours are packed 0xRRGGBB, matching the recipe table and the bucket
+// palette in rk_swing_ui_fxview.jsfx-inc.
+function _fxc_set(c, a)
+(
+  gfx_set(((c / 65536) | 0) / 255,
+          (((c / 256) | 0) % 256) / 255,
+          (c % 256) / 255, a);
+);
+
+// Mix toward black (t=1 -> black). Used for the moulded ring inside a knob and
+// for panel shading, so a light face darkens the same way a dark one does.
+function _fxc_shade(c, t, a)
+  local(r, g, b)
+(
+  r = ((c / 65536) | 0) / 255;
+  g = (((c / 256) | 0) % 256) / 255;
+  b = (c % 256) / 255;
+  gfx_set(r * (1 - t), g * (1 - t), b * (1 - t), a);
+);
+
+// Perceived brightness of a packed colour, 0..1.
+// ⭐ Used to pick the node ring, the 0 dB line and the analyser against the
+// PANEL rather than storing them per card. The CSS had those three hardcoded
+// light, which silently assumed every band-EQ was dark -- so turning Kirchhoff
+// white made its rings and reference line vanish, and both had to be
+// parameterised by hand. Deriving them here means a light card cannot have
+// that bug in the first place.
+// _fxc_shade sets the colour; the blank card's variants need to PASS one to
+// primitives that take a colour argument, so this returns instead of setting.
+function _fxc_shade_c(c, t)
+  local(r, g, b)
+(
+  r = min(255, ((c / 65536) | 0) * t);
+  g = min(255, (((c / 256) | 0) % 256) * t);
+  b = min(255, (c % 256) * t);
+  ((r | 0) * 65536) + ((g | 0) * 256) + (b | 0);
+);
+
+function _fxc_lum(c)
+(
+  (0.299 * ((c / 65536) | 0) +
+   0.587 * (((c / 256) | 0) % 256) +
+   0.114 * (c % 256)) / 255;
+);
+
+// Vertical panel gradient. gfx_gradrect takes the colour at the origin plus a
+// per-pixel delta, so the delta has to be divided by the height -- getting that
+// wrong is invisible on a short card and obvious on a tall one.
+function _fxc_panel(x, y, w, h, c1, c2)
+  local(r1, g1, b1, r2, g2, b2)
+(
+  r1 = ((c1 / 65536) | 0) / 255;
+  g1 = (((c1 / 256) | 0) % 256) / 255;
+  b1 = (c1 % 256) / 255;
+  r2 = ((c2 / 65536) | 0) / 255;
+  g2 = (((c2 / 256) | 0) % 256) / 255;
+  b2 = (c2 % 256) / 255;
+  gfx_gradrect(x, y, w, h, r1, g1, b1, 1,
+               0, 0, 0, 0,
+               (r2 - r1) / h, (g2 - g1) / h, (b2 - b1) / h, 0);
+);
+
+// No ellipse primitive in EEL2, so scan it out one row at a time.
+// ⚠️ The obvious version -- a rect per row at whatever width the maths gives --
+// staircases badly, and a VU bezel is mostly near-horizontal edge, which is
+// exactly where the steps are longest. It read as visibly jagged at 191 px on
+// all 13 vu cards. So each row also stamps its two edge pixels at partial
+// alpha, proportional to how much of that pixel the ellipse actually covers.
+// That is horizontal antialiasing done by hand, and it costs two rects a row.
+// gfx has no colour stack, so the current colour is captured and restored.
+function _fxc_ellipse(cx, cy, rx, ry)
+  local(r, g, b, a, y0, n, yy, dy, hw, iw, fw)
+(
+  r = gfx_r; g = gfx_g; b = gfx_b; a = gfx_a;
+  y0 = ceil(cy - ry); n = max(1, (floor(cy + ry) - y0 + 1) | 0);
+  yy = y0;
+  loop(n,
+    dy = (yy + 0.5 - cy) / ry;
+    hw = rx * sqrt(max(0, 1 - dy * dy));
+    hw > 0.5 ? (
+      iw = floor(hw);
+      gfx_set(r, g, b, a);
+      gfx_rect(cx - iw, yy, iw * 2, 1);
+      fw = hw - iw;
+      fw > 0.02 ? (
+        gfx_set(r, g, b, a * fw);
+        gfx_rect(cx - iw - 1, yy, 1, 1);
+        gfx_rect(cx + iw, yy, 1, 1);
+      );
+    );
+    yy += 1;
+  );
+  gfx_set(r, g, b, a);
+);
+
+// A box with a rounded top and a flat bottom -- CSS `border-radius: 50% 50% 0 0`.
+// ⚠️ NOT an ellipse. Drawing these as a full ellipse rounds the bottom as well,
+// and the shape reads as a blob floating in the tile rather than a form
+// standing on the card. ReaLimit's loudness column and the `wave` motif's hump
+// are both this, and both were wrong until they weren't.
+function _fxc_domebox(bx, by, bw, bh, ry)
+  local(r, g, b, a, yy, n, dy, hw, iw, fw)
+(
+  r = gfx_r; g = gfx_g; b = gfx_b; a = gfx_a;
+  ry = min(ry, bh);
+  yy = ceil(by); n = max(1, (ceil(by + ry) - yy) | 0);
+  loop(n,                                    // the cap, antialiased like the ellipse
+    dy = (by + ry - (yy + 0.5)) / ry;
+    hw = (bw * 0.5) * sqrt(max(0, 1 - dy * dy));
+    hw > 0.5 ? (
+      iw = floor(hw);
+      gfx_set(r, g, b, a);
+      gfx_rect(bx + bw * 0.5 - iw, yy, iw * 2, 1);
+      fw = hw - iw;
+      fw > 0.02 ? (
+        gfx_set(r, g, b, a * fw);
+        gfx_rect(bx + bw * 0.5 - iw - 1, yy, 1, 1);
+        gfx_rect(bx + bw * 0.5 + iw, yy, 1, 1);
+      );
+    );
+    yy += 1;
+  );
+  gfx_set(r, g, b, a);
+  gfx_rect(bx, by + ry, bw, bh - ry);        // the square-shouldered body
+);
+
+// Upper half of an ellipse, stroked. This is the shape behind both the VU scale
+// arc and the whole `curve` motif -- CSS drew them as a border-top on a box
+// with a 50%/100% radius, which is exactly a half-ellipse.
+// c2 >= 0 paints the last `split` fraction of the sweep in c2: the VU's red
+// end-segment. ⭐ The user rejected a needle-only VU; the ARC across the face
+// is what reads as a meter.
+function _fxc_arc_top(cx, cy, rx, ry, th, c1, c2, split, a)
+  local(i, n, t, px, py, qx, qy)
+(
+  // ⚠️ NOT stacked offset lines. gfx_line has no width, and offsetting copies
+  // vertically leaves gaps wherever the curve runs steep -- fine across the top
+  // of the arc, visibly broken down the sides. Stamping an antialiased dot at
+  // each sample gives a constant-width stroke all the way round instead.
+  n = max(12, (rx * 2.2) | 0);
+  i = 0;
+  loop(n + 1,
+    t  = $pi - ($pi * i / n);
+    px = cx + cos(t) * rx;  py = cy - sin(t) * ry;
+    (c2 >= 0 && i / n >= 1 - split) ? _fxc_set(c2, a) : _fxc_set(c1, a);
+    gfx_circle(px, py, max(0.6, th * 0.5), 1, 1);
+    i += 1;
+  );
+);
+
+// The analyser skyline. Same 16-point silhouette the sheet clips its `.an`
+// element to -- a shared vocabulary element, so it is deliberately identical on
+// every card that has one. Held as a ternary chain rather than a table so this
+// lib stays allocation-free and needs no init() from the host.
+function _fxc_sky_y(i)
+(
+  i ==  0 ? 0.58 : i ==  1 ? 0.72 : i ==  2 ? 0.42 : i ==  3 ? 0.64 :
+  i ==  4 ? 0.30 : i ==  5 ? 0.56 : i ==  6 ? 0.22 : i ==  7 ? 0.50 :
+  i ==  8 ? 0.34 : i ==  9 ? 0.62 : i == 10 ? 0.44 : i == 11 ? 0.70 :
+  i == 12 ? 0.52 : i == 13 ? 0.74 : i == 14 ? 0.60 : 0.70;
+);
+
+function _fxc_skyline(x, y, w, h, c, a_bot, a_top)
+  local(bx, bw, by, bh, i, n, t, sx, sw, ty, u, seg, f, r, g, b)
+(
+  bx = x + w * 0.05; bw = w * 0.87;
+  by = y + h * 0.50; bh = h * 0.46;
+  r = ((c / 65536) | 0) / 255;
+  g = (((c / 256) | 0) % 256) / 255;
+  b = (c % 256) / 255;
+  n = max(16, (bw * 0.5) | 0);
+  i = 0;
+  loop(n,
+    t = i / (n - 1);
+    // Interpolate between the 16 silhouette points so the column count can
+    // follow the card width -- at chip size this is 16 columns, at LCD size 70.
+    seg = t * 15; f = seg - (seg | 0);
+    u = _fxc_sky_y(seg | 0) * (1 - f) + _fxc_sky_y(min(15, (seg | 0) + 1)) * f;
+    sx = bx + bw * t; sw = ceil(bw / n) + 1;
+    ty = by + bh * u;
+    gfx_gradrect(sx, ty, sw, by + bh - ty, r, g, b, a_top,
+                 0, 0, 0, 0, 0, 0, 0, (a_bot - a_top) / max(1, by + bh - ty));
+    i += 1;
+  );
+);
+
+// ── ReaPlugs vocabulary ─────────────────────────────────────────────────────
+// A stack of generic slider rows with a handle on each -- the thing that makes
+// a stock JS/ReaPlugs face instantly identifiable, and the reason a screenshot
+// of one is useless in a picker: they all look like this.
+function _fxc_rows(x, y, w, h, n, hcol, tcol)
+  local(i, ry, rh)
+(
+  rh = h / n;
+  i = 0;
+  loop(n,
+    ry = y + i * rh;
+    _fxc_set(tcol, 1);
+    gfx_rect(x, ry + rh * 0.36, w, max(1, rh * 0.28));
+    _fxc_set(hcol, 1);
+    gfx_rect(x + w * (0.18 + 0.18 * (i % 4)), ry + rh * 0.10,
+             max(2, w * 0.12), rh * 0.80);
+    i += 1;
+  );
+);
+
+// A vertical meter: `fill` of it lit from the bottom in c, the rest in bg.
+function _fxc_meter(x, y, w, h, fill, c, bg)
+(
+  _fxc_set(bg, 1); gfx_rect(x, y, w, h);
+  _fxc_set(c, 1);  gfx_rect(x, y + h * (1 - fill), w, h * fill);
+);
+
+// A jagged analyser silhouette, filled to the bottom of its box. Second
+// silhouette in the deck -- the `spectrum` motif's, distinct from `.an`'s.
+function _fxc_spec(x, y, w, h, c, a)
+  local(i, n, t, u, sx, sw, ty, seg, f)
+(
+  n = max(16, (w * 0.5) | 0);
+  i = 0;
+  loop(n,
+    t = i / (n - 1);
+    seg = t * 14; f = seg - (seg | 0);
+    u = _fxc_sky_y(seg | 0) * (1 - f) + _fxc_sky_y(min(15, (seg | 0) + 1)) * f;
+    sx = x + w * t; sw = ceil(w / n) + 1; ty = y + h * u;
+    _fxc_set(c, a);
+    gfx_rect(sx, ty, sw, y + h - ty);
+    i += 1;
+  );
+);
+
+// ── the knob ────────────────────────────────────────────────────────────────
+// Ported from the source's stacked radial gradients: body, a moulded ring at
+// 66-76% of the radius, a highlight up and left, a dark seat, and the pointer.
+// Every radius is a fraction of r, so it holds together at 20 px and at 200.
+function _fxc_knob(cx, cy, r, kc, k2c, ptr, ring, ringc)
+  local(rr)
+(
+  ring > 0 ? (
+    ringc >= 0 ? _fxc_set(ringc, 0.9) : gfx_set(0, 0, 0, 0.4);
+    gfx_circle(cx, cy, r + max(1, r * 0.11), 1, 1);
+  ) : (
+    gfx_set(0, 0, 0, 0.38);
+    gfx_circle(cx, cy, r + max(1, r * 0.08), 1, 1);
+  );
+  _fxc_set(kc, 1);            gfx_circle(cx, cy, r, 1, 1);
+  _fxc_shade(kc, 0.42, 0.55); gfx_circle(cx, cy, r * 0.76, 1, 1);
+  _fxc_set(k2c >= 0 ? k2c : kc, 1);
+  gfx_circle(cx, cy, r * 0.62, 1, 1);
+  // Specular. Low alpha and offset up-left, matching `circle at 38% 30%`.
+  gfx_set(1, 1, 1, 0.20);
+  gfx_circle(cx - r * 0.24, cy - r * 0.30, r * 0.40, 1, 1);
+  ptr >= 0 ? (
+    _fxc_set(ptr, 1);
+    rr = max(1, r * 0.09);
+    gfx_rect(cx - rr * 0.5, cy - r * 0.84, max(1, rr), r * 0.72);
+  );
+);
+
+// ── secondary elements ──────────────────────────────────────────────────────
+function _fxc_elements(x, y, w, h, rec)
+  local(e, ec, i, bw, cx, cy, r, bx, by, bh, ox, oy, ow, oh)
+(
+  e = rec[FXC_ELEM]; ec = rec[FXC_ECOL];
+  ox = rec[FXC_EX]; oy = rec[FXC_EY]; ow = rec[FXC_EW]; oh = rec[FXC_EH];
+
+  // Drawn first, so nodes and curves land on top of it.
+  e & FXC_E_AN ? _fxc_skyline(x, y, w, h, ec >= 0 ? ec : 0x8291aa, 0.42, 0.10);
+
+  e & FXC_E_RAILS ? (                       // wood/metal side rails
+    _fxc_set(ec >= 0 ? ec : 0x5e422c, 1);
+    gfx_rect(x, y, w * 0.045, h);
+    gfx_rect(x + w * 0.955, y, w * 0.045, h);
+  );
+  e & FXC_E_GRILLE ? (                      // slotted grille, top third
+    _fxc_shade(0x161310, 0, 0.45);
+    gfx_rect(x + w * 0.08, y + h * 0.10, w * 0.84, h * 0.30);
+    gfx_set(0, 0, 0, 0.55);
+    i = 0; bw = max(2, w * 0.035);
+    loop((w * 0.84 / bw) | 0,
+      gfx_rect(x + w * 0.08 + i * bw, y + h * 0.10, max(1, bw * 0.4), h * 0.30);
+      i += 1;
+    );
+  );
+  e & FXC_E_LEDS ? (                        // gain-reduction ladder
+    bx = x + w * 0.08; by = y + h * 0.10; bw = w * 0.34; bh = max(2, h * 0.06);
+    i = 0;
+    loop(11,
+      i / 11 < 0.4 ? _fxc_set(0x4ad07a, 1) :
+      i / 11 < 0.7 ? _fxc_set(0xd0a848, 1) : _fxc_set(0xdc463c, 1);
+      gfx_rect(bx + i * bw / 11, by, max(1, bw / 11 * 0.7), bh);
+      i += 1;
+    );
+  );
+  e & FXC_E_BTNS ? (                        // the 1176 ratio row
+    _fxc_set(ec >= 0 ? ec : 0xc8c8c4, 1);
+    bx = x + w * (ox >= 0 ? ox : 0.69); by = y + h * (oy >= 0 ? oy : 0.82);
+    bw = w * (ow >= 0 ? ow : 0.24);     bh = max(2, h * (oh >= 0 ? oh : 0.08));
+    i = 0;
+    loop(4, gfx_rect(bx + i * bw * 0.29, by, max(2, bw * 0.17), bh); i += 1;);
+  );
+  e & FXC_E_ROCKERS ? (                     // Pultec rocker pair
+    bx = x + w * 0.73; by = y + h * 0.12; bw = w * 0.20; bh = max(3, h * 0.10);
+    gfx_set(0, 0, 0, 0.40); gfx_rect(bx, by + bh * 0.42, bw, bh * 0.16);
+    _fxc_set(0xe2ded2, 1);
+    gfx_circle(bx + bw * 0.22, by + bh * 0.5, max(1.5, bh * 0.26), 1, 1);
+    gfx_circle(bx + bw * 0.72, by + bh * 0.5, max(1.5, bh * 0.26), 1, 1);
+  );
+  e & FXC_E_JEWEL ? (                       // tube / lamp glow
+    ec = ec >= 0 ? ec : 0xe0823a;
+    bw = w * (ow >= 0 ? ow : 0.08);         // square in PIXELS, so r is w-based
+    r = max(2, bw * 0.5);
+    cy = y + h * (oy >= 0 ? oy : 0.12) + r;
+    i = 0;
+    loop(e & FXC_E_SOLO ? 1 : 2,
+      // EM> -1.8em at font-size 10px on a 144 card = -18px = 0.125 w
+      cx = x + w * (ox >= 0 ? ox : 0.82) + r - i * w * 0.125;
+      _fxc_set(ec, 0.22); gfx_circle(cx, cy, r * 2.1, 1, 1);
+      _fxc_set(ec, 0.45); gfx_circle(cx, cy, r * 1.5, 1, 1);
+      _fxc_set(ec, 1);    gfx_circle(cx, cy, r, 1, 1);
+      i += 1;
+    );
+  );
+  e & FXC_E_DISP ? (                        // small readout with a lit row
+    bx = x + w * (ox >= 0 ? ox : 0.68); by = y + h * (oy >= 0 ? oy : 0.26);
+    bw = w * (ow >= 0 ? ow : 0.26);     bh = h * (oh >= 0 ? oh : 0.17);
+    _fxc_set(0x0a100c, 1); gfx_rect(bx, by, bw, bh);
+    gfx_set(1, 1, 1, 0.25);
+    gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
+    gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
+    _fxc_set(ec >= 0 ? ec : 0x5adc8c, 0.8);
+    gfx_rect(bx + 1, by + bh * 0.44, bw - 2, max(1, bh * 0.10));
+  );
+  e & FXC_E_RINGS ? (                       // scribed rings around a knob row
+    gfx_set(1, 1, 1, 0.45);
+    i = 0;
+    loop(4,
+      gfx_circle(x + w * (0.18 + i * 0.153), y + h * 0.62,
+                 w * 0.076, 0, 1);
+      i += 1;
+    );
+  );
+  e & FXC_E_AKNOB ? (                       // the one special knob (Maag AIR)
+    _fxc_knob(x + w * 0.85, y + h * 0.62, w * 0.09,
+              ec >= 0 ? ec : 0xc04038, -1, 0xf2f2ee, 0, -1);
+  );
+);
+
+// ── motifs ──────────────────────────────────────────────────────────────────
+function _fxc_motif(x, y, w, h, rec)
+  local(m, i, n, k, k2, acc, cx, cy, r, bx, by, bw, bh, sp, t)
+(
+  m = rec[FXC_MOTIF]; k = rec[FXC_K]; k2 = rec[FXC_K2];
+  acc = rec[FXC_ACC];
+
+m == FXC_M_FLAT3 ? (
+    // Valhalla's language: flat circles, no moulding, no specular. Drawing them
+    // as knobs would be wrong -- the flatness IS the brand.
+    gfx_set(0, 0, 0, 0.40); gfx_rect(x, y, w, h * 0.17);
+    k < 0 ? k = 0xf0e8dc;
+    _fxc_set(k, 1);
+    i = 0;
+    // EM> 4em at font-size 8px on a 144 card = 32px = 0.22222 w
+    loop(3,
+      gfx_circle(x + w * (0.24 + i * 0.22222), y + h * 0.56, w * 0.09, 1, 1);
+      i += 1;
+    );
+    gfx_set(1, 1, 1, 0.45);
+    bw = max(2, w * 0.042); i = 0;
+    loop((w * 0.84 / (bw * 2.17)) | 0,
+      gfx_rect(x + w * 0.08 + i * bw * 2.17, y + h * 0.88, bw, max(1, h * 0.04));
+      i += 1;
+    );
+  ) :
+
+  m == FXC_M_GRAPH ? (
+    bx = x + w * 0.08; by = y + h * 0.14; bw = w * 0.52; bh = h * 0.64;
+    _fxc_set(rec[FXC_C3] >= 0 ? rec[FXC_C3] : 0x1c1e22, 1);
+    gfx_rect(bx, by, bw, bh);
+    rec[FXC_C2] >= 0 ? (                       // the transfer-curve glow
+      i = 0;
+      loop(6,
+        _fxc_set(rec[FXC_C2], 0.10 * (1 - i / 6));
+        _fxc_ellipse(bx + bw * 0.50, by + bh * 0.46,
+                     bw * 0.30 * (1 + i * 0.18), bh * 0.17 * (1 + i * 0.20));
+        i += 1;
+      );
+    );
+    t = _fxc_lum(rec[FXC_C3] >= 0 ? rec[FXC_C3] : 0x1c1e22) > 0.5;
+    t ? gfx_set(0.25, 0.28, 0.34, 0.45) : gfx_set(0.80, 0.84, 0.90, 0.30);
+    gfx_rect(bx, by + bh * 0.46, bw, max(1, bh * 0.025));
+    rec[FXC_C1] >= 0 ? (
+      _fxc_set(rec[FXC_C1], 1);
+      gfx_circle(bx + bw * 0.24, by + bh * 0.56, max(1.5, w * 0.017), 1, 1);
+      gfx_circle(bx + bw * 0.50, by + bh * 0.32, max(1.5, w * 0.017), 1, 1);
+      gfx_circle(bx + bw * 0.76, by + bh * 0.58, max(1.5, w * 0.017), 1, 1);
+    );
+    gfx_set(0.5, 0.5, 0.5, 0.35);
+    gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
+    gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
+    _fxc_meter(x + w * 0.81, by, w * 0.09, bh, 0.55,
+               acc >= 0 ? acc : 0xc9b458, 0x14161a);
+  ) :
+
+  m == FXC_M_REELS ? (
+    // Two reels and the tape path between them. EM> 5.2em at 10.5px on 144 =
+    // 54.6px = 0.37917 w.
+    k < 0 ? k = 0x6a6f5c;
+    r = w * 0.13;
+    i = 0;
+    loop(2,
+      cx = x + w * (0.30 + i * 0.37917); cy = y + h * 0.40;
+      _fxc_set(0x16161a, 1); gfx_circle(cx, cy, r, 1, 1);
+      i == 0 ? (
+        _fxc_set(0x23241f, 1); gfx_circle(cx, cy, r * 0.78, 1, 1);
+        _fxc_set(k, 1);        gfx_circle(cx, cy, r * 0.70, 1, 1);
+        _fxc_set(0x23241f, 1); gfx_circle(cx, cy, r * 0.55, 1, 1);
+        _fxc_set(0xd8d4c8, 1); gfx_circle(cx, cy, r * 0.14, 1, 1);
+      ) : (
+        _fxc_set(0x23241f, 1); gfx_circle(cx, cy, r * 0.92, 1, 1);
+        gfx_set(0.85, 0.83, 0.78, 0.25); gfx_circle(cx, cy, r, 0, 1);
+        _fxc_set(0xd8d4c8, 1); gfx_circle(cx, cy, r * 0.12, 1, 1);
+      );
+      i += 1;
+    );
+    gfx_set(0.08, 0.08, 0.09, 0.85);
+    gfx_rect(x + w * 0.15, y + h * 0.56, w * 0.70, max(1, h * 0.030));
+    _fxc_set(0xd8d4c8, 1);
+    gfx_circle(x + w * 0.50, y + h * 0.60, max(1.5, w * 0.021), 1, 1);
+    gfx_set(0, 0, 0, 0.35); gfx_rect(x, y + h * 0.82, w, h * 0.18);
+  ) :
+
+  m == FXC_M_PROLL ? (
+    _fxc_set(0xe6e6e2, 1); gfx_rect(x, y, w * 0.11, h);   // the key rail
+    _fxc_set(0x16161a, 1);
+    i = 0;
+    loop(4,
+      gfx_rect(x, y + h * (0.09 + i * 0.24), w * 0.11, max(1, h * 0.06));
+      i += 1;
+    );
+    bx = x + w * 0.11; bw = w * 0.89;
+    gfx_set(0.5, 0.5, 0.5, 0.15);
+    i = 0;
+    loop(4, gfx_rect(bx, y + h * (0.23 + i * 0.23), bw, 1); i += 1;);
+    gfx_set(1, 1, 1, 0.30);
+    gfx_rect(bx + bw * 0.47, y, max(1, w * 0.010), h);
+    k = rec[FXC_C1] >= 0 ? rec[FXC_C1] : 0x3ab0d8;       // note blocks
+    _fxc_set(k, 1);
+    bh = max(2, h * 0.08);
+    gfx_rect(bx + bw * 0.16, y + h * 0.26, bw * 0.16, bh);
+    gfx_rect(bx + bw * 0.38, y + h * 0.42, bw * 0.22, bh);
+    gfx_rect(bx + bw * 0.62, y + h * 0.34, bw * 0.14, bh);
+    gfx_rect(bx + bw * 0.80, y + h * 0.56, bw * 0.20, bh);
+    gfx_rect(bx + bw * 0.30, y + h * 0.70, bw * 0.26, bh);
+  ) :
+
+  m == FXC_M_VUTWIN ? (
+    // EM> 6.3em at font-size 10px on a 144 card = 63px = 0.4375 w
+    i = 0;
+    loop(2,
+      cx = x + w * (0.27 + i * 0.4375); cy = y + h * 0.34;
+      _fxc_set(0x23272b, 1);
+      _fxc_ellipse(cx, cy, w * 0.15 + max(2, w * 0.020),
+                   h * 0.17 + max(2, w * 0.020));
+      _fxc_set(0xefe6c8, 1);
+      _fxc_ellipse(cx, cy, w * 0.15, h * 0.17);
+      i == 0 ? _fxc_arc_top(cx, y + h * 0.35, w * 0.11, h * 0.13,
+                            max(1.5, w * 0.014), 0x35322a, 0xc63c30, 0.28, 1);
+      _fxc_set(0x35322a, 1);
+      gfx_line(cx, cy + h * 0.14, cx + w * 0.06, cy - h * 0.11, 1);
+      i += 1;
+    );
+    _fxc_set(acc >= 0 ? acc : 0x74d68a, 1);
+    gfx_circle(x + w * 0.30, y + h * 0.84, max(1.5, w * 0.022), 1, 1);
+    gfx_circle(x + w * 0.68, y + h * 0.84, max(1.5, w * 0.022), 1, 1);
+  ) :
+
+  m == FXC_M_SPECTRUM ? (
+    acc < 0 ? acc = 0x5ec46a;
+    i = 0;
+    loop(6,
+      _fxc_set(acc, 0.07 * (1 - i / 6));
+      _fxc_ellipse(x + w * 0.50, y + h * 0.98,
+                   w * 0.40 * (1 + i * 0.14), h * 0.42 * (1 + i * 0.14));
+      i += 1;
+    );
+    _fxc_spec(x + w * 0.06, y + h * 0.51, w * 0.88, h * 0.44, acc, 0.7);
+  ) :
+
+  m == FXC_M_GEQ ? (
+    gfx_set(0, 0, 0, 0.40);                               // the slider bank
+    bx = x + w * 0.08; bw = w * 0.84; by = y + h * 0.12; bh = h * 0.76;
+    i = 0;
+    loop(9, gfx_rect(bx + bw * i * 0.107, by, max(1, bw * 0.030), bh); i += 1;);
+    _fxc_set(k >= 0 ? k : 0xe8e8e4, 1);
+    // The caps trace a curve -- that silhouette IS the motif.
+    i = 0;
+    loop(9,
+      t = i == 0 ? 0.62 : i == 1 ? 0.52 : i == 2 ? 0.43 : i == 3 ? 0.38 :
+          i == 4 ? 0.40 : i == 5 ? 0.47 : i == 6 ? 0.56 : i == 7 ? 0.63 : 0.58;
+      gfx_circle(x + w * (0.10 + i * 0.10), y + h * t, max(1.5, w * 0.021), 1, 1);
+      i += 1;
+    );
+  ) :
+
+  m == FXC_M_WAVE ? (
+    _fxc_set(0x868b96, 0.9);                              // the loudness hump
+    // left 8%, width 70%, bottom -18% -- it runs off the card on purpose.
+    _fxc_domebox(x + w * 0.08, y + h * 0.30, w * 0.70, h * 0.88, h * 0.44);
+    _fxc_set(acc >= 0 ? acc : 0xdc463c, 1);
+    bw = max(2, w * 0.040); i = 0;
+    loop((w * 0.84 / (bw * 3)) | 0,
+      gfx_rect(x + w * 0.08 + i * bw * 3, y + h * 0.05, bw, max(1, h * 0.07));
+      i += 1;
+    );
+  ) :
+
+  m == FXC_M_BANDS ? (
+    // EM> 1.9em at font-size 10px on an 84-tall card = 19px = 0.22619 h
+    _fxc_set(acc >= 0 ? acc : 0x6ec96e, 0.8);
+    i = 0;
+    loop(3,
+      gfx_rect(x + w * 0.12, y + h * (0.16 + i * 0.22619), w * 0.76, h * 0.12);
+      i += 1;
+    );
+  ) :
+
+  m == FXC_M_REACOMP ? (
+    _fxc_rows(x + w * 0.07, y + h * 0.16, w * 0.54, h * 0.70, 4, 0x6e6e68, 0xbcbcb6);
+    bx = x + w * 0.75; by = y + h * 0.12; bw = w * 0.17; bh = h * 0.76;
+    _fxc_set(0xf8f8f4, 1); gfx_rect(bx, by, bw, bh);
+    _fxc_meter(bx, by, bw * 0.44, bh, 0.55, 0x4ac06a, 0xf8f8f4);
+    _fxc_meter(bx + bw * 0.56, by, bw * 0.44, bh, 0.30, 0xe0823a, 0xf8f8f4);
+    _fxc_set(0xc04038, 1); gfx_rect(bx + bw * 0.56, by, bw * 0.44, max(1, bh * 0.06));
+    gfx_set(0.69, 0.69, 0.67, 1);
+    gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
+    gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
+  ) :
+
+  m == FXC_M_REAXCOMP ? (
+    bx = x + w * 0.08; bw = w * 0.84; by = y + h * 0.12; bh = h * 0.36;
+    _fxc_set(0xf6f6f2, 1); gfx_rect(bx, by, bw, bh);
+    i = 0;
+    loop(4,                                    // per-band reduction bars
+      _fxc_set(0xc04038, 1);
+      gfx_rect(bx + bw * (0.06 + i * 0.26), by, max(2, bw * 0.10), bh * 0.22);
+      _fxc_set(0x4ac06a, 1);
+      gfx_rect(bx + bw * (0.06 + i * 0.26), by + bh * 0.26,
+               max(2, bw * 0.10), bh * 0.74);
+      i += 1;
+    );
+    gfx_set(0.69, 0.69, 0.67, 1);
+    gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
+    gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
+    _fxc_rows(bx, y + h * 0.58, w * 0.80, h * 0.32, 2, 0x6e6e68, 0xbcbcb6);
+  ) :
+
+  m == FXC_M_REAEQ ? (
+    gfx_set(0, 0, 0, 0.06);                                // the plot grid
+    i = 0;
+    loop(7, gfx_rect(x + w * (i * 0.14), y, 1, h * 0.68); i += 1;);
+    i = 0;
+    loop(3, gfx_rect(x, y + h * (0.22 + i * 0.22), w, 1); i += 1;);
+    _fxc_set(0xa8a8a2, 1); gfx_rect(x, y + h * 0.68, w, h * 0.32);
+    _fxc_arc_top(x + w * 0.50, y + h * 0.54, w * 0.42, h * 0.24,
+                 max(1.5, w * 0.014), 0x3c3c3c, -1, 0, 0.85);
+    _fxc_set(0x3c3c3c, 1);
+    gfx_circle(x + w * 0.20, y + h * 0.40, max(1.5, w * 0.020), 1, 1);
+    gfx_circle(x + w * 0.40, y + h * 0.31, max(1.5, w * 0.020), 1, 1);
+    gfx_circle(x + w * 0.82, y + h * 0.42, max(1.5, w * 0.020), 1, 1);
+    _fxc_set(0x2aa8c8, 1);
+    gfx_circle(x + w * 0.62, y + h * 0.32, max(2, w * 0.024), 1, 1);
+    _fxc_set(0x585858, 1); gfx_rect(x + w * 0.14, y + h * 0.80, w * 0.38, h * 0.05);
+    _fxc_set(0x6e6e6e, 1); gfx_rect(x + w * 0.14, y + h * 0.91, w * 0.58, h * 0.05);
+  ) :
+
+  m == FXC_M_REAVERB ? (
+    _fxc_set(0x0e1012, 1);                                 // two mini faders
+    gfx_rect(x + w * 0.09, y + h * 0.15, max(2, w * 0.035), h * 0.70);
+    gfx_rect(x + w * 0.20, y + h * 0.15, max(2, w * 0.035), h * 0.70);
+    _fxc_set(0xecece8, 1);
+    gfx_rect(x + w * 0.075, y + h * 0.37, w * 0.08, h * 0.07);
+    gfx_rect(x + w * 0.185, y + h * 0.59, w * 0.08, h * 0.07);
+    bx = x + w * 0.32; bw = w * 0.62; by = y + h * 0.14; bh = h * 0.64;
+    _fxc_set(0xf8f8f4, 1); gfx_rect(bx, by, bw, bh);       // the impulse list
+    gfx_set(0, 0, 0, 0.10);
+    i = 0;
+    loop(4, gfx_rect(bx, by + bh * (0.14 + i * 0.28), bw, max(1, bh * 0.14)); i += 1;);
+    _fxc_set(0x8a8a86, 1);
+    i = 0;
+    loop(3, gfx_rect(bx + bw * (0.10 + i * 0.36), by + bh * 0.86, bw * 0.22,
+                     max(2, bh * 0.11)); i += 1;);
+    gfx_set(0.69, 0.69, 0.67, 1);
+    gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
+    gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
+  ) :
+
+  m == FXC_M_REALIMIT ? (
+    // ⭐ NOT a light ReaPlugs panel -- ReaLimit is a DARK scope with a red
+    // ceiling line (sweep-verified; the light guess was wrong).
+    _fxc_set(0x26282c, 1); gfx_rect(x, y, w, h * 0.12);
+    // The source is a BOX with heavily rounded top corners (border-radius
+    // 45% 40% 0 0 / 75% 60% 0 0 on left12%/right12%/bottom6%/height50%), not a
+    // dome -- so: an elliptical cap sitting on a square-shouldered column.
+    // A plain ellipse read as a blob and lost the flat sides.
+    _fxc_set(0x8a8f9a, 0.85);
+    _fxc_domebox(x + w * 0.12, y + h * 0.44, w * 0.76, h * 0.50, h * 0.34);
+    _fxc_set(0xdc463c, 1);
+    gfx_rect(x, y + h * 0.34, w, max(1, h * 0.025));       // the ceiling
+    _fxc_meter(x + w * 0.03, y + h * 0.14, w * 0.05, h * 0.74, 0.45,
+               0x4ac06a, 0x23262c);
+  ) :
+
+  m == FXC_M_REAGATE ? (
+    _fxc_rows(x + w * 0.06, y + h * 0.16, w * 0.46, h * 0.70, 4, 0x6e6e68, 0xbcbcb6);
+    _fxc_set(0x0e1012, 1);                                 // the fader trio
+    i = 0;
+    loop(3,
+      gfx_rect(x + w * (0.60 + i * 0.12), y + h * 0.19, max(2, w * 0.035),
+               h * 0.66);
+      i += 1;
+    );
+    _fxc_set(0xecece8, 1);
+    gfx_rect(x + w * 0.585, y + h * 0.33, w * 0.075, h * 0.07);
+    gfx_rect(x + w * 0.705, y + h * 0.55, w * 0.075, h * 0.07);
+    gfx_rect(x + w * 0.825, y + h * 0.41, w * 0.075, h * 0.07);
+    _fxc_meter(x + w * 0.94, y + h * 0.19, w * 0.05, h * 0.66, 0.58,
+               0x4ac06a, 0xcfd2cf);
+  ) :
+
+  m == FXC_M_SWING ? (
+    // Header band, then the 4x4 pad grid that IS Swing's identity, with the
+    // bottom-left pad lit in the wordmark red. Source: the wordmark is
+    // gfx_set(0.85,0.20,0.12) and is explicitly theme-INDEPENDENT.
+    _fxc_set(0x2b2d31, 1); gfx_rect(x, y, w, h * 0.19);
+    gfx_set(0, 0, 0, 0.55);  gfx_rect(x, y + h * 0.19, w, max(1, h * 0.015));
+    _fxc_set(0xd9331e, 1);
+    gfx_rect(x + w * 0.05, y + h * 0.05, w * 0.30, max(2, h * 0.09));
+    bx = x + w * 0.05; bw = w * 0.90; by = y + h * 0.26; bh = h * 0.64;
+    i = 0;
+    loop(16,
+      cx = bx + (i % 4) * bw * 0.26;
+      cy = by + ((i / 4) | 0) * bh * 0.26;
+      (i == 12) ? _fxc_set(0xd9331e, 1) : _fxc_set(0x2f333a, 1);
+      gfx_rect(cx, cy, bw * 0.22, bh * 0.22);
+      i += 1;
+    );
+  ) :
+
+  m == FXC_M_STEPPA ? (
+    // Eight lanes of steps with a few lit. Source: background
+    // gfx_set(0.09,0.10,0.12), active step setcolor(0,200,236).
+    _fxc_set(0x00c8ec, 0.9); gfx_rect(x, y, w * 0.34, h * 0.15);
+    _fxc_set(0x232830, 1);   gfx_rect(x + w * 0.34, y, w * 0.66, h * 0.15);
+    bx = x + w * 0.05; bw = w * 0.90; by = y + h * 0.24; bh = h * 0.66;
+    // 6 x 3 -- matching the sheet's 17% and 35% gradient periods exactly. The
+    // renderer drew a 4th row the baked card does not have.
+    i = 0;
+    loop(18,
+      cx = bx + (i % 6) * bw * 0.17;
+      cy = by + ((i / 6) | 0) * bh * 0.35;
+      // A scatter that reads as a pattern rather than a checkerboard.
+      (i == 0 || i == 2 || i == 7 || i == 11 || i == 14 || i == 16) ?
+        _fxc_set(0x00c8ec, 1) : _fxc_set(0x262b33, 1);
+      gfx_rect(cx, cy, bw * 0.11, bh * 0.30);
+      i += 1;
+    );
+  ) :
+
+  m == FXC_M_LENS ? (
+    // Barrel, aperture ring, glass, flare -- concentric, because that IS what a
+    // lens looks like end-on and it survives being small better than anything
+    // with a body and a strap would.
+    // ⚠️ Every radius is a fraction of h (the SHORT side), never of w. Off w
+    // the circles would go oval the moment the card is not its nominal aspect,
+    // and check_scale_free would not catch that -- it checks that coordinates
+    // are DERIVED, not that they are derived from the right thing.
+    cx = x + w * 0.5; cy = y + h * 0.5;
+    _fxc_set(k < 0 ? 0x1a1c20 : k, 1);
+    gfx_circle(cx, cy, h * 0.40, 1, 1);                  // barrel
+    _fxc_set(0x0a0b0d, 1);
+    gfx_circle(cx, cy, h * 0.31, 1, 1);
+    // Aperture blades: six chords around the opening, so the ring reads as a
+    // mechanism rather than as another circle.
+    _fxc_set(acc >= 0 ? acc : 0xc8703a, 1);
+    i = 0;
+    loop(6,
+      gfx_circle(cx + cos(i * 1.0472) * h * 0.255,
+                 cy + sin(i * 1.0472) * h * 0.255, max(1, h * 0.035), 1, 1);
+      i += 1;
+    );
+    _fxc_set(0x05060a, 1);
+    gfx_circle(cx, cy, h * 0.20, 1, 1);                  // glass
+    // The coating's colour cast, then the flare: one bright bead up and left,
+    // which is what makes a dark disc read as GLASS instead of as a hole.
+    gfx_set(0.20, 0.45, 0.62, 0.55);
+    gfx_circle(cx, cy, h * 0.165, 1, 1);
+    gfx_set(1, 1, 1, 0.85);
+    gfx_circle(cx - h * 0.085, cy - h * 0.085, max(1, h * 0.042), 1, 1);
+    gfx_set(1, 1, 1, 0.22);
+    gfx_circle(cx + h * 0.05, cy + h * 0.06, max(1, h * 0.028), 1, 1);
+  ) :
+
+  m == FXC_M_REAINSERT ? (
+    // Send out, return back. The two directions are colour-split (blue out,
+    // amber home) because at chip size a single grey routing diagram is just
+    // two lines.
+    bx = x + w * 0.08; bw = w * 0.84; by = y + h * 0.12; bh = h * 0.42;
+    _fxc_set(0xf8f8f4, 1); gfx_rect(bx, by, bw, bh);
+    _fxc_set(0x9a9a94, 1);
+    gfx_rect(bx, by + bh * 0.34, bw, max(1, bh * 0.06));
+    gfx_rect(bx, by + bh * 0.76, bw, max(1, bh * 0.06));
+    _fxc_set(0x4a78d8, 1);
+    gfx_rect(bx + bw * 0.04, by + bh * 0.22, bw * 0.11, bh * 0.30);
+    gfx_rect(bx + bw * 0.85, by + bh * 0.22, bw * 0.11, bh * 0.30);
+    _fxc_set(0xe0823a, 1);
+    gfx_rect(bx + bw * 0.04, by + bh * 0.64, bw * 0.11, bh * 0.30);
+    gfx_rect(bx + bw * 0.85, by + bh * 0.64, bw * 0.11, bh * 0.30);
+    gfx_set(0.69, 0.69, 0.67, 1);
+    gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
+    gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
+    _fxc_rows(bx, y + h * 0.62, bw, h * 0.26, 1, 0x6e6e68, 0xbcbcb6);
+  ) :
+
+  m == FXC_M_REAVOICE ? (
+    // A key rail: the shortest way to say "this one is driven by MIDI". Same
+    // shape the `proll` motif already uses, so no new vocabulary.
+    bx = x + w * 0.06; bw = w * 0.17; by = y + h * 0.12; bh = h * 0.76;
+    _fxc_set(0xf8f8f4, 1); gfx_rect(bx, by, bw, bh);
+    _fxc_set(0x16161a, 1);
+    i = 0;
+    loop(4,
+      gfx_rect(bx, by + bh * (0.11 + i * 0.26), bw * 0.72, max(1, bh * 0.06));
+      i += 1;
+    );
+    gfx_set(0.69, 0.69, 0.67, 1);
+    gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
+    gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
+    _fxc_rows(x + w * 0.29, y + h * 0.14, w * 0.63, h * 0.72, 3,
+              0x6e6e68, 0xbcbcb6);
+  ) :
+
+  m == FXC_M_READELAY ? (
+    // A TAP delay: five repeats decaying left to right, anchored to the plot
+    // floor. That is the one fact about ReaDelay a card can carry, and it is
+    // what stops it being the generic slider wall it shared with three others.
+    bx = x + w * 0.08; bw = w * 0.84; by = y + h * 0.10; bh = h * 0.46;
+    _fxc_set(0xf8f8f4, 1); gfx_rect(bx, by, bw, bh);
+    _fxc_set(0x4a78d8, 1);
+    i = 0;
+    loop(5,
+      t = 0.84 - i * 0.17;                    // decaying tap heights
+      gfx_rect(bx + bw * (0.06 + i * 0.21), by + bh * (1 - t),
+               max(2, bw * 0.07), bh * t);
+      i += 1;
+    );
+    gfx_set(0.69, 0.69, 0.67, 1);
+    gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
+    gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
+    _fxc_rows(bx, y + h * 0.64, bw, h * 0.26, 2, 0x6e6e68, 0xbcbcb6);
+  ) :
+
+  m == FXC_M_REAPITCH ? (
+    // The shift readout is the one thing ReaPitch actually shows you, so it
+    // leads. Without it this card was the generic slider wall, identical to
+    // ReaDelay, ReaInsert and ReaVoice.
+    bx = x + w * 0.08; bw = w * 0.84; by = y + h * 0.12; bh = h * 0.32;
+    _fxc_set(0xf8f8f4, 1); gfx_rect(bx, by, bw, bh);
+    _fxc_set(0x2aa8c8, 1);
+    gfx_rect(bx + bw * 0.18, by + bh * 0.35, bw * 0.28, bh * 0.30);
+    gfx_set(0.69, 0.69, 0.67, 1);
+    gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
+    gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
+    _fxc_rows(bx, y + h * 0.54, bw, h * 0.34, 2, 0x6e6e68, 0xbcbcb6);
+  ) :
+
+  m == FXC_M_REASURROUND ? (
+    // ⭐ The panner field is DARK on a light panel -- also sweep-verified after
+    // a wrong light-field guess.
+    bx = x + w * 0.05; by = y + h * 0.08; bw = w * 0.56; bh = h * 0.84;
+    _fxc_set(0x141418, 1); gfx_rect(bx, by, bw, bh);
+    gfx_set(0.59, 0.59, 0.59, 0.40);
+    gfx_rect(bx + bw * 0.5, by, 1, bh); gfx_rect(bx, by + bh * 0.5, bw, 1);
+    _fxc_set(0xe8d43c, 1);
+    gfx_circle(bx + bw * 0.30, by + bh * 0.28, max(1.5, w * 0.020), 1, 1);
+    gfx_circle(bx + bw * 0.70, by + bh * 0.28, max(1.5, w * 0.020), 1, 1);
+    _fxc_set(0xdc5a50, 1);
+    gfx_circle(bx + bw * 0.50, by + bh * 0.74, max(1.5, w * 0.020), 1, 1);
+    _fxc_set(0xe8e8e4, 1);
+    gfx_circle(bx + bw * 0.50, by + bh * 0.50, max(1.5, w * 0.020), 1, 1);
+    gfx_set(0.04, 0.04, 0.05, 1);
+    gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
+    gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
+    _fxc_set(0xc6c6c0, 1);
+    i = 0;
+    loop(6,
+      gfx_rect(x + w * 0.67, y + h * (0.10 + i * 0.135), w * 0.28,
+               max(1, h * 0.08));
+      i += 1;
+    );
+  ) :
+
+  m == FXC_M_KROW ? (
+    acc >= 0 ? ( _fxc_set(acc, 0.85); gfx_rect(x, y, w, h * 0.16); );
+    rec[FXC_VAR] & FXC_V_V2 ? (
+      _fxc_knob(x + w * 0.27, y + h * 0.50, w * 0.15, k, k2, 0xf2f2ee, 1, -1);
+      // EM> 1.9em at 8px on 144 = 15.2px = 0.10556 w
+      i = 0;
+      loop(3, _fxc_knob(x + w * (0.56 + i * 0.10556), y + h * 0.54,
+                        w * 0.055, k, k2, -1, 0, -1); i += 1;);
+    ) : (
+      // EM> 2.6em at 8px on 144 = 20.8px = 0.14444 w. In the source the knob
+      // is 15% w and the pitch is 14.4% w, so they touch -- that overlap is
+      // the authored look, not a bug, and it is preserved by keeping BOTH
+      // numbers proportional.
+      i = 0;
+      loop(4, _fxc_knob(x + w * (0.18 + i * 0.14444), y + h * 0.62,
+                        w * 0.075, k, k2, -1, 0, -1); i += 1;);
+    );
+  ) :
+
+  m == FXC_M_CURVE ? (
+    acc < 0 ? acc = 0xe6783c;
+    // The source blurs an ellipse behind the stroke. Stack a few translucent
+    // ellipses instead: same read, no blur pass.
+    // The source blurs an ellipse behind the stroke. Five equal-alpha shells
+    // read as five rings, not a glow -- the banding was obvious on Pro-C 2. So:
+    // more shells, and alpha that falls off toward the outside, which is what
+    // makes them stop looking like contour lines.
+    i = 0;
+    loop(12,
+      t = i / 11;
+      _fxc_set(acc, 0.05 + 0.10 * (1 - t) * (1 - t));
+      _fxc_ellipse(x + w * 0.50, y + h * 0.48,
+                   w * 0.30 * (1 + t * 0.55), h * 0.15 * (1 + t * 0.70));
+      i += 1;
+    );
+    gfx_set(0.55, 0.59, 0.63, 0.30);
+    gfx_rect(x + w * 0.13, y + h * 0.70, w * 0.74, 1);
+    // ⭐ A solid stroke, not glow alone -- glow-only read as a BLANK card and
+    // took out six designs before it was caught (recipes DB, blank-card audit).
+    _fxc_arc_top(x + w * 0.50, y + h * 0.70, w * 0.37, h * 0.36,
+                 max(2, w * 0.024), acc, -1, 0, 0.95);
+  ) :
+
+  m == FXC_M_VU ? (
+    k < 0 ? k = 0x2e3338;
+    _fxc_knob(x + w * 0.25, y + h * 0.79, w * 0.055, k, -1, -1, 0, -1);
+    _fxc_knob(x + w * 0.75, y + h * 0.79, w * 0.055, k, -1, -1, 0, -1);
+    cx = x + w * 0.50; cy = y + h * 0.26;
+    _fxc_set(0x23272b, 1);
+    _fxc_ellipse(cx, cy, w * 0.22 + max(2, w * 0.020),
+                 h * 0.20 + max(2, w * 0.020));
+    _fxc_set(0xefe6c8, 1);
+    _fxc_ellipse(cx, cy, w * 0.22, h * 0.20);
+    _fxc_arc_top(cx, y + h * 0.32, w * 0.18, h * 0.19,
+                 max(2, w * 0.017), 0x35322a, 0xc63c30, 0.28, 1);
+    _fxc_set(0x35322a, 1);                     // needle
+    gfx_line(cx, cy + h * 0.17, cx + w * 0.10, cy - h * 0.13, 1);
+  ) :
+
+  m == FXC_M_BIGKNOB ? (
+    _fxc_knob(x + w * 0.50, y + h * 0.50, w * 0.21, k, k2,
+              rec[FXC_PTR] >= 0 ? rec[FXC_PTR] : 0xf2f2ee, acc >= 0, acc);
+  ) :
+
+  m == FXC_M_SLIDERS ? (
+    rec[FXC_VAR] & FXC_V_V2 ? (
+      bx = x + w * 0.18; bw = w * 0.64; by = y + h * 0.12; bh = h * 0.76;
+      gfx_set(0, 0, 0, 0.45);
+      i = 0;
+      loop(3, gfx_rect(bx + bw * i * 0.44, by, max(2, bw * 0.12), bh); i += 1;);
+      _fxc_set(0xecece8, 1);                   // fader caps
+      gfx_circle(x + w * 0.255, y + h * 0.42, max(2, w * 0.031), 1, 1);
+      gfx_circle(x + w * 0.500, y + h * 0.56, max(2, w * 0.031), 1, 1);
+      gfx_circle(x + w * 0.745, y + h * 0.36, max(2, w * 0.031), 1, 1);
+    ) : (
+      // The generic-REAPER-UI motif: a wall of slider rows.
+      bx = x + w * 0.10; bw = w * 0.80; by = y + h * 0.08; bh = h * 0.84;
+      rec[FXC_SL] >= 0 ? _fxc_set(rec[FXC_SL], 1) : gfx_set(0, 0, 0, 0.35);
+      i = 0;
+      loop(6, gfx_rect(bx + bw * i * 0.18, by, max(1, bw * 0.06), bh); i += 1;);
+    );
+  ) :
+
+  m == FXC_M_KPAIR ? (
+    _fxc_knob(x + w * 0.30, y + h * 0.48, w * 0.13, k, k2,
+              rec[FXC_PTR] >= 0 ? rec[FXC_PTR] : 0x1a1c20, 0, -1);
+    _fxc_knob(x + w * 0.70, y + h * 0.48, w * 0.13, k, k2,
+              rec[FXC_PTR] >= 0 ? rec[FXC_PTR] : 0x1a1c20, 0, -1);
+  ) :
+
+  m == FXC_M_STRIP ? (
+    gfx_set(0, 0, 0, 0.28);                    // section dividers
+    gfx_rect(x, y + h * 0.270, w, max(1, h * 0.015));
+    gfx_rect(x, y + h * 0.570, w, max(1, h * 0.015));
+    // EM> 1.55em at 9.5px on an 84-tall card = 14.725px = 0.17530 h
+    r = w * 0.06;
+    i = 0;
+    loop(4,
+      i == 0 ? _fxc_set(0xc85a4a, 1) : i == 1 ? _fxc_set(0x4a78c8, 1) :
+      i == 2 ? _fxc_set(0x58a860, 1) : _fxc_set(0xd0a848, 1);
+      gfx_circle(x + w * 0.38, y + h * (0.19 + i * 0.17530), r, 1, 1);
+      gfx_set(0, 0, 0, 0.30);
+      gfx_circle(x + w * 0.38, y + h * (0.19 + i * 0.17530), r, 0, 1);
+      i += 1;
+    );
+    bx = x + w * 0.75; by = y + h * 0.34; bw = w * 0.08; bh = h * 0.56;
+    _fxc_set(0x0e1012, 1); gfx_rect(bx, by, bw, bh);
+    _fxc_set(0xecece8, 1); gfx_rect(bx, by + bh * 0.44, bw, bh * 0.14);
+  ) :
+
+  m == FXC_M_CURVEMULTI ? (
+    // Contrast comes from the panel, not from data -- see _fxc_lum.
+    t = _fxc_lum(rec[FXC_B1]) > 0.5;
+    // (the skyline is drawn by FXC_E_AN in _fxc_elements, not here)
+    t ? gfx_set(0.23, 0.27, 0.34, 0.38) : gfx_set(0.84, 0.88, 0.92, 0.30);
+    gfx_rect(x, y + h * 0.444, w, max(1, h * 0.017));   // the 0 dB reference
+    // Band fills: soft, wide, behind everything. Alpha falls off outward so
+    // they read as glow rather than as stacked contour rings.
+    i = 0;
+    loop(3,
+      cx = x + w * (i == 0 ? rec[FXC_N1X] : i == 1 ? rec[FXC_N2X] : rec[FXC_N3X]);
+      cy = y + h * ((i == 0 ? rec[FXC_N1Y] : i == 1 ? rec[FXC_N2Y] : rec[FXC_N3Y])
+                    + 0.12);
+      k = i == 0 ? rec[FXC_C1] : i == 1 ? rec[FXC_C2] : rec[FXC_C3];
+      k < 0 ? k = 0x6ec96e;
+      n = 0;
+      loop(7,
+        _fxc_set(k, (t ? 0.055 : 0.075) * (1 - n / 7));
+        _fxc_ellipse(cx, cy, w * 0.11 * (1 + n * 0.20), h * 0.10 * (1 + n * 0.22));
+        n += 1;
+      );
+      i += 1;
+    );
+    // Nodes last so a band fill can never wash one out.
+    i = 0;
+    loop(3,
+      cx = x + w * (i == 0 ? rec[FXC_N1X] : i == 1 ? rec[FXC_N2X] : rec[FXC_N3X]);
+      cy = y + h * (i == 0 ? rec[FXC_N1Y] : i == 1 ? rec[FXC_N2Y] : rec[FXC_N3Y]);
+      k = i == 0 ? rec[FXC_C1] : i == 1 ? rec[FXC_C2] : rec[FXC_C3];
+      k < 0 ? k = 0x6ec96e;
+      t ? gfx_set(0.13, 0.15, 0.20, 0.85) : gfx_set(1, 1, 1, 0.95);
+      gfx_circle(cx, cy, max(2, w * 0.030), 1, 1);
+      _fxc_set(k, 1);
+      gfx_circle(cx, cy, max(1, w * 0.018), 1, 1);
+      i += 1;
+    );
+    _fxc_set(0xc9b458, 1);                              // the gain scale strip
+    gfx_rect(x + w * 0.94, y, w * 0.06, h);
+  ) :
+
+  m == FXC_M_MODULES ? (
+    acc < 0 ? acc = 0x5a96dc;
+    rec[FXC_VAR] & FXC_V_V2 ? (
+      bx = x + w * 0.14; by = y + h * 0.14; bw = w * 0.72; bh = h * 0.72;
+      gfx_set(0, 0, 0, 0.50); gfx_rect(bx, by, bw, bh);
+      gfx_set(1, 1, 1, 0.09);
+      i = 0;
+      loop(4, gfx_rect(bx + bw * i * 0.26, by, bw * 0.26 * 0.7, bh); i += 1;);
+      _fxc_set(acc, 1); gfx_rect(bx, by, bw, max(2, h * 0.035));
+    ) : (
+      // EM> 2.8em at 11px on an 84-tall card = 30.8px = 0.36667 h
+      i = 0;
+      loop(2,
+        by = y + h * (0.14 + i * 0.36667);
+        gfx_set(0, 0, 0, 0.35);
+        gfx_rect(x + w * 0.12, by, w * 0.76, h * 0.26);
+        _fxc_set(acc, 1);
+        gfx_rect(x + w * 0.12, by, max(2, w * 0.021), h * 0.26);
+        i += 1;
+      );
+    );
+  );
+);
+
+// ── the public entry point ──────────────────────────────────────────────────
+// Draws one card into (x,y,w,h). No state, no image slots, no allocation --
+// call it as many times per frame as there are visible cards.
+function swing_fxcard_draw(x, y, w, h, rec)
+  local(rad)
+(
+  w > 3 && h > 3 ? (
+    _fxc_panel(x, y, w, h,
+               rec[FXC_B1],
+               rec[FXC_B2] >= 0 ? rec[FXC_B2] : rec[FXC_B1]);
+    _fxc_motif(x, y, w, h, rec);
+    _fxc_elements(x, y, w, h, rec);
+    // Seat the card: a dark edge all round, so a light face does not bleed
+    // into a light list background.
+    gfx_set(0, 0, 0, 0.55);
+    gfx_rect(x, y, w, 1); gfx_rect(x, y + h - 1, w, 1);
+    gfx_rect(x, y, 1, h); gfx_rect(x + w - 1, y, 1, h);
+  );
+);
+
+// The card for a plugin the deck has never heard of.
+//
+// ⚠️ NOT optional. The deck covers 145 recipes and a REAPER install carries
+// ~880 audio FX, so in a grid the majority of tiles have no art. Leaving those
+// blank would make the grid strictly worse than the list; this at least carries
+// the category colour, which is the one fact we always know. Same 1.714:1 box
+// and the same seat as a real card, so a wall of mixed known/unknown still
+// reads as one grid.
+function swing_fxcard_blank(x, y, w, h, col, seed)
+  local(v, i, n, r, cy2, bx, bw, lo, hi, mid)
+(
+  w > 3 && h > 3 ? (
+    // FIVE faces instead of one, chosen by the plugin's own name hash. The old
+    // single fallback meant ~736 uncarded plugins drew the SAME tile, so a
+    // category read as a wall of clones and the grid told you nothing the list
+    // did not. The variant is derived, so a plugin always wears the same face
+    // and neighbours differ -- which is the entire job here.
+    // Built from the deck's real primitives, not placeholder shapes: an unknown
+    // plugin should look like a plugin, not like a gap.
+    v   = seed < 0 ? 0 : (seed | 0) % 5;
+    lo  = _fxc_shade_c(col, 0.45);
+    hi  = _fxc_shade_c(col, 1.25);
+    mid = _fxc_shade_c(col, 0.70);
+
+    _fxc_shade(col, 0.78, 1); gfx_rect(x, y, w, h);
+    _fxc_set(col, 0.85);      gfx_rect(x, y, w, max(2, h * 0.13));
+    // a hairline in the accent, offset by the seed so even same-variant
+    // neighbours are not identical
+    _fxc_shade(col, 1.35, 0.55);
+    gfx_rect(x, y + max(2, h * 0.13), w * (0.35 + 0.12 * ((seed | 0) % 4)), 1);
+
+    v == 0 ? (                                   // a wall of slider rows
+      _fxc_rows(x + w * 0.12, y + h * 0.30, w * 0.76, h * 0.58, 3, hi, lo);
+    ) : v == 1 ? (                               // a row of three small knobs
+      r = h * 0.16; cy2 = y + h * 0.58;
+      i = 0; loop(3,
+        _fxc_knob(x + w * (0.24 + i * 0.26), cy2, r, mid, hi, 1, 0, -1);
+        i += 1;
+      );
+    ) : v == 2 ? (                               // two large knobs, side by side
+      r = h * 0.24; cy2 = y + h * 0.58;
+      _fxc_knob(x + w * 0.30, cy2, r, mid, hi, 1, 1, hi);
+      _fxc_knob(x + w * 0.70, cy2, r, mid, hi, 1, 0, -1);
+    ) : v == 3 ? (                               // a readout over two knobs
+      bx = x + w * 0.10; bw = w * 0.80;
+      _fxc_shade(col, 0.28, 1);
+      gfx_rect(bx, y + h * 0.26, bw, h * 0.28);
+      _fxc_spec(bx + 2, y + h * 0.28, bw - 4, h * 0.24, hi, 0.75);
+      r = h * 0.15; cy2 = y + h * 0.76;
+      _fxc_knob(x + w * 0.32, cy2, r, mid, hi, 1, 0, -1);
+      _fxc_knob(x + w * 0.68, cy2, r, mid, hi, 1, 0, -1);
+    ) : (                                        // a meter beside a fader bank
+      _fxc_meter(x + w * 0.12, y + h * 0.28, w * 0.10, h * 0.56,
+                 0.35 + 0.12 * ((seed | 0) % 4), hi, lo);
+      i = 0; n = 3;
+      loop(n,
+        _fxc_set(lo, 1);
+        gfx_rect(x + w * (0.36 + i * 0.20), y + h * 0.28, max(2, w * 0.05), h * 0.56);
+        _fxc_set(hi, 1);
+        gfx_rect(x + w * (0.34 + i * 0.20), y + h * (0.36 + 0.11 * ((seed + i) % 4)),
+                 max(3, w * 0.09), max(2, h * 0.07));
+        i += 1;
+      );
+    );
+
+    gfx_set(0, 0, 0, 0.55);
+    gfx_rect(x, y, w, 1); gfx_rect(x, y + h - 1, w, 1);
+    gfx_rect(x, y, 1, h); gfx_rect(x + w - 1, y, 1, h);
+  );
+);
+
+// Fill one record. Kept separate from the generated data so the table can be
+// regenerated without touching the renderer.
+function swing_fxcard_set(rec, motif, b1, b2, k, k2, acc)
+(
+  rec[FXC_MOTIF] = motif; rec[FXC_B1] = b1; rec[FXC_B2] = b2;
+  rec[FXC_K] = k; rec[FXC_K2] = k2; rec[FXC_ACC] = acc;
+  rec[FXC_PTR] = -1; rec[FXC_ECOL] = -1; rec[FXC_ELEM] = 0;
+  rec[FXC_VAR] = 0;  rec[FXC_SL] = -1;
+  rec[FXC_EX] = -1;  rec[FXC_EY] = -1; rec[FXC_EW] = -1; rec[FXC_EH] = -1;
+  rec[FXC_C1] = -1;  rec[FXC_C2] = -1; rec[FXC_C3] = -1;
+);

@@ -41,7 +41,8 @@ end
 -- gmem map -- byte-exact mirror of EON_StepSeq.jsfx EON_SS_SYNC_* / EON_SS_XFER_*.
 local SYNC_BASE, SYNC_STRIDE = 26030000, 64
 local F_DMPUSH, F_LISTLEN, F_SPB, F_SYNCON = 8, 9, 10, 11
-local XFER_BASE, XFER_DATA = 26040000, 26040008
+local XFER_BASE, XFER_DATA = 26171536, 26171544   -- XFER v2 (Package 2, 2026-09-03); planes 16 x 128
+local XFER_OFF, XFER_LEN, XFER_SUBDIV = 26173592, 26175640, 26177688
 
 local prev_syncon, push_seq = {}, {}
 
@@ -106,9 +107,15 @@ local function push_region_to_slot(slot)
   gw(XFER_BASE + 2, 16)        -- numpads
   gw(XFER_BASE + 3, listlen)   -- numsteps (the StepSeq's grid)
   gw(XFER_BASE + 4, spb)
+  gw(XFER_BASE + 5, 0)         -- target pattern + 1 (0 = the editor's pattern). Since step 1 the
+                               -- StepSeq routes on this field; a stale value left by a bridge push
+                               -- would otherwise land this import in another pattern.
   -- zero the grid
   for pad = 0, 15 do
-    for s = 0, listlen - 1 do gw(XFER_DATA + pad * listlen + s, 0) end
+    for s = 0, listlen - 1 do
+      local cell = pad * listlen + s
+      gw(XFER_DATA + cell, 0); gw(XFER_OFF + cell, 0); gw(XFER_LEN + cell, 0); gw(XFER_SUBDIV + cell, 0)   -- no stale planes from a bridge push
+    end
   end
   -- fill: pad_index (1-based) -> pad (0-based); note QN offset -> step.
   for pad_index, lane in pairs(blob.lanes or {}) do

@@ -12,6 +12,11 @@
 //      color extension:
 //        '|'        separates items
 //        '||'       produces a blank separator row (empty item)
+//        '!'        prefix marks the item CHECKED (gfx_showmenu's own
+//                   marker). Draws a tick at the left of the pill. When ANY
+//                   item is checked the menu widens, so a tick can never
+//                   collide with a centred label.
+//                   ⚠️ Order when combined: '!' FIRST, then '#', then '^X'.
 //        '#'        prefix marks the item as a disabled header
 //                   (matches gfx_showmenu — always rendered Swing red)
 //        '^X '      prefix tags the item with a palette color (X = single
@@ -73,6 +78,15 @@ SP_POPUP_CALLER_PAD_RANGE   = 31;  // LCD RANGE pill → chromatic key-range pre
 SP_POPUP_CALLER_PAD_GRID_KNOBS = 32;  // pad grid VOL/PAN knob right-click → knob style + colour override
 SP_POPUP_CALLER_SAMPLES_MISSING = 33; // "Kit samples missing" banner click → Relink folder / Load kit / Dismiss (P4 step 3)
 SP_POPUP_CALLER_PAD_CATEGORY = 34; // LCD CATEGORY pill → set the pad's category (kit-categories §9b; via bridge mailbox)
+SP_POPUP_CALLER_MACRO_ASSIGN = 35; // right-click a macro-capable knob → "> <macro name>" ×8; consumed in Swing_ReaKit @gfx (adds a mapping to the picked macro)
+SP_POPUP_CALLER_MACRO_PRESET = 36; // macro editor PRESET ▾ chip → template list; consumed in rk_swing_ui_macroed
+SP_POPUP_CALLER_VIEW_MODE   = 37;  // SWING wordmark right-click → face override (Auto / Full UI / Rack face); consumed in swing_ui_viewmode_click. Rows 5..8 (DOCK LAYOUT) get sp_layout_glyph minis — index-coupled to EON Dock Layout.lua's LAYOUTS
+SP_POPUP_CALLER_RACK_KIT    = 38;  // rack kit card ▾ / right-click → kit-file actions (Load / Save As / Explore); consumed in swing_ui_draw_rack_header
+SP_POPUP_CALLER_RACK_MORE   = 39;  // rack header "⋯" chip → the workstation actions folded out of the row; consumed in swing_ui_draw_rack_header
+SP_POPUP_CALLER_INS_SLOT    = 40;  // console strip insert slot right-click → open / embed TCP / embed MCP / bypass / offline / swap / delete; consumed in swing_panels_draw_mixer_big
+SP_POPUP_CALLER_FB_ROW      = 41;  // mini browser row right-click -> load / layer / preview / reveal / copy / star; consumed in swing_fb_draw
+SP_POPUP_CALLER_FB_LAYER    = 42;  // the "Add as layer" step of that menu -> next free or an explicit layer; consumed in swing_fb_draw
+SP_POPUP_CALLER_FB_TREE     = 43;  // mini browser RAIL row right-click -> show / expand / remove from list / reveal; consumed in swing_fb_draw
 
 // ─── Style enum + persisted default ──────────────────────────────────────
 SP_POPUP_STYLE_CARD       = 0;   // PAD-dialog-like — rounded-ish, red header
@@ -117,6 +131,10 @@ local(_b)
   // Per-item color code (char from '^X' tag, or 0 if untagged → default
   // text color). Applied by swing_popup_apply_color() at draw time.
   sp_popup_item_color = _b; _b += SP_POPUP_MAX_ITEMS;
+  // Per-item checked flag (from a '!' prefix). Separate array rather than a
+  // bit in _dis: an item can be checked AND a header, and folding them would
+  // make one un-representable.
+  sp_popup_item_chk   = _b; _b += SP_POPUP_MAX_ITEMS;
   // Scratch slots for swing_popup_metrics_* out-params (width / height).
   // Two single-cell arrays; addressed as sp_popup_scratch_w[0] /
   // sp_popup_scratch_h[0] from the metrics functions.
@@ -151,14 +169,18 @@ function swing_popup_apply_color(_code, _alpha)
 // are stripped from the displayed text via ofs/len adjustment so the parser
 // stays single-pass.
 function swing_popup_parse_items()
-local(_n, _i, _start, _len, _ch, _is_dis, _color, _slen)
+local(_n, _i, _start, _len, _ch, _is_dis, _color, _slen, _chk)
 (
   _slen = strlen(#swing_popup_items);
   _n = 0;
   _start = 0;
   _is_dis = 0;
   _color  = 0;
-  // Consume leading markers on the very first item.
+  _chk    = 0;
+  // Consume leading markers on the very first item. '!' first — see header.
+  _slen > 0 && str_getchar(#swing_popup_items, _start) == '!' ? (
+    _chk = 1; _start += 1;
+  );
   _slen > 0 && str_getchar(#swing_popup_items, _start) == '#' ? (
     _is_dis = 1; _start += 1;
   );
@@ -180,13 +202,19 @@ local(_n, _i, _start, _len, _ch, _is_dis, _color, _slen)
         sp_popup_item_dis[_n]   = _is_dis;
         sp_popup_item_sep[_n]   = (_len == 0);
         sp_popup_item_color[_n] = _color;
+        sp_popup_item_chk[_n]   = _chk;
         _n += 1;
       );
       // Reset markers for the next item.
       _start = _i + 1;
       _is_dis = 0;
       _color  = 0;
-      // Consume '#' (disabled-header marker) — must come first.
+      _chk    = 0;
+      // Consume '!' (checked) — must come first of the three.
+      _start < _slen && str_getchar(#swing_popup_items, _start) == '!' ? (
+        _chk = 1; _start += 1;
+      );
+      // Consume '#' (disabled-header marker).
       _start < _slen && str_getchar(#swing_popup_items, _start) == '#' ? (
         _is_dis = 1; _start += 1;
       );
@@ -305,7 +333,10 @@ local(_i, _max_w, _h, _tw, _th)
       gfx_setfont(1, "Arial", 11);
       strcpy_substr(#sp_popup_tmp, #swing_popup_items, sp_popup_item_ofs[_i], sp_popup_item_len[_i]);
       gfx_measurestr(#sp_popup_tmp, _tw, _th);
-      _tw + 22 > _max_w ? _max_w = _tw + 22;
+      // +14 more when ANY item carries a tick: labels are CENTRED, so a
+      // glyph at the left of the pill would otherwise meet the longest one.
+      _tw + 22 + (sp_popup_item_chk[_i] ? 14 : 0) > _max_w ?
+        _max_w = _tw + 22 + (sp_popup_item_chk[_i] ? 14 : 0);
       _h += 18;
     );
     _i += 1;
@@ -353,6 +384,46 @@ local(_btn_w, _gap, _btn_h, _cx, _label_w, _label_h, _active, _hover, _bx)
   _hover && _lmb_edge ? swing_popup_style = SP_POPUP_STYLE_STRIP;
 
   _y + 22;
+);
+
+// ─── Dock-layout mini glyphs (VIEW_MODE menu rows 5..8) ──────────────────
+// One tiny SCREEN per layout: monitor frame, Swing + Steppa in the bottom
+// dock, Browser as a left column, Pad FX as a right column. Included pane =
+// filled block; dropped pane = dim outline. Positions are schematic — the
+// ReaImGui picker (EON Dock Layout.lua) draws the user's real dock edges,
+// but JSFX can't query dock positions and 24px doesn't earn bridge machinery.
+// ⚠️ _ord 1..4 must track EON Dock Layout.lua's LAYOUTS table BY INDEX, the
+// same contract the row labels already carry:
+//   1 Full (all four) · 2 Beatmaking (swing+steppa) ·
+//   3 Sound design (swing+browser+padfx) · 4 Pads only (swing).
+// Pure rects, no text — leaves font state alone.
+function sp_layout_glyph(_ord, _gx, _gy, _gw, _gh)
+local(_bw, _dh, _px, _pw, _b_on, _p_on, _sw_on, _st_on)
+(
+  _b_on  = _ord == 1 || _ord == 3;         // browser
+  _p_on  = _ord == 1 || _ord == 3;         // pad fx
+  _sw_on = 1;                              // swing is in every layout
+  _st_on = _ord == 1 || _ord == 2;         // steppa
+
+  gfx_set(0.30, 0.32, 0.36, 1);            // monitor frame
+  gfx_rect(_gx, _gy, _gw, _gh, 0);
+
+  _bw = max((_gw * 0.16)|0, 3);            // side column width
+  _dh = max((_gh * 0.5)|0, 4);             // bottom dock height
+
+  // browser — left column
+  _b_on ? ( gfx_set(0.62, 0.65, 0.70, 1);  gfx_rect(_gx + 1, _gy + 1, _bw, _gh - 2); )
+        : ( gfx_set(0.27, 0.29, 0.32, 1);  gfx_rect(_gx + 1, _gy + 1, _bw, _gh - 2, 0); );
+  // pad fx — right column
+  _p_on ? ( gfx_set(0.62, 0.65, 0.70, 1);  gfx_rect(_gx + _gw - 1 - _bw, _gy + 1, _bw, _gh - 2); )
+        : ( gfx_set(0.27, 0.29, 0.32, 1);  gfx_rect(_gx + _gw - 1 - _bw, _gy + 1, _bw, _gh - 2, 0); );
+  // bottom dock: swing left half, steppa right half of the middle span
+  _px = _gx + _bw + 2;
+  _pw = ((_gw - 2*_bw - 5) / 2)|0;
+  _sw_on ? ( gfx_set(0.62, 0.65, 0.70, 1); gfx_rect(_px, _gy + _gh - 1 - _dh, _pw, _dh); )
+         : ( gfx_set(0.27, 0.29, 0.32, 1); gfx_rect(_px, _gy + _gh - 1 - _dh, _pw, _dh, 0); );
+  _st_on ? ( gfx_set(0.62, 0.65, 0.70, 1); gfx_rect(_px + _pw + 1, _gy + _gh - 1 - _dh, _pw, _dh); )
+         : ( gfx_set(0.27, 0.29, 0.32, 1); gfx_rect(_px + _pw + 1, _gy + _gh - 1 - _dh, _pw, _dh, 0); );
 );
 
 // ─── Render Card style ───────────────────────────────────────────────────
@@ -432,7 +503,7 @@ local(_i, _cy, _row_h, _hover, _tw, _th, _label_w, _label_h, _picked)
 
 // ─── Render Strip style ──────────────────────────────────────────────────
 function swing_popup_draw_strip(_x, _y, _w, _h, _lmb_edge, _mx_in, _my_in)
-local(_i, _cy, _row_h, _hover, _label_w, _label_h, _picked, _pill_pad)
+local(_i, _cy, _row_h, _hover, _label_w, _label_h, _picked, _pill_pad, _res)
 (
   // Drop shadow
   gfx_set(0, 0, 0, 0.45);
@@ -485,6 +556,14 @@ local(_i, _cy, _row_h, _hover, _label_w, _label_h, _picked, _pill_pad)
         _hover ? gfx_set(0.18, 0.32, 0.42, 0.90) : gfx_set(0.08, 0.13, 0.16, 0.85);
       );
       gfx_rect(_x + 4, _cy, _w - 8, _row_h - 2);
+      // Dock-layout rows (VIEW_MODE results 5..8, after the #DOCK LAYOUT
+      // header which counts in results) carry a mini layout glyph at the
+      // left edge of the pill; the centered label clears it comfortably
+      // (the "Auto — follow window shape" row fixes the menu width).
+      swing_popup_caller_id == SP_POPUP_CALLER_VIEW_MODE ? (
+        _res = swing_popup_visual_to_result(_i);
+        (_res >= 5 && _res <= 8) ? sp_layout_glyph(_res - 4, _x + 9, _cy + 2, 24, _row_h - 6);
+      );
       _hover ? (
         // Red underline accent — consistent across colored / neutral pills
         gfx_set(0.85, 0.20, 0.12, 0.90);
@@ -492,6 +571,20 @@ local(_i, _cy, _row_h, _hover, _label_w, _label_h, _picked, _pill_pad)
         swing_popup_hover_idx = _i;
       );
       _hover && _lmb_edge ? _picked = _i;
+      // Tick for a checked item. Two strokes rather than a glyph: the
+      // console cannot depend on a font having one, and a missing glyph is
+      // an invisible state.
+      sp_popup_item_chk[_i] ? (
+        gfx_set(0.95, 0.97, 0.98, 0.95);
+        gfx_line(_x + 10, _cy + _row_h / 2 - 1,
+                 _x + 13, _cy + _row_h / 2 + 2);
+        gfx_line(_x + 13, _cy + _row_h / 2 + 2,
+                 _x + 18, _cy + _row_h / 2 - 5);
+        gfx_line(_x + 10, _cy + _row_h / 2,
+                 _x + 13, _cy + _row_h / 2 + 3);
+        gfx_line(_x + 13, _cy + _row_h / 2 + 3,
+                 _x + 18, _cy + _row_h / 2 - 4);
+      );
       gfx_setfont(1, "Arial", 11);
       gfx_set(0.95, 0.97, 0.98, 1);   // always white-ish text — readable on any color
       strcpy_substr(#sp_popup_tmp, #swing_popup_items, sp_popup_item_ofs[_i], sp_popup_item_len[_i]);

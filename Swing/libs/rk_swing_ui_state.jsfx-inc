@@ -102,17 +102,45 @@ function swing_synthview_open(pad) (
   swing_bigview_open(VIEW_SYNTH);
 );
 
+// Pad editor opener — the other half of the pair above, and for the same
+// reason: only one modal class at a time.
+//
+// ⚠️ THIS EXISTS BECAUSE THE PAD FX STRIP WAS UNREACHABLE ON SYNTH PADS.
+// The pad editor hosts the per-pad EQ, filters, comp, drive and sends
+// (_ov_draw_eq_and_filters / _ov_draw_fx_knobs), and the grid's right-click
+// was the ONLY thing that ever opened it — with synth-only pads deliberately
+// routed to the SYNTH view instead, on the reasoning that they have no sample
+// layers to edit. True of the LAYERS; the FX went with them. So on an
+// all-synth kit every pad's strip was invisible, which the factory macros
+// made loud: PUNCH / TONE / SPACE / DRIVE / VIBE all drive those params.
+// The SYNTH view now carries a PAD FX button that lands here.
+function swing_padfx_open(pad) (
+  swing_bigview_close();          // no-op from the grid; the exit door from a view
+  overlay_pad = pad;
+  overlay_layer = _ov_last_tab >= MAX_LAYERS ? 0 : _ov_last_tab;
+  wf_zoom = 1.0; wf_scroll = 0.0;   // reset zoom on new pad
+);
+
 // Pad input policy: true when the pad grid should receive live input. Today:
 // only when NO modal (pad editor OR big view) is open — exactly the condition
 // the inlined `overlay_pad < 0` guards enforced. Becomes view-aware in a later
 // step (a view may opt its policy into live pads, e.g. Mapping).
-function pad_input_allowed() ( overlay_pad < 0 && big_view_id == VIEW_NONE && rng_ov_pad < 0 && cat_ov_pad < 0 && pk_ov_pad < 0 );
+function pad_input_allowed() ( overlay_pad < 0 && big_view_id == VIEW_NONE && rng_ov_pad < 0 && cat_ov_pad < 0 && pk_ov_pad < 0 && !kmac_ed_open );
 
 function swing_ui_modal_gate() (
 _raw_lmb_down = lmb_down;  // preserve for overlay backdrop-click-to-close
 _raw_LMB = LMB;            // preserve for overlay backdrop-click-to-close
 _raw_wheel = frame_wheel;  // preserve for popup wheel navigation (gate zeroes frame_wheel below)
-overlay_pad >= 0 || big_view_id != VIEW_NONE || rng_ov_pad >= 0 || cat_ov_pad >= 0 || pk_ov_pad >= 0 ? (
+// ⚠️⚠️ swing_popup_active BELONGS HERE and was missing. rk_swing_popup's own
+// header states the contract -- "when swing_popup_active is non-zero,
+// swing_ui_modal_gate() suppresses the underlying UI's mouse state" -- but the
+// condition never tested it, so the click that PICKED a menu item also reached
+// whatever the popup was covering. Reported on the mini browser's rail menu
+// ("remove from list works but there is click thru"); it was true of every
+// popup in the plugin, that is just the first one whose underlay does something
+// visible on a click. The popup itself is unaffected: swing_popup_tick reads
+// the _raw_lmb_down / _raw_LMB copies preserved immediately above.
+overlay_pad >= 0 || big_view_id != VIEW_NONE || rng_ov_pad >= 0 || cat_ov_pad >= 0 || pk_ov_pad >= 0 || kmac_ed_open || swing_popup_active ? (
   _ov_pw = 420; _ov_ph = 560;
   _ov_px = (gfx_w - _ov_pw) / 2;
   _ov_py = 28 + ((gfx_h - 28 - _ov_ph) / 2);
@@ -240,6 +268,8 @@ kit_export_state == 11 ? (
   gmem[_gb + 39] = rvb_predelay;
   gmem[_gb + 40] = rvb_hpf;
   gmem[_gb + 41] = oneshot_global;
+  gmem[_gb + 42] = rvb_on;
+  gmem[_gb + 43] = dly_on;
   // Per-pad metadata
   _ki = 0; loop(NUM_PADS,
     _mb = KIT_GMEM_META + _ki * KIT_GMEM_META_PP;
@@ -328,6 +358,49 @@ kit_export_state == 11 ? (
     _cnl = strlen(_cn);
     _cj = 0; loop(KIT_GMEM_PADNAME_LEN,
       gmem[KIT_GMEM_PADNAMES + _ki * KIT_GMEM_PADNAME_LEN + _cj] =
+        _cj < _cnl ? str_getchar(_cn, _cj) : 0;
+      _cj += 1;
+    );
+    _ki += 1;
+  );
+  // ─── Kit-macro model → transfer band (KMAC_KIT_BASE; kit-LEVEL, once) ──
+  // +0 is the bridge→JSFX staged flag and is NEVER written here. Export-
+  // gated like everything in this phase, so a bridge-staged model can never
+  // be stomped by a publish. The bridge's write_kit_v4 reads +1..+390 right
+  // after this frame and packs them as tail tag 2. Layout MUST match
+  // eon_kmac_pack/stage in Swing_Kit_Bridge.lua.
+  gmem[KMAC_KIT_BASE + 1] = 2;   // model version (v2 = +custom names)
+  gmem[KMAC_KIT_BASE + 2] = macro1; gmem[KMAC_KIT_BASE + 3] = macro2;
+  gmem[KMAC_KIT_BASE + 4] = macro3; gmem[KMAC_KIT_BASE + 5] = macro4;
+  gmem[KMAC_KIT_BASE + 6] = macro5; gmem[KMAC_KIT_BASE + 7] = macro6;
+  gmem[KMAC_KIT_BASE + 8] = macro7; gmem[KMAC_KIT_BASE + 9] = macro8;
+  _ki = 0; loop(KMAC_N,
+    gmem[KMAC_KIT_BASE + 10 + _ki] = kmac_nmap[_ki];
+    gmem[KMAC_KIT_BASE + 18 + _ki] = kmac_scope[_ki];
+    gmem[KMAC_KIT_BASE + 26 + _ki] = kmac_color[_ki];
+    _ki += 1;
+  );
+  _ki = 0; loop(KMAC_N * KMAC_MAX_MAP,
+    gmem[KMAC_KIT_BASE + 34 + _ki]  = kmac_pad[_ki];
+    gmem[KMAC_KIT_BASE + 98 + _ki]  = kmac_pid[_ki];
+    gmem[KMAC_KIT_BASE + 162 + _ki] = kmac_lo[_ki];
+    gmem[KMAC_KIT_BASE + 226 + _ki] = kmac_hi[_ki];
+    gmem[KMAC_KIT_BASE + 290 + _ki] = kmac_curve[_ki];
+    _ki += 1;
+  );
+  _ki = 0; loop(KMAC_NSNAP * KMAC_N,
+    gmem[KMAC_KIT_BASE + 354 + _ki] = kmac_snap[_ki]; _ki += 1;
+  );
+  _ki = 0; loop(KMAC_NSNAP,
+    gmem[KMAC_KIT_BASE + 386 + _ki] = kmac_snap_has[_ki]; _ki += 1;
+  );
+  gmem[KMAC_KIT_BASE + 390] = kmac_snap_act;
+  // model v2: custom names as char cells, KMAC_NAME_LEN per macro (0-pad)
+  _ki = 0; loop(KMAC_N,
+    _cn = swing_lcd_kmac_name_slot(_ki);
+    _cnl = strlen(_cn);
+    _cj = 0; loop(KMAC_NAME_LEN,
+      gmem[KMAC_KIT_BASE + 391 + _ki * KMAC_NAME_LEN + _cj] =
         _cj < _cnl ? str_getchar(_cn, _cj) : 0;
       _cj += 1;
     );
@@ -739,6 +812,13 @@ kit_import_state == 2 ? (
     rvb_predelay   = gmem[_gb + 39];
     rvb_hpf        = gmem[_gb + 40];
     oneshot_global = gmem[_gb + 41];
+    // Bus enables. No KIT_GMEM_VER bump — the `>= 23 && < 25` one-shot
+    // migration below would stop firing for new kits, and none is needed:
+    // the bridge fills EVERY KIT_GLOBAL_KEYS slot on load, from its defaults
+    // table when the file predates the key. So a kit saved before the enables
+    // existed arrives with both set to 1, not zero-init 0.
+    rvb_on         = gmem[_gb + 42];
+    dly_on         = gmem[_gb + 43];
     // Recalc derived values
     recalc_global_fx();
     gfx_lim_rel_c = exp(-1.0 / max(1, gfx_lim_rel * 0.001 * srate));
@@ -902,6 +982,87 @@ kit_import_state == 2 ? (
       );  // end ② LOCK gate
       _ki += 1;
     );
+  );
+  // ── Kit-macro adopt — same contract as the SYN block above: ONLY when
+  // the bridge staged a model (flag at KMAC_KIT_BASE+0, consumed here).
+  // A kit WITHOUT a macro block stages nothing → the live macro rig
+  // SURVIVES the load (deliberate deviation from spec §6's early "loads
+  // empty" line — that predates project persistence; wiping a user's rig
+  // on every old-kit load would be hostile). A staged model replaces the
+  // WHOLE model including values, so a factory kit arrives sounding as
+  // authored: knobs move cosmetically, force re-applies the mappings.
+  // Floats take positive-form guards (a NaN from a foreign file must fall
+  // to a sane default, never reach the engine).
+  gmem[KMAC_KIT_BASE] > 0.5 ? (
+    gmem[KMAC_KIT_BASE] = 0;
+    _kmv = gmem[KMAC_KIT_BASE + 2]; macro1 = _kmv >= 0 && _kmv <= 1 ? _kmv : 0;
+    _kmv = gmem[KMAC_KIT_BASE + 3]; macro2 = _kmv >= 0 && _kmv <= 1 ? _kmv : 0;
+    _kmv = gmem[KMAC_KIT_BASE + 4]; macro3 = _kmv >= 0 && _kmv <= 1 ? _kmv : 0;
+    _kmv = gmem[KMAC_KIT_BASE + 5]; macro4 = _kmv >= 0 && _kmv <= 1 ? _kmv : 0;
+    _kmv = gmem[KMAC_KIT_BASE + 6]; macro5 = _kmv >= 0 && _kmv <= 1 ? _kmv : 0;
+    _kmv = gmem[KMAC_KIT_BASE + 7]; macro6 = _kmv >= 0 && _kmv <= 1 ? _kmv : 0;
+    _kmv = gmem[KMAC_KIT_BASE + 8]; macro7 = _kmv >= 0 && _kmv <= 1 ? _kmv : 0;
+    _kmv = gmem[KMAC_KIT_BASE + 9]; macro8 = _kmv >= 0 && _kmv <= 1 ? _kmv : 0;
+    sliderchange(KMAC_SLMASK);
+    _ki = 0; loop(KMAC_N,
+      kmac_nmap[_ki]  = max(0, min(KMAC_MAX_MAP, gmem[KMAC_KIT_BASE + 10 + _ki] | 0));
+      kmac_scope[_ki] = gmem[KMAC_KIT_BASE + 18 + _ki] | 0;
+      kmac_color[_ki] = max(0, min(7, gmem[KMAC_KIT_BASE + 26 + _ki] | 0));
+      _ki += 1;
+    );
+    _ki = 0; loop(KMAC_N * KMAC_MAX_MAP,
+      kmac_pad[_ki] = max(-2, min(NUM_PADS - 1, gmem[KMAC_KIT_BASE + 34 + _ki] | 0));
+      // Guarded like every field around it. A junk pid is harmless TODAY --
+      // nothing indexes an array by pid, so an unknown one writes nothing --
+      // but that is luck, not design: the day a pid-indexed lookup appears,
+      // an unguarded value out of a kit FILE becomes an out-of-bounds write.
+      _kmv = gmem[KMAC_KIT_BASE + 98 + _ki] | 0;
+      kmac_pid[_ki] = (_kmv >= 0 && _kmv < KMAC_PID_CORE_BASE) ||
+                      (_kmv >= KMAC_PID_CORE_BASE &&
+                       _kmv < KMAC_PID_SYN_BASE + KMAC_PID_SYN_N) ? _kmv : 0;
+      _kmv = gmem[KMAC_KIT_BASE + 162 + _ki];
+      kmac_lo[_ki] = _kmv >= -1000000 && _kmv <= 1000000 ? _kmv : 0;
+      _kmv = gmem[KMAC_KIT_BASE + 226 + _ki];
+      kmac_hi[_ki] = _kmv >= -1000000 && _kmv <= 1000000 ? _kmv : 0;
+      _kmv = gmem[KMAC_KIT_BASE + 290 + _ki];
+      kmac_curve[_ki] = _kmv >= -8 && _kmv <= 8 ? _kmv : 1;
+      _ki += 1;
+    );
+    _ki = 0; loop(KMAC_NSNAP * KMAC_N,
+      _kmv = gmem[KMAC_KIT_BASE + 354 + _ki];
+      kmac_snap[_ki] = _kmv >= 0 && _kmv <= 1 ? _kmv : 0;
+      _ki += 1;
+    );
+    _ki = 0; loop(KMAC_NSNAP,
+      kmac_snap_has[_ki] = gmem[KMAC_KIT_BASE + 386 + _ki] > 0.5 ? 1 : 0;
+      _ki += 1;
+    );
+    kmac_snap_act = max(0, min(KMAC_NSNAP - 1, gmem[KMAC_KIT_BASE + 390] | 0));
+    // model v2: adopt custom names (printable ASCII only; anything else is
+    // dropped, so a foreign block can't smuggle control chars into labels).
+    // A v1 block leaves the live names alone (the bridge zeroed the cells,
+    // and zeros filter out here anyway).
+    gmem[KMAC_KIT_BASE + 1] >= 2 ? (
+      _ki = 0; loop(KMAC_N,
+        _kmn = swing_lcd_kmac_name_slot(_ki);
+        str_setlen(_kmn, KMAC_NAME_LEN);
+        _kml = 0; _kmj = 0;
+        loop(KMAC_NAME_LEN,
+          _kmv = gmem[KMAC_KIT_BASE + 391 + _ki * KMAC_NAME_LEN + _kmj] | 0;
+          // 124 ('|') excluded: names splice into popup menu strings where a
+          // pipe is structural (see the rename drain's ban — a FOREIGN kit
+          // file must not be able to smuggle one in either)
+          _kmv >= 32 && _kmv <= 126 && _kmv != 124 ? (
+            str_setchar(_kmn, _kml, _kmv);
+            _kml += 1;
+          );
+          _kmj += 1;
+        );
+        str_setlen(_kmn, _kml);
+        _ki += 1;
+      );
+    );
+    kmac_force = 1;   // apply the authored mappings at the authored values
   );
   // Format migrations for old kits. ② LOCK: these normalise values the sweep
   // above just ADOPTED, so they must skip the pads that adopted nothing —
@@ -1620,6 +1781,95 @@ function swing_state_embedmenu_open(px, py) (
   swing_popup_open(px, py, #_emb_menu, SP_POPUP_CALLER_EMBED_MENU);
 );
 
+// ── View-mode override menu (Spec_Swing_Dock_Mode.md) ────────────────────
+// Right-click the SWING wordmark (either face) → Auto / Full UI / Rack face.
+// dock_face_mode: 0 = Auto (the aspect trigger decides) · 1 = Full UI always
+// · 2 = Rack face always. Serialized per instance (ser_ver 56); default 0 =
+// Auto, and the variable is deliberately NEVER assigned in @init so a
+// re-init can't stomp the pick. One helper carries hover tooltip, the
+// opener, and the result consumer, so both faces share a single site.
+function swing_ui_viewmode_click(_hx, _hy, _hw, _hh)
+local(_hov, _rig_docked)
+(
+  _hov = mx >= _hx && mx < _hx + _hw && my >= _hy && my < _hy + _hh;
+  // Left-click = the dock toggle (2026-08-26), one implementation for both
+  // faces since this helper already runs in both. Docked (rig heartbeat fresh
+  // + this instance flagged) -> bump POP: our pane script re-shows the float
+  // and its handoff watcher does the rest. Otherwise, bridge alive -> write
+  // our instance_id then bump REDOCK: the bridge selects our track and
+  // launches/reuses the pane. Both cells are read-modify-write bumps (sole
+  // writer = this JSFX; a reloaded instance restarting at 0 would never edge).
+  // No listener -> the click does nothing and the tooltip promises nothing.
+  // ⚠️ GS_RIG_ALIVE_SWING, not the shared GS_RIG_ALIVE. 2626 means "SOME pane is
+  // up" and Steppa's pane stamps it too, so gating here on 2626 let a stale
+  // slider42 read as docked for as long as STEPPA's pane was running -- the
+  // click then posted POP to a Swing pane that was not there and did nothing
+  // (2026-08-30). This cell is stamped only by EON Swing Dock.lua.
+  _rig_docked = (time_precise() - gmem[GS_RIG_ALIVE_SWING]) < 2 && slider42 > 0.5;
+  _hov ? (
+    _rig_docked ? (
+      sprintf(#tooltip, "Pop out to a floating window — right-click: view menu (%s)",
+        dock_face_mode == 1 ? "Full UI" :
+        dock_face_mode == 2 ? "Rack face" : "Auto");
+    ) : gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      sprintf(#tooltip, "Return to the dock — right-click: view menu (%s)",
+        dock_face_mode == 1 ? "Full UI" :
+        dock_face_mode == 2 ? "Rack face" : "Auto");
+    ) : (
+      sprintf(#tooltip, "View: %s — right-click for Auto / Full UI / Rack face",
+        dock_face_mode == 1 ? "Full UI" :
+        dock_face_mode == 2 ? "Rack face" : "Auto (by shape)");
+    );
+  );
+  // dock_want (ser_ver 69) is the INTENT behind the click, and it outlives the
+  // capture. slider42 says "the pane is holding me right now" and the pane
+  // clears it on every release -- including the release that happens when the
+  // user simply closes the dock tab. So a Swing that was docked, closed and
+  // reopened came back floating with nobody remembering it had ever been
+  // docked (2026-09-02). The re-dock hello in Swing_ReaKit.jsfx's floating
+  // branch reads this flag; only the POP click clears it.
+  _hov && lmb_down ? (
+    _rig_docked ? (
+      gmem[GS_POP_REQ_SWING] = (gmem[GS_POP_REQ_SWING]|0) + 1;
+      dock_want ? ( dock_want = 0; mark_dirty(); );
+      lmb_down = 0;
+    ) : gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      gmem[GS_REDOCK_ID_SWING]  = instance_id;
+      gmem[GS_REDOCK_REQ_SWING] = (gmem[GS_REDOCK_REQ_SWING]|0) + 1;
+      !dock_want ? ( dock_want = 1; mark_dirty(); );
+      lmb_down = 0;
+    );
+  );
+  _hov && rmb_down ? (
+    // Rows 1-3 = this instance's face. Rows 5-8 (after the #header, which
+    // counts; the || separator doesn't) = the DOCK RIG's pane layout — the
+    // pick rides GS_DOCK_LAYOUT_REQ to the bridge, which relays it to
+    // EON Dock Layout.lua. Labels must stay in step with that script's
+    // LAYOUTS table: the 1-based index is the contract, not the text.
+    sprintf(#_view_menu, "%sAuto — follow window shape|%sFull UI — always|%sRack face — always||#DOCK LAYOUT|Full rig|Beatmaking|Sound design|Pads only",
+      dock_face_mode == 0 ? "^G " : "",
+      dock_face_mode == 1 ? "^G " : "",
+      dock_face_mode == 2 ? "^G " : "");
+    swing_popup_open(mx, my, #_view_menu, SP_POPUP_CALLER_VIEW_MODE);
+    rmb_down = 0;
+  );
+  swing_popup_result != 0 && swing_popup_caller_id == SP_POPUP_CALLER_VIEW_MODE ? (
+    swing_popup_result >= 1 && swing_popup_result <= 3 &&
+    dock_face_mode != swing_popup_result - 1 ? (
+      dock_face_mode = swing_popup_result - 1;
+      mark_dirty();   // undo point + project dirty, the prefs-menu idiom
+    );
+    swing_popup_result >= 5 && swing_popup_result <= 8 ? (
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+        gmem[GS_DOCK_LAYOUT_REQ] = swing_popup_result - 4;
+      ) : (
+        kit_bridge_warn = 1;   // same "bridge not running" cue as TOOLBAR
+      );
+    );
+    swing_popup_result = 0;   // consume picks AND the -1 cancel
+  );
+);
+
 function swing_ui_draw_header() (
   gfx_set(bg_r, bg_g, bg_b, 1); gfx_rect(0, 0, gfx_w, gfx_h);
 
@@ -1645,10 +1895,19 @@ function swing_ui_draw_header() (
   // mark, so it does NOT follow the theme accent (which would turn it orange under
   // EON, green under SSL, etc.). Other accent elements still follow the theme.
   gfx_set(0.85, 0.20, 0.12, 1);
+  gfx_measurestr("S W I N G", _wm_tw, _wm_th);
   gfx_x = 10; gfx_y = 5; gfx_drawstr("S W I N G");
-  // Subtitle: smaller, more subdued
+  // Right-click the wordmark: view-mode override (Auto / Full UI / Rack face).
+  swing_ui_viewmode_click(8, 0, _wm_tw + 6, 27);
+  // Subtitle: smaller, more subdued. The ink is resolved FROM the header strip
+  // rather than fixed: hd_* follows the theme's ACCENT2, which a derived REAPER
+  // palette can land light or dark, and a fixed mid-grey at half alpha vanished
+  // on the light half of that range. t=0.80 reproduces the charcoal-header look
+  // this line has always had (fixed 0.55/0.53/0.50 at a=0.5 over hd 0.30 composites
+  // to ~0.42 grey; so does a near-white ink pulled 80% back toward hd) while
+  // staying legible when the strip goes pale. Same helper the captions above use.
   gfx_setfont(1, "Arial", 9, 0);
-  gfx_set(0.55, 0.53, 0.50, 0.5);
+  rk_auto_ink_dim(hd_r, hd_g, hd_b, 0.80); gfx_a = 1;
   gfx_x = 78; gfx_y = 17; gfx_drawstr("by EON Studios");
 
   // ── Right-side button cluster (EMBED + UNDO + REDO) ──────────────────
@@ -1700,16 +1959,24 @@ function swing_ui_draw_header() (
   gfx_measurestr("REAPER", _thm_maxw, _thm_th2);
   _thm_bw  = _thm_maxw + _btn_pad * 2;
   _thm_bx  = _tb_bx - _thm_bw - _btn_gap;
-  rkth_input(_thm_bx, _btn_y, _thm_bw, _btn_h, mx, my, lmb_down, rmb_down, frame_wheel, _btn_h) ? ( lmb_down = 0; frame_wheel = 0; );
-  rkth_draw_chip(11);
-  _thm_hover = mx >= _thm_bx && mx <= _thm_bx + _thm_bw && my >= _btn_y && my <= _btn_y + _btn_h;
-  _thm_hover ? (
-    #tooltip = "Theme: click cycles · right-click opens the list · hover+wheel cycles — syncs all EON tools";
-  );
-  // Caption drawn on Swing's side, NOT inside rkth_draw_chip: that widget is
-  // shared with Drum Strip and ships in the ReaKit library, and this is a
-  // Swing-layout decision. Consumed width shifts the TOOLBAR anchor below.
-  _thm_capw = swing_ui_hdr_cap("THEME", _thm_bx, _btn_y, _btn_h, _thm_hover);
+  // Narrow-pane fold (user 2026-08-25, "buttons get in the logo's way" in a
+  // docked full-UI pane): a chip whose LEFT edge would cross the wordmark
+  // clearance neither draws nor takes input. Guarded per block right through
+  // the cluster, so the leftmost chips vanish first and UNDO/REDO survive
+  // longest. Same HDR_CAP_MIN_X the caption system already respects; anchor
+  // math and popup-result consumers stay unconditional.
+  _thm_bx >= HDR_CAP_MIN_X ? (
+    rkth_input(_thm_bx, _btn_y, _thm_bw, _btn_h, mx, my, lmb_down, rmb_down, frame_wheel, _btn_h) ? ( lmb_down = 0; frame_wheel = 0; );
+    rkth_draw_chip(11);
+    _thm_hover = mx >= _thm_bx && mx <= _thm_bx + _thm_bw && my >= _btn_y && my <= _btn_y + _btn_h;
+    _thm_hover ? (
+      #tooltip = "Theme: click cycles · right-click opens the list · hover+wheel cycles — syncs all EON tools";
+    );
+    // Caption drawn on Swing's side, NOT inside rkth_draw_chip: that widget is
+    // shared with Drum Strip and ships in the ReaKit library, and this is a
+    // Swing-layout decision. Consumed width shifts the TOOLBAR anchor below.
+    _thm_capw = swing_ui_hdr_cap("THEME", _thm_bx, _btn_y, _btn_h, _thm_hover);
+  ) : ( _thm_capw = 0; );
 
   // ── TOOLBAR button — open/close the EON toolbar (bridge CMD 78). Sits just left
   //    of THEME. The bridge finds the [Floating toolbar N] titled EON and toggles
@@ -1717,22 +1984,24 @@ function swing_ui_draw_header() (
   //    specific). Posts only if the bridge is alive and the CMD bus is idle. ──
   // _tb_bw/_tb_bx precomputed above the THEME block (swap: TOOLBAR is the
   // rightmost chip, THEME anchors off it).
-  gfx_setfont(1, "Arial", 11, 'b');
-  _tb_hover = mx >= _tb_bx && mx <= _tb_bx + _tb_bw && my >= _btn_y && my <= _btn_y + _btn_h;
-  _tb_lit = gmem[GS_TOOLBAR_OPEN] > 0.5;   // bridge publishes toolbar open-state
-  _tb_lit ? gfx_set(1.0, 0.66, 0.20, _tb_hover ? 1.0 : 0.95)     // open  = vivid orange
-          : gfx_set(0.55, 0.40, 0.18, _tb_hover ? 0.88 : 0.62);  // closed = muted amber
-  gfx_rect(_tb_bx, _btn_y, _tb_bw, _btn_h);
-  gfx_set(1, 1, 1, _tb_hover ? 1.0 : 0.92);
-  gfx_measurestr("TOOLBAR", _tb_lw, _tb_lh);
-  gfx_x = _tb_bx + (_tb_bw - _tb_lw) * 0.5; gfx_y = _btn_y + (_btn_h - _tb_lh) * 0.5;
-  gfx_drawstr("TOOLBAR");
-  _tb_hover ? ( #tooltip = "Open/close the EON toolbar — found by name, works in any toolbar slot."; );
-  _tb_hover && lmb_down ? (
-    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
-      gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_CMD] = 78; );
-    ) : ( kit_bridge_warn = 1; );
-    lmb_down = 0;
+  _tb_bx >= HDR_CAP_MIN_X ? (
+    gfx_setfont(1, "Arial", 11, 'b');
+    _tb_hover = mx >= _tb_bx && mx <= _tb_bx + _tb_bw && my >= _btn_y && my <= _btn_y + _btn_h;
+    _tb_lit = gmem[GS_TOOLBAR_OPEN] > 0.5;   // bridge publishes toolbar open-state
+    _tb_lit ? gfx_set(1.0, 0.66, 0.20, _tb_hover ? 1.0 : 0.95)     // open  = vivid orange
+            : gfx_set(0.55, 0.40, 0.18, _tb_hover ? 0.88 : 0.62);  // closed = muted amber
+    gfx_rect(_tb_bx, _btn_y, _tb_bw, _btn_h);
+    gfx_set(1, 1, 1, _tb_hover ? 1.0 : 0.92);
+    gfx_measurestr("TOOLBAR", _tb_lw, _tb_lh);
+    gfx_x = _tb_bx + (_tb_bw - _tb_lw) * 0.5; gfx_y = _btn_y + (_btn_h - _tb_lh) * 0.5;
+    gfx_drawstr("TOOLBAR");
+    _tb_hover ? ( #tooltip = "Open/close the EON toolbar — found by name, works in any toolbar slot."; );
+    _tb_hover && lmb_down ? (
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+        gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_CMD] = 78; );
+      ) : ( kit_bridge_warn = 1; );
+      lmb_down = 0;
+    );
   );
 
   // ── KNOB style selector — pad-knob style, sits just left of THEME (both are
@@ -1745,30 +2014,32 @@ function swing_ui_draw_header() (
   _knob_bw = _knob_maxw + _btn_pad * 2;
   _knob_bx = _thm_bx - _thm_capw - _knob_bw - _btn_gap;   // clears the THEME caption (swap: THEME is left of TOOLBAR now)
   _knob_cur = gmem[GS_THEME_KNOB_P] | 0;
-  _knob_hover = mx >= _knob_bx && mx <= _knob_bx + _knob_bw && my >= _btn_y && my <= _btn_y + _btn_h;
-  gfx_set(0.35, 0.35, 0.38, _knob_hover ? 0.95 : 0.68);
-  gfx_rect(_knob_bx, _btn_y, _knob_bw, _btn_h);
-  gfx_set(1, 1, 1, _knob_hover ? 1.0 : 0.92);
-  swing_ui_knob_name(_knob_cur);
-  gfx_measurestr(#_knob_name, _knob_lw, _knob_lh);
-  gfx_x = _knob_bx + (_knob_bw - _knob_lw) * 0.5; gfx_y = _btn_y + (_btn_h - _knob_lh) * 0.5;
-  gfx_drawstr(#_knob_name);
-  _knob_hover ? (
-    #tooltip = "Pad knob style — click / right-click for the list · hover+wheel cycles. Saved per theme; master knobs unaffected.";
-  );
-  _knob_capw = swing_ui_hdr_cap("KNOB", _knob_bx, _btn_y, _btn_h, _knob_hover);
-  // Click (either button) → style picker popup
-  _knob_hover && (lmb_down || rmb_down) ? (
-    swing_popup_open(mx, my,
-      "Default|SSL|Vari-Mu|API|Witti|Neve|Joanny|MPC|Jog|Spice|Encoder|Pultec|Ableton|FL|Pro Tools|FabFilter|Serum|Roland|Pultec Cr|Neve Alt",
-      SP_POPUP_CALLER_KNOB_STYLE);
-    lmb_down = 0;
-  );
-  // Wheel → cycle (numeric style order, skips the mem-only bb=9)
-  _knob_hover && frame_wheel != 0 ? (
-    gmem[GS_THEME_KNOB_REQ] = (frame_wheel > 0 ? swing_ui_knob_next(_knob_cur) : swing_ui_knob_prev(_knob_cur)) + 1;
-    frame_wheel = 0;
-  );
+  _knob_bx >= HDR_CAP_MIN_X ? (
+    _knob_hover = mx >= _knob_bx && mx <= _knob_bx + _knob_bw && my >= _btn_y && my <= _btn_y + _btn_h;
+    gfx_set(0.35, 0.35, 0.38, _knob_hover ? 0.95 : 0.68);
+    gfx_rect(_knob_bx, _btn_y, _knob_bw, _btn_h);
+    gfx_set(1, 1, 1, _knob_hover ? 1.0 : 0.92);
+    swing_ui_knob_name(_knob_cur);
+    gfx_measurestr(#_knob_name, _knob_lw, _knob_lh);
+    gfx_x = _knob_bx + (_knob_bw - _knob_lw) * 0.5; gfx_y = _btn_y + (_btn_h - _knob_lh) * 0.5;
+    gfx_drawstr(#_knob_name);
+    _knob_hover ? (
+      #tooltip = "Pad knob style — click / right-click for the list · hover+wheel cycles. Saved per theme; master knobs unaffected.";
+    );
+    _knob_capw = swing_ui_hdr_cap("KNOB", _knob_bx, _btn_y, _btn_h, _knob_hover);
+    // Click (either button) → style picker popup
+    _knob_hover && (lmb_down || rmb_down) ? (
+      swing_popup_open(mx, my,
+        "Default|SSL|Vari-Mu|API|Witti|Neve|Joanny|MPC|Jog|Spice|Encoder|Pultec|Ableton|FL|Pro Tools|FabFilter|Serum|Roland|Pultec Cr|Neve Alt",
+        SP_POPUP_CALLER_KNOB_STYLE);
+      lmb_down = 0;
+    );
+    // Wheel → cycle (numeric style order, skips the mem-only bb=9)
+    _knob_hover && frame_wheel != 0 ? (
+      gmem[GS_THEME_KNOB_REQ] = (frame_wheel > 0 ? swing_ui_knob_next(_knob_cur) : swing_ui_knob_prev(_knob_cur)) + 1;
+      frame_wheel = 0;
+    );
+  ) : ( _knob_capw = 0; );
   // Popup pick → style request. Positions 1..9 → id (r-1); 10..20 → id r.
   swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_KNOB_STYLE ? (
     _knob_pick = swing_popup_result <= 9 ? swing_popup_result - 1 : swing_popup_result;
@@ -1793,43 +2064,51 @@ function swing_ui_draw_header() (
     gfx_measurestr("S+VU", _strv_mw, _strv_th);
     _strv_bw = _strv_mw + _btn_pad * 2;
     _strv_bx = _knob_bx - _knob_capw - _strv_bw - _btn_gap;   // clears the KNOB caption
-    _strv_hover = mx >= _strv_bx && mx <= _strv_bx + _strv_bw && my >= _btn_y && my <= _btn_y + _btn_h;
-    gfx_set(0.35, 0.35, 0.38, _strv_hover ? 0.95 : 0.68);
-    gfx_rect(_strv_bx, _btn_y, _strv_bw, _btn_h);
-    gfx_set(1, 1, 1, _strv_hover ? 1.0 : 0.92);
-    gfx_measurestr(#_strv_l, _strv_lw, _strv_lh);
-    gfx_x = _strv_bx + (_strv_bw - _strv_lw) * 0.5; gfx_y = _btn_y + (_btn_h - _strv_lh) * 0.5;
-    gfx_drawstr(#_strv_l);
-    _strv_hover ? ( #tooltip = "Drum-strip view — click / hover-wheel sets the embedded view of ALL this kit's strips (EQ · Strip · Strip+VU · Full)."; );
-    _strv_capw = swing_ui_hdr_cap("STRIPS", _strv_bx, _btn_y, _btn_h, _strv_hover);
-    _strv_hover && lmb_down ? (
-      swing_strip_view = (_strv + 1) % 4;
-      _reg_my_slot >= 0 ? gmem[GS_STRIP_BASE + _reg_my_slot * GS_STRIP_STRIDE + GS_STRIP_OFF_VIEW_REQ] = swing_strip_view + 1;
-      lmb_down = 0;
-    );
-    _strv_hover && frame_wheel != 0 ? (
-      swing_strip_view = ((_strv + (frame_wheel > 0 ? 1 : -1)) + 4) % 4;
-      _reg_my_slot >= 0 ? gmem[GS_STRIP_BASE + _reg_my_slot * GS_STRIP_STRIDE + GS_STRIP_OFF_VIEW_REQ] = swing_strip_view + 1;
-      frame_wheel = 0;
-    );
+    _strv_bx >= HDR_CAP_MIN_X ? (
+      _strv_hover = mx >= _strv_bx && mx <= _strv_bx + _strv_bw && my >= _btn_y && my <= _btn_y + _btn_h;
+      gfx_set(0.35, 0.35, 0.38, _strv_hover ? 0.95 : 0.68);
+      gfx_rect(_strv_bx, _btn_y, _strv_bw, _btn_h);
+      gfx_set(1, 1, 1, _strv_hover ? 1.0 : 0.92);
+      gfx_measurestr(#_strv_l, _strv_lw, _strv_lh);
+      gfx_x = _strv_bx + (_strv_bw - _strv_lw) * 0.5; gfx_y = _btn_y + (_btn_h - _strv_lh) * 0.5;
+      gfx_drawstr(#_strv_l);
+      _strv_hover ? ( #tooltip = "Drum-strip view — click / hover-wheel sets the embedded view of ALL this kit's strips (EQ · Strip · Strip+VU · Full)."; );
+      _strv_capw = swing_ui_hdr_cap("STRIPS", _strv_bx, _btn_y, _btn_h, _strv_hover);
+      _strv_hover && lmb_down ? (
+        swing_strip_view = (_strv + 1) % 4;
+        _reg_my_slot >= 0 ? gmem[GS_STRIP_BASE + _reg_my_slot * GS_STRIP_STRIDE + GS_STRIP_OFF_VIEW_REQ] = swing_strip_view + 1;
+        lmb_down = 0;
+      );
+      _strv_hover && frame_wheel != 0 ? (
+        swing_strip_view = ((_strv + (frame_wheel > 0 ? 1 : -1)) + 4) % 4;
+        _reg_my_slot >= 0 ? gmem[GS_STRIP_BASE + _reg_my_slot * GS_STRIP_STRIDE + GS_STRIP_OFF_VIEW_REQ] = swing_strip_view + 1;
+        frame_wheel = 0;
+      );
+    ) : ( _strv_capw = 0; );
   );
 
   // ── VU FACE selector — sets the analog VU meter face on EVERY Drum Strip in this
-  //    kit (multi-out only). AUTO follows the One Rack theme; or one of 11 vu_kbsg
-  //    faces. Click forward / hover-wheel cycle; the choice (style+2) is written to
+  //    kit (multi-out only). AUTO follows the One Rack theme; or one of rk_vu's 20
+  //    faces (names mirror rk_vu_theme_name; the strips draw them). Click forward /
+  //    hover-wheel cycle; the choice (style+2) is written to
   //    GS_STRIP_OFF_VU_REQ and EON_Swing_Strip_Sync pushes it to the strips. Sits
   //    just left of the STRIPS chip. Per-strip override still lives on each strip. ──
   multi_out ? (
     swing_svu_seen == 0 ? ( swing_vu_style = -1; swing_svu_seen = 1; );   // default AUTO
-    _svu = max(-1, min(10, swing_vu_style | 0));
-    _svu <  0 ? strcpy(#_svu_l, "AUTO")     : _svu == 0 ? strcpy(#_svu_l, "Classic")  :
-    _svu == 1 ? strcpy(#_svu_l, "Knight")   : _svu == 2 ? strcpy(#_svu_l, "Purple")   :
-    _svu == 3 ? strcpy(#_svu_l, "Moss")     : _svu == 4 ? strcpy(#_svu_l, "Moo")      :
-    _svu == 5 ? strcpy(#_svu_l, "Warm")     : _svu == 6 ? strcpy(#_svu_l, "Ivory")    :
-    _svu == 7 ? strcpy(#_svu_l, "Trooper")  : _svu == 8 ? strcpy(#_svu_l, "Ultimate") :
-    _svu == 9 ? strcpy(#_svu_l, "Mooncake") : strcpy(#_svu_l, "Black");
+    _svu = max(-1, min(19, swing_vu_style | 0));
+    _svu <  0 ? strcpy(#_svu_l, "AUTO")          : _svu == 0  ? strcpy(#_svu_l, "Cream")        :
+    _svu == 1  ? strcpy(#_svu_l, "Dark Studio")  : _svu == 2  ? strcpy(#_svu_l, "Black & Gold") :
+    _svu == 3  ? strcpy(#_svu_l, "Modern White") : _svu == 4  ? strcpy(#_svu_l, "Broadcast")    :
+    _svu == 5  ? strcpy(#_svu_l, "Midnight")     : _svu == 6  ? strcpy(#_svu_l, "Vintage Amber"):
+    _svu == 7  ? strcpy(#_svu_l, "Olive")        : _svu == 8  ? strcpy(#_svu_l, "Ivory")        :
+    _svu == 9  ? strcpy(#_svu_l, "Blackface")    : _svu == 10 ? strcpy(#_svu_l, "SSL")          :
+    _svu == 11 ? strcpy(#_svu_l, "Neve")         : _svu == 12 ? strcpy(#_svu_l, "API")          :
+    _svu == 13 ? strcpy(#_svu_l, "Ableton")      : _svu == 14 ? strcpy(#_svu_l, "FL Studio")    :
+    _svu == 15 ? strcpy(#_svu_l, "Red")          : _svu == 16 ? strcpy(#_svu_l, "Yellow")       :
+    _svu == 17 ? strcpy(#_svu_l, "Orange")       : _svu == 18 ? strcpy(#_svu_l, "Emerald")      :
+                 strcpy(#_svu_l, "Cobalt");
     gfx_setfont(1, "Arial", 11, 'b');
-    gfx_measurestr("Mooncake", _svu_mw, _svu_th);
+    gfx_measurestr("Vintage Amber", _svu_mw, _svu_th);   // the widest face name
     // Caption-or-in-chip: mirror hdr_cap's LAST-RESORT fit test (8px) at the x
     // this chip is about to take. When even that caption would drop (crowded
     // multi-out row — the font stepping still gives up below 8px), the label
@@ -1844,36 +2123,38 @@ function swing_ui_draw_header() (
     gfx_measurestr("VU · ", _svu_pw, _svu_pth);
     _svu_bw = _svu_mw + (_svu_incap ? _svu_pw : 0) + _btn_pad * 2;
     _svu_bx = _strv_bx - _strv_capw - _svu_bw - _btn_gap;   // clears the STRIPS caption
-    _svu_hover = mx >= _svu_bx && mx <= _svu_bx + _svu_bw && my >= _btn_y && my <= _btn_y + _btn_h;
-    gfx_set(0.35, 0.35, 0.38, _svu_hover ? 0.95 : 0.68);
-    gfx_rect(_svu_bx, _btn_y, _svu_bw, _btn_h);
-    _svu_incap ? (
-      // font is still the 9px prefix font from the measure above
-      gfx_set(1, 1, 1, _svu_hover ? 0.72 : 0.55);
-      gfx_x = _svu_bx + _btn_pad; gfx_y = _btn_y + (_btn_h - _svu_pth) * 0.5;
-      gfx_drawstr("VU · ");
-    );
-    gfx_setfont(1, "Arial", 11, 'b');
-    gfx_set(1, 1, 1, _svu_hover ? 1.0 : 0.92);
-    gfx_measurestr(#_svu_l, _svu_lw, _svu_lh);
-    // value centred in its own zone (right of the prefix); with no prefix this
-    // is byte-identical to the old full-chip centring
-    gfx_x = _svu_bx + _btn_pad + (_svu_incap ? _svu_pw : 0) + (_svu_mw - _svu_lw) * 0.5;
-    gfx_y = _btn_y + (_btn_h - _svu_lh) * 0.5;
-    gfx_drawstr(#_svu_l);
-    _svu_hover ? ( #tooltip = "VU meter face for ALL this kit's strips — click / hover-wheel cycles. AUTO follows the theme. (Each strip can still override.)"; );
-    // leftmost — nothing anchors off it; skipped when the label went in-chip
-    !_svu_incap ? swing_ui_hdr_cap("VU", _svu_bx, _btn_y, _btn_h, _svu_hover);
-    _svu_hover && lmb_down ? (
-      swing_vu_style = _svu >= 10 ? -1 : _svu + 1;
-      _reg_my_slot >= 0 ? gmem[GS_STRIP_BASE + _reg_my_slot * GS_STRIP_STRIDE + GS_STRIP_OFF_VU_REQ] = swing_vu_style + 2;
-      lmb_down = 0;
-    );
-    _svu_hover && frame_wheel != 0 ? (
-      swing_vu_style = _svu + (frame_wheel > 0 ? 1 : -1);
-      swing_vu_style > 10 ? swing_vu_style = -1 : swing_vu_style < -1 ? swing_vu_style = 10;
-      _reg_my_slot >= 0 ? gmem[GS_STRIP_BASE + _reg_my_slot * GS_STRIP_STRIDE + GS_STRIP_OFF_VU_REQ] = swing_vu_style + 2;
-      frame_wheel = 0;
+    _svu_bx >= HDR_CAP_MIN_X ? (
+      _svu_hover = mx >= _svu_bx && mx <= _svu_bx + _svu_bw && my >= _btn_y && my <= _btn_y + _btn_h;
+      gfx_set(0.35, 0.35, 0.38, _svu_hover ? 0.95 : 0.68);
+      gfx_rect(_svu_bx, _btn_y, _svu_bw, _btn_h);
+      _svu_incap ? (
+        // font is still the 9px prefix font from the measure above
+        gfx_set(1, 1, 1, _svu_hover ? 0.72 : 0.55);
+        gfx_x = _svu_bx + _btn_pad; gfx_y = _btn_y + (_btn_h - _svu_pth) * 0.5;
+        gfx_drawstr("VU · ");
+      );
+      gfx_setfont(1, "Arial", 11, 'b');
+      gfx_set(1, 1, 1, _svu_hover ? 1.0 : 0.92);
+      gfx_measurestr(#_svu_l, _svu_lw, _svu_lh);
+      // value centred in its own zone (right of the prefix); with no prefix this
+      // is byte-identical to the old full-chip centring
+      gfx_x = _svu_bx + _btn_pad + (_svu_incap ? _svu_pw : 0) + (_svu_mw - _svu_lw) * 0.5;
+      gfx_y = _btn_y + (_btn_h - _svu_lh) * 0.5;
+      gfx_drawstr(#_svu_l);
+      _svu_hover ? ( #tooltip = "VU meter face for ALL this kit's strips — click / hover-wheel cycles. AUTO follows the theme. (Each strip can still override.)"; );
+      // leftmost — nothing anchors off it; skipped when the label went in-chip
+      !_svu_incap ? swing_ui_hdr_cap("VU", _svu_bx, _btn_y, _btn_h, _svu_hover);
+      _svu_hover && lmb_down ? (
+        swing_vu_style = _svu >= 19 ? -1 : _svu + 1;
+        _reg_my_slot >= 0 ? gmem[GS_STRIP_BASE + _reg_my_slot * GS_STRIP_STRIDE + GS_STRIP_OFF_VU_REQ] = swing_vu_style + 2;
+        lmb_down = 0;
+      );
+      _svu_hover && frame_wheel != 0 ? (
+        swing_vu_style = _svu + (frame_wheel > 0 ? 1 : -1);
+        swing_vu_style > 19 ? swing_vu_style = -1 : swing_vu_style < -1 ? swing_vu_style = 19;
+        _reg_my_slot >= 0 ? gmem[GS_STRIP_BASE + _reg_my_slot * GS_STRIP_STRIDE + GS_STRIP_OFF_VU_REQ] = swing_vu_style + 2;
+        frame_wheel = 0;
+      );
     );
   );
 
@@ -1882,19 +2163,22 @@ function swing_ui_draw_header() (
   // in-window swing_popup: MIDI Thru, Tooltips, and Select-track-on-pad-click.
   // The gear tints purple while MIDI Thru is ON so that state stays visible at a
   // glance (it used to be the THRU button's purple). midi_thru = slider22.
-  _gear_hover = mx >= _thru_bx && mx <= _thru_bx + _thru_bw &&
+  _gear_hover = _thru_bx >= HDR_CAP_MIN_X
+             && mx >= _thru_bx && mx <= _thru_bx + _thru_bw &&
                 my >= _btn_y && my <= _btn_y + _btn_h;
-  midi_thru ? (
-    gfx_set(0.55, 0.30, 0.85, _gear_hover ? 1.0 : 0.85);   // purple = MIDI Thru on
-  ) : (
-    gfx_set(0.35, 0.35, 0.38, _gear_hover ? 0.85 : 0.65);  // neutral gray
+  _thru_bx >= HDR_CAP_MIN_X ? (
+    midi_thru ? (
+      gfx_set(0.55, 0.30, 0.85, _gear_hover ? 1.0 : 0.85);   // purple = MIDI Thru on
+    ) : (
+      gfx_set(0.35, 0.35, 0.38, _gear_hover ? 0.85 : 0.65);  // neutral gray
+    );
+    gfx_rect(_thru_bx, _btn_y, _thru_bw, _btn_h);
+    gfx_set(1, 1, 1, _gear_hover ? 1.0 : 0.95);
+    gfx_measurestr("⚙", _gw, _gh);
+    gfx_x = _thru_bx + (_thru_bw - _gw) * 0.5; gfx_y = _btn_y + (_btn_h - _gh) * 0.5;
+    gfx_drawstr("⚙");
+    _gear_hover ? ( #tooltip = "Settings — MIDI Thru · Tooltips · Select track on pad-click · Embed audio · ADSR nodes"; );
   );
-  gfx_rect(_thru_bx, _btn_y, _thru_bw, _btn_h);
-  gfx_set(1, 1, 1, _gear_hover ? 1.0 : 0.95);
-  gfx_measurestr("⚙", _gw, _gh);
-  gfx_x = _thru_bx + (_thru_bw - _gw) * 0.5; gfx_y = _btn_y + (_btn_h - _gh) * 0.5;
-  gfx_drawstr("⚙");
-  _gear_hover ? ( #tooltip = "Settings — MIDI Thru · Tooltips · Select track on pad-click · Embed audio · ADSR nodes"; );
   lmb_down && _gear_hover ? (
     sprintf(#_prefs_menu, "%s|%s|%s|%s|%s",
       midi_thru               ? "^G MIDI Thru: ON"                  : "MIDI Thru: OFF",
@@ -1951,17 +2235,20 @@ function swing_ui_draw_header() (
   );
 
   // ── EMBED button ──
-  _emb_hover = mx >= _emb_bx && mx <= _emb_bx + _emb_bw &&
+  _emb_hover = _emb_bx >= HDR_CAP_MIN_X
+            && mx >= _emb_bx && mx <= _emb_bx + _emb_bw &&
                my >= _emb_by && my <= _emb_by + _emb_bh;
-  embed_show_knobs ? (
-    gfx_set(0.35, 0.65, 0.85, _emb_hover ? 0.95 : 0.75);  // active blue
-  ) : (
-    gfx_set(0.35, 0.35, 0.38, _emb_hover ? 0.85 : 0.65);  // neutral gray
+  _emb_bx >= HDR_CAP_MIN_X ? (
+    embed_show_knobs ? (
+      gfx_set(0.35, 0.65, 0.85, _emb_hover ? 0.95 : 0.75);  // active blue
+    ) : (
+      gfx_set(0.35, 0.35, 0.38, _emb_hover ? 0.85 : 0.65);  // neutral gray
+    );
+    gfx_rect(_emb_bx, _emb_by, _emb_bw, _emb_bh);
+    gfx_set(1, 1, 1, _emb_hover ? 1.0 : 0.95);
+    gfx_x = _emb_bx + _btn_pad; gfx_y = _emb_by + (_emb_bh - _emb_th) * 0.5;
+    gfx_drawstr("EMBED");
   );
-  gfx_rect(_emb_bx, _emb_by, _emb_bw, _emb_bh);
-  gfx_set(1, 1, 1, _emb_hover ? 1.0 : 0.95);
-  gfx_x = _emb_bx + _btn_pad; gfx_y = _emb_by + (_emb_bh - _emb_th) * 0.5;
-  gfx_drawstr("EMBED");
   lmb_down && _emb_hover ? (
     // Migrated to Swing-styled popup. Labels flip with state so the user
     // sees what the click will DO (Show vs Hide) instead of relying on
@@ -1997,17 +2284,20 @@ function swing_ui_draw_header() (
   // global Ctrl+Z — so it can never roll a loaded kit back to empty. Dimmed
   // when the internal undo ring is empty.
   _ur_avail_u = _udo_uc > 0 || _udo_st_valid;  // param entries OR a structural (audio) snapshot
-  _ur_hov_u = mx >= _undo_bx && mx <= _undo_bx + _undo_bw && my >= _btn_y && my <= _btn_y + _btn_h;
-  _ur_avail_u ? (
-    // Amber pill — distinguishes UNDO from REDO at a glance
-    gfx_set(0.85, 0.55, 0.20, _ur_hov_u ? 1.0 : 0.80);
-  ) : (
-    gfx_set(0.20, 0.20, 0.22, 0.45);
+  _ur_hov_u = _undo_bx >= HDR_CAP_MIN_X
+           && mx >= _undo_bx && mx <= _undo_bx + _undo_bw && my >= _btn_y && my <= _btn_y + _btn_h;
+  _undo_bx >= HDR_CAP_MIN_X ? (
+    _ur_avail_u ? (
+      // Amber pill — distinguishes UNDO from REDO at a glance
+      gfx_set(0.85, 0.55, 0.20, _ur_hov_u ? 1.0 : 0.80);
+    ) : (
+      gfx_set(0.20, 0.20, 0.22, 0.45);
+    );
+    gfx_rect(_undo_bx, _btn_y, _undo_bw, _btn_h);
+    gfx_set(1, 1, 1, _ur_avail_u ? (_ur_hov_u ? 1.0 : 0.98) : 0.55);
+    gfx_x = _undo_bx + _btn_pad; gfx_y = _btn_y + (_btn_h - _btn_th) * 0.5;
+    gfx_drawstr("↶ UNDO");
   );
-  gfx_rect(_undo_bx, _btn_y, _undo_bw, _btn_h);
-  gfx_set(1, 1, 1, _ur_avail_u ? (_ur_hov_u ? 1.0 : 0.98) : 0.55);
-  gfx_x = _undo_bx + _btn_pad; gfx_y = _btn_y + (_btn_h - _btn_th) * 0.5;
-  gfx_drawstr("↶ UNDO");
   lmb_down && _ur_hov_u && _ur_avail_u ? ( undo_do(); );
   _ur_hov_u && _ur_avail_u ? (
     strcpy(#_ur_tt, "Undo last edit");
@@ -2016,17 +2306,20 @@ function swing_ui_draw_header() (
 
   // ── REDO button (green) ──
   _ur_avail_r = _udo_rc > 0;
-  _ur_hov_r = mx >= _redo_bx && mx <= _redo_bx + _redo_bw && my >= _btn_y && my <= _btn_y + _btn_h;
-  _ur_avail_r ? (
-    // Green pill — visually mirrors UNDO's amber
-    gfx_set(0.30, 0.75, 0.45, _ur_hov_r ? 1.0 : 0.80);
-  ) : (
-    gfx_set(0.20, 0.20, 0.22, 0.45);
+  _ur_hov_r = _redo_bx >= HDR_CAP_MIN_X
+           && mx >= _redo_bx && mx <= _redo_bx + _redo_bw && my >= _btn_y && my <= _btn_y + _btn_h;
+  _redo_bx >= HDR_CAP_MIN_X ? (
+    _ur_avail_r ? (
+      // Green pill — visually mirrors UNDO's amber
+      gfx_set(0.30, 0.75, 0.45, _ur_hov_r ? 1.0 : 0.80);
+    ) : (
+      gfx_set(0.20, 0.20, 0.22, 0.45);
+    );
+    gfx_rect(_redo_bx, _btn_y, _redo_bw, _btn_h);
+    gfx_set(1, 1, 1, _ur_avail_r ? (_ur_hov_r ? 1.0 : 0.98) : 0.55);
+    gfx_x = _redo_bx + _btn_pad; gfx_y = _btn_y + (_btn_h - _btn_th) * 0.5;
+    gfx_drawstr("↷ REDO");
   );
-  gfx_rect(_redo_bx, _btn_y, _redo_bw, _btn_h);
-  gfx_set(1, 1, 1, _ur_avail_r ? (_ur_hov_r ? 1.0 : 0.98) : 0.55);
-  gfx_x = _redo_bx + _btn_pad; gfx_y = _btn_y + (_btn_h - _btn_th) * 0.5;
-  gfx_drawstr("↷ REDO");
   lmb_down && _ur_hov_r && _ur_avail_r ? ( redo_do(); );
   _ur_hov_r && _ur_avail_r ? (
     strcpy(#_ur_tt, "Redo last edit");
@@ -2309,13 +2602,484 @@ local(_pad_req, _knl, _ki, _cn, _cnl, _cj)
   );  // _is_browser_target gate
 );
 
-function swing_ui_calc_layout() (
-  left_w = (gfx_w * 0.38)|0;
+function swing_ui_calc_layout() local(_ui_w) (
+  // The mini browser strip is taken off the RIGHT, and everything above divides
+  // what is left. When the window grows by the strip's width, _ui_w equals the
+  // old gfx_w and every panel keeps its exact previous geometry -- nothing
+  // moves. When it cannot grow (docked, or no bridge), the pads give up the
+  // width instead, which is visibly a squeeze rather than an overlap.
+  // ⛔ left_x stays 0. It is written here and read NOWHERE, and the left pane's
+  //    coordinates are literals from zero -- do not try to shift that pane.
+  _ui_w = gfx_w - swing_fb_width();
+  left_w = (_ui_w * 0.38)|0;
   right_x = left_w;
-  right_w = gfx_w - left_w;
+  right_w = _ui_w - left_w;
   left_x = 0;
   left_y = 28;
   left_h = gfx_h - 28;
+  grid_top = 28 + LCD_BAR_H;   // pad well starts under the header + LCD bar
+);
+
+// ── One rack-header ACTION chip ──────────────────────────────────────────
+// Chained right-to-left like swing_kdd_chip, but neutral-dark (an action,
+// not a panel toggle) and with a disabled face. EEL2 returns one value (the
+// left edge), so the click lands in rack_act_hit and the geometry the SAVE
+// dot / flash needs in rack_act_w / rack_act_hov — read them straight after
+// the call, before the next chip overwrites them.
+// ── Rack workstation actions ────────────────────────────────────────────────
+// One implementation each, called from BOTH the chip that shows an action while
+// the row has room for it AND the "⋯" menu that holds it when it doesn't.
+// Factored out precisely so those two paths cannot drift — the keep-in-step
+// burden the full-UI / rack-face ports already carry is enough of it.
+function swing_rack_padfx() (
+  gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? ( gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_CMD] = 71; ); )
+                                   : ( kit_bridge_warn = 1; );
+);
+
+function swing_rack_build() (
+  gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+    swing_popup_open(mx, my,
+      "Build Stereo Grid (this track)|Build Drum Matrix (MIDI lanes)|Build Multi-Out (Audio)|Build Both (Audio + MIDI)",
+      SP_POPUP_CALLER_DM_BUILD);
+  ) : ( kit_bridge_warn = 1; );
+);
+
+// ⚠️ CMD 45 toggles REAPER's MEDIA EXPLORER. It does not reveal the kit file in
+// a file manager. It was briefly mislabelled "Show in Explorer" on the kit card
+// menu (2026-08-26) — a kit-file action it is not. It belongs in the row.
+function swing_rack_explore() (
+  gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? ( gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_CMD] = 45; ); )
+                                   : ( kit_bridge_warn = 1; );
+);
+
+function swing_rack_macro() (
+  kmac_ed_open = 1;
+  // Zero the modal-gate saves on open — a stale _ov_lmb_down fires the editor's
+  // click-outside-close on its own open frame (the MACRO tab EDIT chip's
+  // documented flicker fix, rk_swing_lcd).
+  _ov_lmb_down = 0; _ov_rmb_down = 0; _ov_LMB = 0; _ov_RMB = 0; _ov_wheel = 0;
+);
+
+// LOAD: inline of swing_kitsview_open — rk_swing_ui_kitsview imports AFTER this
+// inc, so a direct call would be the definition-time compile kill. KEEP IN STEP
+// with that function (it carries the twin note).
+function swing_rack_kitsview() (
+  gmem[EON_KITLIST_BASE + 5] += 1;   // ask the bridge for a fresh scan
+  kv_scroll = 0; kv_hover = -1;
+  swing_bigview_open(VIEW_KITS);
+);
+
+// Rename / Save As are ONE command here: CMD 10 = "ask Lua for a name", which is
+// exactly what the full UI's LCD kit-name click does (rk_swing_lcd), so the
+// gesture means the same thing in both faces. Same Phase-3 guard as that site —
+// also refuse while this instance is importing or a delivery is in flight, since
+// the state-11 dump reads the SHARED staging bands (chimera-file vector).
+function swing_rack_kitname() (
+  gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0
+    && !kit_busy && gmem[GS_KIT_LOAD_REQ] != 2 ? (
+    gmem[KIT_GMEM_LOCK] = instance_id;
+    gmem[KIT_GMEM_CMD] = 10;
+  ) : ( kit_bridge_warn = 1; );
+);
+
+// The card's ▾ / right-click menu — kit-FILE actions only. Row order IS the
+// contract with the consumer in swing_ui_draw_rack_header: labels may be
+// reworded, indices may not move.
+function swing_rack_kitmenu() (
+  swing_popup_open(mx, my, "Load kit…|Save As (name it)…", SP_POPUP_CALLER_RACK_KIT);
+);
+
+function swing_rack_act_chip(_lbl, _rx, _by, _bh, _ena)
+local(_tw, _th, _bw, _ax, _hov)
+(
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_measurestr(_lbl, _tw, _th);
+  _bw = _tw + 14;
+  _ax = _rx - _bw;
+  _hov = _ena && mx >= _ax && mx < _ax + _bw && my >= _by && my < _by + _bh;
+  gfx_set(0.16, 0.16, 0.18, _ena ? (_hov ? 0.95 : 0.72) : 0.30);
+  gfx_rect(_ax, _by, _bw, _bh);
+  gfx_set(0.42, 0.42, 0.44, _ena ? 0.55 : 0.25);
+  gfx_rect(_ax, _by, _bw, 1); gfx_rect(_ax, _by + _bh - 1, _bw, 1);
+  gfx_rect(_ax, _by, 1, _bh); gfx_rect(_ax + _bw - 1, _by, 1, _bh);
+  gfx_set(0.90, 0.89, 0.86, _ena ? (_hov ? 1 : 0.85) : 0.40);
+  gfx_x = _ax + (_bw - _tw) * 0.5; gfx_y = _by + (_bh - _th) * 0.5;
+  gfx_drawstr(_lbl);
+  rack_act_hov = _hov;
+  rack_act_w = _bw;
+  rack_act_hit = 0;
+  rack_act_rhit = 0;
+  _hov && lmb_down ? ( rack_act_hit = 1; lmb_down = 0; );
+  _hov && rmb_down ? ( rack_act_rhit = 1; rmb_down = 0; );
+  _ax;
+);
+
+// ── Dock rack face header (Spec_Swing_Dock_Mode.md) ──────────────────────
+// The whole top row of the wide-aspect layout: body fill, slim charcoal bar,
+// SWING wordmark, kit card (cover tile + name + BPM), the LOAD/SAVE/SAVE AS/
+// MAP action chips, and the NOTES / OUT / LAYERS dropdown chips. Also owns
+// this face's layout globals — the pad grid fills everything under the bar,
+// full width (right_x/right_w/grid_top).
+//
+// The chips and their panel are the SAME state the KIT tab drives (kdd_open;
+// swing_kdd_chip toggles, swing_chgmap_overlay_draw paints), so a panel
+// opened here and one opened on the KIT tab are one thing. Open-panel input
+// is taken HERE for the same reason swing_chgmap_draw takes it on the KIT
+// tab: the pads draw after this and would otherwise eat the click.
+function swing_ui_draw_rack_header()
+local(_fs, _tw, _th, _bh, _by, _bx, _cx, _cy, _ch, _cw, _cw_full, _cw_name,
+      _ts, _nx, _ny, _nw, _nh, _bpw, _bph, _fit_bpm, _fit_name, _in_panel,
+      _dots_hov, _dw, _dh, _ws, _wmp, _wma, _wco, _wmu, _wbr, _wex,
+      _wpf, _wov, _th2, _tw2, _show_mu, _show_ma, _show_pf, _show_ex, _k,
+      _core, _xtra, _ovw, _ok, _space, _acts, _abx, _save_ok, _sv_el, _sv_a,
+      _pr, _arx, _card_hov, _over_arw, _over_name)
+(
+  // Layout globals for the rack face: full-width grid under a slim bar.
+  rack_hdr_h = max(26, min(40, (gfx_h * 0.12)|0));
+  // Same rule as the full UI: the browser strip comes off the right and the pad
+  // grid divides what is left.
+  right_x = 0; right_w = gfx_w - swing_fb_width();
+  grid_top = rack_hdr_h;
+
+  // Body fill — the pad well repaints most of it; this covers the margins.
+  gfx_set(bg_r, bg_g, bg_b, 1); gfx_rect(0, 0, gfx_w, gfx_h);
+
+  // Slim charcoal bar — same gradient idiom as the 28px full-UI header.
+  gfx_set(hd_r * 0.85, hd_g * 0.85, hd_b * 0.85, 1); gfx_rect(0, 0, gfx_w, 1);
+  gfx_set(hd_r, hd_g, hd_b, 1); gfx_rect(0, 1, gfx_w, rack_hdr_h - 3);
+  gfx_set(hd_r * 1.1, hd_g * 1.1, hd_b * 1.1, 0.6); gfx_rect(0, rack_hdr_h - 2, gfx_w, 1);
+  gfx_set(0.18, 0.18, 0.20, 1); gfx_rect(0, rack_hdr_h - 1, gfx_w, 1);
+
+  // SWING wordmark — brand red in every theme (same rule as the full header).
+  _fs = max(11, min(16, (rack_hdr_h * 0.42)|0));
+  gfx_setfont(1, "Arial", _fs, 'b');
+  gfx_set(0.85, 0.20, 0.12, 1);
+  gfx_measurestr("S W I N G", _tw, _th);
+  gfx_x = 10; gfx_y = (rack_hdr_h - 1 - _th) * 0.5;
+  gfx_drawstr("S W I N G");
+  // Right-click the wordmark: view-mode override (Auto / Full UI / Rack face).
+  swing_ui_viewmode_click(8, 0, _tw + 6, rack_hdr_h - 1);
+
+  // NOTES ▾ was dropped from the rack row too (user 2026-08-26): it is a
+  // readout more than a control, and the panel stays on the full UI's KIT
+  // tab. OUT and LAYERS went the same way on 08-25. The cluster therefore
+  // starts at the pane edge now. A stale kdd_open from the full UI still
+  // paints + closes fine via the panel input mirror at the end of this fn,
+  // which is why swing_chgmap_read() stays.
+  swing_chgmap_read();
+  _bh = min(16, rack_hdr_h - 8);
+  _by = ((rack_hdr_h - 1 - _bh) * 0.5)|0;
+  _bx = gfx_w - 8;
+
+  // Kit card measures — drawn further down, once the action cluster has
+  // fixed its right limit.
+  gfx_setfont(1, "Arial", 11, 'b');
+  gfx_measurestr(strlen(#kit_name) > 0 ? #kit_name : "Untitled Kit", _nw, _nh);
+  sprintf(#_rack_bpm, "%.4g BPM", tempo);
+  gfx_measurestr(#_rack_bpm, _bpw, _bph);
+
+  _ch = rack_hdr_h - 8;
+  _cy = ((rack_hdr_h - 1 - _ch) * 0.5)|0;
+  _ts = _ch - 6;
+  _cx = 10 + _tw + 12;
+  // +12 on both: the card carries a PERMANENT ▾ at its right edge now. The
+  // gutter is reserved in the measure so the arrow can never sit on the name.
+  _cw_name = 3 + _ts + 7 + _nw + 8 + 12;
+  _cw_full = _cw_name + 2 + _bpw + 8;
+
+  // ── Action chips — the rack workstation row (user 2026-08-26 redesign):
+  // CORE, always present: SAVE · BROWSE · COLORS · MAP.
+  // EXTRA, folded into a "⋯" chip one at a time as the pane narrows, and folded
+  // in this order (first to go, first listed): PAD FX · MULTI · MACRO · EXPLORE.
+  // EXPLORE holds out longest of the four by user preference (2026-08-26).
+  // GONE from the row: NOTES (a readout) and LOAD (a kit-file action — it moved
+  // onto the kit card, which is the noun it acts on).
+  //
+  // The chip is a CONSEQUENCE OF WIDTH, not a fixed decision: with room for all
+  // seven it does not appear at all. That is the whole difference from the old
+  // cascade, which also folded but folded into nothing — a dropped button was
+  // unreachable until you widened the pane. Now it lands somewhere.
+  //
+  // Every handler is a port of its full-UI button (rk_swing_ui_panels_controls)
+  // — keep them in step. SAVE is the ONE smart chip: left-click silent-overwrites
+  // (CMD 12; the bridge deflects to the name prompt when there is no source),
+  // right-click opens the extended save menu. ⚠️ The SAVE_KIT and DM_BUILD popup
+  // RESULTS are consumed in Swing_ReaKit's @gfx tail, NOT here — so picks work in
+  // both faces and multiout_prep (defined in a later-imported inc) resolves.
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_measurestr("SAVE", _ws, _th2);     _ws  += 14;
+  gfx_measurestr("BROWSE", _wbr, _th2);  _wbr += 14;
+  gfx_measurestr("COLORS", _wco, _th2);  _wco += 14;
+  gfx_measurestr("MAP", _wmp, _th2);     _wmp += 14;
+  gfx_measurestr("MACRO", _wma, _th2);   _wma += 14;
+  gfx_measurestr("MULTI", _wmu, _th2);   _wmu += 14;
+  gfx_measurestr("PAD FX", _wpf, _th2);  _wpf += 14;
+  gfx_measurestr("EXPLORE", _wex, _th2); _wex += 14;
+  gfx_measurestr("⋯", _wov, _th2);       _wov += 14;
+
+  // Fold cascade, least essential first: BPM → PAD FX → MULTI → MACRO → EXPLORE
+  // → the card collapses to its own "⋯". The core four and the chip hold to the end.
+  _show_ma = 1; _show_mu = 1; _show_pf = 1; _show_ex = 1;
+  _fit_bpm = 0; _fit_name = 1;
+  _core = _ws + _wbr + _wco + _wmp + 4 * 3;              // core four + the gaps between them
+  _xtra = _wex + 4 + _wma + 4 + _wmu + 4 + _wpf + 4;     // extras, each carrying its own gap
+  _ovw  = 0;                                             // 0 = no chip; it costs width only once shown
+  _space = _bx - 10 - _cx;
+  _ok = _space >= _cw_full + 10 + _core + _xtra; _ok ? _fit_bpm = 1;
+  !_ok ? ( _ok = _space >= _cw_name + 10 + _core + _xtra; );
+  !_ok ? ( _show_pf = 0; _xtra -= _wpf + 4; _ovw = _wov + 4;
+           _ok = _space >= _cw_name + 10 + _core + _xtra + _ovw; );
+  !_ok ? ( _show_mu = 0; _xtra -= _wmu + 4;
+           _ok = _space >= _cw_name + 10 + _core + _xtra + _ovw; );
+  !_ok ? ( _show_ma = 0; _xtra -= _wma + 4;
+           _ok = _space >= _cw_name + 10 + _core + _xtra + _ovw; );
+  !_ok ? ( _show_ex = 0; _xtra -= _wex + 4;
+           _ok = _space >= _cw_name + 10 + _core + _xtra + _ovw; );
+  !_ok ? ( _fit_name = 0; _ok = _space >= 30 + _core + _ovw; );
+  _acts = _ok ? 1 : 0;   // 0 = even the core four don't fit; draw no cluster
+  _cw = _fit_bpm ? _cw_full : _cw_name;
+
+  _abx = _bx;
+  // Same save guard as the full-UI SAVE button — the chimera-file vector:
+  // never save while ANY load owns the shared staging pipeline.
+  _save_ok = !kit_busy && gmem[KIT_GMEM_CMD] == 0 && gmem[GS_KIT_LOAD_REQ] != 2;
+  _acts ? (
+    _ovw > 0 ? (
+      _abx = swing_rack_act_chip("⋯", _abx, _by, _bh, 1) - 4;
+      rack_act_hov ? ( #tooltip = "More — the row's remaining actions, folded out for width."; );
+      rack_act_hit ? (
+        // Lists ONLY what is actually folded. Listing everything unconditionally
+        // (the first cut) meant MACRO appeared in the menu while its own chip was
+        // still on the bar — the same action twice, three inches apart.
+        //
+        // The positional index alone therefore cannot be the contract, because
+        // the row set moves with pane width. Instead the folded set is LATCHED
+        // into rack_more_set here, at open time, and the consumer walks the same
+        // fixed candidate order against that latch — so a resize while the menu
+        // is open cannot remap a pick onto a different action.
+        rack_more_set = (!_show_ex) + (!_show_ma)*2 + (!_show_mu)*4 + (!_show_pf)*8;
+        strcpy(#_more_menu, "");
+        (rack_more_set & 1) ? strcat(#_more_menu, "Media Explorer");
+        (rack_more_set & 2) ? ( strlen(#_more_menu) > 0 ? strcat(#_more_menu, "|"); strcat(#_more_menu, "Macro editor"); );
+        (rack_more_set & 4) ? ( strlen(#_more_menu) > 0 ? strcat(#_more_menu, "|"); strcat(#_more_menu, "Build menu…"); );
+        (rack_more_set & 8) ? ( strlen(#_more_menu) > 0 ? strcat(#_more_menu, "|"); strcat(#_more_menu, "Pad FX panel"); );
+        swing_popup_open(mx, my, #_more_menu, SP_POPUP_CALLER_RACK_MORE);
+      );
+    );
+    _show_pf ? (
+      _abx = swing_rack_act_chip("PAD FX", _abx, _by, _bh, 1) - 4;
+      rack_act_hov ? ( #tooltip = "Toggle the Pad FX panel — per-pad EQ, dynamics and sends."; );
+      rack_act_hit ? swing_rack_padfx();
+    );
+    _show_mu ? (
+      _abx = swing_rack_act_chip("MULTI", _abx, _by, _bh, !kit_busy) - 4;
+      rack_act_hov ? ( #tooltip = "Build menu — Stereo Grid · Drum Matrix (MIDI) · Multi-Out (audio) · Both."; );
+      rack_act_hit ? swing_rack_build();
+    );
+    _show_ma ? (
+      _abx = swing_rack_act_chip("MACRO", _abx, _by, _bh, 1) - 4;
+      rack_act_hov ? ( #tooltip = "Macro editor — 8 kit macros, mappings, snapshots."; );
+      rack_act_hit ? swing_rack_macro();
+    );
+    _show_ex ? (
+      _abx = swing_rack_act_chip("EXPLORE", _abx, _by, _bh, 1) - 4;
+      rack_act_hov ? ( #tooltip = "Toggle REAPER's Media Explorer — drag samples straight onto pads."; );
+      rack_act_hit ? swing_rack_explore();
+    );
+    _abx = swing_rack_act_chip("MAP", _abx, _by, _bh, 1) - 4;
+    rack_act_hov ? ( #tooltip = "Controller note map — opens the mapping view over the rack."; );
+    rack_act_hit ? swing_bigview_open(VIEW_MAPPING);
+
+    _abx = swing_rack_act_chip("COLORS", _abx, _by, _bh, 1) - 4;
+    rack_act_hov ? ( #tooltip = "Pad colors — auto-color modes and per-pad overrides."; );
+    rack_act_hit ? swing_bigview_open(VIEW_COLORS);
+
+    _abx = swing_rack_act_chip("BROWSE", _abx, _by, _bh, 1) - 4;
+    rack_act_hov ? ( #tooltip = "Open the Swing sample browser — preview, categories, drag-to-pad."; );
+    rack_act_hit ? (
+      // CMD 60 + browser-routing claim, verbatim from the full-UI BROWSE.
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+        gmem[KIT_GMEM_CMD] == 0 ? (
+          gmem[KIT_GMEM_PARAM1] = sel_pad;
+          gmem[KIT_GMEM_INSTANCE] = instance_id;
+          gmem[KIT_GMEM_CMD] = 60;
+        );
+      ) : ( kit_bridge_warn = 1; );
+    );
+
+    _abx = swing_rack_act_chip("SAVE", _abx, _by, _bh, _save_ok);
+    // The full-UI button's cues at chip scale: unsaved dot + SAVED flash.
+    kit_dirty ? (
+      gfx_set(0.95, 0.72, 0.25, 0.95);
+      gfx_circle(_abx + rack_act_w - 5, _by + 4, 2, 1, 1);
+    );
+    kit_saved_at > 0 ? (
+      _sv_el = time_precise() - kit_saved_at;
+      _sv_el >= 0 && _sv_el < 1.8 ? (
+        _sv_a = _sv_el < 1.2 ? 1 : (1.8 - _sv_el) / 0.6;
+        gfx_set(0.22, 0.72, 0.35, 0.92 * _sv_a);
+        gfx_rect(_abx + 1, _by + 1, rack_act_w - 2, _bh - 2);
+        gfx_setfont(1, "Arial", 9, 'b');
+        gfx_set(1, 1, 1, _sv_a);
+        gfx_measurestr("SAVED", _tw2, _th2);
+        gfx_x = _abx + (rack_act_w - _tw2) * 0.5; gfx_y = _by + (_bh - _th2) * 0.5;
+        gfx_drawstr("SAVED");
+      );
+    );
+    rack_act_hov ? (
+      kit_dirty ? ( #tooltip = "SAVE — unsaved changes. Overwrites the loaded kit; falls back to Save As for new / factory kits."; )
+                : ( #tooltip = "SAVE overwrites the loaded kit — no dialog. Falls back to Save As for new / factory kits."; );
+    );
+    rack_act_hit ? (
+      // CMD 12 = silent overwrite; the bridge deflects to the name prompt
+      // itself when there is no kit source yet. Atomic post, same as the
+      // full-UI SAVE (rk_swing_ui_panels_controls).
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+        gmem[KIT_GMEM_LOCK] = instance_id;
+        gmem[KIT_GMEM_CMD]  = 12;
+        kit_export_state = 10;
+        kit_busy = 1;
+      ) : ( kit_bridge_warn = 1; );
+    );
+    rack_act_rhit && _save_ok ? (
+      // Right-click = the extended save menu (Save As / Browse / SFZ /
+      // RS5k) — same menu as the full-UI SAVE's right-click; the result is
+      // consumed in Swing_ReaKit's @gfx tail so it works in both faces.
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+        swing_popup_open(mx, my,
+          "Save Kit As... (name it)|Save Kit To... (Browse PC)|Export as SFZ Sample Map...|Export as RS5k Rack...",
+          SP_POPUP_CALLER_SAVE_KIT);
+      ) : ( kit_bridge_warn = 1; );
+    );
+    _abx -= 10;
+  );
+
+  // ── "⋯" chip picks. Consumed HERE rather than in Swing_ReaKit's tail: every
+  // action below resolves inside this inc, so nothing forces the trip out.
+  // The result is banked and zeroed BEFORE acting — row 2 opens another popup,
+  // and leaving the old result live while doing so would have it read back as a
+  // pick for the menu we just opened.
+  swing_popup_result != 0 && swing_popup_caller_id == SP_POPUP_CALLER_RACK_MORE ? (
+    _pr = swing_popup_result;
+    swing_popup_result = 0;
+    // Walk the SAME fixed candidate order the menu was built from, counting only
+    // the bits latched at open time. Row N of the menu is therefore the Nth set
+    // bit of rack_more_set, whatever the row happens to be showing now.
+    _k = 0;
+    (rack_more_set & 1) ? ( _k += 1; _k == _pr ? swing_rack_explore(); );
+    (rack_more_set & 2) ? ( _k += 1; _k == _pr ? swing_rack_macro(); );
+    (rack_more_set & 4) ? ( _k += 1; _k == _pr ? swing_rack_build(); );
+    (rack_more_set & 8) ? ( _k += 1; _k == _pr ? swing_rack_padfx(); );
+  );
+
+  // ── Kit card picks (the ▾ / right-click menu). Same bank-then-act rule.
+  swing_popup_result != 0 && swing_popup_caller_id == SP_POPUP_CALLER_RACK_KIT ? (
+    _pr = swing_popup_result;
+    swing_popup_result = 0;
+    _pr == 1 ? swing_rack_kitsview() :
+    _pr == 2 ? swing_rack_kitname();
+  );
+
+  // Kit card — cover tile + kit name + project BPM, after the wordmark.
+  // Folds right-to-left when the pane narrows (cascade above): BPM first,
+  // then the whole card collapses to a "⋯" whose tooltip carries both.
+
+  _fit_name ? (
+    // Card: dark inset body + 1px border (mockup look).
+    gfx_set(0.08, 0.08, 0.09, 0.78); gfx_rect(_cx, _cy, _cw, _ch);
+    gfx_set(0.42, 0.42, 0.44, 0.55);
+    gfx_rect(_cx, _cy, _cw, 1); gfx_rect(_cx, _cy + _ch - 1, _cw, 1);
+    gfx_rect(_cx, _cy, 1, _ch); gfx_rect(_cx + _cw - 1, _cy, 1, _ch);
+    // Hover wash — drawn HERE, under the tile and the text, so it lifts the card
+    // without greying the cover art or the name.
+    _card_hov = mx >= _cx && mx < _cx + _cw && my >= 0 && my < rack_hdr_h;
+    _card_hov ? ( gfx_set(1, 1, 1, 0.06); gfx_rect(_cx + 1, _cy + 1, _cw - 2, _ch - 2); );
+    // Cover tile — the real widget, so it stays the cover drop target too.
+    swing_kitcover_draw(_cx + 3, _cy + 3, _ts);
+    // Name (bright; dim placeholder when unnamed), then BPM (dim).
+    _nx = _cx + 3 + _ts + 7;
+    _ny = _cy + (_ch - _nh) * 0.5;
+    gfx_setfont(1, "Arial", 11, 'b');
+    strlen(#kit_name) > 0 ? gfx_set(0.93, 0.93, 0.90, 1)
+                          : gfx_set(0.93, 0.93, 0.90, 0.5);
+    gfx_x = _nx; gfx_y = _ny;
+    gfx_drawstr(strlen(#kit_name) > 0 ? #kit_name : "Untitled Kit");
+    _fit_bpm ? (
+      gfx_set(0.62, 0.62, 0.60, 1);
+      gfx_x = _nx + _nw + 10; gfx_y = _ny;
+      gfx_drawstr(#_rack_bpm);
+    );
+
+    // ── The card is live (user 2026-08-26) ────────────────────────────────
+    // Body → browse kits · name → rename · ▾ or right-click → the kit-file
+    // actions that used to cost a LOAD chip and an EXPLORE chip in the row.
+    //
+    // The ▾ is PERMANENT, not hover-only. An affordance you can only find by
+    // hovering is not an affordance; Ableton keeps its device hot-swap arrow
+    // visible for the same reason. It is the whole thing stopping this redesign
+    // from trading crowding for hiddenness, so it costs 12px of reserved gutter
+    // (folded into _cw_name above) rather than being drawn on demand.
+    //
+    // ⚠️ The cover tile keeps its own job: swing_kitcover_draw hit-tests
+    // gfx_getdropfile for cover art and shows a DROP IMAGE cue. Dropping and
+    // clicking are different events so they coexist, and the card tooltip names
+    // both — but do not give the tile a competing click meaning.
+    _arx       = _cx + _cw - 12;
+    _over_arw  = mx >= _arx;
+    _over_name = mx >= _nx && mx < _nx + _nw + 6;
+    gfx_setfont(1, "Arial", 8, 'b');
+    gfx_set(0.72, 0.72, 0.70, (_card_hov && _over_arw) ? 1 : 0.55);
+    gfx_x = _arx + 2; gfx_y = _cy + (_ch - 8) * 0.5;
+    gfx_drawstr("▾");
+    _card_hov ? (
+      _over_arw  ? ( #tooltip = "Kit actions — Load kit · Save As."; ) :
+      _over_name ? ( #tooltip = "Click to rename this kit — the name the next save uses."; ) :
+                   ( #tooltip = "Click to browse kits · drop an image on the cover to set it · ▾ for kit actions"; );
+      lmb_down ? (
+        lmb_down = 0;
+        _over_arw  ? swing_rack_kitmenu() :
+        _over_name ? swing_rack_kitname() : swing_rack_kitsview();
+      );
+      rmb_down ? ( rmb_down = 0; swing_rack_kitmenu(); );
+    );
+  ) : (
+    // Overflow: everything folded — "⋯" carries the kit + BPM as a tooltip.
+    // Skipped entirely when even the dots would land on the action cluster
+    // (_abx = its left edge; = _bx - 10 when no chips drew).
+    gfx_setfont(1, "Arial", 12, 'b');
+    gfx_measurestr("⋯", _dw, _dh);
+    _cx + _dw + 8 <= _abx - 4 ? (
+      _dots_hov = mx >= _cx && mx < _cx + _dw + 8 && my >= 0 && my < rack_hdr_h;
+      gfx_set(0.62, 0.62, 0.60, _dots_hov ? 1 : 0.7);
+      gfx_x = _cx + 4; gfx_y = (rack_hdr_h - 1 - _dh) * 0.5;
+      gfx_drawstr("⋯");
+      _dots_hov ? (
+        sprintf(#tooltip, "%s — %s — click for kit actions",
+                strlen(#kit_name) > 0 ? #kit_name : "Untitled Kit", #_rack_bpm);
+        // Fully collapsed, the card is still the card: keep its menu reachable
+        // rather than letting the narrowest pane be the one with no way to load.
+        lmb_down ? ( lmb_down = 0; swing_rack_kitmenu(); );
+        rmb_down ? ( rmb_down = 0; swing_rack_kitmenu(); );
+      );
+    );
+  );
+
+  // Open-panel input (mirror of the KIT-tab block in swing_chgmap_draw):
+  // clicks inside the panel are swallowed before the pads can take them; a
+  // click anywhere else closes the panel and is spent doing so.
+  kdd_open != KDD_MODE_NONE ? (
+    kdd_px = max(4, gfx_w - 8 - CHGMAP_PANEL_W);
+    kdd_py = rack_hdr_h + 3;
+    _in_panel = mx >= kdd_px && mx < kdd_px + CHGMAP_PANEL_W &&
+                my >= kdd_py && my < kdd_py + CHGMAP_PANEL_H;
+    _in_panel ? (
+      lmb_down = 0; rmb_down = 0; frame_wheel = 0;
+    ) : (
+      lmb_down ? ( kdd_open = KDD_MODE_NONE; lmb_down = 0; );
+    );
+  ) : (
+    kdd_hover = -1;
+  );
 );
 
 function swing_ui_draw_lcd_frame() (
@@ -2353,22 +3117,27 @@ function swing_ui_draw_lcd_frame() (
     _scan_y += 1;
   );
 
-  // LCD mode tabs: EQ | DLY | RVB | MIX | COMP
-  _num_tabs = 5;
+  // LCD mode tabs: EQ | DLY | RVB | COMP | MIX | FX
+  _num_tabs = 6;
   _tab_w = ((lcd_w - 4 - (_num_tabs - 1) * 2) / _num_tabs)|0;
   _tab_h = 14; _tab_y = lcd_y + 2;
   _tab_x0 = lcd_x + 2;
   // Init lcd_mode if not set — default to MIX tab
   lcd_mode == 0 && !lcd_mode_init ? ( lcd_mode = 4; lcd_mode_init = 1; );
-  // Remap legacy modes (6+ → clamp to COMP=5)
-  lcd_mode >= 6 ? lcd_mode = 5;
+  // Remap legacy modes (7+ → clamp to FX=6). ⚠️ This clamp EATS any mode at
+  // or above its bound: while it read `>= 6 ? 5`, the FX tab could be drawn
+  // and clicked and would snap straight back to COMP, with nothing to see.
+  lcd_mode >= 7 ? lcd_mode = 6;
 
   // Draw tabs with 3D button effect
   _ti = 0;
   loop(_num_tabs,
     _tx = _tab_x0 + _ti * (_tab_w + 2);
-    // Tab visual order: EQ, DLY, RVB, COMP, MIX → lcd_mode: 1, 2, 3, 5, 4
-    _tab_mode = _ti < 3 ? (_ti + 1) : (_ti == 3 ? 5 : 4);
+    // Tab visual order: EQ, DLY, RVB, COMP, MIX, FX → lcd_mode 1,2,3,5,4,6.
+    // Tab INDEX is not lcd_mode -- COMP and MIX are deliberately swapped on
+    // screen, so this map is the only place the two orders meet.
+    _tab_mode = _ti < 3 ? (_ti + 1) :
+                _ti == 3 ? 5 : _ti == 4 ? 4 : 6;
     _tab_active = (lcd_mode == _tab_mode);
 
     // Tab background
@@ -2398,7 +3167,8 @@ function swing_ui_draw_lcd_frame() (
     _ti == 1 ? strcpy(#_tlab, "DLY") :
     _ti == 2 ? strcpy(#_tlab, "RVB") :
     _ti == 3 ? strcpy(#_tlab, "COMP") :
-               strcpy(#_tlab, "MIX");
+    _ti == 4 ? strcpy(#_tlab, "MIX") :
+               strcpy(#_tlab, "FX");
     gfx_measurestr(#_tlab, tw, th);
     gfx_x = _tx + (_tab_w - tw) / 2; gfx_y = _tab_y + (_tab_h - th) / 2;
     gfx_drawstr(#_tlab);
@@ -2411,6 +3181,7 @@ function swing_ui_draw_lcd_frame() (
         _tab_mode == 2 ? swing_bigview_open(VIEW_DELAY) :
         _tab_mode == 3 ? swing_bigview_open(VIEW_REVERB) :
         _tab_mode == 5 ? swing_bigview_open(VIEW_COMP) :
+        _tab_mode == 6 ? swing_bigview_open(VIEW_FXPICK) :
                          swing_bigview_open(VIEW_CONSOLE);
       ) : (
         lcd_mode = _tab_mode;

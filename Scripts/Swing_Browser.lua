@@ -268,6 +268,26 @@ local kit_browser = {
 
 local IMG_EXT = {"png", "jpg", "jpeg"}
 
+-- An extension is part of a file's name, not a promise about its contents. A
+-- webp or a half-finished download saved as "MyKit.png" still reaches
+-- ImGui.CreateImage, and the pcall around that call cannot save us: CreateImage
+-- defers the decode to render time, so the failure lands inside ImGui's own
+-- frame, past any pcall here, and arrives as an error dialog for every frame the
+-- thumbnail is on screen rather than as a value this code could test. So the
+-- file is fingerprinted first and a stranger is never offered as artwork.
+-- Signatures live inside rather than beside the function: this file is the one
+-- closest to Lua's 200 top-level local ceiling, and building two short strings
+-- per call costs nothing at the handful of scan-time calls this ever sees.
+local function image_header_ok(path)
+  local f = io.open(path, "rb")
+  if not f then return false end
+  local head = f:read(8)
+  f:close()
+  if type(head) ~= "string" then return false end
+  return head:sub(1, 8) == string.char(137, 80, 78, 71, 13, 10, 26, 10)  -- PNG
+      or head:sub(1, 3) == string.char(255, 216, 255)                    -- JPEG
+end
+
 -- Compare two strings the way a person reads them: a run of digits counts as
 -- one number rather than as characters. Plain string compare stops at the first
 -- character that differs, so "Kick 10" < "Kick 2" ("1" beats "2" and the 0 is
@@ -312,12 +332,13 @@ local function scan_kits()
     if fname:match("%.swing$") then
       local kit_name = fname:gsub("%.swing$", "")
       local fpath = kits_dir .. sep .. fname
-      -- Check for matching thumbnail image
+      -- Check for matching thumbnail image. A candidate that exists but is not
+      -- really a PNG or JPEG is skipped rather than accepted, so a bad MyKit.png
+      -- still lets a good MyKit.jpg beside it be found.
       local img_path = nil
       for _, ext in ipairs(IMG_EXT) do
         local candidate = kits_dir .. sep .. kit_name .. "." .. ext
-        local f = io.open(candidate, "rb")
-        if f then f:close(); img_path = candidate; break end
+        if image_header_ok(candidate) then img_path = candidate; break end
       end
       kit_browser.kits[#kit_browser.kits + 1] = {
         name         = kit_name,
@@ -341,6 +362,14 @@ end
 local function get_kit_image(ctx, kit_entry)
   if kit_entry.image then return kit_entry.image end
   if kit_entry.image_failed or not kit_entry.image_path then return nil end
+  -- Checked again HERE, at the only call that reaches ImGui, and not merely in
+  -- scan_kits: the scan can be minutes old, and the invariant this guard exists
+  -- for is "CreateImage is never handed a stranger", which only holds if it is
+  -- tested at the call itself.
+  if not image_header_ok(kit_entry.image_path) then
+    kit_entry.image_failed = true
+    return nil
+  end
   -- Lazy-load: create image + attach to context for auto-cleanup
   local ok, img = pcall(ImGui.CreateImage, kit_entry.image_path)
   if ok and img then
@@ -1426,7 +1455,11 @@ local function parse_sfz(sfz_path)
   local current_group = {}  -- inherited <group> opcodes
   local current_region = nil
 
-  for line in content:gmatch("[^\r\n]+") do
+  -- Loops over raw_line and copies it: from Lua 5.5 a for control variable is
+  -- const, and this body rewrites its line four times as it strips comments,
+  -- headers and the sample= opcode. Copying keeps every one of those legal.
+  for raw_line in content:gmatch("[^\r\n]+") do
+    local line = raw_line
     -- Strip comments
     line = line:gsub("//.*$", ""):match("^%s*(.-)%s*$")
     if line == "" then goto continue end
@@ -1489,7 +1522,18 @@ local function parse_sfz(sfz_path)
     end
 
     -- Parse the remaining (whitespace-delimited) key=value opcodes.
-    for key, val in line:gmatch("(%w+)=([^%s]+)") do
+    -- The name class MUST include the underscore. %w is letters and digits only,
+    -- so "pitch_keycenter=c1" matched as "keycenter" -- a name no branch below
+    -- tests, which is why the pitch_keycenter arm was unreachable and an SFZ
+    -- written with it imported at no particular root note. Worse, the prefixed
+    -- variants were arriving under the BARE name and overwriting the real one:
+    -- "sw_lokey" (keyswitch range) and "xfin_lokey" (crossfade range) both read
+    -- as "lokey", so a file using either imported with the wrong key range
+    -- entirely. Matching the whole name leaves those unrecognised, which is
+    -- correct -- an opcode this parser does not model should be ignored, not
+    -- mistaken for one it does.
+    for raw_key, val in line:gmatch("([%w_]+)=([^%s]+)") do
+      local key = raw_key   -- const from Lua 5.5; the body lowercases it below
       if target then
         key = key:lower()
         if key == "lokey" then
@@ -2045,7 +2089,7 @@ local function draw_import_dialog(ctx)
 
     -- Error state (parse failure, unsupported format, etc.)
     if import_state.error then
-      ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0xFF6644FF)
+      ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0xFF6644FF))
       ImGui.TextWrapped(ctx, import_state.error)
       ImGui.PopStyleColor(ctx)
       ImGui.Spacing(ctx)
@@ -3561,7 +3605,7 @@ local function draw_nav_bar(ctx)
   else
     count_str = count_str .. " \xC2\xB7 Ctrl+click / Shift+click to select more"
   end
-  ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x8C8C96FF)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0x8C8C96FF))
   ImGui.Text(ctx, count_str)
   ImGui.PopStyleColor(ctx)
   if ImGui.IsItemHovered(ctx) then
@@ -3668,7 +3712,7 @@ local function draw_shortcuts_panel(ctx)
             local is_selected = (i == kit_browser.selected_idx)
             local is_loaded   = (kit.name == kit_db.kit_name)
             if is_loaded then
-              ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x80C0FFFF)
+              ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0x80C0FFFF))
             end
             if ImGui.Selectable(ctx, kit.name .. "##kit" .. i, is_selected, 0, 0, 20) then
               kit_browser.selected_idx = i
@@ -3749,11 +3793,18 @@ local function draw_shortcuts_panel(ctx)
         for _, cat in ipairs(categorizer.get_category_order()) do
           local count = cat_counts[cat] or 0
           if count > 0 then
+            -- FULL-STRENGTH category colour, drawn plain. These 46 hues are an
+            -- identity system and the user's call is that they read fine as they
+            -- are: both dimming them to hit a contrast ratio and adding a shadow
+            -- for legibility were tried on 2026-08-30 and rejected, in that order.
+            -- ⛔ Do not "fix" the contrast here again without asking.
+            -- ⚠ This dot is the LEGEND for the Cat column, so both sites must draw
+            -- the SAME value, unmodified, or the key stops matching what it keys.
             local color = categorizer.get_category_color(cat)
-            -- Colored dot (small filled circle) + label + count
-            ImGui.PushStyleColor(ctx, ImGui.Col_Text, color)
-            ImGui.Text(ctx, "\xE2\x97\x8F")  -- ●
-            ImGui.PopStyleColor(ctx)
+            -- Colored dot (small filled circle) + label + count. Same outlined
+            -- treatment as the Cat column this dot is the legend for — full-strength
+            -- colour, never dimmed, with its own dark shade as a thin edge.
+            widgets.text_outlined(ctx, "\xE2\x97\x8F", color)  -- ●
             ImGui.SameLine(ctx, nil, 6)
             local label = string.format("%s (%d)##cat_%s",
               cat:sub(1,1):upper() .. cat:sub(2), count, cat)
@@ -3895,7 +3946,7 @@ local function draw_shortcuts_panel(ctx)
     local any_hidden = not settings.show_kits or not settings.show_categories or not settings.show_shortcuts or not settings.show_favorites or not settings.show_recent
     if any_hidden then
       ImGui.Separator(ctx)
-      ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x8888AAFF)
+      ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0x8888AAFF))
       ImGui.Text(ctx, "Show:")
       ImGui.PopStyleColor(ctx)
       ImGui.SameLine(ctx)
@@ -4019,8 +4070,12 @@ local function draw_file_table(ctx)
           -- Folder/file icon + color differentiation
           local icon
           if e.is_dir then
-            local folder_color = (settings.theme == "light" or settings.theme == "eon") and 0xB08020FF or 0xE8B84DFF
-            ImGui.PushStyleColor(ctx, ImGui.Col_Text, folder_color)
+            -- Folder gold, resolved against whatever the theme's surfaces actually
+            -- are. This used to be a two-name whitelist (light/eon), so Ableton and
+            -- Pro Tools Light got the DARK-theme gold on a near-white list — 1.05:1
+            -- and 1.14:1, which is the unreadable orange in the 2026-08-30 report.
+            -- widgets.ink keeps it gold and only moves it as far as it has to.
+            ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0xE8B84DFF))
             icon = "\xF0\x9F\x93\x81 "  -- 📁
           else
             icon = "\xF0\x9F\x8E\xB5 "  -- 🎵
@@ -4209,9 +4264,23 @@ local function draw_file_table(ctx)
             ImGui.TextDisabled(ctx, "—")
           else
             local cat = e.category or "other"
-            ImGui.PushStyleColor(ctx, ImGui.Col_Text, categorizer.get_category_color(cat))
+            -- Outlined DOT + the word in the theme's own text ink — the same pattern
+            -- the sidebar category list uses, and the one the user signed off on.
+            --
+            -- ⛔ Do NOT paint the word itself in the category colour again. That is
+            -- what made this column unreadable on the light themes, and all three
+            -- ways of rescuing it were tried and rejected on 2026-08-30: dimming the
+            -- colour (muddied the wheel), a drop shadow, and an outline at four
+            -- opacities. An outline works on the DOT because a dot is a solid blob
+            -- and a 1px edge is a small fraction of it; on 12px type the strokes are
+            -- only 1-2px wide, so the same edge nearly doubles the apparent weight
+            -- and the label reads as bold no matter how faint the outline is. 1px is
+            -- the floor for the technique — there is no thinner setting to find.
+            --
+            -- The colour is not lost: it is right there in the dot, at full strength.
+            widgets.text_outlined(ctx, "\xE2\x97\x8F", categorizer.get_category_color(cat))
+            ImGui.SameLine(ctx, nil, 4)
             ImGui.Text(ctx, cat)
-            ImGui.PopStyleColor(ctx)
           end
 
           -- Type column
@@ -4229,7 +4298,7 @@ local function draw_file_table(ctx)
           elseif e.nch == 1 then
             ImGui.TextDisabled(ctx, "M")
           elseif e.nch == 2 then
-            ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x66CCFFFF)  -- soft blue accent for stereo
+            ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0x66CCFFFF))  -- soft blue accent for stereo
             ImGui.Text(ctx, "S")
             ImGui.PopStyleColor(ctx)
           elseif e.nch and e.nch > 2 then
@@ -4389,7 +4458,7 @@ local function draw_playback_bar(ctx)
   local entries = get_display_entries()
   local sel = entries[file_mgr.selected_index]
   if sel and not sel.is_dir then
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0xBBBBC0FF)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0xBBBBC0FF))
     local info = sel.name
     if sel.duration and sel.duration > 0 then
       info = info .. "  |  " .. format_duration(sel.duration)
@@ -4413,19 +4482,19 @@ local function draw_playback_bar(ctx)
       local lbl = measure.derive_labels(axes)
       local parts = { lbl.band, lbl.transient, lbl.decay, lbl.tonality }
       if lbl.space then parts[#parts + 1] = lbl.space end
-      ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x8A8A93FF)
+      ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0x8A8A93FF))
       ImGui.Text(ctx, table.concat(parts, "  ·  "))
       ImGui.PopStyleColor(ctx)
     end
     -- Multi-load truncation warning
     if multi_load_status ~= "" then
       ImGui.SameLine(ctx)
-      ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0xFFAA44FF)  -- orange warning
+      ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0xFFAA44FF))  -- orange warning
       ImGui.Text(ctx, "  |  " .. multi_load_status)
       ImGui.PopStyleColor(ctx)
     end
   else
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x6C6C76FF)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0x6C6C76FF))
     ImGui.Text(ctx, "No file selected")
     ImGui.PopStyleColor(ctx)
   end
@@ -4522,7 +4591,7 @@ local function draw_playback_bar(ctx)
   ImGui.SameLine(ctx, nil, 6)
 
   -- Position display
-  ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0xAAAAAAFF)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0xAAAAAAFF))
   local pos_str = format_duration(playback.position) .. " / " .. format_duration(playback.length)
   ImGui.Text(ctx, pos_str)
   ImGui.PopStyleColor(ctx)
@@ -4658,7 +4727,7 @@ local function draw_pad_info_strip(ctx)
     local name = read_pad_name(pad)
     if name and name ~= "" then
       ImGui.SameLine(ctx)
-      ImGui.TextColored(ctx, widgets.colors.text_dim, name)
+      ImGui.TextColored(ctx, widgets.ink(widgets.colors.text_dim), name)
     end
   end
   ImGui.SameLine(ctx)
@@ -4911,13 +4980,13 @@ local function draw_shortcuts_modal_body(ctx)
   local visible, _ = ImGui.BeginPopupModal(ctx, "Keyboard Shortcuts##shortcuts_modal",
                                            true, ImGui.WindowFlags_NoCollapse)
   if visible then
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.colors.text_gold)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(widgets.colors.text_gold))
     ImGui.Text(ctx, "Swing Browser — Keyboard Shortcuts")
     ImGui.PopStyleColor(ctx)
     ImGui.Spacing(ctx); ImGui.Separator(ctx); ImGui.Spacing(ctx)
 
     for _, group in ipairs(SHORTCUTS) do
-      ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0xFFCC44FF)
+      ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0xFFCC44FF))
       ImGui.Text(ctx, group.section)
       ImGui.PopStyleColor(ctx)
       if ImGui.BeginTable(ctx, "##sc_" .. group.section, 2,
@@ -4927,7 +4996,7 @@ local function draw_shortcuts_modal_body(ctx)
         for _, sc in ipairs(group.items) do
           ImGui.TableNextRow(ctx)
           ImGui.TableSetColumnIndex(ctx, 0)
-          ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x66CCFFFF)
+          ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0x66CCFFFF))
           ImGui.Text(ctx, sc[1])
           ImGui.PopStyleColor(ctx)
           ImGui.TableSetColumnIndex(ctx, 1)
@@ -4939,7 +5008,7 @@ local function draw_shortcuts_modal_body(ctx)
     end
 
     ImGui.Separator(ctx)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0x8888AAFF)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0x8888AAFF))
     ImGui.TextWrapped(ctx, "All single-letter shortcuts are chosen to NOT conflict with REAPER's main-section defaults (S/Z/X/D/E/G/U/L/N/Y/T/V/P/R/W/F/M).")
     ImGui.PopStyleColor(ctx)
 
@@ -5362,6 +5431,22 @@ local function frame()
     return
   end
 
+  -- Live re-dock request — EON Dock Layout's "Spread panes" asks an ALREADY
+  -- OPEN pane to move to a named docker instead of sharing one. Twin of the
+  -- one in Swing_PadFX.lua; value is an ImGui dock id (-1..-16 = REAPER
+  -- docker 0..15, 0 = float) and it rides the same pending_dock_id path the
+  -- Dock button drives. Saved on the spot because the picker reads our dock
+  -- home back out of the settings FILE to draw its cards -- waiting for
+  -- cleanup would leave the drawing lying about where this pane is.
+  local dock_req = reaper.GetExtState("Swing", "browser_dock_req")
+  if dock_req ~= "" then
+    reaper.DeleteExtState("Swing", "browser_dock_req", false)
+    ui.pending_dock_id  = tonumber(dock_req) or 0
+    ui.want_dock_change = true
+    settings.dock_id    = ui.pending_dock_id
+    save_settings()
+  end
+
   -- Check for pending import file (from companion script or bridge)
   local pending_import = reaper.GetExtState("Swing", "import_file")
   if pending_import and pending_import ~= "" then
@@ -5521,6 +5606,16 @@ local function frame()
 
   -- Set initial size on first frame
   if ui.first_frame then
+    -- One-shot landing override staged by EON Swing Dock View: the dock-rig
+    -- layout picker pre-seeds where this window lands so its card matches
+    -- reality. Consumed (and persisted) before the saved dock applies; only
+    -- ever staged when we launch with no saved docked home of our own.
+    local staged = tonumber(reaper.GetExtState("Swing", "browser_dock_stage")) or 0
+    if staged ~= 0 then
+      reaper.DeleteExtState("Swing", "browser_dock_stage", false)
+      settings.dock_id = staged
+      save_settings()
+    end
     ImGui.SetNextWindowSize(ctx, settings.window_w, settings.window_h, ImGui.Cond_Appearing)
     -- Restore dock state from settings on first frame. Cond_Always so the
     -- saved dock takes effect even if ImGui has its own remembered layout.
@@ -5636,7 +5731,7 @@ local function frame()
     -- read from gmem, which holds the LAST instance's kit after deletion)
     local kit_display = (ui.swing_present == false) and "\xE2\x80\x94"
       or (kit_db.kit_name ~= "" and kit_db.kit_name or "(no kit)")
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.colors.text_gold)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(widgets.colors.text_gold))
     ImGui.Text(ctx, kit_display)
     ImGui.PopStyleColor(ctx)
     ImGui.SameLine(ctx)

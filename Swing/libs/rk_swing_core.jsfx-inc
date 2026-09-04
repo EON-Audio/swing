@@ -929,6 +929,84 @@ function build_wv_cache(idx) local(buf, step, i, _wi, val, si, ptr, ptr_R, _wlen
   );
 );
 
+// ─── SYN voice launch ────────────────────────────────────────────────────
+// Lifted out of launch_voices_for_pad so it has TWO callers: a full pad
+// trigger runs it underneath the sample voices as before, and the SYN view's
+// 3D drum runs it ALONE — when you are editing the engine you need to hear
+// the ENGINE, not the pad's sample layer on top of it.
+//
+// The body is the block that used to sit inline; the one new thing is
+// _sy_gaindiv, which carries the sum-mode gain split that the full-trigger
+// path applies. A solo audition passes 1.
+//
+// Deliberately does NOT run the choke / duplicate-kill pass, and does NOT
+// touch pad_flash or p_held: those belong to a pad TRIGGER. An audition is
+// one drum on its own, and its caller owns the visual feedback.
+//
+// ⚠️ Defined BEFORE launch_voices_for_pad on purpose — EEL2 resolves function
+// references at DEFINITION time, so a call to a later-defined function
+// silently kills the whole file (feedback_jsfx_import_order).
+function launch_syn_for_pad(_sy_pad, _sy_midi, _sy_vel, _sy_gaindiv)
+  local(vi, max_age, _oldest_vi, j, _syn_st) (
+  vi = -1; max_age = -1; _oldest_vi = -1;
+  j = 0; loop(MAX_VOICES,
+    v_pos[j] < 0 && v_stage[j] == 0 ? (
+      vi < 0 ? vi = j;
+    ) : (
+      v_age[j] > max_age ? (max_age = v_age[j]; _oldest_vi = j;);
+    );
+    j += 1;
+  );
+  vi < 0 ? ( vi = _oldest_vi; );
+  vi >= 0 && (v_pos[vi] >= 0 || v_stage[vi] > 0) ? (
+    v_pos[vi] < 0 ? (
+      v_pos[vi] = -1; v_env[vi] = 0; v_stage[vi] = 0;
+    ) : (
+      v_slot[MAX_VOICES] = v_slot[vi]; v_pos[MAX_VOICES] = v_pos[vi];
+      v_startpos[MAX_VOICES] = v_startpos[vi];
+      v_gain[MAX_VOICES] = v_gain[vi];
+      v_env[MAX_VOICES] = v_env[vi]; v_note[MAX_VOICES] = v_note[vi];
+      v_inc[MAX_VOICES] = v_inc[vi]; v_decay_ct[MAX_VOICES] = 0;
+      v_sg[MAX_VOICES] = v_sg[vi]; v_layer[MAX_VOICES] = v_layer[vi];
+      v_kind[MAX_VOICES] = v_kind[vi];
+      v_kind[vi] == 1 ? memcpy(v_syn_state + MAX_VOICES * RK_SYN_STATE_SIZE,
+                               v_syn_state + vi * RK_SYN_STATE_SIZE, RK_SYN_STATE_SIZE);
+      v_stage[MAX_VOICES] = 4; // LAST — audio thread gate
+      // park the stolen slot before any state rewrite (sweep finding)
+      v_stage[vi] = 0; v_pos[vi] = -1; v_env[vi] = 0;
+    );
+  );
+  vi >= 0 ? (
+    v_slot[vi] = _sy_pad;
+    v_layer[vi] = 0;
+    v_kind[vi] = 1;
+    _syn_mac_scratch[0] = ps_mac0[_sy_pad]; _syn_mac_scratch[1] = ps_mac1[_sy_pad];
+    _syn_mac_scratch[2] = ps_mac2[_sy_pad]; _syn_mac_scratch[3] = ps_mac3[_sy_pad];
+    _syn_mac_scratch[4] = ps_mac4[_sy_pad]; _syn_mac_scratch[5] = ps_mac5[_sy_pad];
+    _syn_mac_scratch[6] = ps_mac6[_sy_pad]; _syn_mac_scratch[7] = ps_mac7[_sy_pad];
+    _syn_st = v_syn_state + vi * RK_SYN_STATE_SIZE;
+    memset(_syn_st, 0, RK_SYN_STATE_SIZE);
+    _syn_trig_ctr += 1;
+    _syn_st[1] = 1 + ((_syn_trig_ctr * 48271) % 2147483646);   // per-hit PRNG seed
+    // pad TUNE + chromatic offset -> engine pitch (Tuned-mode-native, spec §0.4)
+    rk_syn_reset(ps_engine[_sy_pad], _syn_st, _syn_mac_scratch,
+                 p_tune[_sy_pad] + (_sy_midi - p_note[_sy_pad]), _sy_vel / 127.0);
+    v_pos[vi] = 0; v_inc[vi] = 0; v_startpos[vi] = 0;
+    v_quiet[vi] = 0;   // silence counter starts fresh, or a reused slot would
+                       // arrive already "quiet" and retire on its first sample
+    // max(1,...) so a future caller passing 0 can never divide by zero here;
+    // every real divisor is sqrt(count) >= 1.
+    v_gain[vi] = apply_vel_curve(_sy_vel / 127.0, vel_curve) * ps_level[_sy_pad]
+                 / max(1, _sy_gaindiv);
+    v_sg[vi] = strip_takeover ? 1.0 : p_gain[_sy_pad];
+    v_note[vi] = _sy_midi;
+    v_age[vi] = 0;
+    v_env[vi] = 0;
+    v_decay_ct[vi] = 0;
+    v_stage[vi] = 1;  // LAST — audio thread gate
+  );
+);
+
 // ─── Voice launch helper (eliminates triplication across note-on + repeats) ──
 // _lv_midi = the played MIDI note. For single-note (drum) pads it equals
 // p_note[pad] (offset 0). For a chromatic pad it's the actual key, and the
@@ -1169,60 +1247,12 @@ function launch_voices_for_pad(_lv_pad, _lv_midi, _lv_vel, _lv_flash)
       ) :
       p_layer_mode[_lv_pad] == 2 ? _sel_syn :
       0;
+    // Body lives in launch_syn_for_pad (defined above) so the SYN view can
+    // audition the engine on its own. Sum mode splits gain across the active
+    // layers; every other mode plays the synth at full level, divisor 1.
     _syn_go ? (
-      vi = -1; max_age = -1; _oldest_vi = -1;
-      j = 0; loop(MAX_VOICES,
-        v_pos[j] < 0 && v_stage[j] == 0 ? (
-          vi < 0 ? vi = j;
-        ) : (
-          v_age[j] > max_age ? (max_age = v_age[j]; _oldest_vi = j;);
-        );
-        j += 1;
-      );
-      vi < 0 ? ( vi = _oldest_vi; );
-      vi >= 0 && (v_pos[vi] >= 0 || v_stage[vi] > 0) ? (
-        v_pos[vi] < 0 ? (
-          v_pos[vi] = -1; v_env[vi] = 0; v_stage[vi] = 0;
-        ) : (
-          v_slot[MAX_VOICES] = v_slot[vi]; v_pos[MAX_VOICES] = v_pos[vi];
-          v_startpos[MAX_VOICES] = v_startpos[vi];
-          v_gain[MAX_VOICES] = v_gain[vi];
-          v_env[MAX_VOICES] = v_env[vi]; v_note[MAX_VOICES] = v_note[vi];
-          v_inc[MAX_VOICES] = v_inc[vi]; v_decay_ct[MAX_VOICES] = 0;
-          v_sg[MAX_VOICES] = v_sg[vi]; v_layer[MAX_VOICES] = v_layer[vi];
-          v_kind[MAX_VOICES] = v_kind[vi];
-          v_kind[vi] == 1 ? memcpy(v_syn_state + MAX_VOICES * RK_SYN_STATE_SIZE,
-                                   v_syn_state + vi * RK_SYN_STATE_SIZE, RK_SYN_STATE_SIZE);
-          v_stage[MAX_VOICES] = 4; // LAST — audio thread gate
-          // park the stolen slot before any state rewrite (sweep finding)
-          v_stage[vi] = 0; v_pos[vi] = -1; v_env[vi] = 0;
-        );
-      );
-      vi >= 0 ? (
-        v_slot[vi] = _lv_pad;
-        v_layer[vi] = 0;
-        v_kind[vi] = 1;
-        _syn_mac_scratch[0] = ps_mac0[_lv_pad]; _syn_mac_scratch[1] = ps_mac1[_lv_pad];
-        _syn_mac_scratch[2] = ps_mac2[_lv_pad]; _syn_mac_scratch[3] = ps_mac3[_lv_pad];
-        _syn_mac_scratch[4] = ps_mac4[_lv_pad]; _syn_mac_scratch[5] = ps_mac5[_lv_pad];
-        _syn_mac_scratch[6] = ps_mac6[_lv_pad]; _syn_mac_scratch[7] = ps_mac7[_lv_pad];
-        _syn_st = v_syn_state + vi * RK_SYN_STATE_SIZE;
-        memset(_syn_st, 0, RK_SYN_STATE_SIZE);
-        _syn_trig_ctr += 1;
-        _syn_st[1] = 1 + ((_syn_trig_ctr * 48271) % 2147483646);   // per-hit PRNG seed
-        // pad TUNE + chromatic offset -> engine pitch (Tuned-mode-native, spec §0.4)
-        rk_syn_reset(ps_engine[_lv_pad], _syn_st, _syn_mac_scratch,
-                     p_tune[_lv_pad] + (_lv_midi - p_note[_lv_pad]), _lv_vel / 127.0);
-        v_pos[vi] = 0; v_inc[vi] = 0; v_startpos[vi] = 0;
-        v_gain[vi] = apply_vel_curve(_lv_vel / 127.0, vel_curve) * ps_level[_lv_pad];
-        _is_sum && _active_cnt > 1 ? ( v_gain[vi] = v_gain[vi] / sqrt(_active_cnt); );
-        v_sg[vi] = strip_takeover ? 1.0 : p_gain[_lv_pad];
-        v_note[vi] = _lv_midi;
-        v_age[vi] = 0;
-        v_env[vi] = 0;
-        v_decay_ct[vi] = 0;
-        v_stage[vi] = 1;  // LAST — audio thread gate
-      );
+      launch_syn_for_pad(_lv_pad, _lv_midi, _lv_vel,
+                         _is_sum && _active_cnt > 1 ? sqrt(_active_cnt) : 1);
     );
   );
   pad_flash[_lv_pad] = _lv_flash;

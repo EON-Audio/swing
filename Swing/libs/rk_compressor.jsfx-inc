@@ -1,151 +1,619 @@
-// rk_compressor.jsfx-inc — VCA compressor for DrumKit_ReaKit
+// rk_compressor.jsfx-inc — EON Weld bus-compressor engine
 // (c) EON Studios — All Rights Reserved
 //
-// DSP derived from Prism Comp CLEAN/BUS VCA topology.
-// Peak-detecting feed-forward compressor with soft knee.
+// Circuit model of a 1985 console centre-section bus compressor card:
+// feedback via a dummy VCA, precision full-wave rectifier per channel into
+// a greater-of-two bus, servo'd bus diode (~50 mV residual -- the diodes
+// sit INSIDE the output stage's feedback loop, hardware-verified) into the
+// attack-R x release-cap timing network, 202-family exponential VCA law.
+// Reference implementation, calibration and schematic provenance live in
+// .dev_weld/ (components.py is the annotated schematic read-out).
+//
+// This file REPLACED the former feed-forward CLEAN engine in place
+// (decision 2026-08-24): same API, same globals, circuit internals. Both
+// importers (Swing_ReaKit master comp, EON Weld) compile unchanged.
 //
 // Call cmp_init(mem_start) from @init, cmp_recalc() when params change,
 // cmp_process(inL, inR) from @sample. Returns via cmp_outL / cmp_outR.
-// GR available as cmp_gr_db (negative dB, for metering).
+// GR available as cmp_gr_db (negative dB, for metering), linear gain as
+// cmp_last_lin (VU), display-smoothed GR as cmp_gr_smooth (negative dB).
+// cmp_reset() zeroes runtime state without touching parameters.
 //
 // Global parameters (set from GUI before calling cmp_recalc):
-//   cmp_thresh   — threshold in dB (e.g. -20 to 0)
-//   cmp_ratio    — compression ratio (1.0 = off, 20+ = limiter)
-//   cmp_attack   — attack time in ms (0.1–100)
-//   cmp_release  — release time in ms (10–1000)
-//   cmp_knee     — soft knee width in dB (0 = hard, 6–12 = soft)
-//   cmp_makeup   — output gain in dB
-//   cmp_mix      — wet/dry mix (0–1, 1 = fully compressed)
+//   cmp_thresh   — threshold in dB (-40..0; maps to the panel's -20..+20 pot)
+//   cmp_ratio    — ratio (1..20; detents at 2/4/10 = the 82E26 ladder's
+//                  real switch positions, hardware-pinned vs measured
+//                  G384 CV traces (K/Voff + conduction ceiling F). The
+//                  marks measure 1.90/3.14/8.20 -- the measured unit
+//                  runs soft of its silk-screen, and so do we)
+//   cmp_attack   — attack in ms (0.1..100; panel-label space, detents at
+//                  0.1/0.3/1/3/10/30 = the six hardware resistors)
+//   cmp_release  — release in ms (10..1200; label space, detents at
+//                  100/300/600/1200 = the four release-R positions into
+//                  the one shared 0.47u cap)
+//   cmp_knee     — 0..12; trims the bus conduction region (offset scale
+//                  + diode softness). 6 = the hardware-fitted stock point
+//   cmp_makeup   — output gain in dB, clamped ±24 (negative = sign-
+//                  flipped CV sum). Smoothed over 5 ms with cmp_mix —
+//                  they multiply audio directly, so steps would click.
+//                  Loop-side params (thresh/ratio/knee/timing) are NOT
+//                  smoothed: the timing caps smooth them, like hardware.
+//   cmp_mix      — wet/dry mix (0-1), house wrapper outside the circuit
+//   cmp_auto     — 1 = programme-dependent auto release (dual RC); the
+//                  cmp_release value is ignored while set. Default 0.
+//
+// Three hardware behaviours are LOAD-BEARING, not bugs (see .dev_weld/):
+//   - the release setting changes effective attack (shared timing cap)
+//   - slow attack settings reach less gain reduction (charge divider)
+//   - the release setting trims delivered ratio (the release resistor is
+//     part of the loop divider; faster release = slightly gentler slope)
+// Anyone "fixing" these has removed the reason the box sounds like it does.
 
 @init
 
+// >>> WELD GENERATED (export_jsfx.py) — do not hand-edit this section
+// Provenance: .dev_weld/ reference model, calibrated calibrate.py, component-level 82E26/82E27 (original drawings T82026-71 revB / T82027-71 rev8 + THAT 202XT law); ladder reading pinned by probe_ladder_final.py
+// Schematic: 1980 console card 82E27 (timing) + clone SCH Rev#7;
+// auto network follows the ORIGINAL card (clone swaps the Rs).
+
+// volts at the FWR input per unit sample -- the ONE calibrated
+// constant. Anchor (hardware-measured, G384 CV dataset; asserted
+// in calibrate.py AND verify_port.py): panel 0, 4:1 detent, 10 ms
+// attack, 600 ms release, 48 kHz, steady 1 kHz sine at -19.32
+// dBFS -> 2.0 dB settled GR (0.9 s tone, tail-RMS measure).
+CMP_V_REF = 1.14641528901;
+// 202-family VCA law: 20 dB/V (THAT 202XT sheet) -> 0.05 V per dB
+CMP_VCA_V_PER_DB = 0.05;
+// timing network components, straight off the card. The 3M3 node
+// load is AUTO-SIDE (measured: fixed releases fit raw R*C, auto
+// fits the loaded network) -- cmp_recalc applies it in auto only.
+CMP_DET_LOAD_R = 3300000;
+CMP_REL_C = 0.00000047;
+CMP_AUTO_R1 = 91000;
+CMP_AUTO_C1 = 0.00000047;
+CMP_AUTO_R2 = 750000;
+CMP_AUTO_C2 = 0.0000068;
+// bus-diode conduction: EFFECTIVE REFERRED values, not a raw
+// junction -- the bus diodes sit inside the output stage's servo
+// loop (82E26), so the drop is divided by loop gain to a ~50 mV
+// residual. Hardware-verified via G384 drive reconstruction; the
+// clone's 0.6 V full-junction reading forced a wrong (K,Voff)
+// basin and 2x-fast attacks. Knee 6 = the fitted stock point.
+CMP_DIO_VF = 0.05;
+CMP_DIO_N = 1.9;
+// 82E26 ratio ladder, HARDWARE-PINNED vs the G384 CV dataset
+// (probe_fit_polish 2026-08-27): per detent 2:1/4:1/10:1 the stage
+// gain K, conduction offset Voff (V), and conduction CEILING F --
+// v = w/(1 + w/F), w = K*u - Voff. The ceiling is measured twice
+// over: the inverted static drive law goes sub-linear at the 2:1
+// top (impossible for affine), and the attacks confirm the same
+// saturation dynamically (2:1 3.67 ms at a 3.85 ms open-loop RC =
+// near-zero overdrive). Voff <- measured onsets, K <- measured
+// depths, F <- measured attack63 (perms p004/p064/p022).
+// CV-ALIGNED 2026-08-27: the dataset's raw CV lags the gain the VCA
+// actually applied by 2.4-4.3 samples (its README leaves that
+// refinement to the reader; we had never done it), so the old
+// targets 3.72/11.29/0.45 were inflated. Refit on corrected
+// targets and ranked on ramp RMSE over all 8 perms, not attack63
+// -- t63 is ripple-quantised at the fast detents. Sum 1.708 ->
+// 1.606, better on 7 of 8 perms and tied on the 8th.
+CMP_LADK_0 = 17.7593; CMP_LADV_0 = 0.87097; CMP_LADF_0 = 1.02002;
+CMP_LADK_1 = 11.5419; CMP_LADV_1 = 0.92493; CMP_LADF_1 = 10.3085;
+CMP_LADK_2 = 34.2354; CMP_LADV_2 = 4.50818; CMP_LADF_2 = 29.4363;
+// TL081 output rail (the stage saturates like the hardware)
+CMP_RAIL_V = 13.5;
+// H2 gain-dependence m(|net off unity|), uniform 5 dB grid 0..60.
+// Blackmer-family growth: THAT 2181 figs 10/12 are the only
+// attenuation-direction data (0.15/dB, mid of x2.5..x4 per 15 dB);
+// the 202-family sheet's gain-direction points corroborate the
+// order (x4-7 per 15-20 dB). Past the documented window the slope
+// tapers (0.05/dB to 40) then holds — extrapolation. Indexed by
+// |GR - makeup|: makeup is DC into the audio-VCA CV (82E27 + the
+// G384 paper), so the chip colours at the NET operating point.
+CMP_H2M_0 = 1;
+CMP_H2M_1 = 1.75;
+CMP_H2M_2 = 2.5;
+CMP_H2M_3 = 3.25;
+CMP_H2M_4 = 3.5;
+CMP_H2M_5 = 3.75;
+CMP_H2M_6 = 4;
+CMP_H2M_7 = 4.25;
+CMP_H2M_8 = 4.5;
+CMP_H2M_9 = 4.5;
+CMP_H2M_10 = 4.5;
+CMP_H2M_11 = 4.5;
+CMP_H2M_12 = 4.5;
+CMP_H2M_SCL = 0.2;
+// x^2-residue DC compensation corner (Hz): slow mean-square
+// estimate subtracted at the residue — kills the parked DC the
+// square term made, keeps the harmonic, no coupling-filter phase.
+CMP_H2_DC_HZ = 2;
+// table self-check nodes (formula-matched to the @init loops)
+CMP_CHK_SP0 = 0.00000011253516840234;
+CMP_CHK_SP256 = 0.69314718056;
+CMP_CHK_SP400 = 9.00012340219;
+CMP_CHK_G200 = 0.1;
+CMP_CHK_G600 = 0.001;
+CMP_GEN_OK = 1;
+// <<< WELD GENERATED
+
+// ─── Reset ───────────────────────────────────────────────────────────────────
+// Reset every runtime state to a coherent idle: caps and meters to zero,
+// param smoothers SEATED at their current targets (never a half-glide).
+// Parameters themselves untouched. Hosts must call this instead of poking
+// cmp_env/cmp_gr_db (the old engine's internals no longer exist; the
+// circuit's state is two capacitor voltages).
+
+function cmp_reset()
+(
+  cmp_v1 = 0;                // switched timing node = the CV source
+  cmp_v2 = 0;                // auto's mid node (tracks v1 in fixed mode)
+  cmp_gr_db = 0;
+  cmp_gr_smooth = 0;
+  cmp_last_lin = 1.0;
+  cmp_last_gr_db = 0;
+  cmp_outL = 0;
+  cmp_outR = 0;
+  cmp_dcl = 0;               // x^2-residue DC estimators (mean-square)
+  cmp_dcr = 0;
+  // Param smoothers SEAT at their current targets — a reset must not
+  // preserve a half-finished 5 ms glide (audit 2026-08-25). Before the
+  // first recalc both targets are 0 and cmp_sm_seated is 0, so the first
+  // recalc still seats them at the real values; cmp_sm_seated is
+  // deliberately untouched here.
+  cmp_mk_s = cmp_makeup_lin;
+  cmp_mk_db_s = cmp_mk_db;
+  cmp_mix_s = cmp_mix_frac;
+);
+
 // ─── Init ────────────────────────────────────────────────────────────────────
+// Claims history + two lookup tables from the block the HOST hands in
+// (never freemem directly — wiki 2.4). Tables are built here with exp/log,
+// which are banned from @sample only; @init is the right place to pay.
 
 function cmp_init(mem_start)
+local(_i, _x, _g, _e)
 (
-  // GR history for meter display (scrolling bar)
-  CMP_GR_HIST_LEN = 128;
-  cmp_gr_hist = mem_start; mem_start += CMP_GR_HIST_LEN;
-  cmp_gr_hist_pos = 0;
-  memset(cmp_gr_hist, 0, CMP_GR_HIST_LEN);
+  // (The old engine's 128-word GR history is gone: audit 2026-08-24 found
+  // ZERO consumers — the LCD reads cmp_gr_smooth, the VU cmp_last_lin —
+  // so it cost a write+wrap per sample for nobody.)
 
-  // Runtime state
-  cmp_env     = 0;    // peak envelope
-  cmp_gr_db   = 0;    // current gain reduction (dB, negative)
-  cmp_outL    = 0;
-  cmp_outR    = 0;
+  // Softplus table: sp(x) = ln(1 + e^x) on x in [-16, 16].
+  // The diode+series-R law is nvt * sp((dv - vf)/nvt): exponentially dead
+  // when starving, exactly (dv - vf) deep in conduction. One table serves
+  // every knee setting — the knob only changes the nvt scaling around it.
+  CMP_SP_N = 513;
+  cmp_sp_tbl = mem_start; mem_start += CMP_SP_N;
+  CMP_SP_X0 = -16;
+  CMP_SP_SCL = (CMP_SP_N - 1) / 32;      // x -> index
+  _i = 0;
+  loop(CMP_SP_N,
+    _x = CMP_SP_X0 + _i / CMP_SP_SCL;
+    cmp_sp_tbl[_i] = log(1 + exp(_x));
+    _i += 1;
+  );
 
-  // Denorm constant
-  cmp_denorm = pow(10, -30);
+  // VCA gain table: g = 10^(-gr/20) for gr in [0, 60] dB, 0.1 dB grid.
+  // The loop keeps a bus comp far above the 60 dB floor; past the end the
+  // gain clamps at the last entry.
+  CMP_G_N = 601;
+  cmp_g_tbl = mem_start; mem_start += CMP_G_N;
+  CMP_G_SCL = (CMP_G_N - 1) / 60;        // gr dB -> index
+  _i = 0;
+  loop(CMP_G_N,
+    cmp_g_tbl[_i] = exp(-(_i / CMP_G_SCL) * 0.11512925464970229);
+    _i += 1;
+  );
 
-  // Cached exp() state for per-sample fast path
-  cmp_last_gr_db = 0;
-  cmp_last_lin = 1.0;
+  // Self-check: both tables against Python-computed values at exact nodes
+  // (constants from the generated section). A port that drifts refuses to
+  // claim health instead of drifting silently.
+  cmp_selfok = CMP_GEN_OK;
+  _e = abs(cmp_sp_tbl[0] - CMP_CHK_SP0)
+     + abs(cmp_sp_tbl[256] - CMP_CHK_SP256)
+     + abs(cmp_sp_tbl[400] - CMP_CHK_SP400)
+     + abs(cmp_g_tbl[0] - 1)
+     + abs(cmp_g_tbl[200] - CMP_CHK_G200)
+     + abs(cmp_g_tbl[600] - CMP_CHK_G600);
+  _e > 0.000000001 ? cmp_selfok = 0;
+
+  // Detent tables: ratio (9 solved points), attack (6 parts), release (4).
+  // Filled from the generated constants; interp in cmp_recalc is geometric
+  // between neighbours so every hardware detent is exact.
+  // (The 9-point fitted ratio-drive table is gone with the fit: the
+  // 82E26 ladder's per-detent (K, Voff, F ceiling) are scalar generated
+  // constants interpolated in cmp_recalc -- nothing to allocate.)
+  CMP_ATK_N = 6;
+  cmp_atkms_tbl = mem_start; mem_start += CMP_ATK_N;
+  cmp_atkr_tbl = mem_start; mem_start += CMP_ATK_N;
+  cmp_atkms_tbl[0] = 0.1; cmp_atkr_tbl[0] = 820;
+  cmp_atkms_tbl[1] = 0.3; cmp_atkr_tbl[1] = 2700;
+  cmp_atkms_tbl[2] = 1;   cmp_atkr_tbl[2] = 8200;
+  cmp_atkms_tbl[3] = 3;   cmp_atkr_tbl[3] = 27000;
+  cmp_atkms_tbl[4] = 10;  cmp_atkr_tbl[4] = 82000;
+  cmp_atkms_tbl[5] = 30;  cmp_atkr_tbl[5] = 270000;
+
+  CMP_REL_N = 4;
+  cmp_relms_tbl = mem_start; mem_start += CMP_REL_N;
+  cmp_relr_tbl = mem_start; mem_start += CMP_REL_N;
+  cmp_relms_tbl[0] = 100;  cmp_relr_tbl[0] = 180000;
+  cmp_relms_tbl[1] = 300;  cmp_relr_tbl[1] = 270000;
+  cmp_relms_tbl[2] = 600;  cmp_relr_tbl[2] = 560000;
+  cmp_relms_tbl[3] = 1200; cmp_relr_tbl[3] = 1200000;
+
+  // H2 gain-dependence m(GR): THAT 2181 figs 10/12 (provenance at the
+  // generated constants). Uniform 5 dB grid over 0..60 dB GR, +1 guard
+  // cell repeating the last value so the interp never reads past the end
+  // (_gr is capped at 60 before the lookup, so _ii tops out at 13*0).
+  CMP_H2M_N = 13;
+  cmp_h2m_tbl = mem_start; mem_start += CMP_H2M_N + 1;
+  cmp_h2m_tbl[0]  = CMP_H2M_0;  cmp_h2m_tbl[1]  = CMP_H2M_1;
+  cmp_h2m_tbl[2]  = CMP_H2M_2;  cmp_h2m_tbl[3]  = CMP_H2M_3;
+  cmp_h2m_tbl[4]  = CMP_H2M_4;  cmp_h2m_tbl[5]  = CMP_H2M_5;
+  cmp_h2m_tbl[6]  = CMP_H2M_6;  cmp_h2m_tbl[7]  = CMP_H2M_7;
+  cmp_h2m_tbl[8]  = CMP_H2M_8;  cmp_h2m_tbl[9]  = CMP_H2M_9;
+  cmp_h2m_tbl[10] = CMP_H2M_10; cmp_h2m_tbl[11] = CMP_H2M_11;
+  cmp_h2m_tbl[12] = CMP_H2M_12; cmp_h2m_tbl[13] = CMP_H2M_12;
+
+  // Small numbers built without scientific-notation literals (wiki 1.2)
+  cmp_tiny = pow(10, -30);
+  cmp_snap_eps = pow(10, -9);
+  cmp_dc_max = pow(10, 12);   // estimator ceiling (~+120 dBFS mean-square)
+
+  // H2 residue: the card spec's ~-75 dB THD "mostly H2". x^2 residue with
+  // a = 2*10^(-75/20): a unity sine puts its 2nd harmonic at a/2 = -75 dBc
+  // exactly. The 2181 datasheet names the mechanism (a multiplier's
+  // control-port contamination -> H2; the trimmed chip null itself is
+  // H3-dominated, fig 14) and its figs 10/12 pin how the residue GROWS
+  // off unity gain — the cmp_h2m_tbl curve. The x^2 DC by-product
+  // ((1 - cos 2wt)/2) is compensated in cmp_process with a slow
+  // mean-square estimate (CMP_H2_DC_HZ), so the harmonic survives and
+  // the parked DC does not. Absolute magnitude still bench-calibrates
+  // against a real unit when one is measured (same posture as Anvil's
+  // ln_k).
+  cmp_h2_base = 2 * pow(10, -75/20);
+
+  // Param smoothers seat on the FIRST recalc (no 5 ms fade-in at load),
+  // glide on every later one.
+  cmp_sm_seated = 0;
+
+  // Params (cmp_thresh..cmp_auto) are HOST-owned — cmp_init seats STATE
+  // only. EEL2 zero-inits globals, so an auto-less host still gets 0, and
+  // an @init rerun (srate change) can no longer reset a param behind the
+  // host's back. (External audit 2026-08-25.)
+  cmp_reset();
 
   // Return next free memory slot
   mem_start;
 );
 
-// ─── Recalculate coefficients ────────────────────────────────────────────────
-// Call whenever cmp_thresh/ratio/attack/release/knee/makeup change.
+// ─── Recalculate ─────────────────────────────────────────────────────────────
+// Params -> per-sample constants. Transcendentals live HERE, once per edit,
+// never in cmp_process. Interpolation across the hardware detents is
+// geometric (they are decade ladders); the detents themselves are exact.
 
 function cmp_recalc()
-local(sr)
+local(_sr, _dt, _r, _p, _i, _t, _ra, _rr, _panel, _vf, _n, _k,
+      _pp, _lk, _lv, _lf, _kf,
+      _g1, _g2, _gl, _a1, _a2, _a, _m11, _m12, _m22)
 (
-  sr = srate;
-  sr <= 0 ? ( sr = 44100; );  // guard
+  // NaN self-heal (x != x only for NaN): a corrupt serialized param must
+  // not become a NaN coefficient — the runtime state bound repairs the
+  // caps, but a poisoned coefficient would re-poison them every sample.
+  // Clamps alone can't be trusted for this: EEL2 min/max NaN behaviour
+  // depends on argument order. Defaults = the ver-24 serialize backfill.
+  cmp_thresh  != cmp_thresh  ? cmp_thresh  = 0;
+  cmp_ratio   != cmp_ratio   ? cmp_ratio   = 4;
+  cmp_attack  != cmp_attack  ? cmp_attack  = 10;
+  cmp_release != cmp_release ? cmp_release = 100;
+  cmp_knee    != cmp_knee    ? cmp_knee    = 6;
+  cmp_makeup  != cmp_makeup  ? cmp_makeup  = 0;
+  cmp_mix     != cmp_mix     ? cmp_mix     = 1;
+  cmp_auto    != cmp_auto    ? cmp_auto    = 0;
+  cmp_auto = cmp_auto >= 0.5 ? 1 : 0;   // canonical 0/1: truthiness must
+                                        // not make 0.2 select Auto
 
-  // Attack / release envelope coefficients
-  cmp_at_coeff  = exp(-1 / (sr * max(cmp_attack, 0.1) * 0.001));
-  cmp_rel_coeff = exp(-1 / (sr * max(cmp_release, 10) * 0.001));
+  _sr = srate;
+  _sr <= 0 ? ( _sr = 44100; );  // guard
+  _dt = 1 / _sr;
 
-  // Threshold / knee precomputation
-  cmp_inv_ratio = 1 / max(cmp_ratio, 1.0001);
-  cmp_knee_lo   = cmp_thresh - cmp_knee * 0.5;
-  cmp_knee_hi   = cmp_thresh + cmp_knee * 0.5;
-  cmp_knee_inv  = cmp_knee > 0 ? (1 / (2 * cmp_knee)) : 0;
+  // Ratio -> loop drive: geometric interp over the solved (ratio, drive)
+  // points. Below the first solved point the drive ramps to zero at 1:1
+  // (no loop gain = no compression). Above the last it holds.
+  _r = max(1, min(20, cmp_ratio));
+  // ratio -> the 82E26 ladder's detent axis: 2/4/10 at pos 0/1/2. K
+  // interpolates geometrically (resistance ladder), Voff linearly (a DC
+  // sum); above 10:1 K continues on the last decade's log slope with
+  // Voff held (Swing's 10..20 zone -- deeper, harder, slope saturating);
+  // below 2:1 the stage gain fades on the same log law the old table
+  // used, dead exactly at 1:1. Pinned reading: probe_fit_polish.py on
+  // CV-aligned targets -- the marks measure 1.90/3.14/8.20 (network
+  // truth; the silk-screen runs soft on real units too). The older
+  // 2.36/4.18/8.57 figure predates the CV lag correction; verify_port.py
+  // measures the shipping constants and is the arbiter.
+  _pp = _r <= 2 ? 0
+      : _r <= 4 ? log(_r * 0.5) * 1.44269504089
+      : _r <= 10 ? 1 + log(_r * 0.25) * 1.09135666793
+      : 2 + log(_r * 0.1) * 1.09135666793;
+  _pp < 2 ? (
+    _i = _pp | 0;
+    _t = _pp - _i;
+    _i == 0 ? (
+      _lk = CMP_LADK_0 * pow(CMP_LADK_1 / CMP_LADK_0, _t);
+      _lv = CMP_LADV_0 + (CMP_LADV_1 - CMP_LADV_0) * _t;
+      _lf = CMP_LADF_0 * pow(CMP_LADF_1 / CMP_LADF_0, _t);
+    ) : (
+      _lk = CMP_LADK_1 * pow(CMP_LADK_2 / CMP_LADK_1, _t);
+      _lv = CMP_LADV_1 + (CMP_LADV_2 - CMP_LADV_1) * _t;
+      _lf = CMP_LADF_1 * pow(CMP_LADF_2 / CMP_LADF_1, _t);
+    );
+  ) : (
+    _lk = CMP_LADK_2 * pow(CMP_LADK_2 / CMP_LADK_1, _pp - 2);
+    _lv = CMP_LADV_2;
+    _lf = CMP_LADF_2 * pow(CMP_LADF_2 / CMP_LADF_1, _pp - 2);
+  );
+  _r < 2 ? _lk = _lk * log(max(_r, 1.000001)) * 1.44269504089;
 
-  // Linear level at knee onset (below this, GR = 0 — skip log/exp entirely)
-  cmp_knee_lo_lin = exp(cmp_knee_lo * 0.11512925465);
+  // Attack ms (panel-label space) -> hardware resistor: piecewise
+  // geometric across the six real parts, end segments continued outside.
+  _p = max(0.1, min(100, cmp_attack));
+  _i = 0;
+  while (_i < CMP_ATK_N - 2 && _p > cmp_atkms_tbl[_i + 1]) ( _i += 1; );
+  _t = log(_p / cmp_atkms_tbl[_i])
+     / log(cmp_atkms_tbl[_i + 1] / cmp_atkms_tbl[_i]);
+  _ra = cmp_atkr_tbl[_i] * pow(cmp_atkr_tbl[_i + 1] / cmp_atkr_tbl[_i], _t);
 
-  // Output gain
-  cmp_makeup_lin = exp(cmp_makeup * 0.11512925465);  // db2lin
+  // Release ms (label space) -> hardware R into the shared 0.47u.
+  _p = max(10, min(1200, cmp_release));
+  _i = 0;
+  while (_i < CMP_REL_N - 2 && _p > cmp_relms_tbl[_i + 1]) ( _i += 1; );
+  _t = log(_p / cmp_relms_tbl[_i])
+     / log(cmp_relms_tbl[_i + 1] / cmp_relms_tbl[_i]);
+  _rr = cmp_relr_tbl[_i] * pow(cmp_relr_tbl[_i + 1] / cmp_relr_tbl[_i], _t);
 
-  // Mix
+  // Knee -> the sidechain diode. 6 = the fitted stock point: CMP_DIO_VF
+  // (0.05 V, the servo-REFERRED residual -- not a raw 0.6 V junction,
+  // see the constant) and n = 1.9. The span is the range a builder
+  // reaches with real substitute diodes.
+  _k = max(0, min(12, cmp_knee));
+  _t = (_k - 6) / 6;
+  _vf = CMP_DIO_VF * (1 + 0.10 * _t);
+  _n = CMP_DIO_N * pow(4, _t * 0.5);
+  cmp_nvt = _n * 0.02585;
+  cmp_inv_nvt = 1 / cmp_nvt;
+  cmp_vf = _vf;
+  cmp_nvt_ovr_ra = cmp_nvt / _ra;
+
+  // Threshold: Swing's -40..0 IS the panel's -20..+20 pot, dB for dB.
+  // DC into the sidechain VCA — the programme "looks louder", the diode
+  // never moves. Folded with V_REF, drive and the L+R average into one
+  // detector scalar.
+  _panel = max(-20, min(20, cmp_thresh + 20));
+  // The 82E27's 360K:100K threshold summer shifts the SIDECHAIN VCA's CV
+  // -- structurally dB-true through the 202's 20 dB/V law, so it folds
+  // with the stage gain K and the V_REF bridge into one detector scalar
+  // (pot legend spans +/-15 dB; the slider's wider throw extrapolates
+  // beyond the pot, like ratio 20 beyond the switch).
+  cmp_sc_k = _lk * CMP_V_REF * exp(-_panel * 0.11512925464970229);
+  // Knee knob trims BOTH knee mechanisms of the card: the bus diode's
+  // vf/n (below) and the ladder's conduction offset -- the +/-12
+  // reference legs are the builder's trim points, and the offset
+  // dominates the measured knee. 6 = the drawing's values exactly.
+  _kf = pow(2, (6 - max(0, min(12, cmp_knee))) * 0.0833333333333);
+  _lv = _lv * _kf;
+  _lv > CMP_RAIL_V ? _lv = CMP_RAIL_V;
+  cmp_voff = _lv;
+  cmp_rail_hi = CMP_RAIL_V + max(_lv, 0);
+  // conduction ceiling: the stage runs out of drive at F volts -- the
+  // hardware-measured saturation the affine ladder lacked (2:1's slow
+  // attack and sub-linear static top are BOTH this one constant)
+  cmp_inv_ladf = 1 / _lf;
+
+  // Timing-network step constants (implicit Euler; unconditionally stable)
+  _gl = 1 / CMP_DET_LOAD_R;
+  cmp_auto ? (
+    // node -(0.47u || 91K)- mid -(6u8 || 750K)- ground  [original card]
+    _g1 = 1 / CMP_AUTO_R1;
+    _g2 = 1 / CMP_AUTO_R2;
+    _a1 = CMP_AUTO_C1 / _dt;
+    _a2 = CMP_AUTO_C2 / _dt;
+    _m11 = _a1 + _g1 + _gl;
+    _m12 = -(_a1 + _g1);
+    _m22 = _a1 + _g1 + _a2 + _g2;
+    cmp_t_m12 = _m12;
+    cmp_t_m22 = _m22;
+    cmp_t_m11 = _m11;
+    cmp_t_a1 = _a1;
+    cmp_t_a2 = _a2;
+    cmp_t_invdet = 1 / (_m11 * _m22 - _m12 * _m12);
+  ) : (
+    _a = CMP_REL_C / _dt;
+    cmp_t_a1 = _a;
+    // raw R*C: the 3M3 lives with the auto network (measured -- fixed
+    // releases fit the bare bank, auto fits the loaded one)
+    cmp_t_invden = 1 / (_a + 1 / _rr);
+  );
+
+  // VCA law: cap volts -> dB of gain reduction, then the table finishes it
+  cmp_v2db = 1 / CMP_VCA_V_PER_DB;
+
+  // Output gain (negative panel values are a sign-flipped CV sum — legal;
+  // clamped: this is the ONE param a corrupt serialize could turn into
+  // an exp() overflow)
+  cmp_mk_db = max(-24, min(24, cmp_makeup));
+  cmp_makeup_lin = exp(cmp_mk_db * 0.11512925464970229);
+
+  // Mix — house wrapper, sits outside the circuit like Anvil's
   cmp_mix_frac = max(0, min(1, cmp_mix));
 
-  // Log scale factor (avoids log10 in hot path)
-  cmp_log10e_x20 = 20 / log(10);   // ≈ 8.6859
+  // makeup/mix multiply audio directly — glide them (5 ms) so automation
+  // cannot click. First recalc seats instead (no fade-in at insert).
+  cmp_par_sm = exp(-1 / (_sr * 0.005));
+  cmp_sm_seated ? 0 : (
+    cmp_mk_s = cmp_makeup_lin;
+    cmp_mk_db_s = cmp_mk_db;
+    cmp_mix_s = cmp_mix_frac;
+    cmp_sm_seated = 1;
+  );
 
-  // GR display smoother
-  cmp_gr_smooth_coeff = exp(-1 / (srate * 0.01));  // ~10ms
-  cmp_gr_smooth = 0;
+  // GR display smoother (~10 ms), same time constant the LCD always had
+  cmp_gr_smooth_coeff = exp(-1 / (_sr * 0.01));
+
+  // x^2-residue DC estimator corner (CMP_H2_DC_HZ, ~2 Hz): far below
+  // audio so the estimate cannot track (and cancel) the 2nd harmonic
+  // itself, fast enough that parked DC dies in ~80 ms.
+  cmp_dc_k = 1 - exp(-2 * $pi * CMP_H2_DC_HZ / _sr);
 );
 
 // ─── Process one stereo sample ───────────────────────────────────────────────
-// Feed-forward peak-detecting VCA compressor.
-// Inputs: inL, inR (audio samples)
-// Outputs: cmp_outL, cmp_outR, cmp_gr_db
+// The loop: audio VCAs apply the CURRENT cap voltage; PER CHANNEL a dummy
+// sidechain VCA at the same CV feeds the precision rectifier + ladder
+// stage, and the two stage outputs meet at the bus as a greater-of-two
+// (anodes-common diode OR, 82E26 pin 42) before the shared bus diode
+// charges the cap through the attack R. Anti-phase content detects
+// honestly; the stereo link lives in the shared CV. The one-sample delay
+// at the dummy tap is the same structural delay the Python reference
+// carries. No oversampling is needed, and that is MEASURED, not argued
+// from the 4.4-sample time constant it used to cite: probe_numerics.py
+// runs this step against a Newton-converged fully-implicit one over
+// 44.1/48/96/192 kHz x six attacks x 2/4/10 and they agree to 0.0012 dB
+// settled, 0.02 ms of t63, and 0.0014 dB of bias past the attack. The
+// only visible gap is ~0.3 dB for ~2 ms at 0.1 ms attack / 44.1k, which
+// is 11-133x under the G384 dataset's own CV-alignment noise.
+// NO transcendentals here — tables and arithmetic only.
 
 function cmp_process(inL, inR)
-local(_det, _level_db, _gr_target, _excess, _lin, _dryL, _dryR)
+local(_gr, _fi, _ii, _fr, _g, _dryL, _dryR, _wetL, _wetR, _h2a, _net,
+      _vdl, _vdr, _vrect, _x, _sp, _iin, _b1, _b2, _dold, _nv1)
 (
-  // Save dry for mix
   _dryL = inL;
   _dryR = inR;
 
-  // Peak detection — stereo linked
-  _det = max(abs(inL), abs(inR));
+  // ── audio VCAs: cap volts -> dB -> linear via table ──
+  _gr = cmp_v1 * cmp_v2db;               // positive dB of reduction
+  _gr < 0 ? _gr = 0;
+  _fi = _gr * CMP_G_SCL;
+  _fi > CMP_G_N - 1.0001 ? _fi = CMP_G_N - 1.0001;
+  _ii = _fi | 0;
+  _fr = _fi - _ii;
+  _g = cmp_g_tbl[_ii] + (cmp_g_tbl[_ii + 1] - cmp_g_tbl[_ii]) * _fr;
 
-  // Envelope follower: instant attack via max, exponential release
-  cmp_env = _det > cmp_env
-    ? _det + (cmp_env - _det) * cmp_at_coeff
-    : _det + (cmp_env - _det) * cmp_rel_coeff;
-  cmp_env = max(cmp_env, cmp_denorm);  // prevent denormal CPU spikes on silence
+  // Meter reads the SAME 60 dB cap the gain table applies, so needle and
+  // audio can never disagree. Beyond 60 dB the real chip's control port
+  // saturates off the exponential law anyway; the cap is the model there.
+  _gr > 60 ? _gr = 60;
+  cmp_gr_db = -_gr;                      // meter convention: negative dB
+  cmp_last_lin = _g;
+  cmp_last_gr_db = cmp_gr_db;
 
-  // Fast path: skip log/exp when envelope is below knee onset.
-  // cmp_knee_lo_lin is precomputed in cmp_recalc() as the linear threshold
-  // at the bottom of the knee. Below this, GR is always 0 dB (_lin = 1.0).
-  cmp_env < cmp_knee_lo_lin ? (
-    cmp_gr_db = 0;
-    _lin = 1.0;
+  // clean VCAs + the H2 residue: card-null anchor scaled by the 2181
+  // gain-dependence table (_gr already capped at 60 above). The residue
+  // is generated in the cell's INPUT domain and then rides through the
+  // net gain: the table encodes the sheet's constant-INPUT THD-vs-gain
+  // figures (figs 10/12), so the H2:fundamental ratio must be
+  // base * m(|net|) * A/2 — independent of the gain applied. The old
+  // post-gain squaring multiplied that ratio by the net gain AGAIN,
+  // inverting the attenuation direction (deep GR read cleaner, hot
+  // makeup ~15 dB dirtier than the sheet); fixed 2026-08-28 after the
+  // convention check against the committed THAT PDFs. Only the unity
+  // operating point — where everything was calibrated — was unaffected.
+  // makeup is DC summed into the audio-VCA CV (82E27 + the G384 paper),
+  // so the table argument is the net distance off unity |GR - makeup|;
+  // it tracks a dB twin of the 5 ms makeup glide so the residue level
+  // moves WITH the gain it describes instead of stepping ahead of it.
+  // x^2 DC is compensated by slow INPUT mean-square estimators — the
+  // harmonic survives, the parked DC does not. Tables/arithmetic only.
+  cmp_mk_s += (cmp_makeup_lin - cmp_mk_s) * (1 - cmp_par_sm);
+  abs(cmp_mk_s - cmp_makeup_lin) < cmp_snap_eps ? cmp_mk_s = cmp_makeup_lin;
+  cmp_mk_db_s += (cmp_mk_db - cmp_mk_db_s) * (1 - cmp_par_sm);
+  abs(cmp_mk_db_s - cmp_mk_db) < 0.001 ? cmp_mk_db_s = cmp_mk_db;
+  _net = abs(_gr - cmp_mk_db_s);
+  _net > 60 ? _net = 60;
+  _fi = _net * CMP_H2M_SCL;
+  _ii = _fi | 0;
+  _fr = _fi - _ii;
+  _h2a = cmp_h2_base
+       * (cmp_h2m_tbl[_ii] + (cmp_h2m_tbl[_ii + 1] - cmp_h2m_tbl[_ii]) * _fr);
+  cmp_dcl += (inL * inL - cmp_dcl) * cmp_dc_k;
+  cmp_dcr += (inR * inR - cmp_dcr) * cmp_dc_k;
+  // Estimator bound, same posture as the cap reseat below: legit input
+  // mean-square is finite and >= 0 (NaN fails every comparison, +Inf
+  // fails the ceiling). Without it, ONE non-finite input sample latched
+  // the wet path NaN permanently — the caps healed, these never did.
+  !(cmp_dcl >= 0 && cmp_dcl < cmp_dc_max
+    && cmp_dcr >= 0 && cmp_dcr < cmp_dc_max) ? (
+    cmp_dcl = 0; cmp_dcr = 0;
+  );
+  _wetL = (inL + _h2a * (inL * inL - cmp_dcl)) * _g * cmp_mk_s;
+  _wetR = (inR + _h2a * (inR * inR - cmp_dcr)) * _g * cmp_mk_s;
+
+  // ── dummy VCA + precision rectifier: one CV, both channels ──
+  _vdl = abs(inL) * _g * cmp_sc_k;
+  _vdr = abs(inR) * _g * cmp_sc_k;
+  // Ideal greater-of-two, and it stays that way: CLOSED 2026-08-27 by
+  // probe_bus_or.py. The G384 battery is SINGLE CHANNEL (num_channels
+  // = 1) so it says nothing about the bus, but the physical two-diode
+  // OR -- log-sum-exp at the bus diode's own nVt, no free parameter --
+  // moves settled GR by <= 0.16 dB and its only identifiable signature
+  // (spread across stereo cases) by 0.02 dB, under our own residuals.
+  // It also SHRINKS as GR deepens. 0.5 dB would need 4x the softness
+  // the knee fit pins. Do not reopen without new stereo hardware data.
+  _vrect = max(_vdl, _vdr);
+  _vrect > cmp_rail_hi ? _vrect = cmp_rail_hi;
+  _vrect = _vrect - cmp_voff;
+  // conduction ceiling (rational, no transcendentals): w/(1 + w/F)
+  _vrect > 0 ? _vrect = _vrect / (1 + _vrect * cmp_inv_ladf);
+
+  // ── the real threshold: diode into the timing network ──
+  _x = (_vrect - cmp_v1 - cmp_vf) * cmp_inv_nvt;
+  _x >= 16 ? (
+    _iin = _x * cmp_nvt_ovr_ra;
+  ) : _x <= -16 ? (
+    _iin = 0;
   ) : (
-    // Level to dB (log required — envelope is in active compression range)
-    _level_db = log(cmp_env) * cmp_log10e_x20;
-
-    // Soft-knee gain computer
-    _level_db <= cmp_knee_hi && cmp_knee > 0 ? (
-      _excess = _level_db - cmp_knee_lo;
-      _gr_target = (cmp_inv_ratio - 1) * _excess * _excess * cmp_knee_inv;
-    ) : (
-      _gr_target = (_level_db - cmp_thresh) * (cmp_inv_ratio - 1);
-    );
-
-    cmp_gr_db = _gr_target;
-
-    // Cache exp(): only recompute when GR changes by > 0.05 dB
-    abs(cmp_gr_db - cmp_last_gr_db) > 0.05 ? (
-      cmp_last_lin = exp(cmp_gr_db * 0.11512925465);
-      cmp_last_gr_db = cmp_gr_db;
-    );
-    _lin = cmp_last_lin;
+    _fi = (_x - CMP_SP_X0) * CMP_SP_SCL;
+    _ii = _fi | 0;
+    _fr = _fi - _ii;
+    _sp = cmp_sp_tbl[_ii] + (cmp_sp_tbl[_ii + 1] - cmp_sp_tbl[_ii]) * _fr;
+    _iin = _sp * cmp_nvt_ovr_ra;
   );
 
-  // Smooth GR for display
+  // ── timing network: implicit Euler on the cap(s) ──
+  cmp_auto ? (
+    _dold = cmp_v1 - cmp_v2;
+    _b1 = _iin + cmp_t_a1 * _dold;
+    _b2 = cmp_t_a2 * cmp_v2 - cmp_t_a1 * _dold;
+    _nv1 = (_b1 * cmp_t_m22 - cmp_t_m12 * _b2) * cmp_t_invdet;
+    cmp_v2 = (cmp_t_m11 * _b2 - cmp_t_m12 * _b1) * cmp_t_invdet;
+    cmp_v1 = _nv1;
+  ) : (
+    cmp_v1 = (cmp_t_a1 * cmp_v1 + _iin) * cmp_t_invden;
+    cmp_v2 = cmp_v1;                     // stays seated for mode swaps
+  );
+  // denormal floors on the recursive state
+  abs(cmp_v1) < cmp_tiny ? cmp_v1 = 0;
+  abs(cmp_v2) < cmp_tiny ? cmp_v2 = 0;
+  // State bound: legit CV tops out ~0.37 V (60 dB); 12 V is physically
+  // impossible, and NaN fails every comparison — either way, reseat both
+  // caps and let the loop resettle through its own time constants. This
+  // is the runtime safety; there is deliberately NO output clamp (house
+  // policy: REAPER busses are float — the state bound is the guard, a
+  // limiter is not; see the Anvil ±1-clamp decision).
+  !(cmp_v1 > -1 && cmp_v1 < 12 && cmp_v2 > -1 && cmp_v2 < 12) ? (
+    cmp_v1 = 0; cmp_v2 = 0;
+  );
+
+  // ── display: smoothed GR (the LCD's readout) ──
   cmp_gr_smooth += (cmp_gr_db - cmp_gr_smooth) * (1 - cmp_gr_smooth_coeff);
 
-  // GR history for scrolling meter
-  cmp_gr_hist[cmp_gr_hist_pos] = cmp_gr_smooth;
-  cmp_gr_hist_pos += 1;
-  cmp_gr_hist_pos >= CMP_GR_HIST_LEN ? cmp_gr_hist_pos = 0;
-
-  // Apply gain reduction
-  cmp_outL = inL * _lin * cmp_makeup_lin;
-  cmp_outR = inR * _lin * cmp_makeup_lin;
-
-  // Wet/dry mix
-  cmp_mix_frac < 1 ? (
-    cmp_outL = _dryL + (cmp_outL - _dryL) * cmp_mix_frac;
-    cmp_outR = _dryR + (cmp_outR - _dryR) * cmp_mix_frac;
+  // ── output: self-check failure = dry, never garbage ──
+  cmp_selfok ? (
+    cmp_mix_s += (cmp_mix_frac - cmp_mix_s) * (1 - cmp_par_sm);
+    abs(cmp_mix_s - cmp_mix_frac) < cmp_snap_eps ? cmp_mix_s = cmp_mix_frac;
+    cmp_outL = _dryL + (_wetL - _dryL) * cmp_mix_s;
+    cmp_outR = _dryR + (_wetR - _dryR) * cmp_mix_s;
+  ) : (
+    cmp_outL = _dryL;
+    cmp_outR = _dryR;
   );
 );

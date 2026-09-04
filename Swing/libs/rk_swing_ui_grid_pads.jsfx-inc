@@ -191,7 +191,7 @@ function swing_grid_draw_embedded() (
       !embed_show_icons ? (
       // Note name (top-left)
       gfx_setfont(1, "Arial", max(9, (e_font * 0.65)|0), 0);
-      _nn = p_note[gi]; _oct = (_nn / 12)|0 - 1; _semi = _nn % 12;
+      _nn = p_note[gi]; _oct = (_nn / 12 | 0) - 1; _semi = _nn % 12;
       _semi == 0  ? strcpy(#_note, "C")  :
       _semi == 1  ? strcpy(#_note, "C#") :
       _semi == 2  ? strcpy(#_note, "D")  :
@@ -334,10 +334,14 @@ function swing_grid_draw_shadow() (
 );
 
 function swing_grid_draw_pads() (
+  // grid_top is set by whichever layout ran this frame: swing_ui_calc_layout
+  // (full UI: header + LCD bar) or swing_ui_draw_rack_header (dock rack face:
+  // its slim bar). Hit-testing below uses the same numbers, so both faces stay
+  // click-exact by construction.
   grid_x  = right_x + 4;
-  grid_y  = 28 + LCD_BAR_H + 4;  // below header + LCD bar
+  grid_y  = grid_top + 4;
   grid_w  = right_w - 8;
-  grid_h  = gfx_h - 28 - LCD_BAR_H - 8;  // minus header, LCD bar, margin
+  grid_h  = gfx_h - grid_top - 8;
   cell_w  = (grid_w / 4)|0;
   cell_h  = (grid_h / 4)|0;
   // Control strip (S/M/RPT pills + VOL/PAN knobs) scales WITH the pad cell so the
@@ -426,6 +430,57 @@ function swing_grid_draw_pads() (
       gfx_rect(pad_x - 1, pad_y + ph - 1, pw + 2, 2);
       gfx_rect(pad_x - 1, pad_y - 1, 2, ph + 2);
       gfx_rect(pad_x + pw - 1, pad_y - 1, 2, ph + 2);
+    );
+
+    // ── Kit-macro mode indicators (Spec_Swing_Macro_System §5b) ──
+    // Ring = the SELECTED macro targets this pad (drawn in that macro's
+    // identity colour); chip = one small square per OWNING macro, read
+    // against the MACRO tab's knob legend. MODE-SCOPED on purpose: drawn
+    // only while the MACRO tab or the macro editor is up — the normal pad
+    // face already carries ~13 elements, so permanent dots would be
+    // confetti (grid feedback costs nothing outside macro mode).
+    (lcd_right_tab == 2 || kmac_ed_open) && has_content ? (
+      _mgp_msel = max(0, min(7, macro_sel | 0));
+      _mgp_own = 0; _mgp_selhit = 0;
+      _mgp_m = 0;
+      loop(KMAC_N,
+        _mgp_hit = 0;
+        _mgp_j = 0;
+        loop(min(kmac_nmap[_mgp_m], KMAC_MAX_MAP),
+          _mgp_p = kmac_pad[_mgp_m * KMAC_MAX_MAP + _mgp_j];
+          (_mgp_p == gi || _mgp_p == -2 || (_mgp_p == -1 && gi == sel_pad)) ? _mgp_hit = 1;
+          _mgp_j += 1;
+        );
+        _mgp_hit ? (
+          _mgp_own = _mgp_own | 2^_mgp_m;   // pow bit, never (1<<n)
+          _mgp_m == _mgp_msel ? _mgp_selhit = 1;
+        );
+        _mgp_m += 1;
+      );
+      _mgp_selhit ? (
+        swing_lcd_kmac_pal(kmac_color[_mgp_msel] | 0);
+        gfx_set(kmac_pal_r, kmac_pal_g, kmac_pal_b, 0.95);
+        gfx_rect(pad_x + 2, pad_y + 2, pw - 4, 2);
+        gfx_rect(pad_x + 2, pad_y + ph - 4, pw - 4, 2);
+        gfx_rect(pad_x + 2, pad_y + 2, 2, ph - 4);
+        gfx_rect(pad_x + pw - 4, pad_y + 2, 2, ph - 4);
+      );
+      _mgp_own ? (
+        _mgp_n = 0; _mgp_m = 0;
+        loop(KMAC_N, (_mgp_own & 2^_mgp_m) ? _mgp_n += 1; _mgp_m += 1;);
+        gfx_set(0, 0, 0, 0.48);
+        gfx_rect(pad_x + 27, pad_y + ph - 16, _mgp_n * 5 + 4, 13);
+        _mgp_x = pad_x + 29; _mgp_m = 0;
+        loop(KMAC_N,
+          (_mgp_own & 2^_mgp_m) ? (
+            swing_lcd_kmac_pal(kmac_color[_mgp_m] | 0);
+            gfx_set(kmac_pal_r, kmac_pal_g, kmac_pal_b, 0.95);
+            gfx_rect(_mgp_x, pad_y + ph - 14, 4, 9);
+            _mgp_x += 5;
+          );
+          _mgp_m += 1;
+        );
+      );
     );
 
     // "PAD N" label — on empty pads: centered, on loaded pads: small bottom-right
@@ -585,7 +640,7 @@ function swing_grid_draw_pads() (
 
     // ── Note name (top-left, clickable dropdown) ──────────────────────
     _nn = p_note[gi];
-    _oct = (_nn / 12)|0 - 1;
+    _oct = (_nn / 12 | 0) - 1;
     _semi = _nn % 12;
     _semi == 0  ? strcpy(#_note, "C")  :
     _semi == 1  ? strcpy(#_note, "C#") :
@@ -1131,9 +1186,7 @@ function swing_grid_draw_pads() (
         ps_enable[gi] > 0.5 && !pad_has_audio(gi) ? (
           swing_synthview_open(gi);
         ) : (
-          overlay_pad = gi;
-          overlay_layer = _ov_last_tab >= MAX_LAYERS ? 0 : _ov_last_tab;
-          wf_zoom = 1.0; wf_scroll = 0.0;  // reset zoom on new pad
+          swing_padfx_open(gi);
         );
       );
 

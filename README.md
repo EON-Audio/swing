@@ -18,6 +18,10 @@ recipes, every view illustrated. GitHub renders it right in your browser.
 **Coming from Swing 2.1?** Read **[What's new in 3.0](WHATS_NEW.md)** — the
 short tour of everything that changed, and the few things that moved.
 
+**Already on the beta?** The second beta adds Weld and Anvil, the Console
+desk with its FX picker, docking for Swing and Steppa, the song strip, and
+kit macros. The what's-new page has a **[section on the second beta](WHATS_NEW.md#the-second-beta)**.
+
 ## What's in the box
 
 One install, one ecosystem:
@@ -29,22 +33,32 @@ One install, one ecosystem:
   ports of hardware-measured references. Eleven of the thirteen factory kits
   are pure synth and load instantly.
 - **Steppa** — the step sequencer. Groove import/export (`.rgt` and straight
-  from MIDI files), 824 factory patterns browsable by role and genre, song
-  mode.
+  from MIDI files), 824 factory patterns browsable by role and genre, and a
+  **song strip**: your sections drawn to length across the top, the playhead
+  sweeping through them, one pattern per section.
 - **Drum Matrix** — your patterns as real REAPER MIDI items in the arrange
   window. Edit either end; the other follows, ratchets included.
 - **Drum Strip + FX Return View** — a mixer channel per drum with SSL-style
   controls, plus hardware-faceplate return monitors: the EON 480 reverb and
   EON H9 delay decks, every contributing pad's send on a fader.
-- **EON 76** *(new)* — a bus compressor with a real GR needle. The multi-out
-  build can drop one on your drum bus for glue, and one always drives the new
+- **EON Weld** *(new)* — a bus compressor built from the circuit of the
+  console classic and fitted to measured hardware, with a real GR needle. The
+  multi-out build puts one on your drum bus.
+- **EON Anvil** *(new)* — a FET limiting amplifier solved from the schematic,
+  in Blackface and Blue voices, with the all-buttons trick. It drives the
   **Smash** return: parallel compression on a fader, fed by a per-pad SMASH
   send next to DLY and RVB.
+- **The Console** — Swing's mixer as a full desk: sixteen strips, an inserts
+  band showing every pad's FX chain as cards, and an FX picker with the whole
+  plugin catalogue sorted into categories.
+- **Docking** — Swing and Steppa each fold into a slim dock face that lives
+  under the arrange, and both come back docked when you reopen the project.
 - **EON Lens** — a kit-artwork card for the track panel. Your kit's cover,
   living on the track, pulsing with the audio.
 
-Plus: 14 console themes, 18 knob styles, kit cover art, multiple instances
-per project, and Swing's own undo engine — Ctrl+Z can't wipe a kit
+Plus: eight **kit macros** per kit with snapshots and morph, a file browser
+inside Swing, 14 console themes, 18 knob styles, kit cover art, multiple
+instances per project, and Swing's own undo engine — Ctrl+Z can't wipe a kit
 anymore.
 
 ## In pictures
@@ -57,7 +71,32 @@ master drive.*
 | | |
 |---|---|
 | ![The Drum Synth editor — a 3D drum above the voice controls](screenshots/06_synth.png)<br>*The Drum Synth — nine families, thirty voices, and a 3D drum that moves as you tune it.* | ![The key-range editor — drag a pad across the keyboard](screenshots/13_range.png)<br>*Key ranges — drag a pad's edges and it plays melodically across the keys.* |
-| ![Steppa — lanes with pad names, icons and colors](screenshots/34_stepseq.png)<br>*Steppa — your pads' names, icons and colors carried straight into the sequencer.* | ![The Drum Strip — VU meter, EQ nodes, SSL-style knobs](screenshots/35_drumstrip.png)<br>*Drum Strip — a channel per drum: VU, EQ nodes, drive, comp, sends.* |
+| ![Steppa — the song strip across the top, sections drawn to length, a beat in the grid](screenshots/steppa_song.png)<br>*Steppa — the song strip: Intro, Verse, Chorus, Outro drawn to length, the playhead moving through them, one pattern per section.* | ![The Drum Strip — EQ graph, VU, filters, FX, sends](screenshots/35_drumstrip.png)<br>*Drum Strip — a channel per drum: EQ graph, VU, filters, drive, comp, and the DLY / RVB / SMSH sends.* |
+
+![Swing and Steppa docked under the arrange, the four song sections above them](screenshots/dock.png)
+
+*Docked: Swing's rack face and Steppa's dock face side by side under the
+arrange, the song's four sections above them. Both come back docked when the
+project reopens.*
+
+![The Console — sixteen strips, the inserts band with FX cards, sends and faders](screenshots/console.png)
+
+*The Console: sixteen strips on one desk, every pad's FX chain as cards in the
+inserts band, sends and faders below.*
+
+| | |
+|---|---|
+| ![The compact picker open over the desk — banks, categories and the plugin list](screenshots/console_picker.png)<br>*Click an empty slot and the picker opens right there on the desk: banks, category chips, the list with a card per plugin.* | ![The MACRO tab — eight macro knobs above the pad grid, with snapshots](screenshots/macro_tab.png)<br>*Kit macros — eight knobs above the grid, four snapshots and a morph slider.* |
+| ![The macro editor — PUNCH mapped to four pads' comp](screenshots/macros_punch.png)<br>*The macro editor: PUNCH mapped to the comp on four pads, each with its own range.* | ![The macro editor — DECAY mapped across eight pads](screenshots/macros_decay.png)<br>*DECAY across eight pads, every mapping with a range of its own.* |
+
+| | |
+|---|---|
+| ![EON Weld — bus compressor with a GR needle](screenshots/weld.png)<br>*EON Weld — the bus compressor, on your drum bus after MULTI.* | ![EON Anvil — FET limiting amplifier, Blackface voice](screenshots/anvil.png)<br>*EON Anvil — the FET limiter, driving the Smash return.* |
+
+![The FX picker — banks and categories on the left, the plugin list with cards, the chain on the right](screenshots/fxpicker.png)
+
+*The FX picker: every plugin you own, sorted into categories with a card each,
+and the pad's chain on the right, one drum at a time.*
 
 ![REAPER's mixer with sixteen drum channels, each carrying an embedded Drum Strip](screenshots/hand_mixer.png)
 

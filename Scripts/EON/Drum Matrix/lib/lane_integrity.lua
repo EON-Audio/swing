@@ -25,8 +25,21 @@ end
 -- piano lanes use note_lo/note_hi. Matches render_drum_matrix.resolve_pad_range
 -- for the v1 (lane_info-driven) case — when Swing publishes ranges in Phase 2,
 -- thread the resolved lo/hi through here too.
+-- Injected range resolver (hosts pass lane_tools.LaneRange). For STEREO lanes it
+-- unions the frozen tag window with the paired Swing's live pad pitches
+-- (2026-09-02), so a pad that was remapped outside the seed-time window no
+-- longer counts its whole pattern as "foreign". nil = tag only.
+local _range_resolver = nil
+function M.SetRangeResolver(fn) _range_resolver = fn end
+
 local function lane_range(lane_info)
   if not lane_info then return nil, nil end
+  if _range_resolver then
+    local ok, rlo, rhi = pcall(_range_resolver, lane_info)
+    if ok and type(rlo) == 'number' and type(rhi) == 'number' and rhi >= rlo then
+      return rlo, rhi
+    end
+  end
   local lo, hi = lane_info.note_lo, lane_info.note_hi
   if type(lo) == 'number' and type(hi) == 'number' and hi >= lo then return lo, hi end
   local p = lane_info.pad_pitch
@@ -111,6 +124,10 @@ end
 -- =============================================================================
 function M.NormalizeLane(lane)
   if not (lane and lane.track and lane.lane_info) then return 0 end
+  -- A STEREO lane holds the whole kit in one take. Its "foreign" notes are
+  -- either pads the live map no longer covers or notes painted while Swing was
+  -- offline; the piano path below would DELETE them. Never normalize it.
+  if lane.lane_info.stereo == true then return 0 end
   local lo, hi = lane_range(lane.lane_info)
   if not lo then return 0 end
   local piano = lo < hi

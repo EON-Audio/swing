@@ -39,6 +39,15 @@ local _budget_warned_for_take = {}
 -- `_excl` holds the screen rects (ImGui coords) of every visible floating FX
 -- window, and each draw below skips/clips against them so the FX GUIs show
 -- through the transparent overlay. nil = zero-cost fast path (paint mode off).
+-- Stereo-lane pitch-range resolver, injected by the host (eon_drum_matrix
+-- passes lane_tools.LaneRange). A stereo lane's tag note_lo/note_hi were frozen
+-- when the bridge first saw the Swing; lane_tools resolves the LIVE pad map and
+-- unions it with the tag (2026-09-02), so rows, the key guide and every
+-- paint_mode consumer downstream of lane_targets follow the pads as they are
+-- now. nil = tag only (the pre-injection behaviour).
+local _range_resolver = nil
+function M.SetRangeResolver(fn) _range_resolver = fn end
+
 local _excl = nil
 function M.SetExclusionRects(rects)
   _excl = (rects and #rects > 0) and rects or nil
@@ -340,6 +349,15 @@ local function resolve_pad_range(lane_info, swing_state)
   -- lane). Its pad_index is a placeholder 1 — a per-pad published range for
   -- pad 1 must never collapse the lane back to drum view.
   if lane_info.stereo == true then
+    -- Live-first: the injected resolver (lane_tools.LaneRange) unions the tag
+    -- window with the paired Swing's live pad pitches; the frozen tag is only
+    -- the offline fallback.
+    if _range_resolver then
+      local ok, rlo, rhi = pcall(_range_resolver, lane_info)
+      if ok and type(rlo) == 'number' and type(rhi) == 'number' and rhi >= rlo then
+        return rlo, rhi
+      end
+    end
     local slo, shi = lane_info.note_lo, lane_info.note_hi
     if type(slo) == 'number' and type(shi) == 'number' and shi >= slo then
       return slo, shi

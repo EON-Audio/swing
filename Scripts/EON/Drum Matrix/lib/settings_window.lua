@@ -645,10 +645,13 @@ function M.Draw(ctx, overlay_bounds)
       -- counts via status bar so the user knows what happened.
       local picked_genre = settings.Get('genre') or 'hip-hop'
       reaper.Undo_BeginBlock()
-      local rolled, skipped_locked, skipped_nopreset = 0, 0, 0
+      local rolled, skipped_locked, skipped_nopreset, skipped_stereo = 0, 0, 0, 0
       for _, lane in ipairs(lane_tools.GetLanes()) do
         if lane.lane_info.locked then
           skipped_locked = skipped_locked + 1
+        elseif lane.lane_info.stereo == true then
+          -- whole-kit lane: a per-pad preset has no single row to land on
+          skipped_stereo = skipped_stereo + 1
         else
           local cat = category.GetForLane(lane.lane_info)
           local preset = preset_lib.GetRandom(picked_genre, cat)
@@ -662,8 +665,9 @@ function M.Draw(ctx, overlay_bounds)
       end
       reaper.Undo_EndBlock(string.format("EON DM: randomize kit (%s)", picked_genre), -1)
       reaper.Help_Set(string.format(
-        'EON DM Randomize Kit: %d rolled, %d locked, %d no preset',
-        rolled, skipped_locked, skipped_nopreset), false)
+        'EON DM Randomize Kit: %d rolled, %d locked, %d no preset%s',
+        rolled, skipped_locked, skipped_nopreset,
+        skipped_stereo > 0 and string.format(', %d stereo grid lane skipped', skipped_stereo) or ''), false)
     end
     r.ImGui_SetItemTooltip(ctx, "Roll a random preset on every unlocked lane whose category has presets in the current genre. Lanes without a matching preset stay untouched — not every sound fits every genre.")
 
@@ -681,10 +685,14 @@ function M.Draw(ctx, overlay_bounds)
       else
         last_full_kit_group[picked_genre] = group
         reaper.Undo_BeginBlock()
-        local rolled, skipped_locked, cleared = 0, 0, 0
+        local rolled, skipped_locked, cleared, skipped_stereo = 0, 0, 0, 0
         for _, lane in ipairs(lane_tools.GetLanes()) do
           if lane.lane_info.locked then
             skipped_locked = skipped_locked + 1
+          elseif lane.lane_info.stereo == true then
+            -- whole-kit lane: neither a per-pad fragment nor the "no fragment ->
+            -- ClearLane" fallback may touch it (that would wipe the whole pattern)
+            skipped_stereo = skipped_stereo + 1
           else
             local cat = category.GetForLane(lane.lane_info)
             local preset = preset_lib.GetGroupPreset(group, cat)
@@ -703,8 +711,9 @@ function M.Draw(ctx, overlay_bounds)
         end
         reaper.Undo_EndBlock(string.format("EON DM: full kit (%s / %s)", picked_genre, group), -1)
         reaper.Help_Set(string.format(
-          'EON DM Full Kit "%s": %d lanes stamped, %d cleared, %d locked',
-          group, rolled, cleared, skipped_locked), false)
+          'EON DM Full Kit "%s": %d lanes stamped, %d cleared, %d locked%s',
+          group, rolled, cleared, skipped_locked,
+          skipped_stereo > 0 and string.format(', %d stereo grid lane skipped', skipped_stereo) or ''), false)
       end
     end
     r.ImGui_SetItemTooltip(ctx, "Stamp one imported loop as a coherent full kit: every unlocked lane gets that same loop's fragment for its category. Click again to roll a different kit. Needs imported MIDI (EON_DM_ImportMIDI).")

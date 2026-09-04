@@ -101,7 +101,7 @@ import libs/rk_cat_glyphs.jsfx-inc
 //   UI widgets (eon_seq_widgets.jsfx-inc) adapted from "SEQS (Sequenced FX)"
 //   by Joep Vanlier (Saike), used under the MIT License -- with thanks.
 // ============================================================================
-slider1:0<0,7,1{1,2,3,4,5,6,7,8}>--Pattern
+slider1:0<0,95,1>--Pattern
 slider2:36<0,127,1>--Note start
 slider3:16<1,128,1>--Sequence length
 slider4:16<1,49,1>--Number of notes
@@ -137,6 +137,10 @@ slider48:0<-65,65,1>--EON Pair Slot (bridge-assigned; 0=unpaired, +N=auto, -N=ma
 slider49:1<0,1,1{Off,On}>--EON Sync Mode (Drum Matrix two-views; 0=standalone; default ON)
 slider50:1<0,1,1{Off,On}>--EON Grid Lines (beat lines + per-lane tinted separators; view-only, persists via FX chunk)
 slider51:127<0,127,1>--EON Lane Columns (bitmask: 1 icon, 2 name, 4 mute, 8 solo, 16 vol, 32 pan, 64 swing; view-only, persists via FX chunk)
+slider52:0<0,2,1{Auto,Full UI,Dock face}>--EON Dock View (0=aspect-triggered, 1=pin full UI, 2=pin dock face; view-only, persists via FX chunk)
+slider53:0<0,1,1{Free,Docked}>--EON Rig Docked (set by the dock rig script, not by hand; only honoured while GS_RIG_ALIVE is fresh)
+slider54:0<0,1,1{No,Yes}>--EON Dock Wanted (the wordmark's dock INTENT; set by "dock me", cleared only by "pop out"; outlives a closed pane, unlike slider53)
+slider55:1<0,1,1{Off,On}>--EON Song Strip (the ruler-gutter SONG pill; view-only, persists via FX chunk; ON by default since 2026-09-03)
 in_pin:none
 out_pin:none
 
@@ -541,6 +545,25 @@ function eon_songname(e, dest, maxc) local(b, j, c) (
   );
   dest;
 );
+// ── Strip polish (2026-09-03): region i's NAME from the MAP band's name area: 3 cells
+// per region at +EON_SS_MAP_NAMEOFF, 4 seven-bit chars per cell (c0 + c1*128 + c2*16384
+// + c3*2097152 = 28 bits, safe under every 32-bit EEL2 integer op), 0 = end of name.
+// A full cell (4 chars) continues into the next; a short one ends the name.
+function eon_mapname(i, dest, maxc) local(b, k, v, c, j, n, more) (
+  strcpy(dest, "");
+  b = EON_SS_MAP_BASE + (eon_pair_slot >= 0 ? eon_pair_slot : 0)*EON_SS_MAP_STRIDE + EON_SS_MAP_NAMEOFF + i*3;
+  j = 0; k = 0; more = 1;
+  while(k < 3 && more && j < maxc) (
+    v = gmem[b + k]|0; n = 0; c = v % 128;
+    while(c > 0 && n < 4 && j < maxc) (
+      sprintf(#eon_snch, "%c", c); strcat(dest, #eon_snch); j += 1; n += 1;
+      v = (v / 128)|0; c = v % 128;
+    );
+    more = n == 4;
+    k += 1;
+  );
+  dest;
+);
 // EON ICONS: the 46-category glyphs + eon_cat_for_name/eon_catname live in
 // rk_cat_glyphs.jsfx-inc (imported above; shared with Swing pads).
 // lane right-click menu: left-column row labels (rows 0..13; dividers after 1/5/10)
@@ -571,6 +594,13 @@ function eon_pm_rowlbl(dest, kind, r) (
     ) :
     kind == 4 ? (
       r == 0 ? "Clear song" : "Commit to timeline"
+    ) :
+    kind == 6 ? (
+      r == 0 ? "Clear it" : "Cancel"
+    ) :
+    kind == 7 ? (
+      r == 0 ? "Edit this section" : r == 1 ? "Play from here"  : r == 2 ? "Loop this section" :
+      r == 3 ? "Add to chain"      : r == 4 ? "Add to chain x2" : r == 5 ? "Add to chain x4"   : "Clear chain"
     ) : (
       r == 0 ? "Straight  (16ths)"   : r == 1 ? "Triplet  (8th triplets)" :
       r == 2 ? "Fine straight  (32nds)" : "Fine triplet  (16th triplets)"
@@ -651,6 +681,14 @@ eon_lane_pad        = nextslot1;            // max_numnotes; E-2 lane->pad map (
 nextslot1           = eon_lane_pad        + 000128;   // bump free pointer past eon_lane_pad
 eon_region_override = nextslot1;            // npatterns; EON per-pattern DM region pick (0 = Auto, k>=1 = pin to region ordinal k). Persisted in @serialize.
 nextslot1           = eon_region_override + 000128;   // bump free pointer past eon_region_override
+eon_pat_loaded      = nextslot1;            // npatterns; 1 = this pattern holds its region's grid (bridge-primed, "Steppa plays everywhere" step 1). Transient: cleared on sync off / unpair, NOT persisted.
+nextslot1           = eon_pat_loaded      + 000128;
+eon_map             = nextslot1;            // section map mirror: [i*4] start QN, +1 end QN, +2 pattern index, +3 region colour (EON_SS_MAP band, read when GEN changes). Transient.
+nextslot1           = eon_map             + 000320;   // 2 + 64 x 4 = 258, padded
+eon_sg_xs           = nextslot1;            // song strip geometry (@gfx only): x of chip/region e
+nextslot1           = eon_sg_xs           + 000064;
+eon_sg_ws           = nextslot1;            // song strip geometry (@gfx only): width of chip/region e
+nextslot1           = eon_sg_ws           + 000064;
 // NOTE: eon_region_override is NOT cleared here -- fresh memory is already 0 (= Auto for
 // every pattern), and skipping the clear means a samplerate-change @init re-run can't wipe
 // a value loaded from @serialize (same rationale as ss_embed_view).
@@ -700,6 +738,12 @@ memset(ss_knob_mem, 0, 1568);
 eon_colx             = nextslot1;  nextslot1 = eon_colx + 000008;
 eon_colw             = nextslot1;  nextslot1 = eon_colw + 000008;
 EON_COL_STUB = 9;   // collapsed-column width: just enough for a restore chevron
+// DOCK FACE: the lane-header columns the slim face keeps. The P (pan) knob and
+// the per-lane swing pill are dropped -- the approved mockup gives each lane an
+// icon, a name, M, S and ONE level knob. This is a FACE mask, not a user choice:
+// it is ANDed with slider51 into eon_cv, so the user's own column picks survive
+// untouched in the full UI. 1 icon | 2 name | 4 mute | 8 solo | 16 vol.
+SS_DOCK_COLS = 31;
 // Rebuild the BUILTIN slots (0..8) now -- safe on samplerate re-init (content is code-determined).
 memset(groove_slots, 0, 9*GROOVE_STRIDE);
 groove_slots[128]=$'S'; groove_slots[129]=$'w'; groove_slots[130]=$'i'; groove_slots[131]=$'n'; groove_slots[132]=$'g';
@@ -777,6 +821,15 @@ ms_tb_r7=2^16; // EON P3b-4c: song-strip row (drag states keep the ms_tb bit so 
 ms_tb_songbtn       = ms_tb+ms_tb_r7+0;  // consumed click (PLAY/LOOP/toggle/menu)
 ms_tb_songdrag_pat  = ms_tb+ms_tb_r7+1;  // pattern button being dragged toward the strip
 ms_tb_songdrag_chip = ms_tb+ms_tb_r7+2;  // chip drag (reorder / drag-out remove)
+ms_tb_songlisten    = ms_tb+ms_tb_r7+3;  // strip polish: a timeline block held -> the engine plays it (1g LISTEN)
+// EON DOCK FACE: one latch for a value drag started on the slim bar (Len, Swg)
+// or in its folded-settings popup. Row bit 2^17 is above every ms_tb_r* bit, so
+// mstate carries ms_tb -- the grid handler stays shielded for the whole gesture --
+// while no toolbar-row branch can dispatch on it. Same trick as ms_pads_kit, but
+// with a bit that is genuinely free (ms_tb+200 happens to set the r2 and r3 bits).
+// Not in the release-time noundo list, so a finished drag books an undo point.
+ms_tb_r8=2^17;
+ms_dk_drag=ms_tb+ms_tb_r8+0;
 ms_el=2^11; // envelope lane area
 ms_el_divider=ms_el+0;
 ms_el_envdraw=ms_el+1;
@@ -999,8 +1052,24 @@ function ss_knob_color(nt, appear, is_pan) local(h) (
 //   bit0 ICON   bit1 NAME   bit2 MUTE   bit3 SOLO   bit4 VOL   bit5 PAN   bit6 SWING
 // Icon/name is a VALIDITY RULE on the pair, not two independent toggles: a lane
 // showing neither has no identity left, so NAME is forced back on if both clear.
-function eon_colvis_apply() (
+function eon_colvis_apply() local(_cvs) (
   (eon_colvis & 3) == 0 ? eon_colvis = eon_colvis | 2;
+  // ss_dock_face is written by @gfx and read HERE, and this function is also called
+  // from @slider and @init -- kept global on purpose (gfx_race_audit flags it, and
+  // it is benign): a 0/1 double cannot tear, and the worst case is one @slider pass
+  // deriving pkw for the face @gfx last published, which is the correct one. Any
+  // real disagreement is corrected on the next frame by the ss_dock_prev swap block,
+  // which re-runs this function.
+  // eon_cv = the EFFECTIVE mask everything downstream draws and hit-tests from;
+  // eon_colvis stays the STORED user preference (slider51) that the column-header
+  // strip and the Settings panel toggle. The dock face narrows the one without
+  // touching the other, so floating back restores the user's columns exactly.
+  eon_cv = ss_dock_face ? (eon_colvis & SS_DOCK_COLS) : eon_colvis;
+  // A hidden column normally collapses to a STUB, because its restore chevron
+  // lives in the column-header strip. The dock face does not draw that strip, so
+  // there is no chevron to leave room for -- a stub there is just dead lane header
+  // stealing pixels from the step grid. Collapse to nothing instead.
+  _cvs = ss_dock_face ? 0 : EON_COL_STUB;
   // Control-strip width = only what is enabled. The per-control widths are the
   // worst-case ones the old FIXED eon_ctrlw=126 was derived from (M/S 17+3,
   // knob 18+4, swing 35+4, +3 trailing), so an all-columns-on strip comes out at
@@ -1011,11 +1080,11 @@ function eon_colvis_apply() (
   // the "still have the arrow to show again" requirement. Modelled on the SONG
   // strip, which collapses its height into tbh rather than disappearing.
   eon_ctrlw = 0;
-  eon_ctrlw += (eon_colvis & 4)  ? 20 : EON_COL_STUB;
-  eon_ctrlw += (eon_colvis & 8)  ? 20 : EON_COL_STUB;
-  eon_ctrlw += (eon_colvis & 16) ? 22 : EON_COL_STUB;
-  eon_ctrlw += (eon_colvis & 32) ? 22 : EON_COL_STUB;
-  eon_ctrlw += (eon_colvis & 64) ? 39 : EON_COL_STUB;
+  eon_ctrlw += (eon_cv & 4)  ? 20 : _cvs;
+  eon_ctrlw += (eon_cv & 8)  ? 20 : _cvs;
+  eon_ctrlw += (eon_cv & 16) ? 22 : _cvs;
+  eon_ctrlw += (eon_cv & 32) ? 22 : _cvs;
+  eon_ctrlw += (eon_cv & 64) ? 39 : _cvs;
   eon_ctrlw += 3;
   // Derive the NATURAL widths here rather than trusting the caller to have just
   // assigned them. The earlier version only SHRANK chw/pianow and relied on
@@ -1029,15 +1098,19 @@ function eon_colvis_apply() (
   // Everywhere else the columns are always full width, so a mask set in drum mode
   // cannot leak a 9px gap into the piano roll.
   (mode == 1 && colorscheme == 10) ? (
-    chw    = (eon_colvis & 1) ? eon_chw_nat    : EON_COL_STUB;
-    pianow = (eon_colvis & 2) ? eon_pianow_nat : EON_COL_STUB;
+    chw    = (eon_cv & 1) ? eon_chw_nat    : _cvs;
+    pianow = (eon_cv & 2) ? eon_pianow_nat : _cvs;
   ) : (
     chw = eon_chw_nat; pianow = eon_pianow_nat;
   );
   pkw = chw + pianow + (colorscheme==10 ? eon_ctrlw : 0);   // the one real derivation
 );
 
-function eon_ms_geo() (
+function eon_ms_geo() local(_cvs) (
+  // Effective mask + stub width, exactly as eon_colvis_apply derived them --
+  // the widths it summed into eon_ctrlw and the spans laid out here must agree
+  // or the control strip drifts off its own reserved zone.
+  _cvs = ss_dock_face ? 0 : EON_COL_STUB;
   eon_ms_bh = min(max(row_height-8, 9), 13);
   eon_ms_bw = eon_ms_bh + 4;                     // pill: a touch wider than tall
   eon_ms_row2dy = ((row_height-eon_ms_bh)/2)|0;  // vertically centered in the row
@@ -1054,10 +1127,10 @@ function eon_ms_geo() (
   eon_colx[0] = 0;   eon_colw[0] = chw;
   eon_colx[1] = chw; eon_colw[1] = pianow;
   eon_gx = eon_cz + 3;
-  (eon_colvis & 4) ? ( eon_ms_mx = eon_gx; eon_colx[2]=eon_gx; eon_colw[2]=eon_ms_bw; eon_gx += eon_ms_bw + 3; )
-                   : ( eon_ms_mx = -1000;  eon_colx[2]=eon_gx; eon_colw[2]=EON_COL_STUB; eon_gx += EON_COL_STUB; );
-  (eon_colvis & 8) ? ( eon_ms_sx = eon_gx; eon_colx[3]=eon_gx; eon_colw[3]=eon_ms_bw; eon_gx += eon_ms_bw + 3; )
-                   : ( eon_ms_sx = -1000;  eon_colx[3]=eon_gx; eon_colw[3]=EON_COL_STUB; eon_gx += EON_COL_STUB; );
+  (eon_cv & 4) ? ( eon_ms_mx = eon_gx; eon_colx[2]=eon_gx; eon_colw[2]=eon_ms_bw; eon_gx += eon_ms_bw + 3; )
+                   : ( eon_ms_mx = -1000;  eon_colx[2]=eon_gx; eon_colw[2]=_cvs; eon_gx += _cvs; );
+  (eon_cv & 8) ? ( eon_ms_sx = eon_gx; eon_colx[3]=eon_gx; eon_colw[3]=eon_ms_bw; eon_gx += eon_ms_bw + 3; )
+                   : ( eon_ms_sx = -1000;  eon_colx[3]=eon_gx; eon_colw[3]=_cvs; eon_gx += _cvs; );
   // Knobs also LOD out below an ~18px row, independently of the column bits: at
   // that size a knob is smaller than the finger dragging it. Note the asymmetry --
   // LOD hides the knob but does NOT reclaim its width (eon_ctrlw is fixed per
@@ -1066,14 +1139,14 @@ function eon_ms_geo() (
   // give the step grid its pixels back.
   eon_kn_show = row_height >= 18 ? 1 : 0;
   eon_kn_r    = eon_kn_show ? min(max(((row_height-6)/2)|0, 6), 9) : 0;
-  eon_kn_v_on = eon_kn_show && (eon_colvis & 16);
-  eon_kn_p_on = eon_kn_show && (eon_colvis & 32);
+  eon_kn_v_on = eon_kn_show && (eon_cv & 16);
+  eon_kn_p_on = eon_kn_show && (eon_cv & 32);
   eon_kn_v_on ? ( eon_kn_vx = eon_gx + eon_kn_r; eon_colx[4]=eon_gx; eon_colw[4]=eon_kn_r*2; eon_gx += eon_kn_r*2 + 4; )
-              : ( eon_kn_vx = -1000; eon_colx[4]=eon_gx; eon_colw[4]=(eon_colvis & 16) ? 0 : EON_COL_STUB; eon_gx += eon_colw[4]; );
+              : ( eon_kn_vx = -1000; eon_colx[4]=eon_gx; eon_colw[4]=(eon_cv & 16) ? 0 : _cvs; eon_gx += eon_colw[4]; );
   eon_kn_p_on ? ( eon_kn_px = eon_gx + eon_kn_r; eon_colx[5]=eon_gx; eon_colw[5]=eon_kn_r*2; eon_gx += eon_kn_r*2 + 4; )
-              : ( eon_kn_px = -1000; eon_colx[5]=eon_gx; eon_colw[5]=(eon_colvis & 32) ? 0 : EON_COL_STUB; eon_gx += eon_colw[5]; );
-  (eon_colvis & 64) ? ( eon_sw_x = eon_gx; eon_sw_w = pkw - 3 - eon_sw_x; eon_colx[6]=eon_gx; eon_colw[6]=eon_sw_w; )
-                    : ( eon_sw_x = -1000; eon_sw_w = 0; eon_colx[6]=eon_gx; eon_colw[6]=EON_COL_STUB; );
+              : ( eon_kn_px = -1000; eon_colx[5]=eon_gx; eon_colw[5]=(eon_cv & 32) ? 0 : _cvs; eon_gx += eon_colw[5]; );
+  (eon_cv & 64) ? ( eon_sw_x = eon_gx; eon_sw_w = pkw - 3 - eon_sw_x; eon_colx[6]=eon_gx; eon_colw[6]=eon_sw_w; )
+                    : ( eon_sw_x = -1000; eon_sw_w = 0; eon_colx[6]=eon_gx; eon_colw[6]=_cvs; );
 );
 any_solo=0;
 
@@ -1211,6 +1284,38 @@ EON_SW_COL_L        = 1433;  // GS_COL_EFFECTIVE_L (theme lightness)
 // handshake: 0 = nothing published -> keep the hardcoded EON scheme. Else 8
 // semantic colours x 3 floats (normalized 0..1 RGB) from GS_THEME_BASE, slot
 // order 0 BG,1 PANEL,2 TEXT,3 TEXT_DIM,4 ACCENT,5 ACCENT2,6 GRID,7 BORDER.
+// ── DOCK RIG LIVENESS ───────────────────────────────────────────────────────
+// GS_RIG_ALIVE: the pane scripts (EON Swing Dock.lua / EON Steppa Dock.lua)
+// stamp time_precise() here every tick while they are running. Claimed 2026-08-26
+// out of the retired 2626-2644 run (old FX pub, moved to 26090000).
+//
+// It exists to gate the PER-INSTANCE flag, not to carry it. The pane script sets
+// a slider on the exact FX whose canvas it captured, which is the only signal
+// that can distinguish "this instance is in the dock" from "some instance is" --
+// but a slider lives in the FX chunk, so a REAPER crash mid-capture would leave
+// a floated window pinned to the dock face forever. Honouring that flag only
+// while the rig is demonstrably alive makes the stale case impossible: no
+// script, no heartbeat, no dock face.
+GS_RIG_ALIVE = 2626;
+// ⚠️ ...except 2626 means "SOME pane is up" -- the Swing pane stamps it too, so
+// the stale case above was NOT impossible: whichever pane is running vouches for
+// BOTH plugins' dock flags. That cost Swing its wordmark click on 2026-08-30
+// (fixed there the same way). GS_RIG_ALIVE_STEPPA is stamped ONLY by
+// EON Steppa Dock.lua, so it answers "is OUR pane up". Every slider53 gate reads
+// this one; 2626 keeps its documented meaning.
+// Protocol row 2634, claimed 2026-08-30 out of the retired 2635-2644 run.
+GS_RIG_ALIVE_STEPPA = 2634;
+// Dock toggle relay (2026-08-26; .refs protocol doc rows 2627-2632):
+// POPOUT is consumed by EON Steppa Dock.lua (it just re-shows our float and its
+// handoff watcher does the rest); REDOCK by the bridge (eon_redock_tick), which
+// selects our track and launches/reuses the pane script. Payload slot cell is
+// written BEFORE the REQ bump (mailbox rule). EON_KB_ALIVE = the bridge's
+// heartbeat cell (Swing calls it KIT_GMEM_BRIDGE_ALIVE) — gates the redock
+// affordance so the wordmark never advertises a click nobody is listening to.
+EON_POPOUT_REQ  = 2628;
+EON_REDOCK_REQ  = 2631;
+EON_REDOCK_SLOT = 2632;
+EON_KB_ALIVE    = 99;
 GS_THEME_ID         = 2649;  // band 2649..2673 (padfx=2625-2648; StepSeq M/S=2700+)
 GS_THEME_BASE       = 2650;
 GS_THEME_REQ        = 2674;  // theme selector -> bridge: 0 none; 1 eon,2 dark,3 light,4 reaper
@@ -1317,7 +1422,12 @@ EON_SS_RGNNAME_SEL    = 256;       // offset of the SELECTED-name sub-band
 // 16 slots x 112 -> ..26029791, still below the SYNC band (26030000).
 EON_SS_SONG_BASE      = 26028000;  // + slot*EON_SS_SONG_STRIDE
 EON_SS_SONG_STRIDE    = 112;
-EON_SS_SONG_MAX       = 32;        // entry cap (mirrors the bridge publisher)
+// Cap on entries INSIDE one slot's record, NOT a slot count: entries sit at +8,
+// two cells each, so 8 + 32*2 = 72 <= 112. Slots are the 16 instance-registry
+// slots (26028000..26029791 / 112 = 16 exactly). Named _ENTRY_MAX because sitting
+// beside _BASE and _STRIDE it otherwise reads as the slot count -- it is not.
+// Mirrors SONG_ENTRY_MAX in Swing_Kit_Bridge.lua; rename the two together.
+EON_SS_SONG_ENTRY_MAX = 32;
 // P3b-4e: per-ENTRY names for the song chips. A chain entry can reference an
 // OFF-PAGE ordinal, so the page-windowed RGNNAME band can't serve the strip —
 // the bridge writes each entry's region name here (chars BEFORE the SONG band's
@@ -1404,24 +1514,58 @@ EON_SS_SYNC_OPT_REQ    = 51;     // StepSeq -> courier: option-set request count
 EON_SS_SYNC_OPT_AA     = 53;     // both ways: "Auto-adapt patterns" (③ apply the kit-load lane perm automatically,
                                  // no chip). DEFAULT OFF — canonical ExtState EON_StepSeq/auto_adapt, "1" = on
                                  // (INVERTED vs AZ/SO above, which default on via the unset-means-on idiom).
+// "Steppa plays everywhere" step 1 (2026-09-03): one pattern per region ordinal, every
+// region primed into its pattern by the bridge. StepSeq -> bridge: which patterns hold
+// their region (3 x 32-bit words, pattern k = bit k%32 of word k/32 -- EEL2 shifts are
+// 32-bit, so the words are built with 2^k) and our max_seqlength (the bridge sizes a
+// region's grid with it). Fields 55-58 were verified free 2026-09-03 (54 = COL_REQ).
+EON_SS_SYNC_SS_LOADED0 = 55;
+EON_SS_SYNC_SS_LOADED1 = 56;
+EON_SS_SYNC_SS_LOADED2 = 57;
+EON_SS_SYNC_SS_MAXLEN  = 58;
+// StepSeq -> bridge: the DMPUSH seq we last consumed. The transfer buffer is single and
+// we consume ONE push per @block, so the bridge's priming (many pushes in a row) waits
+// for this ack before staging the next region -- two pushes between two blocks would
+// otherwise lose the first one (rig-caught 2026-09-03: pattern 1 never primed).
+EON_SS_SYNC_DMPUSH_ACK = 59;
+// Section map (bridge -> StepSeq), per slot: +0 GEN (bumped LAST), +1 COUNT, then per
+// region i: +2+i*3 start QN, +3+i*3 end QN, +4+i*3 pattern index (= ordinal-1, -1 when
+// past the pattern cap). 64 regions x 3 + 2 = 194 <= stride 256. Read into eon_map when
+// GEN changes; consumed by the engine's region switch (step 3) and the song ruler.
+EON_SS_MAP_BASE        = 26160200;
+EON_SS_MAP_STRIDE      = 512;    // 4 cells per region since step 4 (+3 = packed region colour); 16 x 512 = 8192
+EON_SS_MAP_MAXRGN      = 64;
+EON_SS_MAP_NAMEOFF     = 260;  // strip polish: +260 + i*3 = region i's NAME, 3 cells x 4 seven-bit chars (eon_mapname)
 // Shared transfer buffer (single, owner-tagged) for one pattern's note grid. In
 // the verified-free gap above the SYNC band (..26031023), below INCMD (26100000).
 // header [0]=owner_slot [1]=seq [2]=numpads [3]=numsteps [4]=steps_per_beat;
 // data: pad p, step s velocity at EON_SS_XFER_DATA + p*numsteps + s (0 = no note).
-EON_SS_XFER_BASE   = 26040000;
-EON_SS_XFER_DATA   = 26040008;
+// ── Package 2 (2026-09-03): XFER v2, one contiguous claim at 26171536, every plane
+// sized 16 pads x 128 steps. The old planes (26040000 / 26042000 / 26130000) were
+// laid out for 64 steps but written with the real pattern length: 86+ step patterns
+// overran SUBVEL into the groove readback band, 125+ overran DATA/SUBDIV. Retired.
+// Header +0 owner, +1 seq, +2 numpads, +3 numsteps, +4 spb, +5 target+1, +6 version (2).
+// Planes (cell = pad*numsteps + s): DATA velocity (accented), OFF start inside the step
+// in steps (nudge + groove/swing), LEN length in steps (tied runs + note length),
+// SUBDIV sdn|mask<<4, SUBVEL 8 per cell. +24584.. reserved for the CC lanes (2B).
+EON_SS_XFER_BASE   = 26171536;
+EON_SS_XFER_DATA   = 26171544;   // +8
+EON_SS_XFER_OFF    = 26173592;   // +2056
+EON_SS_XFER_LEN    = 26175640;   // +4104
+EON_SS_XFER_CC     = 26196120;   // +24584 (2B): 4 rows x 128 steps, 0 = no event, 128 + value
+EON_SS_XFER_CCMETA = 26196632;   // +25096 (2B): per row: type+1 (0 = no row), channel
 // P3b-5b RATCHET band (parallel to DATA): per cell p,s holds packed subdivision info
 // = sdnum | (subdivnotelist << 4). sdnum = getSubdivNum (0 = no subdiv); the cell plays
 // sdnum+1 evenly-spaced sub-hits across the step, bit k of the mask = sub-position k on.
 // The bridge expands a subdivided cell into N+1-spaced MIDI notes on export. Sits clear
 // of DATA (16 x max_seqlength=64 = 1024 -> ..26041031) and below INCMD (26100000).
-EON_SS_XFER_SUBDIV = 26042000;
+EON_SS_XFER_SUBDIV = 26177688;   // +6152 (XFER v2)
 // P3b-5b sub-hit VELOCITY band (parallel to SUBDIV, but 8 slots per cell): velocity
 // of sub-hit k at EON_SS_XFER_SUBVEL + (p*numsteps + s)*8 + k; 0 = unset -> the
 // consumer falls back to the cell velocity. 16 x max_seqlength=64 cells x 8 = 8192
 // -> ..26138191, above the SONGNAME band's end (..26128191); grep-verified free
 // (bundle + Extension repo) 2026-07-02.
-EON_SS_XFER_SUBVEL = 26130000;
+EON_SS_XFER_SUBVEL = 26179736;   // +8200 (XFER v2), 16 x 128 x 8
 // EON Apply band (AP-1): the custom "apply preset to the ACTIVE pattern" path. Unlike
 // the sync XFER above (PAD-keyed, sync-gated), this is ROW-keyed (StepSeq-native rows,
 // like a native preset load) and consumed UNGATED so it works standalone. The bridge
@@ -1484,7 +1628,65 @@ eon_preset_loaded  = 0;        // set by @serialize read (preset/project load) -
 eon_sync_last_exp_digest = -1; // grid digest last EXPORTED (don't re-export an unchanged grid)
 eon_sync_prev_digest     = -1; // grid digest last @block (settle detector)
 eon_sync_settle          = 0;  // seconds the digest has been stable (gesture-end debounce)
+eon_dig_acc              = 0;  // seconds accrued since the last grid digest (digest decimation; see @block)
+eon_gesture_done         = 0;  // Package 3: @gfx raises 1 on a left-button release; @block consumes (atomic)
+_gfx_release             = 0;
+eon_gfx_hold_t           = 0;  // Package 3: time_precise() of the last @gfx frame with the left button HELD (0 = up)
+// ── OFFSCREEN GRID CACHE (@gfx) ──────────────────────────────────────────────
+// The step grid repaints numnotes x listlength cells every frame even when nothing
+// about it changed. It is now rendered once into image slot EON_GC_IMG and blitted
+// on subsequent frames. IMAGE SLOT OWNERSHIP: slot 0 belongs to eon_draw_vtext
+// (rotated label, force-resized on every call); none of the four imported incs
+// (rk_widgets / knobs_kbsg / rk_theme / rk_cat_glyphs) touch image slots at all, so
+// 32 is free -- verified by grep across the main file and all four incs.
+EON_GC_IMG      = 32;
+// ── DOCK FACE (see .docs/specs/Spec_Steppa_Dock_Mode.md) ───────────────────
+// ss_dock_face is DERIVED every @gfx frame from the canvas aspect + the slider52
+// pin, so it is deliberately not persisted and not restored here. ss_dock_prev
+// starts at -1 (never a legal face) so the very first frame counts as a swap and
+// runs the re-derive/invalidate path once, whatever face we open in.
+ss_dock_prev    = -1;
+eon_gc_enable   = 1;   // ESCAPE HATCH: 0 = always draw live, never blit (bypasses the cache)
+eon_gc_valid    = 0;   // the image currently holds a usable render
+eon_gc_key      = -1;  // signature of the state the cached image was rendered from
+// eon_gc_blkseq is the one variable here that crosses threads: bumped inside
+// eon_ss_import_grid / eon_ss_apply_grid (@block) and the @serialize read, folded
+// into the @gfx cache key. gfx_race_audit does not flag it because it only scans
+// top-level section code, not function bodies -- so note it explicitly. The race is
+// benign by construction: it is monotonic and only ever compared for inequality, so
+// the worst a stale read can do is hold a cache hit for one extra frame (~33 ms).
+eon_gc_blkseq   = 0;   // bumped when @block/@serialize rewrites the grid without changing p
+eon_gc_iw       = -1;  // dimensions the image is currently allocated at
+eon_gc_gfxseq   = 0;   // @gfx-owned twin of eon_gc_blkseq: bumped when a @gfx
+                       // handler rewrites the grid arrays (the kind-6 CLEAR).
+                       // Separate counter on purpose -- a non-atomic `+=` on
+                       // blkseq from a third thread context could collide with
+                       // @block's own bump and LOSE one, leaving the cache
+                       // blitting a stale image. Single-writer per counter,
+                       // both folded into the key, no race possible.
+eon_gc_ih       = -1;
 eon_sync_last_p          = -1; // active pattern last @block (suppress export on a pattern switch)
+eon_map_gen              = -1; // section map generation last mirrored (-1 = never; see EON_SS_MAP_BASE)
+eon_map_n                = 0;  // regions in the mirrored map
+eng_p                    = -1; // step 2: the pattern the ENGINE plays (resolved per @block; -1 = not yet)
+eng_silent               = 0;  // step 2: 1 while the playhead sits in no mapped section (engine quiet)
+gfx_beatpos              = -100; // step 2: the playhead column the EDITOR grid shows (-100 = none; engine on another pattern)
+ENG_EDGE_NEVER           = 1000000000; // step 3: the "no next boundary" sentinel, in beats. A PLAIN
+                               // literal: jsfx-lint parses 1e12 as the number 1 followed by the
+                               // identifier e12 and FAILS the whole file (its reported line numbers
+                               // sit ~148 below the source -- it counts the inlined imports).
+eng_edge                 = ENG_EDGE_NEVER; // step 3: next beat at which the engine's section answer changes (never = ENG_EDGE_NEVER)
+eng_map_on               = 0;    // step 3: 1 while synced+paired with a mirrored section map (per @block)
+eng_prev_p               = -1;   // step 3: engine pattern last block (a change forces the step boundary)
+eng_prev_anchor          = 0;    // step 3: engine phase anchor last block
+eng_map_i                = -1;   // step 4: map index of the region the engine plays (-1 = none); lights the timeline block
+eon_song_tl              = 1;    // step 4: song strip face, 1 = timeline (needs a map; falls back to chain), 0 = chain
+eon_listen_p             = -1;   // 1g LISTEN: pattern the engine plays while a timeline block is held (-1 = none; atomic, @gfx -> @block)
+eon_sg_hold_t            = 0;    // 1g: time_precise() of the press on a timeline block
+eon_sg_hold_i            = -1;   // 1g: which block
+eon_sg_tl                = 0;    // step 4: effective face this frame (eon_song_tl && a map exists), set by eon_song_geom
+eon_sg_clk_t             = 0;    // step 4: timeline double-click detector (time of the last block click)
+eon_sg_clk_i             = -1;   // step 4: ... and which block it was
 eon_sync_just_imported   = 0;  // set right after an import -> next @block re-baselines (no echo export)
 eon_apply_last           = 0;  // AP-1: last consumed applyreq_seq (apply-band edge-detect; per-instance)
 eon_apply_primed         = 0;  // AP-1: 0 until first @block baselines applyreq -> a new instance opens BLANK
@@ -1671,6 +1873,24 @@ function getSubdivNotelist(row, step)
   (sdlist[sdlist_p+row*max_seqlength*max_subdivs+step*max_subdivs] & 0x00FF0000) >> 16;
 );
 
+// ── "Steppa plays everywhere" step 2: the ENGINE's pattern accessors ─────────
+// The note engine in @block reads the pattern it is PLAYING (eng_p) through this
+// set, resolved once per block from eng_p; the editor's p and the getters above
+// stay the screen's. The two may differ while synced (the section map picks the
+// engine's pattern); unsynced eng_p == p and every read below is bit-identical
+// to the plain getter. Same bit layouts as setVelo/setStart/setSubdivNum.
+function eng_getVelo(note)              ( eng_velolist[note] & 0x7F; );
+function eng_getStart(note)             ( (eng_velolist[note] & 0x0000FF00) >> 8; );
+function eng_getSubdivNum(note)         ( (eng_velolist[note] & 0x000F0000) >> 16; );
+function eng_getSubdivVelo(row, step, sd_pos)
+(
+  sdlist[eng_sd+row*max_seqlength*max_subdivs+step*max_subdivs+sd_pos] & 0x7F;
+);
+function eng_getSubdivNotelist(row, step)
+(
+  (sdlist[eng_sd+row*max_seqlength*max_subdivs+step*max_subdivs] & 0x00FF0000) >> 16;
+);
+
 // Get CC value from source's bit field indicated by ccpos
 function getCc(source, ccpos) local(val)
 (
@@ -1785,11 +2005,13 @@ function change_pattern(new_p) local(i)
 // by the courier; we clamp defensively and stride the buffer by ITS own numsteps.
 // Clears the active pattern (notes/velocities/ties/ratchets) then writes presence
 // (2^L bit, matching the engine) + velocity (setVelo) + the cell's ratchet if the
-// bridge staged one (P3b-5b: subdiv count/mask from SUBDIV, per-sub-hit velocities
-// from SUBVEL). Only ever called from the gated @block trigger, so Sync OFF /
-// unpaired = this never runs.
-function eon_ss_import_grid() local(np, buf_ns, use_ns, r, s, pad, vel, sd, sdn, bm, k, sv)
+// bridge staged one (P3b-5b), and -- Package 2 -- the note's nudge (OFF minus the
+// lane's groove), its ties (LEN), its un-accented velocity, and the CC lanes (2B:
+// rows matched to lanes by type + channel). Only ever called from the gated @block
+// trigger, so Sync OFF / unpaired = this never runs.
+function eon_ss_import_grid() local(np, buf_ns, use_ns, r, s, pad, vel, sd, sdn, bm, k, sv, off, len, nudge, amp, run, j, cct, ccc, ln)
 (
+  eon_gc_blkseq += 1;   // grid cache: this rewrites the grid without touching p -- invalidate
   np     = gmem[EON_SS_XFER_BASE + 2]|0;          // numpads
   buf_ns = gmem[EON_SS_XFER_BASE + 3]|0;          // numsteps the courier wrote
   use_ns = buf_ns < listlength ? buf_ns : listlength;
@@ -1807,8 +2029,12 @@ function eon_ss_import_grid() local(np, buf_ns, use_ns, r, s, pad, vel, sd, sdn,
       loop(use_ns,
         vel = gmem[EON_SS_XFER_DATA + pad*buf_ns + s]|0;
         vel > 0 ? (
-          notelist[s] += 2^r;                                  // set lane r presence bit
+          // Package 2: the item carries the ACCENTED velocity; the cell stores the raw
+          // one, because the lane's groove accent is applied again at send time.
+          amp = groove_amp_rt[r*max_seqlength + s];
+          amp > 0 ? vel = floor(vel / amp + 0.5);
           vel < 1 ? vel = 1 : vel > 127 ? vel = 127;
+          notelist[s] += 2^r;                                  // set lane r presence bit
           setVelo(r*listlength + s, vel);
           // P3b-5b: adopt the cell's ratchet (count + mask + per-sub-hit velocities).
           // The slabs were cleared above, so a cell without subdiv data stays plain.
@@ -1822,10 +2048,34 @@ function eon_ss_import_grid() local(np, buf_ns, use_ns, r, s, pad, vel, sd, sdn,
             loop(sdn + 1,
               (bm & (2^k)) ? (
                 sv = gmem[EON_SS_XFER_SUBVEL + (pad*buf_ns + s)*8 + k]|0;
+                amp > 0 && sv > 0 ? sv = floor(sv / amp + 0.5);
                 (sv < 1 || sv > 127) ? sv = vel;               // unset -> cell velocity
                 setSubdivVelo(r, s, k, sv);
               );
               k += 1;
+            );
+          ) : (
+            // Package 2: the note's real start and length come back as the hand NUDGE
+            // (what is left after the lane's groove offset, which the engine re-applies)
+            // and as TIES (whole steps beyond the first). Swing lives in Steppa: a swung
+            // start read from the item is not a nudge, it is the groove -- subtracted.
+            off = gmem[EON_SS_XFER_OFF + pad*buf_ns + s];
+            len = gmem[EON_SS_XFER_LEN + pad*buf_ns + s];
+            nudge = floor(off * tpb + 0.5) - groove_off_rt[r*max_seqlength + s];
+            nudge < 0 ? nudge = 0 : nudge > tpb-1 ? nudge = tpb-1;
+            nudge > 0 ? setStart(r*listlength + s, nudge);
+            run = floor(len + off + 0.5);   // steps the note spans (1 = a plain step)
+            run < 1 ? run = 1;
+            j = 1;
+            loop(run - 1,
+              (s + j < use_ns) ? (
+                notetie[s + j - 1] += 2^r;                     // carry through the next step
+                !(notelist[s + j] & (2^r)) ? (
+                  notelist[s + j] += 2^r;
+                  setVelo(r*listlength + s + j, vel);          // a continuation cell keeps the run's velocity
+                );
+              );
+              j += 1;
             );
           );
         );
@@ -1833,6 +2083,31 @@ function eon_ss_import_grid() local(np, buf_ns, use_ns, r, s, pad, vel, sd, sdn,
       );
     );
     r += 1;
+  );
+  // 2B: CC rows -> lanes. A row's meta = (type+1, channel); it lands in the lane whose
+  // type and channel match, overwriting that lane's steps (a present-but-empty row
+  // clears the lane). Rows with no matching lane are ignored; lanes with no row are
+  // left alone (an item that never carried that CC says nothing about it).
+  k = 0;
+  loop(numccs,
+    cct = (gmem[EON_SS_XFER_CCMETA + k*2]|0) - 1;
+    ccc = gmem[EON_SS_XFER_CCMETA + k*2 + 1]|0;
+    cct >= 0 ? (
+      ln = 0;
+      loop(numccs,
+        // 2C: CC 119 in the item is the "chance" controller -> the probability lane (type 127)
+        ((cc_type[ln] == cct || (cct == 119 && cc_type[ln] == 127)) && cc_chan[ln] == ccc) ? (
+          s = 0;
+          loop(use_ns,
+            vel = gmem[EON_SS_XFER_CC + k*128 + s]|0;
+            cclist[s] = setCc(cclist[s], ln, vel >= 128 ? (0x80 + ((vel - 128) & 0x7F)) : 0);
+            s += 1;
+          );
+        );
+        ln += 1;
+      );
+    );
+    k += 1;
   );
   update_has_notes();
   refresh_tb = 1;
@@ -1959,54 +2234,109 @@ function eon_lane_humanize(y, amt) local(x, mask, v) (
 // import layout, so the bridge can write it onto the DM region's lanes. Reads
 // presence from the engine bitmask (notelist[s] & 2^L) and velocity via getVelo.
 // One-shot; only ever called from the gated @block export trigger.
-function eon_ss_export_grid() local(r, s, pad, vel, sdn, bm, k, sv)
+//
+// Package 2 (2026-09-03): the item carries the FEEL, not a flat copy.
+//   OFF  = the note's real start inside its step, in steps (hand nudge + the lane's
+//          groove/swing offset, exactly what the engine fires at), 0..1.
+//   LEN  = its real duration in steps: whole steps of a tied run plus the note-length
+//          setting, truncated at the step boundary the way the engine truncates.
+//   DATA = the ACCENTED velocity (groove_amp_rt applied, what the engine sends).
+//   Ratchet cells: OFF = the lane groove offset (the burst starts there), LEN = 0
+//   (the bridge spaces the sub-hits over the rest of the step, like the engine).
+// Steps that only continue a tied note are skipped: one note per tied run.
+function eon_ss_export_grid() local(r, s, pad, vel, sdn, bm, k, sv, eff, off, run, j, covered, nl_eff)
 (
   gmem[EON_SS_XFER_BASE + 0] = _eon_blk_ps;       // owner slot
   gmem[EON_SS_XFER_BASE + 2] = 16;                // numpads
   gmem[EON_SS_XFER_BASE + 3] = listlength;        // numsteps
   gmem[EON_SS_XFER_BASE + 4] = steps_per_beat;
-  // zero the 16 x listlength grid + ratchet regions (gmem isn't memset-able; loop it).
+  gmem[EON_SS_XFER_BASE + 6] = 2;                 // layout version (OFF/LEN planes present)
+  // zero the 16 x listlength grid + every plane (gmem isn't memset-able; loop it).
   s = 0;
   loop(16 * listlength,
     gmem[EON_SS_XFER_DATA + s] = 0;
+    gmem[EON_SS_XFER_OFF + s] = 0;
+    gmem[EON_SS_XFER_LEN + s] = 0;
     gmem[EON_SS_XFER_SUBDIV + s] = 0;
     k = 0; loop(8, gmem[EON_SS_XFER_SUBVEL + s*8 + k] = 0; k += 1;);
     s += 1;
   );
-  // fill: lane r -> pad; presence bit 2^r at notelist[s]; velocity from getVelo. Also
-  // carry per-cell subdivision (P3b-5b): sdnum + active-bit mask, so the bridge expands a
-  // ratchet into sdnum+1 evenly-spaced notes (matching the @sample subdiv playback).
   r = 0;
   loop(numnotes,
     pad = eon_lane_pad[r];
     (pad >= 0 && pad < 16) ? (
-      s = 0;
+      s = 0; covered = 0;
       loop(listlength,
-        (notelist[s] & (2^r)) ? (
-          vel = getVelo(r*listlength + s);
-          vel < 1 ? vel = 1 : vel > 127 ? vel = 127;
-          gmem[EON_SS_XFER_DATA + pad*listlength + s] = vel;
+        (s >= covered && (notelist[s] & (2^r))) ? (
           sdn = getSubdivNum(r*listlength + s);
+          eff = getStart(r*listlength + s) + groove_off_rt[r*max_seqlength + s];
+          eff > tpb-1 ? eff = tpb-1;
           sdn > 0 ? (
+            // ratchet: the burst starts at the groove offset (getStart never applied
+            // to bursts) and fills the rest of the step -- the bridge derives spacing
+            off = groove_off_rt[r*max_seqlength + s];
+            off > tpb-1 ? off = tpb-1;
+            vel = grv_velo(getVelo(r*listlength + s), r, s);
+            vel < 1 ? vel = 1 : vel > 127 ? vel = 127;
+            gmem[EON_SS_XFER_DATA + pad*listlength + s] = vel;
+            gmem[EON_SS_XFER_OFF  + pad*listlength + s] = off / tpb;
             bm = getSubdivNotelist(r, s);                 // which sub-positions are on
             gmem[EON_SS_XFER_SUBDIV + pad*listlength + s] = sdn + (bm * 16);   // sdn | (bm<<4)
-            // per-sub-hit velocities (P3b-5b): the bridge expansion and a re-import
-            // both restore them 1:1 instead of flattening to the cell velocity.
             k = 0;
             loop(sdn + 1,
               (bm & (2^k)) ? (
-                sv = getSubdivVelo(r, s, k);
+                sv = grv_velo(getSubdivVelo(r, s, k), r, s);
                 sv < 1 ? sv = 1 : sv > 127 ? sv = 127;
                 gmem[EON_SS_XFER_SUBVEL + (pad*listlength + s)*8 + k] = sv;
               );
               k += 1;
             );
+            covered = s + 1;
+          ) : (
+            // plain note: how many steps does it run? A tie bit at step j carries the
+            // note THROUGH j+1; if j+1 also holds the note (+tie) the run continues.
+            run = 1; j = s;
+            while(
+              (j + 1 < listlength) && (notetie[j] & (2^r)) ? (
+                run += 1; j += 1;
+                (notelist[j] & (2^r)) ? 1 : 0;   // a tied-into step without the note ends the run there
+              ) : 0;
+            );
+            nl_eff = defnotelen + eff; nl_eff > tpb ? nl_eff = tpb;   // engine truncation at the boundary
+            vel = grv_velo(getVelo(r*listlength + s), r, s);
+            vel < 1 ? vel = 1 : vel > 127 ? vel = 127;
+            gmem[EON_SS_XFER_DATA + pad*listlength + s] = vel;
+            gmem[EON_SS_XFER_OFF  + pad*listlength + s] = eff / tpb;
+            gmem[EON_SS_XFER_LEN  + pad*listlength + s] = (run - 1) + (nl_eff - eff) / tpb;
+            covered = s + run;
           );
         );
         s += 1;
       );
     );
     r += 1;
+  );
+  // 2B: the CC lanes ride along as rows -- meta per row (type+1, channel; 0 = no row),
+  // per step 0 = no event, else 128 + value. The probability lane (type 127) is not a
+  // CC and is left to the SysEx path; a lane with no events still writes its row, so
+  // an emptied lane clears the item's CCs on export.
+  k = 0;
+  loop(numccs,
+    gmem[EON_SS_XFER_CCMETA + k*2] = 0; gmem[EON_SS_XFER_CCMETA + k*2 + 1] = 0;
+    s = 0; loop(listlength, gmem[EON_SS_XFER_CC + k*128 + s] = 0; s += 1;);
+    cc_type[k] >= 0 ? (
+      // 2C: the probability lane (type 127) leaves as CC 119, the "chance" controller
+      // Swing reads ahead of a step's notes; a real controller leaves as itself.
+      gmem[EON_SS_XFER_CCMETA + k*2]     = (cc_type[k] == 127 ? 119 : cc_type[k]) + 1;
+      gmem[EON_SS_XFER_CCMETA + k*2 + 1] = cc_chan[k];
+      s = 0;
+      loop(listlength,
+        vel = getCc(cclist[s], k);
+        (vel & 0x80) ? gmem[EON_SS_XFER_CC + k*128 + s] = 128 + (vel & 0x7F);
+        s += 1;
+      );
+    );
+    k += 1;
   );
 );
 
@@ -2163,6 +2493,94 @@ function change_seqlen(newsz) local(ip, y, pstart, pstartv, pstart_n, pstartv_n,
   );
 );
 
+// "Steppa plays everywhere" step 1: import the staged grid into pattern t WITHOUT
+// leaving the editor's pattern. The pointer set (notelist/velolist/notetie/cclist/
+// sdlist_p/listlength) is what every setter and the importer read, so rather than
+// duplicate the importer with explicit bases we swap the set to t via change_pattern,
+// adopt the courier's numsteps/spb as t's OWN geometry (change_seqlen acts on p, and
+// p == t here), import, and swap back. Runs at the top of @block, before the play
+// loop, so the engine never sees the swap; @gfx could catch one frame of it (the
+// same window the DM-select consume has always had). What change_pattern touches
+// as a side effect is put back: the select-flash it arms, and ltiestate, which it
+// zeroes (a tied note mid-hold would otherwise be cut at the next boundary).
+// eon_pat_loaded[t] is set on success and published to the bridge (fields 55-57).
+// Sits below change_seqlen for the same parse-order reason as eon_ss_apply_grid.
+function eon_ss_import_grid_to(t) local(old_p, old_ties, old_flash, old_flash_p, want_ns, want_spb)
+(
+  (t < 0 || t == p) ? (
+    eon_ss_import_grid();
+    eon_pat_loaded[p] = 1;
+  ) : t >= npatterns ? (
+    0;   // past the pattern cap: ignore (never fall through to the editor's grid)
+  ) : (
+    old_p = p; old_ties = ltiestate; old_flash = eon_pat_flash; old_flash_p = eon_pat_flash_p;
+    change_pattern(t);
+    want_ns  = gmem[EON_SS_XFER_BASE + 3]|0;
+    want_spb = gmem[EON_SS_XFER_BASE + 4]|0;
+    (want_spb >= 1 && want_spb <= max_steps_per_beat && want_spb != steps_per_beat) ? (
+      steps_per_beat = want_spb; steps_per_beat_pat[p] = want_spb; rateadj = steps_per_beat * rate;
+    );
+    (want_ns >= 1 && want_ns <= max_seqlength && want_ns != listlength) ? change_seqlen(want_ns);
+    eon_ss_import_grid();
+    eon_pat_loaded[t] = 1;
+    p = old_p;
+    change_pattern(old_p);          // new_p == p: no flash re-arm, pointers restored
+    eon_pat_flash = old_flash; eon_pat_flash_p = old_flash_p;
+    ltiestate = old_ties;
+  );
+);
+
+// ── "Steppa plays everywhere" steps 2+3: resolve the ENGINE's pattern at beat bp ──
+// Sets eng_p / eng_anchor / eng_silent / eng_edge and the engine pointer set.
+// With a section map (synced, paired, map mirrored): the region containing bp wins
+// (earliest start first -- the bridge sorts the map by start); its pattern must be
+// loaded, else the engine is quiet there. eng_edge = the next beat at which this
+// answer changes: the region's end, or in a gap the next region's start (ENG_EDGE_NEVER when
+// nothing follows). The per-sample loop re-resolves when beat_position_int crosses
+// eng_edge -- that is the sample-accurate switch (step 3). No map: eng_p == p,
+// anchor = start_beatpos, edge = never; the engine is exactly the old one.
+function eng_resolve(bp) local(i, emp, nxt)
+(
+  eng_p = p; eng_anchor = start_beatpos; eng_silent = 0; eng_edge = ENG_EDGE_NEVER;
+  eng_map_on ? (
+    eng_p = -1; eng_map_i = -1; nxt = ENG_EDGE_NEVER; i = 0;
+    loop(eon_map_n,
+      (eng_p < 0 && bp >= eon_map[i*4] && bp < eon_map[i*4+1]) ? (
+        emp = eon_map[i*4+2]|0;
+        eng_edge = eon_map[i*4+1];
+        (emp >= 0 && emp < npatterns && eon_pat_loaded[emp]) ? (
+          eng_p = emp; eng_anchor = eon_map[i*4]; eng_map_i = i;   // the lit block on the timeline face
+        ) : ( eng_p = -2; );          // mapped, nothing loaded to play yet
+      );
+      (eon_map[i*4] > bp && eon_map[i*4] < nxt) ? nxt = eon_map[i*4];
+      i += 1;
+    );
+    eng_p < 0 ? (
+      eng_silent = 1;
+      eng_p == -1 ? eng_edge = nxt;   // in a gap: wake at the next region's start
+      eng_p = p;
+    );
+  );
+  // LISTEN (1g, strip polish): a timeline block held in @gfx -> the engine plays ITS
+  // pattern now, at the current phase (the anchor stays), until released. Wins over a
+  // gap and over an unloaded section; the lit block on the strip follows it.
+  eng_lsn = atomic_get(eon_listen_p)|0;
+  (eng_lsn >= 0 && eng_lsn < npatterns && eon_pat_loaded[eng_lsn]) ? (
+    eng_p = eng_lsn; eng_silent = 0; eng_map_i = -1; i = 0;
+    loop(eon_map_n, (eng_map_i < 0 && (eon_map[i*4+2]|0) == eng_lsn) ? eng_map_i = i; i += 1;);
+  );
+  eng_off = 0; i = 0;
+  loop(eng_p, eng_off += listlength_pat[i]; i += 1;);
+  eng_notelist   = notelist_base + eng_off;
+  eng_velolist   = velolist_base + max_numnotes*eng_off;
+  eng_notetie    = notetie_base  + eng_off;
+  eng_cclist     = cclist_base   + eng_off;
+  eng_sd         = eng_p*max_numnotes*max_seqlength*max_subdivs;
+  eng_listlength = listlength_pat[eng_p];
+  eng_spb        = steps_per_beat_pat[eng_p];
+  eng_rateadj    = eng_spb * rate;
+);
+
 // (moved BELOW change_seqlen: EEL2 resolves function refs at DEF time,
 //  and AP-0c calls change_seqlen — defined above — from this function.)
 function eon_ss_apply_grid() local(nr, buf_ns, buf_spb, use_ns, r, s, vel,
@@ -2170,6 +2588,7 @@ function eon_ss_apply_grid() local(nr, buf_ns, buf_spb, use_ns, r, s, vel,
                                    sd_v0, sd_base, sd_p, sd_v,
                                    ap_rgnqn, ap_spb, ap_want, ap_geo, sd_rep)
 (
+  eon_gc_blkseq += 1;   // grid cache: this rewrites the grid without touching p -- invalidate
   nr      = gmem[EON_SS_APPLY_BASE + 2]|0;         // numrows the bridge wrote
   buf_ns  = gmem[EON_SS_APPLY_BASE + 3]|0;         // numsteps the bridge wrote
   buf_spb = gmem[EON_SS_APPLY_BASE + 4]|0;         // steps_per_beat the bridge wrote
@@ -2378,7 +2797,7 @@ local(ad_i, ad_p, ad_s, ad_L, ad_nl, ad_tl, ad_vl, ad_sd, ad_inv, ad_buf,
   ad_i = 0; loop(16, ad_t[ad_i] = rowchannel[ad_i];         ad_i += 1;); ad_i = 0; loop(16, rowchannel[ad_i]         = ad_t[ad_inv[ad_i]|0]; ad_i += 1;);
   eon_recalc_solo();
   update_has_notes();
-  groove_dirty = 1;
+  atomic_set(groove_dirty, 1);
   refresh_tb = 1; refresh_pianokeys = 1;
   eon_apply_dirty = 1; eon_apply_settle = 0;   // AP-4: one undo + serialize snapshot
   eon_adapt_pend = 0;   // consumed (eon_adapt_last already tracked at arm)
@@ -2549,16 +2968,32 @@ npatterns=slider47;
 // on it. Default 1 so the structure is on out of the box (the grid read as flat
 // without it); flipping it off restores the previous plain look exactly.
 eon_gridlines=slider50;
+eon_song_on=slider55;      // strip polish: the SONG strip row, ON by default, persisted like slider50
 // Column mask. Read BEFORE the pkw derivation below, which consumes it. Also
 // view-only -- hiding a column changes nothing about what the lane plays, which
 // is why none of this touches groove_dirty or the pattern data.
 eon_colvis=slider51|0;
+// Dock-view pin: 0 Auto (aspect decides), 1 pin full UI, 2 pin dock face. Same
+// class of state as slider50/51 -- view-only, per instance, persisted by the FX
+// chunk. Deliberately a slider rather than a @serialize field: this file's
+// @serialize is a bespoke run-length note encoder with no version-gate scheme,
+// and a view preference has no business inside the pattern chunk format.
+ss_dock_mode=slider52|0;
+// Written by EON Steppa Dock.lua on the exact FX it captured. Read here, but
+// only ACTED on while the rig heartbeat is fresh -- see the trigger in @gfx.
+ss_rig_docked=slider53>0.5;
+// The wordmark's dock INTENT (2026-09-02). slider53 says "the pane is holding
+// me now" and the pane clears it on every release, including the one a closed
+// dock tab causes -- so a docked, closed, reopened Steppa came back floating with
+// nobody remembering. This one is cleared only by the pop-out click; the re-dock
+// hello in @gfx reads it. A slider for the same reason slider52 is one.
+ss_dock_want=slider54>0.5;
 pm!=patternmode ? (
  _ui_patop ? _pend_init48 = pm : initialize48(pm);  // defer past @gfx pattern gestures
 );
 // EON GROOVE: any slider pass may have changed swing strength / pattern state -- rebuild
 // the runtime groove table next @block (flag-gated, ~3k int ops; unconditional is cheap).
-groove_dirty = 1;
+atomic_set(groove_dirty, 1);
 
 @serialize
 // Write:
@@ -2893,7 +3328,8 @@ _srz_serialread ?(
   change_pattern(slider1|0);
   update_chain_beats();
   eon_preset_loaded = 1;   // a preset/project just loaded -> @block pushes it to the DM (don't let sync clobber it)
-  groove_dirty = 1;        // EON GROOVE: lane_groove / user slots / vel amount just (re)loaded -> rebuild the runtime table
+  eon_gc_blkseq += 1;      // grid cache: a load replaces every array the grid draws from
+  atomic_set(groove_dirty, 1);        // EON GROOVE: lane_groove / user slots / vel amount just (re)loaded -> rebuild the runtime table
 );
 
 @block
@@ -2939,7 +3375,7 @@ eon_apply_primed ? (
     // sets — WITHOUT it, an apply that changes listlen/spb (any preset on a
     // region-owned grid; every triplet preset) races the bridge's res-change
     // watcher: the watcher fires ~30ms after the change while the live echo
-    // needs ~100ms of settle, so the re-import could clobber the fresh apply
+    // needs ~50ms of settle, so the re-import could clobber the fresh apply
     // with the region's OLD content. The flag's export fires later THIS SAME
     // @block (site order), so EXPORTREQ is bumped before the bridge can look.
     eon_preset_loaded = 1;
@@ -2987,7 +3423,7 @@ eon_grv_primed ? (
         memset(lane_swing, swing_p, max_numnotes);
         refresh_tb = 1;
       );
-      groove_dirty = 1;
+      atomic_set(groove_dirty, 1);
       eon_apply_dirty = 1; eon_apply_settle = 0;           // debounced sliderchange -> undo point + serialize snapshot
       refresh_pianokeys = 1;
     );
@@ -3003,8 +3439,15 @@ eon_grv_primed ? (
 // groove-correct with the GUI closed. Slot 0 (classic swing) uses the VERBATIM legacy
 // expression ((tpb/2)*(strength/100))|0 on odd steps -- frozen, do NOT refactor: any
 // re-association risks ulp drift vs the old engine and breaks the byte-identical proof.
-groove_dirty ? (
-  groove_dirty = 0;
+//
+// GET-then-CAS consume matches Anvil / Weld (EON_Anvil.jsfx:1638, EON_Weld.jsfx:225).
+// Every @gfx writer uses atomic_set(groove_dirty, 1). A plain read-clear had the
+// same hole documented in Anvil's audit: @gfx writes 1 between the reader's read
+// and its clear, and the request is lost -- a groove edit that never rebuilt the
+// runtime tables until the NEXT edit re-arms the flag. Self-healing on next click,
+// same as Weld's ebc_rc_rq. Argument order is (dest, COMPARAND, NEWVALUE).
+atomic_get(groove_dirty) > 0.5 ? (
+  atomic_setifequal(groove_dirty, 1, 0);
   grv_vamt = groove_vel_amt_p1 > 0 ? groove_vel_amt_p1 - 1 : 100;   // +1 sentinel: unset -> 100
   grv_n = 0;
   loop(max_numnotes,
@@ -3138,6 +3581,31 @@ eon_len_follow = 0;   // Match-rule indicator for @gfx (Len pill tick + tooltip)
   gmem[_ssb + EON_SS_SYNC_SS_LISTLEN] = listlength;
   gmem[_ssb + EON_SS_SYNC_SS_SPB]     = steps_per_beat;
   gmem[_ssb + EON_SS_SYNC_SS_SYNCON]  = 1;
+  // Step 1: tell the bridge which patterns hold their region (3 words, 2^k not <<,
+  // EEL2 shifts are 32-bit) and how long a grid may be, so it can size each
+  // region's pattern. Rebuilt every block: ~npatterns pow ops, negligible.
+  _ld0 = 0; _ld1 = 0; _ld2 = 0; _ldi = 0;
+  loop(min(npatterns, 96),
+    eon_pat_loaded[_ldi] ? (
+      _ldi < 32 ? _ld0 += 2^_ldi : _ldi < 64 ? _ld1 += 2^(_ldi-32) : _ld2 += 2^(_ldi-64);
+    );
+    _ldi += 1;
+  );
+  gmem[_ssb + EON_SS_SYNC_SS_LOADED0] = _ld0;
+  gmem[_ssb + EON_SS_SYNC_SS_LOADED1] = _ld1;
+  gmem[_ssb + EON_SS_SYNC_SS_LOADED2] = _ld2;
+  gmem[_ssb + EON_SS_SYNC_SS_MAXLEN]  = max_seqlength;
+  // Section map: mirror it when the bridge bumps GEN (bumped LAST on its side).
+  _mapb = EON_SS_MAP_BASE + _eon_blk_ps*EON_SS_MAP_STRIDE;
+  gmem[_mapb] != eon_map_gen ? (
+    eon_map_gen = gmem[_mapb];
+    eon_map_n = min(max(gmem[_mapb + 1]|0, 0), EON_SS_MAP_MAXRGN);
+    _mapi = 0;
+    loop(eon_map_n*4,
+      eon_map[_mapi] = gmem[_mapb + 2 + _mapi];
+      _mapi += 1;
+    );
+  );
   // Region-pick: publish the active pattern index (for AUTO positional mapping) and
   // this pattern's override (0 = Auto, k>=1 = pin to region ordinal k). The courier
   // resolves the target region from these, so import/export no longer depend on the
@@ -3147,14 +3615,29 @@ eon_len_follow = 0;   // Match-rule indicator for @gfx (Len pill tick + tooltip)
   // P3b-4 paging: publish the ABSOLUTE selected ordinal (seeded from p on engage so a
   // fresh sync behaves exactly like the old positional map) + the visible page base
   // (the bridge slices the colour window 22..37 from it).
-  eon_sel_ord < 1 ? eon_sel_ord = p + 1;
+  // Step 1: one pattern per ordinal, so the selected ordinal IS p+1 -- however p got
+  // there (chip, dock chip, bank, slider, MIDI trigger). The bridge targets that region.
+  eon_sel_ord = p + 1;
   gmem[_ssb + EON_SS_SYNC_SS_SELORD] = eon_sel_ord;
   gmem[_ssb + EON_SS_SYNC_SS_PAGE]   = eon_pat_base;
   _dmpush = gmem[_ssb + EON_SS_SYNC_DMPUSH];
-  (_dmpush > 0 && _dmpush != eon_sync_last_push && (gmem[EON_SS_XFER_BASE]|0) == _eon_blk_ps) ? (
-    eon_ss_import_grid();
+  // !_ui_patop (audit 2026-09-03): a TARGET import swaps the pointer set to pattern t for
+  // its duration; a @gfx pattern click landing inside that window would re-point the set
+  // mid-import and the region's notes would land in the clicked pattern. Deferred past
+  // the click frame like every other pattern op here (eon_sync_last_push is not
+  // advanced, so the push is retried next block).
+  (_dmpush > 0 && _dmpush != eon_sync_last_push && (gmem[EON_SS_XFER_BASE]|0) == _eon_blk_ps && !_ui_patop) ? (
+    // Header +5 = target pattern + 1 (0 = the editor's pattern, the pre-step-1 contract).
+    // A non-zero target lands in THAT pattern and leaves the editor's grid alone, so the
+    // digest below sees no change and no echo export fires.
+    _dmtgt = (gmem[EON_SS_XFER_BASE + 5]|0) - 1;
+    _dmtgt >= 0 ? eon_ss_import_grid_to(_dmtgt) : (
+      eon_ss_import_grid();
+      eon_pat_loaded[p] = 1;
+      eon_sync_just_imported = 1;   // re-baseline next: a DM push is NOT a user edit (echo suppression)
+    );
     eon_sync_last_push = _dmpush;
-    eon_sync_just_imported = 1;   // re-baseline next: a DM push is NOT a user edit (echo suppression)
+    gmem[_ssb + EON_SS_SYNC_DMPUSH_ACK] = _dmpush;   // consumed: the bridge may stage the next one
   );
   // P3b-5a LENGTH-FOLLOW (the Match rule, spec 8a.4): while synced, the bound region's
   // TIME SPAN is authoritative -- grid steps = region_QN x steps_per_beat, snapped to
@@ -3181,11 +3664,12 @@ eon_len_follow = 0;   // Match-rule indicator for @gfx (Len pill tick + tooltip)
     eon_dm_patseq_last = _dmpatseq;
     _dmpat = gmem[_ssb + EON_SS_SYNC_DM_PATSET]|0;   // absolute pattern index = region ordinal - 1
     (_dmpat >= 0 && _dmpat != (eon_sel_ord - 1)) ? (
-      // P3b-4 paging: page to the ordinal, select its on-page button (internal pattern
-      // slots are 0..7 per page; the grid is re-imported from the region on select).
+      // P3b-4 paging: page to the ordinal, select its button. Since step 1 of "Steppa
+      // plays everywhere" the pattern index IS the ordinal - 1 (no more 0..7 recycling
+      // per page): every region has its own pattern, primed by the bridge.
       eon_sel_ord  = _dmpat + 1;
       eon_pat_page = (_dmpat / 8)|0;
-      _dmpl = _dmpat % 8;
+      _dmpl = _dmpat;
       (_dmpl != p && _dmpl < npatterns) ? (
         change_pattern(_dmpl);
         sliderchange(slider1 = p);
@@ -3208,29 +3692,55 @@ eon_len_follow = 0;   // Match-rule indicator for @gfx (Len pill tick + tooltip)
     eon_export_pending = 1;
     eon_preset_loaded = 0;
   );
-  // EON live SS->DM (P3b-1): auto-fire the export once an edit GESTURE settles (~100ms
-  // of no further grid change), so the DM region tracks the StepSeq 1:1 without the
+  // EON live SS->DM (P3b-1): auto-fire the export once an edit GESTURE settles (50 ms
+  // of no further grid change, or the mouse button coming up -- Package 3), so the DM region tracks the StepSeq 1:1 without the
   // manual button. ECHO/NO-OP SUPPRESSION: a pattern switch (p changed) or a just-
   // consumed DM import re-baselines the digest instead of exporting -- so selecting a
   // pattern never writes, and an imported grid never bounces straight back out.
-  _dig = eon_grid_digest();
-  (p != eon_sync_last_p || eon_sync_just_imported) ? (
-    eon_sync_last_exp_digest = _dig;   // adopt as baseline; no export
-    eon_sync_prev_digest     = _dig;
-    eon_sync_settle          = 0;
-    eon_sync_last_p          = p;
-    eon_sync_just_imported   = 0;
-  ) : (
-    _dig != eon_sync_prev_digest ? (
-      eon_sync_settle = 0;             // grid still changing -> reset the settle timer
-      eon_sync_prev_digest = _dig;
+  // DECIMATED: eon_grid_digest() is O(listlength x numnotes x max_subdivs) -- 2.3k
+  // iterations at the 16x16 default, 18.5k at 16x128, each with a modulo -- and it used to
+  // run EVERY @block. That made it a per-BLOCK cost on the AUDIO thread, so it DOUBLED
+  // every time the buffer halved: ~0.9M modulo-ops/sec at 16x64 / 512 samples, ~7M at
+  // 16x64 / 64 samples. Worst exactly when tracking live, which is when late notes get
+  // noticed. (~88% of that work hashes the ratchet slab, which is usually all zeros.)
+  // The settle threshold below is 0.05 s, so sampling the grid every 10 ms keeps 5x the
+  // resolution this logic needs while cutting the hash rate 10-40x depending on buffer.
+  // eon_dig_acc carries the REAL elapsed time between digests, so eon_sync_settle still
+  // accrues in true seconds rather than in digest ticks. Both branches sit inside the
+  // gate on purpose: skipping a tick can't fire a spurious export, and a pattern switch
+  // still re-baselines correctly when the next tick lands (eon_sync_last_p is only
+  // written in that branch, so the != test survives the gap).
+  eon_dig_acc += samplesblock / srate;
+  eon_dig_acc >= 0.01 ? (
+    _dig = eon_grid_digest();
+    // Package 3: a finished mouse gesture counts as settled NOW. Read-and-clear here so
+    // one release can't fire twice; a release that changed nothing is a no-op below.
+    _gest = atomic_get(eon_gesture_done) > 0.5;
+    _gest ? atomic_setifequal(eon_gesture_done, 1, 0);
+    // ...and while the button is still HELD the settle path waits for that release (one
+    // write per drag, not one per pause). A hold older than 0.5 s is a dead screen thread
+    // (window closed mid-drag), not a hand on the mouse -- ignore it.
+    _hold = atomic_get(eon_gfx_hold_t);
+    _held = _hold > 0 && (time_precise() - _hold) < 0.5;
+    (p != eon_sync_last_p || eon_sync_just_imported) ? (
+      eon_sync_last_exp_digest = _dig;   // adopt as baseline; no export
+      eon_sync_prev_digest     = _dig;
+      eon_sync_settle          = 0;
+      eon_sync_last_p          = p;
+      eon_sync_just_imported   = 0;
     ) : (
-      eon_sync_settle += samplesblock / srate;   // stable this block -> accrue settle time
+      _dig != eon_sync_prev_digest ? (
+        eon_sync_settle = 0;             // grid still changing -> reset the settle timer
+        eon_sync_prev_digest = _dig;
+      ) : (
+        eon_sync_settle += eon_dig_acc;  // stable this tick -> accrue the real elapsed time
+      );
+      (((eon_sync_settle >= 0.05 && !_held) || _gest) && _dig != eon_sync_last_exp_digest) ? (
+        eon_export_pending = 1;          // settled (50 ms) or gesture ended + grid differs from last export -> fire
+        eon_sync_last_exp_digest = _dig;
+      );
     );
-    (eon_sync_settle >= 0.10 && _dig != eon_sync_last_exp_digest) ? (
-      eon_export_pending = 1;          // gesture settled + grid differs from last export -> fire
-      eon_sync_last_exp_digest = _dig;
-    );
+    eon_dig_acc = 0;
   );
   // Export (StepSeq -> DM): fired by the live debounce above OR a SETTINGS "Export -> DM"
   // click (both set eon_export_pending). Serialize the active grid into the transfer
@@ -3245,7 +3755,16 @@ eon_len_follow = 0;   // Match-rule indicator for @gfx (Len pill tick + tooltip)
     eon_export_pending = 0;
   );
 ) : (
-  _eon_blk_ps >= 0 ? gmem[EON_SS_SYNC_BASE + _eon_blk_ps*EON_SS_SYNC_STRIDE + EON_SS_SYNC_SS_SYNCON] = 0;
+  _eon_blk_ps >= 0 ? (
+    gmem[EON_SS_SYNC_BASE + _eon_blk_ps*EON_SS_SYNC_STRIDE + EON_SS_SYNC_SS_SYNCON]  = 0;
+    gmem[EON_SS_SYNC_BASE + _eon_blk_ps*EON_SS_SYNC_STRIDE + EON_SS_SYNC_SS_LOADED0] = 0;
+    gmem[EON_SS_SYNC_BASE + _eon_blk_ps*EON_SS_SYNC_STRIDE + EON_SS_SYNC_SS_LOADED1] = 0;
+    gmem[EON_SS_SYNC_BASE + _eon_blk_ps*EON_SS_SYNC_STRIDE + EON_SS_SYNC_SS_LOADED2] = 0;
+  );
+  // Sync off or unpaired: nothing is "loaded from its region" any more -- a re-engage
+  // re-primes every pattern, and the map is re-read from scratch.
+  eon_map_gen = -1; eon_map_n = 0;
+  memset(eon_pat_loaded, 0, 128);
 );
 
 ts_num_l=ts_num;
@@ -3316,7 +3835,7 @@ want_preview_nt >=0 ?
   want_preview_nt=-1;
 );
 
-chain > 0 && beatpos == listlength-1 && pat_trigger_pending == 0? (
+chain > 0 && beatpos == eng_listlength-1 && pat_trigger_pending == 0? (
   p < chain ? (
     pat_trigger_num=p+1;
     pat_trigger_pending=1;
@@ -3388,15 +3907,32 @@ while (
   );
 );
 
-beat_position >= start_beatpos ? (
-  curbeatpos = beat_position - start_beatpos;
+// ── "Steppa plays everywhere" step 2: resolve the ENGINE's pattern for this block ──
+// The editor's pattern is p. The engine plays eng_p: while synced with a section map
+// (step 1) it is the pattern of the region under the playhead, anchored so step 0 is
+// the region start; in a gap, or on a section whose pattern isn't loaded yet, the
+// engine is quiet (note-offs still go out). Unsynced / no map: eng_p == p, anchor =
+// start_beatpos, i.e. exactly the old engine. Resolved per BLOCK here; the exact
+// boundary sample is step 3. The pointer set below is what every engine read uses.
+eng_map_on = eon_sync_mode && _eon_blk_ps >= 0 && eon_map_n > 0;
+eng_resolve(beat_position);
+// A section change that landed between blocks (seek, loop wrap, first block of play):
+// force the step boundary so the new section's first step fires even when the old
+// pattern happened to end on the same step index. Same treatment as the in-block edge.
+(eng_p != eng_prev_p || eng_anchor != eng_prev_anchor) ? (
+  (eng_prev_p >= 0) ? ( lbeatpos = -1; ltiestate = 0; memset(sd_playstate, 0, max_numnotes*2); );
+  eng_prev_p = eng_p; eng_prev_anchor = eng_anchor;
+);
+
+beat_position >= eng_anchor ? (
+  curbeatpos = beat_position - eng_anchor;
 ) : (
   chain > 0 && p <= chain ? (
     pat_beats=chain_beats / rate;
   ) : (
-    pat_beats=listlength/steps_per_beat / rate;
+    pat_beats=eng_listlength/eng_spb / rate;
   );
-  curbeatpos = beat_position - (start_beatpos - pat_beats * ceil((start_beatpos - beat_position)/pat_beats));
+  curbeatpos = beat_position - (eng_anchor - pat_beats * ceil((eng_anchor - beat_position)/pat_beats));
 );
 
 cursplpos=0;
@@ -3405,11 +3941,27 @@ dbeatpos = (tempo * 4.0 / (60.0 * ts_denom * srate));
 beat_position_int=beat_position;
 
 loop((play_state&1) ? samplesblock : 1,
-  
+
+  // Step 3: the section boundary, on its exact sample. eng_edge is the beat where the
+  // engine's answer changes (region end, or the next region's start from a gap); when
+  // this sample crosses it, re-resolve, re-anchor the phase to the new section, and
+  // force the step boundary so step 0 of the new pattern fires right here. Old ties
+  // and ratchet state are dropped: the boundary block below then sends the held
+  // notes' offs and the new section's ons in the same sample.
+  (eng_map_on && beat_position_int >= eng_edge) ? (
+    eng_resolve(beat_position_int);
+    curbeatpos = beat_position_int - eng_anchor;
+    lbeatpos = -1; ltiestate = 0; memset(sd_playstate, 0, max_numnotes*2);
+    eng_prev_p = eng_p; eng_prev_anchor = eng_anchor;
+  );
   play_state_i=play_state;
   (!play_before_start && beat_position_int < start_beatpos) || (end_beatpos > start_beatpos && beat_position_int >= end_beatpos) ? (
     play_state_i&=0xFFFE; // set bit 0 to 0. Prevents playback.
   );
+  // step 2: eng_silent (no mapped section under the playhead) is NOT the stopped path --
+  // clearing the play bit here made the boundary block below run on EVERY sample of a
+  // gap (its `!(play_state_i&1)` arm), including a 98-cell memset per sample. The engine
+  // keeps stepping; the two emission sites gate on !eng_silent instead (audit 2026-09-03).
   
   chain > 0 && p <= chain ? (
     chains_passed_full=floor(curbeatpos/(chain_beats / rate));
@@ -3434,11 +3986,11 @@ loop((play_state&1) ? samplesblock : 1,
       curbeatpos_c=0;
       debug_hits+=1;
     );
-    beatpos=(play_state_i&1) ? (curbeatpos_c * rateadj)%listlength : -100;
-    tickpos=(play_state_i&1) ? (curbeatpos_c * rateadj * tpb)%(listlength * tpb) : -100;
+    beatpos=(play_state_i&1) ? (curbeatpos_c * eng_rateadj)%eng_listlength : -100;
+    tickpos=(play_state_i&1) ? (curbeatpos_c * eng_rateadj * tpb)%(eng_listlength * tpb) : -100;
   ) : (
-    beatpos=(play_state_i&1) ? (curbeatpos * rateadj)%listlength : -100;
-    tickpos=(play_state_i&1) ? (curbeatpos * rateadj * tpb)%(listlength * tpb) : -100;
+    beatpos=(play_state_i&1) ? (curbeatpos * eng_rateadj)%eng_listlength : -100;
+    tickpos=(play_state_i&1) ? (curbeatpos * eng_rateadj * tpb)%(eng_listlength * tpb) : -100;
   );
   
   tickpos != ltickpos && (beatpos == lbeatpos) && (play_state_i&1) ? (
@@ -3454,9 +4006,9 @@ loop((play_state&1) ? samplesblock : 1,
       // also makes legacy offset==128 cells (previously silently dropped) fire at tick 127.
       // Subdiv cells use the GROOVE offset only (legacy: swing shifted bursts, getStart
       // never applied to subdivs -- preserved).
-      eff = getStart(npos*listlength+beatpos) + groove_off_rt[npos*max_seqlength+beatpos];
+      eff = eng_getStart(npos*eng_listlength+beatpos) + groove_off_rt[npos*max_seqlength+beatpos];
       eff > tpb-1 ? eff = tpb-1;
-      sdnum=getSubdivNum(npos*listlength+beatpos);
+      sdnum=eng_getSubdivNum(npos*eng_listlength+beatpos);
       sdnum == 0 ? ( // not subdiv
         notelen_eff = defnotelen + eff; notelen_eff > tpb ? notelen_eff = tpb;   // ==tpb -> off falls to the boundary (legacy truncation)
         (noneed&1) && notelen_eff == ticks && !(ltiestate_t&1) ? (
@@ -3472,7 +4024,7 @@ loop((play_state&1) ? samplesblock : 1,
             !(ltiestate_t&1) ? ( // send new note only when there is no tie from previous note
               eon_audible(npos) ? ( // EON: mute/solo gate -- PHYSICAL noteonstate: bit set
                                     // only when the note-on actually left the JSFX
-                midisend(cursplpos,0x90+chan[npos],note_to_send + grv_velo(getVelo(npos*listlength+beatpos), npos, beatpos)*256);
+                midisend(cursplpos,0x90+chan[npos],note_to_send + grv_velo(eng_getVelo(npos*eng_listlength+beatpos), npos, beatpos)*256);
                 noteonstate |= 2^npos; // pow not shift: EEL2 << is 32-bit, lanes go to 48
               );
             ) : (
@@ -3480,7 +4032,7 @@ loop((play_state&1) ? samplesblock : 1,
                                  // already carried across the boundary (deferred-tie branch)
                                  // -- do NOT add it again here
             );
-            (swingtiestate & 2^npos) && (beatpos < listlength-1) ? ltiestate+=2^npos; // Set tie state if tie enabled and not last note of sequence
+            (swingtiestate & 2^npos) && (beatpos < eng_listlength-1) ? ltiestate+=2^npos; // Set tie state if tie enabled and not last note of sequence
           );
         );
       ) : ( // subdiv note
@@ -3503,7 +4055,7 @@ loop((play_state&1) ? samplesblock : 1,
               noteonstate -= 2^npos; // exact: guarded by the & test above
             );
             (sd_playstate[2*npos+1] >> (sdpos))&1 ? (// current sd step is enabled
-              playvelo=grv_velo(getSubdivVelo(npos, beatpos, sdpos), npos, beatpos);
+              playvelo=grv_velo(eng_getSubdivVelo(npos, beatpos, sdpos), npos, beatpos);
               eon_audible(npos) ? ( // EON: mute/solo gate
                 midisend(cursplpos,0x90+chan[npos],npos+basenote+trans[npos] + playvelo*256); // note-on subdiv note
                 noteonstate |= 2^npos;
@@ -3558,9 +4110,9 @@ loop((play_state&1) ? samplesblock : 1,
     );
     
     // Send CC
-    (play_state_i&1) ? (
+    (play_state_i&1) && !eng_silent ? (   // no CC from a gap either
       i_blk=0;
-      ccvalues = cclist[beatpos];
+      ccvalues = eng_cclist[beatpos];
       loop(numccs,
         val = getCc(ccvalues, i_blk);
         val & 0x80 && (cc_type[i_blk] < 127)? ( // event enabled and not special type
@@ -3570,12 +4122,12 @@ loop((play_state&1) ? samplesblock : 1,
       );
     );
     
-    (play_state_i&1) ? (
-      a = notelist[beatpos];
+    (play_state_i&1) && !eng_silent ? (   // a gap arms no notes; held ones still get their offs
+      a = eng_notelist[beatpos];
       // Step probability
       rand_a_play=1;
       cc_type[0] == 127 ? (
-        val = getCc(cclist[beatpos], 0);
+        val = getCc(eng_cclist[beatpos], 0);
         (val&0x80) && (rand(127) > val&0x7F) ? rand_a_play=0;
       );
     ) : a = 0;
@@ -3599,17 +4151,17 @@ loop((play_state&1) ? samplesblock : 1,
       // boundary (hand offset + groove offset > 0) is flagged into swingstate and fired
       // by the tick loop at ticks==eff. Subdiv cells defer on the GROOVE offset only
       // (legacy semantics: getStart never applied to subdiv bursts).
-      eff = getStart(npos*listlength+beatpos) + groove_off_rt[npos*max_seqlength+beatpos];
+      eff = eng_getStart(npos*eng_listlength+beatpos) + groove_off_rt[npos*max_seqlength+beatpos];
       eff > tpb-1 ? eff = tpb-1;
       (noneed&1) && !(ltiestate&1) ? (
          midisend(cursplpos,0x80+chan[npos],npos+basenote+trans[npos]); // send note off
       );
       (a&1) && (rand_a_play || chan[npos]!=cc_chan[0] || (ltiestate&1))? (
-        sdnum=getSubdivNum(npos*listlength+beatpos);
+        sdnum=eng_getSubdivNum(npos*eng_listlength+beatpos);
         sdnum == 0 ? ( // not subdiv
           eff > 0 ? (
             swingstate+=2^npos; // flag a delayed (groove/offset) note to be played by the tick loop
-            (notetie[beatpos] & 2^npos) ? swingtiestate+=2^npos;
+            (eng_notetie[beatpos] & 2^npos) ? swingtiestate+=2^npos;
             (ltiestate&1) ? (
               tiestate+=2^npos; // keep the tiestate
               (noneed&1) ? noteonstate |= 2^npos; // tie into a deferred note: the held note
@@ -3619,7 +4171,7 @@ loop((play_state&1) ? samplesblock : 1,
             );
           ) : ( // on-the-boundary note playback
 
-            playvelo=grv_velo(getVelo(npos*listlength+beatpos), npos, beatpos);
+            playvelo=grv_velo(eng_getVelo(npos*eng_listlength+beatpos), npos, beatpos);
             is_midi_val(note_to_send = npos+basenote+trans[npos]) ? (
               // PHYSICAL noteonstate: bit = "a note-on actually left this JSFX and owns a
               // future note-off". Muted lanes set no bit, so they no longer emit note-offs
@@ -3634,13 +4186,13 @@ loop((play_state&1) ? samplesblock : 1,
               ) : (
                 (noneed&1) ? noteonstate |= 2^npos; // tie: held note keeps sounding
               );
-              (notetie[beatpos] & 2^npos) && (beatpos < listlength-1) ? tiestate+=2^npos; // Set tie state if tie enabled and not last note of sequence
+              (eng_notetie[beatpos] & 2^npos) && (beatpos < eng_listlength-1) ? tiestate+=2^npos; // Set tie state if tie enabled and not last note of sequence
             );
           );
         ) : ( // subdiv note
 
           sd_playstate[2*npos]=sdnum;
-          sd_playstate[2*npos+1]=getSubdivNotelist(npos, beatpos); // sd note enable bits
+          sd_playstate[2*npos+1]=eng_getSubdivNotelist(npos, beatpos); // sd note enable bits
           sdreach+=2^npos; // REACH (immediate + deferred bursts): the tick loop's while()
             // only iterates lanes while its masks are nonzero. Legacy got reach from the
             // unconditional noteonstate set; with PHYSICAL noteonstate a muted burst sets
@@ -3656,7 +4208,7 @@ loop((play_state&1) ? samplesblock : 1,
             // carry it would hang).
           groove_off_rt[npos*max_seqlength+beatpos] == 0 ? (
             sd_playstate[2*npos+1]&1 ? (// first sd step is enabled
-              playvelo=grv_velo(getSubdivVelo(npos, beatpos, 0), npos, beatpos);
+              playvelo=grv_velo(eng_getSubdivVelo(npos, beatpos, 0), npos, beatpos);
               eon_audible(npos) ? ( // EON: mute/solo gate -- PHYSICAL noteonstate
                 midisend(cursplpos,0x90+chan[npos],npos+basenote+trans[npos] + playvelo*256); // note-on subdiv note
                 noteonstate |= 2^npos; // |= : idempotent vs the tie-carry above
@@ -3684,6 +4236,7 @@ loop((play_state&1) ? samplesblock : 1,
   beat_position_int+=dbeatpos;
 );
 
+gfx_beatpos = (eng_p == p && !eng_silent) ? lbeatpos : -100;   // step 2: playhead for the EDITOR grid
 midi_buf_len=i_buf;
 i_buf=0;
 loop(midi_buf_len,
@@ -3773,6 +4326,12 @@ panic_go ?
 // Pattern-op arbitration: gesture-edge detect (see @init note). Raised only
 // on click-edge / wheel frames; cleared at the end of this section.
 _ui_patop = ((mouse_cap & 3) && ((mouse_cap & 3) != (_uip_prev & 3))) || mouse_wheel ? 1 : 0;
+// Package 3: a left-button RELEASE this frame = a gesture just ended. Raised at the
+// bottom of @gfx (after every handler has written the grid) as eon_gesture_done, which
+// the @block export debounce treats as "settled now" -- the item follows the edit as
+// soon as the hand lifts instead of after the settle window. Harmless on releases that
+// changed nothing: the export still requires a changed grid digest.
+_gfx_release = ((_uip_prev & 1) && !(mouse_cap & 1)) ? 1 : 0;
 
 // ── knobs_kbsg frame contract ────────────────────────────────────────────────
 // ssl_knob_interact (which mpc_knob_interact delegates to) reads these as plain
@@ -3921,13 +4480,28 @@ eon_msdig != eon_lmsdig ? (eon_lmsdig = eon_msdig; refresh_pianokeys = 1;);
 // playing entry advances (the toolbar is refresh-gated; without this the strip
 // would only update on the next forced redraw). Also keep it live under the
 // mouse so hover/drag feedback tracks the cursor.
-eon_song_dig = 0;
+eon_song_dig = 0; eon_song_pdig = 0;
 (eon_pair_slot >= 0 && eon_song_on) ? (
   eon_song_dig = gmem[EON_SS_SONG_BASE + eon_pair_slot*EON_SS_SONG_STRIDE]
                + gmem[EON_SS_SONG_BASE + eon_pair_slot*EON_SS_SONG_STRIDE + 3]*131
                + gmem[EON_SS_SONG_BASE + eon_pair_slot*EON_SS_SONG_STRIDE + 2]*997;
+  // Strip polish fix (user 2026-09-03: "the playhead line gets stuck when I turn on
+  // loop"): the line and the chain sweep are drawn from beat_position, but nothing
+  // repainted the refresh-gated toolbar as it advanced -- the line only moved on
+  // incidental redraws (a stepping ruler, a hovering mouse), and loop-on took those
+  // away. Its OWN digest -- the line's pixel (timeline face, last frame's geometry) or
+  // a 16th of a beat (chain sweep) -- drives a STRIP-ONLY repaint (eon_song_pdirty,
+  // consumed right after the toolbar block), never refresh_tb: that flag also bypasses
+  // the grid cache (eon_gc_live), which would have cost a full grid redraw per frame
+  // of playback (audit 2026-09-03).
+  (play_state & 1) ? (
+    eon_song_pdig = 1 + ((eon_sg_tl && eon_sg_span > 0)
+      ? ((((beat_position - eon_sg_span0)/eon_sg_span)*eon_sg_avail)|0)
+      : (floor(beat_position * 16)));
+  );
 );
-eon_song_dig != eon_lsongdig ? (eon_lsongdig = eon_song_dig; refresh_tb = 1;);
+eon_song_dig  != eon_lsongdig  ? (eon_lsongdig  = eon_song_dig;  refresh_tb = 1;);
+eon_song_pdig != eon_lsongpdig ? (eon_lsongpdig = eon_song_pdig; eon_song_pdirty = 1;);
 (eon_song_vis && mouse_y >= eon_song_y-2 && mouse_y < eon_song_y+eon_song_h) ? (refresh_tb = 1;);
 // P3b-4d: the chips render NAMES from the refresh-gated toolbar, so repaint when
 // the published window changes. The key fields alone don't move on a same-page
@@ -3945,9 +4519,100 @@ eon_name_dig = 0;
 );
 eon_name_dig != eon_lnamedig ? (eon_lnamedig = eon_name_dig; refresh_tb = 1;);
 
+// ═══════════════════════════════════════════════════════════════════════════
+// EON DOCK FACE — the trigger. Spec: .docs/specs/Spec_Steppa_Dock_Mode.md,
+// approved mockup Steppa_Dock_Mode_mockup.html. Same RECIPE as Swing's rack
+// face -- a hysteresis band, so dragging a dock edge across the boundary cannot
+// flap the face frame to frame -- but deliberately NOT the same constants, and
+// the spec's "identical to Swing's 1.35 / 1.2" is wrong for this plugin.
+//
+// ⚠️ Swing's window is `@gfx 780 780`: square, aspect 1.0, so 1.35 sits far above
+// anything a floated Swing ever shows. Steppa's is `@gfx 860 594` -- aspect
+// 1.448, ALREADY PAST 1.35. Copying Swing's numbers here made a freshly floated
+// Steppa open in the dock face and never leave it, which is the exact opposite
+// of what the trigger is for. The constants are only meaningful relative to a
+// plugin's own natural window shape, and Steppa's natural shape is wide.
+//
+// 2.0 in / 1.7 out clears the floated default (1.448) by a comfortable margin
+// below the exit threshold, while any real dock pane -- short and wide, 660x250
+// is 2.64, 1200x280 is 4.3 -- is comfortably above the entry one.
+//
+// slider52 pins it: 0 Auto, 1 always full UI, 2 always dock face.
+//
+// Held (not recomputed) while REAPER is drawing us EMBEDDED in a TCP/MCP strip:
+// that path renders ss_embed_grid/ss_embed_panels and ignores this layout
+// entirely, and a 300x40 strip must not reach over and flip the floating
+// window's face behind its back.
+!(gfx_ext_flags & 1) ? (
+  ss_dock_asp = gfx_h > 0 ? gfx_w / gfx_h : 0;
+  // Precedence, highest first: the user's pin, then the dock rig, then shape.
+  //
+  // The rig is the better signal and the reason the shape trigger is now only a
+  // fallback: EON Steppa Dock.lua KNOWS which FX's canvas it captured and sets
+  // slider53 on that exact instance, where the window shape merely correlates
+  // (and correlated wrongly here until 2026-08-26 -- 860x594 is aspect 1.448).
+  // Gated on the heartbeat so a slider left at 1 by a crash can never pin a
+  // floated window: no script running, no dock face.
+  // ⚠️ _STEPPA, not the shared GS_RIG_ALIVE: 2626 is stamped by EITHER pane, so
+  // gating on it let Swing's pane vouch for ours (see the declaration note).
+  ss_rig_live = (time_precise() - gmem[GS_RIG_ALIVE_STEPPA]) < 2;
+  // ── Re-dock hello (2026-09-02) ── a Steppa docked from the wordmark, then
+  // closed, came back as a plain float: the pane exits when its tab closes and
+  // clears slider53 on the way out, and the only REDOCK bump lived behind the
+  // click. slider54 (ss_dock_want) survives that, so the first frame of a fresh
+  // window session that wants the dock and is not in it re-posts exactly what
+  // the click posts; the bridge's eon_redock_tick launches or reuses the pane.
+  // "Fresh session" = a >1 s gap in @gfx frames (the window was closed; the
+  // first frame ever counts too). ONE ask per session: a pane that cannot
+  // launch already says so once, and a retry would make that a dialog storm.
+  // Waits for a live bridge rather than spending the ask on a dead one.
+  // ⚠️ Inlined, not ss_dk_dock_toggle(): that function is defined further down
+  // and EEL2 resolves calls at parse time. Twin of Swing_ReaKit.jsfx's hello.
+  ss_dk_now = time_precise();
+  ss_dk_now - ss_dk_gfx_t > 1 ? ss_dk_hello = 0;
+  ss_dk_gfx_t = ss_dk_now;
+  ss_dock_want && !ss_dk_hello && gmem[EON_KB_ALIVE] > 0
+    && !(ss_rig_live && ss_rig_docked) ? (
+    ss_dk_hello = 1;
+    gmem[EON_REDOCK_SLOT] = eon_pair_slot >= 0 ? eon_pair_slot : -1;
+    gmem[EON_REDOCK_REQ]  = (gmem[EON_REDOCK_REQ]|0) + 1;
+  );
+  // ONE-DIRECTIONAL while the rig runs (user rule 2026-08-26: the view must
+  // never change on its own): capture switches TO the dock face, but a
+  // release/pop-out changes NOTHING -- the face you pop out with is the face
+  // you keep until you pick otherwise (wordmark right-click). Only the pin and
+  // the rig-less shape fallback ever assign 0.
+  ss_dock_mode == 1 ? ( ss_dock_face = 0; ) :
+  ss_dock_mode == 2 ? ( ss_dock_face = 1; ) :
+  ss_rig_live       ? ( ss_rig_docked ? ss_dock_face = 1; ) : (
+    ss_dock_face = ss_dock_face ? (ss_dock_asp >= 1.7) : (ss_dock_asp > 2.0);
+  );
+);
+// Face swap: re-derive the lane-header geometry for the new column mask, drop
+// every chrome-anchored popup (their anchors just moved off-canvas), and force a
+// full repaint. gfx_clear is -1 in this file, so REAPER never wipes for us --
+// without the explicit clear the outgoing face's chrome stays painted in the
+// bands the incoming face does not happen to cover.
+ss_dock_face != ss_dock_prev ? (
+  ss_dock_prev = ss_dock_face;
+  eon_colvis_apply();                      // re-derive eon_cv/chw/pianow/eon_ctrlw/pkw
+  recalc_elh = 1;
+  refresh_tb = 1; refresh_pianokeys = 1; refresh_cc_controls = 1; eon_pdraw = 6;
+  eon_gc_valid = 0;                        // grid cache: the geometry it was rendered at is gone
+  settingsopen = 0; eon_vdd_open = 0; eon_prdd_open = 0; eon_gdd_open = 0;
+  eon_ico_open = 0; eon_lm_open = 0; eon_pm_open = 0; rkth_open = 0;
+  ss_dk_more_open = 0; ss_dk_vm_open = 0; ss_dk_drag = 0;
+  color(7); gfx_x = 0; gfx_y = 0; gfx_rectto(gfx_w, gfx_h);
+);
+
 // EON: piano toggle -> dynamic toolbar height. eon_pbh = piano body height (0 when hidden);
 // every toolbar row below the piano is positioned relative to it. Default shown = unchanged layout.
-eon_pbh = 8 + (slider17 < 0.5 ? 0 : (slider17 < 1.5 ? 2*tbrh : (slider17 < 2.5 ? 3*tbrh : (slider17 < 3.5 ? 5*tbrh : 4*tbrh))));   // EON: +8 top margin (was 0); Off, Piano=2, Pads8=3, Pads16=5, Manual=4 rows
+// EON: the top margin (below the piano strip, above the pattern row) grew
+// 8 -> 24 to host the STEPPA wordmark band in the FULL UI (user pick 'B',
+// 2026-08-26). Everything below hangs off eon_pbh, so rows, ruler, grid and
+// every hit-test reflow automatically; the piano strip itself still draws
+// from y=0 and is untouched. Classic schemes keep the old 8 and no band.
+eon_pbh = (colorscheme==10 ? 24 : 8) + (slider17 < 0.5 ? 0 : (slider17 < 1.5 ? 2*tbrh : (slider17 < 2.5 ? 3*tbrh : (slider17 < 3.5 ? 5*tbrh : 4*tbrh))));   // Off, Piano=2, Pads8=3, Pads16=5, Manual=4 rows
 eon_r2  = eon_pbh + tbrh + 6;   // EON: control-row TOP = pattern-row bottom + 6px gap between the two rows
 eon_r2b = eon_r2 + tbrh;        // EON: control-row BOTTOM (all control-row draws/hit-tests route through these)
 // P3b-4c: optional SONG strip row between the control row and the beat ruler.
@@ -3966,6 +4631,32 @@ eon_colhdr_vis = (colorscheme==10 && mode==1) ? 1 : 0;
 eon_colhdr_h   = eon_colhdr_vis ? 13 : 0;
 eon_colhdr_y   = eon_r2b + 1 + eon_song_h;   // sits just under SONG, just above the ruler
 tbh = eon_r2b + 1 + eon_song_h + eon_colhdr_h + 13;
+// DOCK FACE: none of those rows exist. Park them all off-canvas rather than
+// hiding them with a flag -- this file's own convention (eon_ms_geo parks every
+// disabled control at -1000 "so no hit-test, hover test or wheel gate can match
+// something that is not drawn"). Every chrome hit-test downstream is written
+// against eon_pbh or eon_r2/eon_r2b, so parking those is what lets the whole
+// input pipeline below stay ignorant of which face is up: the pattern-row,
+// control-row, pads-drag and highlight handlers all die on their own guards,
+// while the lane, grid and popup handlers keep running untouched.
+// tbh is then the slim bar's height alone, and because the tbh != ltbh watcher
+// on the next line already forces recalc_elh + a full redraw, the lanes, the
+// grid and every tbh-relative hit-test reflow for free.
+// The CC/velocity lane is deliberately NOT special-cased: elh keeps deriving
+// from elh_percent (slider13, default 0 -> collapsed to the 6px divider), so the
+// lane is absent by default exactly as the mockup shows it, and the CC toggle in
+// the folded-settings popup still does something real.
+ss_dock_face ? (
+  ss_dk_h = min(max((gfx_h*0.12)|0, 26), 34);   // slim: tall enough for a 22px chip, capped so a deep pane feeds the grid
+  eon_pbh = -1000; eon_r2 = -1000; eon_r2b = -1000 + tbrh;
+  eon_song_vis = 0; eon_song_h = 0; eon_song_y = -1000;
+  eon_colhdr_vis = 0; eon_colhdr_h = 0; eon_colhdr_y = -1000;
+  // +13: the beat ruler keeps its strip in the dock face too (user 2026-08-26,
+  // "steppas rack view needs the numbers") -- the ruler block draws at
+  // tbh-13..tbh-1, so reserving the band here re-enables it unchanged, and the
+  // lanes/grid start below it exactly as in the full UI.
+  tbh = ss_dk_h + 13;
+);
 tbh != ltbh ? (recalc_elh=1; eon_pdraw=6; ltbh=tbh;);   // layout changed -> force redraws so BOTH double-buffers get it
 slider17 != lslider17 ? (eon_pdraw=6; lslider17=slider17;);   // view switch (piano<->pads<->off) -> force strip redraw
 gmem[GS_THEME_ID] != eon_last_theme_id ? (eon_last_theme_id = gmem[GS_THEME_ID]; eon_pdraw=6;);   // EON: theme band republished -> force full re-skin redraw (cached double-buffer wouldn't update otherwise)
@@ -4005,21 +4696,24 @@ function draw_button_highlight(x, y)
   );
 );
 
-function draw_pat_button(patnum, x, y, hl) local(bx, by, bw, bh, bw_lum, eon_cl, eon_issel, eon_plbl)
+function draw_pat_button(patnum, x, y, hl) local(bx, by, bw, bh, bw_lum, eon_cl, eon_issel, eon_plbl, eon_pabs)
 (
-  // banks removed: patnum is the pattern index directly (one row)
+  // banks removed: patnum is the on-page button index (one row)
   // P3b-4 paging: "selected" only lights when the selected ordinal is on the visible
   // page (eon_sel_onpage); the number label shows the region ORDINAL in sync.
-  eon_issel = patnum==p && eon_sel_onpage;
-  eon_plbl  = eon_pat_sync ? eon_pat_base + patnum + 1 : patnum + 1;
+  // Step 1 "plays everywhere": in sync the pattern behind button patnum on page k is
+  // k*8+patnum (eon_pabs) -- has-notes, hue and the selected test all key on it.
+  eon_pabs  = eon_pat_sync ? eon_pat_base + patnum : patnum;
+  eon_issel = eon_pabs==p && eon_sel_onpage;
+  eon_plbl  = eon_pabs + 1;
   colorscheme==10 ? ( // EON: each pattern its own hue; brightness shows active / has-notes / empty
     bx = x*eon_pbw+2; by = y+1; bw = eon_pbw-3; bh = tbrh-2;   // P3b-4d: sync = wide name chips
     (eon_issel && eon_pat_big) ? (bx-=3; by-=3; bw+=6; bh+=5;);   // EON: selected button drawn enlarged (2nd pass, on top)
-    pattern_hue[patnum] < 0 ? (   // MPC cream / housing pattern
-      eon_cl = eon_issel ? 1.0 : (has_notes[patnum] ? 0.70 : 0.52);
+    pattern_hue[eon_pabs] < 0 ? (   // MPC cream / housing pattern
+      eon_cl = eon_issel ? 1.0 : (has_notes[eon_pabs] ? 0.70 : 0.52);
       gfx_r=0.84*eon_cl; gfx_g=0.81*eon_cl; gfx_b=0.76*eon_cl;
     ) : (
-      eon_hsl2rgb(pattern_hue[patnum], 0.62, eon_issel ? 0.56 : (has_notes[patnum] ? 0.31 : 0.20));
+      eon_hsl2rgb(pattern_hue[eon_pabs], 0.62, eon_issel ? 0.56 : (has_notes[eon_pabs] ? 0.31 : 0.20));
     );
     // EON P3b-3b: in sync, the button = its DM region's actual colour (bridge-published, packed
     // r*65536+g*256+b), brightness-scaled for active/has-notes/empty so selection still reads.
@@ -4032,7 +4726,7 @@ function draw_pat_button(patnum, x, y, hl) local(bx, by, bw, bh, bw_lum, eon_cl,
       // "selected" or "its colour" means.
       eon_issel ? eon_selrc = eon_rc;
       eon_rc > 0 ? (
-        eon_rcl = eon_issel ? 1.0 : (has_notes[patnum] ? 0.66 : 0.46);
+        eon_rcl = eon_issel ? 1.0 : (has_notes[eon_pabs] ? 0.66 : 0.46);
         gfx_r = ((eon_rc/65536)|0)/255*eon_rcl;
         gfx_g = (((eon_rc/256)|0)%256)/255*eon_rcl;
         gfx_b = (eon_rc%256)/255*eon_rcl;
@@ -4040,7 +4734,10 @@ function draw_pat_button(patnum, x, y, hl) local(bx, by, bw, bh, bw_lum, eon_cl,
     );
     bw_lum = gfx_r*0.30 + gfx_g*0.59 + gfx_b*0.11;   // fill luminance -> number contrast
     gfx_a=1; gfx_rect(bx, by, bw, bh);
-    (chain > 0 && chain >= patnum) ? (setcolor(0,205,238,255); gfx_rect(bx, by, bw, 2););  // chain stripe (top)
+    (chain > 0 && chain >= eon_pabs) ? (setcolor(0,205,238,255); gfx_rect(bx, by, bw, 2););  // chain stripe (top)
+    // step 2: the ENGINE is on this pattern while you edit another -> amber bar (bottom).
+    // eng_p / eng_silent are @block ints read here; a one-frame stale read is harmless.
+    (eon_pabs == eng_p && eng_p != p && !eng_silent) ? (setcolor(255,196,64,255); gfx_rect(bx, by+bh-2, bw, 2););
     eon_issel ? (
       // SELECTED: dark outer keyline (pops against the grid) + bright 2px inner ring +
       // a bold accent bar across the bottom (selected-tab style) = unmistakable.
@@ -4128,14 +4825,67 @@ function eon_btn_frame(x, y, cells) ( // EON: rounded pill frame for wide toolba
 // state, so edits cannot echo. Shared geometry (eon_sg_*) is computed by
 // eon_song_geom() so the renderer and the mouse hit-tests always agree.
 // ─────────────────────────────────────────────────────────────────────────────
-function eon_song_geom() (
+function eon_song_geom() local(e, v, ord, rep, wsum, i, w, x, span0, span1, tot) (
   eon_sg_b   = EON_SS_SONG_BASE + (eon_pair_slot >= 0 ? eon_pair_slot : 0)*EON_SS_SONG_STRIDE;
-  eon_sg_len = min(gmem[eon_sg_b+1]|0, EON_SS_SONG_MAX);
-  eon_sg_x0  = busp*2 + 2;                       // chips start after the PLAY + LOOP cells (ZOOM moved to the control row, under the cog)
+  eon_sg_len = min(gmem[eon_sg_b+1]|0, EON_SS_SONG_ENTRY_MAX);
+  eon_sg_x0  = busp*3 + 2;                       // chips start after the PLAY + LOOP + FACE cells
   eon_sg_avail = gfx_w - eon_sg_x0 - 8;
-  // P3b-4e: cap 84px (room for ordinal + name); chips squeeze as the chain grows
-  // and drop the name text below ~30px (the ordinal + colour still read).
-  eon_sg_cw  = eon_sg_len > 0 ? max(14, min(84, (eon_sg_avail/eon_sg_len)|0)) : busp;
+  // Step 4: the strip has two faces. TIMELINE draws the section map (regions in
+  // time order, width = length) with the playhead sweeping across; CHAIN is the
+  // arrangement (drag-built, xN repeats), chips now as wide as the section is long.
+  // Both fill eon_sg_xs/eon_sg_ws so drawing and hit-testing share one geometry.
+  eon_sg_tl = eon_song_tl && eon_map_n > 0;
+  eon_sg_tl ? (
+    span0 = eon_map[0]; span1 = eon_map[1]; i = 0;
+    loop(eon_map_n,
+      eon_map[i*4]   < span0 ? span0 = eon_map[i*4];
+      eon_map[i*4+1] > span1 ? span1 = eon_map[i*4+1];
+      i += 1;
+    );
+    eon_sg_span0 = span0; eon_sg_span = max(span1 - span0, 0.001);
+    i = 0;
+    loop(eon_map_n,
+      eon_sg_xs[i] = eon_sg_x0 + (((eon_map[i*4] - span0)/eon_sg_span)*eon_sg_avail)|0;
+      eon_sg_ws[i] = max(4, (((eon_map[i*4+1] - eon_map[i*4])/eon_sg_span)*eon_sg_avail)|0);
+      i += 1;
+    );
+    eon_sg_cw = 0;
+  ) : (
+    // CHAIN: weight = section length (QN, from the map; one bar when unknown) x repeats.
+    wsum = 0; e = 0;
+    loop(eon_sg_len,
+      v = gmem[eon_sg_b + 8 + e*2]|0; ord = v % 256; rep = max((v/256)|0, 1);
+      w = 4;
+      (ord >= 1 && ord <= eon_map_n) ? w = max(eon_map[(ord-1)*4+1] - eon_map[(ord-1)*4], 0.25);
+      eon_sg_ws[e] = w*rep; wsum += w*rep;
+      e += 1;
+    );
+    x = eon_sg_x0; e = 0;
+    loop(eon_sg_len,
+      w = wsum > 0 ? ((eon_sg_ws[e]/wsum)*eon_sg_avail)|0 : eon_sg_avail;
+      w = max(14, min(160, w));
+      eon_sg_xs[e] = x; eon_sg_ws[e] = w; x += w;
+      e += 1;
+    );
+    (eon_sg_len > 0 && x - eon_sg_x0 > eon_sg_avail) ? (   // squeeze so every chip stays on screen
+      tot = x - eon_sg_x0; x = eon_sg_x0; e = 0;
+      loop(eon_sg_len,
+        w = max(6, ((eon_sg_ws[e]*eon_sg_avail)/tot)|0);
+        eon_sg_xs[e] = x; eon_sg_ws[e] = w; x += w;
+        e += 1;
+      );
+    );
+    eon_sg_cw  = eon_sg_len > 0 ? max(14, min(84, (eon_sg_avail/eon_sg_len)|0)) : busp;
+  );
+);
+// Entry (chain) or region (timeline) under x, from the shared geometry; -1 = none.
+function eon_sg_hit(mx) local(e, n) (
+  n = eon_sg_tl ? eon_map_n : eon_sg_len; e = 0; eon_sg_hit_r = -1;
+  loop(n,
+    (eon_sg_hit_r < 0 && mx >= eon_sg_xs[e] && mx < eon_sg_xs[e] + eon_sg_ws[e]) ? eon_sg_hit_r = e;
+    e += 1;
+  );
+  eon_sg_hit_r;
 );
 // Post one song command (payload first, OP, then the REQ bump LAST — the bridge
 // edge-detects REQ). Seed the counter above whatever gmem already holds so a
@@ -4200,7 +4950,7 @@ function draw_col_header() local(i, cx, cw, on, lbl, hot, pin) (
   );
 );
 
-function draw_song_strip() local(y, h, e, cx, v, ord, rep, col, lum, playing, curent, lp, cy) (
+function draw_song_strip() local(y, h, e, cx, cw, v, ord, rep, col, lum, playing, curent, lp, cy, i, pat, loaded, dim, px, rs, re) (
   eon_song_geom();
   y = eon_song_y; h = tbrh - 2;
   playing = gmem[eon_sg_b+2]|0; curent = gmem[eon_sg_b+3]|0; lp = gmem[eon_sg_b+4]|0;
@@ -4220,39 +4970,108 @@ function draw_song_strip() local(y, h, e, cx, v, ord, rep, col, lum, playing, cu
   lp ? gfx_set(0.0, 0.86, 1.0, 1) : gfx_set(0.55, 0.60, 0.68, 1);
   gfx_circle((busp+2+(busp-3)*0.5)|0, cy|0, 5, 0, 1);
   gfx_triangle(busp+2+(busp-3)*0.5+3, cy-7, busp+2+(busp-3)*0.5+8, cy-4, busp+2+(busp-3)*0.5+3, cy-1);
-  // (ZOOM cell removed — the song/pattern zoom buttons live in the control
-  // row under the settings cog now, available even with this strip hidden.)
-  // Chips: region colour fill + ordinal + xN repeats badge + playing ring
+  // FACE cell (step 4) — TL = timeline (the section map, the playhead sweeping),
+  // CH = chain (the arrangement). Greyed while there is no map to draw a timeline from.
+  eon_nice_button(busp*2+2, y, busp-3, h, 58/255, 64/255, 76/255, 96/255, 104/255, 120/255);
+  gfx_setfont(6, "Verdana", 9, 'b');
+  eon_map_n > 0 ? (eon_sg_tl ? gfx_set(0.95, 0.85, 0.35, 1) : gfx_set(0.55, 0.95, 0.85, 1)) : gfx_set(0.45, 0.50, 0.58, 1);
+  gfx_x = busp*2+2 + ((busp-3)*0.5 - 6)|0; gfx_y = (cy-5)|0;
+  gfx_drawstr(eon_sg_tl ? "TL" : "CH");
   gfx_setfont(6, "Verdana", 10, 'b');
-  eon_sg_len == 0 ? (
+  eon_sg_tl ? (
+    eon_sg_lsn = (mstate == ms_tb_songlisten && atomic_get(eon_listen_p) >= 0);   // 1g: a block is being listened to
+    // ── TIMELINE face: one block per region, width = length, in time order. Fill =
+    // region colour: lit while it is the section the ENGINE plays, dim otherwise, grey
+    // when its pattern isn't loaded. Bright rim = the section the EDITOR shows.
+    i = 0;
+    loop(eon_map_n,
+      cx = eon_sg_xs[i]; cw = eon_sg_ws[i];
+      pat = eon_map[i*4+2]|0; col = eon_map[i*4+3]|0;
+      loaded = pat >= 0 && pat < npatterns && eon_pat_loaded[pat];
+      col > 0 ? (
+        gfx_r = ((col/65536)|0)/255; gfx_g = (((col/256)|0)%256)/255; gfx_b = (col%256)/255;
+      ) : ( gfx_r = 0.42; gfx_g = 0.46; gfx_b = 0.55; );
+      dim = !loaded ? 0.30 : ((i == eng_map_i && !eng_silent) ? 1.0 : 0.60);
+      gfx_r *= dim; gfx_g *= dim; gfx_b *= dim; gfx_a = 1;
+      gfx_rect(cx, y, max(cw-1, 1), h);
+      (loaded && pat == p) ? (   // editing this one: bright rim
+        gfx_set(0.99, 1.0, 1.0, 1);
+        gfx_rect(cx, y, cw-1, 1); gfx_rect(cx, y+h-1, cw-1, 1);
+        gfx_rect(cx, y, 1, h); gfx_rect(cx+cw-2, y, 1, h);
+      );
+      eon_sg_lsn && i == eon_sg_hold_i ? (   // LISTEN (1g): the held block wears a gold rim
+        gfx_set(0.98, 0.85, 0.30, 1);
+        gfx_rect(cx, y, cw-1, 1); gfx_rect(cx, y+h-1, cw-1, 1);
+        gfx_rect(cx, y, 1, h); gfx_rect(cx+cw-2, y, 1, h);
+      );
+      cw >= 14 ? (
+        lum = gfx_r*0.30 + gfx_g*0.59 + gfx_b*0.11;
+        (dim >= 0.9 && lum > 0.42) ? gfx_set(0.10, 0.12, 0.14, 1) : gfx_set(0.93, 0.96, 0.98, 1);
+        gfx_x = cx + 3; gfx_y = (cy-5)|0; gfx_drawnumber(i+1, 0);
+        // strip polish: the region NAME after the number, cut to the block's width
+        cw >= 30 ? (
+          eon_mapname(i, #eon_sgnm, 12);
+          strlen(#eon_sgnm) > 0 ? (
+            eon_sgnx  = cx + (i < 9 ? 14 : 20);
+            eon_sgnaw = cx + cw - eon_sgnx - 3;
+            eon_sgnaw > 8 ? (
+              strcpy(#eon_sgnmt, #eon_sgnm);
+              gfx_measurestr(#eon_sgnmt, eon_sgnw, eon_sgnh);
+              while(strlen(#eon_sgnmt) > 1 && eon_sgnw > eon_sgnaw) (
+                strncpy(#eon_sgnmt, #eon_sgnm, strlen(#eon_sgnmt)-1);
+                gfx_measurestr(#eon_sgnmt, eon_sgnw, eon_sgnh);
+              );
+              gfx_x = eon_sgnx; gfx_y = (cy-5)|0; gfx_drawstr(#eon_sgnmt);
+            );
+          );
+        );
+      );
+      i += 1;
+    );
+    // the playhead, wherever the transport is (the engine follows it)
+    (play_state & 1) ? (
+      px = eon_sg_x0 + (((beat_position - eon_sg_span0)/eon_sg_span)*eon_sg_avail)|0;
+      (px >= eon_sg_x0 && px <= eon_sg_x0 + eon_sg_avail) ? ( gfx_set(1, 1, 1, 0.95); gfx_rect(px, y-1, 2, h+2); );
+    );
+  ) : eon_sg_len == 0 ? (
     gfx_set(0.45, 0.50, 0.58, 0.9); gfx_x = eon_sg_x0 + 4; gfx_y = (cy-5)|0;
     gfx_drawstr("drag patterns here");
   ) : (
+    // ── CHAIN face: region colour fill + ordinal + xN repeats badge + playing ring,
+    // chips as wide as the section is long (x repeats), plus a sweep inside the
+    // playing chip showing how far through it the transport is.
     e = 0;
     loop(eon_sg_len,
-      cx = eon_sg_x0 + e*eon_sg_cw;
+      cx = eon_sg_xs[e]; cw = eon_sg_ws[e];
       v = gmem[eon_sg_b + 8 + e*2]|0; ord = v % 256; rep = (v/256)|0; rep < 1 ? rep = 1;
       col = gmem[eon_sg_b + 8 + e*2 + 1]|0;
       col > 0 ? (
         gfx_r = ((col/65536)|0)/255*0.72; gfx_g = (((col/256)|0)%256)/255*0.72; gfx_b = (col%256)/255*0.72;
       ) : ( gfx_r = 0.30; gfx_g = 0.33; gfx_b = 0.40; );
-      gfx_a = 1; gfx_rect(cx, y, eon_sg_cw-2, h);
-      (playing && curent == e+1) ? (   // playing entry: bright ring
+      gfx_a = 1; gfx_rect(cx, y, cw-2, h);
+      (playing && curent == e+1) ? (   // playing entry: bright ring + progress sweep
+        (ord >= 1 && ord <= eon_map_n) ? (
+          rs = eon_map[(ord-1)*4]; re = eon_map[(ord-1)*4+1];
+          (re > rs && beat_position >= rs && beat_position < re) ? (
+            px = cx + (((beat_position - rs)/(re - rs))*(cw-2))|0;
+            gfx_set(1, 1, 1, 0.55); gfx_rect(cx, y, max(px - cx, 1), h);
+          );
+        );
         gfx_set(0.99, 1.0, 1.0, 1);
-        gfx_rect(cx, y, eon_sg_cw-2, 1); gfx_rect(cx, y+h-1, eon_sg_cw-2, 1);
-        gfx_rect(cx, y, 1, h); gfx_rect(cx+eon_sg_cw-3, y, 1, h);
+        gfx_rect(cx, y, cw-2, 1); gfx_rect(cx, y+h-1, cw-2, 1);
+        gfx_rect(cx, y, 1, h); gfx_rect(cx+cw-3, y, 1, h);
       );
       lum = gfx_r*0.30 + gfx_g*0.59 + gfx_b*0.11;
       lum > 0.52 ? gfx_set(0.10, 0.12, 0.14, 1) : gfx_set(0.93, 0.96, 0.98, 1);
       gfx_x = cx + 3; gfx_y = (cy-5)|0; gfx_drawnumber(ord, 0);
       // P3b-4e: entry's region NAME beside the ordinal (SONGNAME band; written by
-      // the bridge before every GEN bump). Skipped when the chain squeezes chips
-      // too narrow; truncated by measurestr to the room left of the xN badge.
-      eon_sg_cw >= 30 ? (
+      // the bridge before every GEN bump). Skipped when the chip is too narrow;
+      // truncated by measurestr to the room left of the xN badge.
+      cw >= 30 ? (
         eon_songname(e, #eon_sgnm, 15);
         strlen(#eon_sgnm) > 0 ? (
           eon_sgnx  = cx + (ord < 10 ? 14 : 20);
-          eon_sgnaw = cx + eon_sg_cw - eon_sgnx - (rep > 1 ? 16 : 4);
+          eon_sgnaw = cx + cw - eon_sgnx - (rep > 1 ? 16 : 4);
           eon_sgnaw > 8 ? (
             strcpy(#eon_sgnmt, #eon_sgnm);
             gfx_measurestr(#eon_sgnmt, eon_sgnw, eon_sgnh);
@@ -4264,8 +5083,8 @@ function draw_song_strip() local(y, h, e, cx, v, ord, rep, col, lum, playing, cu
           );
         );
       );
-      (rep > 1 && eon_sg_cw >= 20) ? (
-        gfx_x = cx + eon_sg_cw - 16; gfx_y = y + 1;
+      (rep > 1 && cw >= 20) ? (
+        gfx_x = cx + cw - 16; gfx_y = y + 1;
         gfx_drawstr("x"); gfx_drawnumber(rep, 0);
       );
       e += 1;
@@ -4273,7 +5092,6 @@ function draw_song_strip() local(y, h, e, cx, v, ord, rep, col, lum, playing, cu
   );
   gfx_setfont(0);
 );
-
 function draw_mode_button(x,y,hl)
 (
   colorscheme==10 ? (
@@ -4744,7 +5562,7 @@ function draw_drum_note(note) local(notepos, nt, trans, half_rh, scaled_tr, offs
       // chw is 0 when the ICON column is hidden, which would collapse the glyph
       // onto the left edge at a negative radius -- gate on the column bit, not
       // just on the category.
-      (eon_colvis & 1) && eon_cat != PADCAT_NONE ?
+      (eon_cv & 1) && eon_cat != PADCAT_NONE ?
         eon_draw_cat_glyph(eon_cat, (chw*0.5)|0, (tbh+notepos*row_height+row_height*0.5)|0, min(min(chw,row_height)*0.5-2, 12), eon_lum*0.52);
     ) : ( // blank / out-of-kit -> cream (never black)
       setcolor(214,207,194,255);
@@ -4770,7 +5588,7 @@ function draw_drum_note(note) local(notepos, nt, trans, half_rh, scaled_tr, offs
   colorscheme==10 ? gfx_setfont(8, "Verdana", min(max(row_height-3, 9), 14));
   // pianow is 0 when the NAME column is hidden; printing anyway would spill the
   // name across the control strip. Only the EON scheme can hide columns.
-  (colorscheme != 10 || (eon_colvis & 2)) ? gfx_printf(name);
+  (colorscheme != 10 || (eon_cv & 2)) ? gfx_printf(name);
   // EON: lane Mute/Solo buttons + swing% readout in the right control strip (single line, beside the name)
   colorscheme==10 ? (
     eon_ms_by = (tbh+notepos*row_height + eon_ms_row2dy)|0;
@@ -4800,14 +5618,14 @@ function draw_drum_note(note) local(notepos, nt, trans, half_rh, scaled_tr, offs
     row_height >= 8 ? (
       gfx_setfont(8, "Verdana", min(max(eon_ms_bh-2, 7), 12));
       // Mute PILL (red when active)
-      (eon_colvis & 4) ? (
+      (eon_cv & 4) ? (
         eon_vm ? gfx_set(0.84,0.27,0.23,1) : gfx_set(0.22,0.22,0.26,1);
         eon_fill_pill(eon_ms_mx, eon_ms_by, eon_ms_bw, eon_ms_bh);
         eon_vm ? gfx_set(1,1,1,1) : gfx_set(0.66,0.66,0.70,1);
         gfx_x=eon_ms_mx+((eon_ms_bw/2-3)|0); gfx_y=eon_ms_ty; gfx_drawchar($'M');
       );
       // Solo PILL (amber when active)
-      (eon_colvis & 8) ? (
+      (eon_cv & 8) ? (
         eon_vs ? gfx_set(0.95,0.78,0.27,1) : gfx_set(0.22,0.22,0.26,1);
         eon_fill_pill(eon_ms_sx, eon_ms_by, eon_ms_bw, eon_ms_bh);
         eon_vs ? gfx_set(0.09,0.09,0.09,1) : gfx_set(0.66,0.66,0.70,1);
@@ -4872,7 +5690,7 @@ function draw_drum_note(note) local(notepos, nt, trans, half_rh, scaled_tr, offs
       // GROOVE PILL -> blank at rest when straight; appears (highlighted) on hover.
       // Click = pick the groove type, wheel = strength. Classic swing shows "N%",
       // a picked groove shows its short name + strength (amber).
-      (eon_colvis & 64) && (lane_swing[note] > 0 || lane_groove[note] > 0 || note==eon_hover_lane) ? (
+      (eon_cv & 64) && (lane_swing[note] > 0 || lane_groove[note] > 0 || note==eon_hover_lane) ? (
         note==eon_hover_lane ? gfx_set(0.13,0.18,0.24,1) : gfx_set(0.05,0.07,0.10,1);
         eon_fill_pill(eon_sw_x, eon_ms_by, eon_sw_w, eon_ms_bh);
         gfx_setfont(8, "Verdana", 9);
@@ -5491,9 +6309,9 @@ function ss_embed_grid()
     );
     lane += 1;
   );
-  (lbeatpos >= 0 && lbeatpos < cols) ? (                         // playhead column
+  (gfx_beatpos >= 0 && gfx_beatpos < cols) ? (                         // playhead column
     gfx_set(0.0, 0.72, 0.86, 0.18);
-    gfx_rect(lbeatpos*cw, top, max(1, cw), gh);
+    gfx_rect(gfx_beatpos*cw, top, max(1, cw), gh);
   );
   bankh > 0 ? (                                                  // pattern bank (1..8)
     fs = max(8, floor(8*sc)); bw = gfx_w/8; bh = bankh;
@@ -5501,13 +6319,19 @@ function ss_embed_grid()
     i = 0;
     loop(8,
       bx = i*bw;
-      (slider1|0) == i ? gfx_set(0.10, 0.30, 0.40, 1) : (has_notes[i] ? gfx_set(0.22, 0.23, 0.28, 1) : gfx_set(0.13, 0.14, 0.17, 1));
+      // Step 1 "plays everywhere": in sync the bank shows the visible PAGE, and the
+      // pattern behind button i is eon_pat_base+i (no 0..7 recycling).
+      _bka = eon_pat_sync ? eon_pat_base + i : i;
+      p == _bka ? gfx_set(0.10, 0.30, 0.40, 1) : (has_notes[_bka] ? gfx_set(0.22, 0.23, 0.28, 1) : gfx_set(0.13, 0.14, 0.17, 1));
       gfx_rect(bx+1, hh+1, max(1, bw-2), max(1, bh-2));
       gfx_set(0.86, 0.89, 0.93, 1);
-      gfx_x = bx + (bw*0.5 - 3 | 0); gfx_y = hh+2; gfx_drawnumber(i+1, 0);
+      gfx_x = bx + (bw*0.5 - 3 | 0); gfx_y = hh+2; gfx_drawnumber(_bka+1, 0);
       (ss_mx >= bx && ss_mx < bx+bw && ss_my >= hh && ss_my < hh+bh) ? (
         ss_over_widget = 1;
-        (mouse_cap&1) && !ss_lmb_prev ? ( change_pattern(i); sliderchange(slider1=p); sliderchange(slider3=listlength); );
+        (mouse_cap&1) && !ss_lmb_prev ? (
+          eon_pat_sync ? eon_sel_ord = _bka + 1;
+          change_pattern(_bka); sliderchange(slider1=p); sliderchange(slider3=listlength);
+        );
       );
       i += 1;
     );
@@ -5555,7 +6379,7 @@ function ss_embed_panels()
     gfx_set(lr, lg, lb, 1);
     gfx_rect(cx+1, cy+1, colw-2, max(1, rh-2));
     vm ? ( gfx_set(0, 0, 0, 0.48); gfx_rect(cx+1, cy+1, colw-2, max(1, rh-2)); );  // dim when muted
-    (!vm && lbeatpos >= 0 && lbeatpos < listlength && (notelist[lbeatpos] & 2^lane)) ? (
+    (!vm && gfx_beatpos >= 0 && gfx_beatpos < listlength && (notelist[gfx_beatpos] & 2^lane)) ? (
       gfx_set(1, 1, 1, 0.22); gfx_rect(cx+1, cy+1, colw-2, max(1, rh-2));          // step flash
     );
     lum = lr*0.30 + lg*0.59 + lb*0.11;
@@ -5585,6 +6409,585 @@ function ss_embed_panels()
   );
   gfx_setfont(0);
   ss_lmb_prev = mouse_cap & 1;
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EON DOCK FACE — the slim bar, its folded-settings popup, and the view pin.
+// Spec: .docs/specs/Spec_Steppa_Dock_Mode.md; approved mockup beside it.
+//
+// ONE GEOMETRY, TWO CONSUMERS. ss_dock_layout() computes every span into the
+// ss_dk_* globals; ss_dock_input() hit-tests those spans EARLY (before the grid
+// handler gets a look at the click) and ss_dock_bar() draws them later, where
+// the full UI draws its toolbar. Nothing is measured twice, so what is drawn and
+// what is clickable cannot drift apart -- the failure Swing's rack face hit
+// until its grid geometry was funnelled through a single grid_top.
+//
+// Anything that does not fit parks at -1000, the convention eon_ms_geo already
+// uses for hidden lane columns: every hit-test then dies on its own bounds and
+// no caller has to know which chips are up this frame.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Chip width for a label, measured at the bar's own font. The font is set HERE,
+// immediately before the measure: gfx_setfont is global process state and
+// gfx_measurestr never errors, it just answers for whatever font ran last.
+function ss_dk_measure(txt) local(w, h) (
+  gfx_setfont(12, "Verdana", ss_dk_fs, 'b');
+  gfx_measurestr(txt, w, h);
+  w + 14;
+);
+
+// One chip. A parked chip (x = -1000) draws nothing, so callers stay branch-free.
+function ss_dk_pill(cx, cw, txt, r, g, b, tr, tg, tb) (
+  cx > -999 ? (
+    gfx_set(r, g, b, 1);
+    eon_fill_pill(cx, ss_dk_cy, cw, ss_dk_ch);
+    gfx_setfont(12, "Verdana", ss_dk_fs, 'b');
+    gfx_set(tr, tg, tb, 1);
+    gfx_x = cx + 7; gfx_y = ss_dk_cy + (((ss_dk_ch - ss_dk_fs)*0.5)|0);
+    gfx_drawstr(txt);
+  );
+);
+
+// Is the pointer over a span? Parked spans answer false on their own.
+function ss_dk_over(cx, cw) (
+  cx > -999 && mouse_x >= cx && mouse_x < cx + cw && mouse_y >= 0 && mouse_y < ss_dk_h;
+);
+
+// The feel label, word for word the vocabulary the full UI's grid chip uses
+// (draw_numbeats_slider). The two faces must not name the same setting
+// differently.
+function ss_dk_feel_lbl(dest) (
+  steps_per_beat == 4 ? strcpy(dest, "Straight") :
+  steps_per_beat == 3 ? strcpy(dest, "Triplet") :
+  steps_per_beat == 6 ? strcpy(dest, "Triplet 16") :
+  steps_per_beat == 8 ? strcpy(dest, "Straight 32") :
+  sprintf(dest, "S/Bt %d", steps_per_beat);
+);
+
+// Master swing write, verbatim from the full UI's swing-pill drag: the working
+// globals FIRST, then the host mirror. sliderchange() does not re-run @slider, so
+// a mirror-only write would leave swing / lane_swing / groove_dirty stale and the
+// UI would move while nothing played differently.
+function ss_dk_swing_set(v) (
+  swing_p = max(0, min(100, v));
+  swing = ((tpb/2)*(swing_p/100))|0;
+  memset(lane_swing, swing_p, max_numnotes);
+  sliderchange(slider8=swing_p);
+  atomic_set(groove_dirty, 1);
+  refresh_tb = 1;
+);
+
+// Sequence-length write, verbatim from the full UI's Len pill.
+function ss_dk_len_set(v) (
+  listlength = max(2, min(max_seqlength, v));
+  sliderchange(slider3=listlength);
+  change_seqlen(listlength);
+  steps_per_beat = slider9|0;
+  steps_per_beat_pat[p] = steps_per_beat;
+  rateadj = steps_per_beat * rate;
+  p <= chain ? update_chain_beats();
+  refresh_tb = 1;
+);
+
+// The wordmark's dock toggle, ONE implementation for both faces: docked (rig
+// heartbeat fresh + this instance flagged) -> ask our pane script to pop us out;
+// otherwise (bridge alive) -> ask the bridge to dock us. Both are gmem
+// read-modify-write bumps -- sole writer is this JSFX, and a reloaded instance
+// restarting at 0 would never edge. The REDOCK payload (pair slot; -1 lets the
+// bridge fall back to the selected track) is written BEFORE the bump.
+function ss_dk_dock_toggle() (
+  (ss_rig_live && ss_rig_docked) ? (
+    gmem[EON_POPOUT_REQ] = (gmem[EON_POPOUT_REQ]|0) + 1;
+    ss_dock_want ? ( ss_dock_want = 0; sliderchange(slider54 = 0); );
+  ) : gmem[EON_KB_ALIVE] > 0 ? (
+    gmem[EON_REDOCK_SLOT] = eon_pair_slot >= 0 ? eon_pair_slot : -1;
+    gmem[EON_REDOCK_REQ]  = (gmem[EON_REDOCK_REQ]|0) + 1;
+    !ss_dock_want ? ( ss_dock_want = 1; sliderchange(slider54 = 1); );
+  );
+);
+
+// View-pin menu input, extracted from ss_dock_input so the FULL UI's wordmark
+// (which lives outside the dock-face input path) can drive the same menu.
+// Reads/writes the same ss_dk_vm_* geometry the overlay draw uses.
+function ss_dk_vm_tick() local(_i) (
+  ss_dk_vm_in = ss_dk_vm_open
+    && mouse_x >= ss_dk_vm_x && mouse_x < ss_dk_vm_x + ss_dk_vm_w
+    && mouse_y >= ss_dk_vm_y && mouse_y < ss_dk_vm_y + ss_dk_vm_h;
+  (ss_dk_vm_open && mstate==0 && (mouse_cap==1 || mouse_cap==2)) ? (
+    ss_dk_vm_in ? (
+      _i = ((mouse_y - ss_dk_vm_y - 3)/ss_dk_vm_rh)|0;
+      (_i >= 0 && _i < 3) ? ( ss_dock_mode = _i; sliderchange(slider52 = ss_dock_mode); );
+    );
+    ss_dk_vm_open = 0; ss_dk_vm_in = 0;
+    mstate = ms_tb_button_noundo; refresh_tb = 1; eon_pdraw = 4;
+  );
+);
+
+// The house grid picker, anchored at the mouse (eon_pm kind 5) -- the very same
+// panel the full UI's grid chip opens, so Straight/Triplet stays ONE
+// implementation. The beat count is captured at open; the panel's own click
+// handler applies the len+spb pair.
+function ss_dk_grid_menu() (
+  eon_grid_beats = steps_per_beat > 0 ? ((listlength / steps_per_beat) + 0.5)|0 : 4;
+  eon_grid_beats < 1 ? eon_grid_beats = 1;
+  eon_pm_open = 1; eon_pm_kind = 5;
+  eon_pm_ord  = eon_grid_beats; eon_pm_btn = -1;
+  eon_pm_x = mouse_x; eon_pm_y = mouse_y;
+  mstate = ms_tb_button_noundo;
+);
+
+// Preset browser toggle / step, same mailbox cells as the full UI's preset strip.
+function ss_dk_preset_open() (
+  gmem[EON_SS_BROWSER_SLOT]     = eon_pair_slot>=0 ? eon_pair_slot : 0;
+  gmem[EON_SS_BROWSER_OPEN_REQ] = (gmem[EON_SS_BROWSER_OPEN_REQ]|0) + 1;
+);
+function ss_dk_preset_nav(dir) local(_sl) (
+  eon_pnav_seq += 1;
+  _sl = eon_pair_slot>=0 ? eon_pair_slot : 0;
+  gmem[EON_SS_PCTRL_BASE + _sl*EON_SS_PCTRL_STRIDE]     = eon_pnav_seq;
+  gmem[EON_SS_PCTRL_BASE + _sl*EON_SS_PCTRL_STRIDE + 1] = dir;
+  refresh_tb = 1;
+);
+
+// View label -- the same five words slider17 is declared with.
+function ss_dk_view_lbl(dest) (
+  slider17 < 0.5 ? strcpy(dest, "Off") :
+  slider17 < 1.5 ? strcpy(dest, "Piano") :
+  slider17 < 2.5 ? strcpy(dest, "Pads 8") :
+  slider17 < 3.5 ? strcpy(dest, "Pads 16") : strcpy(dest, "Manual");
+);
+
+function ss_dock_layout() local(_x, _r, _w, _h, _n, _e, _p) (
+  ss_dk_fs  = min(max(ss_dk_h - 16, 9), 12);
+  ss_dk_ch  = min(ss_dk_h - 8, 22);
+  ss_dk_cy  = ((ss_dk_h - ss_dk_ch)*0.5)|0;
+  ss_dk_wfs = min(max(ss_dk_h - 14, 10), 14);
+
+  // The right cluster is placed FIRST and never folds: the pair light says whether
+  // this Steppa is talking to a Swing, and "..." is the only way back to the folded
+  // settings. Everything between it and the wordmark shares what is left.
+  _r = gfx_w - 8;
+  ss_dk_mo_w  = ss_dk_measure("...");
+  ss_dk_mo_x  = _r - ss_dk_mo_w;             _r = ss_dk_mo_x - 8;
+  ss_dk_dot_x = _r - 8;                      _r = ss_dk_dot_x - 10;
+
+  gfx_setfont(13, "Verdana", ss_dk_wfs, 'b');
+  gfx_measurestr("STEPPA", _w, _h);
+  ss_dk_wm_x = 8; ss_dk_wm_w = _w;
+  _x = ss_dk_wm_x + _w + 12;
+
+  // -- pattern slots (+ pager, + add) --
+  // Shrink the pitch to a 14px floor before dropping any slot, and window the
+  // survivors so the SELECTED pattern is always one of them: a chip row that can
+  // hide where you are is worse than a short one.
+  _e = (eon_pat_sync && eon_npat_total > 8 ? 1 : 0) + (eon_pat_addbtn ? 1 : 0);
+  _n = eon_npat_vis;
+  _p = ss_dk_ch + 4;
+  ((_n + _e)*_p > _r - _x) ? _p = max(14, ((_r - _x) / max(1, _n + _e))|0);
+  while(_n > 1 && (_n + _e)*_p > _r - _x) (_n -= 1;);
+  ss_dk_pat_w = _p;
+  ss_dk_pat_i = 0;
+  // Window the chips around the ON-PAGE index of the editor's pattern (step 1: p is
+  // the absolute ordinal-1 in sync, so subtract the page base first).
+  _pp = eon_pat_sync ? p - eon_pat_base : p;
+  (_n < eon_npat_vis && _pp >= _n) ? ss_dk_pat_i = min(_pp - _n + 1, eon_npat_vis - _n);
+  ((_n + _e)*_p <= _r - _x) ? (
+    ss_dk_pat_x = _x; ss_dk_pat_n = _n;
+    _x += _n*_p;
+    (eon_pat_sync && eon_npat_total > 8) ? ( ss_dk_pg_x = _x; _x += _p; ) : ( ss_dk_pg_x = -1000; );
+    eon_pat_addbtn ? ( ss_dk_add_x = _x; _x += _p; ) : ( ss_dk_add_x = -1000; );
+    _x += 10;
+  ) : (
+    ss_dk_pat_x = -1000; ss_dk_pat_n = 0; ss_dk_pg_x = -1000; ss_dk_add_x = -1000;
+  );
+
+  // -- Len, feel, Swg, Preset: each placed only if it clears the right cluster --
+  sprintf(#ss_dk_lens, "Len %d", listlength);
+  ss_dk_len_w = ss_dk_measure(#ss_dk_lens);
+  (_x + ss_dk_len_w <= _r) ? ( ss_dk_len_x = _x; _x += ss_dk_len_w + 5; ) : ( ss_dk_len_x = -1000; );
+  ss_dk_feel_lbl(#ss_dk_fls);
+  ss_dk_fl_w = ss_dk_measure(#ss_dk_fls);
+  (_x + ss_dk_fl_w <= _r) ? ( ss_dk_fl_x = _x; _x += ss_dk_fl_w + 5; ) : ( ss_dk_fl_x = -1000; );
+  sprintf(#ss_dk_swgs, "Swg %d", swing_p);
+  ss_dk_sw_w = ss_dk_measure(#ss_dk_swgs);
+  (_x + ss_dk_sw_w <= _r) ? ( ss_dk_sw_x = _x; _x += ss_dk_sw_w + 5; ) : ( ss_dk_sw_x = -1000; );
+  ss_dk_ps_w = ss_dk_measure("< Preset >");
+  (_x + ss_dk_ps_w <= _r) ? ( ss_dk_ps_x = _x; _x += ss_dk_ps_w + 5; ) : ( ss_dk_ps_x = -1000; );
+
+  // -- overlay geometry: input reads it early, the draw reads it late --
+  ss_dk_mp_rh = 24;
+  ss_dk_mp_w  = 216;
+  ss_dk_mp_h  = 8*ss_dk_mp_rh + 8;
+  ss_dk_mp_x  = min(max(ss_dk_mo_x + ss_dk_mo_w - ss_dk_mp_w, 4), max(4, gfx_w - ss_dk_mp_w - 4));
+  ss_dk_mp_y  = ss_dk_h + 2;
+  ss_dk_mp_cx = ss_dk_mp_x + 96;
+  ss_dk_mp_cw = ss_dk_mp_w - 96 - 8;
+  ss_dk_vm_rh = 20;
+  ss_dk_vm_w  = 140;
+  ss_dk_vm_h  = 3*ss_dk_vm_rh + 6;
+  ss_dk_vm_x  = ss_dk_wm_x;
+  ss_dk_vm_y  = ss_dk_h + 2;
+  gfx_setfont(0);
+);
+
+// Input for the whole dock face. Called EARLY in the frame -- before the grid's
+// handler -- so a click on a chip or in an overlay is consumed where it lands.
+// Every gesture latches mstate: ms_tb_button_noundo for one-shots (the file's own
+// "swallow this click" idiom) and ms_dk_drag for value drags, both of which carry
+// the ms_tb bit that shields the grid for the rest of the gesture. Without that,
+// pressing on a chip and sliding down would start drawing notes.
+function ss_dock_input() local(_i, _v, _lmb, _rmb, _cell) (
+  ss_dk_tt = 0;
+  _lmb = mstate==0 && mouse_cap==1;
+  _rmb = mstate==0 && mouse_cap==2;
+
+  // -- a value drag already in flight --
+  // Bar chips move RELATIVELY (1 unit per few px from the press anchor): they are
+  // only ~50px wide, and mapping 0..100 across that would make every pixel worth
+  // two. The popup's bars are wide enough to map absolutely, like the full UI's.
+  mstate == ms_dk_drag ? (
+    ss_dk_drag == 1 ? ss_dk_len_set(ss_dk_dv + (((mouse_x - ss_dk_dx)/6)|0)) :
+    ss_dk_drag == 2 ? ss_dk_swing_set(ss_dk_dv + (((mouse_x - ss_dk_dx)/3)|0)) :
+    ss_dk_drag == 3 ? (
+      lastvelo = max(1, min(127, (1 + 127*(mouse_x - ss_dk_mp_cx)/max(1, ss_dk_mp_cw))|0));
+      refresh_tb = 1;
+    ) :
+    ss_dk_drag == 4 ? (
+      notelen_p  = max(1, min(100, (1 + 100*(mouse_x - ss_dk_mp_cx)/max(1, ss_dk_mp_cw))|0));
+      defnotelen = (tpb*(notelen_p/100))|0;
+      sliderchange(slider6=notelen_p);
+      refresh_tb = 1;
+    );
+  ) : ( ss_dk_drag = 0; );
+
+  // -- folded-settings popup ("...") --
+  ss_dk_more_in = ss_dk_more_open
+    && mouse_x >= ss_dk_mp_x && mouse_x < ss_dk_mp_x + ss_dk_mp_w
+    && mouse_y >= ss_dk_mp_y && mouse_y < ss_dk_mp_y + ss_dk_mp_h;
+  (ss_dk_more_open && (_lmb || _rmb)) ? (
+    ss_dk_more_in ? (
+      _i    = ((mouse_y - ss_dk_mp_y - 4)/ss_dk_mp_rh)|0;
+      _cell = mouse_x >= ss_dk_mp_cx && mouse_x < ss_dk_mp_cx + ss_dk_mp_cw;
+      (_i == 0 && _cell) ? ( mstate = ms_dk_drag; ss_dk_drag = 3;
+        lastvelo = max(1, min(127, (1 + 127*(mouse_x - ss_dk_mp_cx)/max(1, ss_dk_mp_cw))|0));
+      ) :
+      (_i == 1 && _cell) ? ( mstate = ms_dk_drag; ss_dk_drag = 4;
+        notelen_p  = max(1, min(100, (1 + 100*(mouse_x - ss_dk_mp_cx)/max(1, ss_dk_mp_cw))|0));
+        defnotelen = (tpb*(notelen_p/100))|0;
+        sliderchange(slider6=notelen_p);
+      ) :
+      _i == 2 ? ( slider17 = (slider17 + 1) % 5; sliderchange(slider17); recalc_elh = 1;
+                  mstate = ms_tb_button_noundo; ) :
+      _i == 3 ? (
+        // CC/velocity lane show/hide, verbatim from the full UI's CC chip: park the
+        // old height so re-showing returns to it rather than to a default.
+        elh_percent > 0.02 ? ( eon_cc_lasth = elh_percent; elh_percent = 0; )
+                           : ( elh_percent = (eon_cc_lasth > 0.02 ? eon_cc_lasth : 0.18); );
+        sliderchange(slider13=elh_percent); recalc_elh = 1;
+        mstate = ms_tb_button_noundo;
+      ) :
+      _i == 4 ? ( eon_sync_mode = eon_sync_mode ? 0 : 1; sliderchange(slider49=eon_sync_mode);
+                  mstate = ms_tb_button_noundo; ) :
+      _i == 5 ? (
+        // Zoom: frame the arrange on ALL pattern regions (bridge op 10, the
+        // full UI's magnifier-S cell). Regions only exist in sync -- the cell
+        // draws grey and the click is inert otherwise.
+        (eon_pat_sync && eon_pair_slot >= 0) ? eon_song_cmd(10, 0, 0);
+        mstate = ms_tb_button_noundo;
+      ) :
+      _i == 6 ? (
+        // Loop ALL patterns (user 2026-08-26, "loop all patterns not just
+        // current"). Sync: bridge op 12 = loop-selection across every pattern
+        // region + repeat ON. Standalone: the Chain slider IS loop-all --
+        // cycle patterns 0..last-with-notes; clicking again un-chains.
+        // Working globals first, then the slider mirror (house rule).
+        (eon_pat_sync && eon_pair_slot >= 0) ? (
+          eon_song_cmd(12, 0, 0);
+        ) : (
+          eon_lp_last = 0; eon_lp_i = 0;
+          loop(npatterns, has_notes[eon_lp_i] ? eon_lp_last = eon_lp_i; eon_lp_i += 1;);
+          chain = (chain == eon_lp_last && chain > 0) ? 0 : eon_lp_last;
+          sliderchange(slider12 = chain);
+          chain > 0 ? update_chain_beats();
+          refresh_tb = 1;
+        );
+        mstate = ms_tb_button_noundo;
+      ) :
+      _i == 7 ? (
+        // Clear pattern -> the kind-6 confirm panel ("are you sure" is the
+        // user rule); this popup closes underneath it.
+        eon_pm_open = 1; eon_pm_kind = 6; eon_pm_ord = p; eon_pm_btn = -1;
+        eon_pm_x = mouse_x; eon_pm_y = mouse_y;
+        ss_dk_more_open = 0;
+        mstate = ms_tb_button_noundo;
+      )
+              : ( mstate = ms_tb_button_noundo; );
+      refresh_tb = 1; eon_pdraw = max(eon_pdraw, 2);
+    ) : (
+      ss_dk_more_open = 0; ss_dk_more_in = 0;
+      mstate = ms_tb_button_noundo; refresh_tb = 1; eon_pdraw = 4;
+    );
+  );
+
+  // -- view-mode pin menu (right-click the wordmark; shared with the full UI) --
+  ss_dk_vm_tick();
+
+  // -- the bar --
+  (mouse_y >= 0 && mouse_y < ss_dk_h && !ss_dk_more_in && !ss_dk_vm_in) ? (
+    // Hover hints. Parked chips answer false, so no hint can name a chip that is
+    // not on screen. Rendered by the shared tooltip tail, which runs in both faces.
+    ss_dk_over(ss_dk_wm_x,  ss_dk_wm_w)  ? (
+      // State-aware, same three-way as the full-UI band: a floating window
+      // held in the dock face (the one-directional rule keeps faces put) must
+      // say "return", not promise a pop-out it cannot do.
+      ss_dk_tt = (ss_rig_live && ss_rig_docked) ? "Click: pop out to a floating window - right-click: Auto / Full UI / Dock face" :
+                 gmem[EON_KB_ALIVE] > 0         ? "Click: return to the dock - right-click: Auto / Full UI / Dock face" :
+                                                  "Right-click: Auto / Full UI / Dock face";
+    ) :
+    ss_dk_over(ss_dk_len_x, ss_dk_len_w) ? ss_dk_tt = "Pattern length (drag / scroll)" :
+    ss_dk_over(ss_dk_fl_x,  ss_dk_fl_w)  ? ss_dk_tt = "Grid: Straight / Triplet" :
+    ss_dk_over(ss_dk_sw_x,  ss_dk_sw_w)  ? ss_dk_tt = "Swing amount (drag / scroll)" :
+    ss_dk_over(ss_dk_ps_x,  ss_dk_ps_w)  ? ss_dk_tt = "Presets: prev | browse | next" :
+    ss_dk_over(ss_dk_mo_x,  ss_dk_mo_w)  ? ss_dk_tt = "U velocity, Note length, View, CC lane, Sync" :
+    ss_dk_over(ss_dk_add_x, ss_dk_pat_w) ? ss_dk_tt = "New Drum Matrix region" :
+    ss_dk_over(ss_dk_pg_x,  ss_dk_pat_w) ? ss_dk_tt = "Next page of regions" :
+    ss_dk_over(ss_dk_dot_x - 4, 16)      ? ss_dk_tt = (eon_pair_slot >= 0 ? "Paired with Swing" : "Not paired") : 0;
+
+    _lmb ? (
+      ss_dk_over(ss_dk_wm_x, ss_dk_wm_w) ? (
+        // Pop out: our pane script re-shows the float; its handoff watcher
+        // restores the canvas and closes the pane. One bump, no window code here.
+        ss_dk_dock_toggle();
+        mstate = ms_tb_button_noundo;
+      ) :
+      ss_dk_over(ss_dk_mo_x, ss_dk_mo_w) ? (
+        ss_dk_more_open = 1 - ss_dk_more_open; ss_dk_vm_open = 0;
+        mstate = ms_tb_button_noundo; refresh_tb = 1;
+      ) :
+      (ss_dk_pat_x > -999 && mouse_y < ss_dk_h
+       && mouse_x >= ss_dk_pat_x && mouse_x < ss_dk_pat_x + ss_dk_pat_n*ss_dk_pat_w) ? (
+        _i = ss_dk_pat_i + (((mouse_x - ss_dk_pat_x)/ss_dk_pat_w)|0);
+        // The same three writes the full UI's pattern button makes: the ABSOLUTE
+        // region ordinal (published to the bridge as SS_SELORD, so paging cannot
+        // aim it at the wrong region), then the local switch and its mirrors.
+        eon_pat_sync ? eon_sel_ord = eon_pat_base + _i + 1;
+        change_pattern(eon_pat_sync ? eon_pat_base + _i : _i);   // step 1: ordinal-1, no recycling
+        sliderchange(slider1=p);
+        sliderchange(slider3=listlength);
+        mstate = ms_tb_button_noundo; refresh_tb = 1;
+      ) :
+      ss_dk_over(ss_dk_pg_x, ss_dk_pat_w) ? (
+        eon_pat_page = (eon_pat_page + 1) % eon_pat_pages;
+        mstate = ms_tb_button_noundo; refresh_tb = 1;
+      ) :
+      (ss_dk_over(ss_dk_add_x, ss_dk_pat_w) && eon_pair_slot >= 0) ? (
+        // gmem read-modify-write, not a local counter -- sole writer is this JSFX,
+        // and a reloaded instance restarting at 0 would never edge.
+        gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_NEW_REQ] =
+          (gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_NEW_REQ]|0) + 1;
+        mstate = ms_tb_button_noundo;
+      ) :
+      ss_dk_over(ss_dk_len_x, ss_dk_len_w) ? (
+        mstate = ms_dk_drag; ss_dk_drag = 1; ss_dk_dx = mouse_x; ss_dk_dv = listlength;
+      ) :
+      ss_dk_over(ss_dk_sw_x, ss_dk_sw_w) ? (
+        mstate = ms_dk_drag; ss_dk_drag = 2; ss_dk_dx = mouse_x; ss_dk_dv = swing_p;
+      ) :
+      ss_dk_over(ss_dk_fl_x, ss_dk_fl_w) ? ss_dk_grid_menu() :
+      ss_dk_over(ss_dk_ps_x, ss_dk_ps_w) ? (
+        // Three zones, exactly as the full UI's preset strip: the outer thirds step
+        // the preset, the middle toggles the browser.
+        (mouse_x >= ss_dk_ps_x + ss_dk_ps_w*0.30 && mouse_x < ss_dk_ps_x + ss_dk_ps_w*0.70) ?
+          ss_dk_preset_open() : ss_dk_preset_nav(mouse_x < ss_dk_ps_x + ss_dk_ps_w*0.5 ? -1 : 1);
+        mstate = ms_tb_button_noundo; refresh_tb = 1;
+      ) : 0;
+    );
+
+    _rmb ? (
+      ss_dk_over(ss_dk_wm_x, ss_dk_wm_w) ? (
+        ss_dk_vm_open = 1 - ss_dk_vm_open; ss_dk_more_open = 0;
+        mstate = ms_tb_button_noundo; refresh_tb = 1;
+      ) :
+      ss_dk_over(ss_dk_fl_x, ss_dk_fl_w) ? ss_dk_grid_menu() :
+      ss_dk_over(ss_dk_ps_x, ss_dk_ps_w) ? ( ss_dk_preset_open(); mstate = ms_tb_button_noundo; ) : 0;
+    );
+
+    mouse_wheel != 0 ? (
+      _v = mouse_wheel > 0 ? 1 : -1;
+      ss_dk_over(ss_dk_len_x, ss_dk_len_w) ? ss_dk_len_set(listlength + _v) :
+      ss_dk_over(ss_dk_sw_x,  ss_dk_sw_w)  ? ss_dk_swing_set(swing_p + _v*((mouse_cap&8) ? 1 : 5)) :
+      ss_dk_over(ss_dk_ps_x,  ss_dk_ps_w)  ? ss_dk_preset_nav(_v) : 0;
+      mouse_wheel = 0;
+    );
+  );
+);
+
+// The bar itself. Drawn where the full UI draws its toolbar, so refresh_tb is
+// consumed at exactly the same point in the frame -- the grid cache reads that
+// flag earlier on purpose and must keep seeing this frame's value.
+//
+// Repaints EVERY frame rather than on the dirty flag: it is a dozen chips, next
+// to nothing beside the note matrix, and this file runs gfx_clear = -1, so a
+// refresh-gated bar would carry stale pixels forward on every change that
+// forgot to raise the flag.
+function ss_dock_bar() local(_i, _n, _cx, _sel, _cl, _rc, _lum) (
+  refresh_tb = 0;
+  gfx_set(0.122, 0.122, 0.122, 1); gfx_rect(0, 0, gfx_w, ss_dk_h);
+  gfx_set(0, 0, 0, 1);             gfx_rect(0, ss_dk_h - 1, gfx_w, 1);
+
+  gfx_setfont(13, "Verdana", ss_dk_wfs, 'b');
+  gfx_set(0.878, 0.439, 0.188, 1);
+  gfx_x = ss_dk_wm_x; gfx_y = ((ss_dk_h - ss_dk_wfs)*0.5)|0;
+  gfx_drawstr("STEPPA");
+
+  // Pattern slots. The colour derivation is the full UI's draw_pat_button, ported
+  // rather than simplified: a pattern -- or, in sync, a Drum Matrix region -- wears
+  // ONE identity in both faces. Per-pattern hue, or the bridge-published region
+  // colour when synced, brightness-scaled for selected / has-notes / empty, with
+  // the number taking its contrast from the fill luminance by the same rule.
+  // eon_sel_onpage keeps a paged-away selection from lighting the same-index chip
+  // on another page.
+  // The selected chip also CAPTURES eon_selrc, the grid backdrop tint: in the full
+  // UI draw_pat_button owns that capture, and draw_pat_button does not run here.
+  ss_dk_pat_x > -999 ? (
+    gfx_setfont(12, "Verdana", ss_dk_fs, 'b');
+    _i = 0;
+    loop(ss_dk_pat_n,
+      _n   = ss_dk_pat_i + _i;
+      _na  = eon_pat_sync ? eon_pat_base + _n : _n;   // step 1: the pattern behind this chip (ordinal-1 in sync)
+      _cx  = ss_dk_pat_x + _i*ss_dk_pat_w;
+      _sel = _na == p && eon_sel_onpage;
+      pattern_hue[_na] < 0 ? (           // MPC cream / housing pattern
+        _cl = _sel ? 1.0 : (has_notes[_na] ? 0.70 : 0.52);
+        gfx_r=0.84*_cl; gfx_g=0.81*_cl; gfx_b=0.76*_cl;
+      ) : (
+        eon_hsl2rgb(pattern_hue[_na], 0.62, _sel ? 0.56 : (has_notes[_na] ? 0.31 : 0.20));
+      );
+      eon_pat_sync ? (
+        // Field RGNCOL+n is a PAGE WINDOW (the bridge slices at SS_PAGE), so it is
+        // indexed by slot, not by absolute ordinal -- same as the full UI.
+        _rc = gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_RGNCOL + _n]|0;
+        _sel ? eon_selrc = _rc;
+        _rc > 0 ? (
+          _cl = _sel ? 1.0 : (has_notes[_na] ? 0.66 : 0.46);
+          gfx_r = ((_rc/65536)|0)/255*_cl;
+          gfx_g = (((_rc/256)|0)%256)/255*_cl;
+          gfx_b = (_rc%256)/255*_cl;
+        );
+      );
+      _lum = gfx_r*0.30 + gfx_g*0.59 + gfx_b*0.11;
+      gfx_a = 1;
+      eon_fill_pill(_cx, ss_dk_cy, ss_dk_pat_w - 3, ss_dk_ch);
+      (chain > 0 && chain >= _na) ? ( setcolor(0,205,238,255); gfx_rect(_cx+2, ss_dk_cy, ss_dk_pat_w-7, 2); );
+      _sel ? (   // bright rim + cyan accent bar: the full UI's selected treatment, chip-sized
+        gfx_set(0.99,1.0,1.0,1.0);
+        gfx_rect(_cx+1, ss_dk_cy, ss_dk_pat_w-5, 1);
+        gfx_rect(_cx+1, ss_dk_cy+ss_dk_ch-1, ss_dk_pat_w-5, 1);
+        gfx_set(0.0,0.86,1.0,1.0);
+        gfx_rect(_cx+2, ss_dk_cy+ss_dk_ch-3, ss_dk_pat_w-7, 2);
+      );
+      _lum > 0.52 ? setcolor(26,30,36,255) : setcolor(238,244,250,255);
+      gfx_x = (_cx + (ss_dk_pat_w - 3)*0.5 - 4)|0;
+      gfx_y = ss_dk_cy + (((ss_dk_ch - ss_dk_fs)*0.5)|0);
+      gfx_drawnumber(eon_pat_sync ? eon_pat_base + _n + 1 : _n + 1, 0);
+      _i += 1;
+    );
+  );
+  ss_dk_pg_x  > -999 ? ss_dk_pill(ss_dk_pg_x,  ss_dk_pat_w - 3, ">>", 0.149,0.149,0.149, 0.541,0.541,0.541);
+  ss_dk_add_x > -999 ? ss_dk_pill(ss_dk_add_x, ss_dk_pat_w - 3, "+",  0.149,0.149,0.149, 0.541,0.541,0.541);
+
+  ss_dk_pill(ss_dk_len_x, ss_dk_len_w, #ss_dk_lens, 0.761,0.416,0.165, 0.067,0.067,0.067);
+  ss_dk_pill(ss_dk_fl_x,  ss_dk_fl_w,  #ss_dk_fls,  0.541,0.184,0.165, 1,1,1);
+  ss_dk_pill(ss_dk_sw_x,  ss_dk_sw_w,  #ss_dk_swgs, 0.200,0.200,0.200, 0.867,0.867,0.867);
+  ss_dk_pill(ss_dk_ps_x,  ss_dk_ps_w,  "< Preset >", 0.149,0.149,0.149, 0.541,0.541,0.541);
+
+  // Pair light: lit while a Swing owns this Steppa's lane names, colours and mixer.
+  eon_pair_slot >= 0 ? gfx_set(0.227, 0.624, 0.847, 1) : gfx_set(0.220, 0.220, 0.240, 1);
+  gfx_circle(ss_dk_dot_x + 4, (ss_dk_h*0.5)|0, 4, 1, 1);
+
+  ss_dk_pill(ss_dk_mo_x, ss_dk_mo_w, "...",
+             ss_dk_more_open ? 0.30 : 0.149, ss_dk_more_open ? 0.34 : 0.149, ss_dk_more_open ? 0.40 : 0.149,
+             ss_dk_more_open ? 0.93 : 0.541, ss_dk_more_open ? 0.96 : 0.541, ss_dk_more_open ? 1.0 : 0.541);
+  gfx_setfont(0);
+);
+
+// Overlays: the folded-settings popup and the view pin menu. Drawn LATE, over the
+// grid, in the same tail the full UI's own dropdowns draw from. Cream-on-teal is
+// the house menu language (eon_vdd / eon_pm).
+function ss_dock_overlays() local(_i, _y, _fr, _bw, _lbl) (
+  ss_dk_more_open ? (
+    gfx_set(0,0,0,0.30);         gfx_rect(ss_dk_mp_x+3, ss_dk_mp_y+4, ss_dk_mp_w, ss_dk_mp_h);
+    gfx_set(0.84,0.81,0.76,1.0); gfx_rect(ss_dk_mp_x, ss_dk_mp_y, ss_dk_mp_w, ss_dk_mp_h);
+    gfx_set(0.40,0.37,0.32,1.0); gfx_rect(ss_dk_mp_x, ss_dk_mp_y, ss_dk_mp_w, ss_dk_mp_h, 0);
+    gfx_setfont(12, "Verdana", ss_dk_fs, 'b');
+    _i = 0;
+    loop(8,
+      _y = ss_dk_mp_y + 4 + _i*ss_dk_mp_rh;
+      gfx_set(0.14,0.16,0.14,1);
+      gfx_x = ss_dk_mp_x + 8; gfx_y = _y + ((ss_dk_mp_rh - ss_dk_fs)*0.5)|0;
+      _i == 0 ? gfx_drawstr("U velocity") :
+      _i == 1 ? gfx_drawstr("Note length") :
+      _i == 2 ? gfx_drawstr("View") :
+      _i == 3 ? gfx_drawstr("CC lane") :
+      _i == 4 ? gfx_drawstr("Sync (DM)") :
+      _i == 5 ? gfx_drawstr("Zoom: song") :   // = the S zoom cell (op 10: fit the arrange to every pattern region); "Zoom out" said less than it did
+      _i == 6 ? gfx_drawstr("Loop") : gfx_drawstr("Clear pattern");
+      // Value cell. Rows 0/1 are filled bars (click or drag anywhere in the cell);
+      // rows 2..4 are click-to-change cells, lit when the setting is on.
+      _i <= 1 ? (
+        _fr = _i == 0 ? lastvelo/127 : notelen_p/100;
+        gfx_set(0.10,0.12,0.14,1); gfx_rect(ss_dk_mp_cx, _y+2, ss_dk_mp_cw, ss_dk_mp_rh-6);
+        _bw = (ss_dk_mp_cw*_fr)|0;
+        gfx_set(0.16*(0.5+_fr), 0.55*(0.5+_fr), 0.66*(0.5+_fr), 1);
+        _bw > 0 ? gfx_rect(ss_dk_mp_cx, _y+2, _bw, ss_dk_mp_rh-6);
+        gfx_set(0.93,0.96,0.99,1);
+        gfx_x = ss_dk_mp_cx + 6; gfx_y = _y + ((ss_dk_mp_rh - ss_dk_fs)*0.5)|0;
+        _i == 0 ? gfx_drawnumber(lastvelo, 0) : ( gfx_drawnumber(notelen_p, 0); gfx_drawstr("%"); );
+      ) : (
+        _i == 2 ? gfx_set(0.16,0.34,0.42,1) :
+        _i == 3 ? ((elh_percent > 0.02) ? gfx_set(0.18,0.45,0.28,1) : gfx_set(0.22,0.24,0.22,1)) :
+        _i == 4 ? (eon_sync_mode ? gfx_set(0.18,0.45,0.28,1) : gfx_set(0.22,0.24,0.22,1)) :
+        _i == 5 ? ((eon_pat_sync && eon_pair_slot >= 0) ? gfx_set(0.16,0.34,0.42,1) : gfx_set(0.20,0.21,0.20,1)) :
+        _i == 6 ? ((eon_pat_sync && eon_pair_slot >= 0) ? gfx_set(0.16,0.34,0.42,1)
+                   : (chain > 0 ? gfx_set(0.18,0.45,0.28,1) : gfx_set(0.22,0.24,0.22,1))) :
+                  gfx_set(0.42,0.16,0.14,1);
+        gfx_rect(ss_dk_mp_cx, _y+2, ss_dk_mp_cw, ss_dk_mp_rh-6);
+        gfx_set(0.90,0.95,0.97,1);
+        gfx_x = ss_dk_mp_cx + 6; gfx_y = _y + ((ss_dk_mp_rh - ss_dk_fs)*0.5)|0;
+        _i == 2 ? ( ss_dk_view_lbl(#ss_dk_vls); gfx_drawstr(#ss_dk_vls); ) :
+        _i == 3 ? gfx_drawstr(elh_percent > 0.02 ? "On" : "Off") :
+        _i == 4 ? gfx_drawstr(eon_sync_mode ? "On" : "Off") :
+        _i == 5 ? gfx_drawstr((eon_pat_sync && eon_pair_slot >= 0) ? "All patterns" : "Sync only") :
+        _i == 6 ? ((eon_pat_sync && eon_pair_slot >= 0) ? gfx_drawstr("All patterns")
+                   : (chain > 0 ? ( gfx_drawstr("Chain 1-"); gfx_drawnumber(chain+1, 0); )
+                                : gfx_drawstr("Off (chain all)")))
+                : gfx_drawstr("Clear...");
+      );
+      _i += 1;
+    );
+    gfx_setfont(0);
+  );
+
+  ss_dk_vm_open ? (
+    gfx_set(0,0,0,0.30);         gfx_rect(ss_dk_vm_x+3, ss_dk_vm_y+4, ss_dk_vm_w, ss_dk_vm_h);
+    gfx_set(0.84,0.81,0.76,1.0); gfx_rect(ss_dk_vm_x, ss_dk_vm_y, ss_dk_vm_w, ss_dk_vm_h);
+    gfx_set(0.40,0.37,0.32,1.0); gfx_rect(ss_dk_vm_x, ss_dk_vm_y, ss_dk_vm_w, ss_dk_vm_h, 0);
+    gfx_setfont(12, "Verdana", ss_dk_fs, 'b');
+    _i = 0;
+    loop(3,
+      _y = ss_dk_vm_y + 3 + _i*ss_dk_vm_rh;
+      (mouse_x >= ss_dk_vm_x && mouse_x < ss_dk_vm_x+ss_dk_vm_w && mouse_y >= _y && mouse_y < _y+ss_dk_vm_rh) ? (
+        gfx_set(0.16,0.34,0.42,1); gfx_rect(ss_dk_vm_x+2, _y, ss_dk_vm_w-4, ss_dk_vm_rh);
+        gfx_set(0.96,0.98,1.0,1);
+      ) : gfx_set(0.14,0.16,0.14,1);
+      gfx_x = ss_dk_vm_x + 8; gfx_y = _y + ((ss_dk_vm_rh - ss_dk_fs)*0.5)|0;
+      ss_dock_mode == _i ? gfx_drawstr("* ") : gfx_drawstr("  ");
+      _i == 0 ? gfx_drawstr("Auto") :
+      _i == 1 ? gfx_drawstr("Full UI always") : gfx_drawstr("Dock face always");
+      _i += 1;
+    );
+    gfx_setfont(0);
+  );
 );
 
 row_height = (grid_bottom-tbh) / numnotes;
@@ -5765,6 +7168,44 @@ ss_emb ? (
   mouse_wheel = 0;
 ) : (
 
+// DOCK FACE: geometry then input, before anything else in this branch can look
+// at the click. ss_dock_input() latches mstate on every gesture it claims, which
+// is what keeps the grid handler (and the lane handlers) off the bar.
+// The two "in panel" flags are shields the grid guard reads; they must be
+// cleared in the full UI or a stale 1 would wedge grid input after a face swap.
+ss_dock_face ? (
+  ss_dock_layout();
+  ss_dock_input();
+) : (
+  ss_dk_more_in = 0; ss_dk_tt = 0;
+  // FULL UI wordmark (the 24px band above the pattern row, EON scheme only):
+  // same gestures as the dock face's wordmark -- left-click toggles docked
+  // state (pop out / redock via ss_dk_dock_toggle), right-click the view-pin
+  // menu, which anchors just under the band here. Runs EARLY so a click on the
+  // band can never fall through to the piano-strip drag or pattern handlers
+  // (they all guard on mstate==0).
+  colorscheme==10 ? (
+    gfx_setfont(13, "Verdana", 13, 'b');
+    gfx_measurestr("STEPPA", eon_wm_w, eon_wm_h);
+    eon_wm_y0 = eon_pbh - 22;
+    eon_wm_hov = mouse_x >= 8 && mouse_x < 8 + eon_wm_w + 6
+              && mouse_y >= eon_wm_y0 && mouse_y < eon_pbh - 2;
+    eon_wm_hov != eon_l_wm_hov ? (eon_l_wm_hov = eon_wm_hov; refresh_tb = 1;);
+    (eon_wm_hov && mstate==0 && mouse_cap==1 && !ss_dk_vm_in) ? (
+      ss_dk_dock_toggle();
+      mstate = ms_tb_button_noundo;
+    );
+    (eon_wm_hov && mstate==0 && mouse_cap==2 && !ss_dk_vm_in) ? (
+      ss_dk_vm_x = 8; ss_dk_vm_y = eon_pbh + 2;
+      ss_dk_vm_rh = 20; ss_dk_vm_w = 140; ss_dk_vm_h = 3*ss_dk_vm_rh + 6;
+      ss_dk_vm_open = 1 - ss_dk_vm_open;
+      mstate = ms_tb_button_noundo; refresh_tb = 1;
+    );
+    ss_dk_vm_tick();
+    gfx_setfont(0);
+  ) : ( ss_dk_vm_in = 0; );
+);
+
 refresh_pianokeys ? (
   refresh_pianokeys=0;
   draw_pianokeys();
@@ -5826,7 +7267,7 @@ colorscheme==10 && mode==1 && mouse_wheel != 0 && eon_kn_hov < 0 && mouse_x >= 0
     lane_swing[eon_sw_lane] = max(0, min(100, lane_swing[eon_sw_lane] + (mouse_wheel>0 ? (mouse_cap&8 ? 1 : 5) : (mouse_cap&8 ? -1 : -5))));
     mouse_wheel = 0;
     refresh_pianokeys = 1;
-    groove_dirty = 1;   // EON GROOVE: lane strength changed -> rebuild the runtime table
+    atomic_set(groove_dirty, 1);   // EON GROOVE: lane strength changed -> rebuild the runtime table
   );
 );
 
@@ -5841,7 +7282,7 @@ settingsopen != eon_so_last_open ? (
   refresh_tb=1; refresh_pianokeys=1; refresh_cc_controls=1; eon_pdraw = max(eon_pdraw, 2);
 );
 eon_so_open ? (
-  eon_so_w=372; eon_so_h=466; eon_so_x=((gfx_w-eon_so_w)/2)|0; eon_so_y=(tbh+18)|0;  // h: +30 each for "Region (DM)" + "Grid feel" + "Export > DM" + "Zoom on select" + "Sync on by default" + "Auto-adapt patterns" + "Grid lines" + "Lane columns" rows over the 226 base — keeps all inside the click-shield
+  eon_so_w=372; eon_so_h=526; eon_so_x=((gfx_w-eon_so_w)/2)|0; eon_so_y=(tbh+18)|0;  // h: +30 each for "Region (DM)" + "Grid feel" + "Export > DM" + "Zoom on select" + "Sync on by default" + "Auto-adapt patterns" + "Grid lines" + "Lane columns" rows over the 226 base — keeps all inside the click-shield
   eon_so_in_panel = (mouse_x>=eon_so_x && mouse_x<eon_so_x+eon_so_w && mouse_y>=eon_so_y && mouse_y<eon_so_y+eon_so_h);
 ) : (eon_so_in_panel=0);
 
@@ -5890,6 +7331,12 @@ colorscheme==10 && mstate==0 && mouse_cap==1 && eon_pair_slot >= 0
   ) :
   (mouse_x >= eon_cogb_x+busp && mouse_x < eon_cogb_x+busp*2-3) ? (
     eon_song_cmd(11, max(eon_sel_ord, 1), 0);
+    mstate = ms_tb_button_noundo; refresh_tb = 1;
+  ) :
+  (mouse_x >= eon_cogb_x+busp*2 && mouse_x < eon_cogb_x+busp*3-3) ? (
+    // LOOP ALL: bridge op 12 -- loop selection across every pattern region +
+    // repeat ON (companion to the S zoom cell; user 2026-08-26).
+    eon_song_cmd(12, 0, 0);
     mstate = ms_tb_button_noundo; refresh_tb = 1;
   );
 );
@@ -5980,7 +7427,7 @@ eon_gdd_open && mstate==0 && mouse_cap==1 ? (
         memset(lane_groove, eon_gs_slot, max_numnotes);
         memset(lane_swing, swing_p, max_numnotes);
       );
-      groove_dirty = 1;
+      atomic_set(groove_dirty, 1);
       eon_apply_dirty = 1; eon_apply_settle = 0;
       refresh_pianokeys = 1;
     ) :
@@ -5998,7 +7445,7 @@ eon_gdd_open && mstate==0 && mouse_cap==1 ? (
         memset(lane_groove, eon_gdd_pick, max_numnotes);   // master pick -> all lanes (lane picks override after)
         memset(lane_swing, swing_p, max_numnotes);
       );
-      groove_dirty = 1;
+      atomic_set(groove_dirty, 1);
       eon_apply_dirty = 1; eon_apply_settle = 0;           // debounced sliderchange -> undo point + serialize snapshot
       refresh_pianokeys = 1;
     ) : (
@@ -6006,7 +7453,7 @@ eon_gdd_open && mstate==0 && mouse_cap==1 ? (
         eon_gv = groove_vel_amt_p1 > 0 ? groove_vel_amt_p1 - 1 : 100;
         eon_gv = eon_gv >= 100 ? 0 : eon_gv + 25;
         groove_vel_amt_p1 = eon_gv + 1;
-        groove_dirty = 1; eon_apply_dirty = 1; eon_apply_settle = 0;
+        atomic_set(groove_dirty, 1); eon_apply_dirty = 1; eon_apply_settle = 0;
         eon_gdd_keep = 1;                                  // stay open for repeat clicks
       ) :
       eon_gdd_isimp ? (                                    // "Import grooves..." -> bridge launches the .rgt browser
@@ -6170,10 +7617,14 @@ eon_lm_open && mstate==0 && (mouse_cap==1 || mouse_cap==2) ? (
 //   4 = song-strip background (Clear song / Commit)
 //   5 = grid picker (Straight/Triplet/Fine; eon_pm_ord = beat count captured
 //       at open -- Elektron model, the bar re-divides)
+//   6 = CLEAR PATTERN confirm (user 2026-08-26: "ensure it asks are you sure");
+//       eon_pm_ord = the 0-based pattern index captured at open (always the
+//       ACTIVE one -- both openers pass p). Row 0 clears, row 1 cancels, and a
+//       click anywhere else dismisses like every other kind.
 eon_pm_open ? (
   eon_pm_hh = 22; eon_pm_rh = 19;
-  eon_pm_n = eon_pm_kind == 3 ? 9 : eon_pm_kind == 4 ? 2 : eon_pm_kind == 5 ? 4 : 3;
-  eon_pm_w = eon_pm_kind == 5 ? 190 : 150;
+  eon_pm_n = eon_pm_kind == 3 ? 9 : eon_pm_kind == 4 ? 2 : eon_pm_kind == 5 ? 4 : eon_pm_kind == 6 ? 2 : eon_pm_kind == 7 ? 7 : 3;
+  eon_pm_w = eon_pm_kind == 5 ? 190 : eon_pm_kind == 7 ? 160 : 150;
   eon_pm_h = eon_pm_hh + eon_pm_n*eon_pm_rh;
   eon_pm_x > gfx_w - eon_pm_w - 2 ? eon_pm_x = max(0, gfx_w - eon_pm_w - 2);
   eon_pm_y + eon_pm_h > gfx_h - 2 ? eon_pm_y = max(0, gfx_h - 2 - eon_pm_h);
@@ -6226,6 +7677,48 @@ eon_pm_open && mstate==0 && (mouse_cap==1 || mouse_cap==2) ? (
       ) :
       eon_pm_kind == 4 ? (
         eon_pm_hrow == 0 ? eon_song_cmd(8, 0, 0) : eon_song_cmd(9, 0, 0);
+      ) :
+      eon_pm_kind == 7 ? (
+        // timeline block menu (strip polish): 0 edit it, 1 play from here (op 13),
+        // 2 loop this section (op 15), 3/4/5 add to the chain x1/x2/x4 (op 14, one
+        // op so a half-landed append can't happen), 6 clear the chain (op 8).
+        eon_pm_hrow == 0 ? (
+          _tlp = eon_map[eon_pm_btn*4+2]|0;
+          (_tlp >= 0 && _tlp < npatterns && _tlp != p) ? (
+            eon_sel_ord = eon_pm_ord; eon_pat_page = (eon_pm_btn / 8)|0;
+            change_pattern(_tlp); sliderchange(slider1=p); sliderchange(slider3=listlength);
+          );
+        ) :
+        eon_pm_hrow == 1 ? eon_song_cmd(13, eon_pm_ord, 0) :
+        eon_pm_hrow == 2 ? eon_song_cmd(15, eon_pm_ord, 0) :
+        eon_pm_hrow == 3 ? eon_song_cmd(14, eon_pm_ord, 1) :
+        eon_pm_hrow == 4 ? eon_song_cmd(14, eon_pm_ord, 2) :
+        eon_pm_hrow == 5 ? eon_song_cmd(14, eon_pm_ord, 4) :
+                           eon_song_cmd(8, 0, 0);
+      ) :
+      eon_pm_kind == 6 ? (
+        // kind 6: CLEAR PATTERN, confirmed. Wipes the active pattern's note /
+        // tie / cc / velocity / ratchet storage (clear_pattern covers the spare
+        // pattern-mode banks too), then everything a grid rewrite must touch:
+        eon_pm_hrow == 0 ? (
+          clear_pattern(eon_pm_ord);
+          // clear_pattern covers notes/ties/cc/velocity + the pattern-mode spare
+          // banks but NOT the ratchet slab; both openers pass the ACTIVE pattern
+          // (eon_pm_ord == p), whose slab base is sdlist_p (the :1897 idiom) --
+          // without this a re-added step would resurrect its old ratchets.
+          memset(sdlist + sdlist_p, 0, max_numnotes*max_seqlength*max_subdivs);
+          update_has_notes();   // the house finisher (legacy clear at :8344 does the same)
+          eon_gc_gfxseq += 1;   // grid cache: arrays rewritten without p changing -- invalidate
+                                // (the @gfx-owned counter -- see its @init comment)
+          atomic_set(groove_dirty, 1);
+          refresh_pianokeys = 1;
+          // Sync: the DM region is the source of truth, so an un-exported clear
+          // would be resurrected by the next region import. Post the same
+          // one-shot the Settings "Export > DM" row posts; @block serializes
+          // the (now empty) grid onto the region.
+          (eon_pat_sync && eon_pair_slot >= 0 && eon_pm_ord == p) ? eon_export_pending = 1;
+          eon_pm_undo = 1;      // real grid edit -> the release fires the undo point
+        );
       ) : (
         // kind 5: grid re-divide -- the old inline gfx_showmenu apply, verbatim.
         // Beat count was captured at OPEN in eon_pm_ord; same apply idiom as the
@@ -6263,7 +7756,9 @@ eon_pm_open && mstate==0 && (mouse_cap==1 || mouse_cap==2) ? (
 );
 
 // EON: mouse-wheel over toolbar value controls (Swing / Velocity / Note Length / Seq Length / Steps-per-beat)
-colorscheme==10 && mouse_wheel != 0 && mouse_y >= 0 && mouse_y < tbh ? (
+// !ss_dock_face: in the dock face this y band IS the slim bar, and the bar's own
+// wheel handler already ran (and zeroed the notch) up in ss_dock_input.
+colorscheme==10 && !ss_dock_face && mouse_wheel != 0 && mouse_y >= 0 && mouse_y < tbh ? (
   eon_wd = mouse_wheel>0 ? 1 : -1;
   eon_ws = (mouse_cap&8) ? 1 : 5;   // Shift = fine
   (slider17 >= 3.5 && mouse_y < eon_pbh) ? (   // Manual map: scroll a pad to retune its note
@@ -6281,8 +7776,30 @@ colorscheme==10 && mouse_wheel != 0 && mouse_y >= 0 && mouse_y < tbh ? (
   ) :
   (mouse_y>=eon_pbh && mouse_y<eon_pbh+tbrh && mouse_x>=eon_swpx && mouse_x<eon_swpx+eon_swpw) ? (
     swing_p = max(0,min(100, swing_p + eon_wd*eon_ws)); swing=((tpb/2)*(swing_p/100))|0;
-    memset(lane_swing, swing_p, max_numnotes); groove_dirty = 1;   // EON GROOVE: master wheel now propagates like the drag (was inert per-lane before)
+    memset(lane_swing, swing_p, max_numnotes); atomic_set(groove_dirty, 1);   // EON GROOVE: master wheel now propagates like the drag (was inert per-lane before)
     sliderchange(slider8=swing_p); refresh_tb=1;
+  ) : (eon_song_vis && mouse_y >= eon_song_y-1 && mouse_y < eon_song_y+eon_song_h-2) ? (
+    // Strip polish (2026-09-03): wheel over the SONG strip. TIMELINE face = step the
+    // EDITOR through the sections in time order (the same three writes as a click; the
+    // engine keeps following the playhead). CHAIN face = the repeat count of the chip
+    // under the cursor (SET_REPEATS, op 4), 1..16.
+    eon_song_geom();
+    eon_sg_tl ? (
+      eon_wi = max(0, min(eon_map_n-1, (p < eon_map_n ? p : 0) + eon_wd));
+      eon_wp = eon_map[eon_wi*4+2]|0;
+      (eon_wp >= 0 && eon_wp < npatterns && eon_wp != p) ? (
+        eon_sel_ord = eon_wi + 1; eon_pat_page = (eon_wi / 8)|0;
+        change_pattern(eon_wp); sliderchange(slider1=p); sliderchange(slider3=listlength);
+      );
+    ) : (
+      eon_we = eon_sg_hit(mouse_x);
+      eon_we >= 0 ? (
+        eon_wv = gmem[eon_sg_b + 8 + eon_we*2]|0; eon_wr = max((eon_wv/256)|0, 1);
+        eon_wr2 = max(1, min(16, eon_wr + eon_wd));
+        eon_wr2 != eon_wr ? eon_song_cmd(4, eon_we + 1, eon_wr2);
+      );
+    );
+    refresh_tb = 1;
   ) : (mouse_y>=eon_r2 && mouse_y<eon_r2b) ? (
     mouse_x>=busp*2  && mouse_x<busp*4  ? (lastvelo = max(1,min(127, lastvelo + eon_wd*eon_ws)); refresh_tb=1;) :
     mouse_x>=busp*4  && mouse_x<busp*8  ? (notelen_p = max(1,min(100, notelen_p + eon_wd*eon_ws)); defnotelen=(tpb*(notelen_p/100))|0; sliderchange(slider6=notelen_p); refresh_tb=1;) :
@@ -6395,7 +7912,7 @@ colorscheme==10 && slider17 >= 1.5 && slider17 < 3.5 && mouse_x > 0 && mouse_y >
 // EON: the right-click-the-drum-glyph shortcut to the bridge pairing picker was REMOVED
 // (it popped over the lanes unexpectedly). Pairing is done via the PAIR button dropdown.
 
-((mouse_y >= tbh && mouse_y < grid_bottom) || mstate&ms_grid || mstate&ms_pk) && !(mstate&ms_tb) && !(mstate&ms_el) && !eon_so_in_panel && !eon_vdd_in_panel && !eon_thdd_in_panel && !eon_prdd_in_panel ? ( // Mouse below toolbar and above env lane or clicking/dragging in progress
+((mouse_y >= tbh && mouse_y < grid_bottom) || mstate&ms_grid || mstate&ms_pk) && !(mstate&ms_tb) && !(mstate&ms_el) && !eon_so_in_panel && !eon_vdd_in_panel && !eon_thdd_in_panel && !eon_prdd_in_panel && !ss_dk_more_in && !ss_dk_vm_in ? ( // Mouse below toolbar and above env lane or clicking/dragging in progress
 
   // Highlight current piano key
   (y != lhl && mouse_x >= 0 && mouse_x < gfx_w && mouse_y >= tbh && mouse_y < grid_bottom) && (mstate == 0 || ms_sub_drawfreehand || mstate == ms_preview) ? (
@@ -7093,7 +8610,7 @@ colorscheme==10 && slider17 >= 1.5 && slider17 < 3.5 && mouse_x > 0 && mouse_y >
             // EON: CTRL+drag = row transpose (MIDI channel when x < chw) -- moved off
             // the bare drag so a plain click/drag on the names AUDITION-SCRUBS instead.
             mstate=ms_rowtranpose;
-            (eon_colvis & 1) && mouse_x < chw ? ms_sub_channelchange=1;   // stub width when hidden -> not a channel zone
+            (eon_cv & 1) && mouse_x < chw ? ms_sub_channelchange=1;   // stub width when hidden -> not a channel zone
             nt_note=y;
             mstart = mouse_y;
             nt_trans_start = notetranspose[nt_note];
@@ -7133,8 +8650,8 @@ colorscheme==10 && slider17 >= 1.5 && slider17 < 3.5 && mouse_x > 0 && mouse_y >
             mstate=ms_lanebtn; refresh_pianokeys=1;
           ) : eon_ms_instrip ? (
             mstate=ms_lanebtn;   // clicked the control strip but not a button -> consume (no transpose)
-          ) : (eon_ms_inrange && (eon_colvis & 1) && mouse_x < chw) ? (
-            // (eon_colvis & 1): with the icon column hidden chw is the 9px STUB, so
+          ) : (eon_ms_inrange && (eon_cv & 1) && mouse_x < chw) ? (
+            // (eon_cv & 1): with the icon column hidden chw is the 9px STUB, so
             // without this the leftmost 9px of every lane stayed a live, invisible
             // hit target that opened the glyph picker for a column that isn't shown.
             // EON ICONS: click the lane icon column -> open the glyph picker for this lane.
@@ -7421,7 +8938,7 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
         memset(lane_swing, swing_p, max_numnotes);
         sliderchange(slider8=swing_p);
         refresh_tb=1;
-        groove_dirty = 1;   // EON GROOVE: master strength -> all lanes -> rebuild table
+        atomic_set(groove_dirty, 1);   // EON GROOVE: master strength -> all lanes -> rebuild table
       );
     );
   mstate==0 ? hl_state=hl_swing;
@@ -7440,7 +8957,9 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
         // mouse moves down past the threshold; a plain click stays instant-select).
         eon_sdrag_ord = eon_pat_base + button + 1;
         eon_sdrag_y   = mouse_y;
-        change_pattern(button); // Change active pattern (no banks)
+        // Step 1 "plays everywhere": in sync the pattern index is the region ordinal-1,
+        // so a chip on page k selects pattern k*8+button, never a recycled 0..7 slot.
+        change_pattern(eon_pat_sync ? eon_pat_base + button : button);
         sliderchange(slider1=p);
         sliderchange(slider3=listlength);
       );
@@ -7572,13 +9091,14 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
       );
     );
   );
-) : (colorscheme==10 && eon_pat_sync && mstate==0
+) : (colorscheme==10 && !ss_dock_face && eon_pat_sync && mstate==0
      && mouse_y >= tbh-13 && mouse_y < tbh-1 && mouse_x >= 2 && mouse_x < 42) ? (
   // P3b-4c: SONG pill in the ruler gutter -> toggle the song-strip row. noundo:
   // pure view state, no pattern edit (the tbh watcher forces the relayout).
   mouse_cap == 1 ? (
     mstate = ms_tb_button_noundo;
     eon_song_on = !eon_song_on;
+    sliderchange(slider55 = eon_song_on);   // persists with the FX chunk
     refresh_tb = 1;
   );
 
@@ -7633,7 +9153,8 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
     // REMOVE when dragged well clear of the strip (drag-out delete).
     mouse_cap == 0 ? (
       (mouse_y >= eon_song_y - tbrh && mouse_y < eon_song_y + eon_song_h + tbrh) ? (
-        eon_sdrop = (((mouse_x - eon_sg_x0) / eon_sg_cw)|0) + 1;
+        eon_sdrop = eon_sg_hit(mouse_x) + 1;
+        eon_sdrop < 1 ? eon_sdrop = (mouse_x < eon_sg_x0 ? 1 : eon_sg_len);
         eon_sdrop < 1 ? eon_sdrop = 1;
         eon_sdrop > eon_sg_len ? eon_sdrop = eon_sg_len;
         eon_sdrop != eon_sdrag_from ? eon_song_cmd(3, eon_sdrag_from, eon_sdrop);
@@ -7641,6 +9162,20 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
         eon_song_cmd(2, eon_sdrag_from, 0);
       );
       mstate = 0; refresh_tb = 1;
+    );
+  ) :
+  mstate == ms_tb_songlisten ? (
+    // LISTEN (1g): armed after a 0.3 s hold on a timeline block; the engine swaps to
+    // that section's pattern (eng_resolve reads eon_listen_p every block) and swaps
+    // back on release. Never an undo point: nothing in the grid changes.
+    mouse_cap == 0 ? (
+      atomic_set(eon_listen_p, -1); mstate = 0; refresh_tb = 1;
+    ) : (
+      (atomic_get(eon_listen_p) < 0 && time_precise() - eon_sg_hold_t >= 0.3) ? (
+        _lsp = eon_sg_hold_i >= 0 ? eon_map[eon_sg_hold_i*4+2]|0 : -1;
+        (_lsp >= 0 && _lsp < npatterns && eon_pat_loaded[_lsp]) ? atomic_set(eon_listen_p, _lsp);
+        refresh_tb = 1;
+      );
     );
   ) : (
     (mouse_cap == 1 && mstate == 0) ? (
@@ -7651,9 +9186,36 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
       mouse_x < busp*2 ? (               // LOOP = DAW transport repeat toggle
         mstate = ms_tb_button_noundo;
         eon_song_cmd(7, 0, 0);
+      ) :
+      mouse_x < busp*3 ? (               // FACE: timeline <-> chain (step 4)
+        mstate = ms_tb_button_noundo;
+        eon_song_tl = !eon_song_tl; refresh_tb = 1;
+      ) : eon_sg_tl ? (
+        // TIMELINE face: click a section = edit it (same three writes as a pattern
+        // chip); a second click within 0.35 s on the same block = LOCATE the
+        // transport to its start (bridge op 13; the engine follows the playhead).
+        eon_schip = eon_sg_hit(mouse_x);
+        eon_schip >= 0 ? (
+          (time_precise() - eon_sg_clk_t < 0.35 && eon_sg_clk_i == eon_schip) ? (
+            eon_song_cmd(13, eon_schip + 1, 0); eon_sg_clk_t = 0;
+            mstate = ms_tb_button_noundo;
+          ) : (
+            eon_sg_clk_t = time_precise(); eon_sg_clk_i = eon_schip;
+            _tlp = eon_map[eon_schip*4+2]|0;
+            (_tlp >= 0 && _tlp < npatterns && _tlp != p) ? (
+              eon_sel_ord = eon_schip + 1; eon_pat_page = (eon_schip / 8)|0;
+              change_pattern(_tlp); sliderchange(slider1=p); sliderchange(slider3=listlength);
+            );
+            // strip polish (1g LISTEN): keep the button down and, after 0.3 s, the
+            // ENGINE plays this section until it comes up (the r7 branch above arms it).
+            eon_sg_hold_t = time_precise(); eon_sg_hold_i = eon_schip;
+            mstate = ms_tb_songlisten;
+          );
+          refresh_tb = 1;
+        );
       ) : (
-        eon_schip = ((mouse_x - eon_sg_x0) / eon_sg_cw)|0;
-        (mouse_x >= eon_sg_x0 && eon_schip >= 0 && eon_schip < eon_sg_len) ? (
+        eon_schip = eon_sg_hit(mouse_x);
+        (eon_schip >= 0) ? (
           mstate = ms_tb_songdrag_chip;  // click-drag a chip (reorder / drag-out)
           eon_sdrag_from = eon_schip + 1;
         );
@@ -7663,8 +9225,13 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
       // eon_pm house panel (kind 3 = chip ops, kind 4 = strip background);
       // actions dispatch in the eon_pm EARLY block via eon_song_cmd.
       mstate = ms_tb_button_noundo;
-      eon_schip = ((mouse_x - eon_sg_x0) / eon_sg_cw)|0;
-      (mouse_x >= eon_sg_x0 && eon_schip >= 0 && eon_schip < eon_sg_len) ? (
+      eon_schip = eon_sg_hit(mouse_x);
+      (eon_schip >= 0 && eon_sg_tl) ? (
+        // strip polish: a timeline block's own menu (kind 7): edit / play / loop / chain
+        eon_pm_open = 1; eon_pm_kind = 7;
+        eon_pm_ord  = eon_schip + 1; eon_pm_btn = eon_schip;
+      ) :
+      (eon_schip >= 0) ? (
         eon_pm_open = 1; eon_pm_kind = 3;
         eon_pm_ord  = eon_schip + 1; eon_pm_btn = eon_schip;
       ) : (
@@ -7805,7 +9372,7 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
       memset(lane_swing, swing_p, max_numnotes);   // EON: master Swing slider sets every lane
       sliderchange(slider8=swing_p);
       refresh_tb=1;
-      groove_dirty = 1;   // EON GROOVE: master strength -> all lanes -> rebuild table
+      atomic_set(groove_dirty, 1);   // EON GROOVE: master strength -> all lanes -> rebuild table
     );
     mstate==0 ? hl_state=hl_swing;
   );
@@ -8254,7 +9821,7 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
       y = (((mouse_y - grid_bottom - el_divh) / (elh - el_divh))*numccs )|0;
       mstate==0 ? ( // Click / Button down
         mstate = ms_el_ctrlchange;
-        (eon_colvis & 1) && mouse_x < chw ? ms_sub_channelchange=1;   // stub width when hidden -> not a channel zone
+        (eon_cv & 1) && mouse_x < chw ? ms_sub_channelchange=1;   // stub width when hidden -> not a channel zone
         cc_to_adjust=y;
         sliderchange(slider14=cc_to_adjust);
         mstart = mouse_y;
@@ -8329,11 +9896,16 @@ button = (mouse_x / busp)|0;
  || (mouse_x > 8*busp  && (mouse_y > 5*tbrh && mouse_y < 6*tbrh))
 ) && (mstate!=ms_tb_numbeats)? hl_state=0; // Clear toolbar highlights
 
-// Erase everything within note matrix
+// Erase everything within envelope lane.
+// MOVED ABOVE the note-matrix erase (2026-08-23) so everything below is one
+// contiguous, side-effect-free block the grid cache can skip. This erase and the
+// draw_cc_controls() call under it must run EVERY frame -- the envelope lane is
+// repainted live further down, and refresh_cc_controls is a one-shot latch that
+// would never clear if a cache hit skipped it. Both touch only x<=pkw / y>=grid_bottom
+// (draw_cc_controls starts at grid_bottom+el_divh), so they are disjoint from the
+// note matrix and reordering them past its erase changes nothing. color(7) is set
+// explicitly here because it used to be inherited from the erase that now follows.
 color(7);
-gfx_x=pkw; gfx_y=tbh; gfx_rectto(gfx_w,grid_bottom);
-
-// Erase everything within envelope lane
 gfx_x=pkw-1; // -1 to erase also the leftmost pixels of event dots
 gfx_y=gfx_h - elh+el_divh; gfx_rectto(gfx_w,gfx_h);
 
@@ -8341,6 +9913,86 @@ refresh_cc_controls ? (
   draw_cc_controls();
   refresh_cc_controls=0;
 );
+
+// Pattern-indexed cell colours. Hoisted out of the lane loop (they were recomputed
+// identically for every lane) AND out of the cached block below, because the CC
+// envelope backdrop further down reads use_r/use_g/use_b -- on a cache hit the block
+// no longer runs, so they must already be set.
+cidx=(p&7);
+use_r=(cidx&1) ? 0.6 : 0.2;
+use_g=(cidx&2) ? 0.6 : 0.2;
+use_b=(cidx&4) ? 0.2 : 0.6;
+cidx==3 ? use_r*=2;
+cidx==4 ? use_g*=2;
+
+// ══ OFFSCREEN GRID CACHE — OPEN ═════════════════════════════════════════════
+// Everything from here to the matching close is the note matrix: erase, backdrop,
+// octave lines, the in-grid bar-line segment, the numnotes x listlength cell loop,
+// and the gridline structure. It is now pure drawing confined to x>=pkw and
+// y in [tbh, grid_bottom] -- the two things in it that were NOT (the envelope erase
+// and draw_cc_controls, a one-shot latch) were lifted above, along with use_r/g/b
+// because the CC envelope backdrop reads those after this block.
+//
+// It renders into image EON_GC_IMG and is blitted on frames where nothing it draws
+// from can have changed. eon_gc_key covers every scalar the render depends on;
+// eon_gc_live is a deliberate OVER-approximation for everything else -- while any
+// mouse button is down, a gesture is in flight (mstate), the wheel moved, or the
+// file's own repaint flag is up, we simply redraw. Erring that way costs exactly
+// what the old code cost, so the failure mode is "no speedup", never a stale grid.
+// (refresh_tb is read here on purpose: it is not consumed until the toolbar draw
+// further down, so it still carries this frame's value.)
+//
+// gfx_beatpos is IN the key, so the playhead stays correct without splitting the cell
+// body: playback re-renders once per step (~8/s at 120bpm 16ths) instead of every
+// frame, and a stopped or idle editor re-renders only when something actually moves.
+eon_gc_k = gfx_w;
+eon_gc_k = (eon_gc_k*131 + gfx_h)                % 2000000011;
+eon_gc_k = (eon_gc_k*131 + pkw)                  % 2000000011;
+eon_gc_k = (eon_gc_k*131 + tbh)                  % 2000000011;
+eon_gc_k = (eon_gc_k*131 + grid_bottom)          % 2000000011;
+eon_gc_k = (eon_gc_k*131 + numnotes)             % 2000000011;
+eon_gc_k = (eon_gc_k*131 + listlength)           % 2000000011;
+eon_gc_k = (eon_gc_k*131 + steps_per_beat)       % 2000000011;
+eon_gc_k = (eon_gc_k*131 + basenote)             % 2000000011;
+eon_gc_k = (eon_gc_k*131 + colorscheme)          % 2000000011;
+eon_gc_k = (eon_gc_k*131 + p)                    % 2000000011;
+eon_gc_k = (eon_gc_k*131 + gfx_beatpos)             % 2000000011;
+eon_gc_k = (eon_gc_k*131 + nbars)                % 2000000011;
+eon_gc_k = (eon_gc_k*131 + ((barlen*100)|0))     % 2000000011;
+eon_gc_k = (eon_gc_k*131 + ((row_height*100)|0)) % 2000000011;
+eon_gc_k = (eon_gc_k*131 + velobarwidth)         % 2000000011;
+eon_gc_k = (eon_gc_k*131 + tpb)                  % 2000000011;
+eon_gc_k = (eon_gc_k*131 + eon_gridlines)        % 2000000011;
+eon_gc_k = (eon_gc_k*131 + eon_pat_sync)         % 2000000011;
+eon_gc_k = (eon_gc_k*131 + eon_selrc)            % 2000000011;
+eon_gc_k = (eon_gc_k*131 + eon_gc_blkseq)        % 2000000011;
+eon_gc_k = (eon_gc_k*131 + eon_gc_gfxseq)        % 2000000011;
+// The face swap already moves tbh, pkw, grid_bottom and row_height, so the key
+// changes on its own -- this is belt and braces, and it says out loud that the
+// cached image belongs to ONE face. (ss_dock_face != ss_dock_prev also drops
+// eon_gc_valid outright on the swap frame.)
+eon_gc_k = (eon_gc_k*131 + ss_dock_face)         % 2000000011;
+eon_gc_live = !eon_gc_enable || (mouse_cap & 3) || mstate || mouse_wheel || refresh_tb;
+eon_gc_hit  = eon_gc_enable && eon_gc_valid && !eon_gc_live && (eon_gc_k == eon_gc_key);
+
+eon_gc_hit ? (
+  gfx_a = 1; gfx_mode = 0;   // blit honours both; set explicitly, never inherited
+  gfx_blit(EON_GC_IMG, 1, 0, pkw, tbh, gfx_w-pkw, grid_bottom-tbh,
+                             pkw, tbh, gfx_w-pkw, grid_bottom-tbh);
+) : (
+  eon_gc_enable ? (
+    (eon_gc_iw != gfx_w || eon_gc_ih != gfx_h) ? (
+      gfx_setimgdim(EON_GC_IMG, gfx_w, gfx_h);
+      eon_gc_iw = gfx_w; eon_gc_ih = gfx_h;
+    );
+    // The image is sized to the FULL framebuffer so every absolute gfx_x/gfx_y in the
+    // block below is unchanged -- no coordinate translation, nothing to get off by one.
+    gfx_dest = EON_GC_IMG;
+  );
+
+// Erase everything within note matrix
+color(7);
+gfx_x=pkw; gfx_y=tbh; gfx_rectto(gfx_w,grid_bottom);
 
 // EON: deep-teal LCD backdrop behind the STEP GRID only (x >= pkw); the lane-label
 // column (0..pkw) is left to draw_drum_note so its names/glyphs/colours survive
@@ -8386,37 +10038,49 @@ loop(numnotes,
   notepos+=1;
 );
 
-// Draw bar lines  
+// Draw bar lines -- IN-GRID SEGMENT ONLY (tbh..grid_bottom).
+// These used to run tbh..gfx_h in one call. The cached image only covers the note
+// matrix, so the tail below grid_bottom is redrawn live after the blit (see
+// "bar lines, below-grid tail" further down). Splitting a non-antialiased vertical
+// line at grid_bottom is pixel-identical -- both halves paint that row in the same
+// opaque colour. The in-grid half stays here, before the cells, so the cells keep
+// painting over it exactly as they always have.
 xpos=pkw;
 bar=1;
 loop(nbars,
   xpos+=barlen;
   color(19);
   gfx_x=xpos+1; gfx_y=tbh;
-  gfx_lineto(gfx_x,gfx_h,0);
+  gfx_lineto(gfx_x,grid_bottom,0);
   bar+=1;
 );
 
 ly=tbh;
 notepos=0;
+// GRID CSE: the cell body below runs numnotes x listlength times per frame (256 at the
+// 16x16 default, 6,272 at piano-roll max) and it used to re-derive the same handful of
+// values inside every cell. These hoists are pure common-subexpression elimination --
+// same values, same arithmetic, bit-identical output -- they just stop paying for it
+// per cell. Nothing in the draw writes numnotes/listlength/gfx_beatpos/steps_per_beat/pkw,
+// so all of them are provably invariant for the whole pass (notepos is only bumped by
+// the outer loop's own tail).
+eon_gwpk = gfx_w - pkw;                      // frame-invariant: was re-subtracted per cell
 loop(numnotes,
 
   ty=(tbh+((notepos+1)*(grid_bottom-tbh))/(numnotes))|0;
 
   lx=pkw;
   xpos=0;
-  mask = 2^(numnotes-1-notepos);
-
-  cidx=(p&7);
-  use_r=(cidx&1) ? 0.6 : 0.2;
-  use_g=(cidx&2) ? 0.6 : 0.2;
-  use_b=(cidx&4) ? 0.2 : 0.6;
-  cidx==3  ? use_r*=2;
-  cidx==4 ? use_g*=2;
+  eon_lrow  = numnotes-1-notepos;            // lane's data row; was recomputed up to 8x per cell
+  eon_lgrvb = eon_lrow*max_seqlength;        // groove-table row base
+  eon_lcnb  = eon_lrow*listlength;           // note/velocity row base
+  mask = 2^eon_lrow;
+  // (cidx / use_r / use_g / use_b are hoisted above the cached block -- they are
+  //  pattern-indexed, not lane-indexed, so recomputing them per lane was redundant.)
   // EON: per-lane cell colour (matches the Swing pad). Use the actual MIDI note,
   // and only LOADED pads (with a name) get colour; blank pads stay neutral.
   colorscheme==10 ? (
-    eon_lnote = basenote + (numnotes-1-notepos) + notetranspose[numnotes-1-notepos];
+    eon_lnote = basenote + eon_lrow + notetranspose[eon_lrow];
     eon_lhue = eon_pad_hue_for_note(eon_lnote);
     eon_haslane = (eon_lhue > -5) && (notenames[eon_lnote] != 0);
     eon_haslane ? (
@@ -8429,37 +10093,44 @@ loop(numnotes,
 
   
   loop(listlength,
-    tx = (((xpos+1)*(gfx_w - pkw))/listlength)+pkw|0;
+    tx = (((xpos+1)*eon_gwpk)/listlength)+pkw|0;
     sel=(notelist[xpos]&mask);
+    // Per-cell CSE: the groove cell was fetched TWICE on the eon_swsh line (with its index
+    // recomputed both times), and the beat/playhead tests were re-evaluated up to five
+    // times each across the colour branches below -- including once per sub-hit inside the
+    // ratchet loop. Same values, resolved once.
+    eon_cgrv = groove_off_rt[eon_lgrvb + xpos];
+    eon_conb = !(xpos % steps_per_beat);      // on a beat line (was up to 5 modulos per cell)
+    eon_cply = gfx_beatpos == xpos;              // this cell is under the playhead
     // EON: visual swing -- nudge off-beat (odd) cells right on swung lanes, up to half a cell
-    eon_swsh = (colorscheme==10 && groove_off_rt[(numnotes-1-notepos)*max_seqlength + xpos] > 0) ? (((groove_off_rt[(numnotes-1-notepos)*max_seqlength + xpos]/tpb) * (tx - lx))|0) : 0;   // EON GROOVE: nudge = the lane's actual per-step offset (any groove shape)
+    eon_swsh = (colorscheme==10 && eon_cgrv > 0) ? (((eon_cgrv/tpb) * (tx - lx))|0) : 0;   // EON GROOVE: nudge = the lane's actual per-step offset (any groove shape)
 
     // draw square
     colorscheme==1 ? (
 
     gfx_a=1;
-    gfx_r=use_r; gfx_g=use_g; gfx_b=use_b;  
-    !(xpos % steps_per_beat) ? ( gfx_g=gfx_r; gfx_r=gfx_b; gfx_b=use_g;);
-    lbeatpos == xpos ? ( gfx_r=gfx_g=gfx_b=sel?0.8:0.4; ) :
+    gfx_r=use_r; gfx_g=use_g; gfx_b=use_b;
+    eon_conb ? ( gfx_g=gfx_r; gfx_r=gfx_b; gfx_b=use_g;);
+    eon_cply ? ( gfx_r=gfx_g=gfx_b=sel?0.8:0.4; ) :
        !sel ? (gfx_r*=0.55; gfx_g*=0.55; gfx_b*=0.55; );
 
     ):(
-    color(21); //selected standard beats 
-    (xpos % steps_per_beat) == 0 ? ( 
-       color(20); //selected first beat 
+    color(21); //selected standard beats
+    eon_conb ? (
+       color(20); //selected first beat
     );
-    lbeatpos == xpos ? ( // time position color
-      sel?(color(22);):(color(23);); 
+    eon_cply ? ( // time position color
+      sel?(color(22);):(color(23););
       ) : !sel ? ( // standard row colour
-        (xpos % steps_per_beat) == 0 ? (colorscheme==10 ? (gfx_r=eon_pc24r;gfx_g=eon_pc24g;gfx_b=eon_pc24b;gfx_a=1;):(color(24);)):(colorscheme==10 ? (gfx_r=eon_pc25r;gfx_g=eon_pc25g;gfx_b=eon_pc25b;gfx_a=1;):(color(25);))
-      ); 
+        eon_conb ? (colorscheme==10 ? (gfx_r=eon_pc24r;gfx_g=eon_pc24g;gfx_b=eon_pc24b;gfx_a=1;):(color(24);)):(colorscheme==10 ? (gfx_r=eon_pc25r;gfx_g=eon_pc25g;gfx_b=eon_pc25b;gfx_a=1;):(color(25);))
+      );
     );
 
-    curnote=(numnotes-1-notepos)*listlength+xpos;
+    curnote=eon_lcnb+xpos;
     num_sd = getSubdivNum(curnote);
     // EON: shade active step cell by velocity (louder = brighter teal; ghost = dim).
     // Applies to normal (non-subdivided) cells only; subdiv cells re-set their own color.
-    (colorscheme==10 && sel && lbeatpos != xpos && !num_sd) ? (
+    (colorscheme==10 && sel && gfx_beatpos != xpos && !num_sd) ? (
       eon_vf = 0.40 + 0.60*(getVelo(curnote)/127);
       eon_haslane ? (
         gfx_r = eon_clr*eon_vf; gfx_g = eon_clg*eon_vf; gfx_b = eon_clb*eon_vf; gfx_a = 1;
@@ -8468,7 +10139,7 @@ loop(numnotes,
       );
     );
     num_sd ? (
-      sd_ena = getSubdivNotelist((numnotes-1-notepos), xpos);
+      sd_ena = getSubdivNotelist(eon_lrow, xpos);
       sd = 0;
       // EON GROOVE: the burst draws where it PLAYS -- delayed start, sub-hits compressed
       // into [groove offset .. step end] (mirrors sd_ticks = (tpb-off)/(n+1) in the engine).
@@ -8479,31 +10150,31 @@ loop(numnotes,
         (sd_ena >> sd)&1 ? ( 
         // enabled sd step
         colorscheme==10 ? (   // EON: enabled subdiv = lane pad colour (consistent with normal cells)
-          eon_svf = 0.40 + 0.60*(getSubdivVelo((numnotes-1-notepos), xpos, sd)/127);
+          eon_svf = 0.40 + 0.60*(getSubdivVelo(eon_lrow, xpos, sd)/127);
           eon_haslane ? (gfx_r=eon_clr*eon_svf; gfx_g=eon_clg*eon_svf; gfx_b=eon_clb*eon_svf;) : (gfx_r=0.46*eon_svf; gfx_g=0.46*eon_svf; gfx_b=0.50*eon_svf;);
           gfx_a=1;
         ) :
         colorscheme==1 ? (
         gfx_r=sd_r; gfx_g=sd_g; gfx_b=sd_b;
         ) : (
-        (xpos % steps_per_beat) == 0 ? (
-              lbeatpos == xpos  ? (color(22);):(color(20););
+        eon_conb ? (
+              eon_cply ? (color(22);):(color(20););
             ):(
-              lbeatpos == xpos  ? (color(22);):(color(21););
+              eon_cply ? (color(22);):(color(21););
             );
           );
-      ) : ( 
+      ) : (
     // non selected step
       colorscheme==1 ? (
       gfx_r=sd_r*0.55; gfx_g=sd_g*0.55; gfx_b=sd_b*0.55;
-      ) : (         
-      (xpos % steps_per_beat) == 0 ? (
-        lbeatpos == xpos  ? (color(23);):(color(24););
+      ) : (
+      eon_conb ? (
+        eon_cply ? (color(23);):(color(24););
         ):(
-        lbeatpos == xpos  ? (color(23);):(color(25););
+        eon_cply ? (color(23);):(color(25););
         );
     );
-    );       
+    );
       gfx_x=lx_sd ;gfx_y=ly; gfx_rectto(tx_sd,ty);
       lx_sd=tx_sd+1;
       sd += 1;
@@ -8525,7 +10196,7 @@ loop(numnotes,
         loop(num_sd+1,
           tx_sd = (((sd+1)*(tx-lx-eon_swsh))/(num_sd+1))+lx+eon_swsh|0;
           (sd_ena&1) ? (
-            draw_velobar(lx_sd, ty, getSubdivVelo((numnotes-1-notepos), xpos, sd), tx_sd-lx_sd, ty-ly);
+            draw_velobar(lx_sd, ty, getSubdivVelo(eon_lrow, xpos, sd), tx_sd-lx_sd, ty-ly);
           );
           sd_ena *= 0.5;
           lx_sd=tx_sd+1;
@@ -8582,10 +10253,33 @@ colorscheme==10 && eon_gridlines ? (
   );
 );
 
+// ══ OFFSCREEN GRID CACHE — CLOSE ════════════════════════════════════════════
+  eon_gc_enable ? (
+    gfx_dest = -1;             // back to the main framebuffer
+    gfx_a = 1; gfx_mode = 0;
+    gfx_blit(EON_GC_IMG, 1, 0, pkw, tbh, gfx_w-pkw, grid_bottom-tbh,
+                               pkw, tbh, gfx_w-pkw, grid_bottom-tbh);
+    eon_gc_valid = 1;
+    eon_gc_key   = eon_gc_k;
+  );
+);
+
+// Bar lines, below-grid tail (grid_bottom..gfx_h). Split off from the in-grid segment
+// above because the cached image only covers the note matrix; nothing overlaps this
+// stretch, so drawing it after the blit is equivalent to the single full-height line
+// these used to be.
+xpos=pkw;
+loop(nbars,
+  xpos+=barlen;
+  color(19);
+  gfx_x=xpos+1; gfx_y=grid_bottom;
+  gfx_lineto(gfx_x,gfx_h,0);
+);
+
 // EON: translucent playhead column over the step grid (clearer than per-cell brighten)
-(colorscheme==10 && lbeatpos >= 0 && lbeatpos < listlength) ? (
-  eon_phx0 = ((lbeatpos)*(gfx_w - pkw))/listlength + pkw;
-  eon_phx1 = ((lbeatpos+1)*(gfx_w - pkw))/listlength + pkw;
+(colorscheme==10 && gfx_beatpos >= 0 && gfx_beatpos < listlength) ? (
+  eon_phx0 = ((gfx_beatpos)*(gfx_w - pkw))/listlength + pkw;
+  eon_phx1 = ((gfx_beatpos+1)*(gfx_w - pkw))/listlength + pkw;
   gfx_r=0.0; gfx_g=0.72; gfx_b=0.86; gfx_a=0.16;
   gfx_x=eon_phx0; gfx_y=tbh; gfx_rectto(eon_phx1, grid_bottom);
 );
@@ -8622,9 +10316,9 @@ loop(listlength,
   colorscheme==1 ? (
     gfx_r=use_r; gfx_g=use_g; gfx_b=use_b; gfx_a=1;
     (xpos % steps_per_beat) == 0 ? ( gfx_g=gfx_r; gfx_r=gfx_b; gfx_b=use_g;);
-    lbeatpos == xpos ? ( gfx_r=gfx_g=gfx_b=0.4) : (gfx_r*=0.55; gfx_g*=0.55; gfx_b*=0.55; );
+    gfx_beatpos == xpos ? ( gfx_r=gfx_g=gfx_b=0.4) : (gfx_r*=0.55; gfx_g*=0.55; gfx_b*=0.55; );
   ) : (
-    lbeatpos == xpos ? (color(23);) : (
+    gfx_beatpos == xpos ? (color(23);) : (
     (xpos % steps_per_beat) == 0 ? (
       color(24);
       x=1;
@@ -8728,7 +10422,10 @@ mstate == ms_el_envdraw ? (
   gfx_drawnumber(envval,0);
 );
 
-// Draw toolbar
+// Draw toolbar -- or, in the dock face, the one slim bar that replaces all of it.
+// Same point in the frame either way, so refresh_tb is consumed where the grid
+// cache above already expects it to still be carrying this frame's value.
+ss_dock_face ? ss_dock_bar() : (
 refresh_tb || lgfx_w_tb != gfx_w || lgfx_h_tb != gfx_h || last_hl_state!=hl_state || drawnvelo!=lastvelo ? (
   refresh_tb=0;
   lgfx_w_tb=gfx_w;
@@ -8738,11 +10435,24 @@ refresh_tb || lgfx_w_tb != gfx_w || lgfx_h_tb != gfx_h || last_hl_state!=hl_stat
   gfx_x=gfx_y=0; color(31);
   gfx_rectto(gfx_w,tbh);
 
+  // STEPPA wordmark band (EON scheme, full UI): brand mark + the dock toggle.
+  // Sits in the grown top margin just above the pattern row; the piano strip
+  // (when shown) draws above it from y=0 and is untouched. Hover brightens via
+  // the eon_wm_hov -> refresh_tb watcher in the input block.
+  colorscheme==10 ? (
+    gfx_setfont(13, "Verdana", 13, 'b');
+    gfx_set(0.878, 0.439, 0.188, eon_wm_hov ? 1.0 : 0.85);
+    gfx_x = 8; gfx_y = eon_pbh - 20;
+    gfx_drawstr("STEPPA");
+    gfx_setfont(0);
+  );
+
   // Draw pattern buttons
   // EON AP-4: decay the select-flash once per frame (here, before the 8 buttons draw it).
   eon_pat_flash > 0.001 ? (eon_pat_flash *= 0.84; refresh_tb = 1;) : (eon_pat_flash = 0;);
   pat=0;
   eon_song_vis ? draw_song_strip();   // P3b-4c: SONG strip row (between control row and ruler)
+  eon_song_pdirty = 0;                // the strip was just painted; no strip-only pass this frame
   // Column-header strip. eon_ms_geo() first: it owns eon_colx/eon_colw, and on a
   // frame where the lane headers happen not to repaint those would otherwise be
   // stale, putting the header cells over the wrong columns.
@@ -8866,9 +10576,16 @@ refresh_tb || lgfx_w_tb != gfx_w || lgfx_h_tb != gfx_h || last_hl_state!=hl_stat
     eon_zmcx = eon_cogb_x + busp + 7;
     gfx_circle(eon_zmcx|0, (eon_zmcy-1)|0, 4, 0, 1);
     gfx_x = eon_zmcx+2; gfx_y = eon_zmcy+2; gfx_lineto(eon_zmcx+6, eon_zmcy+6, 1);
+    // LOOP-ALL cell: a loop glyph (circle + arrowhead) in the third slot.
+    eon_nice_button(eon_cogb_x+busp*2, eon_zmy, busp-3, tbrh-2, 58/255, 64/255, 76/255, 96/255, 104/255, 120/255);
+    eon_pair_slot >= 0 ? gfx_set(0.72, 0.78, 0.86, 1) : gfx_set(0.40, 0.44, 0.50, 1);
+    eon_zmcx = eon_cogb_x + busp*2 + 9;
+    gfx_circle(eon_zmcx|0, (eon_zmcy-1)|0, 4, 0, 1);
+    gfx_x = eon_zmcx+3; gfx_y = eon_zmcy-6; gfx_lineto(eon_zmcx+6, eon_zmcy-3, 1);
     gfx_setfont(7, "Verdana", 8, 'b');
     gfx_x = eon_cogb_x + busp - 3 - 7;   gfx_y = eon_zmy + 2; gfx_drawstr("S");
     gfx_x = eon_cogb_x + busp*2 - 3 - 7; gfx_y = eon_zmy + 2; gfx_drawstr("P");
+    gfx_x = eon_cogb_x + busp*3 - 3 - 7; gfx_y = eon_zmy + 2; gfx_drawstr("L");
     gfx_setfont(0);
   );
   // EON AP-2: Preset scroll strip (control row, eon_psx..+eon_psw). Wheel or click the
@@ -8908,6 +10625,15 @@ refresh_tb || lgfx_w_tb != gfx_w || lgfx_h_tb != gfx_h || last_hl_state!=hl_stat
   (slider17 >= 2.5 && slider17 < 3.5) ? draw_tb_pads(busp*0, 0, 16);          // Pads 16 (1 pattern row + 4x4 kit)
   slider17 >= 3.5 ? draw_tb_manual(busp*0, 0);                                // Manual map (4x4 remappable pads)
 );
+);   // end `ss_dock_face ? ss_dock_bar() : (full-UI toolbar)`
+// Strip polish (audit 2026-09-03): the playhead line's own repaint. When the toolbar
+// block above ran it painted the strip and cleared this; otherwise paint JUST the
+// strip here -- the same point in the frame (before popups and tooltips) and without
+// refresh_tb, whose side effect is bypassing the grid cache for the frame.
+eon_song_pdirty ? (
+  eon_song_vis ? (draw_song_strip(); gfx_setfont(0););
+  eon_song_pdirty = 0;
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // EON: widget tooltips (rk_widgets hint system, MIT). megababy gates the toolbar
@@ -8917,6 +10643,13 @@ refresh_tb || lgfx_w_tb != gfx_w || lgfx_h_tb != gfx_h || last_hl_state!=hl_stat
 colorscheme==10 ? (
   HINT_FONT = 9; gfx_setfont(HINT_FONT, "Arial", 14);
   eon_tt = 0;
+  // DOCK FACE: every hint region below is written against the chrome rows, whose
+  // y bands now lie over the grid -- running them would hand out toolbar hints for
+  // lanes. Take the bar's own hint, collected in ss_dock_input, and skip the map.
+  // The timing + render tail underneath is deliberately OUTSIDE this split so it
+  // runs in BOTH faces: the dock face gets tooltips for free, and the shared
+  // frame tail stays shared (hiding it is how an input gate wedges).
+  ss_dock_face ? ( eon_tt = ss_dk_tt; ) : (
   // Toolbar button hover hints. x = busp*col, y = row*tbrh, single cell = busp wide.
   (mouse_y >= 4*tbrh && mouse_y < 5*tbrh) ? (
     mouse_x >= busp*0  && mouse_x < busp*1  ? (eon_tt = "Toggle Drum-map / Piano-roll mode") :
@@ -8935,6 +10668,13 @@ colorscheme==10 ? (
     (settingsopen && mouse_x >= busp*24 && mouse_x < busp*26) ? (eon_tt = "MIDI-trigger note (= pattern 1)") : 0;
   );
   (mouse_y >= 1*tbrh && mouse_y < 2*tbrh && mouse_x >= busp*24 && mouse_x < busp*26) ? (eon_tt = "Cycle colour scheme");
+  // Wordmark band. Say only what a click will actually do right now: pop out
+  // when the rig holds us, dock when the bridge can hear us, else menu only.
+  eon_wm_hov ? (
+    (ss_rig_live && ss_rig_docked) ? (eon_tt = "Pop out to a floating window - right-click: view menu") :
+    gmem[EON_KB_ALIVE] > 0        ? (eon_tt = "Return to the dock - right-click: view menu") :
+                                    (eon_tt = "Right-click: Auto / Full UI / Dock face");
+  );
   // Column-header strip hints. The icon/name pair gets its OWN text when it is the
   // last one standing -- clicking it does nothing by design, and a control that
   // refuses silently reads as broken. eon_colx/eon_colw come from eon_ms_geo, so
@@ -8964,6 +10704,8 @@ colorscheme==10 ? (
     (eon_tt = "Zoom: fit the arrange to the whole song (all patterns)");
   (mouse_y >= eon_r2 && mouse_y < eon_r2b && mouse_x >= eon_cogb_x+busp && mouse_x < eon_cogb_x+busp*2-3) ?
     (eon_tt = "Zoom: fit the arrange to the selected pattern");
+  (mouse_y >= eon_r2 && mouse_y < eon_r2b && mouse_x >= eon_cogb_x+busp*2 && mouse_x < eon_cogb_x+busp*3-3) ?
+    (eon_tt = "Loop ALL patterns: loop-select every region + repeat on");
   (settingsopen==1 && mouse_y >= 5*tbrh && mouse_y < 6*tbrh && mouse_x >= busp*0 && mouse_x < busp*1) ? (eon_tt = "Pattern layout: 96x64 / 48x128 steps");
   // P3b-4b: hovering a pattern button in sync mode -> tooltip = the region NAME.
   // Trusted only when the courier's NAMEPAGE matches our visible page (a page flip
@@ -8980,6 +10722,7 @@ colorscheme==10 ? (
   // sync-mode name chips extend under the chip while it's lit).
   (eon_adapt_pend && mouse_x > eon_swpx-63 && mouse_x < eon_swpx-3 && mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh) ?
     (eon_tt = "Re-aim patterns at moved pads (right-click: dismiss)");
+  );   // end `ss_dock_face ? (bar hint) : (full-UI hint map)`
   // Self-contained tooltip timing (robust in the refresh-gated toolbar): count
   // still frames while hovering a hinted button, then draw the hint box on top.
   (eon_tt && eon_ttlx == mouse_x && eon_ttly == mouse_y) ? (eon_tthold += 1) : (eon_tthold = 0);
@@ -9016,7 +10759,11 @@ colorscheme==10 ? (
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EON: beat ruler (1 2 3 4 ...) in the strip just above the grid, column-aligned
+// EON: beat ruler (1 2 3 4 ...) in the strip just above the grid, column-aligned.
+// Runs in BOTH faces -- the dock face reserves its own 13px band (tbh includes
+// it), so the numbers land under the slim bar. Only the SONG pill inside stays
+// full-UI: the SONG strip itself is hidden in the dock face, and a toggle whose
+// subject is invisible reads as broken.
 // ─────────────────────────────────────────────────────────────────────────────
 colorscheme==10 ? (
   gfx_set(0.10, 0.26, 0.35, 1.0);
@@ -9033,7 +10780,7 @@ colorscheme==10 ? (
     eon_rs += 1;
   );
   // P3b-4c: SONG pill at the gutter's left edge (sync only) -> toggles the strip.
-  (eon_pat_sync && eon_pair_slot >= 0) ? (
+  (!ss_dock_face && eon_pat_sync && eon_pair_slot >= 0) ? (
     eon_song_on ? gfx_set(0.0, 0.55, 0.68, 1.0) : gfx_set(0.16, 0.20, 0.27, 1.0);
     roundRect(2, tbh-13, 38, 11, 3, 1);
     eon_song_on ? gfx_set(0.95, 1.0, 1.0, 1.0) : gfx_set(0.60, 0.66, 0.74, 1.0);
@@ -9319,8 +11066,8 @@ eon_pm_open ? (
   // recompute the kind-derived metrics here -- otherwise the first frame paints
   // the PREVIOUS panel's size (first-ever open: invisible; kind switch: cropped).
   eon_pm_hh = 22; eon_pm_rh = 19;
-  eon_pm_n = eon_pm_kind == 3 ? 9 : eon_pm_kind == 4 ? 2 : eon_pm_kind == 5 ? 4 : 3;
-  eon_pm_w = eon_pm_kind == 5 ? 190 : 150;
+  eon_pm_n = eon_pm_kind == 3 ? 9 : eon_pm_kind == 4 ? 2 : eon_pm_kind == 5 ? 4 : eon_pm_kind == 6 ? 2 : eon_pm_kind == 7 ? 7 : 3;
+  eon_pm_w = eon_pm_kind == 5 ? 190 : eon_pm_kind == 7 ? 160 : 150;
   eon_pm_h = eon_pm_hh + eon_pm_n*eon_pm_rh;
   gfx_set(0,0,0,0.30);         gfx_rect(eon_pm_x+3, eon_pm_y+4, eon_pm_w, eon_pm_h);   // shadow
   gfx_set(0.84,0.81,0.76,1.0); gfx_rect(eon_pm_x, eon_pm_y, eon_pm_w, eon_pm_h);       // cream panel
@@ -9341,6 +11088,16 @@ eon_pm_open ? (
     strcpy(#eon_pmt, "");
     eon_pm_btn >= 0 ? eon_songname(eon_pm_btn, #eon_pmt, 16);
     strlen(#eon_pmt) == 0 ? sprintf(#eon_pmt, "ENTRY %d", eon_pm_ord);
+    gfx_drawstr(#eon_pmt);
+  ) :
+  eon_pm_kind == 7 ? (
+    strcpy(#eon_pmt, "");
+    eon_pm_btn >= 0 ? eon_mapname(eon_pm_btn, #eon_pmt, 16);
+    strlen(#eon_pmt) == 0 ? sprintf(#eon_pmt, "SECTION %d", eon_pm_ord);
+    gfx_drawstr(#eon_pmt);
+  ) :
+  eon_pm_kind == 6 ? (
+    sprintf(#eon_pmt, "CLEAR P%d?", eon_pat_sync ? eon_pat_base + eon_pm_ord + 1 : eon_pm_ord + 1);
     gfx_drawstr(#eon_pmt);
   ) : (
     gfx_drawstr(eon_pm_kind == 2 ? "PATTERNS" : eon_pm_kind == 4 ? "SONG" : "GRID");
@@ -9367,6 +11124,8 @@ eon_pm_open ? (
       (eon_pm_kind == 1 && eon_pm_r == 2
        && (gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_DM_RGNCNT]|0) < eon_pm_ord)
         ? gfx_set(0.52,0.49,0.44,1.0)      // greyed: no region behind this tab yet (lane-menu grey)
+      : (eon_pm_kind == 6 && eon_pm_r == 0)
+        ? gfx_set(0.62,0.14,0.10,1.0)      // the destructive row wears red at rest
       : eon_pm_r == eon_pm_cur
         ? gfx_set(0.10,0.30,0.40,1.0)      // current = teal text (lane-menu channel idiom)
         : gfx_set(0.16,0.14,0.10,1.0);
@@ -9389,7 +11148,8 @@ eon_pm_open ? (
     );
     // group dividers: k3 after Repeats-8 and Remove; k4 none; others before last row
     (eon_pm_kind == 3 ? (eon_pm_r == 5 || eon_pm_r == 6)
-     : eon_pm_kind == 4 ? 0 : eon_pm_r == 1) ? (
+     : eon_pm_kind == 7 ? (eon_pm_r == 2 || eon_pm_r == 5)
+     : eon_pm_kind == 4 ? 0 : eon_pm_kind == 6 ? eon_pm_r == 0 : eon_pm_r == 1) ? (
       gfx_set(0.55,0.51,0.44,0.6); gfx_rect(eon_pm_x+6, eon_pm_ry+eon_pm_rh-1, eon_pm_w-12, 1);
     );
     eon_pm_r += 1;
@@ -9557,6 +11317,40 @@ eon_so_open ? (
   );
   eon_so_ry+=30;
 
+  // Dock view — the full UI's half of the pin. The dock face puts this on a
+  // right-click of its STEPPA wordmark; the full UI has no wordmark, and the
+  // Settings panel is where its other view-only preferences already live. Click
+  // cycles Auto -> Full UI -> Dock face; the label always names the current value,
+  // so cycling is never blind. Auto = the aspect trigger decides (>1.35 in, <1.2 out).
+  gfx_set(0.14,0.16,0.14,1); gfx_x=eon_so_lx; gfx_y=eon_so_ry+4; gfx_drawstr("Dock view");
+  ss_dock_mode ? gfx_set(0.18,0.45,0.28,1) : gfx_set(0.22,0.24,0.22,1);
+  gfx_rect(eon_so_cx, eon_so_ry, 200, 22);
+  gfx_set(0.90,0.95,0.97,1); gfx_x=eon_so_cx+8; gfx_y=eon_so_ry+5;
+  gfx_drawstr(ss_dock_mode == 1 ? "Full UI always"
+            : ss_dock_mode == 2 ? "Dock face always" : "Auto (by pane shape)");
+  (eon_so_click && mouse_x>=eon_so_cx && mouse_x<eon_so_cx+200 && mouse_y>=eon_so_ry && mouse_y<eon_so_ry+22) ? (
+    // Working global first, then the slider — same reason as the toggles above.
+    ss_dock_mode = (ss_dock_mode + 1) % 3;
+    sliderchange(slider52 = ss_dock_mode);
+    eon_pdraw = max(eon_pdraw, 2);
+  );
+  eon_so_ry+=30;
+
+  // Clear pattern — wipes the ACTIVE pattern, behind the kind-6 confirm panel
+  // ("are you sure" is the user rule, 2026-08-26). Anchored at the mouse like
+  // the grid picker; the Settings panel closes underneath so the confirm is
+  // never buried (Settings paints after eon_pm in this tail).
+  gfx_set(0.14,0.16,0.14,1); gfx_x=eon_so_lx; gfx_y=eon_so_ry+4; gfx_drawstr("Clear pattern");
+  gfx_set(0.42,0.16,0.14,1); gfx_rect(eon_so_cx, eon_so_ry, 200, 22);
+  gfx_set(0.95,0.90,0.90,1); gfx_x=eon_so_cx+8; gfx_y=eon_so_ry+5;
+  gfx_drawstr("Clear the active pattern...");
+  (eon_so_click && mouse_x>=eon_so_cx && mouse_x<eon_so_cx+200 && mouse_y>=eon_so_ry && mouse_y<eon_so_ry+22) ? (
+    eon_pm_open = 1; eon_pm_kind = 6; eon_pm_ord = p; eon_pm_btn = -1;
+    eon_pm_x = mouse_x; eon_pm_y = mouse_y;
+    settingsopen = 0; refresh_tb = 1; eon_pdraw = 4;
+  );
+  eon_so_ry+=30;
+
   // Lane columns — seven inline letter toggles rather than seven rows, which would
   // have cost 210px of panel height. Order matches the header left-to-right so the
   // control reads as a picture of the thing it edits.
@@ -9662,10 +11456,20 @@ eon_so_open ? (
   eon_so_clk_last = mouse_cap&1;
 ) : (eon_so_clk_last = mouse_cap&1;);
 
+// The folded-settings popup and the view pin menu, drawn last so they sit over
+// the grid like every other panel in this tail. Called in BOTH faces since the
+// vm (view-pin) menu is shared with the full UI's wordmark now; the "..." popup
+// half self-gates on ss_dk_more_open, which only the dock face ever sets.
+ss_dock_overlays();
+
 );   // ═══ end EMBEDDED branch: close of `ss_emb ? (embed) : (full-UI draw + input)` ═══
 
 // Pattern-op arbitration: gesture frame over — release the audio side.
 _ui_patop = 0;
+// Package 3: every handler above has written the grid for this frame; if the left
+// button came up this frame, tell the @block debounce the gesture is over.
+_gfx_release ? atomic_set(eon_gesture_done, 1);
+atomic_set(eon_gfx_hold_t, (mouse_cap & 1) ? time_precise() : 0);
 // End-of-frame mouse state. JSFX never auto-clears mouse_wheel, and knobs_kbsg's
 // contract (libs/knobs_kbsg.jsfx-inc:43) is explicit that the CALLER zeroes it --
 // the widget only ever reads frame_wheel. Every raw mouse_wheel handler above has

@@ -24,8 +24,39 @@ local lane_tools     = dofile(_SCRIPT_DIR .. 'lane_tools.lua')
 local category       = dofile(_SCRIPT_DIR .. 'category.lua')
 local preset_lib     = dofile(_SCRIPT_DIR .. 'preset_library.lua')
 local lane_integrity = dofile(_SCRIPT_DIR .. 'lane_integrity.lua')
+-- This is paint_mode's OWN lane_integrity instance (dofile, not require), so
+-- it needs its own injection: stereo lanes resolve their pitch window through
+-- lane_tools.LaneRange (tag ∪ live pad map), same as eon_drum_matrix does.
+if lane_integrity.SetRangeResolver then lane_integrity.SetRangeResolver(lane_tools.LaneRange) end
 local selection     = dofile(_SCRIPT_DIR .. 'selection.lua')
 local grid          = dofile(_SCRIPT_DIR .. 'grid.lua')
+
+-- Persist a few lane_info keys to the track's EON_DRUM_LANE tag by READ-MODIFY-
+-- WRITE (2026-09-02). The lane menu used to re-encode the whole in-memory
+-- lane_info table it captured when the popup opened; swing_sync may have healed
+-- the tag in the meantime (stereo note_lo/note_hi follow the live pad map), and
+-- that stale table would silently put the old window back. Only `keys` move
+-- from the in-memory table to the tag; everything else is whatever the tag
+-- holds right now. A nil value removes the key (piano view off).
+local function persist_lane_fields(lane, keys)
+  local jok, jlib = pcall(dofile, _SCRIPT_DIR .. 'json.lua')
+  if not (jok and jlib and jlib.encode) then return false end
+  local li = lane.lane_info or {}
+  local fresh = nil
+  local ok, raw = reaper.GetSetMediaTrackInfo_String(lane.track, 'P_EXT:EON_DRUM_LANE', '', false)
+  if ok and raw and raw ~= '' and jlib.decode then
+    local dok, dec = pcall(jlib.decode, raw)
+    if dok and type(dec) == 'table' then fresh = dec end
+  end
+  if not fresh then fresh = {} for k, v in pairs(li) do fresh[k] = v end end
+  for _, k in ipairs(keys) do fresh[k] = li[k] end
+  local eok, encoded = pcall(jlib.encode, fresh)
+  if not (eok and encoded) then return false end
+  reaper.GetSetMediaTrackInfo_String(lane.track, 'P_EXT:EON_DRUM_LANE', encoded, true)
+  -- mirror the tag's OTHER keys back so later reads in this popup see the healed values
+  for k, v in pairs(fresh) do li[k] = v end
+  return true
+end
 
 -- Multi-cell rectangle selection state (Phase D / multi-select).
 -- Ctrl+drag draws a rectangle; on release every painted note whose cell
@@ -555,8 +586,12 @@ local function find_existing_take_at(track, time)
     local e = s + reaper.GetMediaItemInfo_Value(item, 'D_LENGTH')
     if time >= s and time < e then
       local take = reaper.GetActiveTake(item)
+      -- Keep scanning past a non-MIDI item instead of bailing here. A merged-
+      -- mode lane track carries AUDIO items alongside its pattern item by
+      -- design, and an audio item overlapping this time would otherwise mask
+      -- the MIDI item behind it and silently disable erase. Classic and stereo
+      -- lanes only ever hold MIDI, so this is a no-op for them.
       if take and reaper.TakeIsMIDI(take) then return take end
-      return nil
     end
   end
   return nil
@@ -1825,7 +1860,13 @@ function M.Update(ctx, lane_targets, coords)
 
       -- Lane integrity: only show "Normalize" when there are foreign notes.
       local foreign_count = lane_integrity.CountForeignOnLane(lane)
-      if foreign_count > 0 then
+      if foreign_count > 0 and lane.lane_info and lane.lane_info.stereo == true then
+        -- Whole-kit lane: NormalizeLane refuses it (it would DELETE notes at
+        -- pads the live map no longer covers). Report, don't offer.
+        reaper.ImGui_TextDisabled(ctx, string.format('%d note%s outside the pad map',
+          foreign_count, foreign_count == 1 and '' or 's'))
+        reaper.ImGui_Separator(ctx)
+      elseif foreign_count > 0 then
         -- Piano lanes DELETE out-of-range notes (transposing into a range is
         -- meaningless); drum lanes transpose to the pad pitch. Match the label
         -- to what NormalizeLane will actually do.
@@ -1846,11 +1887,7 @@ function M.Update(ctx, lane_targets, coords)
       local clicked, new_pin = reaper.ImGui_MenuItem(ctx, 'Pin velocity strip here', nil, pin_cur)
       if clicked then
         lane.lane_info.show_strip = (new_pin == true) and true or nil
-        local json_ok, json_lib = pcall(dofile, _SCRIPT_DIR .. 'json.lua')
-        if json_ok and json_lib then
-          reaper.GetSetMediaTrackInfo_String(lane.track, 'P_EXT:EON_DRUM_LANE',
-            json_lib.encode(lane.lane_info), true)
-        end
+        persist_lane_fields(lane, { 'show_strip' })
       end
 
       -- Piano view: a per-lane pitch RANGE turns the lane into a mini piano-
@@ -1861,11 +1898,7 @@ function M.Update(ctx, lane_targets, coords)
       if reaper.ImGui_BeginMenu(ctx, 'Piano view') then
         local li = lane.lane_info
         local function persist_range()
-          local jok, jlib = pcall(dofile, _SCRIPT_DIR .. 'json.lua')
-          if jok and jlib and jlib.encode then
-            reaper.GetSetMediaTrackInfo_String(lane.track, 'P_EXT:EON_DRUM_LANE',
-              jlib.encode(li), true)
-          end
+          persist_lane_fields(lane, { 'note_lo', 'note_hi' })
         end
         local is_piano = type(li.note_lo) == 'number' and type(li.note_hi) == 'number'
                          and li.note_hi > li.note_lo
@@ -1889,7 +1922,13 @@ function M.Update(ctx, lane_targets, coords)
             is_piano = on
           end
         end
-        if is_piano then
+        if li.stereo == true then
+          -- The window follows the Swing pad map (lane_tools.LaneRange unions the
+          -- tag with the live pitches and swing_sync heals the tag); a hand-set
+          -- narrower window would have no effect on collect/write and only mislead.
+          local slo, shi = lane_tools.LaneRange(li)
+          reaper.ImGui_TextDisabled(ctx, string.format('Range follows the Swing pad map (%d-%d)', slo or 0, shi or 0))
+        elseif is_piano then
           reaper.ImGui_SetNextItemWidth(ctx, 140)
           local lch, lv = reaper.ImGui_SliderInt(ctx, 'low##pv', li.note_lo, 0, 127)
           if lch then li.note_lo = math.max(0, math.min(lv, li.note_hi - 1)); persist_range() end
@@ -1912,11 +1951,7 @@ function M.Update(ctx, lane_targets, coords)
       do
         local li = lane.lane_info
         local function persist_swing()
-          local jok, jlib = pcall(dofile, _SCRIPT_DIR .. 'json.lua')
-          if jok and jlib and jlib.encode then
-            reaper.GetSetMediaTrackInfo_String(lane.track, 'P_EXT:EON_DRUM_LANE',
-              jlib.encode(li), true)
-          end
+          persist_lane_fields(lane, { 'swing_amount', 'swing_subdiv' })
         end
         local _, gdiv = reaper.GetSetProjectGrid(0, false)
         -- Swing grid (subdivision): the grid THIS lane's swing math runs on,
@@ -1952,7 +1987,12 @@ function M.Update(ctx, lane_targets, coords)
         local g_eff     = (coords and coords.EffectiveSwingDivQN and coords.EffectiveSwingDivQN(li)) or gdiv
         local swingable = coords and coords.IsSwingableDiv and coords.IsSwingableDiv(g_eff)
         local cur = tonumber(li.swing_amount) or 0
-        if not swingable then
+        if lane_tools.LaneSynced and lane_tools.LaneSynced(li) then
+          -- Package 2: swing has one owner. While a StepSeq is synced to this Swing, its
+          -- groove is what the item carries and what plays; the lane's own swing would
+          -- only be straightened again on the next import. Shown, not editable.
+          reaper.ImGui_TextDisabled(ctx, 'Swing follows Steppa while synced')
+        elseif not swingable then
           reaper.ImGui_TextDisabled(ctx, 'Swing: needs a 1/4\xE2\x80\x931/16 or triplet grid')
         else
           reaper.ImGui_SetNextItemWidth(ctx, 140)

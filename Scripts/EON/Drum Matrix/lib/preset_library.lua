@@ -379,6 +379,16 @@ end
 function M.Apply(lane, preset)
   if not (lane and lane.track and lane.lane_info and preset
           and (preset.steps or preset.notes)) then return 0 end
+  -- A STEREO lane holds the whole kit in one take; applying a single-pad
+  -- preset at its pad_pitch (= the lowest pad) would stamp, say, a kick pattern
+  -- onto whichever pad happens to sit lowest and wipe that row. The stereo cog
+  -- menu applies per ROW through synthetic single-pitch lanes (no `stereo`
+  -- flag), so those still work; only the whole-lane application is refused.
+  if lane.lane_info.stereo == true then
+    warn_once('preset:stereo:' .. tostring(lane.track),
+              'preset apply skipped on the stereo grid lane: use the per-row Pad rows menu')
+    return 0
+  end
   local item, take = pick_target_take(lane.track)
   if not take then
     -- Empty lane AND CreateNewMIDIItemInProj failed — surface so the user

@@ -1,17 +1,40 @@
-// rk_reverb.jsfx-inc — Hadamard FDN stereo reverb for DrumKit_ReaKit
+// rk_reverb.jsfx-inc — 8-line Hadamard FDN stereo reverb for DrumKit_ReaKit
 // (c) EON Studios — All Rights Reserved
 //
-// DSP derived from Red Lexikan S2 Hadamard FDN topology.
-// 4-path FDN with Hadamard mixing matrix, 4× series allpass input diffusion,
-// one-pole LP damping in feedback, triangle-LFO modulated delay reads,
-// multi-tap output, pre-delay, and output HPF.
+// ⭐ REBUILT 2026-08-26 (see .docs/specs/Spec_Swing_Reverb_Repair.md). The previous
+// tank was two independent 4-line FDNs and was measurably under-specified: its mode
+// density supported an RT60 of ~1.0 s while its feedback asked for 2.8–4.5 s, which
+// Schroeder/Jot/Smith all name as the cause of audible "ringing tones". Two further
+// defects were fixed: the "mutually prime" delay lengths stopped being prime the
+// moment Size scaled them (at Size 0.5 all four shared the factor 3), and the entire
+// RIGHT channel was unmodulated.
 //
-// Call rvb_init(mem_start) from @init, rvb_recalc() when params change,
-// rvb_tick() once per @block (updates LFO), rvb_process(inL, inR) from @sample.
-// Returns via rvb_outL / rvb_outR.
+// Design, all from the standard literature:
+//   • ONE 8-line FDN (was 2×4). Same delay-line count, but every line's poles now
+//     feed BOTH outputs, so mode density per output roughly doubles for free.
+//   • PRIME-SNAPPED lengths, unique and ascending ⇒ pairwise coprime BY CONSTRUCTION
+//     at every Size, not just at Size = 1.0.
+//   • RT60 is DERIVED FROM the Schroeder mode-density budget (density >= 0.15 * RT60),
+//     so the tank can never again be asked for more tail than its modes support.
+//   • Per-line Jot decay gains  g_i = 10^(-3*L_i / (RT60*srate))  ⇒ every line decays
+//     at the SAME rate (the old tank shared one gain across unequal lines, giving a
+//     2.76 s / 4.51 s spread — the tail changed character as it faded).
+//   • LOSSLESS normalized 8×8 Hadamard (fast Walsh butterflies, ×1/sqrt(8)). Decay
+//     comes from the per-line gains, never from breaking the matrix. The old tank's
+//     asymmetric fbA/fbB deliberately made the matrix non-unitary and then needed a
+//     0.93 stability cap to compensate — both are gone.
+//   • ALL EIGHT lines modulated, both output channels, with smoothed (parabolic-sine,
+//     no trig) LFOs at audible-but-clean rates.
+//
+// Call rvb_init(mem_start) from @init (returns advanced mem_start), rvb_recalc() when
+// params change, rvb_tick() once per @block (updates LFOs), rvb_process(inL, inR) from
+// @sample. Returns via rvb_outL / rvb_outR.
+//
+// ⚠️ Transcendentals (pow/sqrt) appear ONLY in rvb_init / rvb_recalc — never in
+// rvb_process. House rule: no transcendentals in @sample.
 //
 // Global parameters (set from GUI before calling rvb_recalc):
-//   rvb_size     — room size (0–1): scales feedback + delay times
+//   rvb_size     — room size (0–1): scales delay times, and through them RT60
 //   rvb_damp     — damping (0–1): higher = darker tail
 //   rvb_mix      — wet/dry mix for return (0–1, applied by host/GUI externally)
 //   rvb_width    — stereo width (0–1)
@@ -20,35 +43,112 @@
 
 @init
 
+// ─── Design constants ──────────────────────────────────────────────────────
+// Base line lengths at Size = 1.0, geometric from 1000 to ~3400 samples @44.1k
+// (22.7 ms … 77 ms). Spread 3.4:1 — wide spread spaces the modes out; the old
+// tank's 1.64:1 clustered them. Sum ≈ 15.9k ⇒ supports RT60 ≈ 2.4 s (Schroeder).
+RVB_N        = 8;              // delay lines in the tank
+RVB_SPREAD_A = 1000;           // shortest base length (samples @ 44.1k)
+RVB_SPREAD_K = 1.1907;         // geometric ratio per line (1.1907^7 ≈ 3.4)
+// Schroeder: mode density (sum(L)/srate) must be >= 0.15 modes/Hz per second of
+// RT60. We derive RT60 FROM the budget with margin, so the criterion holds by
+// construction at every Size.
+RVB_DENS_K      = 0.15;
+RVB_DENS_MARGIN = 0.88;
+RVB_RT60_MIN    = 0.25;
+// Modulation: 0.6 % of line length, hard-capped so long lines don't chorus.
+RVB_MOD_FRAC = 0.006;
+RVB_MOD_CAP  = 12;             // samples of peak excursion
+
+// ── Tank diffusion (added 2026-08-26 pass 2: "still rings, and not lush") ──
+// One MODULATED allpass sits in each line's feedback path, so every circulation
+// MULTIPLIES the echo count instead of merely delaying it. This is the classic
+// Dattorro/Griesinger plate trick and it is what echo density — the time-domain
+// twin of mode density — actually needs. Pass 1 fixed mode density (no more
+// ringing TONES in the tail); sparse early echo density is what still read as
+// metallic and thin.
+// Modulating an ALLPASS shifts phase, not pitch, so it can be swung far harder
+// than a delay line: ±6 samples on a ~300-sample allpass is ~2 %, versus 0.35 %
+// on a 3400-sample delay. That is what breaks up the remaining ring.
+RVB_TAP_G     = 0.70;          // tank allpass coefficient
+RVB_TAP_SWING = 6;             // samples of allpass modulation
+// Input diffusion: SIX stages per channel (was four), gains raised from
+// 0.50/0.55/0.45/0.40. Measured with normalized echo density
+// (.dev_tests/reverb_density.py): stage COUNT dominates — going 4→6 stages at
+// moderate gain took time-to-diffuse from 60 ms to 30 ms, while merely running
+// four stages hotter made it WORSE (50 ms). The old low gains were protecting
+// drum attack at the cost of starving the tank of early density, which is what
+// read as "metallic and not lush".
+RVB_NDIFF = 6;
+RVB_IN_G1 = 0.70; RVB_IN_G2 = 0.72; RVB_IN_G3 = 0.66;
+RVB_IN_G4 = 0.62; RVB_IN_G5 = 0.58; RVB_IN_G6 = 0.55;
+
+// ─── Primality helpers (rvb_recalc only — never called from @sample) ───────
+
+function _rvb_is_prime(n)
+local(i, lim, r)
+(
+  n = n | 0;
+  r = 1;
+  n < 2 ? ( r = 0; );
+  (r && n > 3 && (n - ((n / 2) | 0) * 2) == 0) ? ( r = 0; );
+  (r && n > 4) ? (
+    lim = sqrt(n) | 0;
+    i = 3;
+    while (i <= lim) (
+      (n - ((n / i) | 0) * i) == 0 ? ( r = 0; i = lim + 1; ) : ( i += 2; );
+    );
+  );
+  r;
+);
+
+// Smallest prime >= n. Bounded walk; n is always small here (<= RVB_MAX_DL).
+function _rvb_prime_at_or_above(n)
+local(c, guard)
+(
+  c = max(2, n | 0);
+  guard = 0;
+  while (!_rvb_is_prime(c) && guard < 512) ( c += 1; guard += 1; );
+  c;
+);
+
+// Largest prime <= n. Only used on the buffer-ceiling path: clamping a snapped
+// length to a raw integer would silently reintroduce shared factors (the exact
+// defect this rebuild exists to kill — 3393 snaps to 3407, and a naive clamp to
+// 3397 lands on 43*79). Clamp to a PRIME or not at all.
+function _rvb_prime_at_or_below(n)
+local(c, guard)
+(
+  c = max(2, n | 0);
+  guard = 0;
+  while (!_rvb_is_prime(c) && c > 2 && guard < 512) ( c -= 1; guard += 1; );
+  c;
+);
+
 // ─── Init ──────────────────────────────────────────────────────────────────
 
 function rvb_init(mem_start)
-local(i, sc)
+local(i, sc, base)
 (
   sc = srate / 44100;
 
-  // ── FDN base delay lengths (samples at srate) ──
-  // Mutually prime ratios chosen for maximum density / minimal flutter.
-  // These are the LATE reverb tank delays. Tuned for a natural room sound.
-  // Lengths: ~29ms, ~37ms, ~41ms, ~47ms at 44100 (prime-ish ratios)
-  RVB_BASE_D1 = (1277 * sc) | 0;   // 29.0ms
-  RVB_BASE_D2 = (1637 * sc) | 0;   // 37.1ms
-  RVB_BASE_D3 = (1823 * sc) | 0;   // 41.3ms
-  RVB_BASE_D4 = (2089 * sc) | 0;   // 47.4ms
+  // Base (unscaled) line lengths — geometric spread, ascending.
+  rvb_base_len = mem_start; mem_start += RVB_N;
+  base = RVB_SPREAD_A * sc;
+  i = 0; loop(RVB_N,
+    rvb_base_len[i] = base | 0;
+    base *= RVB_SPREAD_K;
+    i += 1;
+  );
+  // Longest line + PRIME-SEARCH HEADROOM (3 %: snapping walks UP to the next
+  // prime, so the buffer must hold more than the raw base length) + modulation
+  // excursion + interpolation guard.
+  RVB_MAX_DL = ((rvb_base_len[RVB_N - 1] * 1.03) | 0) + RVB_MOD_CAP + 8;
 
-  // Stereo offset — different for each path to maximize decorrelation
-  RVB_ST_OFS1 = (23 * sc) | 0;
-  RVB_ST_OFS2 = (37 * sc) | 0;
-  RVB_ST_OFS3 = (51 * sc) | 0;
-  RVB_ST_OFS4 = (67 * sc) | 0;
-
-  // Maximum delay length (for size=1 + modulation headroom + stereo offset)
-  RVB_MAX_DL = ((2300 * sc) | 0) + 8;
-
-  // Allocate 8 delay buffers (L: 0-3, R: 4-7)
-  rvb_dl_buf = mem_start; mem_start += 8;
-  rvb_dl_wp  = mem_start; mem_start += 8;
-  i = 0; loop(8,
+  // Delay lines
+  rvb_dl_buf = mem_start; mem_start += RVB_N;
+  rvb_dl_wp  = mem_start; mem_start += RVB_N;
+  i = 0; loop(RVB_N,
     rvb_dl_buf[i] = mem_start;
     memset(mem_start, 0, RVB_MAX_DL);
     mem_start += RVB_MAX_DL;
@@ -56,36 +156,68 @@ local(i, sc)
     i += 1;
   );
 
-  // FDN delay lengths array (8 entries, filled by rvb_recalc)
-  rvb_dl_len = mem_start; mem_start += 8;
-  memset(rvb_dl_len, 0, 8);
+  // ── Tank diffusion allpasses: one per line, inside the feedback path ──
+  // Fixed prime lengths, ~3.6:1 spread, all distinct from each other.
+  rvb_tap_len = mem_start; mem_start += RVB_N;
+  rvb_tap_len[0] = max(8, (149 * sc) | 0);  rvb_tap_len[1] = max(8, (211 * sc) | 0);
+  rvb_tap_len[2] = max(8, (263 * sc) | 0);  rvb_tap_len[3] = max(8, (313 * sc) | 0);
+  rvb_tap_len[4] = max(8, (373 * sc) | 0);  rvb_tap_len[5] = max(8, (431 * sc) | 0);
+  rvb_tap_len[6] = max(8, (479 * sc) | 0);  rvb_tap_len[7] = max(8, (541 * sc) | 0);
+  RVB_MAX_TAP = (rvb_tap_len[RVB_N - 1] | 0) + RVB_TAP_SWING + 8;
 
-  // One-pole LP filter state per delay path (8 total)
-  rvb_lp_state = mem_start; mem_start += 8;
-  memset(rvb_lp_state, 0, 8);
+  rvb_tap_buf = mem_start; mem_start += RVB_N;
+  rvb_tap_wp  = mem_start; mem_start += RVB_N;
+  rvb_tap_mod = mem_start; mem_start += RVB_N;
+  i = 0; loop(RVB_N,
+    rvb_tap_buf[i] = mem_start;
+    memset(mem_start, 0, RVB_MAX_TAP);
+    mem_start += RVB_MAX_TAP;
+    rvb_tap_wp[i] = 0;
+    rvb_tap_mod[i] = rvb_tap_len[i];
+    i += 1;
+  );
+
+  // Per-line state: current length, decay gain, damping state, live modulated length
+  rvb_dl_len   = mem_start; mem_start += RVB_N;  memset(rvb_dl_len,   0, RVB_N);
+  rvb_loop_len = mem_start; mem_start += RVB_N;  memset(rvb_loop_len, 0, RVB_N);
+  rvb_gain     = mem_start; mem_start += RVB_N;  memset(rvb_gain,     0, RVB_N);
+  rvb_lp_state = mem_start; mem_start += RVB_N;  memset(rvb_lp_state, 0, RVB_N);
+  rvb_mod_len  = mem_start; mem_start += RVB_N;  memset(rvb_mod_len,  0, RVB_N);
+  rvb_mod_dep  = mem_start; mem_start += RVB_N;  memset(rvb_mod_dep,  0, RVB_N);
+  rvb_lfo_ph   = mem_start; mem_start += RVB_N;  memset(rvb_lfo_ph,   0, RVB_N);
+  rvb_lfo_rate = mem_start; mem_start += RVB_N;  memset(rvb_lfo_rate, 0, RVB_N);
+
+  // LFO rates 0.47 … 1.31 Hz, irregularly spaced so they never lock together,
+  // and phases spread across the cycle. Every line modulates — the old tank
+  // modulated only the left half, which left the right side ringing.
+  rvb_lfo_rate[0] = 0.47; rvb_lfo_rate[1] = 0.59;
+  rvb_lfo_rate[2] = 0.71; rvb_lfo_rate[3] = 0.83;
+  rvb_lfo_rate[4] = 0.97; rvb_lfo_rate[5] = 1.09;
+  rvb_lfo_rate[6] = 1.21; rvb_lfo_rate[7] = 1.31;
+  i = 0; loop(RVB_N, rvb_lfo_ph[i] = i / RVB_N; i += 1; );
 
   // ── Input diffusion allpasses (4 series, stereo = 8 buffers) ──
-  // Lengths: ~5ms, ~7ms, ~3ms, ~1.7ms (prime-ish, descending for smear)
-  RVB_AP1_LEN = max(4, (227 * sc) | 0);   // 5.1ms
-  RVB_AP2_LEN = max(4, (311 * sc) | 0);   // 7.1ms
-  RVB_AP3_LEN = max(4, (149 * sc) | 0);   // 3.4ms
-  RVB_AP4_LEN = max(4, (79 * sc) | 0);    // 1.8ms
-  // R offsets for diffusion decorrelation
-  RVB_AP1R_LEN = max(4, (241 * sc) | 0);
-  RVB_AP2R_LEN = max(4, (337 * sc) | 0);
-  RVB_AP3R_LEN = max(4, (163 * sc) | 0);
-  RVB_AP4R_LEN = max(4, (89 * sc) | 0);
+  // Six stages per channel, descending prime lengths: 0–5 = L chain, 6–11 = R.
+  // Descending so the first stage smears the transient and the later short ones
+  // pack in density.
+  rvb_ap_buf = mem_start; mem_start += RVB_NDIFF * 2;
+  rvb_ap_wp  = mem_start; mem_start += RVB_NDIFF * 2;
+  rvb_ap_len = mem_start; mem_start += RVB_NDIFF * 2;
 
-  rvb_ap_buf = mem_start; mem_start += 8;  // pointers
-  rvb_ap_wp  = mem_start; mem_start += 8;  // write positions
-  rvb_ap_len = mem_start; mem_start += 8;  // lengths
+  rvb_ap_len[0]  = max(4, (227 * sc) | 0);   // 5.1 ms
+  rvb_ap_len[1]  = max(4, (311 * sc) | 0);   // 7.1 ms
+  rvb_ap_len[2]  = max(4, (149 * sc) | 0);   // 3.4 ms
+  rvb_ap_len[3]  = max(4, (79  * sc) | 0);   // 1.8 ms
+  rvb_ap_len[4]  = max(4, (53  * sc) | 0);   // 1.2 ms
+  rvb_ap_len[5]  = max(4, (37  * sc) | 0);   // 0.8 ms
+  rvb_ap_len[6]  = max(4, (241 * sc) | 0);
+  rvb_ap_len[7]  = max(4, (337 * sc) | 0);
+  rvb_ap_len[8]  = max(4, (163 * sc) | 0);
+  rvb_ap_len[9]  = max(4, (89  * sc) | 0);
+  rvb_ap_len[10] = max(4, (59  * sc) | 0);
+  rvb_ap_len[11] = max(4, (41  * sc) | 0);
 
-  rvb_ap_len[0] = RVB_AP1_LEN; rvb_ap_len[1] = RVB_AP2_LEN;
-  rvb_ap_len[2] = RVB_AP3_LEN; rvb_ap_len[3] = RVB_AP4_LEN;
-  rvb_ap_len[4] = RVB_AP1R_LEN; rvb_ap_len[5] = RVB_AP2R_LEN;
-  rvb_ap_len[6] = RVB_AP3R_LEN; rvb_ap_len[7] = RVB_AP4R_LEN;
-
-  i = 0; loop(8,
+  i = 0; loop(RVB_NDIFF * 2,
     rvb_ap_buf[i] = mem_start;
     memset(mem_start, 0, rvb_ap_len[i]);
     mem_start += rvb_ap_len[i];
@@ -105,21 +237,17 @@ local(i, sc)
   rvb_hpf_stateL = 0;
   rvb_hpf_stateR = 0;
 
-  // ── LFO state (triangle, 4 phases) ──
-  rvb_lfo_ph1 = 0.00;
-  rvb_lfo_ph2 = 0.25;
-  rvb_lfo_ph3 = 0.50;
-  rvb_lfo_ph4 = 0.75;
-  rvb_lfo_mod1 = 0; rvb_lfo_mod2 = 0;
-  rvb_lfo_mod3 = 0; rvb_lfo_mod4 = 0;
-
-  // ── Denormal protection constant ──
-  // JSFX has no scientific notation; precompute via pow().
+  // ── Denormal protection constant (JSFX has no scientific notation) ──
   RVB_DENORM = pow(10, -18);
+  // Normalized 8x8 Hadamard scale, and the output tap scale.
+  RVB_HAD_S = 1 / sqrt(8);
+  RVB_OUT_S = 0.42;
 
   // ── Runtime state ──
   rvb_outL = 0;
   rvb_outR = 0;
+  rvb_in_gain = 0.5;
+  rvb_rt60 = 1.0;
 
   mem_start;
 );
@@ -127,55 +255,75 @@ local(i, sc)
 // ─── Recalculate coefficients ──────────────────────────────────────────────
 
 function rvb_recalc()
-local(sz)
+local(sz, i, scale, target, prev, total, gsum, gavg, dens)
 (
   sz = max(0, min(1, rvb_size));
 
-  // Feedback A (primary): 0.60 (tiny room) to 0.93 (huge hall)
-  // Capped at 0.93 (not 0.94) for stability margin: the asymmetric
-  // fbA/fbB trick makes the mixing matrix non-unitary, so we keep
-  // headroom to prevent energy creep toward instability at max size.
-  rvb_fbA = 0.60 + sz * 0.33;
-  // Feedback B (secondary): 85% of A — asymmetric decay creates natural envelope
-  // where some paths die faster, preventing the "even wash" that sounds artificial
-  rvb_fbB = rvb_fbA * 0.85;
+  // Delay time scaling: 0.35x (tight) to 1.0x (full).
+  scale = 0.35 + sz * 0.65;
 
-  // Input injection gain — scales inversely with feedback (Lexikan-style)
-  // At small rooms (fbA=0.60): in_gain ≈ 0.56 (punchy, short)
-  // At big halls (fbA=0.94): in_gain ≈ 0.08 (gentle, long tail)
-  // This prevents the "splashy" onset where the first hit overwhelms the tail.
-  rvb_in_gain = (1.0 - rvb_fbA) * 1.4;
+  // ── Lengths: scale, then SNAP TO A PRIME, ascending and unique ──
+  // Snapping is what keeps the set pairwise coprime at every Size. The old tank
+  // multiplied its primes and truncated, which destroyed coprimality everywhere
+  // except Size = 1.0 (at Size 0.5 all four lengths shared the factor 3).
+  // ⭐ It is the LOOP length (delay + its tank allpass) that sets the modes, so
+  // the LOOP length is what gets snapped to a prime — the delay is then sized to
+  // fit underneath it. Snapping the delay alone would leave the real loop lengths
+  // sharing factors again.
+  prev = 0;
+  total = 0;
+  i = 0; loop(RVB_N,
+    target = (rvb_base_len[i] * scale) | 0;
+    target < rvb_tap_len[i] + 16 ? target = rvb_tap_len[i] + 16;
+    target <= prev ? target = prev + 1;
+    prev = _rvb_prime_at_or_above(target);
+    // Ceiling guard: stay a PRIME (see _rvb_prime_at_or_below). With the 3 %
+    // headroom above this should never fire; it exists so an odd sample rate
+    // can't quietly break coprimality.
+    prev > RVB_MAX_DL - RVB_MOD_CAP - 4 ?
+      prev = _rvb_prime_at_or_below(RVB_MAX_DL - RVB_MOD_CAP - 4);
+    rvb_loop_len[i] = prev;
+    rvb_dl_len[i] = max(8, prev - rvb_tap_len[i]);
+    rvb_mod_len[i] = rvb_dl_len[i];
+    total += prev;
+    i += 1;
+  );
 
-  // Delay time scaling: size stretches the FDN delays
-  // Range: 0.35× (tight) to 1.0× (full)
-  rvb_dl_scale = 0.35 + sz * 0.65;
+  // ── RT60 derived FROM the Schroeder mode-density budget ──
+  // density = total/srate must be >= RVB_DENS_K * RT60. Solving for RT60 and
+  // applying a safety margin means the tank is never asked for more tail than
+  // its modes can carry — which is exactly the defect that made it ring.
+  dens = total / srate;
+  rvb_rt60 = max(RVB_RT60_MIN, RVB_DENS_MARGIN * dens / RVB_DENS_K);
 
-  // Actual FDN delay lengths stored as array (L: 0-3, R: 4-7)
-  // Array avoids nested ternaries in _rvb_dl_read_tap.
-  rvb_dl_len[0] = max(8, (RVB_BASE_D1 * rvb_dl_scale) | 0);
-  rvb_dl_len[1] = max(8, (RVB_BASE_D2 * rvb_dl_scale) | 0);
-  rvb_dl_len[2] = max(8, (RVB_BASE_D3 * rvb_dl_scale) | 0);
-  rvb_dl_len[3] = max(8, (RVB_BASE_D4 * rvb_dl_scale) | 0);
-  // R paths: different stereo offsets per path for rich decorrelation
-  rvb_dl_len[4] = max(8, ((RVB_BASE_D1 + RVB_ST_OFS1) * rvb_dl_scale) | 0);
-  rvb_dl_len[5] = max(8, ((RVB_BASE_D2 + RVB_ST_OFS2) * rvb_dl_scale) | 0);
-  rvb_dl_len[6] = max(8, ((RVB_BASE_D3 + RVB_ST_OFS3) * rvb_dl_scale) | 0);
-  rvb_dl_len[7] = max(8, ((RVB_BASE_D4 + RVB_ST_OFS4) * rvb_dl_scale) | 0);
+  // ── Per-line Jot decay gains: g_i = 10^(-3*L_i / (RT60*srate)) ──
+  // Longer line ⇒ higher gain ⇒ every line reaches -60 dB at the same instant.
+  // NOTE: the exponent uses the LOOP length (delay + tank allpass), because that
+  // is the actual round trip. Using the bare delay would make every line decay
+  // slightly slow.
+  gsum = 0;
+  i = 0; loop(RVB_N,
+    rvb_gain[i] = pow(10, -3 * rvb_loop_len[i] / (rvb_rt60 * srate));
+    gsum += rvb_gain[i];
+    // Modulation depth in SAMPLES, capped so long lines never chorus.
+    rvb_mod_dep[i] = min(RVB_MOD_CAP, rvb_dl_len[i] * RVB_MOD_FRAC);
+    i += 1;
+  );
 
-  // Damping: one-pole LP coefficient
-  // damp=0 → coeff=0 (bypass, bright), damp=1 → coeff=0.80 (heavy, dark)
+  // Input normalization: standard comb energy term, so output level stays put
+  // as Size sweeps. (The old tank used (1-fb)*1.4, which swung ~20 dB.)
+  gavg = gsum / RVB_N;
+  rvb_in_gain = sqrt(max(0.02, 1 - gavg * gavg));
+
+  // Damping: one-pole LP coefficient (unity DC gain, so it shortens the HF
+  // RT60 relative to LF — physically what a room does).
   rvb_damp_coeff = max(0, min(1, rvb_damp)) * 0.80;
 
   // Pre-delay in samples
   rvb_pre_samps = min(RVB_MAX_PRE - 2,
     max(0, rvb_predelay * 0.001 * srate) | 0);
 
-  // Output HPF coefficient (one-pole, 6dB/oct)
-  // Implemented as: subtract LP(input) from input. rvb_hpf_alpha is the
-  // LP smoothing factor: α = 2πf / (2πf + srate). The HPF state update
-  // is: state += (in - state) * α; out = in - state.
-  // Gate at 20 Hz — sub-audio HPF values have no useful effect and the
-  // formula degrades at very low frequencies.
+  // Output HPF coefficient (one-pole, 6dB/oct): state += (in-state)*α; out = in-state.
   rvb_hpf >= 20 ? (
     rvb_hpf_on = 1;
     rvb_hpf_alpha = rvb_hpf * 2 * $pi / (rvb_hpf * 2 * $pi + srate);
@@ -187,38 +335,32 @@ local(sz)
   // Width
   rvb_w1 = max(0, min(1, rvb_width)) * 0.5 + 0.5;
   rvb_w2 = (1.0 - max(0, min(1, rvb_width))) * 0.5;
-
-  // LFO modulation depth (0.4% — thickens the tail, prevents metallic ringing)
-  rvb_lfo_depth = sz > 0.05 ? 0.004 : 0;
 );
 
 // ─── Block-rate LFO tick ───────────────────────────────────────────────────
 
 function rvb_tick()
-local(v1, v2, v3, v4, inc)
+local(i, inc, p, t, s)
 (
   inc = samplesblock / srate;
-  rvb_lfo_ph1 += 0.17 * inc;
-  rvb_lfo_ph2 += 0.23 * inc;
-  rvb_lfo_ph3 += 0.13 * inc;
-  rvb_lfo_ph4 += 0.31 * inc;
-  // Robust wrap: handles multi-wrap in case samplesblock spikes (offline render)
-  rvb_lfo_ph1 -= (rvb_lfo_ph1 | 0);
-  rvb_lfo_ph2 -= (rvb_lfo_ph2 | 0);
-  rvb_lfo_ph3 -= (rvb_lfo_ph3 | 0);
-  rvb_lfo_ph4 -= (rvb_lfo_ph4 | 0);
-
-  // Triangle LFO: phase 0..1 → -1..+1
-  v1 = 4 * rvb_lfo_ph1 - 1; v1 > 1 ? v1 = 2 - v1; v1 < -1 ? v1 = -2 - v1;
-  v2 = 4 * rvb_lfo_ph2 - 1; v2 > 1 ? v2 = 2 - v2; v2 < -1 ? v2 = -2 - v2;
-  v3 = 4 * rvb_lfo_ph3 - 1; v3 > 1 ? v3 = 2 - v3; v3 < -1 ? v3 = -2 - v3;
-  v4 = 4 * rvb_lfo_ph4 - 1; v4 > 1 ? v4 = 2 - v4; v4 < -1 ? v4 = -2 - v4;
-
-  // Modulated delay lengths for L paths (R paths use fixed lengths — asymmetry = wider)
-  rvb_lfo_mod1 = max(8, rvb_dl_len[0] * (1 + v1 * rvb_lfo_depth));
-  rvb_lfo_mod2 = max(8, rvb_dl_len[1] * (1 + v2 * rvb_lfo_depth * 0.8));
-  rvb_lfo_mod3 = max(8, rvb_dl_len[2] * (1 + v3 * rvb_lfo_depth * 0.6));
-  rvb_lfo_mod4 = max(8, rvb_dl_len[3] * (1 + v4 * rvb_lfo_depth * 0.7));
+  i = 0; loop(RVB_N,
+    p = rvb_lfo_ph[i] + rvb_lfo_rate[i] * inc;
+    p -= (p | 0);            // robust wrap (offline renders can spike samplesblock)
+    rvb_lfo_ph[i] = p;
+    // Triangle, then a parabolic sine shaping so the turnarounds are smooth.
+    // The old tank used a raw triangle, whose hard corners are themselves
+    // audible. t*(2-|t|) is a sine approximation and needs no trig.
+    t = 4 * p - 1;
+    t > 1 ? t = 2 - t;
+    t < -1 ? t = -2 - t;
+    s = t * (2 - abs(t));
+    rvb_mod_len[i] = max(8, rvb_dl_len[i] + s * rvb_mod_dep[i]);
+    // Tank allpass swings the OPPOSITE way on the same LFO, so the delay and its
+    // own diffuser never move together — and proportionally much harder, which
+    // is safe because an allpass modulates phase rather than pitch.
+    rvb_tap_mod[i] = max(4, rvb_tap_len[i] - s * RVB_TAP_SWING);
+    i += 1;
+  );
 );
 
 // ─── Inline delay helpers ──────────────────────────────────────────────────
@@ -238,8 +380,6 @@ local(buf, wp, rp, rp_int, rp_frac, s0, s1)
 (
   buf = rvb_dl_buf[idx];
   wp = rvb_dl_wp[idx];
-  // Clamp to valid range — prevents out-of-bounds if LFO modulation
-  // ever pushes delay_samps beyond the buffer.
   delay_samps = min(RVB_MAX_DL - 2, max(1, delay_samps));
   rp = wp - delay_samps;
   rp < 0 ? rp += RVB_MAX_DL;
@@ -251,37 +391,37 @@ local(buf, wp, rp, rp_int, rp_frac, s0, s1)
   s0 + (s1 - s0) * rp_frac;
 );
 
-// Read from delay at a secondary tap position (for multi-tap output)
-function _rvb_dl_read_tap(idx, tap_frac)
-local(buf, wp, len, rp, rp_int, rp_frac, s0, s1)
+// Tank allpass with a FRACTIONAL, modulated delay. Standard Schroeder form:
+//   d = read(D);  v = in + g*d;  write(v);  out = d - g*v
+// Unity magnitude ⇒ it adds density without touching loop gain or RT60.
+function _rvb_tap_process(idx, input, g, delay_samps)
+local(buf, wp, rp, rp_int, rp_frac, s0, s1, d, v)
 (
-  buf = rvb_dl_buf[idx];
-  wp = rvb_dl_wp[idx];
-  // tap_frac is fraction of current delay length (0.0–1.0)
-  // Read at a different point in the delay for richer output
-  len = max(1, rvb_dl_len[idx] * tap_frac);
-  rp = wp - len;
-  rp < 0 ? rp += RVB_MAX_DL;
+  buf = rvb_tap_buf[idx];
+  wp = rvb_tap_wp[idx];
+  delay_samps = min(RVB_MAX_TAP - 2, max(1, delay_samps));
+  rp = wp - delay_samps;
+  rp < 0 ? rp += RVB_MAX_TAP;
   rp_int = rp | 0;
   rp_frac = rp - rp_int;
   s0 = buf[rp_int];
-  rp_int += 1; rp_int >= RVB_MAX_DL ? rp_int = 0;
+  rp_int += 1; rp_int >= RVB_MAX_TAP ? rp_int = 0;
   s1 = buf[rp_int];
-  s0 + (s1 - s0) * rp_frac;
+  d = s0 + (s1 - s0) * rp_frac;
+  v = input + g * d;
+  buf[wp] = v;
+  wp += 1; wp >= RVB_MAX_TAP ? wp = 0;
+  rvb_tap_wp[idx] = wp;
+  d - g * v;
 );
 
-// ─── Inline allpass helper ─────────────────────────────────────────────────
-// Schroeder allpass: output = -g*in + buf[read] + g*buf[read]
-// where g = allpass gain coefficient
-
 function _rvb_ap_process(idx, input, g)
-local(buf, wp, cl, rd_pos, buf_out, out)
+local(buf, wp, cl, buf_out, out)
 (
   buf = rvb_ap_buf[idx];
   wp = rvb_ap_wp[idx];
   cl = rvb_ap_len[idx];
-  rd_pos = wp;  // circular read = oldest sample
-  buf_out = buf[rd_pos];
+  buf_out = buf[wp];              // circular read = oldest sample
   out = -g * input + buf_out;
   buf[wp] = input + g * buf_out;
   wp += 1; wp >= cl ? wp = 0;
@@ -293,10 +433,8 @@ local(buf, wp, cl, rd_pos, buf_out, out)
 
 function rvb_process(inL, inR)
 local(pre_rp, diffL, diffR,
-      e1L, e2L, e3L, e4L, e1R, e2R, e3R, e4R,
-      h1L, h2L, h3L, h4L, h1R, h2R, h3R, h4R,
-      f1L, f2L, f3L, f4L, f1R, f2R, f3R, f4R,
-      t1L, t2L, t3L, t4L, t1R, t2R, t3R, t4R,
+      d0, d1, d2, d3, d4, d5, d6, d7,
+      b0, b1, b2, b3, b4, b5, b6, b7,
       sumL, sumR)
 (
   // ── Pre-delay ──
@@ -309,104 +447,88 @@ local(pre_rp, diffL, diffR,
   rvb_pre_wp += 1; rvb_pre_wp >= RVB_MAX_PRE ? rvb_pre_wp = 0;
 
   // ── Input diffusion — 4 series allpasses per channel ──
-  // Progressively lower gain: first stage smears hard transients,
-  // later stages add density. Lower coefficients preserve drum attack.
-  diffL = _rvb_ap_process(0, inL, 0.50);
-  diffL = _rvb_ap_process(1, diffL, 0.55);
-  diffL = _rvb_ap_process(2, diffL, 0.45);
-  diffL = _rvb_ap_process(3, diffL, 0.40);
+  // Descending gains: the first stage smears hard transients, later stages add
+  // density without eating the drum attack.
+  diffL = _rvb_ap_process(0, inL,   RVB_IN_G1);
+  diffL = _rvb_ap_process(1, diffL, RVB_IN_G2);
+  diffL = _rvb_ap_process(2, diffL, RVB_IN_G3);
+  diffL = _rvb_ap_process(3, diffL, RVB_IN_G4);
+  diffL = _rvb_ap_process(4, diffL, RVB_IN_G5);
+  diffL = _rvb_ap_process(5, diffL, RVB_IN_G6);
 
-  diffR = _rvb_ap_process(4, inR, 0.50);
-  diffR = _rvb_ap_process(5, diffR, 0.55);
-  diffR = _rvb_ap_process(6, diffR, 0.45);
-  diffR = _rvb_ap_process(7, diffR, 0.40);
+  diffR = _rvb_ap_process(6,  inR,   RVB_IN_G1);
+  diffR = _rvb_ap_process(7,  diffR, RVB_IN_G2);
+  diffR = _rvb_ap_process(8,  diffR, RVB_IN_G3);
+  diffR = _rvb_ap_process(9,  diffR, RVB_IN_G4);
+  diffR = _rvb_ap_process(10, diffR, RVB_IN_G5);
+  diffR = _rvb_ap_process(11, diffR, RVB_IN_G6);
 
-  // ── Read FDN delay lines (L: 0-3, R: 4-7) ──
-  // L paths use modulated delay lengths; R paths use fixed (asymmetric = wider image)
-  e1L = _rvb_dl_read(0, rvb_lfo_mod1);
-  e2L = _rvb_dl_read(1, rvb_lfo_mod2);
-  e3L = _rvb_dl_read(2, rvb_lfo_mod3);
-  e4L = _rvb_dl_read(3, rvb_lfo_mod4);
+  // ── Read all eight lines at their live modulated lengths ──
+  d0 = _rvb_dl_read(0, rvb_mod_len[0]);
+  d1 = _rvb_dl_read(1, rvb_mod_len[1]);
+  d2 = _rvb_dl_read(2, rvb_mod_len[2]);
+  d3 = _rvb_dl_read(3, rvb_mod_len[3]);
+  d4 = _rvb_dl_read(4, rvb_mod_len[4]);
+  d5 = _rvb_dl_read(5, rvb_mod_len[5]);
+  d6 = _rvb_dl_read(6, rvb_mod_len[6]);
+  d7 = _rvb_dl_read(7, rvb_mod_len[7]);
 
-  e1R = _rvb_dl_read(4, rvb_dl_len[4]);
-  e2R = _rvb_dl_read(5, rvb_dl_len[5]);
-  e3R = _rvb_dl_read(6, rvb_dl_len[6]);
-  e4R = _rvb_dl_read(7, rvb_dl_len[7]);
+  // ── Stereo output taps: two ORTHOGONAL Hadamard rows over the raw line
+  // outputs. Every line feeds both outputs, so both channels see all eight
+  // lines' modes — that is where the doubled mode density comes from.
+  sumL = (d0 - d1 + d2 - d3 + d4 - d5 + d6 - d7) * RVB_OUT_S;
+  sumR = (d0 + d1 - d2 - d3 + d4 + d5 - d6 - d7) * RVB_OUT_S;
 
-  // ── Hadamard mixing matrix (4×4, normalized by 0.5) ──
-  // H = 0.5 * [[1,1,1,1],[1,-1,1,-1],[1,1,-1,-1],[1,-1,-1,1]]
-  h1L = 0.5 * ( e1L + e2L + e3L + e4L);
-  h2L = 0.5 * ( e1L - e2L + e3L - e4L);
-  h3L = 0.5 * ( e1L + e2L - e3L - e4L);
-  h4L = 0.5 * ( e1L - e2L - e3L + e4L);
+  // ── Lossless normalized 8x8 Hadamard, as fast Walsh butterflies ──
+  // 24 add/sub + 8 multiplies. Unitary ⇒ energy-preserving; ALL decay comes
+  // from the per-line gains below, never from detuning the matrix.
+  b0 = d0 + d1; b1 = d0 - d1; b2 = d2 + d3; b3 = d2 - d3;
+  b4 = d4 + d5; b5 = d4 - d5; b6 = d6 + d7; b7 = d6 - d7;
+  d0 = b0 + b2; d2 = b0 - b2; d1 = b1 + b3; d3 = b1 - b3;
+  d4 = b4 + b6; d6 = b4 - b6; d5 = b5 + b7; d7 = b5 - b7;
+  b0 = d0 + d4; b4 = d0 - d4; b1 = d1 + d5; b5 = d1 - d5;
+  b2 = d2 + d6; b6 = d2 - d6; b3 = d3 + d7; b7 = d3 - d7;
 
-  h1R = 0.5 * ( e1R + e2R + e3R + e4R);
-  h2R = 0.5 * ( e1R - e2R + e3R - e4R);
-  h3R = 0.5 * ( e1R + e2R - e3R - e4R);
-  h4R = 0.5 * ( e1R - e2R - e3R + e4R);
+  b0 *= RVB_HAD_S; b1 *= RVB_HAD_S; b2 *= RVB_HAD_S; b3 *= RVB_HAD_S;
+  b4 *= RVB_HAD_S; b5 *= RVB_HAD_S; b6 *= RVB_HAD_S; b7 *= RVB_HAD_S;
 
-  // ── One-pole LP damping in feedback path ──
-  f1L = h1L * (1 - rvb_damp_coeff) + rvb_lp_state[0] * rvb_damp_coeff;
-  f2L = h2L * (1 - rvb_damp_coeff) + rvb_lp_state[1] * rvb_damp_coeff;
-  f3L = h3L * (1 - rvb_damp_coeff) + rvb_lp_state[2] * rvb_damp_coeff;
-  f4L = h4L * (1 - rvb_damp_coeff) + rvb_lp_state[3] * rvb_damp_coeff;
-  f1R = h1R * (1 - rvb_damp_coeff) + rvb_lp_state[4] * rvb_damp_coeff;
-  f2R = h2R * (1 - rvb_damp_coeff) + rvb_lp_state[5] * rvb_damp_coeff;
-  f3R = h3R * (1 - rvb_damp_coeff) + rvb_lp_state[6] * rvb_damp_coeff;
-  f4R = h4R * (1 - rvb_damp_coeff) + rvb_lp_state[7] * rvb_damp_coeff;
-  rvb_lp_state[0] = f1L; rvb_lp_state[1] = f2L;
-  rvb_lp_state[2] = f3L; rvb_lp_state[3] = f4L;
-  rvb_lp_state[4] = f1R; rvb_lp_state[5] = f2R;
-  rvb_lp_state[6] = f3R; rvb_lp_state[7] = f4R;
+  // ── Tank diffusion: a modulated allpass in EVERY feedback path ──
+  // Each circulation now multiplies the echo count instead of just delaying it,
+  // which is what turns discrete repeats into a wash. Allpasses are unity-gain,
+  // so RT60 and stability are untouched — only density changes.
+  b0 = _rvb_tap_process(0, b0, RVB_TAP_G, rvb_tap_mod[0]);
+  b1 = _rvb_tap_process(1, b1, RVB_TAP_G, rvb_tap_mod[1]);
+  b2 = _rvb_tap_process(2, b2, RVB_TAP_G, rvb_tap_mod[2]);
+  b3 = _rvb_tap_process(3, b3, RVB_TAP_G, rvb_tap_mod[3]);
+  b4 = _rvb_tap_process(4, b4, RVB_TAP_G, rvb_tap_mod[4]);
+  b5 = _rvb_tap_process(5, b5, RVB_TAP_G, rvb_tap_mod[5]);
+  b6 = _rvb_tap_process(6, b6, RVB_TAP_G, rvb_tap_mod[6]);
+  b7 = _rvb_tap_process(7, b7, RVB_TAP_G, rvb_tap_mod[7]);
 
-  // ── Write to FDN delay lines: scaled input + asymmetric damped feedback ──
-  // rvb_in_gain scales input inversely with feedback — prevents splashy onset.
-  // Paths 0,2 (L) and 4,6 (R) use fbA; paths 1,3 and 5,7 use fbB (shorter decay).
-  // This asymmetry creates a more natural, less "even" tail.
-  //
-  // Intentional cross-coupling: paths 2,3 inject diffR into L tank; paths 6,7
-  // inject diffL into R tank. Paths 0,1 and 4,5 stay straight. This symmetric
-  // cross-feed creates a wider stereo image by distributing both channels'
-  // energy across both tanks, while keeping the Hadamard mix and asymmetric
-  // feedback for natural decorrelation. Feedback terms (fNL/fNR) stay on
-  // their own side — only the fresh input crosses.
-  //
-  // Denormal protection: +1e-18 on paths 0 and 4 prevents the FDN from
-  // dropping to denormal magnitudes during silent tails (which causes CPU
-  // spikes on some architectures). One injection per L/R tank is sufficient
-  // — the Hadamard mix propagates it to all paths.
-  _rvb_dl_write(0, diffL * rvb_in_gain + f1L * rvb_fbA + RVB_DENORM);
-  _rvb_dl_write(1, diffL * rvb_in_gain + f2L * rvb_fbB);
-  _rvb_dl_write(2, diffR * rvb_in_gain + f3L * rvb_fbA);
-  _rvb_dl_write(3, diffR * rvb_in_gain + f4L * rvb_fbB);
-  _rvb_dl_write(4, diffR * rvb_in_gain + f1R * rvb_fbA + RVB_DENORM);
-  _rvb_dl_write(5, diffR * rvb_in_gain + f2R * rvb_fbB);
-  _rvb_dl_write(6, diffL * rvb_in_gain + f3R * rvb_fbA);
-  _rvb_dl_write(7, diffL * rvb_in_gain + f4R * rvb_fbB);
+  // ── Per-line damping (one-pole LP, unity DC gain) then the Jot decay gain ──
+  rvb_lp_state[0] = b0 * (1 - rvb_damp_coeff) + rvb_lp_state[0] * rvb_damp_coeff;
+  rvb_lp_state[1] = b1 * (1 - rvb_damp_coeff) + rvb_lp_state[1] * rvb_damp_coeff;
+  rvb_lp_state[2] = b2 * (1 - rvb_damp_coeff) + rvb_lp_state[2] * rvb_damp_coeff;
+  rvb_lp_state[3] = b3 * (1 - rvb_damp_coeff) + rvb_lp_state[3] * rvb_damp_coeff;
+  rvb_lp_state[4] = b4 * (1 - rvb_damp_coeff) + rvb_lp_state[4] * rvb_damp_coeff;
+  rvb_lp_state[5] = b5 * (1 - rvb_damp_coeff) + rvb_lp_state[5] * rvb_damp_coeff;
+  rvb_lp_state[6] = b6 * (1 - rvb_damp_coeff) + rvb_lp_state[6] * rvb_damp_coeff;
+  rvb_lp_state[7] = b7 * (1 - rvb_damp_coeff) + rvb_lp_state[7] * rvb_damp_coeff;
 
-  // ── Multi-tap output (Dattorro-style) ──
-  // Tap each delay at ~31% of its length for a secondary reflection point.
-  // This adds density without extending the feedback loop.
-  t1L = _rvb_dl_read_tap(0, 0.31);
-  t2L = _rvb_dl_read_tap(1, 0.41);
-  t3L = _rvb_dl_read_tap(2, 0.37);
-  t4L = _rvb_dl_read_tap(3, 0.29);
-  t1R = _rvb_dl_read_tap(4, 0.33);
-  t2R = _rvb_dl_read_tap(5, 0.43);
-  t3R = _rvb_dl_read_tap(6, 0.39);
-  t4R = _rvb_dl_read_tap(7, 0.27);
+  // ── Write back: fresh input + decayed feedback ──
+  // diffL feeds the even lines, diffR the odd ones, so the stereo input stays
+  // decorrelated inside a single shared tank. One denormal injection is enough:
+  // the Hadamard propagates it to every line.
+  _rvb_dl_write(0, diffL * rvb_in_gain + rvb_lp_state[0] * rvb_gain[0] + RVB_DENORM);
+  _rvb_dl_write(1, diffR * rvb_in_gain + rvb_lp_state[1] * rvb_gain[1]);
+  _rvb_dl_write(2, diffL * rvb_in_gain + rvb_lp_state[2] * rvb_gain[2]);
+  _rvb_dl_write(3, diffR * rvb_in_gain + rvb_lp_state[3] * rvb_gain[3]);
+  _rvb_dl_write(4, diffL * rvb_in_gain + rvb_lp_state[4] * rvb_gain[4]);
+  _rvb_dl_write(5, diffR * rvb_in_gain + rvb_lp_state[5] * rvb_gain[5]);
+  _rvb_dl_write(6, diffL * rvb_in_gain + rvb_lp_state[6] * rvb_gain[6]);
+  _rvb_dl_write(7, diffR * rvb_in_gain + rvb_lp_state[7] * rvb_gain[7]);
 
-  // Sum: primary Hadamard outputs + secondary taps
-  // All 4 outputs per channel with alternating signs for richness.
-  // Gains tuned so reverb sits naturally at moderate mix levels.
-  sumL = (h1L - h2L + h3L + h4L) * 0.30
-       + (t1L + t2L - t3L + t4L) * 0.18;
-  sumR = (h1R + h2R - h3R + h4R) * 0.30
-       + (t1R - t2R + t3R + t4R) * 0.18;
-
-  // ── Output HPF (one-pole, removes reverb mud in low end) ──
-  // Subtract LP(signal): state tracks the low-frequency content via α,
-  // then out = in - state removes it. Clean 6dB/oct roll-off.
+  // ── Output HPF (one-pole, removes reverb mud in the low end) ──
   rvb_hpf_on ? (
     rvb_hpf_stateL += (sumL - rvb_hpf_stateL) * rvb_hpf_alpha;
     sumL -= rvb_hpf_stateL;

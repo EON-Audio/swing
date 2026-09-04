@@ -1,0 +1,942 @@
+// rk_swing_ui_macroed.jsfx-inc — kit-macro EDITOR overlay (slice 3,
+// Spec_Swing_Macro_System §5c)
+// (c) EON Studios — All Rights Reserved
+//
+// Opens from the MACRO tab's EDIT ▸ chip (kmac_ed_open = 1). A focused modal
+// panel over the pad-grid region: 4×2 big macro knobs (identity colours, the
+// same sliders the strip drives), the SELECTED macro's mappings list with
+// draggable range bars and per-row remove, an ADD picker (pad → param), and
+// DICE (randomize the 8 values within 0..1).
+//
+// Modal contract (matches rk_swing_ui_range): input is suppressed for the
+// underlying UI by swing_ui_modal_gate() when kmac_ed_open; this restores the
+// real mouse from the _ov_* saves, hit-tests, and draws last in the @gfx
+// dispatch chain. The opener must ZERO the stale _ov_* saves (the RANGE
+// pill's documented flicker fix) or click-outside-close fires on the open
+// frame.
+//
+// Dirty policy (spec §3): macro VALUE motion (knobs, DICE) never marks dirty
+// — slider write + slider_automate touch only. STRUCTURE edits (add / remove
+// / range drag) call mark_dirty_kit() and raise kmac_force so the engine
+// re-applies the mapping at the current macro value immediately.
+//
+// Naming: functions swing_macroed_*, mutable scratch _me_* (globals) — the
+// overlay-scaffold idiom (single @gfx writer, no @block contention).
+
+@init
+
+// pid → short display label into a #dest string.
+//
+// Takes the PAD because the engine-knob pids (KMAC_PID_SYN_BASE+) have no
+// fixed names: index 1 is DECAY on a snare and P.DEC on a kick. Callers that
+// only have ALL/SEL pass a negative pad and get the selected pad's family,
+// which is the one the user is looking at.
+function swing_macroed_pid_lbl(_me_pid, _me_lpad, _me_dest) local(_me_lp) (
+  _me_pid == FX_PID_HPF_FREQ    ? strcpy(_me_dest, "HPF") :
+  _me_pid == FX_PID_LPF_FREQ    ? strcpy(_me_dest, "LPF") :
+  _me_pid == FX_PID_RESO        ? strcpy(_me_dest, "FILT Q") :
+  _me_pid == FX_PID_EQ_LO       ? strcpy(_me_dest, "EQ LO") :
+  _me_pid == FX_PID_EQ_MID      ? strcpy(_me_dest, "EQ MID") :
+  _me_pid == FX_PID_EQ_HI       ? strcpy(_me_dest, "EQ HI") :
+  _me_pid == FX_PID_EQ_LO_FREQ  ? strcpy(_me_dest, "LO FRQ") :
+  _me_pid == FX_PID_EQ_MID_FREQ ? strcpy(_me_dest, "MID FRQ") :
+  _me_pid == FX_PID_EQ_HI_FREQ  ? strcpy(_me_dest, "HI FRQ") :
+  _me_pid == FX_PID_CMP_AMT     ? strcpy(_me_dest, "COMP") :
+  _me_pid == FX_PID_CMP_MODE    ? strcpy(_me_dest, "CMP MD") :
+  _me_pid == FX_PID_BC_RATE     ? strcpy(_me_dest, "CRUSH") :
+  _me_pid == FX_PID_BC_BITS     ? strcpy(_me_dest, "BITS") :
+  _me_pid == FX_PID_SAT_DRV     ? strcpy(_me_dest, "DRIVE") :
+  _me_pid == FX_PID_DRV_MODE    ? strcpy(_me_dest, "DRV MD") :
+  _me_pid == FX_PID_SND_DLY     ? strcpy(_me_dest, "DLY SND") :
+  _me_pid == FX_PID_SND_RVB     ? strcpy(_me_dest, "RVB SND") :
+  _me_pid == FX_PID_SND_SMASH   ? strcpy(_me_dest, "SMASH") :
+  _me_pid == FX_PID_EQ_MID2      ? strcpy(_me_dest, "HIMID") :
+  _me_pid == FX_PID_EQ_MID2_FREQ ? strcpy(_me_dest, "HM FRQ") :
+  _me_pid == FX_PID_EQ_MID_Q     ? strcpy(_me_dest, "MID Q") :
+  _me_pid == FX_PID_EQ_MID2_Q    ? strcpy(_me_dest, "HM Q") :
+  _me_pid == FX_PID_EQ_LO_Q      ? strcpy(_me_dest, "LO Q") :
+  _me_pid == FX_PID_EQ_HI_Q      ? strcpy(_me_dest, "HI Q") :
+  _me_pid == KMAC_PID_TUNE       ? strcpy(_me_dest, "TUNE") :
+  _me_pid == KMAC_PID_PAN        ? strcpy(_me_dest, "PAN") :
+  _me_pid == KMAC_PID_DECAY      ? strcpy(_me_dest, "DECAY") :
+  _me_pid == KMAC_PID_ATTACK     ? strcpy(_me_dest, "ATTACK") :
+  _me_pid >= KMAC_PID_SYN_BASE && _me_pid < KMAC_PID_SYN_BASE + KMAC_PID_SYN_N ? (
+    _me_lp = _me_lpad >= 0 ? _me_lpad : max(0, min(NUM_PADS - 1, sel_pad));
+    _syn_macro_label(ps_engine[_me_lp] | 0, _me_pid - KMAC_PID_SYN_BASE);
+    // "" = an index past this family's macro count; name it positionally
+    // rather than drawing a blank row.
+    strlen(#_syn_ml) > 0 ? strcpy(_me_dest, #_syn_ml)
+                         : sprintf(_me_dest, "SYN %d", _me_pid - KMAC_PID_SYN_BASE + 1);
+  ) :
+  strcpy(_me_dest, "?");
+);
+
+// pid → native range into kmac_ed_pmin / kmac_ed_pmax. Values mirror the
+// Drum Strip's declared slider ranges (EON_Drum_Strip.jsfx:31-72) — the
+// strip MUST match the engine, so its header is the authoritative table.
+function swing_macroed_pid_range(_me_pid) (
+  kmac_ed_pmin = 0; kmac_ed_pmax = 1;                       // 0..1 family default
+  _me_pid == FX_PID_HPF_FREQ    ? ( kmac_ed_pmin = 20;   kmac_ed_pmax = 20000; );
+  _me_pid == FX_PID_LPF_FREQ    ? ( kmac_ed_pmin = 20;   kmac_ed_pmax = 20000; );
+  _me_pid == FX_PID_RESO        ? ( kmac_ed_pmin = 0.3;  kmac_ed_pmax = 12; );
+  _me_pid == FX_PID_EQ_LO       ? ( kmac_ed_pmin = -12;  kmac_ed_pmax = 12; );
+  _me_pid == FX_PID_EQ_MID      ? ( kmac_ed_pmin = -12;  kmac_ed_pmax = 12; );
+  _me_pid == FX_PID_EQ_HI       ? ( kmac_ed_pmin = -12;  kmac_ed_pmax = 12; );
+  _me_pid == FX_PID_EQ_MID2     ? ( kmac_ed_pmin = -12;  kmac_ed_pmax = 12; );
+  _me_pid == FX_PID_EQ_LO_FREQ  ? ( kmac_ed_pmin = 40;   kmac_ed_pmax = 500; );
+  _me_pid == FX_PID_EQ_MID_FREQ ? ( kmac_ed_pmin = 200;  kmac_ed_pmax = 8000; );
+  _me_pid == FX_PID_EQ_HI_FREQ  ? ( kmac_ed_pmin = 2000; kmac_ed_pmax = 16000; );
+  _me_pid == FX_PID_EQ_MID2_FREQ ? ( kmac_ed_pmin = 500; kmac_ed_pmax = 12000; );
+  _me_pid == FX_PID_EQ_MID_Q    ? ( kmac_ed_pmin = 0.3;  kmac_ed_pmax = 6; );
+  _me_pid == FX_PID_EQ_MID2_Q   ? ( kmac_ed_pmin = 0.3;  kmac_ed_pmax = 6; );
+  _me_pid == FX_PID_EQ_LO_Q     ? ( kmac_ed_pmin = 0.3;  kmac_ed_pmax = 6; );
+  _me_pid == FX_PID_EQ_HI_Q     ? ( kmac_ed_pmin = 0.3;  kmac_ed_pmax = 6; );
+  _me_pid == FX_PID_CMP_MODE    ? ( kmac_ed_pmin = 0;    kmac_ed_pmax = 2; );
+  _me_pid == FX_PID_DRV_MODE    ? ( kmac_ed_pmin = 0;    kmac_ed_pmax = 4; );
+  _me_pid == FX_PID_BC_BITS     ? ( kmac_ed_pmin = 1;    kmac_ed_pmax = 16; );
+  // Core-param pids (ranges = the LCD PAD-tab knob clamps)
+  _me_pid == KMAC_PID_TUNE      ? ( kmac_ed_pmin = -24;  kmac_ed_pmax = 24; );
+  _me_pid == KMAC_PID_PAN       ? ( kmac_ed_pmin = -1;   kmac_ed_pmax = 1; );
+  _me_pid == KMAC_PID_DECAY     ? ( kmac_ed_pmin = 1;    kmac_ed_pmax = 2000; );
+  _me_pid == KMAC_PID_ATTACK    ? ( kmac_ed_pmin = 0;    kmac_ed_pmax = 500; );
+);
+
+// Current live value of (pad, pid) — read-side mirror of swing_fx_set.
+function swing_macroed_get(_me_pad, _me_pid) (
+  _me_pid == FX_PID_HPF_FREQ    ? fx_hpf_freq[_me_pad] :
+  _me_pid == FX_PID_LPF_FREQ    ? fx_lpf_freq[_me_pad] :
+  _me_pid == FX_PID_RESO        ? fx_reso[_me_pad] :
+  _me_pid == FX_PID_EQ_LO       ? fx_eq_lo[_me_pad] :
+  _me_pid == FX_PID_EQ_MID      ? fx_eq_mid[_me_pad] :
+  _me_pid == FX_PID_EQ_HI       ? fx_eq_hi[_me_pad] :
+  _me_pid == FX_PID_EQ_LO_FREQ  ? fx_eq_lo_freq[_me_pad] :
+  _me_pid == FX_PID_EQ_MID_FREQ ? fx_eq_mid_freq[_me_pad] :
+  _me_pid == FX_PID_EQ_HI_FREQ  ? fx_eq_hi_freq[_me_pad] :
+  _me_pid == FX_PID_CMP_AMT     ? fx_cmp_amt[_me_pad] :
+  _me_pid == FX_PID_CMP_MODE    ? fx_cmp_mode[_me_pad] :
+  _me_pid == FX_PID_BC_RATE     ? fx_bc_rate[_me_pad] :
+  _me_pid == FX_PID_BC_BITS     ? fx_bc_bits[_me_pad] :
+  _me_pid == FX_PID_SAT_DRV     ? fx_sat_drv[_me_pad] :
+  _me_pid == FX_PID_DRV_MODE    ? fx_drv_mode[_me_pad] :
+  _me_pid == FX_PID_SND_DLY     ? fx_snd_dly[_me_pad] :
+  _me_pid == FX_PID_SND_RVB     ? fx_snd_rvb[_me_pad] :
+  _me_pid == FX_PID_SND_SMASH   ? fx_snd_smash[_me_pad] :
+  _me_pid == FX_PID_EQ_MID2      ? fx_eq_mid2[_me_pad] :
+  _me_pid == FX_PID_EQ_MID2_FREQ ? fx_eq_mid2_freq[_me_pad] :
+  _me_pid == FX_PID_EQ_MID_Q     ? fx_eq_mid_q[_me_pad] :
+  _me_pid == FX_PID_EQ_MID2_Q    ? fx_eq_mid2_q[_me_pad] :
+  _me_pid == FX_PID_EQ_LO_Q      ? fx_eq_lo_q[_me_pad] :
+  _me_pid == FX_PID_EQ_HI_Q      ? fx_eq_hi_q[_me_pad] :
+  _me_pid == KMAC_PID_TUNE       ? p_tune[_me_pad] :
+  _me_pid == KMAC_PID_PAN        ? p_pan[_me_pad] :
+  _me_pid == KMAC_PID_DECAY      ? p_decay[_me_pad] :
+  _me_pid == KMAC_PID_ATTACK     ? p_attack[_me_pad] :
+  // Engine knobs. _syn_mac_get lives in rk_swing_ui_overlay_syn, imported at
+  // 139 vs this file at 148 — before, so the reference resolves.
+  _me_pid >= KMAC_PID_SYN_BASE && _me_pid < KMAC_PID_SYN_BASE + KMAC_PID_SYN_N ?
+    _syn_mac_get(_me_pad, _me_pid - KMAC_PID_SYN_BASE) :
+  0;
+);
+
+// The engine knob a pad's FAMILY calls its decay: kick has no plain DECAY, so
+// it uses A.DEC (amp decay, index 2); every other family puts DECAY at index
+// 1. Returns a pid ready for a mapping. Single source of truth for "what does
+// DECAY mean on a synth pad" — the factory baker resolves the same rule, and
+// the two must agree (.dev_tests/make_factory_macros.py SYN_DECAY_IX).
+function swing_macroed_syn_decay_pid(_me_pad) (
+  KMAC_PID_SYN_BASE + ((ps_engine[_me_pad] | 0) % 10 == 0 ? 2 : 1);
+);
+
+// How many ENGINE-knob cells the picker appends for a pad: that family's real
+// macro count, and only when the pad actually has its synth on. A sample-only
+// pad offers none — its ps_mac* exist but reach nothing audible.
+function swing_macroed_syn_cells(_me_pad) (
+  _me_pad = _me_pad >= 0 ? _me_pad : max(0, min(NUM_PADS - 1, sel_pad));
+  ps_enable[_me_pad] > 0.5 ? rk_syn_dd_macro_count((ps_engine[_me_pad] | 0) % 10) : 0;
+);
+
+// ADD-picker cell index → pid. 0..27 are the fixed FX + core targets; 28 and
+// up are the picked pad's own engine knobs, appended by the draw loop (see
+// swing_macroed_syn_cells). Core params ride up front with the other
+// macro-worthy targets.
+function swing_macroed_pick_pid(_me_i) (
+  _me_i >= 28 ? KMAC_PID_SYN_BASE + (_me_i - 28) :
+  _me_i == 0  ? FX_PID_CMP_AMT      : _me_i == 1  ? FX_PID_SAT_DRV      :
+  _me_i == 2  ? KMAC_PID_TUNE       : _me_i == 3  ? KMAC_PID_PAN        :
+  _me_i == 4  ? KMAC_PID_DECAY      : _me_i == 5  ? KMAC_PID_ATTACK     :
+  _me_i == 6  ? FX_PID_BC_RATE      : _me_i == 7  ? FX_PID_BC_BITS      :
+  _me_i == 8  ? FX_PID_SND_DLY      : _me_i == 9  ? FX_PID_SND_RVB     :
+  _me_i == 10 ? FX_PID_SND_SMASH    : _me_i == 11 ? FX_PID_HPF_FREQ    :
+  _me_i == 12 ? FX_PID_LPF_FREQ     : _me_i == 13 ? FX_PID_RESO        :
+  _me_i == 14 ? FX_PID_EQ_LO        : _me_i == 15 ? FX_PID_EQ_LO_FREQ  :
+  _me_i == 16 ? FX_PID_EQ_LO_Q      : _me_i == 17 ? FX_PID_EQ_MID      :
+  _me_i == 18 ? FX_PID_EQ_MID_FREQ  : _me_i == 19 ? FX_PID_EQ_MID_Q    :
+  _me_i == 20 ? FX_PID_EQ_MID2      : _me_i == 21 ? FX_PID_EQ_MID2_FREQ :
+  _me_i == 22 ? FX_PID_EQ_MID2_Q    : _me_i == 23 ? FX_PID_EQ_HI       :
+  _me_i == 24 ? FX_PID_EQ_HI_FREQ   : _me_i == 25 ? FX_PID_EQ_HI_Q     :
+  _me_i == 26 ? FX_PID_CMP_MODE     : FX_PID_DRV_MODE;
+);
+
+// Small labelled button; returns 1 on click (restored _me_mdn edge).
+function swing_macroed_btn(_me_bx, _me_by, _me_bw, _me_bh, _me_lbl) local(_me_hov) (
+  _me_hov = _me_mx >= _me_bx && _me_mx <= _me_bx + _me_bw &&
+            _me_my >= _me_by && _me_my <= _me_by + _me_bh;
+  gfx_set(0.20, 0.22, 0.26, _me_hov ? 1.0 : 0.85);
+  gfx_rect(_me_bx, _me_by, _me_bw, _me_bh);
+  gfx_set(0.45, 0.48, 0.54, 0.8);
+  gfx_rect(_me_bx, _me_by, _me_bw, 1); gfx_rect(_me_bx, _me_by + _me_bh - 1, _me_bw, 1);
+  gfx_rect(_me_bx, _me_by, 1, _me_bh); gfx_rect(_me_bx + _me_bw - 1, _me_by, 1, _me_bh);
+  gfx_setfont(1, "Arial", 9, 'b');
+  gfx_set(0.85, 0.87, 0.92, _me_hov ? 1.0 : 0.85);
+  gfx_measurestr(_me_lbl, _me_tw, _me_th);
+  gfx_x = _me_bx + (_me_bw - _me_tw) * 0.5;
+  gfx_y = _me_by + (_me_bh - _me_th) * 0.5;
+  gfx_drawstr(_me_lbl);
+  _me_hov && _me_mdn;
+);
+
+// One macro slider write + automation touch, by index (0..7). Pow masks —
+// sliders 32+ sit past the 32-bit shift range (feedback_eel2_shift_32bit).
+function swing_macroed_set_val(_me_k, _me_nv) (
+  _me_k == 0 ? ( macro1 = _me_nv; ) : _me_k == 1 ? ( macro2 = _me_nv; ) :
+  _me_k == 2 ? ( macro3 = _me_nv; ) : _me_k == 3 ? ( macro4 = _me_nv; ) :
+  _me_k == 4 ? ( macro5 = _me_nv; ) : _me_k == 5 ? ( macro6 = _me_nv; ) :
+  _me_k == 6 ? ( macro7 = _me_nv; ) : ( macro8 = _me_nv; );
+  slider_automate(2^(31 + _me_k));
+);
+
+// ── Preset templates ─────────────────────────────────────────────────────
+// One-click starter mappings so a fresh kit is instantly hands-on. A
+// template REPLACES all 8 macros' mappings — that's what "apply preset"
+// means — and it is a structure edit (mark_dirty_kit), so REAPER undo
+// restores the previous mappings (the whole kmac model rides ser_ver 54).
+// Every lo end = the engine default, so applying a template changes NOTHING
+// audible until a knob moves — the same contract as everything else here.
+// PUNCH is CATEGORY-SMART: it targets the pads whose published category is
+// in the kick..clap family (ids 0-3, rk_cat_glyphs vocabulary), resolved
+// at click time into concrete, visible, editable rows; an uncategorised
+// rack falls back to ALL pads. WIDTH / PITCH / DECAY stay empty on purpose:
+// macros reach FX params only today — pan/tune/ADSR targeting is a future
+// engine extension, not a template's job to fake.
+function swing_macroed_add_map(_ma_m, _ma_pad, _ma_pid, _ma_lo, _ma_hi) local(_ma_j) (
+  kmac_nmap[_ma_m] < KMAC_MAX_MAP ? (
+    _ma_j = _ma_m * KMAC_MAX_MAP + kmac_nmap[_ma_m];
+    kmac_pad[_ma_j]   = _ma_pad;
+    kmac_pid[_ma_j]   = _ma_pid;
+    kmac_lo[_ma_j]    = _ma_lo;
+    kmac_hi[_ma_j]    = _ma_hi;
+    kmac_curve[_ma_j] = 1;
+    kmac_nmap[_ma_m] += 1;
+    1;
+  ) : 0;
+);
+function swing_macroed_map_cat(_ma_m, _ma_c0, _ma_c1, _ma_pid, _ma_lo, _ma_hi)
+local(_ma_p, _ma_c, _ma_n) (
+  _ma_n = 0; _ma_p = 0;
+  loop(NUM_PADS,
+    _ma_c = swing_lcd_padcat_eff(_ma_p);
+    _ma_c >= _ma_c0 && _ma_c <= _ma_c1 ? (
+      _ma_n += swing_macroed_add_map(_ma_m, _ma_p, _ma_pid, _ma_lo, _ma_hi);
+    );
+    _ma_p += 1;
+  );
+  _ma_n;
+);
+// Per-pad RELATIVE mapping: lo = the pad's CURRENT value, hi derived from
+// it (×mult +add, clamped). Core params like decay/tune vary per pad, so a
+// fixed range would stomp hand-set values at knob-zero; relative ranges
+// keep every pad's own state as the neutral point. c0 = -3 catches
+// uncategorised pads too (padcat_eff returns -1/-3 for none/NONE).
+function swing_macroed_map_cat_rel(_ma_m, _ma_c0, _ma_c1, _ma_pid, _ma_mult, _ma_add, _ma_hmin, _ma_hmax)
+local(_ma_p, _ma_c, _ma_n, _ma_cur) (
+  _ma_n = 0; _ma_p = 0;
+  loop(NUM_PADS,
+    _ma_c = swing_lcd_padcat_eff(_ma_p);
+    _ma_c >= _ma_c0 && _ma_c <= _ma_c1 ? (
+      _ma_cur = swing_macroed_get(_ma_p, _ma_pid);
+      _ma_n += swing_macroed_add_map(_ma_m, _ma_p, _ma_pid, _ma_cur,
+                 max(_ma_hmin, min(_ma_hmax, _ma_cur * _ma_mult + _ma_add)));
+    );
+    _ma_p += 1;
+  );
+  _ma_n;
+);
+// WIDTH spread: alternate matching pads left/right (lo = current pan, so
+// zero = the mix as-is; turning up fans the family across the field).
+function swing_macroed_map_width(_ma_m, _ma_c0, _ma_c1, _ma_amt)
+local(_ma_p, _ma_c, _ma_n) (
+  _ma_n = 0; _ma_p = 0;
+  loop(NUM_PADS,
+    _ma_c = swing_lcd_padcat_eff(_ma_p);
+    _ma_c >= _ma_c0 && _ma_c <= _ma_c1 ? (
+      _ma_n += swing_macroed_add_map(_ma_m, _ma_p, KMAC_PID_PAN, p_pan[_ma_p],
+                 (_ma_n & 1) ? -_ma_amt : _ma_amt);
+    );
+    _ma_p += 1;
+  );
+  _ma_n;
+);
+
+function swing_macroed_tpl_finish() (
+  macro_sel = 0; slider_automate(2^40);
+  mark_dirty_kit();
+  kmac_force = 1;
+);
+function swing_macroed_tpl_clear() local(_ma_m) (
+  _ma_m = 0; loop(KMAC_N, kmac_nmap[_ma_m] = 0; _ma_m += 1;);
+);
+function swing_macroed_tpl_house() (
+  swing_macroed_tpl_clear();
+  // PUNCH → comp on the drums that want it (kick..clap family); ALL fallback
+  swing_macroed_map_cat(0, 0, 3, FX_PID_CMP_AMT, 0, 0.80) == 0 ? (
+    swing_macroed_add_map(0, -2, FX_PID_CMP_AMT, 0, 0.70);
+  );
+  swing_macroed_add_map(1, -2, FX_PID_EQ_HI,    0, 6);       // TONE = tilt up...
+  swing_macroed_add_map(1, -2, FX_PID_EQ_LO,    0, -4);      // ...lows down
+  swing_macroed_add_map(2, -2, FX_PID_SND_RVB,  0, 0.65);    // SPACE
+  swing_macroed_add_map(2, -2, FX_PID_SND_DLY,  0, 0.25);
+  swing_macroed_add_map(3, -2, FX_PID_SAT_DRV,  0, 0.55);    // DRIVE
+  swing_macroed_map_width(4, 2, 6, 0.55);                    // WIDTH = fan the
+                                                             // rims/claps/hats
+  swing_macroed_map_cat_rel(6, 0, 3, KMAC_PID_DECAY, 2.2, 30, 40, 2000); // DECAY
+                                                             // = drums bloom
+  swing_macroed_add_map(7, -2, FX_PID_BC_RATE,  0, 0.30);    // VIBE = lo-fi haze
+  swing_macroed_add_map(7, -2, FX_PID_LPF_FREQ, 20000, 3500);
+  swing_macroed_tpl_finish();
+);
+function swing_macroed_tpl_lofi() (
+  swing_macroed_tpl_clear();
+  swing_macroed_add_map(0, -2, FX_PID_CMP_AMT,  0, 0.60);    // PUNCH
+  swing_macroed_add_map(1, -2, FX_PID_HPF_FREQ, 20, 280);    // TONE = thin it
+  swing_macroed_add_map(2, -2, FX_PID_SND_RVB,  0, 0.40);    // SPACE
+  swing_macroed_add_map(3, -2, FX_PID_SAT_DRV,  0, 0.80);    // DRIVE
+  swing_macroed_add_map(7, -2, FX_PID_BC_RATE,  0, 0.50);    // VIBE = crush
+  swing_macroed_add_map(7, -2, FX_PID_BC_BITS,  16, 6);
+  swing_macroed_add_map(7, -2, FX_PID_LPF_FREQ, 20000, 2800);
+  swing_macroed_tpl_finish();
+);
+function swing_macroed_tpl_trap() (
+  swing_macroed_tpl_clear();
+  // PUNCH → the drums; VIBE → the HATS (ids 4-6), the trap signature move.
+  swing_macroed_map_cat(0, 0, 3, FX_PID_CMP_AMT, 0, 0.85) == 0 ? (
+    swing_macroed_add_map(0, -2, FX_PID_CMP_AMT, 0, 0.75);
+  );
+  swing_macroed_add_map(1, -2, FX_PID_EQ_LO,    0, 5);       // TONE = boom...
+  swing_macroed_add_map(1, -2, FX_PID_EQ_HI,    0, 3);       // ...and crisp
+  swing_macroed_add_map(2, -2, FX_PID_SND_DLY,  0, 0.50);    // SPACE = throws
+  swing_macroed_add_map(2, -2, FX_PID_SND_RVB,  0, 0.25);
+  swing_macroed_add_map(3, -2, FX_PID_SAT_DRV,  0, 0.65);    // DRIVE
+  swing_macroed_map_cat(7, 4, 6, FX_PID_LPF_FREQ, 20000, 5000) == 0 ? (
+    swing_macroed_add_map(7, -2, FX_PID_LPF_FREQ, 20000, 6000);
+  );
+  swing_macroed_map_cat(7, 4, 6, FX_PID_BC_RATE, 0, 0.20);   // hat sizzle-crush
+  // PITCH = 808 down-tune: kicks slide up to -12 from wherever they sit
+  swing_macroed_map_cat_rel(5, 0, 0, KMAC_PID_TUNE, 1, -12, -24, 24) == 0 ? (
+    swing_macroed_add_map(5, -2, KMAC_PID_TUNE, 0, -7);
+  );
+  swing_macroed_tpl_finish();
+);
+function swing_macroed_tpl_club() (
+  swing_macroed_tpl_clear();
+  swing_macroed_add_map(0, -2, FX_PID_CMP_AMT,  0, 0.90);    // PUNCH = slam
+  swing_macroed_add_map(1, -2, FX_PID_HPF_FREQ, 20, 150);    // TONE = DJ filter:
+  swing_macroed_add_map(1, -2, FX_PID_RESO,     0.707, 4);   // tighter + resonant
+  swing_macroed_add_map(2, -2, FX_PID_SND_RVB,  0, 0.80);    // SPACE = big room
+  swing_macroed_add_map(3, -2, FX_PID_SND_SMASH, 0, 0.90);   // DRIVE = into the
+  swing_macroed_add_map(3, -2, FX_PID_SAT_DRV,  0, 0.30);    // smasher, plus grit
+  swing_macroed_add_map(7, -2, FX_PID_SND_DLY,  0, 0.40);    // VIBE = echo wash
+  // DECAY = gate: drums tighten toward 30% of their own length
+  swing_macroed_map_cat_rel(6, 0, 3, KMAC_PID_DECAY, 0.3, 0, 20, 2000);
+  swing_macroed_tpl_finish();
+);
+// CLEAR = empty every macro's mappings (values and pad params stay put —
+// unmapping returns direct control, spec §2). Structure edit ⇒ undoable.
+function swing_macroed_tpl_empty() (
+  swing_macroed_tpl_clear();
+  mark_dirty_kit();
+  kmac_force = 1;
+);
+function swing_macroed_tpl_tape() (
+  swing_macroed_tpl_clear();
+  swing_macroed_map_cat(0, 0, 3, FX_PID_CMP_AMT, 0, 0.60) == 0 ? (
+    swing_macroed_add_map(0, -2, FX_PID_CMP_AMT, 0, 0.55);   // PUNCH = gentle glue
+  );
+  swing_macroed_add_map(1, -2, FX_PID_LPF_FREQ, 20000, 8000); // TONE = age darkens
+  swing_macroed_add_map(1, -2, FX_PID_EQ_HI,    0, -3);
+  swing_macroed_add_map(2, -2, FX_PID_SND_RVB,  0, 0.50);     // SPACE
+  swing_macroed_add_map(3, -2, FX_PID_SAT_DRV,  0, 0.70);     // DRIVE = tape sat
+  swing_macroed_add_map(7, -2, FX_PID_BC_RATE,  0, 0.15);     // VIBE = worn edges
+  swing_macroed_add_map(7, -2, FX_PID_BC_BITS,  16, 10);
+  // PITCH = tape sag: every pad droops 2 semis from its own tuning
+  // (c0 = -3 catches uncategorised pads — this one is for the whole kit)
+  swing_macroed_map_cat_rel(5, -3, 45, KMAC_PID_TUNE, 1, -2, -24, 24);
+  swing_macroed_tpl_finish();
+);
+
+// Pad label for list rows and the ADD picker: the pad's real NAME (cname)
+// when it has one, else "P<n>"; -2/-1 = ALL / SEL.
+function swing_macroed_padlbl(_mp_pad, _mp_dest) (
+  _mp_pad >= 0 ? (
+    strcpy(_mp_dest, get_cname_slot(_mp_pad));
+    strlen(_mp_dest) == 0 ? sprintf(_mp_dest, "P%d", _mp_pad + 1);
+  ) : (
+    strcpy(_mp_dest, _mp_pad == -2 ? "ALL" : "SEL");
+  );
+);
+
+function swing_macroed_draw()
+local(_me_px, _me_py, _me_pw, _me_ph, _me_k, _me_cellw, _me_cellh, _me_kx,
+      _me_ky, _me_kr, _me_v, _me_nv, _me_msel, _me_b, _me_j, _me_ry, _me_bx0,
+      _me_bw2, _me_lo_x, _me_hi_x, _me_pad, _me_pid, _me_n0, _me_n1, _me_cur,
+      _me_y0, _me_st, _me_mapped, _me_i, _me_gx, _me_gy)
+(
+  // ── restore real mouse from the modal-gate saves ──
+  _me_mx = _ov_mx; _me_my = _ov_my;
+  _me_mdn = _ov_lmb_down; _me_lmb = _ov_LMB;
+  _me_rdn = _ov_rmb_down;
+
+  _me_msel = max(0, min(7, macro_sel | 0));
+
+  // ── panel + dim backdrop ──
+  _me_pw = min(560, gfx_w - 40); _me_ph = 470;
+  _me_px = ((gfx_w - _me_pw) / 2) | 0;
+  _me_py = (28 + (gfx_h - 28 - _me_ph) / 2) | 0;
+  gfx_set(0, 0, 0, 0.45); gfx_rect(0, 28, gfx_w, gfx_h - 28);
+  gfx_set(0.10, 0.12, 0.15, 1); gfx_rect(_me_px, _me_py, _me_pw, _me_ph);
+  swing_lcd_kmac_pal(kmac_color[_me_msel] | 0);
+  gfx_set(kmac_pal_r, kmac_pal_g, kmac_pal_b, 1);
+  gfx_rect(_me_px, _me_py, _me_pw, _me_ph, 0);
+  gfx_rect(_me_px + 1, _me_py + 1, _me_pw - 2, _me_ph - 2, 0);
+
+  // ── header: title, DICE, close X ──
+  gfx_set(kmac_pal_r * 0.30, kmac_pal_g * 0.30, kmac_pal_b * 0.30, 1);
+  gfx_rect(_me_px, _me_py, _me_pw, 26);
+  gfx_setfont(1, "Arial", 11, 'b'); gfx_set(1, 1, 1, 0.9);
+  gfx_x = _me_px + 10; gfx_y = _me_py + 7; gfx_drawstr("MACROS");
+  // Header controls: PRESET ▾ dropdown (templates via swing_popup, caller
+  // 36 — consumed below each frame), CLEAR kept as a button, DICE as a
+  // die icon (randomize the 8 VALUES — performance gesture, no dirty).
+  swing_macroed_btn(_me_px + _me_pw - 170, _me_py + 4, 64, 18, "PRESET ▾") ? (
+    swing_popup_open(_me_mx, _me_my, "HOUSE|TRAP|CLUB|LOFI|TAPE",
+                     SP_POPUP_CALLER_MACRO_PRESET);
+  );
+  swing_macroed_btn(_me_px + _me_pw - 100, _me_py + 4, 46, 18, "CLEAR") ? swing_macroed_tpl_empty();
+  // die face: box + five pips
+  _me_dhov = _me_mx >= _me_px + _me_pw - 48 && _me_mx <= _me_px + _me_pw - 28 &&
+             _me_my >= _me_py + 4 && _me_my <= _me_py + 22;
+  gfx_set(0.20, 0.22, 0.26, _me_dhov ? 1.0 : 0.85);
+  gfx_rect(_me_px + _me_pw - 48, _me_py + 4, 20, 18);
+  gfx_set(0.45, 0.48, 0.54, 0.8);
+  gfx_rect(_me_px + _me_pw - 48, _me_py + 4, 20, 18, 0);
+  gfx_set(0.85, 0.87, 0.92, _me_dhov ? 1.0 : 0.85);
+  gfx_circle(_me_px + _me_pw - 43, _me_py + 9, 1.4, 1, 1);
+  gfx_circle(_me_px + _me_pw - 33, _me_py + 9, 1.4, 1, 1);
+  gfx_circle(_me_px + _me_pw - 38, _me_py + 13, 1.4, 1, 1);
+  gfx_circle(_me_px + _me_pw - 43, _me_py + 17, 1.4, 1, 1);
+  gfx_circle(_me_px + _me_pw - 33, _me_py + 17, 1.4, 1, 1);
+  _me_dhov && _me_mdn ? (
+    _me_k = 0; loop(8, swing_macroed_set_val(_me_k, rand(1)); _me_k += 1;);
+  );
+
+  // PRESET dropdown result (caller 36)
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_MACRO_PRESET ? (
+    swing_popup_result == 1 ? swing_macroed_tpl_house() :
+    swing_popup_result == 2 ? swing_macroed_tpl_trap() :
+    swing_popup_result == 3 ? swing_macroed_tpl_club() :
+    swing_popup_result == 4 ? swing_macroed_tpl_lofi() :
+    swing_popup_result == 5 ? swing_macroed_tpl_tape();
+    swing_popup_result = 0;  // mark consumed
+  );
+  _me_xh = _me_mx >= _me_px + _me_pw - 22 && _me_mx <= _me_px + _me_pw - 6 &&
+           _me_my >= _me_py + 5 && _me_my <= _me_py + 21;
+  gfx_setfont(1, "Arial", 15, 'b'); gfx_set(1, 1, 1, _me_xh ? 1.0 : 0.6);
+  gfx_x = _me_px + _me_pw - 19; gfx_y = _me_py + 4; gfx_drawstr("x");
+
+  // (Macro-rename keyboard input lives in swing_lcd_kmac_ren_tick, called
+  // every frame from swing_lcd_draw — so the STRIP pill renames with this
+  // editor closed. This surface only STARTS renames and draws the buffer;
+  // the tick owns drain/commit/cancel and the '|' menu-injection ban.)
+
+  // ── colour PICKER input (mini-modal): handled BEFORE everything else,
+  // then the rest of the editor's input is swallowed for this frame — a
+  // pick-click must never double as a cell-select underneath. Geometry
+  // mirrors the draw block below (knob grid constants: cells (pw-20)/4
+  // wide, 86 tall, top at py+32 — keep in sync).
+  kmac_colpick_k >= 0 ? (
+    _me_cpx = max(_me_px + 8, min(_me_px + _me_pw - 190,
+              _me_px + 10 + (kmac_colpick_k % 4) * ((_me_pw - 20) / 4)
+              + ((_me_pw - 20) / 8) - 91));
+    _me_cpy = _me_py + 32 + ((kmac_colpick_k / 4) | 0) * 86 + 88;
+    _me_mdn ? (
+      _me_i = -1;
+      _me_mx >= _me_cpx + 3 && _me_mx < _me_cpx + 179 &&
+      _me_my >= _me_cpy && _me_my < _me_cpy + 24 ? (
+        _me_i = ((_me_mx - _me_cpx - 3) / 22) | 0;
+      );
+      _me_i >= 0 && _me_i <= 7 ? (
+        kmac_color[kmac_colpick_k] = _me_i;
+        mark_dirty_kit();
+      );
+      kmac_colpick_k = -1;   // pick or click-away both close
+    );
+    _me_mdn = 0; _me_rdn = 0; _me_lmb = 0;
+  );
+
+  // ── 4×2 big knobs ──
+  _me_cellw = (_me_pw - 20) / 4; _me_cellh = 86; _me_kr = 22;
+  _me_k = 0; loop(8,
+    _me_kx = _me_px + 10 + (_me_k % 4) * _me_cellw + _me_cellw * 0.5;
+    _me_ky = _me_py + 34 + ((_me_k / 4) | 0) * _me_cellh + 30;
+    _me_st = km_maced + _me_k * KS;
+    _me_mapped = kmac_nmap[_me_k] > 0;
+
+    _me_k == _me_msel ? (
+      gfx_set(0.16, 0.20, 0.25, 0.9);
+      gfx_rect(_me_px + 10 + (_me_k % 4) * _me_cellw + 2,
+               _me_py + 32 + ((_me_k / 4) | 0) * _me_cellh,
+               _me_cellw - 4, _me_cellh - 2);
+    );
+
+    swing_lcd_kmac_pal(kmac_color[_me_k] | 0);
+    !_me_mapped ? (
+      kmac_pal_r *= 0.35; kmac_pal_g *= 0.35; kmac_pal_b *= 0.35;
+    );
+
+    _me_v = _me_k == 0 ? macro1 : _me_k == 1 ? macro2 : _me_k == 2 ? macro3 :
+            _me_k == 3 ? macro4 : _me_k == 4 ? macro5 : _me_k == 5 ? macro6 :
+            _me_k == 6 ? macro7 : macro8;
+    _me_nv = mpc_knob_interact(_me_st, _me_kx, _me_ky, _me_kr, _me_v, 0, 1, 0, 0);
+    _me_nv != _me_v ? (
+      swing_macroed_set_val(_me_k, _me_nv);
+      _me_k != _me_msel ? ( macro_sel = _me_k; slider_automate(2^40); );
+      _me_v = _me_nv;
+    );
+    mpc_knob_draw(_me_kx, _me_ky, _me_kr, _me_v, 0, 1, 0,
+                  _me_st[0], kmac_pal_r, kmac_pal_g, kmac_pal_b,
+                  0.08, 0.10, 0.13);
+
+    // ── NAME PILL (pad-name-pill idiom): identity-colour body on an eased
+    // hover, border lift, white ink over shadow, caret tick. Single CLICK
+    // renames in place; while renaming the pill holds the typing buffer
+    // with a blinking caret (& converts via 64-bit int — clean floor+AND;
+    // bare `|0 & 1` would parse as `|(0&1)`, the precedence trap).
+    kmac_ren_k == _me_k ? (
+      strcpy(#_me_s, #kmac_ren_buf);
+      (time_precise() * 2) & 1 ? strcat(#_me_s, "_");
+    ) : (
+      swing_lcd_kmac_label(_me_k, #_me_s);
+    );
+    gfx_setfont(1, "Arial", 9, 'b');
+    gfx_measurestr(#_me_s, _me_tw, _me_th);
+    _me_pw2 = max(36, _me_tw + 12);
+    _me_px2 = _me_kx - _me_pw2 * 0.5;
+    _me_py2 = _me_ky + _me_kr + 3;
+    _me_phov = _me_mx >= _me_px2 && _me_mx <= _me_px2 + _me_pw2 &&
+               _me_my >= _me_py2 && _me_my <= _me_py2 + 14;
+    kmac_hv[8 + _me_k] += (((_me_phov || kmac_ren_k == _me_k) ? 1 : 0)
+                           - kmac_hv[8 + _me_k]) * 0.30;
+    _me_phv = kmac_hv[8 + _me_k];
+    swing_lcd_kmac_pal(kmac_color[_me_k] | 0);  // fresh — the knob path dimmed it
+    _me_mapped || kmac_ren_k == _me_k ? (
+      gfx_set(kmac_pal_r * (0.32 + 0.26 * _me_phv), kmac_pal_g * (0.32 + 0.26 * _me_phv),
+              kmac_pal_b * (0.32 + 0.26 * _me_phv), 0.95);
+    ) : (
+      gfx_set(0.10 + 0.06 * _me_phv, 0.12 + 0.06 * _me_phv, 0.15 + 0.06 * _me_phv, 0.9);
+    );
+    gfx_rect(_me_px2, _me_py2, _me_pw2, 14);
+    gfx_set(1, 1, 1, 0.22 + 0.55 * _me_phv);
+    gfx_rect(_me_px2, _me_py2, _me_pw2, 14, 0);
+    rk_ink_label(#_me_s, _me_px2 + 6, _me_py2 + 2, 1);
+    _me_phv > 0.05 && kmac_ren_k != _me_k ? (
+      gfx_set(0.99, 1.0, 1.0, 0.75 * _me_phv);
+      gfx_rect(_me_px2 + _me_pw2 - 5, _me_py2 + 3, 2, 8);
+    );
+    kmac_ren_k == _me_k && _me_phov ? ( kmac_ren_pillhov = 1; );
+    _me_mdn && _me_phov && kmac_ren_k != _me_k ? (
+      macro_sel != _me_k ? ( macro_sel = _me_k; slider_automate(2^40); );
+      kmac_ren_k = _me_k;   // an in-flight rename on another pill was
+                            // committed by the ren tick's click-away rule
+                            // earlier this same frame
+      strcpy(#kmac_ren_buf, swing_lcd_kmac_name_slot(_me_k));
+    );
+    // right-click the cell = colour swatch picker (drawn on top)
+    _me_rdn &&
+    _me_mx >= _me_px + 10 + (_me_k % 4) * _me_cellw &&
+    _me_mx <  _me_px + 10 + (_me_k % 4 + 1) * _me_cellw &&
+    _me_my >= _me_py + 32 + ((_me_k / 4) | 0) * _me_cellh &&
+    _me_my <  _me_py + 32 + ((_me_k / 4) | 0) * _me_cellh + _me_cellh ? (
+      kmac_colpick_k = _me_k;   // open the swatch picker (drawn on top)
+    );
+    _me_mapped ? sprintf(#_me_s, "%d%% · %d", (_me_v * 100 + 0.5) | 0, kmac_nmap[_me_k])
+               : strcpy(#_me_s, "--");
+    gfx_setfont(1, "Arial", 9);
+    gfx_measurestr(#_me_s, _me_tw, _me_th);
+    gfx_set(0.55, 0.60, 0.66, 0.9);
+    gfx_x = _me_kx - _me_tw * 0.5; gfx_y = _me_ky + _me_kr + 19; gfx_drawstr(#_me_s);
+
+    // Click anywhere in the cell (when not turning a knob) selects.
+    _me_mdn && kmac_ed_drag == 0 &&
+    _me_mx >= _me_px + 10 + (_me_k % 4) * _me_cellw &&
+    _me_mx <  _me_px + 10 + (_me_k % 4 + 1) * _me_cellw &&
+    _me_my >= _me_py + 32 + ((_me_k / 4) | 0) * _me_cellh &&
+    _me_my <  _me_py + 32 + ((_me_k / 4) | 0) * _me_cellh + _me_cellh ? (
+      macro_sel != _me_k ? ( macro_sel = _me_k; slider_automate(2^40); );
+    );
+    _me_k += 1;
+  );
+
+  // ── mappings header ──
+  _me_y0 = _me_py + 34 + 2 * _me_cellh + 8;
+  swing_lcd_kmac_pal(kmac_color[_me_msel] | 0);
+  gfx_setfont(1, "Arial", 10, 'b');
+  swing_lcd_kmac_label(_me_msel, #_me_s2);
+  sprintf(#_me_s, "MAPPINGS — %s", #_me_s2);
+  gfx_set(kmac_pal_r, kmac_pal_g, kmac_pal_b, 1);
+  gfx_x = _me_px + 12; gfx_y = _me_y0; gfx_drawstr(#_me_s);
+  gfx_set(0.30, 0.34, 0.40, 0.7);
+  gfx_rect(_me_px + 10, _me_y0 + 14, _me_pw - 20, 1);
+
+  kmac_nmap[_me_msel] < KMAC_MAX_MAP ? (
+    swing_macroed_btn(_me_px + _me_pw - 86, _me_y0 - 3, 76, 16,
+                      kmac_ed_add ? "CANCEL" : "+ ADD") ? (
+      kmac_ed_add = !kmac_ed_add; kmac_ed_addpad = -3;
+    );
+    // + LAST = assign the last-touched param (PadFX panel / strip / viewer
+    // edits and the LCD TUNE/PAN knobs feed it); shown only while fresh.
+    kmac_lt_t > 0 && time_precise() - kmac_lt_t < 120 ? (
+      swing_macroed_btn(_me_px + _me_pw - 148, _me_y0 - 3, 56, 16, "+ LAST") ? (
+        swing_macroed_pid_range(kmac_lt_pid);
+        swing_macroed_add_map(_me_msel, kmac_lt_pad, kmac_lt_pid,
+          swing_macroed_get(kmac_lt_pad, kmac_lt_pid), kmac_ed_pmax);
+        mark_dirty_kit();
+        kmac_force = 1;
+      );
+    );
+  ) : (
+    gfx_setfont(1, "Arial", 9);
+    gfx_set(0.45, 0.50, 0.56, 0.7);
+    gfx_x = _me_px + _me_pw - 86; gfx_y = _me_y0; gfx_drawstr("full (8/8)");
+  );
+
+  // + EXT = link the last-touched param of ANOTHER FX on this track to the
+  // selected macro, via the bridge (CMD 68 → native param link). OUTSIDE
+  // the mapping-fullness branch on purpose: a plink consumes no mapping
+  // slot, so a full macro can still take external links.
+  gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+    swing_macroed_btn(_me_px + _me_pw - 210, _me_y0 - 3, 56, 16, "+ EXT") ? (
+      gmem[KIT_GMEM_CMD] == 0 && !kit_busy ? (
+        gmem[KIT_GMEM_VER] = _me_msel;        // PARAM1 = macro index
+        gmem[KIT_GMEM_LOCK] = instance_id;    // requester
+        gmem[KIT_GMEM_CMD] = 68;              // CMD written LAST
+      );
+    );
+  );
+
+  _me_ry = _me_y0 + 20;
+  _me_b  = _me_msel * KMAC_MAX_MAP;
+
+  kmac_ed_add ? (
+    // ── ADD picker: pad row, then param grid ──
+    gfx_setfont(1, "Arial", 9, 'b'); gfx_set(0.60, 0.65, 0.72, 0.9);
+    gfx_x = _me_px + 12; gfx_y = _me_ry; gfx_drawstr("PAD:");
+    _me_i = 0; loop(16,
+      _me_gx = _me_px + 46 + _me_i * 26;
+      swing_color_pad_hsl(_me_i, 0.70, kmac_ed_addpad == _me_i ? 0.62 : 0.35);
+      gfx_set(_hsl_r, _hsl_g, _hsl_b, 1);
+      gfx_rect(_me_gx, _me_ry - 2, 24, 16);
+      kmac_ed_addpad == _me_i ? (
+        gfx_set(1, 1, 1, 0.95); gfx_rect(_me_gx, _me_ry - 2, 24, 16, 0);
+      );
+      sprintf(#_me_s, "%d", _me_i + 1);
+      gfx_setfont(1, "Arial", 9, 'b');
+      gfx_measurestr(#_me_s, _me_tw, _me_th);
+      gfx_set(1, 1, 1, 0.9);
+      gfx_x = _me_gx + (24 - _me_tw) * 0.5; gfx_y = _me_ry; gfx_drawstr(#_me_s);
+      _me_mdn && _me_mx >= _me_gx && _me_mx < _me_gx + 24 &&
+      _me_my >= _me_ry - 2 && _me_my < _me_ry + 14 ? ( kmac_ed_addpad = _me_i; );
+      _me_i += 1;
+    );
+    swing_macroed_btn(_me_px + 46 + 16 * 26 + 4, _me_ry - 2, 34, 16, "ALL") ? ( kmac_ed_addpad = -2; );
+    kmac_ed_addpad == -2 ? (
+      gfx_set(1, 1, 1, 0.95);
+      gfx_rect(_me_px + 46 + 16 * 26 + 4, _me_ry - 2, 34, 16, 0);
+    );
+
+    // param grid, 5 columns (active only once a pad is picked).
+    // 5 not 4 on purpose: the engine knobs append up to 6 more cells, and at
+    // 4 wide that spilled to an 8th row — which lands exactly on the morph
+    // graph at _me_ph - 56. Widening costs no height; a cell is still ~103 px
+    // for a 7-character label.
+    _me_i = 0; loop(28 + swing_macroed_syn_cells(kmac_ed_addpad),
+      _me_gx = _me_px + 12 + (_me_i % 5) * ((_me_pw - 24) / 5);
+      _me_gy = _me_ry + 24 + ((_me_i / 5) | 0) * 22;
+      swing_macroed_pid_lbl(swing_macroed_pick_pid(_me_i), kmac_ed_addpad, #_me_s);
+      swing_macroed_btn(_me_gx, _me_gy, ((_me_pw - 24) / 5) - 4, 18, #_me_s) &&
+      kmac_ed_addpad != -3 ? (
+        // Append: default range = [current value .. full-scale end] (spec §2)
+        _me_pid = swing_macroed_pick_pid(_me_i);
+        swing_macroed_pid_range(_me_pid);
+        _me_j = _me_b + kmac_nmap[_me_msel];
+        kmac_pad[_me_j]   = kmac_ed_addpad;
+        kmac_pid[_me_j]   = _me_pid;
+        kmac_lo[_me_j]    = swing_macroed_get(
+          kmac_ed_addpad >= 0 ? kmac_ed_addpad : max(0, min(NUM_PADS - 1, sel_pad)), _me_pid);
+        kmac_hi[_me_j]    = kmac_ed_pmax;
+        kmac_curve[_me_j] = 1;
+        kmac_nmap[_me_msel] += 1;
+        kmac_ed_add = 0;
+        mark_dirty_kit();
+        kmac_force = 1;
+      );
+      _me_i += 1;
+    );
+    kmac_ed_addpad == -3 ? (
+      gfx_setfont(1, "Arial", 9);
+      gfx_set(0.55, 0.60, 0.66, 0.8);
+      gfx_x = _me_px + 12; gfx_y = _me_ry + 24 + 7 * 22 + 4;
+      gfx_drawstr("pick a pad first, then the parameter");
+    ) : (
+      // confirm the pick by NAME before the param click lands
+      swing_macroed_padlbl(kmac_ed_addpad, #_me_s2);
+      sprintf(#_me_s, "%s — now pick the parameter", #_me_s2);
+      gfx_setfont(1, "Arial", 9, 'b');
+      gfx_set(0.60, 0.90, 0.95, 0.9);
+      gfx_x = _me_px + 12; gfx_y = _me_ry + 24 + 7 * 22 + 4;
+      gfx_drawstr(#_me_s);
+    );
+  ) : (
+    // ── mappings list for the selected macro ──
+    kmac_nmap[_me_msel] == 0 ? (
+      gfx_setfont(1, "Arial", 10);
+      gfx_set(0.48, 0.53, 0.60, 0.9);
+      gfx_x = _me_px + 12; gfx_y = _me_ry + 8;
+      gfx_drawstr("No targets yet — + ADD picks a pad and a parameter.");
+    );
+    _me_j = 0; loop(min(kmac_nmap[_me_msel], KMAC_MAX_MAP),
+      _me_pad = kmac_pad[_me_b + _me_j];
+      _me_pid = kmac_pid[_me_b + _me_j];
+      swing_macroed_pid_range(_me_pid);
+
+      // pad chip + the pad's real NAME (truncated to its zone) + param
+      _me_pad >= 0 ? (
+        swing_color_pad_hsl(_me_pad, 0.70, 0.50);
+        gfx_set(_hsl_r, _hsl_g, _hsl_b, 1);
+      ) : (
+        gfx_set(0.50, 0.55, 0.62, 0.9);
+      );
+      gfx_rect(_me_px + 12, _me_ry + 3, 8, 10);
+      swing_macroed_padlbl(_me_pad, #_me_s);
+      gfx_setfont(1, "Arial", 9, 'b');
+      gfx_measurestr(#_me_s, _me_tw, _me_th);
+      while (_me_tw > 60 && strlen(#_me_s) > 2) (
+        strcpy_substr(#_me_s2, #_me_s, 0, strlen(#_me_s) - 1);
+        strcpy(#_me_s, #_me_s2);
+        gfx_measurestr(#_me_s, _me_tw, _me_th);
+      );
+      gfx_set(0.80, 0.84, 0.90, 1);
+      gfx_x = _me_px + 24; gfx_y = _me_ry + 2; gfx_drawstr(#_me_s);
+      swing_macroed_pid_lbl(_me_pid, _me_pad, #_me_s);
+      gfx_set(0.62, 0.67, 0.74, 0.95);
+      gfx_x = _me_px + 90; gfx_y = _me_ry + 2; gfx_drawstr(#_me_s);
+
+      // range bar
+      _me_bx0 = _me_px + 150; _me_bw2 = _me_pw - 150 - 118;
+      gfx_set(0.04, 0.07, 0.10, 1);
+      gfx_rect(_me_bx0, _me_ry + 3, _me_bw2, 10);
+      _me_n0 = (kmac_lo[_me_b + _me_j] - kmac_ed_pmin) / (kmac_ed_pmax - kmac_ed_pmin);
+      _me_n1 = (kmac_hi[_me_b + _me_j] - kmac_ed_pmin) / (kmac_ed_pmax - kmac_ed_pmin);
+      _me_lo_x = _me_bx0 + max(0, min(1, _me_n0)) * _me_bw2;
+      _me_hi_x = _me_bx0 + max(0, min(1, _me_n1)) * _me_bw2;
+      gfx_set(0.75, 0.51, 0.22, 0.9);
+      gfx_rect(min(_me_lo_x, _me_hi_x), _me_ry + 3,
+               max(2, abs(_me_hi_x - _me_lo_x)), 10);
+      gfx_set(1, 1, 1, 0.95);
+      gfx_rect(_me_lo_x - 1, _me_ry + 1, 2, 14);
+      gfx_rect(_me_hi_x - 1, _me_ry + 1, 2, 14);
+      // live value tick (concrete pads only)
+      _me_pad >= 0 ? (
+        _me_cur = (swing_macroed_get(_me_pad, _me_pid) - kmac_ed_pmin)
+                  / (kmac_ed_pmax - kmac_ed_pmin);
+        gfx_set(0.45, 0.90, 0.95, 0.9);
+        gfx_rect(_me_bx0 + max(0, min(1, _me_cur)) * _me_bw2 - 1, _me_ry + 5, 2, 6);
+      );
+
+      // numeric readout
+      sprintf(#_me_s, "%g > %g", kmac_lo[_me_b + _me_j], kmac_hi[_me_b + _me_j]);
+      gfx_setfont(1, "Arial", 9);
+      gfx_measurestr(#_me_s, _me_tw, _me_th);
+      gfx_set(0.55, 0.60, 0.66, 0.95);
+      gfx_x = _me_px + _me_pw - 34 - _me_tw; gfx_y = _me_ry + 2; gfx_drawstr(#_me_s);
+
+      // remove ✕
+      swing_macroed_btn(_me_px + _me_pw - 28, _me_ry, 16, 16, "x") ? (
+        _me_i = _me_b + kmac_nmap[_me_msel] - 1;   // swap-remove with the last row
+        kmac_pad[_me_b + _me_j]   = kmac_pad[_me_i];
+        kmac_pid[_me_b + _me_j]   = kmac_pid[_me_i];
+        kmac_lo[_me_b + _me_j]    = kmac_lo[_me_i];
+        kmac_hi[_me_b + _me_j]    = kmac_hi[_me_i];
+        kmac_curve[_me_b + _me_j] = kmac_curve[_me_i];
+        kmac_nmap[_me_msel] -= 1;
+        mark_dirty_kit();
+        kmac_force = 1;
+      );
+
+      // range-handle drag: start / continue (release handled after the loop)
+      _me_mdn && kmac_ed_drag == 0 &&
+      _me_my >= _me_ry && _me_my <= _me_ry + 16 ? (
+        abs(_me_mx - _me_lo_x) <= 6 ? ( kmac_ed_drag = _me_j * 2 + 1; ) :
+        abs(_me_mx - _me_hi_x) <= 6 ? ( kmac_ed_drag = _me_j * 2 + 2; ) : 0;
+      );
+      // ⚠️ parens around the |0 floor: bare `|0 == x` parses as `|(0==x)`
+      // (feedback_eel2_bitwise_precedence).
+      kmac_ed_drag > 0 && (((kmac_ed_drag - 1) / 2) | 0) == _me_j && _me_lmb ? (
+        _me_cur = kmac_ed_pmin +
+          max(0, min(1, (_me_mx - _me_bx0) / _me_bw2)) * (kmac_ed_pmax - kmac_ed_pmin);
+        (kmac_ed_drag & 1) ? ( kmac_lo[_me_b + _me_j] = _me_cur; )
+                           : ( kmac_hi[_me_b + _me_j] = _me_cur; );
+        kmac_force = 1;          // live re-apply while dragging (audible edit)
+        kmac_ed_dragged = 1;
+      );
+      _me_ry += 22;
+      _me_j += 1;
+    );
+    // release: one dirty mark per completed drag gesture
+    !_me_lmb && kmac_ed_drag > 0 ? (
+      kmac_ed_dragged ? ( mark_dirty_kit(); kmac_ed_dragged = 0; );
+      kmac_ed_drag = 0;
+    );
+  );
+
+  // ── morph graph: the 8 live values as identity-colour bars, with white
+  // ticks marking where the DESTINATION snapshot will take each one — the
+  // "what is the morph about to do" readout from the design render. Ticks
+  // draw only when the chain is morphable (both ends captured).
+  _me_gy = _me_py + _me_ph - 56;
+  _me_bw2 = (_me_pw - 24) / 8;
+  _me_i = 0;
+  _me_n0 = max(0, min(KMAC_NSNAP - 1, macro_morph));
+  _me_n1 = min(KMAC_NSNAP - 1, (_me_n0 | 0) + 1);   // destination slot
+  loop(8,
+    _me_gx = _me_px + 12 + _me_i * _me_bw2;
+    gfx_set(0.05, 0.08, 0.11, 1);
+    gfx_rect(_me_gx, _me_gy, _me_bw2 - 3, 20);
+    _me_v = _me_i == 0 ? macro1 : _me_i == 1 ? macro2 : _me_i == 2 ? macro3 :
+            _me_i == 3 ? macro4 : _me_i == 4 ? macro5 : _me_i == 5 ? macro6 :
+            _me_i == 6 ? macro7 : macro8;
+    swing_lcd_kmac_pal(kmac_color[_me_i] | 0);
+    gfx_set(kmac_pal_r, kmac_pal_g, kmac_pal_b, kmac_nmap[_me_i] > 0 ? 0.9 : 0.35);
+    gfx_rect(_me_gx, _me_gy + 20 - _me_v * 20, _me_bw2 - 3, _me_v * 20);
+    kmac_snap_has[_me_n0 | 0] && kmac_snap_has[_me_n1] ? (
+      gfx_set(0.95, 0.98, 1.00, 0.95);
+      gfx_rect(_me_gx, _me_gy + 20 - kmac_snap[_me_n1 * KMAC_N + _me_i] * 20 - 1,
+               _me_bw2 - 3, 2);
+    );
+    _me_i += 1;
+  );
+
+  // ── snapshot footer (slice 4): dots I..IV · CAPTURE · MORPH ──
+  // Same widgets as the strip row, driven from the restored _me_* mouse —
+  // the strip's own row is input-gated while this modal is up. Actions are
+  // the shared swing_lcd_kmac_* helpers, so both surfaces stay one state.
+  _me_ry = _me_py + _me_ph - 28;
+  gfx_set(0.30, 0.34, 0.40, 0.7);
+  gfx_rect(_me_px + 10, _me_ry - 8, _me_pw - 20, 1);
+  gfx_setfont(1, "Arial", 9, 'b'); gfx_set(0.55, 0.60, 0.66, 0.9);
+  gfx_x = _me_px + 12; gfx_y = _me_ry + 3; gfx_drawstr("SNAP");
+  _me_i = swing_lcd_kmac_modified();
+  _me_k = 0; loop(KMAC_NSNAP,
+    _me_gx = _me_px + 50 + _me_k * 23;
+    kmac_snap_has[_me_k] ? gfx_set(0.10, 0.28, 0.32, 1) : gfx_set(0.06, 0.09, 0.12, 1);
+    gfx_rect(_me_gx, _me_ry, 20, 17);
+    kmac_snap_act == _me_k ? (
+      _me_i ? gfx_set(0.95, 0.72, 0.25, 0.95) : gfx_set(0.90, 0.97, 1.00, 0.9);
+    ) : gfx_set(0.24, 0.34, 0.38, 0.9);
+    gfx_rect(_me_gx, _me_ry, 20, 17, 0);
+    swing_lcd_kmac_roman(_me_k, #_me_s);
+    gfx_setfont(1, "Arial", 8, 'b');
+    gfx_measurestr(#_me_s, _me_tw, _me_th);
+    kmac_snap_has[_me_k] ? gfx_set(0.45, 0.90, 0.95, 1) : gfx_set(0.35, 0.42, 0.48, 0.9);
+    gfx_x = _me_gx + (20 - _me_tw) * 0.5; gfx_y = _me_ry + (17 - _me_th) * 0.5;
+    gfx_drawstr(#_me_s);
+    _me_mx >= _me_gx && _me_mx < _me_gx + 20 &&
+    _me_my >= _me_ry && _me_my < _me_ry + 17 ? (
+      _me_mdn ? (
+        CTRL ? swing_lcd_kmac_clear(_me_k)     // ctrl+click = delete snapshot
+             : swing_lcd_kmac_recall(_me_k);
+      );
+      _me_rdn ? swing_lcd_kmac_capture(_me_k);
+    );
+    _me_k += 1;
+  );
+  swing_macroed_btn(_me_px + 50 + KMAC_NSNAP * 23 + 6, _me_ry, 58, 17, "CAPTURE") ? (
+    swing_lcd_kmac_capture(kmac_snap_act);
+  );
+  gfx_setfont(1, "Arial", 9, 'b'); gfx_set(0.55, 0.60, 0.66, 0.9);
+  _me_gx = _me_px + 50 + KMAC_NSNAP * 23 + 72;
+  gfx_x = _me_gx; gfx_y = _me_ry + 3; gfx_drawstr("MORPH");
+  _me_gx += 44;
+  _me_bw2 = _me_px + _me_pw - 96 - _me_gx;
+  gfx_set(0.03, 0.07, 0.10, 1);
+  gfx_rect(_me_gx, _me_ry + 4, _me_bw2, 9);
+  _me_i = swing_lcd_kmac_ncap() >= 2;
+  _me_n0 = max(0, min(1, macro_morph / (KMAC_NSNAP - 1)));
+  gfx_set(0.20, 0.55, 0.60, _me_i ? 0.95 : 0.30);
+  gfx_rect(_me_gx, _me_ry + 4, _me_n0 * _me_bw2, 9);
+  gfx_set(0.90, 0.97, 1.00, _me_i ? 0.95 : 0.35);
+  gfx_rect(_me_gx + _me_n0 * _me_bw2 - 1, _me_ry + 2, 2, 13);
+  _me_mdn && _me_mx >= _me_gx - 4 && _me_mx <= _me_gx + _me_bw2 + 4 &&
+  _me_my >= _me_ry && _me_my <= _me_ry + 17 ? ( kmac_ed_mdrag = 1; );
+  kmac_ed_mdrag ? (
+    _me_lmb ? (
+      macro_morph = max(0, min(1, (_me_mx - _me_gx) / _me_bw2)) * (KMAC_NSNAP - 1);
+      slider_automate(2^39);
+    ) : ( kmac_ed_mdrag = 0; );
+  );
+  _me_i ? (
+    _me_n1 = max(0, min(KMAC_NSNAP - 1, macro_morph));
+    swing_lcd_kmac_roman(min(KMAC_NSNAP - 1, (_me_n1 | 0) + 1), #_me_s2);
+    swing_lcd_kmac_roman(_me_n1 | 0, #_me_s);
+    sprintf(#_me_s, "%s>%s %.2f", #_me_s, #_me_s2, _me_n1 - (_me_n1 | 0));
+  ) : strcpy(#_me_s, "capture 2+");
+  gfx_setfont(1, "Arial", 8, 'b');
+  gfx_measurestr(#_me_s, _me_tw, _me_th);
+  gfx_set(0.55, 0.60, 0.66, 0.95);
+  gfx_x = _me_px + _me_pw - 12 - _me_tw; gfx_y = _me_ry + 3; gfx_drawstr(#_me_s);
+
+  // ── colour PICKER draw — LAST, so the swatch row floats above the knob
+  // grid and the mappings header. Same geometry as the input block above.
+  kmac_colpick_k >= 0 ? (
+    _me_cpx = max(_me_px + 8, min(_me_px + _me_pw - 190,
+              _me_px + 10 + (kmac_colpick_k % 4) * ((_me_pw - 20) / 4)
+              + ((_me_pw - 20) / 8) - 91));
+    _me_cpy = _me_py + 32 + ((kmac_colpick_k / 4) | 0) * 86 + 88;
+    gfx_set(0.07, 0.10, 0.14, 0.98);
+    gfx_rect(_me_cpx, _me_cpy, 182, 24);
+    gfx_set(0.45, 0.55, 0.65, 0.9);
+    gfx_rect(_me_cpx, _me_cpy, 182, 24, 0);
+    _me_i = 0; loop(8,
+      swing_lcd_kmac_pal(_me_i);
+      gfx_set(kmac_pal_r, kmac_pal_g, kmac_pal_b, 1);
+      gfx_rect(_me_cpx + 3 + _me_i * 22, _me_cpy + 4, 20, 16);
+      (kmac_color[kmac_colpick_k] | 0) == _me_i ? (
+        gfx_set(1, 1, 1, 0.95);
+        gfx_rect(_me_cpx + 2 + _me_i * 22, _me_cpy + 3, 22, 18, 0);
+      );
+      _me_i += 1;
+    );
+  );
+
+  // (click-away rename commits are the ren tick's job — see rk_swing_lcd)
+
+  // ── close: X, or a click on the dimmed backdrop (outside the panel) ──
+  // (an active rename survives the close when the MACRO tab still shows
+  // its pill — the ren tick commits it if no surface is left showing one)
+  (_me_xh && _me_mdn) ? (
+    kmac_ed_open = 0; kmac_ed_drag = 0; kmac_ed_add = 0; kmac_colpick_k = -1;
+  );
+  (_me_mdn && kmac_ed_drag == 0 &&
+    (_me_mx < _me_px || _me_mx > _me_px + _me_pw ||
+     _me_my < _me_py || _me_my > _me_py + _me_ph)) ? (
+    kmac_ed_open = 0; kmac_ed_add = 0; kmac_colpick_k = -1;
+  );
+);

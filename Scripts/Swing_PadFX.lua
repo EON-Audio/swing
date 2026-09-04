@@ -481,7 +481,7 @@ end
 
 -- Refresh + draw a single FX control (knob or pill); queues edits. Caller
 -- handles layout (SameLine / groups).
-local function draw_fx_control(ctx, item, fx_live, knob_size, pill_w)
+local function draw_fx_control(ctx, item, fx_live, knob_size, pill_w, compact)
   local pid = item.pid
   -- Refresh cache from gmem unless this control is being dragged (knob or graph node).
   if pid ~= active_pid and not eq_drag_pids[pid] and fx_live and fx_live[pid] ~= nil then
@@ -494,9 +494,12 @@ local function draw_fx_control(ctx, item, fx_live, knob_size, pill_w)
     local idx = math.floor((display[pid] or 0) + 0.5)
     if idx < 0 then idx = 0 end
     local changed, nidx = widgets.mode_pill(ctx, tostring(pid), item.modes, idx, pill_w or 56)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.colors.text_dim)
-    ImGui.Text(ctx, item.label)
-    ImGui.PopStyleColor(ctx)
+    if not compact then
+      -- compact rung: the pill face already names the current mode
+      ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.colors.text_dim)
+      ImGui.Text(ctx, item.label)
+      ImGui.PopStyleColor(ctx)
+    end
     ImGui.EndGroup(ctx)
     if changed then display[pid] = nidx; pending[pid] = nidx end
   else
@@ -510,7 +513,8 @@ local function draw_fx_control(ctx, item, fx_live, knob_size, pill_w)
     end
     local changed, nv, act = widgets.knob(ctx, tostring(pid), display[pid],
       item.min, item.max, { log = item.log, fmt = item.fmt, default = item.default,
-                            label = item.label, size = knob_size, role = item.role, hue = hue })
+                            label = item.label, size = knob_size, role = item.role, hue = hue,
+                            compact = compact })
     if act then next_active = pid end
     if changed then display[pid] = nv; pending[pid] = nv end
   end
@@ -541,6 +545,23 @@ local function frame()
     return
   end
   reaper.SetExtState("Swing", "padfx_heartbeat", tostring(os.time()), false)
+
+  -- Live re-dock request — EON Dock Layout's "Spread panes" asks an ALREADY
+  -- OPEN pane to move to a named docker instead of sharing one. Value is an
+  -- ImGui dock id in this pane's own units (-1..-16 = REAPER docker 0..15,
+  -- 0 = float), and it rides the exact pending_dock_id path the Dock button
+  -- drives, so SetNextWindowDockID still has only one caller. dock_id is
+  -- written + saved here rather than waiting for the frame that applies it:
+  -- the picker reads this key back to draw where the pane now lives, and a
+  -- card that lags the move would break the drawing==landing promise.
+  local dock_req = reaper.GetExtState("Swing", "padfx_dock_req")
+  if dock_req ~= "" then
+    reaper.DeleteExtState("Swing", "padfx_dock_req", false)
+    ui.pending_dock_id  = tonumber(dock_req) or 0
+    ui.want_dock_change = true
+    settings.dock_id    = ui.pending_dock_id
+    save_settings()
+  end
 
   -- Identity rollout: ~1Hz target revalidation (auto_pick_instance clears a
   -- registry-absent id and re-picks; no-op while the target is healthy).
@@ -741,14 +762,31 @@ local function frame()
       next_active = nil                      -- collected during this frame's draw
       eq_drag_pids = {}                      -- repopulated by the EQ graph if dragging
 
-      -- Auto-fit layout: the panel scales its whole contents (EQ + knobs) to the
-      -- docked size so every control stays visible without growing the panel —
-      -- never clipping, never clustering in a corner.
-      local avail_w, avail_h = ImGui.GetContentRegionAvail(ctx)
+      -- Auto-fit layout: the panel scales its contents (EQ + knobs) to the
+      -- docked size — but controls have a FLOOR (user 2026-08-25: "buttons
+      -- always stay big"). Below the floor the window scrolls instead of
+      -- miniaturizing; the EQ curve is the compression victim (down to its
+      -- own 40px floor) before the knobs give up anything.
+      local avail_h = select(2, ImGui.GetContentRegionAvail(ctx))
       -- Reflow the four columns to as many per row as fit; shrink 4→2→1 so every
       -- control stays reachable as the panel narrows (the window only scrolls at
       -- the very smallest sizes).
-      local ncols = (avail_w >= 300) and 4 or ((avail_w >= 150) and 2 or 1)
+      --
+      -- ⚠️ Decide from a width THE SCROLLBAR CANNOT MOVE. GetContentRegionAvail
+      -- loses the scrollbar's ~14px the instant one appears, and the ladder
+      -- below sizes the EQ to consume exactly whatever height is left — so the
+      -- content permanently sits on the overflow knife-edge. A pane whose avail
+      -- width straddled 300 (the user's bottom docker, 322px wide) therefore
+      -- flipped EVERY FRAME: no scrollbar → 306 → 4 cols/1 row → content height
+      -- changes → scrollbar → 292 → 2 cols/2 rows → … (user 2026-08-27: "Pad FX
+      -- is blinking when I'm in dock mode"; resizing the neighbouring panes
+      -- moved it off the boundary and it stopped). Measuring off the WINDOW
+      -- width, which a scrollbar never changes, breaks the feedback loop rather
+      -- than damping it, and keeps the original thresholds: window_w - padding
+      -- IS avail_w in the no-scrollbar case the numbers were chosen for.
+      local _padx = ImGui.GetStyleVar(ctx, ImGui.StyleVar_WindowPadding)  -- x only
+      local col_w = settings.window_w - 2 * _padx
+      local ncols = (col_w >= 300) and 4 or ((col_w >= 150) and 2 or 1)
       local nrows = math.ceil(4 / ncols)
 
       -- Overheads are measured generously: each stacked knob reserves its diameter
@@ -756,21 +794,37 @@ local function frame()
       -- table cell padding. Slightly over-reserving leaves a small gap below the
       -- knobs instead of clipping the bottom row — which is the bug we're avoiding.
       local SEPS    = 54                        -- two SeparatorText rows ("EQ" + "DYNAMICS")
-      local ROW_OVH = 90                        -- per knob-row: title + 2×(value/label+spacing) + cell pad
       local GRIDGAP = (nrows - 1) * 10          -- gap between rows in the 2-/1-wide reflow
-      -- Scale EVERYTHING to the docked height so all controls stay visible without
-      -- growing the panel. Strip the fixed text/separator overhead, then split the
-      -- remaining "graphical" space ~45% to the EQ curve and the rest to the knob
-      -- diameters (a column stacks two knobs over `nrows` rows). When there's plenty
-      -- of room the knobs cap out and the EQ absorbs the surplus.
+      -- FIT LADDER (user 2026-08-25: "no scroll on Pad FX"): the dials never
+      -- shrink below 34px and the pane never scrolls at real sizes. What
+      -- gives way instead, in order: the EQ curve compresses (40 → 24px thin
+      -- strip, still draggable), then the knob value/label rows fold away
+      -- (compact mode — names and values live on in the hover tooltips).
+      -- Scrolling survives only below the ladder's absolute floor (~230px),
+      -- which no real rig pane reaches.
+      local ROW_OVH = 90                        -- per knob-row: title + 2×(value/label+spacing) + cell pad
+      local KNOB_MIN, KNOB_MAX = 34, 54
+      local EQ_FULL, EQ_THIN   = 40, 24
+      local compact = false
       local scal = avail_h - SEPS - nrows * ROW_OVH - GRIDGAP
       if scal < 40 then scal = 40 end
       local knob_size = (scal * 0.55) / (2 * nrows)
-      if knob_size > 54 then knob_size = 54 end
-      if knob_size < 13 then knob_size = 13 end
+      if knob_size > KNOB_MAX then knob_size = KNOB_MAX end
+      if knob_size < KNOB_MIN then knob_size = KNOB_MIN end
       local dyn_h = nrows * (2 * knob_size + ROW_OVH) + GRIDGAP
-      local eq_h  = avail_h - SEPS - dyn_h      -- EQ takes the rest
-      if eq_h < 40 then eq_h = 40 end
+      if avail_h - SEPS - dyn_h < EQ_FULL then
+        -- Rung 1: dials to the floor, EQ allowed thin.
+        knob_size = KNOB_MIN
+        dyn_h = nrows * (2 * knob_size + ROW_OVH) + GRIDGAP
+        if avail_h - SEPS - dyn_h < EQ_THIN then
+          -- Rung 2: fold the text rows under the dials.
+          compact = true
+          ROW_OVH = 46                          -- title + cell pad only
+          dyn_h = nrows * (2 * knob_size + ROW_OVH) + GRIDGAP
+        end
+      end
+      local eq_h = avail_h - SEPS - dyn_h       -- EQ takes the rest
+      if eq_h < EQ_THIN then eq_h = EQ_THIN end
 
       -- EQ: the interactive graph owns the bands (HPF/LPF + Lo/Mid/Hi); the
       -- only EQ knob is the shared filter Q.
@@ -800,7 +854,7 @@ local function frame()
           ImGui.PopStyleColor(ctx)
           for _, item in ipairs(col.items) do
             center(item.pill and pill_w or knob_size)
-            draw_fx_control(ctx, item, fx_live, knob_size, pill_w)
+            draw_fx_control(ctx, item, fx_live, knob_size, pill_w, compact)
           end
         end
         ImGui.EndTable(ctx)
@@ -810,11 +864,21 @@ local function frame()
       drain_pending(pad)
     end
 
-    -- Track dock changes in memory only; saved once on cleanup. (Saving every
-    -- frame churned ExtState to disk when the dock id briefly oscillated.)
+    -- Publish dock changes the moment they happen, the way Swing_Browser
+    -- already does. In-memory-until-cleanup was wrong: EON Dock Layout reads
+    -- this key to work out which panes are sharing a docker, so a pane the
+    -- user had dragged reported yesterday's home for as long as it ran, and
+    -- "Spread panes" kept concluding there was nothing to separate
+    -- (2026-08-27, "spread panes aint working... everytime").
+    -- The old note here warned that saving churned ExtState "every frame" —
+    -- that was save-unconditionally; this saves only on an actual CHANGE, so a
+    -- settled dock costs one write and a drag costs a handful.
     if ImGui.GetWindowDockID then
       local cur = ImGui.GetWindowDockID(ctx)
-      if cur ~= settings.dock_id then settings.dock_id = cur end
+      if cur ~= settings.dock_id then
+        settings.dock_id = cur
+        save_settings()
+      end
     end
 
     ImGui.PopStyleVar(ctx, 2)

@@ -31,7 +31,16 @@ local function reaper_palette(mode)
   local f = reaper.GetLastColorThemeFile and reaper.GetLastColorThemeFile() or ""
   local key = f .. "|" .. mode
   if key ~= _reaper_key then
-    _reaper_pal[mode] = rktheme and rktheme.make_reaper(mode) or nil
+    -- Through clamp_for_swing, NOT raw make_reaper: the clamp is what makes a
+    -- derived palette drawable, and Swing's JSFX side gets it via T.resolve().
+    -- Calling make_reaper directly here would leave the Browser and Pad FX on
+    -- the unclamped palette, so the same theme name would render two different
+    -- ways depending on which window you were looking at.
+    -- clamp_for_swing guarded, not assumed: rk_lua_theme ships separately and a
+    -- half-updated install would otherwise call nil and take the whole UI down.
+    _reaper_pal[mode] = rktheme and (rktheme.clamp_for_swing
+                                     and rktheme.clamp_for_swing(rktheme.make_reaper(mode))
+                                     or rktheme.make_reaper(mode)) or nil
     _reaper_key = key
   end
   return _reaper_pal[mode]
@@ -114,7 +123,84 @@ function w._apply_semantic(ctx, p)
   ImGui.PushStyleColor(ctx, ImGui.Col_Separator,           grid)
 end
 
+-- The palette push_theme last applied, so meaning-colours can be resolved against
+-- the surfaces they will actually land on. See w.ink below.
+w._pal = nil
+
+-- Draw text in its own colour with a thin black outline, so a vivid colour keeps
+-- its full strength and still reads on a pale surface.
+--
+-- ⚠ ALPHA is the dial here, not the offset. Redrawing a glyph at ±1px is a 1px
+-- dilation and that is the floor for this technique — you cannot outline thinner
+-- than one pixel. What made the first two attempts read as a heavy stroke was
+-- opacity, not width: the four passes OVERLAP at every corner, so at 0xE6 (90%)
+-- and even 0xA6 (65%) the corners compound to near-solid black and the label
+-- looks bold ("too much outline" / "too thick", user 2026-08-30, twice).
+--
+-- At 0x40 (25%) a single pass is a faint edge and the compounded corners land
+-- around 68%, which separates the glyph from a pale row without weight. If this
+-- still reads heavy the next step is fewer passes, not a smaller offset.
+--
+-- Offsets are CARDINAL, never diagonal: a diagonal pushes 1.4px, not 1px.
+--
+-- Black regardless of theme: on a light surface it is the whole point, and on a
+-- dark one it simply disappears into the background and costs nothing.
+-- ⚠ The GLYPH is drawn by the real ImGui.Text, not by the draw list. Only the
+-- outline passes are manual. Drawing the main glyph with DrawList_AddText and
+-- then reserving space for it with Dummy skips the widget path's baseline
+-- alignment and per-cell clipping, and the label lands a hair off from every
+-- other label in the table — which reads as "did you change the font too?"
+-- (user, 2026-08-30). It did not; it was drawn the wrong way.
+local OUTLINE = { {-1,0}, {1,0}, {0,-1}, {0,1} }
+function w.text_outlined(ctx, txt, color, outline)
+  if not outline then
+    -- A DARK VERSION OF THE COLOUR ITSELF, not black. Pure black around a vivid
+    -- hue reads as a stroke drawn on top of the label; the colour's own shadow
+    -- reads as the label having depth. Keeps the hue, so the wheel still reads.
+    local rr = (((color >> 24) & 255) * 0.30) // 1
+    local gg = (((color >> 16) & 255) * 0.30) // 1
+    local bb = (((color >> 8)  & 255) * 0.30) // 1
+    outline = (rr << 24) | (gg << 16) | (bb << 8) | 0x59
+  end
+  local dl = ImGui.GetWindowDrawList(ctx)
+  local x, y = ImGui.GetCursorScreenPos(ctx)
+  for _, o in ipairs(OUTLINE) do
+    ImGui.DrawList_AddText(dl, x + o[1], y + o[2], outline, txt)
+  end
+  ImGui.PushStyleColor(ctx, ImGui.Col_Text, color)
+  ImGui.Text(ctx, txt)
+  ImGui.PopStyleColor(ctx)
+end
+
+-- Make a MEANING colour readable on the current theme without losing what it means.
+--
+-- The browser's semantic inks — folder gold, error red, stereo blue, the status
+-- greens — are fixed literals chosen against a dark window, and every one of them
+-- measured under 2:1 on all four light themes (folder gold reached 1.02:1 on EON).
+-- The one attempt at a fix was `theme == "light" or theme == "eon"`, a name
+-- whitelist that missed Ableton and Pro Tools Light entirely and was still only
+-- 1.88:1 on the two it did catch.
+--
+-- So: don't test the theme's NAME, test the colour against the theme's surfaces.
+-- rktheme.ink_on keeps the hue and moves lightness the minimum distance needed,
+-- so gold stays gold. Falls through to the colour unchanged when the theme module
+-- is missing, which is the same thing the old literal did.
+function w.ink(c, minr)
+  if not (rktheme and rktheme.ink_on and w._pal) then return c end
+  return rktheme.ink_on(c, { w._pal.bg, w._pal.panel }, minr)
+end
+
 function w.push_theme(ctx, theme)
+  -- Record the palette FIRST: w.ink is called during the same frame this pushes.
+  if rktheme then
+    if theme == "reaper" or theme == "reaper_panel" or theme == "reaper_color" then
+      w._pal = reaper_palette(_reaper_mode_of(theme))
+    else
+      w._pal = rktheme.FIXED and rktheme.FIXED[theme]
+    end
+    -- Unknown name falls to the dark branch below, so resolve ink against dark too.
+    if not w._pal then w._pal = rktheme.FIXED and rktheme.FIXED.dark end
+  end
   if theme == "light" then
     ImGui.PushStyleColor(ctx, ImGui.Col_WindowBg,         0xF0F0F2FF)
     ImGui.PushStyleColor(ctx, ImGui.Col_ChildBg,          0xF0F0F2FF)
@@ -131,8 +217,8 @@ function w.push_theme(ctx, theme)
     ImGui.PushStyleColor(ctx, ImGui.Col_Button,           0xD5D5DCFF)
     ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered,    0xC5C5D0FF)
     ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive,     0xFF8C32FF)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text,             0x222228FF)
-    ImGui.PushStyleColor(ctx, ImGui.Col_TextDisabled,     0x888890FF)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text,             (rktheme and rktheme.FIXED["light"] and rktheme.FIXED["light"].text) or 0x222228FF)
+    ImGui.PushStyleColor(ctx, ImGui.Col_TextDisabled,     (rktheme and rktheme.FIXED["light"] and rktheme.FIXED["light"].text_dim) or 0x888890FF)
     ImGui.PushStyleColor(ctx, ImGui.Col_ScrollbarBg,      0xE8E8ECFF)
     ImGui.PushStyleColor(ctx, ImGui.Col_ScrollbarGrab,    0xB8B8C0FF)
     ImGui.PushStyleColor(ctx, ImGui.Col_ScrollbarGrabHovered, 0xA0A0AAFF)
@@ -164,8 +250,8 @@ function w.push_theme(ctx, theme)
     ImGui.PushStyleColor(ctx, ImGui.Col_Button,           0xADA89EFF)  -- transport grey
     ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered,    0xBBB6ABFF)
     ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive,     0xFF8C32FF)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text,             0x2B2822FF)
-    ImGui.PushStyleColor(ctx, ImGui.Col_TextDisabled,     0x7E776AFF)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text,             (rktheme and rktheme.FIXED["eon"] and rktheme.FIXED["eon"].text) or 0x2B2822FF)
+    ImGui.PushStyleColor(ctx, ImGui.Col_TextDisabled,     (rktheme and rktheme.FIXED["eon"] and rktheme.FIXED["eon"].text_dim) or 0x7E776AFF)
     ImGui.PushStyleColor(ctx, ImGui.Col_ScrollbarBg,      0xC8C0B0FF)
     ImGui.PushStyleColor(ctx, ImGui.Col_ScrollbarGrab,    0xADA89EFF)
     ImGui.PushStyleColor(ctx, ImGui.Col_ScrollbarGrabHovered, 0x9C9483FF)
@@ -198,8 +284,8 @@ function w.push_theme(ctx, theme)
     ImGui.PushStyleColor(ctx, ImGui.Col_Button,           0x3A3A42FF)
     ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered,    0x4F4F5AFF)
     ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive,     0xFF8C32FF)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text,             0xDDDDE0FF)
-    ImGui.PushStyleColor(ctx, ImGui.Col_TextDisabled,     0x8C8C96FF)
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text,             (rktheme and rktheme.FIXED["dark"] and rktheme.FIXED["dark"].text) or 0xDDDDE0FF)
+    ImGui.PushStyleColor(ctx, ImGui.Col_TextDisabled,     (rktheme and rktheme.FIXED["dark"] and rktheme.FIXED["dark"].text_dim) or 0x8C8C96FF)
     ImGui.PushStyleColor(ctx, ImGui.Col_ScrollbarBg,      0x1E1E22FF)
     ImGui.PushStyleColor(ctx, ImGui.Col_ScrollbarGrab,    0x4A4A55FF)
     ImGui.PushStyleColor(ctx, ImGui.Col_ScrollbarGrabHovered, 0x5A5A68FF)
@@ -710,19 +796,25 @@ function w.knob(ctx, id, value, vmin, vmax, opts)
       w.colors.white, 2)
   end
 
-  -- Value text + optional label, centered under the dial
-  local vtxt = string.format(opts.fmt or "%.2f", newval)
-  local tw   = ImGui.CalcTextSize(ctx, vtxt)
-  ImGui.DrawList_AddText(dl, ccx - tw * 0.5, cy + size + 1, w.colors.text_info, vtxt)
-  if opts.label then
-    local lw = ImGui.CalcTextSize(ctx, opts.label)
-    ImGui.DrawList_AddText(dl, ccx - lw * 0.5, cy + size + 15, w.colors.text_dim, opts.label)
+  -- Value text + optional label, centered under the dial. opts.compact skips
+  -- both rows (Pad FX fit ladder — short panes fold the text away instead of
+  -- shrinking the dials); name and value stay reachable via the tooltip.
+  if not opts.compact then
+    local vtxt = string.format(opts.fmt or "%.2f", newval)
+    local tw   = ImGui.CalcTextSize(ctx, vtxt)
+    ImGui.DrawList_AddText(dl, ccx - tw * 0.5, cy + size + 1, w.colors.text_info, vtxt)
+    if opts.label then
+      local lw = ImGui.CalcTextSize(ctx, opts.label)
+      ImGui.DrawList_AddText(dl, ccx - lw * 0.5, cy + size + 15, w.colors.text_dim, opts.label)
+    end
+    -- Reserve the text rows in layout so siblings don't overlap.
+    ImGui.Dummy(ctx, size, opts.label and 26 or 13)
   end
-  -- Reserve the text rows in layout so siblings don't overlap.
-  ImGui.Dummy(ctx, size, opts.label and 26 or 13)
   ImGui.EndGroup(ctx)
 
-  if hovered and opts.label then ImGui.SetTooltip(ctx, opts.label .. ": " .. vtxt) end
+  if hovered and opts.label then
+    ImGui.SetTooltip(ctx, opts.label .. ": " .. string.format(opts.fmt or "%.2f", newval))
+  end
   return changed, newval, active
 end
 

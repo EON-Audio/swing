@@ -1,11 +1,36 @@
 // rk_delay.jsfx-inc — Stereo tempo-synced delay for DrumKit_ReaKit
 // (c) EON Studios — All Rights Reserved
 //
-// Shared stereo delay bus with tempo sync, feedback, and feedback filtering.
-// Call dly_init(mem_start) from @init, dly_recalc() from @block,
+// ⭐ REBUILT 2026-08-26: this now runs the EON Delay engine (the DSP from the
+// ReaKit suite's `EON: Delay`), so Swing's send delay and the standalone product
+// are the same instrument — the same relationship the master comp already has
+// with EON Weld. What changed, and why each one is audible:
+//
+//   • CUBIC (4-point Hermite) interpolated reads. The old engine read the buffer
+//     at an INTEGER position — `dly_len` was truncated with `|0` — so the delay
+//     time could only ever land on whole samples and any change stepped.
+//   • FRACTIONAL, SMOOTHED delay time. The length now glides to its target
+//     (~50 ms) instead of jumping, so changing division or tempo tape-slides
+//     rather than clicking. This is what the integer read made impossible.
+//   • RBJ BIQUAD feedback filters (2nd order) replacing the old one-pole pair —
+//     the repeats darken and thin far more musically.
+//   • TEMPO IS NOW FOLLOWED. `dly_recalc()` reads `tempo`, but Swing only ever
+//     called it on parameter change, so changing project tempo left the delay at
+//     the old timing until you nudged a knob. `dly_tick()` (call from @block)
+//     fixes that.
+//
+// ⚠️ The two trees keep SEPARATE lib copies (EON/ReaKit/* vs Swing/libs/*, already
+// diverged, deployed separately by deploy.sh) — so this is a port, not a shared
+// file. If the ReaKit delay's engine changes, mirror it here deliberately.
+//
+// Call dly_init(mem_start) from @init (returns advanced mem_start),
+// dly_recalc() when parameters change, dly_tick() once per @block (tempo watch),
 // dly_process(inL, inR) from @sample. Returns via dly_outL / dly_outR.
 //
-// Global parameters (set from GUI):
+// ⚠️ Transcendentals (sin/cos/exp) appear ONLY in dly_recalc — never in
+// dly_process or dly_tick. House rule: no transcendentals in @sample.
+//
+// Global parameters (set from GUI before calling dly_recalc):
 //   dly_div    — sync division, 16 entries (0=off; then 1/4·1/8·1/16·1/32·1/64,
 //                each straight/T/D — see the dly_recalc table below)
 //   dly_fb     — feedback amount (0–0.95)
@@ -18,6 +43,8 @@
 
 // Maximum delay buffer: ~2 seconds at 192kHz (generous for slow tempos)
 DLY_BUF_MAX = 384000;
+// JSFX has no scientific notation; precompute the denormal guard.
+DLY_DENORM = pow(10, -18);
 
 function dly_init(mem_start)
 (
@@ -26,26 +53,44 @@ function dly_init(mem_start)
   memset(dly_bufL, 0, DLY_BUF_MAX);
   memset(dly_bufR, 0, DLY_BUF_MAX);
   dly_wpos = 0;
-  dly_len  = 0;       // delay length in samples (set by dly_recalc)
-  dly_fb_hpf_stL = 0; dly_fb_hpf_stR = 0;
-  dly_fb_lpf_stL = 0; dly_fb_lpf_stR = 0;
+  dly_len  = 0;       // TARGET delay length in samples (fractional; dly_recalc/dly_tick)
+  dly_len_s = 0;      // smoothed length actually read (glides toward dly_len)
+  dly_fb_s = 0;       // smoothed feedback
+  // Biquad state, per channel
+  dly_hp_x1L = 0; dly_hp_x2L = 0; dly_hp_y1L = 0; dly_hp_y2L = 0;
+  dly_hp_x1R = 0; dly_hp_x2R = 0; dly_hp_y1R = 0; dly_hp_y2R = 0;
+  dly_lp_x1L = 0; dly_lp_x2L = 0; dly_lp_y1L = 0; dly_lp_y2L = 0;
+  dly_lp_x1R = 0; dly_lp_x2R = 0; dly_lp_y1R = 0; dly_lp_y2R = 0;
+  dly_hp_on = 0; dly_lp_on = 0;
+  // Glide on the delay length — the tape-slide, and what makes a division or
+  // tempo change musical instead of a click. 50 ms matches EON Delay's own
+  // time_coeff, so the two instruments behave identically.
+  // ⚠️ Measured (.dev_tests/delay_probe.py): a 1/4→1/8 change at 120 bpm moves
+  // the read pointer at up to ~2.5 samples/sample, i.e. a momentary ~22-semitone
+  // tape slide that decays over the glide. That IS the classic tape sound and is
+  // deliberate — DLY_GLIDE_S is the knob if it ever wants softening (larger =
+  // gentler slide but slower to arrive).
+  DLY_GLIDE_S = 0.05;
+  dly_sm_c = exp(-1 / (DLY_GLIDE_S * srate));
+  dly_snap = 1;       // first sample after init/load lands without a ramp
   dly_outL = 0; dly_outR = 0;
   // Return total memory consumed
   mem_start + DLY_BUF_MAX * 2;
 );
 
-// ─── Recalculate delay length from tempo + division ──────────────────────
-// Call from @block (tempo may change).
-function dly_recalc()
+// ─── Delay length from tempo + division (cheap: no transcendentals) ────────
+// Split out of dly_recalc so @block can follow tempo every block without
+// recomputing filter coefficients.
+function _dly_len_from_tempo()
 local(beat_samples)
 (
   beat_samples = (60.0 / max(20, tempo)) * srate;
   // Expanded divisions: straight, triplet (T=*2/3), dotted (D=*1.5)
   dly_div == 1  ? dly_len = beat_samples :                    // 1/4
-  dly_div == 2  ? dly_len = beat_samples * 2.0 / 3.0 :       // 1/4T
+  dly_div == 2  ? dly_len = beat_samples * 2.0 / 3.0 :        // 1/4T
   dly_div == 3  ? dly_len = beat_samples * 1.5 :              // 1/4D
   dly_div == 4  ? dly_len = beat_samples * 0.5 :              // 1/8
-  dly_div == 5  ? dly_len = beat_samples * 0.5 * 2.0 / 3.0 : // 1/8T
+  dly_div == 5  ? dly_len = beat_samples * 0.5 * 2.0 / 3.0 :  // 1/8T
   dly_div == 6  ? dly_len = beat_samples * 0.5 * 1.5 :        // 1/8D
   dly_div == 7  ? dly_len = beat_samples * 0.25 :             // 1/16
   dly_div == 8  ? dly_len = beat_samples * 0.25 * 2.0 / 3.0 : // 1/16T
@@ -57,50 +102,125 @@ local(beat_samples)
   dly_div == 14 ? dly_len = beat_samples * 0.0625 * 2.0 / 3.0 : // 1/64T
   dly_div == 15 ? dly_len = beat_samples * 0.0625 * 1.5 :     // 1/64D
                   dly_len = 0;
-  dly_len = min(dly_len | 0, DLY_BUF_MAX - 1);
-  // Feedback filter coefficients
-  dly_fb_hpf_a = exp(-2.0 * $pi * max(20, dly_hpf_hz) / srate);
-  dly_fb_lpf_a = exp(-2.0 * $pi * min(20000, dly_lpf_hz) / srate);
+  // NOTE: no `|0` — the length stays FRACTIONAL. The cubic reader interpolates
+  // between samples, which is what lets the glide be smooth instead of stepped.
+  dly_len = min(dly_len, DLY_BUF_MAX - 8);
+);
+
+// ─── Recalculate on parameter change (has transcendentals) ────────────────
+function dly_recalc()
+local(w0, alpha, cs, a0i)
+(
+  _dly_len_from_tempo();
+
+  // Feedback HPF — RBJ biquad, Butterworth Q. Replaces the old one-pole:
+  // 12 dB/oct instead of 6 means the rumble actually goes away without
+  // hollowing out the repeat.
+  dly_hp_on = dly_hpf_hz > 25;
+  dly_hp_on ? (
+    w0 = 2 * $pi * min(dly_hpf_hz, srate * 0.499) / srate;
+    alpha = sin(w0) * 0.7071; cs = cos(w0);
+    a0i = 1 / (1 + alpha);
+    dly_hp_a0 = (1 + cs) * 0.5 * a0i;
+    dly_hp_a1 = -(1 + cs) * a0i;
+    dly_hp_a2 = dly_hp_a0;
+    dly_hp_b1 = -2 * cs * a0i;
+    dly_hp_b2 = (1 - alpha) * a0i;
+  );
+
+  // Feedback LPF — RBJ biquad.
+  dly_lp_on = dly_lpf_hz < 19500;
+  dly_lp_on ? (
+    w0 = 2 * $pi * min(dly_lpf_hz, srate * 0.499) / srate;
+    alpha = sin(w0) * 0.7071; cs = cos(w0);
+    a0i = 1 / (1 + alpha);
+    dly_lp_a0 = (1 - cs) * 0.5 * a0i;
+    dly_lp_a1 = (1 - cs) * a0i;
+    dly_lp_a2 = dly_lp_a0;
+    dly_lp_b1 = -2 * cs * a0i;
+    dly_lp_b2 = (1 - alpha) * a0i;
+  );
+);
+
+// ─── Block tick: follow tempo ─────────────────────────────────────────────
+// ⚠️ Call once per @block. Without this the delay silently keeps whatever
+// tempo was current the last time a delay knob moved (the bug this rebuild
+// fixes). Cheap by design — pure arithmetic, no filter recompute.
+function dly_tick()
+(
+  _dly_len_from_tempo();
+);
+
+// ─── Cubic (4-point Hermite) interpolated read ────────────────────────────
+// Explicit wrapping rather than a power-of-two mask: DLY_BUF_MAX is 384000, and
+// growing it to 2^19 just to allow masking would cost ~2 MB per instance.
+function _dly_cread(buf, wpos, d)
+local(pos, i, f, im1, ip1, ip2, x0, x1, x2, x3, a0, a1, a2)
+(
+  d = max(2, min(DLY_BUF_MAX - 8, d));
+  pos = wpos - d;
+  pos < 0 ? pos += DLY_BUF_MAX;
+  i = pos | 0;
+  f = pos - i;
+  im1 = i - 1; im1 < 0 ? im1 += DLY_BUF_MAX;
+  ip1 = i + 1; ip1 >= DLY_BUF_MAX ? ip1 -= DLY_BUF_MAX;
+  ip2 = i + 2; ip2 >= DLY_BUF_MAX ? ip2 -= DLY_BUF_MAX;
+  x0 = buf[im1]; x1 = buf[i]; x2 = buf[ip1]; x3 = buf[ip2];
+  a0 = x3 - x2 - x0 + x1;
+  a1 = x0 - x1 - a0;
+  a2 = x2 - x0;
+  ((a0 * f + a1) * f + a2) * f + x1;
 );
 
 // ─── Process one sample ──────────────────────────────────────────────────
 // inL/inR = send bus input (accumulated from per-pad sends).
 // After call, dly_outL / dly_outR = wet delay output.
 function dly_process(inL, inR)
-local(rpos, tapL, tapR, fbL, fbR)
+local(tapL, tapR, fbL, fbR, t)
 (
   dly_len > 0 ? (
-    // Read from circular buffer
-    rpos = dly_wpos - dly_len;
-    rpos < 0 ? rpos += DLY_BUF_MAX;
-    tapL = dly_bufL[rpos];
-    tapR = dly_bufR[rpos];
+    // Snap on the first sample after init/kit load so nothing ramps in audibly.
+    dly_snap ? ( dly_len_s = dly_len; dly_fb_s = dly_fb; dly_snap = 0; );
 
-    // Feedback path with filtering (clamp to prevent runaway from corrupt state)
-    fbL = tapL * min(0.95, dly_fb);
-    fbR = tapR * min(0.95, dly_fb);
+    // Glide the length (tape-slide) and the feedback amount.
+    dly_len_s = dly_len_s * dly_sm_c + dly_len * (1 - dly_sm_c);
+    dly_fb_s  = dly_fb_s  * dly_sm_c + min(0.95, dly_fb) * (1 - dly_sm_c);
 
-    // Feedback HPF (remove rumble)
-    dly_hpf_hz > 25 ? (
-      dly_fb_hpf_stL = dly_fb_hpf_a * dly_fb_hpf_stL + (1.0 - dly_fb_hpf_a) * fbL;
-      dly_fb_hpf_stR = dly_fb_hpf_a * dly_fb_hpf_stR + (1.0 - dly_fb_hpf_a) * fbR;
-      fbL -= dly_fb_hpf_stL;
-      fbR -= dly_fb_hpf_stR;
+    tapL = _dly_cread(dly_bufL, dly_wpos, dly_len_s);
+    tapR = _dly_cread(dly_bufR, dly_wpos, dly_len_s);
+
+    fbL = tapL * dly_fb_s;
+    fbR = tapR * dly_fb_s;
+
+    // Feedback HPF (remove rumble) — RBJ biquad, direct form 1.
+    dly_hp_on ? (
+      t = dly_hp_a0 * (fbL + DLY_DENORM) + dly_hp_a1 * dly_hp_x1L + dly_hp_a2 * dly_hp_x2L
+          - dly_hp_b1 * dly_hp_y1L - dly_hp_b2 * dly_hp_y2L;
+      dly_hp_x2L = dly_hp_x1L; dly_hp_x1L = fbL;
+      dly_hp_y2L = dly_hp_y1L; dly_hp_y1L = t; fbL = t;
+      t = dly_hp_a0 * (fbR + DLY_DENORM) + dly_hp_a1 * dly_hp_x1R + dly_hp_a2 * dly_hp_x2R
+          - dly_hp_b1 * dly_hp_y1R - dly_hp_b2 * dly_hp_y2R;
+      dly_hp_x2R = dly_hp_x1R; dly_hp_x1R = fbR;
+      dly_hp_y2R = dly_hp_y1R; dly_hp_y1R = t; fbR = t;
     );
 
-    // Feedback LPF (darken repeats)
-    dly_lpf_hz < 19500 ? (
-      dly_fb_lpf_stL = dly_fb_lpf_a * dly_fb_lpf_stL + (1.0 - dly_fb_lpf_a) * fbL;
-      dly_fb_lpf_stR = dly_fb_lpf_a * dly_fb_lpf_stR + (1.0 - dly_fb_lpf_a) * fbR;
-      fbL = dly_fb_lpf_stL;
-      fbR = dly_fb_lpf_stR;
+    // Feedback LPF (darken repeats) — RBJ biquad.
+    dly_lp_on ? (
+      t = dly_lp_a0 * (fbL + DLY_DENORM) + dly_lp_a1 * dly_lp_x1L + dly_lp_a2 * dly_lp_x2L
+          - dly_lp_b1 * dly_lp_y1L - dly_lp_b2 * dly_lp_y2L;
+      dly_lp_x2L = dly_lp_x1L; dly_lp_x1L = fbL;
+      dly_lp_y2L = dly_lp_y1L; dly_lp_y1L = t; fbL = t;
+      t = dly_lp_a0 * (fbR + DLY_DENORM) + dly_lp_a1 * dly_lp_x1R + dly_lp_a2 * dly_lp_x2R
+          - dly_lp_b1 * dly_lp_y1R - dly_lp_b2 * dly_lp_y2R;
+      dly_lp_x2R = dly_lp_x1R; dly_lp_x1R = fbR;
+      dly_lp_y2R = dly_lp_y1R; dly_lp_y1R = t; fbR = t;
     );
 
-    // Write to buffer: input + filtered feedback
-    // Ping-pong: cross-feed L→R, R→L in feedback
+    // Write to buffer: input + filtered feedback.
+    // Ping-pong: cross-feed L→R, R→L in feedback.
     dly_ping ? (
-      dly_bufL[dly_wpos] = inL + fbR;  // R feedback feeds L
-      dly_bufR[dly_wpos] = inR + fbL;  // L feedback feeds R
+      dly_bufL[dly_wpos] = inL + fbR;
+      dly_bufR[dly_wpos] = inR + fbL;
     ) : (
       dly_bufL[dly_wpos] = inL + fbL;
       dly_bufR[dly_wpos] = inR + fbR;

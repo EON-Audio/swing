@@ -43,13 +43,14 @@ local(_sv_x, _sv_y, _sv_w, _sv_h, _sv_p, _sv_eng, _sv_fam, _sv_typ, _sv_cnt,
       _sv_tc, _sv_i, _sv_r, _sv_c, _sv_cx, _sv_cy, _sv_cell, _sv_gap, _sv_gx,
       _sv_gy, _sv_hit, _sv_on, _sv_px, _sv_pw, _sv_kx, _sv_ky, _sv_kr, _sv_km,
       _sv_ov, _sv_nv, _sv_lx, _sv_tx, tw, th, _sv_inside, _sv_ex, _sv_row,
-      _sv_col, _sv_pn, _sv_d3y, _sv_d3h, _sv_mi)
+      _sv_col, _sv_pn, _sv_d3y, _sv_d3h, _sv_mi, _sv_hit_e, _sv_hit_a)
 global(big_view_id, syn_view_pad, mx, my, lmb_down, rmb_down, LMB, RMB,
        frame_wheel, _ov_lmb_down, _ov_rmb_down, _ov_LMB, _ov_RMB, _ov_wheel,
        grid_x, grid_y, grid_w, grid_h, gfx_w, gfx_h, gfx_x, gfx_y,
        NUM_PADS, KS, km_syn, KM_SYN_PER_PAD,
        ps_enable, ps_engine, ps_level, ps_vel_lo, ps_vel_hi,
        p_note, p_held, p_held_vel, p_held_note, gui_held_pad, sel_pad,
+       sv_d3_hit_t, sv_d3_hit_v, SV_D3_HIT_SEC, SV_D3_LIT_SEC,
        _syn_ecr, _syn_ecg, _syn_ecb,
        #_syn_en, #_syn_ml, #_syn_val)
 (
@@ -89,6 +90,29 @@ global(big_view_id, syn_view_pad, mx, my, lmb_down, rmb_down, LMB, RMB,
   gfx_x = _sv_x + 62; gfx_y = _sv_y + 6;
   sprintf(#_syn_val, "PAD %d  %s  T%d", _sv_p + 1, #_syn_en, _sv_typ + 1);
   gfx_drawstr(#_syn_val);
+
+  // ── PAD EDIT: the pad's STRIP — EQ, filters, comp, drive, sends ──────────
+  // On a synth-only pad the grid's right-click lands HERE instead of the pad
+  // editor, and the pad editor was the only thing that ever opened it, so
+  // without this button the strip is unreachable on an all-synth kit. Which
+  // is most of them, and exactly the pads five of the eight factory macros
+  // drive.
+  //
+  // In the HEADER, right-aligned beside the close X, NOT appended to the
+  // INIT/RAND/CLEAR row. That row is laid out from _sv_ex, which tracks the
+  // pad-grid width, so its right edge moves with the window: grid_w is
+  // 0.62*gfx_w - 8, and a fifth button there needs 274 px of row where the
+  // default 780-wide window only affords ~285 and a narrow one far less —
+  // CLEAR itself already runs off the panel below ~grid_w 350. The header has
+  // room at any usable size: the info text ends around _sv_x + 202 and this
+  // sits at _sv_w - 84.
+  // ⚠️ NOT "PAD FX": the left panel already has a button by that name, and it
+  // opens something else entirely -- the ReaImGui per-pad INSERT-FX rack, via
+  // bridge CMD 71 (panels_controls:1309). This one opens the pad EDITOR, which
+  // owns the built-in EQ / filters / comp / sends. Two buttons, one name, two
+  // destinations was worse than the gap it fixed.
+  swing_synthview_btn(_sv_x + _sv_w - 84, _sv_y + 4, 56, 18, "PAD EDIT") ?
+    swing_padfx_open(_sv_p);
 
   // Close X
   _sv_cx = _sv_x + _sv_w - 20; _sv_cy = _sv_y + 3;
@@ -166,7 +190,6 @@ global(big_view_id, syn_view_pad, mx, my, lmb_down, rmb_down, LMB, RMB,
     _syn_autoname(_sv_p);
     mark_dirty_pad(_sv_p);
   );
-
   // ── Family pill row (9) ──
   _sv_pw = ((_sv_x + _sv_w - 10 - _sv_ex) / 9)|0;
   _sv_i = 0;
@@ -287,6 +310,49 @@ global(big_view_id, syn_view_pad, mx, my, lmb_down, rmb_down, LMB, RMB,
     swing_drum3d_orbit(_sv_x + 10, _sv_d3y, _sv_w - 20, _sv_d3h, mx, my, LMB);
     rmb_down && mx >= _sv_x + 10 && mx <= _sv_x + _sv_w - 10 &&
       my >= _sv_d3y && my <= _sv_d3y + _sv_d3h ? swing_drum3d_reset();
+    // ── Hit the drum: audition this pad's ENGINE ALONE ──────────────────
+    // launch_syn_for_pad, NOT launch_voices_for_pad: you are looking at the
+    // synth editor, so a sample layer on top is exactly what you don't want
+    // to hear. The pad strip above still auditions the whole pad.
+    // Gated on ps_enable — the shell is drawn dim when the synth is off, and
+    // a dim drum that makes a sample noise would be lying about what it is.
+    //
+    // Fires on the PRESS edge, so the gesture that starts an orbit-drag also
+    // gives you one hit. That is what hitting a drum does.
+    //
+    // ⚠️ Deliberately does NOT set p_held / gui_held_pad the way the pad strip
+    // does. p_held drives note-repeat in @block, and that path calls the FULL
+    // launch_voices_for_pad — a held repeat would smuggle the sample layer
+    // back into a "synth only" audition. A timestamped strike animation
+    // replaces the held-state one.
+    lmb_down && ps_enable[_sv_p] > 0.5 &&
+      mx >= _sv_x + 10 && mx <= _sv_x + _sv_w - 10 &&
+      my >= _sv_d3y && my <= _sv_d3y + _sv_d3h ? (
+      launch_syn_for_pad(_sv_p, p_note[_sv_p], 110, 1);
+      sv_d3_hit_t = time_precise(); sv_d3_hit_v = 110 / 127;
+    );
+    // ── strike envelope ──────────────────────────────────────────────────
+    // A TIMESTAMP, not a per-frame decay. Three reasons, all of which bit the
+    // first version (a *= 0.80 tick reading ~17 frames):
+    //   1. frame-counted animation runs at whatever rate the FX window
+    //      redraws — the same strike lasted 0.28 s at 60 fps and 0.85 s at
+    //      20 fps, and stretched further under load;
+    //   2. the tick only ran while this view was open and the drum area was
+    //      tall enough, so closing the view mid-decay FROZE the value and
+    //      reopening showed a stale squashed, lit drum;
+    //   3. nothing to reset — elapsed time is already large next time.
+    // ⭐ `lit` is a hard boolean in the renderer: it REPLACES the batter head
+    // colour with teal (drum3d:717), so it cannot ease out the way the squash
+    // does. Its window is therefore much shorter than the squash's — long
+    // enough to read as a flash at ~30 fps, short enough not to look held.
+    // That mismatch, not the squash, is what made a hit "hold".
+    // Positive form, not a clamp: an out-of-range or NaN elapsed must fail
+    // BOTH tests and leave the drum at rest. A clamp would map a negative
+    // elapsed (clock skew, a reloaded @init) onto "0 seconds ago" and pin the
+    // head lit forever — the failure this idiom exists to prevent.
+    _sv_hit_e = time_precise() - sv_d3_hit_t;
+    _sv_hit_a = _sv_hit_e >= 0 && _sv_hit_e < SV_D3_HIT_SEC ?
+                1 - _sv_hit_e / SV_D3_HIT_SEC : 0;
     // Accent fetched here and passed in: rk_swing_ui_drum3d imports before
     // rk_swing_ui_overlay_syn, so it cannot call _syn_engine_col itself.
     _syn_engine_col(_sv_fam, 1.0);
@@ -295,10 +361,13 @@ global(big_view_id, syn_view_pad, mx, my, lmb_down, rmb_down, LMB, RMB,
     // rk_swing_ui_overlay_syn, which imports after rk_swing_ui_drum3d.
     _sv_mi = swing_drum3d_morph_macro(_sv_fam);
     swing_drum3d_draw(_sv_x + 10, _sv_d3y, _sv_w - 20, _sv_d3h, _sv_fam,
-                      p_held[_sv_p] > 0.5, _sv_on ? 1 : 0.42,
+                      p_held[_sv_p] > 0.5 ||
+                        (_sv_hit_e >= 0 && _sv_hit_e < SV_D3_LIT_SEC),
+                      _sv_on ? 1 : 0.42,
                       _syn_ecr, _syn_ecg, _syn_ecb,
                       _sv_mi >= 0 ? _syn_mac_get(_sv_p, _sv_mi) : 0,
-                      p_held[_sv_p] > 0.5 ? p_held_vel[_sv_p] / 127 : 0);
+                      p_held[_sv_p] > 0.5 ? p_held_vel[_sv_p] / 127
+                                         : _sv_hit_a * sv_d3_hit_v);
   );
 
   // ── Hint ──

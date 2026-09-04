@@ -1,0 +1,2467 @@
+desc:EON Anvil FET Limiting Amplifier
+//tags: EON ReaKit dynamics compressor FET drums
+options:gfx_hz=60 gfx_idle no_meter
+// EON Studios — EON Anvil, development port.
+//
+// Circuit-solved FET limiter: O-12-class input iron, solved
+// JFET shunt cell, preamp residual, feedback sidechain with biased full-wave
+// diode detector fed by the real Rev D ratio ladders into the timing network
+// as drawn (attack pot with its speed-up branch, release pot with its
+// parallel resistor, anode self-bias), Class A output stage
+// into a DC-magnetised core. Every constant comes from anvil_fitted.jsfx-inc,
+// generated from the calibrated reference model (.dev_anvil/, fitted against
+// published vintage-unit measurements). The reference implementation is
+// fet_cell.py / sidechain.py / input_xfmr.py / output_stage.py — this file
+// must track those, never lead them.
+//
+// Discipline:
+//   * The audio section contains NO transcendentals: the cell is a 2-D
+//     table, the diode a 2-D table (voltage x series-R, so timing changes
+//     never rebuild), tanh a 1-D table; both cores are rational (divide
+//     only).
+//   * All tables are built in @init from closed forms — nothing shipped.
+//   * @init verifies its tables against ground-truth nodes computed by the
+//     Python reference (embedded in the generated inc). A port that drifts
+//     shows a red corner LED instead of drifting silently.
+//   * Zero latency AT THE NATIVE RATE: the cell is memoryless and the
+//     sidechain's one-sample delay sits in the control path. No PDC.
+//     ⚠️The 2x path is EXPERIMENTAL and locked out. ⭐The two figures that
+//     used to sit here were BOTH optimistic: measured, the shipped decimator
+//     is -13.3 dB at 20 kHz (not -18) and passes 30 kHz at -3.6 dB (not
+//     -6.7), i.e. 3 dB worse than recorded. The coefficients were never the
+//     problem — two STRUCTURAL bugs were, and with those repaired the round
+//     trip goes from -23.89 dB at 97 Hz / -10.83 dB at 20 kHz to 0.000 dB
+//     flat, stopband -0.08 -> -107.8 dB.
+//     ⭐⭐AND OVERSAMPLING IS PROBABLY THE WRONG FIX ANYWAY: the alias is
+//     CONTROL PATH, not audio path. Deleting the entire output stage moves
+//     the 11 kHz alias 5.1650% -> 5.1602% — it is rectifier ripple order 4
+//     folding to 99.6 Hz. It is also an attack-speed artefact: attack 7 gives
+//     -29.0 dB sidebands, attack 3 gives -44.7 dB. So a full audio-path 2x
+//     costs >2x CPU and ~4 host samples of dispersive PDC to buy 9.8 dB that
+//     a DETECTOR-ONLY oversample would buy at zero PDC, the control path
+//     carrying no latency. That decision is open; ANV_OS_ALLOW stays 0.
+//
+// GUI: 500-series vertical module. One @gfx serves both worlds — the ratio
+// is the MCP embed aspect (Drum Strip pairing) and the floating window is
+// the same module with a solved gap stretch. The Voice IS the skin: BLACK =
+// blackface panel, BLUE = the silverface with the blue stripe.
+//
+// WHAT BLUE ACTUALLY IS, stated exactly, because this header has carried the
+// wrong answer before: BLUE is the Rev A AUDIO BRANCH as far as it is solved
+// from p48 — its JFET preamp (Q2), its JFET line-amp input (Q4), and a
+// GROUNDED Q1 source. BLACK's Rev D cell DRIVES that source through the
+// C28/R18/R84 network, carried by ANV_GAMMA, so the voices are built on TWO
+// SEPARATE CELL SURFACES (ANV_CELLK / ANV_CELLB) and differ AT THE GAIN CELL,
+// not merely downstream of it.
+// ⛔The older claim that the cell is SHARED between the voices and that
+// src_gamma is unsolved is FALSE as of the 2026-08-23 fit (ANV_GAMMA =
+// 0.0292, 2.89% separation at the node). If that claim survives anywhere
+// else in this tree, it is stale — the self-test's independent BLUE cell
+// nodes (ANV_VB0_G..ANV_VB4_G) exist precisely because the surfaces differ.
+// ⚠️BLUE is still NOT a complete Rev A: revision-specific Q bias, the
+// remaining input-stage and preamp values, and the whole sidechain
+// calibration are still Rev D's. It is an honest PARTIAL revision and must
+// not be called a modelled Rev A until those carry their own fitted
+// constants.
+//
+// STANDALONE BY DESIGN. Anvil is a general-purpose FET limiter, not a Swing
+// component: no gmem, no bridge calls, no companion script, plain stereo
+// pins. It loads on any track in any project whether or not Swing is
+// installed — vocals, bass, guitars, room mics, the lot. Swing is where it
+// LIVES, not what it needs. Its only imports are two shared ReaKit GUI libs
+// plus its own generated constants, so those three files are the whole
+// dependency set. Any future Swing integration (auto-insert, link deck,
+// theme-follow) must stay strictly ADDITIVE — it can never become required.
+//
+// Dev status: lives beside Swing for testing; NOT in any manifest (does
+// not ship — see JSFX_EXCLUDE in gen_manifest.py), not wired to Swing. The
+// rename landmine (the bus comp went EON Weld -> EON Weld 2026-08-24) is a separate
+// step.
+
+slider1:anv_sl_in=0<-30,24,0.1>-Input drive (dB)
+slider2:anv_sl_out=0<-24,24,0.1>-Output (dB)
+slider3:anv_sl_atk=3<1,7,0.01>-Attack (1=slow, 7=fast)
+slider4:anv_sl_rel=5<1,7,0.01>-Release (1=slow, 7=fast)
+slider5:anv_sl_ratio=3<0,4,1{20:1,12:1,8:1,4:1,ALL}>-Ratio
+slider6:anv_sl_mix=1<0,1,0.01>-Mix
+slider7:anv_sl_voice=0<0,1,1{Black,Blue}>-Voice
+slider8:anv_sl_byp=0<0,1,1{Active,Bypass}>-Bypass
+slider9:anv_sl_os=0<0,1,1{Off,2x (locked out)}>-Oversample
+slider10:anv_sl_schp=0<0,500,5>-SC HP (Hz; below 20 = off)
+slider11:anv_sl_iron=1<0,1,0.01>-Iron
+slider12:anv_sl_link=1<0,1,1{Dual mono,Stereo link}>-Detector
+slider13:anv_sl_face=0<0,19,1>-Meter Face
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import libs/knobs_kbsg.jsfx-inc
+import libs/rk_vu.jsfx-inc
+import libs/anvil_fitted.jsfx-inc
+
+@init
+ext_noinit = 0;
+gfx_ext_retina == 0 ? gfx_ext_retina = 1;
+// Embed support — 0x100 MUST be set in @init (REAPER 7.45+); 0x400 kills
+// REAPER's hover tooltip over the MCP embed (house standard, all embeds).
+gfx_ext_flags |= 0x100 | 0x400;
+
+// ── functions (definition order matters: EEL2 resolves at definition time) ──
+
+// Stable positive root of a*x^2 + b*x + c = 0. b >= 1 here; the c/q branch
+// stays finite as a -> 0 (ln_k near 0.5), where the schoolbook form cancels.
+function anv_qroot(qa, qb, qc)
+  local(disc, q) (
+  disc = qb*qb - 4*qa*qc;
+  disc < 0 ? disc = 0;
+  q = -0.5*(qb + sqrt(disc));
+  abs(qa) < 0.0000000001 ? ( -qc/qb ) : ( abs(q) < 0.000000000001 ? 0 : qc/q );
+);
+
+// Solve the FET divider for the signal-node voltage. Mirrors
+// fet_cell.solve_v_ds_closed exactly, INCLUDING the analytic region
+// boundary — inspecting the triode root instead was a real bug once.
+// Takes the DC overdrive a (V) rather than the gate voltage: the caller has
+// already applied the subthreshold tail, once per gate row.
+// gam = src_gamma, the fraction of the drain swing fed back to the SOURCE.
+// Rev D does that: p52 couples Q1's source through C28 50uF to the midpoint of
+// the R18/R84 180/180 pair in Q2's emitter leg. Rev A p48 has no such network
+// -- its source is a bare wire to ground -- so BLUE passes 0 and that is the
+// one real cell-level difference between the revisions.
+// ⚠️ The two branches scale DIFFERENTLY and it is not a typo: triode carries
+// the (1-gam) channel scaling, saturation does NOT, because the saturation
+// current depends only on the overdrive -- though saturation still carries gam
+// through peff on the POSITIVE half; it is only the negative half that is
+// gam-free. They meet continuously at the boundary in BOTH polarities and for
+// any gam, where V_DS == overdrive collapses the triode law to beta*V_ov^2;
+// verified numerically, value jump at the 1e-13 finite-difference floor and
+// du/dw equal across the boundary to 5 decimals (the branches are C1, not C0).
+// At gam = 0 both reduce to the previous single-constant form exactly.
+function anv_cell_solve(vin, a, k, gam)
+  local(sgn, w, m, peff, slope, ub, wb, u, rbe, g1) (
+  a <= 0 ? vin : (
+    sgn = vin < 0 ? -1 : 1;
+    w = abs(vin);
+    g1  = 1 - gam;
+    rbe = ANV_RB*g1;
+    m = (2*k - gam - 1)*sgn;
+    // the overdrive slope flips with polarity because the swap changes WHICH
+    // terminal the gate is measured against -- source (k - gam) on the positive
+    // half, drain (1 - k) on the negative. That asymmetry is the even-harmonic
+    // source, and driving the source deepens it.
+    peff = sgn >= 0 ? k - gam : 1 - k;
+    slope = g1 - peff;
+    slope < 0.000000000001 ? slope = 0.000000000001;
+    ub = a/slope;
+    wb = ub + ANV_RB*g1*g1*ub*ub;
+    w <= wb ? (
+      u = anv_qroot(rbe*m, 2*rbe*a + 1, -w);
+    ) : (
+      // ⚠️⚠️THE SATURATION BRANCH IS GAMMA-BLIND ON THE NEGATIVE HALF, and
+      // that is CORRECT PHYSICS, not a hole. gam sets the potential of ONE
+      // terminal; on the negative half that terminal is the DRAIN (the signal
+      // node is the lower one, so IT is the source), and saturation is by
+      // definition the state where the drain end has pinched off and stopped
+      // setting the current. Derived independently from the SYMMETRIC square
+      // law I = beta*[f(ov_at_drain) - f(ov_at_source)], f(x) = max(x,0)^2,
+      // which carries no swap logic and no region test: on vin < 0 the drain
+      // term is f(a - (k-gam)*u), and that is exactly the term which clamps to
+      // zero past ub = a/(k-gam). The POSITIVE half keeps gam via peff = k-gam.
+      // MEASURED (.dev_anvil/probe_gamma_sat.py): separation exactly 0.0 on
+      // 11,288 of 131,841 points (8.56%), vin < 0 only, gate rows ig 0..48 =
+      // BLACK GR 0.0031 .. 5.3446 dB (ig 49 = 5.9315 dB; BLUE reads the same
+      // rows as 0.0032 .. 5.4637). The set predicted by |vin| > wb matches the
+      // measured set with symmetric difference ZERO both ways, and a 60-digit
+      // solve gives d|u|/d(gam) = 0 to 60 digits there -- against 5.1e-2 on the
+      // positive half, so the test has power.
+      // ⛔DO NOT "FIX" THIS. Putting (1-gam) on the saturation current, or gam
+      // into peff on the negative half, breaks the branches apart: the node
+      // solve goes MULTI-VALUED over a window of width ~R5*dI and du/dw spikes
+      // from 0.6 to 48-136, i.e. a hard corner in the transfer curve. Both
+      // variants also move the WHOLE scorecard, because solve_q_bias drives
+      // 8 mV at the resting gate where wb(neg) is only 6.09 mV -- 22.4% of the
+      // CALIBRATION waveform lives in this region even though audio never does.
+      // ⭐WHAT THE OLD NOTE HAD BACKWARDS: the blind region is NOT the reason
+      // the cell matters little at low GR, and "not at all" is simply false.
+      // Settled audio never REACHES this region -- at 2/4/6/10 dB GR the node
+      // peaks at 0.78/1.15/1.61/2.96 mV against a boundary of
+      // 14.9/42.3/91.3/317.6 mV, and the gap WIDENS with depth (0 blind
+      // samples of 8192, every time). The cell DOES separate the voices at low
+      // GR: at 2 dB, same gate, BLACK's H2 sits +10.04 dB over BLUE's, matching
+      // the +10.19 dB that the polarity asymmetry 20*log10((1-2k+gam)/(1-2k))
+      // predicts. It is simply the SMALLEST of the three voice-differing
+      // stages. Level-matched BLACK-vs-BLUE residual at the settled 2 dB GR
+      // operating point: cell -70.5 dB, ANV_PSHK/B -50.9 dB, ANV_Q4K/B -50.5 dB
+      // at 0.05 V rising to -30.4 dB at 0.5 V; raw level split 0.05 dB at the
+      // cell against 1.30 dB at the shaper. So the old ADVICE stands -- judge
+      // BLUE at depth or you are judging the shapers -- but for that reason,
+      // not because the cell goes blind.
+      // Only a hot leading-NEGATIVE transient on the SLOW attack enters the
+      // region at all: 11/18/23 samples (0.12/0.19/0.24 ms) at +12/+18/+24
+      // dBFS; a burst starting positive never does.
+      // Above the region, separation |g_black - g_blue|/|g_black| runs
+      // min 1.8e-10, mean 2.63e-02 -- the old line's numbers, units now stated.
+      u = anv_qroot(ANV_RB*peff*peff, 2*ANV_RB*a*peff + 1, ANV_RB*a*a - w);
+    );
+    u < 0 ? u = 0;
+    u > w ? u = w;
+    sgn*u;
+  );
+);
+
+// Preamp shaper tables, both filled at @init and weighted by anv_vxf.
+//
+// BLACK reproduces the biased tanh the stage used to evaluate inline, to the
+// same constants, so switching to a table changes that voice by less than
+// 1e-8 V. Its small-signal slope is sech^2(PBIAS/PSAT) ~ 0.857, i.e. the Rev D
+// residual has always carried ~1.34 dB of loss and the fit is calibrated
+// around it — do NOT "fix" that here.
+//
+// BLUE is the Rev A stage solved: square law with the source degeneration C3
+// leaves in band (R12 1K; C3 shorts R11 at audio but sets the DC point through
+// all 11k). Normalised to unit slope, then driven +1.8 dB by ANV_A_DRIVE —
+// the remainder of the revision guide's "~5 dB more overall gain" after the
+// drawn 1.9 dB (line amp) and the ~1.3 dB the normalisation already carries.
+// ⭐Pre-tap ON PURPOSE: inside the loop this is CHARACTER — BLUE's threshold
+// lands ~2 dB earlier, GR runs deeper at the same Input, the preamp makes
+// more hair — where post-tap it would only be loudness. ⚠️BLUE's output does
+// rise a little at matched settings (the loop compresses part of it back);
+// that is stated, not secretly compensated — the hardware revisions differ in
+// level too. GUIDE-derived, not schematic: tagged so in the exporter, and
+// applied 2026-08-24 by owner decision after the voices judged too close.
+//
+//   I = 2*b*a0^2 / (s + 1 + sqrt(2s+1)),   s = 2*a0*b*Rs
+//
+// the conjugate form of the square-law-with-degeneration root. The textbook
+// form loses catastrophically to cancellation as s -> 0; the Python reference
+// self-test caught that (8e8 relative error) before it reached here.
+function anv_build_shapers()
+  local(j, x, dx, u, e, t0, a0, sd, id) (
+  dx = 2*ANV_VMAX/(ANV_PSH_N - 1);
+  t0 = 0;
+  ANV_PSAT > 0 ? (
+    u = ANV_PBIAS*ANV_IPSAT;
+    u > 20 ? u = 20 : ( u < -20 ? u = -20 );
+    e = exp(2*u);
+    t0 = 1 - 2/(e + 1);
+  );
+  j = 0;
+  loop(ANV_PSH_N,
+    x = -ANV_VMAX + j*dx;
+    ANV_PSAT > 0 ? (
+      u = (x*ANV_PREG + ANV_PBIAS)*ANV_IPSAT;
+      u > 20 ? u = 20 : ( u < -20 ? u = -20 );
+      e = exp(2*u);
+      ANV_PSHK[j] = ANV_PSAT*((1 - 2/(e + 1)) - t0)*ANV_IPREG;
+    ) : (
+      ANV_PSHK[j] = x;                  // stage disabled = identity, no branch in @sample
+    );
+    a0 = x - ANV_A_VSDC + ANV_A_IQ*ANV_A_RSAC - ANV_A_VTH;
+    a0 < 0 ? a0 = 0;                    // below cutoff the channel is off
+    sd = 2*a0*ANV_A_BETA*ANV_A_RSAC;
+    id = 2*ANV_A_BETA*a0*a0/(sd + 1 + sqrt(2*sd + 1));
+    ANV_PSHB[j] = (id - ANV_A_IQ)*ANV_A_NORM*ANV_A_DRIVE;
+    j += 1;
+  );
+
+  // Q4. Same square law, its own network: only R28 560 degenerates the signal
+  // (C9 shorts R27 12K at audio) against the preamp's 1K, so it curves harder.
+  // Solved at Q4's OWN level — the line amp's closed loop divides the signal
+  // down to the gate and multiplies it back — so the stage's gain is unchanged
+  // and only its curvature is added.
+  dx = 2*ANV_Q4_VMAX/(ANV_Q4_N - 1);
+  j = 0;
+  loop(ANV_Q4_N,
+    x = -ANV_Q4_VMAX + j*dx;
+    ANV_Q4K[j] = x;                     // BLACK: identity, the fitted amp owns it
+    a0 = x/ANV_A_GLINE - ANV_Q4_VSDC + ANV_Q4_IQ*ANV_Q4_RSAC - ANV_Q4_VTH;
+    a0 < 0 ? a0 = 0;
+    sd = 2*a0*ANV_Q4_BETA*ANV_Q4_RSAC;
+    id = 2*ANV_Q4_BETA*a0*a0/(sd + 1 + sqrt(2*sd + 1));
+    ANV_Q4B[j] = (id - ANV_Q4_IQ)*ANV_Q4_NORM*ANV_A_GLINE;
+    j += 1;
+  );
+);
+
+// Preamp residual lookup on the ACTIVE shaper. Linear interpolation over the
+// same +-ANV_VMAX range the cell's drain axis uses, so there is one range to
+// reason about. 2049 points measured: worst interpolation error 8e-9 V against
+// a signal that lives at 8 mV, and a 1 kHz tone reproduces the exact THD to
+// four decimals.
+// Line-amp input curve on the ACTIVE table.
+//
+// ⚠️ This one sits on the MAIN signal path, where the input reaches several
+// volts, so it must NOT clamp the way the preamp shaper does — a clamp here
+// would brick-wall the audio. Past either edge it continues with the edge
+// segment's slope: exact for BLACK (a straight line stays straight) and
+// correctly FLAT past BLUE's cutoff, where the JFET is off and the last
+// segment's slope is already zero.
+function anv_lamp(x, base)
+  local(u, j, tu, e) (
+  u = (x + ANV_Q4_VMAX)*ANV_IQ4DX;
+  u < 0 ? (
+    e = base[1] - base[0];
+    base[0] + u*e;
+  ) : ( u > ANV_Q4_N - 1.0001 ? (
+    e = base[ANV_Q4_N - 1] - base[ANV_Q4_N - 2];
+    base[ANV_Q4_N - 1] + (u - (ANV_Q4_N - 1))*e;
+  ) : (
+    j = u|0; tu = u - j;
+    base[j] + (base[j + 1] - base[j])*tu;
+  ));
+);
+
+function anv_pshp(x, base)
+  local(u, j, tu) (
+  u = (x + ANV_VMAX)*ANV_IPSHDX;
+  u < 0 ? u = 0 : ( u > ANV_PSH_N - 1.0001 ? u = ANV_PSH_N - 1.0001 );
+  j = u|0; tu = u - j;
+  base[j] + (base[j + 1] - base[j])*tu;
+);
+
+// Fill the cell surface + the GR-per-gate row for the meter, for LN factor k
+// and source-drive fraction gam. Called once per voice at @init. Both voices
+// pass the same k (both revisions carry the 50/50 gate divider) but DIFFERENT
+// gam — BLACK drives the source (ANV_GAMMA), BLUE grounds it (0) — so the
+// voices differ AT THE CELL as of the 2026-08-23 fit, 2.89% at the separation
+// node. An older comment here said "the voices differ downstream, not here";
+// that was true before src_gamma was fitted and is false now.
+function anv_build_cell(base, k, gam)
+  local(dv, dg, ig, iv, vg, a, ss, row, vin) (
+  dv = 2*ANV_VMAX/(ANV_NV - 1);
+  dg = (ANV_GMAX - ANV_GMIN)/(ANV_NG - 1);
+  ig = 0;
+  loop(ANV_NG,
+    vg = ANV_GMIN + ig*dg;
+    a = vg - ANV_VTH;
+    // Subthreshold tail: softplus of the overdrive with slope ANV_SUBVT --
+    // square law above pinch-off, exponential below, no edge. A real JFET
+    // has no edge, and this architecture biases its FET exactly where that
+// matters.
+    // Once per ROW, so the log/exp never reach @sample. ANV_SUBVT = 0 keeps
+    // the old hard cutoff. Mirrors FetCell.overdrive() in the reference.
+    ANV_SUBVT > 0 ? a = ANV_SUBVT*log(1 + exp(min(a/ANV_SUBVT, 60)));
+    ss = a > 0 ? 1/(1 + 2*ANV_RB*(1 - gam)*a) : 1;   // rb_eff, gamma-scaled
+    row = base + ig*ANV_NV;
+    iv = 0;
+    loop(ANV_NV,
+      vin = -ANV_VMAX + iv*dv;
+      row[iv] = abs(vin) < 0.0000001 ? ss : anv_cell_solve(vin, a, k, gam)/vin;
+      iv += 1;
+    );
+    ig += 1;
+  );
+);
+
+// tanh + diode tables. The diode axis pair is (voltage, series R) so the
+// attack knob and ratio buttons pick an R coordinate at runtime — no table
+// ever rebuilds on a knob.
+function anv_build_static()
+  local(j, u, e, ir, iv, r, v, lo, hi, mid, f, dvv, drr, base) (
+  j = 0;
+  loop(ANV_TANH_N,
+    u = j*ANV_TANH_UMAX/(ANV_TANH_N - 1);
+    e = exp(2*u);
+    ANV_TANH[j] = 1 - 2/(e + 1);
+    j += 1;
+  );
+  dvv = ANV_DIO_VMAX/(ANV_DIO_NV - 1);
+  drr = log(ANV_DIO_RHI/ANV_DIO_RLO)/(ANV_DIO_NR - 1);   // log-spaced R rows
+  ir = 0;
+  loop(ANV_DIO_NR,
+    r = ANV_DIO_RLO*exp(ir*drr);
+    base = ANV_DIO + ir*ANV_DIO_NV;
+    base[0] = 0;
+    iv = 1;
+    loop(ANV_DIO_NV - 1,
+      v = iv*dvv;
+      lo = 0;
+      hi = v/r + 0.000000001;
+      loop(80,
+        mid = 0.5*(lo + hi);
+        f = ANV_NVT*log(mid/ANV_ISAT + 1) + mid*r - v;
+        f < 0 ? lo = mid : hi = mid;
+      );
+      base[iv] = 0.5*(lo + hi);
+      iv += 1;
+    );
+    ir += 1;
+  );
+);
+
+// ── audio-rate lookups: loads, lerps, divides — nothing transcendental ──
+
+function anv_cell_gp(v, vg, base)
+  local(fv, fg, ivv, igg, tv, tg, r0, r1, ga, gb) (
+  fv = (v + ANV_VMAX)*ANV_IDV;
+  fv < 0 ? fv = 0 : ( fv > ANV_NV - 1.0001 ? fv = ANV_NV - 1.0001 );
+  fg = (vg - ANV_GMIN)*ANV_IDG;
+  fg < 0 ? fg = 0 : ( fg > ANV_NG - 1.0001 ? fg = ANV_NG - 1.0001 );
+  ivv = fv|0; tv = fv - ivv;
+  igg = fg|0; tg = fg - igg;
+  r0 = base + igg*ANV_NV + ivv;
+  r1 = r0 + ANV_NV;
+  ga = r0[0] + (r0[1] - r0[0])*tv;
+  gb = r1[0] + (r1[1] - r1[0])*tv;
+  ga + (gb - ga)*tg;
+);
+
+// fr is the FRACTIONAL R-row index, computed once per recalc (the axis is
+// logarithmic, and the log must not run at audio rate).
+function anv_dio_i(v, fr)
+  local(fv, ivv, irr, tv, tr, p0, p1, ia, ib) (
+  v <= 0 ? ( anv_dio_g = 0; 0; ) : (
+    fv = v*ANV_IDDV;
+    fv > ANV_DIO_NV - 1.0001 ? fv = ANV_DIO_NV - 1.0001;
+    ivv = fv|0; tv = fv - ivv;
+    irr = fr|0; tr = fr - irr;
+    p0 = ANV_DIO + irr*ANV_DIO_NV + ivv;
+    p1 = p0 + ANV_DIO_NV;
+    ia = p0[0] + (p0[1] - p0[0])*tv;
+    ib = p1[0] + (p1[1] - p1[0])*tv;
+    // di/dv, from the SAME four entries already loaded -- costs one lerp and
+    // one multiply, and it is what lets the storage node be solved implicitly
+    // instead of stepped. See the update in anv_tick().
+    anv_dio_g = ((p0[1] - p0[0]) + ((p1[1] - p1[0]) - (p0[1] - p0[0]))*tr)*ANV_IDDV;
+    ia + (ib - ia)*tr;
+  );
+);
+
+function anv_th(x)
+  local(s, u, j, tu) (
+  s = x < 0 ? -1 : 1;
+  u = abs(x)*ANV_IDU;
+  u > ANV_TANH_N - 1.0001 ? u = ANV_TANH_N - 1.0001;
+  j = u|0; tu = u - j;
+  s*(ANV_TANH[j] + (ANV_TANH[j + 1] - ANV_TANH[j])*tu);
+);
+
+// Biased Class A transfer — asymmetric by construction, and that asymmetry is
+// the 2nd-harmonic source. Vout = F(Vdrive, Iprimary): the swing available to
+// the stage is NOT a constant. A Class A stage can source as much as the device
+// allows but can only SINK its standing current, so the swing collapses on one
+// side as the load draws and opens on the other — and the transformer IS the
+// load. That is how the core's state reaches the ACTIVE device instead of only
+// the terminal voltage, and it is the only term in the model that can make
+// distortion depend on FREQUENCY at a fixed level.
+// ⛔⛔READ THE VALUE BEFORE CITING THIS STAGE: the fit currently returns
+// ANV_AMPKI = 0, which restores the old single-input transfer EXACTLY -- the
+// coupling is present in the code and multiplied by zero. It is not evidence
+// of anything in the shipped build, and a THD-vs-frequency validation of it
+// would be validating a dead branch.
+// History: 10.78 (pregamma) -> 9.88 (preallin) -> 0, the collapse to the lower
+// bound arriving in the same refit that unlocked src_gamma.
+// ⛔⛔AND IT IS A REJECTED STAGE, not a bound to push outward. An earlier
+// version of THIS COMMENT claimed ~9.9 "put LF/HF at 10.3 against a measured
+// 10.297, EXACT, and 0 slips to 9.2", i.e. that the term works when the
+// landscape lets it. That was a FALSE ATTRIBUTION and it is retracted: those
+// two figures come from two different parameter sets in which fifteen other
+// values also moved. Isolated properly -- everything else frozen at preallin,
+// bisection levels held identical so the harness cannot jitter -- amp_ki moves
+// LF/HF 10.3120 (ki=0) to 10.3131 (ki=9.88). It accounts for 0.011% of that
+// number. The 10.3 -> 9.2 drop belongs to the other parameters in that refit.
+// Measured over a 200-cell grid (10 freqs x 4 levels x 5 ki, 31.5 Hz..16 kHz,
+// -10..+20 dBu, verified at 768 kHz with an independent coherent DFT):
+//   * at 9.88 it is INERT -- worst 2.7% anywhere on the stage grid, 0.011% to
+//     0.22% on every scored row.
+//   * where it HAS authority the shape is wrong in SIGN at both ends. At
+//     ki=400 / +16 dBu, 31.5 Hz gets CLEANER (8.39 -> 7.57 THD%) when it is
+//     the frequency with the most magnetising current, and 16 kHz moves 18%
+//     when a 1/f quantity cannot have that authority there. All the added
+//     dirt is a mid-band bump (125 Hz 0.57 -> 4.17) authored by the SATLO
+//     clamp below -- 35% of samples are clamped at 31.5 Hz and exactly 0%
+//     above 500 Hz -- not by load-current modulation.
+//   * i_p carries a frequency-independent DC term (its own rectification
+//     offset through r_eff), so AC/DC is 0.98 at 4 kHz and 0.25 at 16 kHz:
+//     above ~4 kHz the term degenerates into a static rescale of ANV_SATV.
+// ⭐KEEP THE CODE ANYWAY -- it is one multiply, and the load-aware form may
+// become correct once the DC-restoring path is solved (fit_global.py:145-151).
+// ⚠️And there is nothing to validate it AGAINST: the project holds no measured
+// THD-vs-frequency curve at all, only comp_1k 0.37 / comp_50 3.81 and a
+// shape-only burst pair. Any "THD vs f" claim here is internal consistency.
+// ⛔DO NOT "correct" the range figures: LF/HF 4.8x at 0 and 24.5x at 400
+// reproduce EXACTLY (4.81 / 24.53) on the fitted_params.precls.json basis they
+// were measured on -- stage-only 50 Hz/1 kHz at 6.912 Vpk, 96 kHz, n_harm=8,
+// ⭐n_an = 16384. That window is NOT a detail: at n_an = 32768 the same basis
+// gives 5.61 / 25.16, because the "50 Hz" bin is really 52.734 Hz at 16384 and
+// 49.805 Hz at 32768. Every LF THD figure in this project carries that
+// bin-snapping error, comp_50's 3.81 target included.
+// They look unreproducible on any later basis. That cost an agent a full pass
+// to rediscover; the basis is named here so nobody spends it twice.
+function anv_amp(x, il)
+  local(s) (
+  s = ANV_SATV*(1 - ANV_AMPKI*il);
+  s < ANV_SATLO ? s = ANV_SATLO;      // never collapse: that is a discontinuity
+  s*(anv_th((x + ANV_ABIAS)/s) - anv_th(ANV_ABIAS/s));
+);
+
+// O-12-class input iron, per channel: symmetric Frohlich + Rayleigh-region
+// hysteresis (the low-level loop memory that gives real input transformers
+// their rising-toward-the-lows distortion). Sits BEFORE the cell, inside
+// what the feedback loop sees — its dirt gets compressed. THIS MODEL's core
+// is symmetric and carries no DC, so it makes odd order only; real iron
+// still makes some even order from winding imbalance, remanence and
+// asymmetric loading, none of which are modelled. The IRON knob scales the NONLINEAR part
+// only (1 = the calibrated amount; 0 = a perfect transformer, response kept).
+function anv_ixf(vx)
+  instance(lam, lamenv, im)
+  local(vp, aa, ifro, ilin, al, drn, fadd, ih, pl, fe) (
+  vp = (vx - ANV_IX_RSRC*im)*ANV_IX_IDIV;
+  pl = lam;
+  lam += vp*anv_dte;
+  // silence floor: lam decays toward zero through the source divider, and a
+  // denormal flux is a CPU spike feeding every multiply below it
+  abs(lam) < 0.000000000000001 ? lam = 0;
+  aa = abs(lam)*ANV_IX_ILAMS;
+  aa > 0.995 ? aa = 0.995;
+  ifro = lam/(ANV_IX_LM*(1 - aa));
+  ilin = lam*ANV_IX_ILM;
+  al = abs(lam);
+  al > lamenv ? lamenv = al : lamenv = lamenv*anv_ix_envd;
+  lamenv < 0.000000000001 ? lamenv = 0;
+  drn = lam > pl ? 1 : -1;
+  fe = lamenv*ANV_IX_IRAY;
+  fadd = 1/(1 + fe*fe);
+  ih = ANV_IX_NUR*drn*(lamenv*lamenv - lam*lam)*fadd;
+  im = ilin + anv_iron*(ifro - ilin + ih);
+  vp;
+);
+
+// DC-magnetised core: one flux state per channel (instance), Frohlich law.
+// The nonlinear magnetising current robs voltage through the source R —
+// that divider is where the iron's distortion enters, and it self-centres
+// the flux (the physical LF rolloff, ~6 Hz). IRON blends toward a linear
+// core; the rest-current reference blends with it (anv_im0b).
+function anv_core(va)
+  instance(lam, im)
+  local(vp, lamt, aa, imf, iml) (
+  vp = (va - ANV_RSEFF*(im - anv_im0b))*ANV_IDIVR;
+  lam += vp*anv_dte;
+  abs(lam) < 0.000000000000001 ? lam = 0;   // silence floor, as in anv_ixf
+  lamt = lam + ANV_LAMDC;
+  aa = abs(lamt)*ANV_ILAMS;
+  aa > 0.995 ? aa = 0.995;
+  imf = lamt/(ANV_LM*(1 - aa));
+  iml = lamt*ANV_ILM;
+  im = iml + anv_iron*(imf - iml);
+  vp;
+);
+
+// ── polyphase halfband for 2x oversampling ──────────────────────────────
+// ⭐⭐BEFORE ANYONE DESIGNS ANOTHER FILTER HERE: ReaKit already ships one.
+// EON/ReaKit/rk_firhalfband.jsfx-inc is a 65-tap linear-phase halfband at
+// 96 dB attenuation, already namespaced, MIT (Justin Johnson / Tukan) so it is
+// sellable, and EON/ReaKit/oversample_kbsg.jsfx-inc is a lighter 7-tap
+// polyphase at ~44 dB. Saike's saike_upsamplers.jsfx-inc is the same 65-tap
+// class and also MIT. This local allpass pair existed because nobody looked,
+// and it was measured at -13.3 dB at 20 kHz.
+// ⚠️But the filter is not the open question. The alias this path exists to
+// kill is CONTROL path, not audio path -- deleting the entire output stage
+// moves the 11 kHz alias 5.1650% -> 5.1602%, and it is rectifier ripple order
+// 4 folding to 99.6 Hz. So an audio-path 2x costs >2x CPU and real PDC (a
+// 65-tap linear-phase halfband is 32 taps of latency) to buy 9.8 dB that
+// oversampling the DETECTOR ALONE buys at zero PDC, the control path carrying
+// no latency. Decide that before picking a filter.
+// FILTER: REPAIRED AND VALIDATED (2026-08-24) — the two structural bugs
+// (first-order allpass written in second-order form; polyphase banks never
+// crossed) are fixed above, and the corrected round trip measures 0.000 dB
+// flat with -107.8 dB stopband. FULL-PATH 2x: INTENTIONALLY DISABLED
+// (ANV_OS_ALLOW = 0) — not because the filter is broken any more, but
+// because the dominant alias is DETECTOR-side (control path), so
+// detector-only oversampling is the open question. See the note above.
+// The old figures quoted here (-18 dB at 20 kHz, 30 kHz at -6.7 dB) were
+// re-measured at -13.3 and -3.6 before the repair; both are history now.
+//
+// Note for the replacement: 1x costs <8% on attack timing (measured), so
+// the only remaining reason to FULL-PATH oversample here is alias images from
+// the shaper -- and the paragraph above measured those as the SMALLER problem:
+// the dominant alias is detector-side rectifier ripple, which detector-only
+// oversampling addresses at zero PDC. A linear-phase FIR halfband would be
+// trivially verifiable but adds latency that must then be reported via
+// pdc_delay in @block.
+function anv_hb_ap(x, mem, a)
+  local(y) (
+  y = a*(x - mem[1]) + mem[0];
+  mem[0] = x; mem[1] = y;
+  y;
+);
+
+function anv_hb_run(x, membase, cbase)
+  local(i, v) (
+  v = x;
+  i = 0;
+  loop(6,
+    v = anv_hb_ap(v, membase + i*4, cbase[i]);
+    i += 1;
+  );
+  v;
+);
+
+// One sample of the full circuit at the EFFECTIVE rate (1x or 2x). Inputs
+// already carry the Input-knob gain; results land in anv_w0/anv_w1 (unit
+// domain). Everything rate-dependent here reads anv_dte / anv_ix_envd /
+// anv_kchg / anv_kdis, set per oversample mode by anv_recalc().
+// ── voice crossfade ────────────────────────────────────────────────────
+// Swapping three transfer curves between one sample and the next is a step in
+// the transfer, and it clicks. Nobody swaps hardware revisions mid-note, so
+// this is a plugin-quality fix rather than a circuit one -- but automation can
+// do it, and a click is a click.
+// ⛔NOT an interpolation of circuit PARAMETERS: a half-Rev-D cell is not any
+// unit that ever existed. What is blended is the two curves' OUTPUTS at the
+// same input -- a CLICK-SUPPRESSION TRANSFER CROSSFADE, evaluated per stage.
+// ⚠️Which is NOT the same object as crossfading two complete Anvils: the
+// blended stage outputs go on through the SAME shared nonlinear downstream
+// circuit and the SAME detector, and a nonlinear system does not commute with
+// mixing, so (1-x)F_A + x*F_B into one circuit != (1-x)C_A + x*C_B. That is
+// deliberate -- running two full instances for 4 ms to automate a revision
+// selector would be absurd -- but it must not be DESCRIBED as an output
+// crossfade between two circuits. The STATE (flux, detector charge, self-bias)
+// is shared and stays continuous, so nothing is duplicated or reset.
+// ⭐⭐anv_vxf is the BLUE WEIGHT, not a fade-progress counter, and anv_vxt is
+// the target it walks toward. THAT is what makes a mid-fade flip continuous:
+// the weight reverses from wherever it currently is. A FROM/TO pointer pair
+// with a counter reset to 0 cannot do that -- on a reversal its new FROM is
+// the old TARGET curve, so the next sample steps to 100% of a curve that was
+// only partly faded in, which is the click the crossfade exists to remove.
+// Two voices need ONE weight, not two pointers.
+function anv_cell_gain(v, vg) (
+  anv_vxf <= 0 ? anv_cell_gp(v, vg, ANV_CELLK) : (
+    anv_vxf >= 1 ? anv_cell_gp(v, vg, ANV_CELLB) : (
+      anv_cell_gp(v, vg, ANV_CELLK)*(1 - anv_vxf) + anv_cell_gp(v, vg, ANV_CELLB)*anv_vxf;
+    );
+  );
+);
+function anv_pshape(x) (
+  anv_vxf <= 0 ? anv_pshp(x, ANV_PSHK) : (
+    anv_vxf >= 1 ? anv_pshp(x, ANV_PSHB) : (
+      anv_pshp(x, ANV_PSHK)*(1 - anv_vxf) + anv_pshp(x, ANV_PSHB)*anv_vxf;
+    );
+  );
+);
+function anv_lineamp(x) (
+  anv_vxf <= 0 ? anv_lamp(x, ANV_Q4K) : (
+    anv_vxf >= 1 ? anv_lamp(x, ANV_Q4B) : (
+      anv_lamp(x, ANV_Q4K)*(1 - anv_vxf) + anv_lamp(x, ANV_Q4B)*anv_vxf;
+    );
+  );
+);
+
+// ── THE DETECTOR, ONE INSTANCE PER CHANNEL ─────────────────────────────
+// STEREO LINK runs a SINGLE instance fed by the louder channel — which is what
+// a strapped pair does, and is bit-identical to what this file did before the
+// split. DUAL MONO runs two, each seeing only its own channel.
+// ⚠️⚠️ALL of the state had to move, not some of it: storage cap, gate voltage,
+// BOTH anode self-bias halves, the C22 speed-up node and the sidechain
+// high-pass. A half-split detector — independent caps sharing one self-bias,
+// say — is not a unit that has ever existed, and it would couple the channels
+// through the one path nobody would think to look at.
+// ⭐The gate is read on the NEXT tick (the structural unit delay), so `vg` is
+// instance state and not a return value.
+function anv_det(tap)
+  instance(vcap, vg, v22, sbp, sbn, shx1, shx2, shy1, shy2)
+  local(sc, rect, di, fy, sba, gq, sig, r1, r2, r3, qq, vnew, wnew, snew) (
+  // sidechain high-pass: keeps the kick from owning the detector. Control
+  // path only — the audio never passes through it.
+  anv_schp_on ? (
+    fy = anv_shp_b0*tap + anv_shp_b1*shx1 + anv_shp_b2*shx2
+       - anv_shp_a1*shy1 - anv_shp_a2*shy2;
+    abs(fy) < 0.000000000001 ? fy = 0;   // denormal flush on the recursion
+    shx2 = shx1; shx1 = tap;
+    shy2 = shy1; shy1 = fy;
+    tap = fy;
+  );
+
+  // amp ceiling (asymmetric), full-wave rectify, biased diode, timing cap
+  sc = tap*anv_drive;
+  sc >= 0 ? (
+    sc = ANV_RAIL*anv_th(sc/ANV_RAIL);
+  ) : (
+    sc = -anv_railn*anv_th(-sc/anv_railn);
+  );
+  // each half-wave meets its own diode, whose anode carries its own sag.
+  // ⚠️ONLY ONE half conducts per sample. sba is that half; the other carries
+  // no current at all and its row of the system is the pure decay row.
+  sc >= 0 ? sba = sbp : sba = sbn;
+  rect = sc >= 0 ? sc - sba : -sc - sba;
+  di = anv_dio_i(rect - anv_bias - vcap - v22, anv_dioi);
+  gq = anv_dio_g;
+
+  // ── the storage node, SEMI-IMPLICIT ──────────────────────────────────
+  // This was a forward-Euler step, and it is the one place where that is
+  // genuinely dangerous: the fastest attack on this box is about ONE SAMPLE at
+  // 48 kHz, so the RC is comparable to dt and explicit stepping is worst
+  // exactly where the box is most characterful.
+  // Linearise the diode about the present point, i(V+d) ~ i - g*d, and solve
+  // the whole node at once:
+  //     V' = V + k*(i - g*(V' - V)) - d*V'
+  //     V' = ( V*(1 + k*g) + k*i ) / ( 1 + k*g + d )
+  // Backward-Euler on the linear discharge, linearly-implicit on the diode.
+  // Unconditionally stable, and because the linearisation is the tangent to a
+  // CONVEX current it does not overshoot. ⚠️⚠️STATE THAT GUARANTEE EXACTLY —
+  // a looser sentence stood here ("cannot overshoot the TRUE operating point
+  // HOWEVER STIFF") and an adversarial pass falsified both halves of it:
+  //   ✅It holds against the TABULATED operating point, which is the one this
+  //     step actually solves for: 0 crossings in ~45.7M step evaluations, over
+  //     every table cell and the whole SR/attack/ratio grid, max k*g of 6.43.
+  //   ⛔NOT against the TRUE diode — 2550 crossings, worst +8.579e-4 V. That
+  //     residual belongs to the PWL table (V_eq(table) - V_eq(true) is
+  //     +8.718e-4 V right there), not to the step, but the sentence claimed it.
+  //   ⛔NOT "however stiff". V* crosses V_eq(table) at 92.3% of discharging
+  //     points; the STEP stays put because it is a convex combination of V and
+  //     V*, so the behaviour is fine and the unconditional phrasing was not.
+  //     Provably safe only for k*g <= 0.0514.
+  //   ⚠️And the "180/180 cells at exactly 0.000e+00" quoted here was a max()
+  //     FLOOR, not a margin: the probe folded silent samples in as hard zeros,
+  //     so the metric could not report a negative number at all. The measured
+  //     margins are -5.47e-8 V and +6.887e-14 A. ⭐A metric that cannot express
+  //     failure is not evidence of success, however many cells it ran.
+  // It collapses to the old explicit form when g = 0. ⚠️What it is NOT is
+  // ACCURATE when k*g is large: it is first order, so at the fastest attack
+  // with 20:1 (k*g ~ 6 at 44.1 kHz) vcap lags the true trajectory by up to
+  // 0.6 V and the attack measures ~40% fast — of which 0.283 V is this step
+  // and the rest was the C22 branch, which is now solved jointly below.
+  // ⛔DO NOT "improve" this by raising the order — see the 2x2 note.
+  // ── HISTORY: the vcap+v22 2x2 (same day, superseded by the 3-node solve
+  // below when the anode self-bias turned out to be the third coupled node;
+  // the diagnosis here is why the solve exists, the code is no longer the
+  // 2x2 it describes) ───────────────────────────────────────────────────
+  // They are not two nodes that can be stepped in turn: v22 subtracts from the
+  // diode's forward voltage exactly as vcap does, so freezing di across the
+  // sample solves NEITHER. The size of that coupling over one sample is the
+  // branch's own loop gain, ~anv_tk_b22*di/dv. Measured: 0 at attack 1, 0.03 at
+  // attack 4, 0.38 at attack 6.75, and 25 at attack 7 with 20:1, where the
+  // wiper reaches the end of travel and anv_dior collapses to 16 ohm. That is
+  // why only the last few percent of the pot was ever wrong — and why it was
+  // wrong by 34x when it was.
+  //   i(V+a, W+b) ~ i - g*(a + b), then backward Euler on BOTH nodes.
+  // ⭐ONE linearisation is the right number: a converged Newton on this same
+  // system lands within 1.5 percentage points, so what remains is the METHOD's
+  // truncation error and a second table lookup would buy nothing.
+  // ⚠️⚠️SECOND ORDER IS WORSE HERE, NOT BETTER. The diode's conductance moves
+  // seven decades inside one sample: the trapezoid (A-stable, not L-stable)
+  // DIVERGES (+1157% on a hard edge) and SDIRK2 lands +45% where this lands
+  // -7%. Only a stiffly accurate, L-stable, FIRST-order step behaves.
+  // ⭐The determinant is 1 + A + B + kd + kd22 + A*kd22 + kd*B + kd*kd22 for
+  // A = anv_kchg*g and B = anv_tk_kc22*g, both >= 0 — so it is >= 1 BY
+  // CONSTRUCTION. No guard needed and the divide cannot blow up. Measured
+  // minimum over the whole SR/attack/ratio/level grid: 1.513.
+  // At attack 1 the wiper shorts the branch (anv_tk_kc22 = 0) and the solve
+  // degenerates to the nodes that remain — the property carried forward into
+  // the 3-node form below, which asserts it over 5400 grid points.
+  // ── ALL THREE NODES, SOLVED AS ONE ───────────────────────────────────
+  // The anode self-bias was the third node with the same disease: sba
+  // subtracts from the diode's forward voltage exactly as vcap and v22 do,
+  // and was then updated from the current computed BEFORE any of the three
+  // had moved. The start-of-sample current is an upper bound on the current
+  // over the sample, so the self-bias was systematically OVER-charged: at
+  // 44.1 kHz, attack 7, 20:1, settled 10 dB GR, it sat at 46.0 mV against a
+  // solved 35.8 mV.
+  // ⭐WHY THIS MATTERED AT ALL, given its per-sample coupling anv_tk_ksc*g is
+  // ~300x SMALLER than the C22 branch's: C22's time constant is ~10 us, so its
+  // error is forgotten within a sample or two, while C19*R74 is 319.6 ms and
+  // holds a per-sample charge error as a standing offset.
+  // ⚠️⚠️BUT DO NOT CALL THE RESULT A LARGE SETTLED EFFECT. Measured, level
+  // held, 6.3 time constants in: +0.030 dB of settled GR at 44.1 kHz and
+  // +0.004 dB at 96 kHz, at the fastest attack and 20:1; every slower attack
+  // is under +0.002 dB. What IS large is the FIRST FEW HUNDRED MILLISECONDS,
+  // which is where program material lives: +0.53 dB at 44.1 kHz over a 50 ms
+  // window at 14.5 dB GR, decaying with the 319.6 ms constant. A claim of
+  // "+0.565/+0.487/+0.309 dB of SETTLED GR" was checked and is wrong by 29x
+  // to 70x; the magnitude is real, the word settled is not.
+  //   i(v - a - b - c) ~ di - gq*(a + b + c), then backward Euler on all
+  // three. M = D + gq*k*ones^T is a RANK-1 UPDATE OF A DIAGONAL, so
+  // Sherman-Morrison solves it with no 3x3 and no determinant:
+  //   r_i = x_i + k_i*sig,  sig = di + gq*(vcap + v22 + sba)
+  //   S = sum r_i/d_i, T = gq*sum k_i/d_i, x_i' = r_i/d_i - k_i/d_i*gq*S/(1+T)
+  // Every term of T is non-negative, so 1 + T >= 1 BY CONSTRUCTION -- no
+  // guard, and the divide cannot blow up. Measured over the whole
+  // rate/attack/ratio/level grid: min 1.000000, max 27.376.
+  // ⭐CHEAPER than the 2x2 it replaces -- 18 multiplies against 23, one divide
+  // either way -- because the shared sig removes six of them and the three
+  // k_i/d_i are constants. Same single anv_dio_i call, no new lookup.
+  // ⭐ONE linearisation is still the right number with three nodes. A
+  // converged Newton on the same system was run: it moves settled GR by
+  // 0.0024 dB where the fix itself moves it by 0.142, i.e. this step already
+  // recovers 97% of the defect and the rest is the method's truncation.
+  // ⚠️Remove the third node -- sba = 0 and anv_tk_ksc = 0 -- and this
+  // reproduces the previous 2x2 term for term; probe_selfbias_check.py
+  // asserts it over 5400 grid points.
+  sig  = di + gq*(vcap + v22 + sba);
+  r1   = vcap + anv_kchg*sig;
+  r2   = v22  + anv_tk_kc22*sig;
+  r3   = sba  + anv_tk_ksc*sig;
+  qq   = (r1*anv_sm_id1 + r2*anv_sm_id2 + r3*anv_sm_id3)/(1 + gq*anv_sm_ks);
+  vnew = r1*anv_sm_id1 - anv_sm_k1*gq*qq;
+  wnew = r2*anv_sm_id2 - anv_sm_k2*gq*qq;
+  snew = r3*anv_sm_id3 - anv_sm_k3*gq*qq;
+  // the 1e-12 floors double as DENORMAL flushes: all three nodes decay
+  // multiplicatively toward zero on silence, and a denormal double on the
+  // audio thread is a CPU spike wearing a number's clothes. vcap always had
+  // one; v22 and the self-bias halves get the same.
+  vcap = vnew < 0.000000000001 ? 0 : vnew;
+  v22  = wnew < 0.000000000001 ? 0 : wnew;
+  // s' < 0 is NOT excluded by the algebra the way 1 + T >= 1 is, so it is
+  // clamped like its two neighbours. Measured: never fires -- 0 clamps in
+  // 315225 closed-loop samples across the grid, worst s seen exactly 0.
+  snew < 0.000000000001 ? snew = 0;
+  // the conducting half takes the solved value; the idle half carries no
+  // current this sample, so its row is the pure decay row and its answer is
+  // s/d3 -- one multiply, and it keeps CR3 and CR4 on ONE decay law instead
+  // of two. Measured on its own: 3.5e-6 dB at 44.1 kHz, 8e-7 at 192 kHz.
+  sc >= 0 ? ( sbp = snew; sbn *= anv_sm_id3; )
+          : ( sbn = snew; sbp *= anv_sm_id3; );
+  sbp < 0.000000000001 ? sbp = 0;
+  sbn < 0.000000000001 ? sbn = 0;
+  vg = ANV_VGREST + ANV_GDIV*vcap;
+);
+
+function anv_tick(x0, x1) (
+  anv_vin0 = ixl.anv_ixf(x0*ANV_XSCALE)*ANV_IXUP;
+  anv_vin1 = ixr.anv_ixf(x1*ANV_XSCALE)*ANV_IXUP;
+
+  // gate from the PREVIOUS tick — the structural unit delay that makes a
+  // delay-free feedback loop computable (control path only; audio unbroken)
+  // ch1 ALWAYS reads dr.vg. While linked, dr is bit-identical to dl (see the
+  // sidechain note below), so this is the linked gate; across a mode flip it
+  // is the CONTINUOUS one -- switching the read between instances was the
+  // step this removes.
+  anv_g0 = anv_cell_gain(anv_vin0, dl.vg);
+  anv_g1 = anv_cell_gain(anv_vin1, dr.vg);
+  anv_vo0 = anv_vin0*anv_g0;
+  anv_vo1 = anv_vin1*anv_g1;
+
+  // preamp residual: Rev D's bipolar (BLACK) or Rev A's JFET (BLUE), both
+  // baked into tables at @init and weighted by anv_vxf. Ahead of BOTH the
+  // tap and the output, so its dirt lives inside the loop — which is where
+  // the manual puts the detector tap (preamp out, before the output pot).
+  anv_vo0 = anv_pshape(anv_vo0);
+  anv_vo1 = anv_pshape(anv_vo1);
+
+  // sidechain. STEREO LINK taps the louder channel, signed, so the Class A
+  // asymmetry still engages; DUAL MONO gives each channel its own detector and
+  // never compares them.
+  // ⭐⭐BOTH instances tick in BOTH modes, and that is the whole transition
+  // design. An earlier version ticked only dl while linked, which froze dr --
+  // flip to dual after ten linked seconds and channel 1 started from a gate
+  // ten seconds stale.
+  // STATED EXACTLY, because a looser sentence stood here: while linked, dr is
+  // bit-identical to dl IF THEY ENTERED LINKED MODE WITH IDENTICAL STATE --
+  // from @init that is always, so pure linked use is unchanged to the bit.
+  // After a dual-mono excursion the states differ, and on re-link dr
+  // CONVERGES to dl through the detector's own time constants: upward gaps
+  // close at ATTACK speed (ms), downward at RELEASE speed (up to seconds at
+  // release 1). During that settling the two channels genuinely carry
+  // different GR -- the link SEATS rather than snaps.
+  // ⭐THAT IS THE DESIGNED TRAJECTORY, not an accident, and the alternative
+  // was considered and declined: a third always-running LINK instance with a
+  // gate crossfade makes re-link instant, but crossfading between two gates
+  // that differ by several dB is a FAST GR sweep -- more audible, not less --
+  // and strapping two hardware sidechains mid-signal is itself a
+  // discontinuity. Release-shaped settling is the sound this box already
+  // makes when the program changes. If listening ever says otherwise, the
+  // three-instance design is the fallback, at one more detector tick.
+  // No state copies, no edge detection, no crossfade machinery, and the CPU
+  // ceiling is unchanged because dual mode always paid for two ticks.
+  anv_link ? (
+    anv_tap = abs(anv_vo0) > abs(anv_vo1) ? anv_vo0 : anv_vo1;
+    dl.anv_det(anv_tap);
+    dr.anv_det(anv_tap);
+  ) : (
+    dl.anv_det(anv_vo0);
+    dr.anv_det(anv_vo1);
+  );
+  // output pot ahead of the Class A stage (hardware order), then the iron
+  // the current each core is drawing right now, from its own settled state
+  anv_vs0 = anv_amp(anv_lineamp(anv_vo0*ANV_OSC*anv_outgain), corel.im - anv_im0b);
+  anv_vs1 = anv_amp(anv_lineamp(anv_vo1*ANV_OSC*anv_outgain), corer.im - anv_im0b);
+  anv_w0 = corel.anv_core(anv_vs0)*ANV_IOUTV;
+  anv_w1 = corer.anv_core(anv_vs1)*ANV_IOUTV;
+);
+
+// Tables must match the Python reference at the embedded ground-truth nodes,
+// or the port has drifted. Surfaced in @gfx; do not trust a FAIL build.
+// Verifies EVERY resident table against ground truth the Python reference
+// computed at these exact grid indices.
+//
+// ⭐THE RULE THIS ENCODES: a check node that reads the SAME on both voices
+// proves the table exists, not that it is the right one. It was learned on the
+// cell surface, where the first four nodes agreed to within 0.02% -- inside the
+// 0.1% tolerance -- so a build that filled both tables from one parameter would
+// have passed every one of them.
+//
+// Where that rule applies has moved TWICE. First the BLUE cell rows were
+// deleted, when the cell really was one shared surface (both revisions carry
+// the 50/50 gate divider) and six checks that could not fail made the LED
+// look thorough. Then src_gamma was fitted (2026-08-23) and the surfaces
+// genuinely split -- BLACK drives the FET's source, BLUE grounds it -- so the
+// independent BLUE cell rows below are back and can fail again. The
+// separation guarantee also lives on the preamp shaper and Q4 tables, whose
+// nodes the exporter picks by maximum separation and asserts at export time.
+function anv_selfcheck()
+  local(e) (
+  anv_st_err = 0;
+  e = abs(ANV_CELLK[ANV_VC0_IG*ANV_NV + ANV_VC0_IV]/ANV_VC0_G - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_CELLK[ANV_VC1_IG*ANV_NV + ANV_VC1_IV]/ANV_VC1_G - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_CELLK[ANV_VC2_IG*ANV_NV + ANV_VC2_IV]/ANV_VC2_G - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_CELLK[ANV_VC3_IG*ANV_NV + ANV_VC3_IV]/ANV_VC3_G - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_CELLK[ANV_VC4_IG*ANV_NV + ANV_VC4_IV]/ANV_VC4_G - 1); e > anv_st_err ? anv_st_err = e;
+  // BLUE's cell is its own surface again -- Rev A grounds the FET's source
+  // where Rev D drives it -- so these check a genuinely different table.
+  e = abs(ANV_CELLB[ANV_VC0_IG*ANV_NV + ANV_VC0_IV]/ANV_VB0_G - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_CELLB[ANV_VC1_IG*ANV_NV + ANV_VC1_IV]/ANV_VB1_G - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_CELLB[ANV_VC2_IG*ANV_NV + ANV_VC2_IV]/ANV_VB2_G - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_CELLB[ANV_VC3_IG*ANV_NV + ANV_VC3_IV]/ANV_VB3_G - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_CELLB[ANV_VC4_IG*ANV_NV + ANV_VC4_IV]/ANV_VB4_G - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_DIO[ANV_VD0_IR*ANV_DIO_NV + ANV_VD0_IV]/ANV_VD0_I - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_DIO[ANV_VD1_IR*ANV_DIO_NV + ANV_VD1_IV]/ANV_VD1_I - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_DIO[ANV_VD2_IR*ANV_DIO_NV + ANV_VD2_IV]/ANV_VD2_I - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_TANH[ANV_VT_U]/ANV_VT_T - 1); e > anv_st_err ? anv_st_err = e;
+  // Preamp shapers, both voices. Nodes were picked by the exporter for
+  // SEPARATION, not coverage: node 2 reads 0.0390 on BLACK and 0.0826 on BLUE.
+  // A node that agreed on both would prove the table exists, not that it is
+  // the right one — the lesson the cell surface taught in August.
+  e = abs(ANV_PSHK[ANV_VP0_I]/ANV_VP0_K - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_PSHK[ANV_VP1_I]/ANV_VP1_K - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_PSHK[ANV_VP2_I]/ANV_VP2_K - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_PSHB[ANV_VP0_I]/ANV_VP0_B - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_PSHB[ANV_VP1_I]/ANV_VP1_B - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_PSHB[ANV_VP2_I]/ANV_VP2_B - 1); e > anv_st_err ? anv_st_err = e;
+  // Q4 line amp, both voices. BLACK is the identity by construction, so these
+  // also catch a table filled with the wrong curve or left at zero.
+  e = abs(ANV_Q4K[ANV_VQ0_I]/ANV_VQ0_K - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_Q4K[ANV_VQ1_I]/ANV_VQ1_K - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_Q4K[ANV_VQ2_I]/ANV_VQ2_K - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_Q4B[ANV_VQ0_I]/ANV_VQ0_B - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_Q4B[ANV_VQ1_I]/ANV_VQ1_B - 1); e > anv_st_err ? anv_st_err = e;
+  e = abs(ANV_Q4B[ANV_VQ2_I]/ANV_VQ2_B - 1); e > anv_st_err ? anv_st_err = e;
+  // the atomics' argument order (dest, COMPARAND, newvalue) is load-bearing
+  // for the @block mailbox: with the last two args swapped the consume is a
+  // no-op and anv_recalc() runs every block forever. Probe the semantics the
+  // mailbox depends on, so an API surprise fails the SELF-TEST instead of
+  // shipping as a CPU leak. This is the project's own rule -- a check must be
+  // able to fail -- applied to the runtime, not just the tables.
+  anv_cas_t = 1;
+  atomic_setifequal(anv_cas_t, 1, 0);      // consume form: must take 1 -> 0
+  anv_cas_t > 0.5 ? anv_st_err = 1000000000;
+  anv_cas_t = 0;
+  atomic_setifequal(anv_cas_t, 1, 0);      // miss form: must leave 0 alone
+  anv_cas_t > 0.5 ? anv_st_err = 1000000000;
+  anv_st_ok = anv_st_err < 0.001;
+);
+
+// The ONE place circuit coefficients are derived -- and @block is the only
+// caller now (plus a single seeding call at @init). @gfx and @slider merely
+// set anv_rc_req; they used to call this directly, which put a dozen live
+// DSP scalars on the GUI thread while @sample was mid-buffer.
+// ⭐The house lesson that made the old shape tempting still holds and still
+// matters: slider_automate() does NOT re-run @slider, so a GUI write cannot
+// rely on @slider to notice it. It sets the request flag instead.
+function anv_recalc() (
+  // INPUT = a passive attenuator, exactly as on the hardware: the circuit is
+// driven at a fixed calibrated level and the front panel only ATTENUATES
+// from that maximum. ANV_REFDRIVE maps 0 dBFS into the modelled circuit's
+// operating range; the knob then removes 0..-54 dB ahead of the transformer.
+// (Algebraically identical to the previous fixed-offset form — the signal
+// path was already correct. This states what the control is.) The 600R
+// bridged-T holds its source impedance across its travel, which the model
+// already carries as a fixed ANV_IX_RSRC rather than a level-dependent one.
+anv_inatten = anv_sl_in - 24;                        // 0 at the top of travel
+anv_ingain_t  = pow(10, (ANV_REFDRIVE + anv_inatten)/20);
+  anv_outgain_t = pow(10, anv_sl_out/20);
+
+  // The RATE is only REQUESTED here. @block switches it, together with the
+  // state that belongs to it. Deferring the clear but not the switch was
+  // worse than doing neither: @sample would run at the new rate over the old
+  // rate's filter memory until the next block caught up.
+  anv_osn = ANV_OS_ALLOW && anv_sl_os > 0.5 ? 2 : 1;
+  anv_dte = ANV_DT/anv_osf;            // the rate IN FORCE, not the one asked for
+  anv_ix_envd = 1 - anv_dte/ANV_IX_ENVS;
+
+  // ── the timing network, as drawn (sidechain.py has the derivation) ──
+  // ATTACK: R77 pot, wiper tied back to the diode node through R76 || C22.
+  // Diode -> C27 path = R_b + (R_a || R76 || C22). Travel 0 = fastest.
+  anv_tk_atr = (7 - anv_atk_w)/6;    // the WIPER, not the slider -- see @block
+  anv_tk_rb  = ANV_RPOT_A*anv_tk_atr;                      // wiper -> C27
+  anv_tk_ra  = ANV_RPOT_A - anv_tk_rb;                     // diode node -> wiper
+  anv_tk_par = anv_tk_ra*ANV_R76/(anv_tk_ra + ANV_R76);    // R_a || R76
+  // ⛔⛔"THE BRANCH'S OWN STATE STEPS EXACTLY" WAS CLAIMED HERE AND IS FALSE.
+  // It steps exactly only for a current held CONSTANT across the sample, and
+  // the parenthetical that used to justify it is precisely why it cannot be:
+  // tau22 is 10.15 us against a 22.68 us sample at 44.1 kHz, so this node is
+  // STIFFER than the storage node next door that got the implicit treatment —
+  // the same disease, on the neighbour, left out of the cure.
+  // What it cost, measured: at attack 7 the wiper collapsed anv_dior to
+  // ~16 ohm, the diode passed 0.453 A, and holding that start-of-sample
+  // current for a whole sample put v_c22 at 186.33 V against a true 5.407 V —
+  // 34.5x wrong and 13.3x the 14 V rail, barely improving with rate (134 V at
+  // 96 kHz, 84 V at 192 kHz). Attack time measured 33-50% fast.
+  // ✅FIXED: first solved jointly with the storage node as a 2x2 — and later
+  // the same day the anode self-bias proved to be a THIRD coupled node, so
+  // all three are now one Sherman-Morrison solve in anv_det(). Originally,
+  // in anv_det(). ⚠️Fixing C22 ALONE was tested and is not enough — it leaves
+  // the storage-node error at +240.09%, exactly where it started, as do three
+  // other cheaper repairs. The coupling is the defect, not either node.
+  // ⛔The old note here also claimed "194 non-monotone dips against the
+  // reference's 0". Do NOT restore that framing: under a plain tone the
+  // converged solve produces 46/50/102 dips of its own, so raw dip counts are
+  // only a diagnostic under a MONOTONE drive. The defensible claims are the
+  // voltage ratio and the attack time.
+  // Was present identically in sidechain.py; both moved in one commit.
+  // Backward-Euler coefficients: the branch is solved TOGETHER with the
+  // storage node in anv_det() rather than stepped on a frozen current, so the
+  // exponential kernel (a22/b22) is gone and its exp() call with it.
+  // anv_tk_ra = 0 shorts the branch — anv_tk_kc22 = 0 pins v22 at zero and the
+  // 2x2 degenerates to the storage node alone.
+  anv_tk_kc22 = anv_tk_ra < 1 ? 0 : anv_dte/ANV_C22;
+  anv_tk_kd22 = anv_dte/(max(anv_tk_par, 0.001)*ANV_C22);
+  anv_atk_us = (ANV_RDSRC + anv_tk_rb + anv_tk_par)*ANV_CSM*1000000;   // DC tau, for the chip
+  // RELEASE: R78 rheostat with R79 across its lower segment, to the rest node.
+  anv_tk_rlt  = (7 - anv_rel_w)/6;   // ditto
+  anv_tk_rc   = ANV_RPOT_R*anv_tk_rlt;
+  anv_tk_rd   = ANV_RPOT_R - anv_tk_rc;
+  anv_tk_rrel = anv_tk_rc + anv_tk_rd*ANV_R79/(anv_tk_rd + ANV_R79);
+  anv_rel_ms  = anv_tk_rrel*ANV_CSM*1000;
+  anv_kchg = anv_dte/ANV_CSM;
+  anv_kdis = anv_dte/(anv_tk_rrel*ANV_CSM);
+  // anode self-bias: C19 charges with diode current, R74 returns it
+  anv_tk_ksc = anv_dte/ANV_C19;
+  anv_tk_ksd = anv_dte/(ANV_R74*ANV_C19);
+  // ── the 3x3 as a RANK-1 UPDATE OF A DIAGONAL ─────────────────────────
+  // Backward Euler on all three discharges with the diode linearised once
+  // gives M = D + g*k*ones^T, D = diag(1+kdis, 1+kd22, 1+ksd) and
+  // k = (kchg, kc22, ksc). Sherman-Morrison inverts that with no 3x3 and no
+  // determinant, and 1 + T -- T = g*anv_sm_ks -- is >= 1 by construction
+  // because every term in it is non-negative, so the one divide in anv_det()
+  // cannot blow up and needs no guard.
+  // ⭐The three k_i/d_i are constants, which is what makes the @sample form
+  // CHEAPER than the 2x2 it replaces rather than more expensive.
+  // ⚠️These seven must come after anv_kchg/anv_kdis, anv_tk_kc22/anv_tk_kd22
+  // and anv_tk_ksc/anv_tk_ksd are set. Here satisfies all three.
+  anv_sm_id1 = 1/(1 + anv_kdis);
+  anv_sm_id2 = 1/(1 + anv_tk_kd22);
+  anv_sm_id3 = 1/(1 + anv_tk_ksd);
+  anv_sm_k1  = anv_kchg*anv_sm_id1;
+  anv_sm_k2  = anv_tk_kc22*anv_sm_id2;
+  anv_sm_k3  = anv_tk_ksc*anv_sm_id3;
+  anv_sm_ks  = anv_sm_k1 + anv_sm_k2 + anv_sm_k3;
+
+  anv_ridx  = anv_sl_ratio|0;
+  anv_drive = anv_ridx == 0 ? ANV_DRV0 : anv_ridx == 1 ? ANV_DRV1 :
+              anv_ridx == 2 ? ANV_DRV2 : anv_ridx == 3 ? ANV_DRV3 : ANV_DRV4;
+  anv_bias  = anv_ridx == 0 ? ANV_BIAS0 : anv_ridx == 1 ? ANV_BIAS1 :
+              anv_ridx == 2 ? ANV_BIAS2 : anv_ridx == 3 ? ANV_BIAS3 : ANV_BIAS4;
+  anv_rth   = anv_ridx == 0 ? ANV_RTH0 : anv_ridx == 1 ? ANV_RTH1 :
+              anv_ridx == 2 ? ANV_RTH2 : anv_ridx == 3 ? ANV_RTH3 : ANV_RTH4;
+  // what the diode sees, instantaneously: source floor + wiper-side pot
+  // segment + the bias ladder. Converted to a fractional table row HERE.
+  anv_dior = ANV_RDSRC + anv_tk_rb + anv_rth;
+  anv_dioi = log(anv_dior/ANV_DIO_RLO)*ANV_IDDR;
+  anv_dioi < 0 ? anv_dioi = 0 : ( anv_dioi > ANV_DIO_NR - 1.0001 ? anv_dioi = ANV_DIO_NR - 1.0001 );
+
+  anv_railn = ANV_RAIL*(1 - ANV_ASYM);
+  anv_mixw_t = anv_sl_mix;
+  // bypass target snapshotted HERE, not read from the slider in @sample --
+  // @gfx writes anv_sl_byp, and the audio path observing a GUI-thread write
+  // directly (even one the fade makes continuous) breaks the slider ->
+  // request -> @block snapshot -> @sample discipline everything else follows.
+  anv_bypt = anv_sl_byp > 0.5 ? 1 : 0;
+
+  // iron depth: nonlinear share of both transformers; the rest-current
+  // reference of the output core blends with it
+  // TARGET only -- @sample glides anv_iron toward it and derives anv_im0b
+  // from the glided value, so the constitutive blend never steps.
+  anv_iron_t = max(0, min(1, anv_sl_iron));
+
+  // sidechain HP: RBJ biquad at the EFFECTIVE rate (trig never in @sample)
+  anv_schp_on = anv_sl_schp >= 20;
+  anv_schp_on ? (
+    // ANV_SRSAFE, not srate. This was the ONE place still reading the host
+    // rate raw, which reopened exactly the hole ANV_SRSAFE exists to close:
+    // @init supports being handed srate = 0 and @init calls anv_recalc(), so
+    // a preset restored with SC HP already ON would have divided by zero at
+    // load. Default-off hid it; a recalled state would not have.
+    anv_shw = 2*$pi*anv_sl_schp/(ANV_SRSAFE*anv_osf);
+    anv_shc = cos(anv_shw);
+    anv_shal = sin(anv_shw)/1.4142135623731;
+    anv_sha0 = 1 + anv_shal;
+    anv_shp_b0 = (1 + anv_shc)*0.5/anv_sha0;
+    anv_shp_b1 = -(1 + anv_shc)/anv_sha0;
+    anv_shp_b2 = anv_shp_b0;
+    anv_shp_a1 = -2*anv_shc/anv_sha0;
+    anv_shp_a2 = (1 - anv_shal)/anv_sha0;
+  ) : (
+    // Looks like the same live-state write @block now owns, and is not:
+    // @sample gates the whole biquad on anv_schp_on, so with SC HP off
+    // nothing reads these. Clearing them here has no reader to race.
+    dl.shx1 = dl.shx2 = dl.shy1 = dl.shy2 = 0;
+    dr.shx1 = dr.shx2 = dr.shy1 = dr.shy2 = 0;
+  );
+
+  // voice: publish a crossfade TARGET and nothing else. @sample walks the
+  // weight to it. This is now a single scalar write of a 0 or a 1 -- there is
+  // no pointer to tear and no state to re-arm, so reaching here from @gfx is
+  // safe by construction rather than by argument, and a flip that arrives
+  // mid-walk simply reverses the direction of travel.
+  anv_vxt = anv_sl_voice > 0.5;
+  anv_link = anv_sl_link > 0.5;
+);
+
+// ── GUI helpers ─────────────────────────────────────────────────────────
+
+// Recessed LED value window centred on cx — the deck-readout grammar.
+function anv_chip(cx, ry, rw, rh, tr, tg, tb)
+  local(tw, th) (
+  gfx_set(0, 0, 0, 0.62);
+  gfx_rect(cx - rw*0.5, ry, rw, rh);
+  gfx_set(0, 0, 0, 0.85);
+  gfx_rect(cx - rw*0.5, ry, rw, 1);
+  gfx_set(1, 1, 1, gx_blu ? 0.35 : 0.07);
+  gfx_rect(cx - rw*0.5, ry + rh - 1, rw, 1);
+  gfx_set(tr, tg, tb, 0.32);
+  gfx_rect(cx - rw*0.5, ry, rw, rh, 0);
+  gfx_setfont(6, "Arial", max(10, floor(rh*0.74)), 'b');
+  gfx_measurestr(#anv_val, tw, th);
+  gfx_set(0.96, 0.93, 0.85, 1);
+  gfx_x = cx - tw*0.5; gfx_y = ry + floor((rh - th)*0.5);
+  gfx_drawstr(#anv_val);
+);
+
+// Needle position -> GR dB. The VU lib owns the ballistics (fed per sample
+// with the actual applied gain). On rk_vu the needle position IS the linear
+// gain it shows (1 = no reduction), so this is one log, not an inversion of
+// the old spring's calibration constants: the needle and the readout are the
+// same number by construction. Same call EON Weld makes.
+function anv_gr_db() ( -gr_vu.pos; );   // rk_vu's GR pos IS dB of reduction, 0 = none
+
+// Letter-spaced silkscreen. Real panel legends are tracked out; drawing
+// char by char with a gap is most of what separates "printed on metal"
+// from "UI text". Returns the drawn width so callers can centre.
+function anv_ltext(str, cx, y, sp)
+  local(i, n, c, tw, th, x) (
+  gfx_measurestr(str, tw, th);
+  n = strlen(str);
+  tw += (n - 1)*sp;
+  x = cx - tw*0.5;
+  gfx_x = x; gfx_y = y;
+  i = 0;
+  loop(n,
+    c = str_getchar(str, i);
+    gfx_drawchar(c);
+    gfx_x += sp;
+    i += 1;
+  );
+  tw;
+);
+
+// Engraved hairline separator across the faceplate.
+function anv_sep(y) (
+  gfx_set(0, 0, 0, gx_blu ? 0.18 : 0.45);
+  gfx_rect(gx_mfx + floor(16*sc), y, gx_mfw - floor(32*sc), 1);
+  gfx_set(1, 1, 1, gx_blu ? 0.50 : 0.05);
+  gfx_rect(gx_mfx + floor(16*sc), y + 1, gx_mfw - floor(32*sc), 1);
+);
+
+// ── machined-cap knob ──────────────────────────────────────────────────
+// On the real unit the numerals are SILK-SCREENED ON THE PANEL behind the
+// knob; the cap is a plain dark cylinder with one white line. That
+// separation — scale stays put, cap turns — is what makes the eye read a
+// physical control instead of a drawn dial, so the scale is painted here
+// as panel furniture rather than as part of the knob.
+//
+// usearc = 1 (floating): a thin value arc between scale and cap.
+// usearc = 0 (embedded): the passed ticks light instead — an arc goes thin
+// and noisy at strip size, while ticks are already the coarsest mark.
+function anv_knob(cx, cy, r, val, vmin, vmax, usearc, hov)
+  local(t, a, i, f, ta, maj, lit, r0, r1, px, py, sa, ca, ar, n,
+        cr, cg, cb, lr, lg, lb, tw, th, nx, ny, sh, rk, rt, t2) (
+  t = (vmax - vmin) != 0 ? (val - vmin)/(vmax - vmin) : 0;
+  t < 0 ? t = 0; t > 1 ? t = 1;
+  a = ANV_KSTART + t*ANV_KSWEEP;
+
+  // ── panel scale: 15 marks, major every other ──
+  // ⭐THE RING RADIUS IS WHAT BOUNDS THE CAP, not the cell. The numerals sat at
+  // 1.74r and the marks reached 1.50r, so the cap was only 57% of its own
+  // visual footprint and reading small on a narrow panel however much r grew —
+  // and r could NOT grow, because 2*1.74r against the 0.44W row pitch is what
+  // ran out first. Pulling the ring to 1.55r/1.40r bought that back and the
+  // radii below grew into it. ⚠️If a row ever collides, move THESE first: the
+  // binding constraint is horizontal on the drawer row (0.23W pitch) and
+  // vertical between rows 1 and 2 (112*sc, of which the ring owns
+  // 1.19r_row1 + 1.55r_row2 — the bottom of a sweep only reaches 0.766 of the
+  // ring radius, because the scale stops 140 degrees from vertical).
+  i = 0;
+  loop(15,
+    f = i/14;
+    ta = ANV_KSTART + f*ANV_KSWEEP;
+    maj = (i % 2) == 0;
+    lit = !usearc && f <= t + 0.0001;
+    lit ? gfx_set(gx_ac_r, gx_ac_g, gx_ac_b, 0.95) :
+      ( maj ? gfx_set(gx_tx_r, gx_tx_g, gx_tx_b, 0.95)
+            : gfx_set(gx_td_r, gx_td_g, gx_td_b, 0.8) );
+    sa = sin(ta); ca = cos(ta);
+    // ⭐MAJORS ARE STUBS: every major position carries a numeral, and after
+    // the ring came in to buy cap size the full-length majors (1.40r) ran
+    // straight into the digits (text inner edge ~1.24r) -- the mush the first
+    // panel screenshot showed. Hardware silkscreen answers this the obvious
+    // way: the NUMBER is the outer half of its mark. Minors, which carry no
+    // digit, keep the longer reach so the ring still reads as a scale.
+    r0 = r*1.16;  r1 = maj ? r*1.26 : r*1.34;
+    // thicken by stepping along the PERPENDICULAR so every angle thickens
+    // equally (offsetting in x alone only works for near-vertical marks)
+    px = ca*max(0.6, r*0.028); py = sa*max(0.6, r*0.028);
+    gfx_line(cx + sa*r0, cy - ca*r0, cx + sa*r1, cy - ca*r1);
+    maj ? (
+      gfx_line(cx + sa*r0 + px, cy - ca*r0 + py, cx + sa*r1 + px, cy - ca*r1 + py);
+      gfx_line(cx + sa*r0 - px, cy - ca*r0 - py, cx + sa*r1 - px, cy - ca*r1 - py);
+    );
+    i += 1;
+  );
+
+  // ── numerals 0..7, only when the arc can honestly hold them ──
+  // Seated at 1.46r: just past the 1.26r major stubs with clear air, inside
+  // the old 1.55r so none of the cap-size budget is given back. One font set
+  // per knob (it was set twice per digit), a step smaller than before -- the
+  // digits are silkscreen, not headline -- and a 1 px drop toward the light's
+  // shadow side so they read as printed on the panel rather than floating.
+  r >= (micro ? floor(15*ret) : floor(19*sc)) ? (
+    gfx_setfont(7, "Arial", max(9, floor(r*0.54)), 'b');
+    n = 0;
+    loop(8,
+      ta = ANV_KSTART + (n/7)*ANV_KSWEEP;
+      sprintf(#anv_num, "%d", n);
+      gfx_measurestr(#anv_num, tw, th);
+      nx = cx + sin(ta)*r*1.46 - tw*0.5;
+      ny = cy - cos(ta)*r*1.46 - th*0.5;
+      gx_blu ? gfx_set(1, 1, 1, 0.35) : gfx_set(0, 0, 0, 0.45);
+      gfx_x = nx + 1; gfx_y = ny + 1;
+      gfx_drawstr(#anv_num);
+      gfx_set(gx_tx_r, gx_tx_g, gx_tx_b, 0.92);
+      gfx_x = nx; gfx_y = ny;
+      gfx_drawstr(#anv_num);
+      n += 1;
+    );
+  );
+
+  // ── value arc (floating only), between scale and cap ──
+  usearc ? (
+    ar = r*1.10;
+    gfx_set(gx_td_r, gx_td_g, gx_td_b, 0.22);
+    gfx_arc(cx, cy, ar, ANV_KSTART, ANV_KSTART + ANV_KSWEEP, 1);
+    gfx_set(gx_ac_r, gx_ac_g, gx_ac_b, 0.95);
+    gfx_arc(cx, cy, ar,       ANV_KSTART, a, 1);
+    gfx_arc(cx, cy, ar - 1,   ANV_KSTART, a, 1);
+    gfx_arc(cx, cy, ar + 1,   ANV_KSTART, a, 1);
+  );
+
+  // ── seated shadow: lifts the cap off the panel ──
+  sh = max(1, floor(r*0.09));
+  gfx_set(0, 0, 0, 0.42);
+  gfx_circle(cx, cy + sh, r, 1, 1);
+
+  // ── cap: MACHINED ALUMINIUM WITH A KNURLED SKIRT ──
+  // The knob on this box is a turned aluminium cylinder whose KNURL IS MOST OF
+  // IT — the band runs from 0.55r out to the rim, leaving a small machined face
+  // — and the knurl is the part the eye reads as "this kind of compressor"
+  // before it reads a single legend.
+  // ⭐TWO fixes got it there, and neither was the shape. First the SKIRT BASE:
+  // at 0.15 the flutes were bright marks on a dark disc and read as spokes on a
+  // black ring; at 0.42 the whole cap reads as one lit cylinder that the flutes
+  // merely turn on. Then the RAMP. Every previous cap moved R, G and B together,
+  // which is the definition of grey — no amount of contrast makes a grey ramp
+  // look like metal. Aluminium is COOL IN SHADOW AND WARM AT THE SPECULAR, so
+  // the three channels now travel at different rates: (0.42, 0.435, 0.485) at
+  // the dark end, crossing over to (1.00, 1.00, 0.985) at the face highlight.
+  // The blue lead shrinks to nothing and then inverts, and that crossover is
+  // the whole difference between silver and grey.
+  //
+  // ⚠️⚠️ WEDGES, NOT RADIAL LINES, and that is a SCALING requirement rather than
+  // a style choice: EEL2's gfx_line has NO WIDTH, so a 1 px radial flute leaves
+  // a gap at the rim that GROWS with radius — at r = 52 the pitch is ~5 px and
+  // it reads as spokes, not knurling. gfx_triangle takes a fourth point and
+  // fills a convex quad, which tiles with no gaps at ANY radius. The flute
+  // COUNT tracks r as well, holding a ~4-5 px pitch from the 8 px embedded knob
+  // to the largest floating one, so it neither aliases into moiré nor thins
+  // out. Light sits upper-left, as everywhere else on this panel.
+  gfx_set(0.42, 0.435, 0.485, 1);
+  gfx_circle(cx, cy, r, 1, 1);
+  n  = max(10, min(48, floor(r*1.6)));
+  rk = r*0.55;
+  ar = 2*$pi/n;
+  i = 0;
+  loop(n,
+    ta = i*ar;
+    t2 = ta + ar;
+    // a flute's normal at its mid-angle is (sin, -cos) in screen terms, dotted
+    // with an upper-left light that is 0.7071*(cos - sin)
+    f = 0.5 + 0.3536*(cos(ta + ar*0.5) - sin(ta + ar*0.5));
+    f < 0 ? f = 0 : ( f > 1 ? f = 1 );
+    gfx_set(0.42 + 0.565*f, 0.435 + 0.550*f, 0.485 + 0.480*f, 1);
+    sa = sin(ta); ca = cos(ta);
+    px = sin(t2); py = cos(t2);
+    gfx_triangle(cx + sa*rk, cy - ca*rk,  cx + sa*r,  cy - ca*r,
+                 cx + px*r,  cy - py*r,   cx + px*rk, cy - py*rk);
+    i += 1;
+  );
+
+  // ── the turned face: brighter, stepped toward the light, faint tool rings ──
+  // Same silver ramp as the knurl, one stop up. It ends at (1.00, 1.00, 0.985)
+  // rather than at white, because a specular on aluminium is the one place the
+  // hue crosses over to the warm side.
+  rt = rk;
+  i = 0;
+  loop(8,
+    f = i/7;
+    gfx_set(0.62 + 0.380*f, 0.638 + 0.362*f, 0.692 + 0.293*f, 1);
+    gfx_circle(cx - r*0.05*f, cy - r*0.07*f, rt*(1 - f*0.26), 1, 1);
+    i += 1;
+  );
+  gfx_set(0.30, 0.31, 0.335, 0.12);     // turning marks: a whisper, not a groove
+  i = 1;
+  loop(3,
+    gfx_circle(cx, cy, rt*(0.26 + i*0.22), 0, 1);
+    i += 1;
+  );
+  gfx_set(0.28, 0.295, 0.345, 0.55);    // turned step down to the knurl
+  gfx_circle(cx, cy, rt, 0, 1);
+  gfx_set(0.97, 0.975, 0.99, 0.30);     // and its lit lip, one pixel in
+  gfx_circle(cx, cy, rt - 1, 0, 1);
+  // A silver knob on the silverface panel needs a harder outline than it does
+  // on the blackface, or it dissolves into the background.
+  gfx_set(0.05, 0.05, 0.06, gx_blu ? 0.95 : 0.8);
+  gfx_circle(cx, cy, r, 0, 1);
+  hov ? (
+    gfx_set(gx_ac_r, gx_ac_g, gx_ac_b, 0.30);
+    gfx_circle(cx, cy, r + 1, 0, 1);
+  );
+
+  // ── the pointer: one cream line across the face, as on the hardware ──
+  // A quad for the same reason as the knurl: three offset 1 px lines open gaps
+  // as soon as the width has to scale with the knob.
+  sa = sin(a); ca = cos(a);
+  rt = max(0.8, r*0.045);               // half-width, scaled
+  px = ca*rt; py = sa*rt;
+  r0 = r*0.12; r1 = r*0.72;
+  gfx_set(0.97, 0.965, 0.95, 0.55);     // engraved HIGHLIGHT, one pixel off
+  gfx_triangle(cx + sa*r0 - px + 1, cy - ca*r0 - py + 1,
+               cx + sa*r1 - px + 1, cy - ca*r1 - py + 1,
+               cx + sa*r1 + px + 1, cy - ca*r1 + py + 1,
+               cx + sa*r0 + px + 1, cy - ca*r0 + py + 1);
+  gfx_set(0.10, 0.102, 0.118, hov ? 1 : 0.94);
+  gfx_triangle(cx + sa*r0 - px, cy - ca*r0 - py,
+               cx + sa*r1 - px, cy - ca*r1 - py,
+               cx + sa*r1 + px, cy - ca*r1 + py,
+               cx + sa*r0 + px, cy - ca*r0 + py);
+);
+
+// -- XTRAS drawer --------------------------------------------------------
+// SC HP, IRON, MIX and OVERSAMPLE are the four controls this panel has that
+// the hardware never had. They live in a drawer behind the XTRAS button
+// rather than on the face full time -- but the drawer opens INTO the layout,
+// as a real row of knobs the solver makes room for, not as a card floating
+// over the panel.
+
+// A small raised-cap button in the ratio row's language. Returns 1 the frame
+// it is clicked.
+function anv_xtchip(xb, xy, xw, xh, xon, xlbl) local(hov, tw, th) (
+  hov = mx >= xb && mx <= xb + xw && my >= xy && my <= xy + xh;
+  xon ? (
+    gfx_gradrect(xb, xy + 2, xw, xh - 2,
+      0.48, 0.13, 0.10, 1, 0,0,0,0, 0.0035, 0.0015, 0.0012, 0);
+    gfx_set(0, 0, 0, 0.55);       gfx_rect(xb, xy + 2, xw, 1);
+    gfx_set(1, 0.55, 0.45, 0.25); gfx_rect(xb, xy + xh - 1, xw, 1);
+    gfx_set(0.18, 0.04, 0.03, 1); gfx_rect(xb, xy + 2, xw, xh - 2, 0);
+  ) : (
+    gfx_gradrect(xb, xy, xw, xh - 2,
+      hov ? 0.930 : 0.845, hov ? 0.940 : 0.855, hov ? 0.955 : 0.875, 1,
+      0,0,0,0, -0.0055, -0.0055, -0.0052, 0);
+    gfx_set(1, 1, 1, 0.75); gfx_rect(xb, xy, xw, 1);
+    gfx_set(0, 0, 0, 0.50); gfx_rect(xb, xy + xh - 2, xw, 2);
+    gfx_set(0, 0, 0, 0.30); gfx_rect(xb, xy, xw, xh - 2, 0);
+  );
+  gfx_setfont(7, "Arial", max(7, floor(xh*0.56)), 'b');
+  xon ? gfx_set(0.96, 0.93, 0.88, 1) : gfx_set(0.16, 0.17, 0.19, 1);
+  gfx_measurestr(xlbl, tw, th);
+  gfx_x = xb + xw*0.5 - tw*0.5;
+  gfx_y = xy + (xh - th)*0.5 + (xon ? 1 : 0);
+  gfx_drawstr(xlbl);
+  hov ? gx_hov = 1;
+  hov && lmb_down;
+);
+
+// Slotted rack screw.
+function anv_screw(cx, cy, r) (
+  gfx_set(0.05, 0.05, 0.06, 1); gfx_circle(cx, cy, r, 1, 1);
+  gfx_set(0.42, 0.44, 0.48, 1); gfx_circle(cx, cy, r*0.7, 1, 1);
+  gfx_set(0.12, 0.12, 0.14, 1);
+  gfx_line(cx - r*0.5, cy, cx + r*0.5, cy);
+);
+
+// ── memory ──
+freemem = 0;     // rk_vu claims no memory (vu_kbsg squatted on 0..437)
+// TWO cell surfaces, both resident from @init -- a rebuild reachable from
+// @gfx was a real data race once, so tables are never rebuilt at runtime; the
+// voice crossfade only moves a WEIGHT between them (anv_vxf; the pointers an
+// older comment mentioned here are gone). Two surfaces, for a reason the
+// drawings support.
+// Both revisions carry a 50/50 gate divider, so "BLUE = no LN" was never a Rev
+// A model. What DOES differ is the FET's source: Rev D drives it (C28 50uF into
+// the R18/R84 tap, p52), Rev A grounds it outright (p48). That is ANV_GAMMA,
+// and it is now the one cell-level difference between the voices.
+ANV_CELLK = freemem; freemem += ANV_NG*ANV_NV;   // BLACK: rev D, source driven
+ANV_CELLB = freemem; freemem += ANV_NG*ANV_NV;   // BLUE:  rev A, source grounded
+// Preamp shapers, one per voice. BLACK = Rev D's Q2 (2N3391A bipolar under
+// feedback) as the fitted biased tanh; BLUE = Rev A's Q2 (DP6021AQ JFET,
+// common source) solved. A table each because anv_th() is SHARED with the
+// Class A stage and the sidechain rails and so cannot itself be swapped.
+ANV_PSHK = freemem; freemem += ANV_PSH_N;        // BLACK
+ANV_PSHB = freemem; freemem += ANV_PSH_N;        // BLUE
+// Line-amp input stage Q4, one curve per voice. Rev A puts a DP6021AQ JFET
+// here where Rev D has a 2N3391A bipolar — same slot in an otherwise identical
+// chain (Q5 2N3707, Q6 2N4033, T2 UA-5002 on both sheets). Q4 sits after the
+// output pot but BEFORE the line amp's gain, so it runs ~20 dB hotter than the
+// preamp and its square law is ~150x more significant. BLACK's curve is the
+// identity — the fitted Class A block already stands for its bipolar chain.
+ANV_Q4K = freemem; freemem += ANV_Q4_N;          // BLACK: identity
+ANV_Q4B = freemem; freemem += ANV_Q4_N;          // BLUE:  Rev A JFET
+ANV_DIO  = freemem; freemem += ANV_DIO_NR*ANV_DIO_NV;
+ANV_TANH = freemem; freemem += ANV_TANH_N;
+ANV_HBA  = freemem; freemem += 6;
+ANV_HBB  = freemem; freemem += 6;
+ANV_OSM  = freemem; freemem += 8*24;   // 8 allpass paths (up/down x A/B x 2ch)
+KS = 16;                               // knobs_kbsg per-knob state stride
+anv_km = freemem; freemem += 8*KS;     // IN OUT ATK REL HP IRON MIX + spare
+
+// ── derived constants ──
+ANV_RB    = ANV_RS*ANV_IDSS/(ANV_VTH*ANV_VTH);
+ANV_IDV   = (ANV_NV - 1)/(2*ANV_VMAX);
+ANV_IDG   = (ANV_NG - 1)/(ANV_GMAX - ANV_GMIN);
+ANV_IDDV  = (ANV_DIO_NV - 1)/ANV_DIO_VMAX;
+ANV_IDDR  = (ANV_DIO_NR - 1)/log(ANV_DIO_RHI/ANV_DIO_RLO);   // log R axis
+ANV_IDU   = (ANV_TANH_N - 1)/ANV_TANH_UMAX;
+// ⭐⭐THE AMP AND THE 5002 ARE ONE SYSTEM, AND THIS IS WHERE THEY MEET.
+// The output transformer sits INSIDE the amplifier's feedback (p52: the
+// primary's cold end returns through R34 82K into the amp). Global feedback
+// divides the amp's output impedance by (1+T), and the output impedance is
+// precisely what decides how far the core's magnetising current can drag the
+// output down -- which is the term two lines up in anv_core(). So the loop
+// enters as a stiffer source, and the coupling runs both ways: the core's
+// state sets the current, the current sets the voltage, the voltage integrates
+// back into the core's flux.
+// ⚠️ MEASURED FALSE START worth not repeating: injecting -fbk*(core deviation)
+// at the AMP'S INPUT instead cancels 16 dB of core distortion with the amp
+// linearised, and makes THD WORSE with the real one -- sat_v/bias_v are a
+// CLOSED-LOOP transfer with no spare gain, so the correction just walks the amp
+// along its own biased tanh. You cannot bolt a global loop onto a block that
+// already has one.
+ANV_RSEFF = ANV_RSRC*ANV_ZRED;   // ZRED := 1/(1+T). See the inc.
+ANV_IDIVR = 1/(1 + ANV_RSEFF/ANV_RLOAD);
+ANV_ILAMS = 1/ANV_LAMSAT;
+ANV_ILM   = 1/ANV_LM;
+ANV_IX_ILM = 1/ANV_IX_LM;
+ANV_IM0   = ANV_LAMDC/(ANV_LM*(1 - ANV_LAMDC/ANV_LAMSAT));
+// srate has been reported as 0 in @init -- Geraint Luff's ui-lib carries a
+// workaround for it, conditioned on @gfx being defined, the UI displaying, and
+// an earlier FX having set pdc_delay, which is every condition a compressor in
+// a chain meets. Unconfirmed here, and cheap either way.
+//
+// ⚠️ max(1, srate) was the wrong fallback: it makes dt = 1 SECOND, so one
+// sample would advance the timing network by a second and the whole detector
+// would be nonsense. Fall back to a real rate instead. Everything latched off
+// srate derives from ANV_SRSAFE, so they cannot disagree.
+ANV_SRSAFE = srate > 1000 ? srate : 48000;
+ANV_DT    = 1/ANV_SRSAFE;
+ANV_OSC   = ANV_OUTV/ANV_VREF;
+ANV_IOUTV = 1/ANV_OUTV;
+ANV_IPSAT = ANV_PSAT > 0 ? 1/ANV_PSAT : 0;
+ANV_IPREG = 1/ANV_PREG;
+anv_dte   = ANV_DT;            // anv_recalc() re-derives per oversample mode
+anv_iron  = 1;            // seated; @block only moves the TARGET now
+anv_iron_t = 1;
+anv_osf   = 1;                 // the rate in force; @block owns it from here
+ANV_PKD = exp(-1/(0.4*ANV_SRSAFE));   // ~0.4 s decay on the input readout
+// Host-control smoothing, ~5 ms at the host rate. See @sample for what it is
+// allowed to touch -- three front-panel gains and nothing modelled.
+ANV_SMC = 1 - exp(-1/(0.005*ANV_SRSAFE));
+ANV_POTRATE = 150;            // pot positions per second: 6 of travel in 40 ms
+ANV_VXSTEP  = 1/(0.004*ANV_SRSAFE);   // voice crossfade: 4 ms
+anv_pk  = 0;
+ANV_REFDRIVE = 42;             // dB: digital reference -> circuit operating level
+// ⛔⛔**2x STAYS LOCKED OUT — but the reason CHANGED on 2026-08-24 and the
+// old one must not be quoted.** The filter is REPAIRED (round trip 0.000 dB
+// flat, stopband -107.8 dB; it was two structural bugs, not coefficients).
+// What keeps this at 0 now is that full-path 2x is probably the WRONG FIX:
+// the dominant alias is detector-side — deleting the entire output stage
+// moves the 11 kHz alias 5.1650% -> 5.1602% — so audio-path oversampling
+// buys 9.8 dB for >2x CPU and ~4 samples of dispersive PDC that
+// DETECTOR-ONLY oversampling would buy at zero PDC. That decision is open.
+// Until it is made, this forces the native rate no matter what the slider
+// or an automation lane says.
+// ⚠️Set to 1 ONLY to test a replacement, and never commit a 1 without a
+// passband + image-rejection measurement to go with it.
+ANV_OS_ALLOW = 0;
+ANV_KSTART = -2.44346095279;   // -140 deg from vertical
+ANV_KSWEEP =  4.88692190558;   //  280 deg sweep
+anv_im0b  = ANV_IM0;
+
+// halfband coefficient set (public domain, musicdsp.org polyphase entry)
+ANV_HBA[0] = 0.036681502163648017; ANV_HBB[0] = 0.13654762463195771;
+ANV_HBA[1] = 0.2746317593794541;   ANV_HBB[1] = 0.42313861743656667;
+ANV_HBA[2] = 0.5610989697879195;   ANV_HBB[2] = 0.6775400499741616;
+ANV_HBA[3] = 0.769741833862266;    ANV_HBB[3] = 0.839889624849638;
+ANV_HBA[4] = 0.8922608180038789;   ANV_HBB[4] = 0.9315419599631839;
+ANV_HBA[5] = 0.962094548378084;    ANV_HBB[5] = 0.9878163707328971;
+
+// ── build + verify (always BLACK first: the ground truth is BLACK's table;
+//    anv_recalc() applies the BLUE rebuild afterwards if the voice asks) ──
+anv_build_static();
+ANV_T0 = anv_th(ANV_ABIAS/ANV_SATV);   // legacy rest value; anv_amp re-derives per sample
+ANV_SATLO = 0.2*ANV_SATV;
+ANV_IPSHDX = (ANV_PSH_N - 1)/(2*ANV_VMAX);
+ANV_IQ4DX  = (ANV_Q4_N - 1)/(2*ANV_Q4_VMAX);
+anv_build_shapers();
+anv_build_cell(ANV_CELLK, ANV_LNK, ANV_GAMMA);   // BLACK: rev D, source driven
+anv_build_cell(ANV_CELLB, ANV_LNK, 0);           // BLUE:  rev A, source grounded
+anv_vxt = anv_sl_voice > 0.5; // no fade on load, only on a change:
+anv_vxf = anv_vxt;            // the weight STARTS at the target
+anv_bypt = anv_sl_byp > 0.5 ? 1 : 0;   // bypass target + weight likewise
+anv_bypw = anv_bypt;
+anv_selfcheck();
+
+// runtime state. BOTH detectors, always — dr is live only in dual mono, but a
+// dr.vg left at 0 would put channel 1 at the wrong gate the instant it is.
+dl.vcap = 0; dl.vg = ANV_VGREST; dl.v22 = dl.sbp = dl.sbn = 0;
+dr.vcap = 0; dr.vg = ANV_VGREST; dr.v22 = dr.sbp = dr.sbn = 0;
+anv_link = anv_sl_link > 0.5;
+// Seat the output cores at their RESTING magnetisation. Leaving these at 0
+// makes the first sample see a full -ANV_IM0 step through the source
+// divider — the thump on insert. lam starts at 0 (correct: no flux yet);
+// it is the CURRENT that must start where the DC bias puts it.
+corel.im = ANV_IM0;
+corer.im = ANV_IM0;
+// One direct recalc, so the first block has coefficients no matter what the
+// host does; from here on it is @block's alone.
+anv_rc_req = 0;
+anv_atk_w = anv_sl_atk;       // wipers start WHERE THE KNOBS ARE, or the first
+anv_rel_w = anv_sl_rel;       // 40 ms of every session sweeps the timing network
+anv_recalc();
+anv_ingain  = anv_ingain_t;   // seated, or the plugin fades in on load
+anv_outgain = anv_outgain_t;
+anv_mixw    = anv_mixw_t;
+
+gr_vu.rk_vu_init_gr();        // GR meter: fed linear gain, 1.0 = none
+                              // (face and bezel are set at draw time)
+
+@slider
+// Requests only, same as the panel does. Automation and preset recall land
+// here too, and they must not derive coefficients on whatever thread they
+// arrive on either.
+atomic_set(anv_rc_req, 1);
+
+@block
+// ⚠️ ANV_SRSAFE and everything latched off it were fixed at @init, and @init
+// can be handed srate = 0 (see the note there). If that happened, the whole
+// timing network is sitting on the 48 kHz fallback while the project runs at
+// something else -- safe, but wrong. Re-latch the moment a sane rate is
+// visible and make the coefficients follow. Costs one comparison per block.
+// ⚠️ Yes, these are UPPERCASE and the house convention says constants are
+// written once in @init. They are: this is the same latch, corrected once,
+// on the audio thread, because the value @init was given was not real.
+srate > 1000 && srate != ANV_SRSAFE ? (
+  ANV_SRSAFE = srate;
+  ANV_DT  = 1/ANV_SRSAFE;
+  ANV_PKD = exp(-1/(0.4*ANV_SRSAFE));
+  ANV_SMC = 1 - exp(-1/(0.005*ANV_SRSAFE));
+  // the voice fade too: latched at @init off the 48k fallback, a 96k project
+  // would fade in ~2 ms instead of 4 -- the per-sample step stays sized for
+  // 48k while twice as many samples arrive per second. (One audit called this
+  // 8 ms; the arithmetic goes the other way.) anv_vxf is a WEIGHT, not a
+  // countdown,
+  // so re-deriving the step mid-fade is safe -- the walk just changes speed.
+  ANV_VXSTEP = 1/(0.004*ANV_SRSAFE);
+  atomic_set(anv_rc_req, 1);              // anv_dte and the whole timing network follow
+);
+
+// ⭐⭐THE POTS MOVE, THE DETECTOR DOES NOT GET SMOOTHED.
+// A wiper is a physical object: it sweeps through its resistance over the
+// duration of the gesture. Automation can teleport it instead, and a stepped
+// resistance steps the time constant, which puts a kink in the envelope's
+// slope. So the RESISTANCE is what travels gradually, and anv_recalc()
+// re-derives the network from the wiper actually in force.
+// ⭐Precisely: TIME-NORMALISED, BLOCK-RATE wiper movement. The total traversal
+// is ~40 ms regardless of block size or sample rate (that is what the
+// samplesblock/ANV_SRSAFE factor buys), but the RESOLUTION is one step per
+// block -- at 1024 samples / 48 kHz that is ~21 ms, so a 40 ms sweep lands in
+// about two positions. Accepted: this belongs in @block, and the alternative
+// is a per-sample recalc with a dozen transcendentals in it.
+// ⛔What is NOT smoothed, and must never be: the timing cap's charge, the
+// envelope, the self-bias states. Those ARE the modelled dynamics; a one-pole
+// on them would corrupt precisely what the model exists to reproduce. This is
+// the distinction between smoothing the control and smoothing the circuit.
+anv_atk_w != anv_sl_atk || anv_rel_w != anv_sl_rel ? (
+  anv_pstep = ANV_POTRATE*samplesblock/ANV_SRSAFE;
+  anv_atk_w += max(-anv_pstep, min(anv_pstep, anv_sl_atk - anv_atk_w));
+  anv_rel_w += max(-anv_pstep, min(anv_pstep, anv_sl_rel - anv_rel_w));
+  // SNAP on arrival. w + (target - w) is not exactly target in floating point,
+  // so without this the != above can stay true forever and every block pays for
+  // a full anv_recalc() -- a dozen exp/log calls -- on a knob nobody is moving.
+  abs(anv_sl_atk - anv_atk_w) < 0.0001 ? anv_atk_w = anv_sl_atk;
+  abs(anv_sl_rel - anv_rel_w) < 0.0001 ? anv_rel_w = anv_sl_rel;
+  atomic_set(anv_rc_req, 1);
+);
+
+// ⭐⭐HOUSE RULE, NOW ACTUALLY ENFORCED: @gfx may REQUEST a DSP-state change;
+// it must never perform one. Every control on the panel, and @slider with it,
+// sets anv_rc_req and stops there. Every coefficient in anv_recalc() -- the
+// gains, the whole attack/release network, anv_kchg/anv_kdis, the ratio drive
+// and bias, the diode R coordinate, the sidechain biquad, and the three voice
+// pointers -- is derived HERE, on the audio thread, between blocks.
+//
+// Until this landed the rule was written down but not kept: all eleven panel
+// controls called anv_recalc() straight from the GUI thread, so @sample could
+// read a half-updated timing network or a half-updated biquad mid-buffer. The
+// pointer swaps were always safe (one word each); the twenty-odd scalars
+// around them were not.
+//
+// ⭐The consume is GET-then-CAS, and the shape matters. Two prior versions
+// of this line were wrong in opposite directions. The plain read-clear had
+// the classic hole: @gfx writes 1 between the read and the clear and the
+// request is lost -- and my earlier defence, "slider_automate() fires
+// @slider which re-raises the flag", contradicted this file's OWN header,
+// which states slider_automate() does NOT re-run @slider. The header was
+// right; the defence was false; a lost click could leave a stale timing
+// network until the next touch.
+// So: atomic_set() from every producer (the house ban is on atomic_exch,
+// nothing else), and here atomic_get to observe, atomic_setifequal to
+// consume the 1 exactly if it is still there. A write landing between the
+// get and the CAS is consumed WITH this pass; a write landing after the CAS
+// survives for the next block. No interleaving loses a request, and the
+// CAS's return value is deliberately unused so nothing rests on its
+// old-vs-new semantics.
+// ⛔⛔THE ARGUMENT ORDER IS (dest, COMPARAND, NEWVALUE) -- "if dest ==
+// comparand, set dest to newvalue, return the old value". The first version
+// of this line had the last two swapped, which made the consume a NO-OP: the
+// flag went sticky at 1 and anv_recalc() -- pow, exp, the whole coefficient
+// build -- ran every block forever after the first touch. An external audit
+// caught it. The order is confirmed by every use in the local corpus (four
+// independent authors' lock idioms, e.g. atomic_setifequal(lock, 0, 1) as
+// try-acquire), and anv_selfcheck() now PROBES it at @init -- if REAPER's
+// semantics ever differ from this comment, the LED goes red instead of the
+// CPU quietly melting.
+atomic_get(anv_rc_req) > 0.5 ? (
+  atomic_setifequal(anv_rc_req, 1, 0);
+  anv_recalc();
+);
+
+// ⭐⭐THE COROLLARY, which cost a revision to learn: the PROCESSING RATE and
+// the STATE THAT BELONGS TO IT must change at the same audio-thread boundary.
+// An earlier pass deferred the 192-word oversampler clear to here but left
+// `anv_osf = anv_osn` back in anv_recalc, so flipping 2x switched the rate
+// immediately and cleared the filter memory a block later -- @sample ran at
+// the new rate over the old rate's state in between. Both halves live here.
+//
+// anv_osn is the requested rate (refreshed by the recalc above), anv_osf the
+// one in force, written only here. Comparing them IS the request, and unlike a
+// counter it cannot lose an update: flip the switch twice and the final value
+// is simply what this sees.
+
+anv_osn != anv_osf ? (
+  anv_osf = anv_osn;
+  memset(ANV_OSM, 0, 8*24);            // both halfband banks restart clean
+  dl.shx1 = dl.shx2 = dl.shy1 = dl.shy2 = 0;       // so do both SC HP biquads
+  dr.shx1 = dr.shx2 = dr.shy1 = dr.shy2 = 0;
+  dl.v22 = dl.sbp = dl.sbn = 0;                    // and both timing networks
+  dr.v22 = dr.sbp = dr.sbn = 0;
+  anv_recalc();                        // re-derive every rate-dependent constant
+);
+
+@sample
+// The circuit runs UNCONDITIONALLY; bypass only chooses what leaves. Freezing
+// it stops the detector charge, both flux integrators, the sidechain filter
+// and the oversampler dead, so re-engaging after a few seconds re-entered on
+// stale magnetic and detector state. Continuity costs the CPU either way.
+(
+  anv_dry0 = spl0;
+  anv_dry1 = spl1;
+  // arriving level, for the readout only -- never touches the audio path
+  anv_pk = max(anv_pk*ANV_PKD, max(abs(anv_dry0), abs(anv_dry1)));
+  anv_pk < 0.000000000001 ? anv_pk = 0;   // silence floor on the 0.4 s decay
+  // Host-control smoothing. These three are NOT circuit state -- they are the
+  // front panel arriving from a host that can step them instantly, which no pot
+  // can do. One pole, ~5 ms, at the host rate.
+  // ⛔The Attack/Release DETECTOR STATE is not smoothed and never will be --
+  // the timing capacitor's charge, the envelope and the self-bias are genuine
+  // circuit state. What IS rate-limited, in @block, is the modelled POT WIPER:
+  // host control moves through its travel instead of teleporting. Smoothing
+  // the control is not smoothing the circuit.
+  // IRON is smoothed below with the other controls -- the LF-probe
+  // measurement its old refusal note demanded exists now (probe_iron_knob.py)
+  // and settled it: control glides, state never touched.
+  anv_ingain  += (anv_ingain_t  - anv_ingain )*ANV_SMC;
+  anv_outgain += (anv_outgain_t - anv_outgain)*ANV_SMC;
+  anv_mixw    += (anv_mixw_t    - anv_mixw   )*ANV_SMC;
+  // IRON: smooth the CONTROL, never the state -- the attack/release rule,
+  // finally applied here. The knob scales the magnetising-current LAW while
+  // both cores keep their flux; a step in the blend weight is a step in i_m
+  // and therefore a click through the source divider, measured LF-heavy
+  // (probe_iron_knob.py: 0.68% -> 0.002% THD at 50 Hz across the travel).
+  // The flux integrators are continuous in the weight, so gliding it is
+  // safe by construction. An older comment refused a "reflex one-pole"
+  // pending a measurement; the measurement exists now, and this is it.
+  // anv_im0b rides the glided value -- it is the same blend evaluated at
+  // rest, and leaving it at the old value while anv_iron moved would put a
+  // false load-current offset into the Class A stage for the fade's 5 ms.
+  anv_iron += (anv_iron_t - anv_iron)*ANV_SMC;
+  // endpoint snaps: MIX and IRON can legitimately target exactly 0, and a
+  // pure one-pole never ARRIVES -- it walks the state into the subnormals
+  // instead, and anv_iron feeds both transformer laws every sample. Snap to
+  // the TARGET (not to zero) so every endpoint terminates, same as bypass.
+  abs(anv_mixw - anv_mixw_t) < 0.000000001 ? anv_mixw = anv_mixw_t;
+  abs(anv_iron - anv_iron_t) < 0.000000001 ? anv_iron = anv_iron_t;
+  anv_im0b  = ANV_LAMDC*ANV_ILM + anv_iron*(ANV_IM0 - ANV_LAMDC*ANV_ILM);
+
+  // walk the blue weight toward its target, clamping on arrival at EITHER
+  // end -- a reversal mid-walk is just a sign change here, no reset.
+  anv_vxf != anv_vxt ? (
+    anv_vxt > anv_vxf ? (
+      anv_vxf += ANV_VXSTEP; anv_vxf > anv_vxt ? anv_vxf = anv_vxt;
+    ) : (
+      anv_vxf -= ANV_VXSTEP; anv_vxf < anv_vxt ? anv_vxf = anv_vxt;
+    );
+  );
+
+  anv_in0 = spl0*anv_ingain;
+  anv_in1 = spl1*anv_ingain;
+
+  anv_osf < 2 ? (
+    anv_tick(anv_in0, anv_in1);
+    anv_y0 = anv_w0;
+    anv_y1 = anv_w1;
+  ) : (
+    // upsample (each polyphase branch runs once per host sample), run the
+    // circuit twice at 2x, downsample. ⛔NOT near-zero delay: the CORRECTED
+    // round trip measures ~3.97 host samples below 5 kHz and disperses upward
+    // (13 samples of group delay at 18 kHz). If this path is ever engaged it
+    // owes a pdc_delay. See ANV_OS_ALLOW.
+    anv_u00 = anv_hb_run(anv_in0, ANV_OSM + 0,   ANV_HBA);
+    anv_u01 = anv_hb_run(anv_in0, ANV_OSM + 24,  ANV_HBB);
+    anv_u10 = anv_hb_run(anv_in1, ANV_OSM + 48,  ANV_HBA);
+    anv_u11 = anv_hb_run(anv_in1, ANV_OSM + 72,  ANV_HBB);
+
+    anv_tick(anv_u00, anv_u10);
+    anv_t00 = anv_w0; anv_t10 = anv_w1;
+    anv_tick(anv_u01, anv_u11);
+
+    // ⭐The banks are CROSSED on purpose. A polyphase decimator needs one
+    // branch to lag the other by one 2x sample; feeding both from the same
+    // host sample -- what this used to do -- is a different filter, and it
+    // measures -0.08 dB of stopband, i.e. no stopband at all. Handing HBA the
+    // SECOND sub-sample and HBB the FIRST selects the odd output phase, which
+    // is exactly that one-sample lag and costs no state. Each state block
+    // stays welded to its own coefficient set.
+    anv_y0 = 0.5*(anv_hb_run(anv_w0,  ANV_OSM + 96,  ANV_HBA)
+                + anv_hb_run(anv_t00, ANV_OSM + 120, ANV_HBB));
+    anv_y1 = 0.5*(anv_hb_run(anv_w1,  ANV_OSM + 144, ANV_HBA)
+                + anv_hb_run(anv_t10, ANV_OSM + 168, ANV_HBB));
+  );
+
+  // NOTE the name. EEL2 identifiers are CASE-INSENSITIVE, so an earlier
+  // 'anv_gmin' here was the same variable as ANV_GMIN, the gate-axis
+  // minimum the cell lookup subtracts. It got overwritten every sample,
+  // the lookup clamped to row 0 (cutoff) and the compressor went inert
+  // from the second sample onward. Never name a working value after a
+  // table constant, in any case.
+  anv_grm = anv_g0 < anv_g1 ? anv_g0 : anv_g1;   // deeper channel drives the needle
+
+  // ── terminal safety ──────────────────────────────────────────────────
+  // ⛔NOT a clipper. The normal operating range is untouched on purpose: a
+  // hard clamp would become part of the transfer curve this whole model
+  // exists to reproduce. What this catches is a state that has gone
+  // non-finite or absurd -- and because the model INTEGRATES (core flux,
+  // the detector cap, the Rayleigh envelope), one bad sample would otherwise
+  // be inherited by every sample after it. So: hand back dry for this one and
+  // reseat exactly the states that can latch it. anv_y != anv_y is the NaN
+  // test; EEL2 has no isnan().
+  (anv_y0 != anv_y0 || anv_y1 != anv_y1 ||
+   abs(anv_y0) > 1000 || abs(anv_y1) > 1000) ? (
+    anv_y0 = anv_dry0; anv_y1 = anv_dry1;
+    dl.vcap = 0; dl.vg = ANV_VGREST; dl.v22 = dl.sbp = dl.sbn = 0;
+    dr.vcap = 0; dr.vg = ANV_VGREST; dr.v22 = dr.sbp = dr.sbn = 0;
+    // anv_im0b, NOT ANV_IM0: the rest current belongs to the ACTIVE iron
+    // blend. Reseating to the full-iron value with IRON below 1 injected a
+    // false load-current offset (im - anv_im0b != 0 at rest) into the Class A
+    // stage until the core settled again -- a recovery that added its own
+    // small wound. @init's ANV_IM0 seed stays correct because @init also
+    // seeds anv_iron = 1.
+    corel.lam = 0; corel.im = anv_im0b;
+    corer.lam = 0; corer.im = anv_im0b;
+    ixl.lam = ixl.lamenv = ixl.im = 0;
+    ixr.lam = ixr.lamenv = ixr.im = 0;
+    // ⚠️ The SC HP biquad HAS to be in here. It is the one recursive filter
+    // upstream of everything: its output IS anv_tap, which drives the rectifier,
+    // the diode and the cap. Leaving these four out meant a NaN that started in
+    // the filter -- or merely passed through it -- survived the reseat and
+    // poisoned the detector again on the very next sample, so the recovery
+    // would have looked like a hang rather than a recovery.
+    dl.shx1 = dl.shx2 = dl.shy1 = dl.shy2 = 0;
+    dr.shx1 = dr.shx2 = dr.shy1 = dr.shy2 = 0;
+    // Same argument for the halfband banks. Unreachable while ANV_OS_ALLOW = 0,
+    // included now so enabling 2x later cannot quietly reopen the hole.
+    memset(ANV_OSM, 0, 8*24);
+    anv_recov += 1;   // diagnostic counter, healthy value 0. NOT surfaced on
+                      // the panel yet -- if this ever reads non-zero in the
+                      // wild we want to know, so it wants a home there.
+  );
+
+  // A build that failed its own self-test does not get to be audible. The
+  // tables are rebuilt in @init from closed forms and checked against ground
+  // truth the exporter embedded; if that comparison fails, the surfaces are
+  // not the ones the model was fitted against and the honest output is the
+  // input. The LED already said so -- now the audio agrees with it.
+  // ⭐BYPASS is a SMOOTHED WEIGHT (same 5 ms one-pole as input/output/mix):
+  // it used to switch the output in one sample, and with wet != dry at the
+  // switch sample that is a click. The circuit always ran regardless -- bypass
+  // only chooses what leaves -- so fading what leaves costs nothing.
+  // ⛔The SELF-TEST branch stays a HARD CUT on purpose: a build whose tables
+  // failed verification must not spend 5 ms crossfading out of audio nobody
+  // has validated. Wrong-but-fading is worse than a click there.
+  // The snap at the ends is the denormal guard: (1 - anv_bypw) decaying
+  // toward zero forever otherwise walks the blend multiply through denormals
+  // on every silent tail.
+  !anv_st_ok ? (
+    anv_bypw = 1;
+    gr_vu.rk_vu_sample_gr(1);       // needle relaxes; audio passes untouched
+    spl0 = anv_dry0;
+    spl1 = anv_dry1;
+  ) : (
+    // ⭐POLICY, decided and recorded because every external audit re-raises
+    // it: there is NO +/-1 output clamp, on purpose. REAPER busses are
+    // floating point; a hard clamp inside the plugin is a clipper the model
+    // never had, destroys inter-plugin headroom, and would change the very
+    // transfer this file exists to reproduce. The |y| > 1000 guard above is
+    // CORRUPTION detection (NaN/runaway -> dry + reseat), not level
+    // management. Level management belongs to the host and the user's
+    // limiter. Generic JSFX style guides that demand a terminal clamp lose
+    // to this paragraph.
+    anv_bypw += (anv_bypt - anv_bypw)*ANV_SMC;
+    anv_bypw < 0.000001 ? anv_bypw = 0 : ( anv_bypw > 0.999999 ? anv_bypw = 1; );
+    gr_vu.rk_vu_sample_gr(anv_bypt > 0.5 ? 1 : anv_grm);
+    anv_wetw = anv_mixw*(1 - anv_bypw);
+    spl0 = anv_dry0 + (anv_y0 - anv_dry0)*anv_wetw;
+    spl1 = anv_dry1 + (anv_y1 - anv_dry1)*anv_wetw;
+  );
+);
+
+@gfx 380 800
+// ⚠️ @gfx sets the EMBED ASPECT (house rule: portrait = tall MCP strip;
+// 380x800 ≈ Drum Strip's 300x700 ratio so the strips pair in the mixer).
+// The floating window opens at ~489x800 (REAPER's ~489px min float width
+// is a hard floor) — portrait, and smaller than EON Weld's 900.
+micro = gfx_ext_flags & 1;
+gfx_getchar();
+ret = max(1, gfx_ext_retina);
+W = gfx_w; H = gfx_h;
+sc = micro ? ret : max(0.70, min(W/420, H/820));
+// ⭐⭐WIDTH FILL. sc is set by HEIGHT in every real floating window: REAPER
+// will not float this panel narrower than ~489px, so the W/420 term binds
+// only when W < 0.512*H, which does not happen. Everything sized in sc
+// therefore kept 420-wide proportions inside whatever width the window
+// actually had -- the meter, ratio row, readout and bypass bar held a
+// quarter to a third of the width and got relatively SMALLER the wider you
+// dragged it, while the knobs, placed at fractions of W, spread. Two
+// scaling laws on one face.
+//
+// gx_fw is how much wider the window is than the height-driven design
+// assumes. Width-spanning furniture is multiplied by it, so the face fills
+// what it is given. Capped at 1.20: past that the ratio buttons and the
+// bypass bar start reading as stretched rather than larger, and a very wide
+// window is better left with margins than with distorted furniture.
+gx_fw = micro ? 1 : max(1, min(W/(420*sc), 1.20));
+mx = mouse_x; my = mouse_y;
+LMB = mouse_cap & 1;
+lmb_down = LMB && !prev_LMB;
+// Face sheet open (rk_vu_picker, called last): widgets drawn before it must
+// not see this click. Stash the press edge; the picker call restores it.
+_anv_pk_lmb = lmb_down; !micro && gr_vu.pk_open ? lmb_down = 0;
+RMB = mouse_cap & 2;
+rmb_down = RMB && !prev_RMB;
+CTRL = mouse_cap & 4;
+SHIFT = mouse_cap & 8;
+gx_dt = min(time_precise() - gx_lt, 0.05); gx_lt = time_precise();
+dt = gx_dt; tau = 2*$pi; hv_speed = 11;   // knobs_kbsg caller contract
+frame_wheel = mouse_wheel/120;
+// Clear 0x200 UNCONDITIONALLY (house pattern: Drum Strip:1590, Swing_ReaKit,
+// Weld post-2026-08-27): gfx_ext_flags is ONE variable shared by both @gfx
+// passes, so a micro-gated clear leaves the embed's end-of-frame re-arm
+// standing across the floating pass. The re-arm below stays micro-gated.
+gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
+// Embedded wheel events arrive with a STALE mouse position; remember the
+// cursor on normal frames, reuse it on wheel frames (house-verified fix).
+micro ? (
+  frame_wheel == 0 ? ( gx_hmx = mx; gx_hmy = my; )
+                   : ( mx = gx_hmx; my = gx_hmy; );
+);
+
+// ── Skin: the Voice IS the face. BLACK = blackface; BLUE = silver
+// with the blue stripe through the meter. (One Rack theme-follow arrives
+// with Swing integration.)
+// The panel FILLS its window — house standard across the suite (EON Weld,
+// Drum Strip, StepSeq all do this). These three stay as names because every
+// position below is written against them; they simply resolve to the whole
+// surface now.
+gx_mfw = W;
+gx_mfx = 0;
+gx_mfc = W*0.5;
+
+gx_blu = anv_sl_voice > 0.5;
+gx_blu ? (
+  gx_bg_r = 0.700; gx_bg_g = 0.712; gx_bg_b = 0.736;   // brushed silver
+  gx_pn_r = 0.640; gx_pn_g = 0.652; gx_pn_b = 0.678;
+  gx_tx_r = 0.135; gx_tx_g = 0.145; gx_tx_b = 0.165;   // dark silkscreen
+  gx_td_r = 0.310; gx_td_g = 0.325; gx_td_b = 0.360;
+  gx_ac_r = 0.247; gx_ac_g = 0.427; gx_ac_b = 0.667;   // stripe blue
+) : (
+  gx_bg_r = 0.090; gx_bg_g = 0.094; gx_bg_b = 0.110;   // blackface panel
+  gx_pn_r = 0.135; gx_pn_g = 0.140; gx_pn_b = 0.160;
+  gx_tx_r = 0.930; gx_tx_g = 0.935; gx_tx_b = 0.950;
+  gx_td_r = 0.555; gx_td_g = 0.575; gx_td_b = 0.615;
+  gx_ac_r = 0.905; gx_ac_g = 0.915; gx_ac_b = 0.940;
+);
+
+// ── Faceplate ──────────────────────────────────────────────────────────
+// Panel: a real top-to-bottom gradient (the old flat overlay rect left a
+// hard seam at 34% height), then fine vertical striations for brushed metal.
+gx_g0 = gx_blu ? 0.115 : 0.030;          // lighten at the top
+gx_g1 = gx_blu ? -0.055 : -0.022;        // darken at the bottom
+gfx_gradrect(0, 0, W, H,
+  gx_bg_r + gx_g0, gx_bg_g + gx_g0, gx_bg_b + gx_g0, 1,
+  0, 0, 0, 0,
+  (gx_g1 - gx_g0)/H, (gx_g1 - gx_g0)/H, (gx_g1 - gx_g0)/H, 0);
+// (no striations: at panel scale they read as noise, not brushed metal,
+// and they were fighting every legend for contrast)
+
+show_chrome = !micro && H >= floor(120*ret);
+gx_hov = 0;
+
+// ── Needle physics: lightly under-damped spring chasing the true GR from
+// the solved surface (the meter reads the same table the audio uses).
+gx_tgt = anv_sl_byp > 0.5 ? 0 : anv_gr_db();
+
+// ── Layout ─────────────────────────────────────────────────────────────
+micro ? (
+  // MCP strip: VU first (the face of the unit), GR chip, ratio strip when
+  // there is room, then the knob grid (Drum Strip grammar: label above,
+  // value below), bypass pill at the floor.
+  top = floor(2*ret);
+  gx_vur = max(24, floor(min(W/2.8, H*0.22)));
+  gx_vcy = top + floor(2*ret) + gx_vur*1.4;
+  gx_vbot = gx_vcy + gx_vur*0.3;
+  gx_fy = top;
+  gx_rt_show = H >= floor(240*ret);
+  gx_bp_show = H >= floor(330*ret);
+  gx_kcols = W >= floor(150*ret) ? 4 : 2;
+  // the drawer adds SC HP, IRON, MIX and the 2x switch to the same grid
+  gx_krows = (anv_xt_open ? 8 : 4)/gx_kcols;
+) : (
+  // Single top-down cursor. Every row is placed from it, so nothing can
+  // collide and nothing can fall off the bottom.
+  gx_rt_show = 1; gx_bp_show = 1;
+  gx_vy = floor(52*sc);                    // voice rocker, clear of the brand
+  gx_vh = floor(19*sc);
+  gx_vur = floor(78*sc*gx_fw);             // meter radius
+  gx_vcy = gx_vy + gx_vh + floor(12*sc) + gx_vur*1.4;
+  gx_vbot = gx_vcy + gx_vur*0.34;
+  gx_fy = gx_vy;
+);
+gx_vg = 1;   // floating gap stretch — solved below once the chip row is known
+
+// ── Brand row + voice rocker (floating) ────────────────────────────────
+show_chrome ? (
+  gfx_setfont(3, "Arial", max(14, floor(23*sc)), 'b');
+  gfx_set(0, 0, 0, gx_blu ? 0.30 : 0.55);
+  anv_ltext("ANVIL", gx_mfc, floor(9*sc) + 1, floor(4*sc));
+  gfx_set(gx_tx_r, gx_tx_g, gx_tx_b, 1);
+  anv_ltext("ANVIL", gx_mfc, floor(9*sc), floor(4*sc));
+  gfx_setfont(4, "Arial", max(9, floor(10*sc)), 'b');
+  gfx_set(gx_tx_r, gx_tx_g, gx_tx_b, 0.68);
+  anv_ltext("FET LIMITING AMPLIFIER", gx_mfc, floor(33*sc), floor(2*sc));
+  anv_screw(gx_mfx + floor(9*sc), floor(11*sc), floor(4*sc));
+  anv_screw(gx_mfx + gx_mfw - floor(9*sc), floor(11*sc), floor(4*sc));
+  anv_screw(gx_mfx + floor(9*sc), H - floor(11*sc), floor(4*sc));
+  anv_screw(gx_mfx + gx_mfw - floor(9*sc), H - floor(11*sc), floor(4*sc));
+
+  // voice rocker: two half-buttons, engaged side lit
+  gx_vw = floor(136*sc);
+  gx_vx = gx_mfc - gx_vw*0.5;
+  gx_vhov = mx >= gx_vx && mx <= gx_vx + gx_vw && my >= gx_vy && my <= gx_vy + gx_vh;
+  gx_vhov && lmb_down ? (
+    anv_sl_voice = mx < gx_vx + gx_vw*0.5 ? 1 : 0;   // left = BLUE, right = BLACK
+    slider_automate(64); atomic_set(anv_rc_req, 1);
+  );
+  gfx_set(0, 0, 0, 0.62); gfx_rect(gx_vx - 1, gx_vy - 1, gx_vw + 2, gx_vh + 2);
+  gx_blu ? gfx_gradrect(gx_vx, gx_vy, gx_vw*0.5, gx_vh,
+             0.255, 0.400, 0.575, 1, 0,0,0,0, -0.006, -0.006, -0.006, 0)
+         : gfx_gradrect(gx_vx, gx_vy, gx_vw*0.5, gx_vh,
+             0.115, 0.118, 0.135, 1, 0,0,0,0, -0.002, -0.002, -0.002, 0);
+  gx_blu ? gfx_gradrect(gx_vx + gx_vw*0.5, gx_vy, gx_vw*0.5, gx_vh,
+             0.115, 0.118, 0.135, 1, 0,0,0,0, -0.002, -0.002, -0.002, 0)
+         : gfx_gradrect(gx_vx + gx_vw*0.5, gx_vy, gx_vw*0.5, gx_vh,
+             0.310, 0.315, 0.350, 1, 0,0,0,0, -0.006, -0.006, -0.006, 0);
+  gfx_set(1, 1, 1, 0.10); gfx_rect(gx_vx, gx_vy, gx_vw, 1);
+  gfx_set(0, 0, 0, 0.5); gfx_rect(gx_vx + gx_vw*0.5, gx_vy, 1, gx_vh);
+  gfx_setfont(5, "Arial", max(9, floor(10.5*sc)), 'b');
+  gfx_set(0.85, 0.91, 0.99, gx_blu ? 1 : 0.40);
+  anv_ltext("BLUE", gx_vx + gx_vw*0.25, gx_vy + (gx_vh - floor(10.5*sc))*0.5, floor(2*sc));
+  gfx_set(0.96, 0.95, 0.90, gx_blu ? 0.40 : 1);
+  anv_ltext("BLACK", gx_vx + gx_vw*0.75, gx_vy + (gx_vh - floor(10.5*sc))*0.5, floor(2*sc));
+  gx_vhov ? gx_hov = 1;
+);
+
+// ── The meter: the ReaKit house VU (rk_vu — clean-room 300 ms VU
+// movement, 20 faces), GR mode, bezel blended into the panel — the same
+// meter as EON Weld / 1175 / Drum Strip. The rev A blue stripe runs across
+// the PANEL through the meter zone in BLUE voice (the stripe is a panel
+// feature on the real unit; the lib owns the face itself).
+// The lib draws its own bezel; tint it with the panel value AT THIS HEIGHT
+// (the panel is a gradient now, so the base colour no longer matches and the
+// bezel read as a box around the meter).
+gx_pf = gx_g0 + (gx_g1 - gx_g0)*(gx_vcy/H);
+rk_vu_theme(anv_sl_face);                          // the face picked on the cover; Cream by default
+rk_vu_pal_rgb(2, gx_bg_r + gx_pf, gx_bg_g + gx_pf, gx_bg_b + gx_pf);
+// The lib's split draw, in the same box rk_vu_draw_at uses (2.6r x 1.7r,
+// centre 1.4r below the top), so the rev A stripe can go BETWEEN the face
+// card and the ink: on the real unit the stripe is paint on the meter's
+// face, and the needle, the hub cover and the glass all sit in front of it.
+// Drawn after the meter it ran over the hub dome and the needle root, and
+// rk_vu's dome is ~0.2r across where vu_kbsg's hub was a dot.
+rk_vu_face(gx_mfc - gx_vur*1.3, gx_vcy - gx_vur*1.4, gx_vur*2.6, gx_vur*1.7, 1, -1, "GR");
+gx_blu ? (
+  gx_sbh = max(3, floor(gx_vur*0.17));
+  gx_sby = gx_vcy + gx_vur*0.12 - gx_sbh*0.5;
+  gfx_set(0.235, 0.408, 0.635, 0.93);
+  gfx_rect(gx_mfx, gx_sby, gx_mfw, gx_sbh);
+  gfx_set(0.145, 0.267, 0.412, 0.95);
+  gfx_rect(gx_mfx, gx_sby, gx_mfw, 1);
+  gfx_rect(gx_mfx, gx_sby + gx_sbh - 1, gx_mfw, 1);
+  gfx_set(1, 1, 1, 0.10);
+  gfx_rect(gx_mfx, gx_sby + 1, gx_mfw, 1);
+);
+rkvu_hold_style = gr_vu.hold_style;
+rk_vu_ink(gr_vu.pos, gr_vu.hold, 1, 0);
+rk_vu_cap_led(gr_vu.over > 0);
+
+// Readout under the meter: what is arriving, and what the cell is doing
+// about it. INPUT is the threshold on this topology, so the arriving level
+// is the number you set INPUT against.
+gx_ind = anv_pk > 0.0000158 ? log(anv_pk)*8.68588963806504 : -99;
+gx_ind > -98 ? sprintf(#anv_val, "IN %.0f    GR %.1f", gx_ind, -gx_tgt)
+             : sprintf(#anv_val, "IN --    GR %.1f", -gx_tgt);
+gx_cy = gx_vbot + floor(8*(micro ? ret : sc));
+anv_chip(gx_mfc, gx_cy, floor(min(158*sc*gx_fw, gx_mfw - floor(16*sc))), floor(19*sc),
+         0.86, 0.72, 0.42);
+
+// ── floating layout solver: place every row from a cursor and stretch the
+// gaps to exactly fill the space above the bypass bar. Fixed budget 316sc,
+// stretchable budget 94sc; vg = 0 packs tight, 2 breathes on tall windows.
+micro ? 0 : (
+  gx_base  = gx_cy + floor(20*sc);
+  gx_avail = (H - floor(62*sc)) - gx_base;      // floor = bypass + footer
+  // budget grew: the panel scale rings each knob out to r*1.74 plus numerals
+  gx_kr3   = floor(16*sc);                      // drawer knob radius
+  gx_xtdh  = anv_xt_open ? floor(136*sc) : 0;   // the drawer's own budget
+  // If the window cannot take the drawer whole, its knobs shrink -- the stack
+  // must not run off the bottom to make room for it.
+  anv_xt_open ? (
+    gx_xtsp = gx_avail - floor(356*sc);
+    gx_xtsp < gx_xtdh ? (
+      gx_kr3  = max(floor(7*sc), gx_kr3 - ceil((gx_xtdh - gx_xtsp)/3.69));
+      gx_xtdh = floor(136*sc) - floor((floor(14*sc) - gx_kr3)*3.69);
+    );
+  );
+  // The cap used to be 1.8, which every real window size saturated: the
+  // stretch went to its ceiling and the leftover -- 28px at 640, 184px at
+  // 1100 -- was dumped as a dead gap above the bypass bar instead of being
+  // spread through the stack. The solver only solves if it is allowed to.
+  gx_vg    = max(0, min(6, (gx_avail - floor(356*sc) - gx_xtdh)/(74*sc)));
+  gx_ky1  = gx_base + floor(62*sc) + floor(20*sc*gx_vg);
+  gx_ky2  = gx_ky1 + floor(112*sc) + floor(18*sc*gx_vg);
+  gx_ry_f = gx_ky2 + floor(70*sc) + floor(18*sc*gx_vg);
+  gx_ky3  = gx_ry_f + floor(26*sc) + floor(48*sc) + floor(16*sc*gx_vg);
+  gx_ky4  = gx_ky3 + floor(23*sc) + gx_kr3*1.95 + floor(32*sc);
+  // Last resort on a window too short to hold the drawer at any knob
+  // size: it crowds the button above it rather than crossing the
+  // bypass bar below it. Nothing ever leaves the panel.
+  gx_ky4  = min(gx_ky4,
+                H - floor(61*sc) - gx_kr3*1.74 - floor(30*sc));
+);
+
+// ── Ratio buttons: 20 12 8 4 | ALL ─────────────────────────────────────
+gx_rt_show ? (
+  gx_bw = micro ? floor(W/5.6) : floor(56*sc*gx_fw);
+  gx_aw = micro ? floor(W/4.6) : floor(72*sc*gx_fw);
+  gx_bh = micro ? floor(15*ret) : floor(26*sc);
+  gx_gap = micro ? floor(2*ret) : floor(7*sc*gx_fw);
+  gx_rw = 4*gx_bw + gx_aw + 4*gx_gap;
+  gx_rx = gx_mfc - gx_rw*0.5;
+  gx_ry = micro ? gx_cy + floor(20*ret) : gx_ry_f;
+  gx_i = 0;
+  loop(5,
+    gx_bx = gx_rx + gx_i*(gx_bw + gx_gap) + (gx_i == 4 ? 0 : 0);
+    gx_bwc = gx_i == 4 ? gx_aw : gx_bw;
+    gx_bhov = mx >= gx_bx && mx <= gx_bx + gx_bwc && my >= gx_ry && my <= gx_ry + gx_bh;
+    gx_bhov && lmb_down ? ( anv_sl_ratio = gx_i; slider_automate(16); atomic_set(anv_rc_req, 1); );
+    gx_on = (anv_sl_ratio|0) == gx_i;
+    gx_on ? (
+      // pressed: sunk, lit, with the shadow above it
+      gfx_gradrect(gx_bx, gx_ry + 2, gx_bwc, gx_bh - 2,
+        0.48, 0.13, 0.10, 1, 0,0,0,0, 0.0035, 0.0015, 0.0012, 0);
+      gfx_set(0, 0, 0, 0.55); gfx_rect(gx_bx, gx_ry + 2, gx_bwc, 1);
+      gfx_set(1, 0.55, 0.45, 0.25); gfx_rect(gx_bx, gx_ry + gx_bh - 1, gx_bwc, 1);
+      gfx_set(0.18, 0.04, 0.03, 1); gfx_rect(gx_bx, gx_ry + 2, gx_bwc, gx_bh - 2, 0);
+    ) : (
+      // raised: brushed cap, light from above
+      gfx_gradrect(gx_bx, gx_ry, gx_bwc, gx_bh - 2,
+        0.845, 0.855, 0.875, 1, 0,0,0,0, -0.0055, -0.0055, -0.0052, 0);
+      gfx_set(1, 1, 1, 0.75); gfx_rect(gx_bx, gx_ry, gx_bwc, 1);
+      gfx_set(0, 0, 0, 0.50); gfx_rect(gx_bx, gx_ry + gx_bh - 2, gx_bwc, 2);
+      gfx_set(0, 0, 0, 0.30); gfx_rect(gx_bx, gx_ry, gx_bwc, gx_bh - 2, 0);
+    );
+    gfx_setfont(5, "Arial", max(8, floor((micro ? 9*ret : 12.5*sc))), 'b');
+    gx_on ? gfx_set(0.96, 0.93, 0.88, 1) : gfx_set(0.16, 0.17, 0.19, 1);
+    gx_i == 0 ? strcpy(#anv_val, "20") : gx_i == 1 ? strcpy(#anv_val, "12") :
+    gx_i == 2 ? strcpy(#anv_val, "8")  : gx_i == 3 ? strcpy(#anv_val, "4")  :
+                strcpy(#anv_val, "ALL");
+    gfx_measurestr(#anv_val, gx_tw, gx_th);
+    gfx_x = gx_bx + gx_bwc*0.5 - gx_tw*0.5;
+    gfx_y = gx_ry + (gx_bh - gx_th)*0.5 + (gx_on ? 1 : 0);
+    gfx_drawstr(#anv_val);
+    gx_bhov ? gx_hov = 1;
+    gx_i += 1;
+  );
+  // 11sc is the legend's own height, so this was landing its baseline on
+  // the buttons; the extra 6sc is the gap between them.
+  gx_rlab_y = gx_ry - floor(11*sc) - floor(6*sc);
+  micro ? 0 : (
+    gfx_setfont(4, "Arial", max(9, floor(11*sc)), 'b');
+    gfx_set(gx_tx_r, gx_tx_g, gx_tx_b, 0.9);
+    anv_ltext("RATIO", gx_mfc, gx_rlab_y, floor(2.6*sc));
+  );
+);
+
+// ── Knobs ──────────────────────────────────────────────────────────────
+// Floating: IN/OUT big pair, ATK/REL pair, and -- when the XTRAS drawer is
+// open -- SC HP/IRON/MIX plus the 2x switch on a fourth row, each with LED
+// chip + engraved label. Embedded: the Drum Strip grid grammar, 4 slots
+// closed and 8 open. Every write pairs slider_automate(mask) with an
+// ATOMIC atomic_set(anv_rc_req, 1) -- consumed by CAS in @block --
+// -- the REQUEST flag, not a direct anv_recalc() call, which from this thread
+// was a real race and is exactly what the request/perform split exists for.
+micro ? (
+  gx_kcur = gx_rt_show ? gx_ry + gx_bh + floor(4*ret) : gx_cy + floor(20*ret);
+  gx_cellh = (H - gx_kcur - floor(20*ret)
+              - (gx_bp_show ? floor(32*ret) : floor(2*ret)))/gx_krows;
+  gx_kr = max(6, floor(min(W/gx_kcols*0.22, (gx_cellh - floor(22*ret))*0.34)));
+  gx_kr = min(gx_kr, floor(18*ret));
+  gx_val_show = gx_cellh >= gx_kr*2 + floor(26*ret);
+) : (
+  gx_kr1 = floor(29*sc);
+  gx_kr2 = floor(26*sc);
+  // gx_kr3 is solved with the layout (the drawer shrinks it on short windows)
+  // separators AFTER the radii exist — they were reading a stale gx_kr3
+  anv_sep(gx_cy + floor(30*sc));                        // meter | controls
+  anv_sep(gx_ry_f - floor(24*sc));                      // controls | ratio
+  anv_sep(gx_ky3 - floor(26*sc));                       // ratio | xtras
+);
+
+// The drawer reads as a compartment in the face that opened, so it gets a
+// shallow recess -- not a raised card. Drawn before the knobs that sit in it.
+!micro && anv_xt_open ? (
+  gx_xtby = gx_ky4 - gx_kr3*1.95 - floor(32*sc);
+  gx_xtbh = (gx_ky4 + gx_kr3*1.74 + floor(29*sc)) - gx_xtby;
+  gfx_set(0, 0, 0, gx_blu ? 0.10 : 0.24);
+  gfx_rect(gx_mfx + floor(16*sc), gx_xtby, gx_mfw - floor(32*sc), gx_xtbh);
+  gfx_set(0, 0, 0, gx_blu ? 0.22 : 0.50);
+  gfx_rect(gx_mfx + floor(16*sc), gx_xtby, gx_mfw - floor(32*sc), 1);
+  gfx_set(1, 1, 1, gx_blu ? 0.45 : 0.07);
+  gfx_rect(gx_mfx + floor(16*sc), gx_xtby + gx_xtbh - 1, gx_mfw - floor(32*sc), 1);
+);
+
+gx_ki = 0;
+loop(anv_xt_open ? 8 : 4,
+  micro ? (
+    // grid order: IN OUT ATK REL
+    gx_slot = gx_ki;
+    gx_kid = gx_ki;
+    gx_kcx = gx_mfx + gx_mfw/gx_kcols*(gx_slot % gx_kcols) + gx_mfw/(2*gx_kcols);
+    gx_kcy = gx_kcur + gx_cellh*((gx_slot/gx_kcols)|0) + floor(10*ret) + gx_kr;
+    gx_krr = gx_kr;
+  ) : (
+    gx_kid = gx_ki;
+    gx_kid == 0 ? ( gx_kcx = gx_mfx + gx_mfw*0.28; gx_kcy = gx_ky1; gx_krr = gx_kr1; ) :
+    gx_kid == 1 ? ( gx_kcx = gx_mfx + gx_mfw*0.72; gx_kcy = gx_ky1; gx_krr = gx_kr1; ) :
+    gx_kid == 2 ? ( gx_kcx = gx_mfx + gx_mfw*0.28; gx_kcy = gx_ky2; gx_krr = gx_kr2; ) :
+    gx_kid == 3 ? ( gx_kcx = gx_mfx + gx_mfw*0.72; gx_kcy = gx_ky2; gx_krr = gx_kr2; ) :
+                  ( gx_kcx = gx_mfx + gx_mfw*(0.155 + (gx_kid - 4)*0.23);
+                    gx_kcy = gx_ky4; gx_krr = gx_kr3; );
+  );
+  gx_km = anv_km + gx_kid*KS;
+
+  // Slot 7 is a switch, not a value, so it leaves the knob path entirely.
+  gx_kid == 7 ? (
+    // ⚠️TWO chips share this one cell, and that is deliberate rather than
+    // cramped: a ninth grid slot would make the embed's row arithmetic
+    // 9/gx_kcols — 2.25 or 4.5 rows — and round a control off the bottom of
+    // the MCP view. Splitting a cell costs nothing and keeps 8/gx_kcols exact.
+    gx_b2w  = floor(gx_krr*1.26);
+    gx_b2h  = floor(gx_krr*1.5);
+    gx_b2x  = gx_kcx - gx_krr*0.72;        // left  — oversample
+    gx_b2xr = gx_kcx + gx_krr*0.72;        // right — detector link
+    ANV_OS_ALLOW ? (
+      anv_xtchip(gx_b2x - gx_b2w*0.5, gx_kcy - gx_b2h*0.5, gx_b2w, gx_b2h,
+                 anv_sl_os > 0.5, "2X") ? (
+        anv_sl_os = anv_sl_os > 0.5 ? 0 : 1; slider_automate(256); atomic_set(anv_rc_req, 1);
+      );
+    ) : (
+      // A switch known to damage the frequency response should not be
+      // pressable. Drawn as a dead recessed plate: no cap, no hover, no
+      // click -- it reads as a hole where a control will go.
+      gfx_set(0, 0, 0, gx_blu ? 0.16 : 0.34);
+      gfx_rect(gx_b2x - gx_b2w*0.5, gx_kcy - gx_b2h*0.5, gx_b2w, gx_b2h);
+      gfx_set(0, 0, 0, gx_blu ? 0.28 : 0.55);
+      gfx_rect(gx_b2x - gx_b2w*0.5, gx_kcy - gx_b2h*0.5, gx_b2w, 1);
+      gfx_set(1, 1, 1, gx_blu ? 0.40 : 0.06);
+      gfx_rect(gx_b2x - gx_b2w*0.5, gx_kcy + gx_b2h*0.5 - 1, gx_b2w, 1);
+      gfx_setfont(7, "Arial", max(7, floor(gx_b2h*0.56)), 'b');
+      gfx_set(gx_td_r, gx_td_g, gx_td_b, 0.55);
+      gfx_measurestr("2X", gx_tw, gx_th);
+      gfx_x = gx_b2x - gx_tw*0.5; gfx_y = gx_kcy - gx_th*0.5;
+      gfx_drawstr("2X");
+    );
+
+    // DETECTOR LINK. Lit = ST, one sidechain fed by the louder channel, which
+    // is a strapped pair. Unlit = DU, two complete independent detectors.
+    // ⭐It reads its own state rather than a generic on/off, because "off"
+    // would be the wrong word for either position.
+    anv_xtchip(gx_b2xr - gx_b2w*0.5, gx_kcy - gx_b2h*0.5, gx_b2w, gx_b2h,
+               anv_sl_link > 0.5, anv_sl_link > 0.5 ? "ST" : "DU") ? (
+      anv_sl_link = anv_sl_link > 0.5 ? 0 : 1;
+      slider_automate(2048); atomic_set(anv_rc_req, 1);
+    );
+
+    gfx_setfont(5, "Arial", max(7, floor(micro ? 8*ret : 11*sc)), 'b');
+    gfx_set(gx_td_r, gx_td_g, gx_td_b, 0.92);
+    micro ? (
+      strcpy(#anv_lbl, "OS/DET");
+      gfx_measurestr(#anv_lbl, gx_tw, gx_th);
+      gfx_x = gx_kcx - gx_tw*0.5; gfx_y = gx_kcy - gx_krr*1.62 - floor(9*ret);
+      gfx_drawstr(#anv_lbl);
+    ) : (
+      anv_ltext(ANV_OS_ALLOW ? "OVERSAMP" : "UNAVAIL",
+                gx_b2x, gx_kcy + gx_b2h*0.5 + floor(9*sc), max(1, floor(1.2*sc)));
+      anv_ltext(anv_sl_link > 0.5 ? "STEREO" : "DUAL",
+                gx_b2xr, gx_kcy + gx_b2h*0.5 + floor(9*sc), max(1, floor(1.2*sc)));
+    );
+  ) : (
+
+  gx_kid == 0 ? (
+    gx_nv = ssl_knob_interact(gx_km, gx_kcx, gx_kcy, gx_krr, anv_sl_in, -30, 24, 0, 0);
+    gx_nv != anv_sl_in ? ( anv_sl_in = gx_nv; slider_automate(1); atomic_set(anv_rc_req, 1); );
+    gx_dv = anv_sl_in; gx_dmin = -30; gx_dmax = 24; gx_dsym = 0;
+    strcpy(#anv_lbl, "INPUT"); sprintf(#anv_val, "%+.1f", anv_sl_in);
+  ) :
+  gx_kid == 1 ? (
+    gx_nv = ssl_knob_interact(gx_km, gx_kcx, gx_kcy, gx_krr, anv_sl_out, -24, 24, 0, 0);
+    gx_nv != anv_sl_out ? ( anv_sl_out = gx_nv; slider_automate(2); atomic_set(anv_rc_req, 1); );
+    gx_dv = anv_sl_out; gx_dmin = -24; gx_dmax = 24; gx_dsym = 1;
+    strcpy(#anv_lbl, "OUTPUT"); sprintf(#anv_val, "%+.1f", anv_sl_out);
+  ) :
+  gx_kid == 2 ? (
+    gx_nv = ssl_knob_interact(gx_km, gx_kcx, gx_kcy, gx_krr, anv_sl_atk, 1, 7, 3, 0);
+    gx_nv != anv_sl_atk ? ( anv_sl_atk = gx_nv; slider_automate(4); atomic_set(anv_rc_req, 1); );
+    gx_dv = anv_sl_atk; gx_dmin = 1; gx_dmax = 7; gx_dsym = 0;
+    strcpy(#anv_lbl, "ATTACK");
+    anv_atk_us < 1000 ? sprintf(#anv_val, "%.0fus", anv_atk_us)
+                      : sprintf(#anv_val, "%.1fms", anv_atk_us*0.001);
+  ) :
+  gx_kid == 3 ? (
+    gx_nv = ssl_knob_interact(gx_km, gx_kcx, gx_kcy, gx_krr, anv_sl_rel, 1, 7, 5, 0);
+    gx_nv != anv_sl_rel ? ( anv_sl_rel = gx_nv; slider_automate(8); atomic_set(anv_rc_req, 1); );
+    gx_dv = anv_sl_rel; gx_dmin = 1; gx_dmax = 7; gx_dsym = 0;
+    strcpy(#anv_lbl, "RELEASE"); sprintf(#anv_val, "%.0fms", anv_rel_ms);
+  ) :
+  gx_kid == 4 ? (
+    gx_nv = ssl_knob_interact(gx_km, gx_kcx, gx_kcy, gx_krr, anv_sl_schp, 0, 500, 0, 0);
+    gx_nv != anv_sl_schp ? ( anv_sl_schp = gx_nv; slider_automate(512); atomic_set(anv_rc_req, 1); );
+    gx_dv = anv_sl_schp; gx_dmin = 0; gx_dmax = 500; gx_dsym = 0;
+    strcpy(#anv_lbl, "SC HP");
+    anv_sl_schp < 20 ? strcpy(#anv_val, "OFF")
+                     : sprintf(#anv_val, "%.0fHz", anv_sl_schp);
+  ) :
+  gx_kid == 5 ? (
+    gx_nv = ssl_knob_interact(gx_km, gx_kcx, gx_kcy, gx_krr, anv_sl_iron, 0, 1, 1, 0);
+    gx_nv != anv_sl_iron ? ( anv_sl_iron = gx_nv; slider_automate(1024); atomic_set(anv_rc_req, 1); );
+    gx_dv = anv_sl_iron; gx_dmin = 0; gx_dmax = 1; gx_dsym = 0;
+    strcpy(#anv_lbl, "IRON"); sprintf(#anv_val, "%.0f%%", anv_sl_iron*100);
+  ) : (
+    gx_nv = ssl_knob_interact(gx_km, gx_kcx, gx_kcy, gx_krr, anv_sl_mix, 0, 1, 1, 0);
+    gx_nv != anv_sl_mix ? ( anv_sl_mix = gx_nv; slider_automate(32); atomic_set(anv_rc_req, 1); );
+    gx_dv = anv_sl_mix; gx_dmin = 0; gx_dmax = 1; gx_dsym = 0;
+    strcpy(#anv_lbl, "MIX"); sprintf(#anv_val, "%.0f%%", anv_sl_mix*100);
+  );
+
+  anv_knob(gx_kcx, gx_kcy, gx_krr, gx_dv, gx_dmin, gx_dmax, !micro, gx_km[6]);
+
+  micro ? (
+    (gx_val_show || gx_km[6]) ? (
+      gfx_setfont(6, "Arial", max(8, floor(9*ret)), 'b');
+      gfx_set(gx_tx_r, gx_tx_g, gx_tx_b, 0.95);
+      gfx_measurestr(#anv_val, gx_tw, gx_th);
+      gfx_x = max(floor(2*ret), min(W - gx_tw - floor(2*ret), gx_kcx - gx_tw*0.5));
+      gfx_y = gx_kcy + gx_krr*1.62 + floor(1*ret);
+      gfx_drawstr(#anv_val);
+    );
+    gx_kid == 0 ? strcpy(#anv_lbl, "IN")  : gx_kid == 1 ? strcpy(#anv_lbl, "OUT") :
+    gx_kid == 2 ? strcpy(#anv_lbl, "ATK") : gx_kid == 3 ? strcpy(#anv_lbl, "REL") :
+    gx_kid == 4 ? strcpy(#anv_lbl, "HP")  : gx_kid == 5 ? strcpy(#anv_lbl, "IRN") :
+                  strcpy(#anv_lbl, "MIX");
+    gfx_setfont(5, "Arial", max(8, floor(9*ret)), 'b');
+    gfx_set(gx_tx_r, gx_tx_g, gx_tx_b, 0.95);
+    gfx_measurestr(#anv_lbl, gx_tw, gx_th);
+    gfx_x = gx_kcx - gx_tw*0.5; gfx_y = gx_kcy - gx_krr*1.62 - floor(9*ret);
+    gfx_drawstr(#anv_lbl);
+  ) : (
+    anv_chip(gx_kcx, gx_kcy - gx_krr*1.95 - floor(24*sc), floor(70*sc*gx_fw),
+             floor(19*sc), gx_ac_r, gx_ac_g, gx_ac_b);
+    gfx_setfont(5, "Arial", max(9, floor(14*sc)), 'b');
+    gfx_set(0, 0, 0, gx_blu ? 0.22 : 0.5);
+    anv_ltext(#anv_lbl, gx_kcx, gx_kcy + gx_krr*1.74 + floor(7*sc) + 1, floor(1.2*sc));
+    gfx_set(gx_tx_r, gx_tx_g, gx_tx_b, 1);
+    anv_ltext(#anv_lbl, gx_kcx, gx_kcy + gx_krr*1.74 + floor(7*sc), floor(1.2*sc));
+  );
+  gx_km[6] ? gx_hov = 1;
+  );
+  gx_ki += 1;
+);
+
+// -- XTRAS button -------------------------------------------------------
+// One small button, in the same raised-cap bevel as the ratio row so it
+// reads as a control of the same family. It opens the drawer above the
+// bypass bar: SC HP, IRON and MIX as real knobs plus the 2x switch, drawn
+// into the layout, which the solver has already made room for.
+gx_sups = micro ? ret : sc;
+gx_suph = floor(micro ? 15*ret : 22*sc);
+gx_supw = micro ? min(W - floor(10*ret), floor(62*ret)) : floor(86*sc*gx_fw);
+gx_supx = floor(gx_mfc - gx_supw*0.5);
+gx_supy = micro
+  ? floor(H - (gx_bp_show ? floor(32*ret) : floor(2*ret)) - gx_suph - floor(3*ret))
+  : floor(gx_ky3 - gx_suph*0.5);
+gx_suphv = mx >= gx_supx && mx <= gx_supx + gx_supw
+        && my >= gx_supy && my <= gx_supy + gx_suph;
+gx_suphv ? gx_hov = 1;
+gx_suphv && lmb_down ? anv_xt_open = anv_xt_open > 0.5 ? 0 : 1;
+
+anv_xt_open ? (
+  // held down for as long as its panel is showing
+  gfx_gradrect(gx_supx, gx_supy + 2, gx_supw, gx_suph - 2,
+    0.700, 0.710, 0.730, 1, 0,0,0,0, 0.0030, 0.0030, 0.0030, 0);
+  gfx_set(0, 0, 0, 0.55); gfx_rect(gx_supx, gx_supy + 2, gx_supw, 1);
+  gfx_set(1, 1, 1, 0.30); gfx_rect(gx_supx, gx_supy + gx_suph - 1, gx_supw, 1);
+  gfx_set(0, 0, 0, 0.35); gfx_rect(gx_supx, gx_supy + 2, gx_supw, gx_suph - 2, 0);
+) : (
+  gfx_gradrect(gx_supx, gx_supy, gx_supw, gx_suph - 2,
+    0.845, 0.855, 0.875, 1, 0,0,0,0, -0.0055, -0.0055, -0.0052, 0);
+  gfx_set(1, 1, 1, gx_suphv ? 0.95 : 0.75);
+  gfx_rect(gx_supx, gx_supy, gx_supw, 1);
+  gfx_set(0, 0, 0, 0.50);
+  gfx_rect(gx_supx, gx_supy + gx_suph - 2, gx_supw, 2);
+  gfx_set(0, 0, 0, 0.30);
+  gfx_rect(gx_supx, gx_supy, gx_supw, gx_suph - 2, 0);
+);
+
+gx_supfs = max(8, floor(micro ? 9*ret : 11.5*sc));
+gfx_setfont(5, "Arial", gx_supfs, 'b');
+gfx_set(0.16, 0.17, 0.19, 1);
+anv_ltext("XTRAS", gx_mfc - floor(5*gx_sups),
+          gx_supy + (gx_suph - gx_supfs)*0.5 - 1 + (anv_xt_open ? 2 : 0),
+          floor(max(1, 1.8*gx_sups)));
+
+// the arrow that says this opens -- and flips once it has
+gx_supts = max(3, floor(micro ? 3*ret : 4*sc));
+gx_supax = gx_supx + gx_supw - gx_supts - floor(8*gx_sups);
+gx_supay = gx_supy + gx_suph*0.5 - gx_supts*0.5 + (anv_xt_open ? 2 : 0);
+gfx_set(0.16, 0.17, 0.19, gx_suphv || anv_xt_open ? 1 : 0.8);
+anv_xt_open ? (
+  gfx_triangle(gx_supax - gx_supts, gx_supay + gx_supts,
+               gx_supax + gx_supts, gx_supay + gx_supts,
+               gx_supax,            gx_supay);
+) : (
+  gfx_triangle(gx_supax - gx_supts, gx_supay,
+               gx_supax + gx_supts, gx_supay,
+               gx_supax,            gx_supay + gx_supts);
+);
+
+// ── Footer: bypass bar, 2x chip, selftest LED ──────────────────────────
+gx_bp_show ? (
+  gx_bpw = micro ? floor(W*0.7) : floor(146*sc*gx_fw);
+  gx_bph = micro ? floor(18*ret) : floor(27*sc);
+  // Centred. The old +29sc shifted the bar right to clear a 2x button that
+  // used to sit beside it in the footer; that button moved into the XTRAS
+  // drawer and the offset stayed behind, leaving the bar off-centre with
+  // nothing in the space it was making room for.
+  gx_bpx = gx_mfc - gx_bpw*0.5;
+  gx_bpy = micro ? H - gx_bph - floor(4*ret) : H - gx_bph - floor(34*sc);
+  gx_bphov = mx >= gx_bpx && mx <= gx_bpx + gx_bpw && my >= gx_bpy && my <= gx_bpy + gx_bph;
+  gx_bphov && lmb_down ? ( anv_sl_byp = anv_sl_byp > 0.5 ? 0 : 1; slider_automate(128); atomic_set(anv_rc_req, 1); );
+  gfx_gradrect(gx_bpx, gx_bpy, gx_bpw, gx_bph,
+    gx_blu ? 0.30 : 0.175, gx_blu ? 0.31 : 0.180, gx_blu ? 0.34 : 0.205, 1,
+    0,0,0,0, -0.0022, -0.0022, -0.0022, 0);
+  gfx_set(1, 1, 1, 0.10); gfx_rect(gx_bpx, gx_bpy, gx_bpw, 1);
+  gfx_set(0, 0, 0, 0.55); gfx_rect(gx_bpx, gx_bpy + gx_bph - 1, gx_bpw, 1);
+  gfx_set(gx_td_r, gx_td_g, gx_td_b, gx_bphov ? 0.95 : 0.5);
+  gfx_rect(gx_bpx, gx_bpy, gx_bpw, gx_bph, 0);
+  anv_sl_byp > 0.5 ? gfx_set(0.95, 0.60, 0.20, 0.95) : gfx_set(0.25, 0.55, 0.30, 0.9);
+  gfx_circle(gx_bpx + floor(11*sc), gx_bpy + gx_bph*0.5, floor(4*sc), 1, 1);
+  gfx_setfont(5, "Arial", max(10, floor(12.5*sc)), 'b');
+  gfx_set(0.95, 0.95, 0.93, anv_sl_byp > 0.5 ? 1 : 0.82);
+  anv_ltext("BYPASS", gx_bpx + gx_bpw*0.5 + floor(5*sc),
+            gx_bpy + (gx_bph - floor(12.5*sc))*0.5, floor(2.6*sc));
+  gx_bphov ? gx_hov = 1;
+
+) : (
+  anv_sl_byp > 0.5 ? ( gfx_set(0.95, 0.60, 0.20, 0.9); gfx_circle(W - floor(7*ret), H - floor(7*ret), floor(3*ret), 1, 1); );
+);
+
+show_chrome ? (
+  // selftest LED + brand corner
+  // Green = tables verified. RED = self-test failed, and the audio is dry.
+  // AMBER = tables fine but the terminal guard has fired at least once, which
+  // should never happen in normal use: it means a state went non-finite and was
+  // reseated. Silent recovery is worse than no recovery -- if this is ever amber
+  // in the wild we want to hear about it.
+  anv_st_ok ? ( anv_recov > 0 ? gfx_set(0.86, 0.62, 0.16, 1)
+                              : gfx_set(0.30, 0.62, 0.34, 0.9) )
+            : gfx_set(0.90, 0.25, 0.20, 1);
+  gfx_circle(gx_mfx + gx_mfw - floor(50*sc), H - floor(19*sc), floor(3*sc), 1, 1);
+  gfx_setfont(4, "Arial", max(7, floor(9*sc)), 'b');
+  gfx_set(gx_td_r, gx_td_g, gx_td_b, 0.6);
+  gfx_x = gx_mfx + gx_mfw - floor(42*sc); gfx_y = H - floor(24*sc);
+  gfx_drawstr("EON");
+);
+!anv_st_ok ? ( gfx_set(0.90, 0.25, 0.20, 1); gfx_circle(floor(6*ret), floor(6*ret), floor(3*ret), 1, 1); )
+  : ( anv_recov > 0 ? ( gfx_set(0.86, 0.62, 0.16, 1); gfx_circle(floor(6*ret), floor(6*ret), floor(3*ret), 1, 1); ) );
+
+// ── Face picker on the meter's coil cover: a sheet of live miniatures of this
+// same face. LAST (it may open over everything), floating only. The pick lives
+// on a hidden slider so it persists with the project. ──
+!micro ? (
+  lmb_down = _anv_pk_lmb;
+  _anv_pk = rk_vu_picker(gx_mfc - gx_vur*1.3, gx_vcy - gx_vur*1.4, gx_vur*2.6, gx_vur*1.7, anv_sl_face);
+  _anv_pk >= 0 ? ( anv_sl_face = _anv_pk; slider_automate(2^12); );   // 2^12 = slider13
+);
+
+// ── End of frame: embed click-through re-arm + input latches ───────────
+micro && !gx_hov ? gfx_ext_flags |= 0x200;
+prev_LMB = LMB;
+prev_RMB = RMB;
+mouse_wheel = 0;

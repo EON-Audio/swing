@@ -3,7 +3,7 @@ desc:EON FX Return View — pad contributors monitor (Verb / Delay / Smash)
 // pads are feeding the bus: a vertical bar list of each contributing pad's send
 // level + a live "hitting" glow, inside a classic-rack hardware faceplate
 // (Lexicon-homage skin for the verb bus, Eventide-homage for the delay bus,
-// EON 76 skin for the smash bus — whose deck drives the EON 76 comp in the
+// EON Weld skin for the smash bus — whose deck drives the EON Weld comp in the
 // same FX chain over the GS_BC_LINK gmem band).
 //
 // Data is READ from the per-instance strip band in gmem (published by
@@ -18,7 +18,7 @@ options:gmem=Swing_Media_Transfer
 
 // Hidden/internal — driven by the bridge (bus_id) and the strip-sync companion
 // (link_slot). Not meant for the user.
-slider1:link_slot=-1<-1,64,1>-Linked registry slot (internal; Lua-pushed)
+slider1:link_slot=-1<-1,63,1>-Linked registry slot (internal; Lua-pushed)
 slider2:bus_id=0<0,2,1>-Bus (0 = Reverb, 1 = Delay, 2 = Smash) (internal)
 
 in_pin:left input
@@ -69,7 +69,9 @@ CMD_SEQ = 4; CMD_PAD = 5; CMD_PID = 6; CMD_VAL = 7;
 // indexes bus_val[] and the echo. Order:
 //   0 rvb_size · 1 rvb_damp · 2 rvb_width · 3 rvb_predelay · 4 rvb_hpf ·
 //   5 rvb_mix · 6 dly_div · 7 dly_fb · 8 dly_hpf_hz · 9 dly_lpf_hz ·
-//   10 dly_ping · 11 dly_mix
+//   10 dly_ping · 11 dly_mix · 12 rvb_on · 13 dly_on
+// 12/13 are the BUS ENABLES (Swing ser_ver 57). They are what the POWER pill
+// in the display header drives; dly_div no longer carries an OFF position.
 FX_PID_BUS_BASE       = 64;
 GS_STRIP_OFF_BUS_BASE = 610;
 DK_HOLD_S             = 0.30;   // adopt hold-off after a local edit (s)
@@ -88,13 +90,17 @@ m_glow   = freemem; freemem += NUM_PADS;
 // Control-deck state: local echo of the 12 bus params, per-param adopt
 // hold-off deadlines, knob interact memory (16 slots each), fader memory
 // (lib-managed via slider_init, which returns the bumped pointer).
-bus_val  = freemem; freemem += 12;
-dk_hold  = freemem; freemem += 12;
+bus_val  = freemem; freemem += 14;
+dk_hold  = freemem; freemem += 14;
+// The enables read as booleans, so zero-init would paint the POWER pill OFF
+// for the frames before the first echo lands (and forever on an unlinked
+// viewer). Every other slot is a level where 0 is an honest "unknown".
+bus_val[12] = 1; bus_val[13] = 1;
 dk_kmem  = freemem; freemem += 6 * 16;
 freemem  = slider_init(freemem, 6);
-// Smash deck (bus 2): local echo + adopt hold-off for the EON 76's params,
+// Smash deck (bus 2): local echo + adopt hold-off for the EON Weld's params,
 // linked over the GS_BC_LINK band (row per registry slot; MUST match
-// EON_76.jsfx). +0 hb · +1..8 echo (thr,rat,atk,rel,knee,mkp,mix,byp) ·
+// EON_Weld.jsfx). +0 hb · +1..8 echo (thr,rat,atk,rel,knee,mkp,mix,byp) ·
 // +9 GR dB · +16 cmd_seq · +17 cmd_param(1..8) · +18 cmd_val (seq LAST).
 GS_BC_LINK_BASE   = 26170000;
 GS_BC_LINK_STRIDE = 24;
@@ -102,9 +108,22 @@ bc_val  = freemem; freemem += 8;
 bc_hold = freemem; freemem += 8;
 bc_seq  = 0;   // our cmd counter (bumped per write; 76 consumes on change)
 
-// Push one comp-param edit to the linked EON 76 (param 1..8, real units).
-function bc_write(p, v) local(_row) (
+// Push one comp-param edit to the linked EON Weld (param 1..8, real units).
+function bc_write(p, v) local(_row, _rs) (
   _row = GS_BC_LINK_BASE + (max(0, link_slot) | 0) * GS_BC_LINK_STRIDE;
+  // Seed our counter from the row's RESIDENT seq on the first write to
+  // this row (2026-08-28): gmem persists for the whole REAPER process
+  // while bc_seq restarts at 0 per instantiation. The Weld adopts the
+  // resident value on its own reload — if our first bump lands on that
+  // same number, it reads "no change" and the FIRST deck edit after a
+  // project reload silently drops (knob snaps back at hold-off expiry).
+  // NaN row seeds from 0 (writer-restores discipline); a corrupt huge
+  // value is ignored so the counter cannot be driven to Inf.
+  bc_seeded_row == _row ? 0 : (
+    _rs = gmem[_row + 16];
+    _rs > bc_seq && _rs < 1000000000 ? bc_seq = _rs;
+    bc_seeded_row = _row;
+  );
   gmem[_row + 17] = p;
   gmem[_row + 18] = v;
   bc_seq += 1;
@@ -248,7 +267,11 @@ mx = mouse_x; my = mouse_y; lmb = mouse_cap & 1;
 // Consume the wheel ONCE per frame (don't let it accumulate between frames while
 // the cursor is off the bars — that caused a big jump on the next hover).
 wheel = mouse_wheel; mouse_wheel = 0;
-micro ? gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
+// Clear 0x200 UNCONDITIONALLY (house pattern: Drum Strip:1590, Swing_ReaKit,
+// Weld post-2026-08-27): gfx_ext_flags is ONE variable shared by both @gfx
+// passes, so a micro-gated clear leaves the embed's end-of-frame re-arm
+// standing across the floating pass. The re-arm below stays micro-gated.
+gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
 // Embedded wheel events arrive with a STALE/zero mouse position — every hover
 // test (rows AND deck knobs) misses on the wheel frame. Remember the cursor on
 // normal frames, reuse it on wheel frames (Drum Strip's user-verified fix).
@@ -292,6 +315,18 @@ i = 0; loop(NUM_PADS,
   i += 1;
 );
 
+// ── Bus enable echo (slots 12/13) ─────────────────────────────────────────
+// Adopted OUTSIDE the deck block on purpose: the POWER pill lives in the
+// display header, which draws on embeds far too short to show a deck. Same
+// hold-off contract as dk_commit so Swing's throttled echo (every 4th @block)
+// cannot fight a click that has just been sent. Smash has no enable - its bus
+// is raw sends into the EON Weld on this track, with no Swing-side DSP to gate.
+!smash ? (
+  _bo_b = GS_STRIP_BASE + (max(0, link_slot) | 0) * GS_STRIP_STRIDE + GS_STRIP_OFF_BUS_BASE;
+  (linked && time_precise() > dk_hold[12]) ? bus_val[12] = gmem[_bo_b + 12];
+  (linked && time_precise() > dk_hold[13]) ? bus_val[13] = gmem[_bo_b + 13];
+);
+
 // ── Faceplate chrome ───────────────────────────────────────────────────────
 verb  ? ( plr = 0.16;  plg = 0.17;  plb = 0.19;  ) :
 smash ? ( plr = 0.063; plg = 0.067; plb = 0.078; ) :
@@ -310,7 +345,7 @@ show_chrome ? (
   smash ? gfx_set(0.93, 0.94, 0.95, 1) :
           gfx_set(1.0, 0.55, 0.16, 1);
   gfx_x = floor(14 * sc); gfx_y = floor(7 * sc);
-  gfx_drawstr(verb ? "EON 480" : smash ? "EON 76" : "EON H9");
+  gfx_drawstr(verb ? "EON 480" : smash ? "EON WELD" : "EON H9");
   gfx_setfont(4, "Arial", max(8, floor(10 * sc)));
   gfx_set(0.58, 0.60, 0.64, 0.9);
   gfx_drawstr(verb ? "   DIGITAL REVERB" : smash ? "   BUS COMPRESSOR" : "   HARMONIZED DELAY");
@@ -355,6 +390,48 @@ gfx_x = dx + floor(6 * sc); gfx_y = dy + floor(4 * sc);
 gfx_drawstr(narrow ? (verb ? "REVERB" : smash ? "SMASH" : "DELAY")
                    : (verb ? "REVERB — CONTRIBUTORS" :
                       smash ? "SMASH — CONTRIBUTORS" : "DELAY — CONTRIBUTORS"));
+
+// ── POWER pill (right of the header) ──────────────────────────────────────
+// The bus enable, mirrored from Swing's LCD. In the header rather than the
+// deck so it survives a short embed — a bus you cannot switch off from the
+// return track is the gap this closes. Dark = off, lit phosphor = on; the
+// contributor list below dims to match so the whole panel reads as bypassed.
+bus_pow = 1;
+!smash ? (
+  _pw_k  = verb ? 12 : 13;
+  bus_pow = bus_val[_pw_k] >= 0.5;
+  _pw_w  = floor((narrow ? 30 : 42) * sc);
+  _pw_h  = floor(13 * sc);
+  _pw_x  = dx + dw - _pw_w - floor(6 * sc);
+  _pw_y  = dy + floor(3 * sc);
+  _pw_hv = linked && mx >= _pw_x && mx <= _pw_x + _pw_w &&
+                     my >= _pw_y && my <= _pw_y + _pw_h;
+  _pw_hv && lmb_down ? (
+    dk_commit(_pw_k, bus_pow ? 0 : 1);
+    bus_pow = !bus_pow;
+  );
+  bus_pow ? gfx_set(phr * 0.30, phg * 0.30, phb * 0.30, 1) : gfx_set(0.10, 0.10, 0.11, 1);
+  gfx_rect(_pw_x, _pw_y, _pw_w, _pw_h);
+  gfx_set(phr, phg, phb, _pw_hv ? 0.85 : 0.45);
+  gfx_rect(_pw_x, _pw_y, _pw_w, 1); gfx_rect(_pw_x, _pw_y + _pw_h - 1, _pw_w, 1);
+  gfx_rect(_pw_x, _pw_y, 1, _pw_h); gfx_rect(_pw_x + _pw_w - 1, _pw_y, 1, _pw_h);
+  // pilot lamp + legend
+  gfx_set(phr, phg, phb, bus_pow ? 0.95 : 0.28);
+  gfx_circle(_pw_x + floor(7 * sc), _pw_y + _pw_h * 0.5, max(2, floor(3 * sc)), 1, 1);
+  gfx_setfont(1, "Arial", max(7, floor(9 * sc)), 'b');
+  bus_pow ? strcpy(#pw_lbl, "ON") : strcpy(#pw_lbl, "OFF");
+  gfx_measurestr(#pw_lbl, _pw_tw, _pw_th);
+  gfx_set(phr, phg, phb, bus_pow ? 0.95 : 0.40);
+  gfx_x = _pw_x + floor(13 * sc); gfx_y = _pw_y + (_pw_h - _pw_th) * 0.5;
+  gfx_drawstr(#pw_lbl);
+  // restore the header font for anything downstream that assumes it
+  gfx_setfont(1, "Arial", max(8, floor(11 * sc)), 'b');
+  _pw_hv ? over_bar = 1;   // keep the click inline instead of popping the float
+  // Everything below this point is drawn in phosphor — knock it back once and
+  // the contributor list and the deck both read as bypassed, with no per-call
+  // -site dimming. The pill itself is already drawn, so it stays bright.
+  !bus_pow ? ( phr *= 0.5; phg *= 0.5; phb *= 0.5; );
+);
 
 listy = dy + floor(20 * sc);
 listh = dh - floor(24 * sc);
@@ -438,7 +515,7 @@ listh = dh - floor(24 * sc);
 // CrushStation homage: LED value windows over a rotary sync selector, FL-style
 // knobs and an illuminated ping toggle. Edits go through dk_commit → the CMD
 // mailbox; values echo back via GS_STRIP_OFF_BUS_BASE on Swing's publish tick.
-// Smash = EON 76 deck: six knobs driving the EON 76 in this same FX chain over
+// Smash = EON Weld deck: six knobs driving the EON Weld in this same FX chain over
 // the GS_BC_LINK band (bc_commit; echo + heartbeat published by its @block).
 over_deck = 0;
 dk_drag   = 0;
@@ -451,7 +528,7 @@ show_deck ? (
       _di += 1;
     );
   ) : (
-    // BC link: adopt the EON 76's param echo (hold-off guarded) + health-check
+    // BC link: adopt the EON Weld's param echo (hold-off guarded) + health-check
     // its @block heartbeat — stale for >1s ⇒ no comp in the chain (NO COMP).
     _db = GS_BC_LINK_BASE + (max(0, link_slot) | 0) * GS_BC_LINK_STRIDE;
     _di = 0; loop(8,
@@ -492,8 +569,7 @@ show_deck ? (
                        max(0, min(1, bus_val[_k] / _hi)), sld_base + _di * 16);
       // phosphor value above the throw
       _k == 3 ? sprintf(#dk_val, "%dms", bus_val[3] | 0) :
-      _k == 0 ? ( bus_val[0] <= 0.001 ? strcpy(#dk_val, "OFF")
-                                      : sprintf(#dk_val, "%d%%", floor(bus_val[0] * 100 + 0.5)) ) :
+      _k == 0 ? sprintf(#dk_val, "%d%%", floor(bus_val[0] * 100 + 0.5)) :
       _k == 4 ? ( bus_val[4] < 20 ? strcpy(#dk_val, "OFF")
                                   : sprintf(#dk_val, "%dHz", bus_val[4] | 0) ) :
                 sprintf(#dk_val, "%d%%", floor(bus_val[_k] * 100 + 0.5));
@@ -510,9 +586,9 @@ show_deck ? (
       _di += 1;
     );
   ) : smash ? (
-    // ── EON 76 deck: THR · RAT · ATK · REL · MKP · MIX → the comp in this chain ──
+    // ── EON Weld deck: THR · RAT · ATK · REL · MKP · MIX → the comp in this chain ──
     !bc_alive ? (
-      // No EON 76 heartbeat on this slot's link row — comp missing/offline.
+      // No EON Weld heartbeat on this slot's link row — comp missing/offline.
       gfx_setfont(6, "Arial", max(9, floor(12 * sc)), 'b');
       gfx_set(phr, phg, phb, 0.45);
       gfx_measurestr("NO COMP", _tw, _th);
@@ -525,19 +601,23 @@ show_deck ? (
       _di = 0; loop(6,
         _fc = dx + floor((_di + 0.5) * dk_pitch);
         // deck position → echo index k (0 thr · 1 rat · 2 atk · 3 rel · 5 mkp · 6 mix;
-        // knee 4 and bypass 7 stay on the EON 76 itself)
+        // knee 4 and bypass 7 stay on the EON Weld itself)
         _k = _di <= 3 ? _di : _di == 4 ? 5 : 6;
         // normalized 0..1 domain (log not needed — comp ranges are linear)
+        // REL maps 100..1200 ms = the EON Weld's real slider span
+        // (2026-08-28; it was 10..990+10 — the bottom tenth printed
+        // values the comp clamps away and the knob snapped back, while
+        // the Weld's own 1000-1200 zone was unreachable from the deck)
         _nrm = _k == 0 ? (bc_val[0] + 40) / 40 :
                _k == 1 ? (bc_val[1] - 1) / 19 :
                _k == 2 ? (bc_val[2] - 0.1) / 99.9 :
-               _k == 3 ? (bc_val[3] - 10) / 990 :
+               _k == 3 ? (bc_val[3] - 100) / 1100 :
                _k == 5 ? (bc_val[5] + 12) / 24 :
                          bc_val[6];
         _nrm = max(0, min(1, _nrm));
         // dbl-click defaults = the smash-context defaults
         _def = _k == 0 ? (-25 + 40) / 40 : _k == 1 ? (10 - 1) / 19 :
-               _k == 2 ? (3 - 0.1) / 99.9 : _k == 3 ? (120 - 10) / 990 :
+               _k == 2 ? (3 - 0.1) / 99.9 : _k == 3 ? (120 - 100) / 1100 :
                _k == 5 ? (8 + 12) / 24 : 1;
         _nv = ssl_knob_interact(dk_kmem + _di * 16, _fc, dk_kcy, dk_r, _nrm, 0, 1, _def, 0);
         _nv != _nrm ? (
@@ -545,14 +625,14 @@ show_deck ? (
             _k == 0 ? _nv * 40 - 40 :
             _k == 1 ? 1 + _nv * 19 :
             _k == 2 ? 0.1 + _nv * 99.9 :
-            _k == 3 ? 10 + _nv * 990 :
+            _k == 3 ? 100 + _nv * 1100 :
             _k == 5 ? _nv * 24 - 12 :
                       _nv);
         );
         _nrm = _k == 0 ? (bc_val[0] + 40) / 40 :
                _k == 1 ? (bc_val[1] - 1) / 19 :
                _k == 2 ? (bc_val[2] - 0.1) / 99.9 :
-               _k == 3 ? (bc_val[3] - 10) / 990 :
+               _k == 3 ? (bc_val[3] - 100) / 1100 :
                _k == 5 ? (bc_val[5] + 12) / 24 :
                          bc_val[6];
         rk_knob_draw(14, _fc, dk_kcy, dk_r, max(0, min(1, _nrm)), 0, 1, _k == 5,
@@ -580,13 +660,16 @@ show_deck ? (
     _di = 0; loop(6,
       _fc = dx + floor((_di + 0.5) * dk_pitch);
       _di == 0 ? (
-        // SYNC — stepped rotary through the 16 divisions (0 = OFF)
-        _pos = max(0, min(15, bus_val[6] | 0));
-        _np  = rotsel_interact(dk_kmem, _fc, dk_kcy, dk_r, _pos, 16);
-        _np != _pos ? dk_commit(6, _np);
-        rotsel_knob_draw(_fc, dk_kcy, dk_r, max(0, min(15, bus_val[6] | 0)), 16,
+        // SYNC — stepped rotary over the 15 REAL divisions (1..15). Position 0
+        // used to be OFF; that is the POWER pill's job now, and leaving it on
+        // the selector would let you silence a bus whose pilot lamp is lit.
+        // Detent index is div-1, so the commit adds it back.
+        _pos = max(1, min(15, bus_val[6] | 0)) - 1;
+        _np  = rotsel_interact(dk_kmem, _fc, dk_kcy, dk_r, _pos, 15);
+        _np != _pos ? dk_commit(6, _np + 1);
+        rotsel_knob_draw(_fc, dk_kcy, dk_r, _pos, 15,
                          dk_kmem[0], phr, phg, phb, 0.32, 0.33, 0.37);
-        dk_div_name(bus_val[6]);
+        dk_div_name(max(1, bus_val[6] | 0));
         strcpy(#dk_lab, "SYNC");
       ) :
       _di == 4 ? (

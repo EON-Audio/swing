@@ -99,15 +99,83 @@ local function each_midi_take_on_track(track, fn)
   end
 end
 
+-- Live Swing pad map (swing_state_reader over the per-slot identity band).
+-- Loaded lazily; `false` remembers a failed load so we don't retry per call.
+-- Declared up here because lane_range below needs it for stereo lanes.
+local swing_state
+local function ensure_swing_state()
+  if swing_state ~= nil then return swing_state or nil end
+  local ok, mod = pcall(dofile, SCRIPT_DIR .. 'swing_state_reader.lua')
+  swing_state = (ok and type(mod) == 'table' and mod.SlotForLane) and mod or false
+  return swing_state or nil
+end
+
+-- { [pad_index] = live pitch } for a stereo lane, straight from the paired
+-- Swing's identity band -- EVERY valid pad, no window applied. nil when the
+-- instance can't be resolved (offline / no bridge), so callers fall back to
+-- the tag's contiguous layout.
+local function stereo_live_pitches(lane_info)
+  local ss = ensure_swing_state()
+  if not ss then return nil end
+  pcall(ss.Init)
+  local ok, slot = pcall(ss.SlotForLane, lane_info)
+  if not ok or slot == nil then return nil end
+  local map, any = {}, false
+  for pad = 1, 16 do
+    local ok2, p = pcall(ss.GetPadPitch, pad, slot)
+    if ok2 and type(p) == 'number' and p == math.floor(p) and p > 0 and p <= 127 then
+      map[pad] = p
+      any = true
+    end
+  end
+  return any and map or nil
+end
+
 -- Resolve a lane's pitch range. Piano lanes use note_lo..note_hi; drum lanes
 -- collapse to pad_pitch..pad_pitch (so range-aware ops behave identically there).
+--
+-- STEREO lanes FOLLOW THE LIVE PAD MAP (2026-09-02). The tag's note_lo/note_hi
+-- were frozen when the bridge first saw the Swing (root..root+15, root=36 on a
+-- fresh insert), so any kit or remap that moved a pad outside that window had
+-- the pad DROPPED on StepSeq export and then WIPED from the StepSeq grid on the
+-- next region re-import (rig: .dev_tests/sssync_run.sh NO_SHOW ROOT44 -- rows
+-- 8..11 vanished). The range is now the UNION of the tag window and the live
+-- pitches: the live half is what makes every pad collectable/writable, the tag
+-- half keeps notes at pitches a pad USED to own inside the clear window, so an
+-- export still fully defines the region instead of leaving stale hits behind.
 local function lane_range(lane_info)
   local lo, hi = lane_info.note_lo, lane_info.note_hi
-  if type(lo) == 'number' and type(hi) == 'number' and hi >= lo then return lo, hi end
+  local tagged = type(lo) == 'number' and type(hi) == 'number' and hi >= lo
+  if lane_info.stereo == true then
+    local live = stereo_live_pitches(lane_info)
+    if live then
+      if not tagged then lo, hi = nil, nil end   -- malformed tag: live map alone
+      for _, p in pairs(live) do
+        if not lo or p < lo then lo = p end
+        if not hi or p > hi then hi = p end
+      end
+      return lo, hi
+    end
+  end
+  if tagged then return lo, hi end
   local p = lane_info.pad_pitch
   return p, p
 end
 M.LaneRange = lane_range
+M.StereoLivePitches = stereo_live_pitches   -- { [pad] = pitch } or nil when offline
+
+-- Is a StepSeq currently SYNCED to this lane's Swing? (Package 2: swing has one owner.
+-- While synced, the StepSeq's groove is what the item carries and what plays; the DM's
+-- own lane swing is shown as following it.) Reads the StepSeq courier band's SYNCON
+-- field for the lane's registry slot; false when the instance can't be resolved.
+function M.LaneSynced(lane_info)
+  local ss = ensure_swing_state()
+  if not ss then return false end
+  pcall(ss.Init)
+  local ok, slot = pcall(ss.SlotForLane, lane_info)
+  if not ok or slot == nil then return false end
+  return (reaper.gmem_read(26030000 + slot * 64 + 11) or 0) > 0.5   -- EON_SS_SYNC_SS_SYNCON
+end
 
 -- Collect all notes on `take` whose pitch is within [lo..hi]. For drum lanes
 -- (lo == hi == pad_pitch) this is the original single-pitch behavior. The note
@@ -675,7 +743,11 @@ function M.ZoomToAllItemsOnDMLanes()
       local n = reaper.CountTrackMediaItems(lane.track)
       for i = 0, n - 1 do
         local item = reaper.GetTrackMediaItem(lane.track, i)
-        if item then
+        -- MIDI only: a merged lane rides an audio track and carries audio items
+        -- by design, which would otherwise stretch the zoom to cover them.
+        -- No-op for classic and stereo lanes (MIDI is all they hold).
+        local tk = item and reaper.GetActiveTake(item)
+        if tk and reaper.TakeIsMIDI(tk) then
           local pos = reaper.GetMediaItemInfo_Value(item, 'D_POSITION') or 0
           local len = reaper.GetMediaItemInfo_Value(item, 'D_LENGTH')   or 0
           if pos < min_start          then min_start = pos          end
@@ -978,40 +1050,26 @@ end
 -- Stereo-mode support: a stereo lane (lane_info.stereo == true, tag on the
 -- Swing track itself) holds ALL pads' notes in one take, so the blob
 -- conversion needs a pad_index <-> pitch map. Prefer the live Swing pad map
--- (per-slot identity band); fall back to the contiguous note_lo + pad - 1
--- layout BuildStereo writes when the instance is offline.
-local swing_state
-local function ensure_swing_state()
-  if swing_state ~= nil then return swing_state or nil end
-  local ok, mod = pcall(dofile, SCRIPT_DIR .. 'swing_state_reader.lua')
-  swing_state = (ok and type(mod) == 'table' and mod.SlotForLane) and mod or false
-  return swing_state or nil
-end
+-- (per-slot identity band, via stereo_live_pitches near the top of this file);
+-- fall back to the contiguous note_lo + pad - 1 layout BuildStereo writes when
+-- the instance is offline.
 
--- { [pad_index] = pitch }, limited to the lane's [note_lo..note_hi] window.
+-- { [pad_index] = pitch }. Live map = every valid pad, UNWINDOWED (2026-09-02:
+-- the old `p >= lo and p <= hi` filter against the seed-time tag window is
+-- what dropped remapped pads from export and wiped them on re-import). The
+-- offline fallback is still laid out inside the TAG window, since without the
+-- instance the tag is the only layout we know.
 local function stereo_pad_pitches(lane_info)
-  local lo, hi = lane_range(lane_info)
-  local map, any = {}, false
-  local ss = ensure_swing_state()
-  if ss then
-    pcall(ss.Init)
-    local ok, slot = pcall(ss.SlotForLane, lane_info)
-    if ok and slot ~= nil then
-      for pad = 1, 16 do
-        local ok2, p = pcall(ss.GetPadPitch, pad, slot)
-        if ok2 and type(p) == 'number' and p == math.floor(p)
-           and p > 0 and p >= lo and p <= hi then
-          map[pad] = p
-          any = true
-        end
-      end
-    end
+  local live = stereo_live_pitches(lane_info)
+  if live then return live end
+  local map = {}
+  local lo, hi = lane_info.note_lo, lane_info.note_hi
+  if not (type(lo) == 'number' and type(hi) == 'number' and hi >= lo) then
+    lo, hi = lane_range(lane_info)
   end
-  if not any then
-    for pad = 1, 16 do
-      local p = lo + pad - 1
-      if p <= hi then map[pad] = p end
-    end
+  for pad = 1, 16 do
+    local p = lo + pad - 1
+    if p <= hi then map[pad] = p end
   end
   return map
 end
@@ -1096,6 +1154,29 @@ function M.CollectRegion(t0, t1)
       blob.lanes[pad] = rec
     end
   end
+  -- 2B: controller events from the HOME lane (the stereo lane when there is one,
+  -- otherwise the first lane) -> blob.cc = { {q, chan, cc, v}, ... }. The StepSeq's
+  -- CC lanes live there on export, so that is where they are read back from.
+  local home = nil
+  for _, lane in ipairs(M.GetLanes()) do
+    if lane.lane_info and lane.lane_info.stereo == true then home = lane; break end
+    home = home or lane
+  end
+  if home then
+    blob.cc = {}
+    each_midi_take_on_track(home.track, function(_, take)
+      local _, _, ccn = reaper.MIDI_CountEvts(take)
+      for i = 0, (ccn or 0) - 1 do
+        local ok, _, _, ppq, chanmsg, chan, msg2, msg3 = reaper.MIDI_GetCC(take, i)
+        if ok and chanmsg == 0xB0 then
+          local ts = reaper.MIDI_GetProjTimeFromPPQPos(take, ppq)
+          if ts >= t0 - 1e-6 and ts < t1 - 1e-6 then
+            blob.cc[#blob.cc + 1] = { q = reaper.TimeMap_timeToQN(ts) - q0, chan = chan, cc = msg2, v = msg3 }
+          end
+        end
+      end
+    end)
+  end
   return blob
 end
 
@@ -1144,8 +1225,11 @@ function M.WriteRegion(t0, t1, blob)
     if li.stereo == true then
       -- Stereo lane: EVERY blob pad writes into the one take, each at its
       -- pad's pitch (live Swing map; the blob's own pad_pitch as fallback).
-      -- Pitches outside the lane window are skipped — they'd be invisible to
-      -- the grid and would double-trigger against a coexisting lane build.
+      -- The window check below is against lane_range, which for a stereo lane
+      -- now spans the live pad map -- so a live pad is never skipped; only a
+      -- blob pad_pitch fallback outside every known window is dropped (it
+      -- would be invisible to the grid and double-trigger against a
+      -- coexisting lane build).
       local pmap = stereo_pad_pitches(li)
       local lo, hi = lane_range(li)
       local any = false
@@ -1186,6 +1270,43 @@ function M.WriteRegion(t0, t1, blob)
           finalize_take(dest)
         end
       end
+    end
+  end
+  -- 2B: the StepSeq's CC lanes -> controller events on the HOME lane (stereo lane if
+  -- any, else the first lane). Only the controllers the StepSeq OWNS (blob.cc_lanes,
+  -- listed even when empty) are cleared in the window first; anything else in the
+  -- item -- pitch bend, other CCs -- is not ours and stays.
+  if type(blob.cc_lanes) == 'table' and #blob.cc_lanes > 0 then
+    local home = nil
+    for _, lane in ipairs(M.GetLanes()) do
+      if lane.lane_info and lane.lane_info.stereo == true then home = lane; break end
+      home = home or lane
+    end
+    -- (not `home and take_covering(...)`: an `and` expression keeps only the FIRST of a
+    -- function's return values, which handed us the item and no take -- audit 2026-09-03)
+    local dest = nil
+    if home then local _; _, dest = take_covering(home.track, t0, t1, nil) end
+    if dest then
+      local owned = {}
+      for _, l in ipairs(blob.cc_lanes) do owned[tostring(l.cc) .. ':' .. tostring(l.chan)] = true end
+      local _, _, ccn = reaper.MIDI_CountEvts(dest)
+      for i = (ccn or 0) - 1, 0, -1 do   -- delete high-to-low so indices stay valid
+        local ok, _, _, ppq, chanmsg, chan, msg2 = reaper.MIDI_GetCC(dest, i)
+        if ok and chanmsg == 0xB0 and owned[tostring(msg2) .. ':' .. tostring(chan)] then
+          local ts = reaper.MIDI_GetProjTimeFromPPQPos(dest, ppq)
+          if ts >= t0 - 1e-6 and ts < t1 - 1e-6 then reaper.MIDI_DeleteCC(dest, i) end
+        end
+      end
+      for _, ev in ipairs(blob.cc or {}) do
+        local s_t = reaper.TimeMap_QNToTime(q0 + (tonumber(ev.q) or 0))
+        if s_t < t1 then
+          reaper.MIDI_InsertCC(dest, false, false, reaper.MIDI_GetPPQPosFromProjTime(dest, s_t), 0xB0,
+                               math.floor(ev.chan or 0), math.floor(ev.cc or 0), math.floor(ev.v or 0))
+          written = written + 1
+        end
+      end
+      reaper.MIDI_Sort(dest)
+      finalize_take(dest)
     end
   end
   reaper.Undo_EndBlock('EON DM: sync write region (StepSeq -> Drum Matrix)', -1)
@@ -1261,10 +1382,16 @@ function M.CommitPatternToItem()
     local nit = reaper.CountTrackMediaItems(lane.track)
     for i = 0, nit - 1 do
       local item = reaper.GetTrackMediaItem(lane.track, i)
-      local s = reaper.GetMediaItemInfo_Value(item, 'D_POSITION')
-      local e = s + reaper.GetMediaItemInfo_Value(item, 'D_LENGTH')
-      if s < t0 then t0 = s end
-      if e > t1 then t1 = e end
+      -- MIDI only — see ZoomToAllItemsOnDMLanes. An audio item on a merged lane
+      -- would widen the committed pattern span to cover audio that is not part
+      -- of the pattern at all.
+      local tk = item and reaper.GetActiveTake(item)
+      if tk and reaper.TakeIsMIDI(tk) then
+        local s = reaper.GetMediaItemInfo_Value(item, 'D_POSITION')
+        local e = s + reaper.GetMediaItemInfo_Value(item, 'D_LENGTH')
+        if s < t0 then t0 = s end
+        if e > t1 then t1 = e end
+      end
     end
   end
   if t1 <= t0 then status('EON DM: lanes are empty — nothing to commit'); return false end

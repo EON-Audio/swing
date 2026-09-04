@@ -61,6 +61,13 @@ local pattern_manager = dofile(SCRIPT_DIR .. 'lib/pattern_manager.lua')
 -- here (not require'd inside the renderer) to avoid a mutual-dofile cycle
 -- between render_drum_matrix and paint_mode.
 if renderer.SetDragQuery then renderer.SetDragQuery(paint_mode.IsAnyDragActive) end
+-- Stereo lanes follow the LIVE pad map (2026-09-02): the renderer's rows/key
+-- guide and the integrity badge resolve their pitch window through
+-- lane_tools.LaneRange (tag window ∪ live pitches) instead of the tag frozen
+-- at seeding. Injected the same way as the drag query: every host dofile()s
+-- its own module instances, so paint_mode wires its own lane_integrity too.
+if renderer.SetRangeResolver then renderer.SetRangeResolver(lane_tools.LaneRange) end
+if lane_integrity.SetRangeResolver then lane_integrity.SetRangeResolver(lane_tools.LaneRange) end
 
 -- ── Overlay keymap dispatch table ──────────────────────────────────────────
 -- One handler per keymap.Registry action id. Each closes over the modules
@@ -317,7 +324,14 @@ local function draw_pad_label(dl, track, lane_info, coords, swing_state, L, mx, 
     end
     local text
     if settings.Get('show_pitch_in_label') then
-      text = string.format('%s (%d)', name, lane_info.pad_pitch or 0)
+      if lane_info.stereo == true then
+        -- Whole-kit lane: show the live pitch window, not the frozen tag's
+        -- pad_pitch (which is just the seed-time low bound).
+        local slo, shi = lane_tools.LaneRange(lane_info)
+        text = string.format('%s (%d-%d)', name, slo or 0, shi or 0)
+      else
+        text = string.format('%s (%d)', name, lane_info.pad_pitch or 0)
+      end
     else
       text = name
     end

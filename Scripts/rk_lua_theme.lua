@@ -225,38 +225,69 @@ function T.make_reaper(mode)
 end
 
 -- Fixed semantic palettes (tuned to match rk_lua_widgets.push_theme look).
+-- ⚠ These eleven are hand-tuned and are NOT put through clamp_for_swing — only the
+-- three derived reaper* palettes are. They were, however, tuned by eye in SWING,
+-- where `panel` is just the pad tray and a whisper of recess looks right. The
+-- ReaImGui side spends the SAME value on every button, input field, popup and
+-- table header, and `grid` on the scrollbar thumb — so several of them had
+-- controls in the browser you could not actually see (FL's thumb sat 0.008 from
+-- the panel it slides on; SSL's buttons had neither a distinct fill nor a visible
+-- edge; EON, Light and Ableton put disabled text under 3:1).
+--
+-- Corrected 2026-08-30, lightness only, nothing that touches a theme's character:
+-- a button must stand 0.06 off its window OR carry a 0.08 border, the scrollbar
+-- thumb must stand 0.08 off the panel, and secondary text must clear 3:1 on both.
+-- `dark` and `protools_light` already passed and are untouched.
+-- ⛔ Do not "tidy" these back toward their neighbours — .dev_tests/theme_contrast_gate.py
+-- checks them and will fail. Run it after any edit here.
 T.FIXED = {
-  eon   = { bg = 0xD6CFC2FF, panel = 0xC2BDB3FF, text = 0x2B2822FF, text_dim = 0x7E776AFF,
+  eon   = { bg = 0xD6CFC2FF, panel = 0xC2BDB3FF, text = 0x2B2822FF, text_dim = 0x4F4B43FF,
             accent = 0xFF8C32FF, accent2 = 0x4D4D52FF, grid = 0x938A78FF, border = 0x938A78FF },
-  dark  = { bg = 0x1E1E22FF, panel = 0x2A2A30FF, text = 0xDDDDE0FF, text_dim = 0x8C8C96FF,
+  dark  = { bg = 0x1E1E22FF, panel = 0x2A2A30FF, text = 0xDDDDE0FF, text_dim = 0x91919AFF,
             accent = 0xFF8C32FF, accent2 = 0x4A4A55FF, grid = 0x414148FF, border = 0x414148FF },
-  light = { bg = 0xF0F0F2FF, panel = 0xE0E0E5FF, text = 0x222228FF, text_dim = 0x888890FF,
+  light = { bg = 0xF0F0F2FF, panel = 0xE0E0E5FF, text = 0x222228FF, text_dim = 0x626268FF,
             accent = 0xFF8C32FF, accent2 = 0xC0C0CCFF, grid = 0xC0C0C8FF, border = 0xC0C0C8FF },
   -- ── EON console themes (palette here; knob style + per-role hues below) ──
   -- SSL: classic console-fader grey body, signature green accent
-  ssl   = { bg = 0x44484CFF, panel = 0x4E5254FF, text = 0xE6E8E4FF, text_dim = 0xBCC0BAFF,
-            accent = 0x2FB463FF, accent2 = 0xB0B6BEFF, grid = 0x5A5F60FF, border = 0x5A5F60FF },
-  -- Neve: lighter blue-grey body (was too dark) + Neve red
-  neve  = { bg = 0x38414EFF, panel = 0x45505FFF, text = 0xEDE7D8FF, text_dim = 0xAEB6C2FF,
-            accent = 0xD8413AFF, accent2 = 0x6E8CB8FF, grid = 0x4E5868FF, border = 0x4E5868FF },
-  -- makeover: indigo + chrome (off the SSL green; chrome suits the API look)
-  api   = { bg = 0x1E1F22FF, panel = 0x2A2C30FF, text = 0xF0F2F5FF, text_dim = 0x8C9098FF,
-            accent = 0x3E5BC0FF, accent2 = 0xC8CDD2FF, grid = 0x32343AFF, border = 0x3E4248FF },
+  ssl   = { bg = 0x44484CFF, panel = 0x575B5DFF, text = 0xE6E8E4FF, text_dim = 0xD0D3CFFF,
+            accent = 0x2FB463FF, accent2 = 0xB0B6BEFF, grid = 0x6F7374FF, border = 0x6F7374FF },
+  -- Neve: lighter blue-grey body (was too dark) + Neve red. The blue-grey is well
+  -- founded — AMS Neve's own modules are described as "RAF blue-grey".
+  neve  = { bg = 0x38414EFF, panel = 0x4A5463FF, text = 0xEDE7D8FF, text_dim = 0xC1C8D1FF,
+            accent = 0xD8413AFF, accent2 = 0x6E8CB8FF, grid = 0x606977FF, border = 0x606977FF },
+  -- makeover: indigo + chrome (off the SSL green; chrome suits the API look).
+  -- ⚠ NOT authentic to a real API console, and has never claimed to be.
+  api   = { bg = 0x1E1F22FF, panel = 0x2A2C30FF, text = 0xF0F2F5FF, text_dim = 0x91949CFF,
+            accent = 0x3E5BC0FF, accent2 = 0xC8CDD2FF, grid = 0x414349FF, border = 0x3E4248FF },
   tube  = { bg = 0x211A14FF, panel = 0x2C2218FF, text = 0xF0E4D0FF, text_dim = 0x9C8A70FF,
-            accent = 0xF0A83CFF, accent2 = 0xC2663AFF, grid = 0x3A2E20FF, border = 0x4A3A28FF },
+            accent = 0xF0A83CFF, accent2 = 0xC2663AFF, grid = 0x44382BFF, border = 0x4A3A28FF },
   -- ── EON DAW themes (matched to the real DAW UIs) ──
-  -- Ableton: Live light grey + authentic salmon-orange selection accent
-  ableton  = { bg = 0xC8C8C8FF, panel = 0xBABABAFF, text = 0x2A2A2AFF, text_dim = 0x6C6C6CFF,
-               accent = 0xFF764DFF, accent2 = 0x8A8E94FF, grid = 0xAEAEAEFF, border = 0x9E9E9EFF },
-  fl       = { bg = 0x262626FF, panel = 0x303030FF, text = 0xD8D8D8FF, text_dim = 0x828282FF,
-               accent = 0xF89B30FF, accent2 = 0x6FBF4FFF, grid = 0x2E2E2EFF, border = 0x383838FF },
-  -- Pro Tools: greyer graphite body (lifted off near-black) + edit-blue accent
-  protools = { bg = 0x36393CFF, panel = 0x42464AFF, text = 0xE2E6EAFF, text_dim = 0x9498A0FF,
-               accent = 0x46A6D8FF, accent2 = 0x5A636EFF, grid = 0x50545AFF, border = 0x50545AFF },
+  -- Ableton: Live light grey + salmon-orange selection accent. ⚠ The salmon is
+  -- UNVERIFIED — Live's stock theme is not published and we have no install to sample.
+  ableton  = { bg = 0xC8C8C8FF, panel = 0xBABABAFF, text = 0x2A2A2AFF, text_dim = 0x4A4A4AFF,
+               accent = 0xFF764DFF, accent2 = 0x8A8E94FF, grid = 0xA5A5A5FF, border = 0x9E9E9EFF },
+  -- ⚠ Diverges from the published FL palette (gold #FDB200, emerald #1EC173, near-black
+  -- ground): ours is a redder orange, a yellower green, and a much lighter body. Open
+  -- question, deliberately NOT changed here — moving it is a character decision.
+  fl       = { bg = 0x262626FF, panel = 0x3A3A3AFF, text = 0xD8D8D8FF, text_dim = 0xA5A5A5FF,
+               accent = 0xF89B30FF, accent2 = 0x6FBF4FFF, grid = 0x535353FF, border = 0x515151FF },
+  -- Pro Tools: greyer graphite body (lifted off near-black) + edit-blue accent.
+  -- ⚠ Both Pro Tools recreations on the dev machine use a LIGHT window over a dark
+  -- panel, i.e. closer to protools_light below than to this. Open question.
+  protools = { bg = 0x36393CFF, panel = 0x474B4FFF, text = 0xE2E6EAFF, text_dim = 0xB8BBC0FF,
+               accent = 0x46A6D8FF, accent2 = 0x5A636EFF, grid = 0x5D6166FF, border = 0x5D6166FF },
   -- PT Light: Pro-Tools mid-grey chrome + white graph panel + dark legible text
   -- (distinct from `light` which is near-white). bg=window grey, panel=white EQ
   -- graph fill, grid/border stay grey (JSFX passes fixed alphas — band is RGB only).
-  protools_light = { bg = 0xB0B3B5FF, panel = 0xFAFAFAFF, text = 0x303236FF, text_dim = 0x5C5E62FF,
+  --
+  -- ⚠ Its ink runs DARKER than the other light themes on purpose. Their windows are
+  -- near-white (light 0xF0F0F2, ableton 0xC8C8C8) so a 0x22-0x2B ink is comfortable
+  -- there; this one's window is a mid-grey 0xB0B3B5, which squeezes everything drawn
+  -- on it. At the old 0x303236 / 0x5C5E62 the body ink managed 6.09:1 on that window
+  -- and the secondary ink only 3.08:1 — over the 3.0 floor on paper, thin to actually
+  -- read (user, 2026-08-30) — and 2.80:1 on the orange accent, which was under.
+  -- Now 7.92:1 and 4.99:1. ⛔ Do not "align" these with the other light themes.
+  protools_light = { bg = 0xB0B3B5FF, panel = 0xFAFAFAFF, text = 0x1C1E21FF, text_dim = 0x3E3F42FF,
                      accent = 0xFF8C32FF, accent2 = 0xA8AEB6FF, grid = 0xBFC2C6FF, border = 0xAEB2B6FF },
 }
 
@@ -308,13 +339,216 @@ function T.role_band(name)
   return b
 end
 
+-- ── EON survivability clamp (NOT part of the TK port) ─────────────────────
+-- TK's derivation is safe in TK's app because his UI never trusts the palette:
+-- every label asks `text_for_background()` at draw time what ink clears 4.5:1
+-- on the shade actually under it (~84 call sites across 20 files). ImGui gives
+-- him the rest for free — one push of 14 style colours and every widget
+-- inherits.
+--
+-- Swing has neither. It is JSFX: no style stack, nothing inherits, and ~2100
+-- of its colours are literals baked for the cream iMPC housing. Only BG /
+-- PANEL / ACCENT / ACCENT2 are themed at all. So a palette derived from an
+-- arbitrary REAPER theme can land somewhere none of those literals survive —
+-- which is the "everything goes dark, can't read it" report.
+--
+-- This pass runs ONLY on the three derived reaper* palettes. The 11 fixed
+-- palettes are hand-tuned and ship untouched. It is deliberately kept OUT of
+-- make_reaper(), so that function stays a byte-identical port and can still be
+-- diffed against TK upstream (verified identical at TK v0.9.3, 2026-08-29).
+--
+-- It moves LIGHTNESS only, never hue, so the DAW's colour identity survives.
+-- Escape hatch for A/B: ExtState Swing/eon_theme_clamp = "0".
+local INK_DARK, INK_LIGHT = 0x20242AFF, 0xF2F4F7FF   -- TK's two guaranteed inks
+
+-- Separation thresholds, in color_distance units (sum of |channel deltas| / 765).
+-- For a grey pair that is exactly delta/255, so 0.08 == 20 grey levels.
+--
+-- Tuned against the 12 themes installed here. Set too high and the clamp starts
+-- "fixing" surfaces that were already distinct: at 0.10, CLogic's tray (19 levels
+-- off its body, plainly visible, text on it at 11.8:1) got dragged 52 levels away
+-- and lost half its contrast for nothing. 0.08 still catches the genuinely flat
+-- pairs -- Default 5 Dark ships a body and tray 7 levels apart, and every theme
+-- whose col_main_bg2 simply repeats col_main_bg.
+local SEP_PANEL = 0.08   -- tray vs body: a large area, needs only to read as recessed
+local SEP_LINE  = 0.08   -- gridlines and borders: thin, so no lower than the above
+local SEP_ACC   = 0.12   -- accent vs body: must read as a deliberate mark, not a shade
+
+-- Can ANY ink clear `ratio` on this surface? A mid-luminance surface fails
+-- against BOTH near-black and near-white — that is the band on which nothing
+-- can legibly be drawn, and the band a baked literal cannot escape.
+local function ink_survives(c, ratio)
+  return math.max(contrast_ratio(c, INK_DARK), contrast_ratio(c, INK_LIGHT)) >= ratio
+end
+
+-- Walk a colour toward whichever pole it already leans to until an ink clears
+-- `ratio`. 20 steps of 5% is finer than the eye resolves, so the result still
+-- reads as the theme's own colour.
+local function escape_midband(c, ratio)
+  if ink_survives(c, ratio) then return c end
+  local target = luminance(c) >= 0.5 and 0xFFFFFFFF or 0x000000FF
+  for i = 1, 20 do
+    local out = blend(c, target, i * 0.05)
+    if ink_survives(out, ratio) then return out end
+  end
+  return target
+end
+
+-- Pull `c` onto the same side of the light/dark divide as `base`, so that ONE
+-- ink is legible on both — without letting them get closer than `mind`.
+--
+-- This exists because the Lua consumer cannot do what Swing does. Swing resolves
+-- ink per surface at draw time (rk_auto_ink), so its BG and PANEL are free to sit
+-- on opposite sides. The Browser and Pad FX are ReaImGui: w._apply_semantic
+-- pushes ONE Col_Text and ImGui paints it on the window, the popups, the frames,
+-- the buttons and the table rows alike. A theme like Pro Tools 2020 (light window
+-- 164,164,164 over a dark docker 51,51,51) leaves no single ink that clears 4.5:1
+-- on both, so whichever way the guard resolves, half the Browser goes unreadable.
+--
+-- Walking the panel to BG's side costs a little DAW fidelity in that one case and
+-- buys a window you can actually read. It is a no-op for every theme whose
+-- surfaces already share a side, which is most of them.
+local function share_ink(c, base, mind)
+  local ink = readable_text(base)
+  if contrast_ratio(ink, c) >= 4.5 then return c end
+  local target = luminance(base) > 0.5 and 0xFFFFFFFF or 0x000000FF
+  for i = 1, 20 do
+    local out = blend(c, target, i * 0.05)
+    if contrast_ratio(ink, out) >= 4.5 and color_distance(out, base) >= mind then return out end
+  end
+  return c   -- no point satisfies both; keep separation and let the guard compromise
+end
+
+-- Push `c` away from `from` until they differ by at least `mind`, moving to
+-- whichever pole `from` is NOT near (so a dark surface gets a lighter panel).
+local function separate(c, from, mind)
+  if color_distance(c, from) >= mind then return c end
+  local target = luminance(from) < 0.5 and 0xFFFFFFFF or 0x000000FF
+  for i = 1, 20 do
+    local out = blend(c, target, i * 0.05)
+    if color_distance(out, from) >= mind then return out end
+  end
+  return target
+end
+
+function T.clamp_for_swing(pal)
+  if reaper and reaper.GetExtState
+     and reaper.GetExtState("Swing", "eon_theme_clamp") == "0" then return pal end
+
+  -- 1. BG off the extremes. Swing's bezels and recesses are drawn as black and
+  --    white ALPHA washes over the body; on pure black or pure white one side
+  --    of every bevel disappears and the housing reads as a flat slab.
+  local bg = pal.bg
+  if luminance(bg) < 0.05 then bg = blend(bg, 0xFFFFFFFF, 0.10) end
+  if luminance(bg) > 0.95 then bg = blend(bg, 0x000000FF, 0.10) end
+  -- 2. BG out of the dead mid-band. Swing draws BOTH near-white and near-black
+  --    literals on the body; a mid-grey body loses whichever it is nearer, and
+  --    at the centre it loses both.
+  bg = escape_midband(bg, 4.5)
+
+  -- 3. PANEL stands off BG, and is itself drawable. Many REAPER themes give
+  --    col_main_bg and col_main_bg2 the same or near-same value, which
+  --    collapses Swing's tray into its body — the "everything goes flat" half
+  --    of the report. Then onto BG's side of the light/dark divide, so a single
+  --    ink serves both — see share_ink for why that is not optional. The final
+  --    escape_midband is a no-op whenever share_ink succeeded (a colour that
+  --    clears 4.5:1 against one ink clears it against the better of the two).
+  local panel = separate(pal.panel, bg, SEP_PANEL)
+  panel = escape_midband(share_ink(panel, bg, SEP_PANEL), 4.5)
+
+  -- 4. Structure lines stand off the surface they are drawn on, or the panel
+  --    edges and gridlines vanish into it.
+  local grid   = separate(pal.grid,   panel, SEP_LINE)
+  local border = separate(pal.border, panel, SEP_LINE)
+
+  -- 5. ACCENT must be able to carry a label (Swing prints on top of it) and
+  --    must still read as a distinct element against the moved BG.
+  local accent = separate(escape_midband(pal.accent, 4.5), bg, SEP_ACC)
+  -- 6. ACCENT2 becomes Swing's header strip; it needs to read as its own band.
+  --    Its captions self-resolve via rk_auto_ink_dim, so only separation here.
+  local accent2 = separate(pal.accent2, bg, SEP_PANEL)
+
+  -- 7. Re-run the text guards against the surfaces as they NOW are — shipping a
+  --    palette whose ink was proven against a BG no longer in it is how the
+  --    guard becomes decoration.
+  --
+  --    Proven against BG **and** PANEL together. ensure_readable takes the
+  --    MINIMUM contrast across the list, so this is only a promise worth making
+  --    because step 3 already walked PANEL onto BG's side of the divide — ask
+  --    for both across a straddling pair and you get a compromise that fails on
+  --    each. The pair is the two surfaces ReaImGui paints its one Col_Text on;
+  --    Swing's remaining surfaces (header strip, pads, LCDs) resolve their own
+  --    ink at draw time via rk_auto_ink, the same answer TK reaches with
+  --    text_for_background().
+  local dark = luminance(bg) < 0.5
+  local text = ensure_readable(pal.text, { bg, panel }, readable_text(bg), 4.5)
+  local text_dim = ensure_readable(pal.text_dim, { bg, panel },
+                                   blend(text, bg, dark and 0.28 or 0.42), 3.0)
+
+  pal.bg, pal.panel, pal.grid, pal.border = bg, panel, grid, border
+  pal.accent, pal.accent2, pal.text, pal.text_dim = accent, accent2, text, text_dim
+  -- badge_text is the ink TK computes for drawing ON the accent. to_band drops
+  -- it (the 8-slot band has no room), but keep it correct on the table for the
+  -- Lua-side consumers that read the palette directly.
+  pal.badge_text = ensure_readable(luminance(accent) > 0.55 and 0x000000DD or 0xFFFFFFFF,
+                                   { accent }, nil, 4.5)
+  return pal
+end
+
+-- Keep a colour's HUE and move only its lightness, until it clears `minr` on every
+-- surface it will be drawn on. Returns it untouched when it already does.
+--
+-- This is the half of TK's text_for_background we could not use as-is. His falls
+-- back to a guaranteed near-black or near-white ink, which is exactly right for
+-- body text and exactly wrong for a colour that MEANS something — the browser's
+-- folder gold, its error red, its stereo-file blue. Throwing the hue away there
+-- throws the signal away with it. So this tries both directions and takes the
+-- one that reaches the ratio with the SMALLER move, keeping as much of the
+-- original colour as the contrast allows.
+--
+-- Only falls through to a flat ink when neither direction can get there at all.
+function T.ink_on(c, surfaces, minr)
+  minr = minr or 4.5
+  if type(surfaces) ~= "table" then surfaces = { surfaces } end
+  if #surfaces == 0 then return c end
+  if min_contrast(c, surfaces) >= minr then return c end
+  local best, best_ch, best_t
+  for _, pole in ipairs({ 0x000000FF, 0xFFFFFFFF }) do
+    for i = 1, 20 do
+      local t = i * 0.05
+      local out = blend(c, pole, t)
+      if min_contrast(out, surfaces) >= minr then
+        -- SATURATION first, distance second. On a MID-grey surface both directions
+        -- reach the ratio, and picking purely by the smaller move takes the lighter
+        -- one — which washes the colour out. SSL's category wheel lost 46% of its
+        -- saturation that way and Neve 33%, and saturation is the entire point of
+        -- those colours: it is what tells a ride from a clap at a glance.
+        --
+        -- ⚠ Must be HSV saturation (max-min)/max, NOT color_chroma (max-min)/255.
+        -- Chroma falls by exactly (1-t) in BOTH directions, so comparing it here
+        -- is a no-op — measured, after writing it that way first.
+        local rr, gg, bb = split(out)
+        local hi = math.max(rr, gg, bb)
+        local sat = hi > 0 and (hi - math.min(rr, gg, bb)) / hi or 0
+        if not best or sat > best_sat + 0.02
+           or (math.abs(sat - best_sat) <= 0.02 and t < best_t) then
+          best, best_sat, best_t = out, sat, t
+        end
+        break
+      end
+    end
+  end
+  return best or best_text(surfaces)
+end
+
 -- name → semantic palette (packed RGBA). The three REAPER entries map to the TK
 -- derivation modes (matches TK Workbench's three separate preset entries):
 --   reaper = balanced · reaper_panel = panel · reaper_color = color
+-- Derived palettes go through the survivability clamp; fixed ones do not.
 function T.resolve(name)
-  if name == "reaper"       then return T.make_reaper("balanced") end
-  if name == "reaper_panel" then return T.make_reaper("panel") end
-  if name == "reaper_color" then return T.make_reaper("color") end
+  if name == "reaper"       then return T.clamp_for_swing(T.make_reaper("balanced")) end
+  if name == "reaper_panel" then return T.clamp_for_swing(T.make_reaper("panel")) end
+  if name == "reaper_color" then return T.clamp_for_swing(T.make_reaper("color")) end
   return T.FIXED[name] or T.FIXED.eon
 end
 

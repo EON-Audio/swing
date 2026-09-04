@@ -430,7 +430,48 @@ local function do_sync(snapshot, lanes, policy)
       -- Stereo-mode lane: the tag lives on the Swing track itself. Its track
       -- name/color are owned by the bridge (renaming it "01 <pad>" here would
       -- clobber the Swing track), and FollowNoteRemap must never transpose a
-      -- multi-pitch pattern. Range updates are static in v1 — skip entirely.
+      -- multi-pitch pattern. What DOES follow the pads is the pitch WINDOW
+      -- (2026-09-02): note_lo/note_hi were frozen when the bridge first saw the
+      -- Swing (root..root+15), so a kit or remap that moved a pad outside it
+      -- left the tag lying about the kit -- the overlay and the StepSeq sync
+      -- resolve the live window at read time (lane_tools.LaneRange), but an
+      -- OFFLINE Swing can only fall back to the tag. Heal it here: this branch
+      -- runs only when the group's digest changed (kit load / remap / first
+      -- pass), so it is naturally throttled. Write contract = track_detection's
+      -- validator: integers, 0 <= lo <= hi <= 127, or the whole lane vanishes.
+      local lo, hi, n = nil, nil, 0
+      for i = 1, 16 do
+        local p = snapshot[i] and snapshot[i].pitch
+        if type(p) == 'number' and p == math.floor(p) and p >= 0 and p <= 127 then
+          n = n + 1
+          if not lo or p < lo then lo = p end
+          if not hi or p > hi then hi = p end
+        end
+      end
+      local info = lane.lane_info
+      if n >= 2 and lo and hi and hi >= lo
+         and (info.note_lo ~= lo or info.note_hi ~= hi or info.pad_pitch ~= lo) then
+        info.note_lo, info.note_hi = lo, hi
+        info.pad_pitch = lo                 -- BuildStereo's own convention
+        info.range_source = 'live'
+        write_pext(lane)
+        touched = touched + 1
+        -- Grow-only track height, same numbers as EON_DM_BuildStereo (20 px per
+        -- row + the 20 px header band, clamped 200..640). Never shrink.
+        local want_h = (hi - lo + 1) * 20 + 20
+        if want_h < 200 then want_h = 200 end
+        if want_h > 640 then want_h = 640 end
+        if (reaper.GetMediaTrackInfo_Value(lane.track, 'I_HEIGHTOVERRIDE') or 0) < want_h then
+          reaper.SetMediaTrackInfo_Value(lane.track, 'I_HEIGHTOVERRIDE', want_h)
+          reaper.TrackList_AdjustWindows(false)
+        end
+      end
+    elseif lane.lane_info.merged == true then
+      -- Merged-mode lane: the tag rides one of Swing's multi-out AUDIO tracks,
+      -- whose name, colour and icon belong to the Kit Bridge (sync_lane would
+      -- rename it "01 <pad>" and then fight make_track_name on every pass).
+      -- Same ownership reasoning as the stereo lane above, so skip entirely;
+      -- a changed pad pitch is picked up by re-running EON_DM_BuildMerged.
     elseif not lane_diff(lane, snapshot, policy) then
       -- nothing to do for this lane
     elseif lane.lane_info.locked == true then
