@@ -83,6 +83,8 @@ MIDI items.
 - Lanes carry your pad names, colours and icons straight through from Swing
 - Role-based remapping, so a pattern aimed at one kit lands sensibly on another
 
+![The Drum Matrix in the arrange](screenshots/dm_arrange.png)
+
 ### EON Drum Strip
 
 A standalone channel strip — the per-pad chain as its own plugin, and a full
@@ -211,6 +213,11 @@ drives the Smash return, and the rack build offers it for the bus too.
 
 ![EON Anvil](screenshots/anvil.png)
 
+MULTI asks once which compressor goes where — Weld, Anvil, one of the stock
+JS comps, or one of your own FX chains — for the bus and for the Smash return:
+
+![Drum Bus Options](screenshots/rack_dialog.png)
+
 ### The Console is a desk now
 
 Open CONSOLE and you get a full window: sixteen strips, an inserts band that
@@ -245,6 +252,8 @@ around the arrange in a few layouts, or one of your own.
 
 ![Swing and Steppa docked](screenshots/dock.png)
 
+![The dock layout picker](screenshots/dock_layout.png)
+
 ### The song strip
 
 Song mode has a face. Your sections run across the top of the sequencer,
@@ -255,6 +264,12 @@ block for its menu, hold one to listen. Zoom to a section or to the whole
 song from the strip, and the arrange scrolls the kit tracks into view.
 
 ![Steppa with the song strip](screenshots/steppa_song.png)
+
+A song starts from **New Song**: tempo, sections with their own bar counts,
+or a genre template, and it lays out the regions, the Swing track and the
+lanes in one go.
+
+![EON: New Song](screenshots/new_song.png)
 
 ### Kit macros
 
