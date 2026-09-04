@@ -306,6 +306,47 @@ kit. All thirteen factory kits carry a macro block.
 
 ---
 
+## After the second beta
+
+Two small updates since, 3.0.1 and 3.0.2.
+
+### EON Floatter
+
+Every EON plugin's floating window now opens at the size it was designed
+for. A JSFX has one size line, and it also shapes the panel embed, so the
+float has to be sized from outside: Floatter watches for EON windows and
+sets each one as it appears, on any screen, at any display scale. Resize a
+window yourself and it stays that way; Capture keeps that size as yours for
+that plugin, Reset goes back to EON's. One dial scales all of EON's sizes
+for a small laptop or a big display, and "Apply EON sizes to this project"
+sets every EON plugin already in the project, quietly. The Kit Bridge starts
+it for you. Run **EON_Floatter** from the Action List for the panel. It
+takes over from the EON_FloatSize scripts in the beta and keeps every size
+you captured with them.
+
+### The dock rig ships
+
+EON Swing Dock, EON Steppa Dock, EON Dock Layout, EON Swing Dock View and
+EON Chain Dock install with Swing and appear in the Action List, so the
+wordmark's dock toggle and its DOCK LAYOUT menu work on a fresh install.
+
+### The picker
+
+It fills on a fresh install: the Kit Bridge starts the picker's bridge
+itself. And EON's own plugins wear their own faces on their cards, drawn
+from the shipping plugins, so Weld, Anvil, the Drum Strip and the rest are
+telling apart at a glance.
+
+### Small things
+
+- The Drum Bus Options dialog shows its comp cards on installed copies.
+- Snare A.DEC at full turn holds the longest decay.
+- The Kit Bridge reports a missing extension in the console once, naming
+  what it affects.
+- Every ReaPack version is pinned to the commit that carries its files.
+
+---
+
 ## Things that moved — read this bit
 
 These are the changes most likely to have you hunting for something.

@@ -55,6 +55,11 @@ One install, one ecosystem:
   under the arrange, and both come back docked when you reopen the project.
 - **EON Lens** — a kit-artwork card for the track panel. Your kit's cover,
   living on the track, pulsing with the audio.
+- **EON Floatter** *(new)* — every EON plugin's floating window opens at the
+  size it was designed for, on any screen. Capture your own size for any
+  JSFX, go back to EON's with one click, and turn one dial to scale them
+  all for a small laptop or a big display. It starts with REAPER; run
+  **EON_Floatter** from the Action List for its panel.
 
 Plus: eight **kit macros** per kit with snapshots and morph, a file browser
 inside Swing, 14 console themes, 18 knob styles, kit cover art, multiple
@@ -173,9 +178,9 @@ Plain answers, because you shouldn't have to read source to know:
 
 - **Startup action.** That one-time Swing_Kit_Bridge run adds a small block to
   `Scripts/__startup.lua` in your REAPER resource folder so the bridge starts
-  with REAPER. The bridge then starts its two companions itself, the Drum
-  Strip sync helper and the FX picker bridge, and each registers itself the
-  same way, so all three come up with REAPER from then on. The blocks are
+  with REAPER. The bridge then starts its three companions itself, the Drum
+  Strip sync helper, the FX picker bridge and EON Floatter, and each registers
+  itself the same way, so all four come up with REAPER from then on. The blocks are
   self-cleaning: uninstall the scripts and each block removes itself and its
   settings on the next launch. The file is rewritten through a temp file +
   rename, so other scripts' startup lines are never at risk.
