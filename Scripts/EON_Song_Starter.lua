@@ -35,7 +35,8 @@ S.prompt(function(opts)
   -- Plain toggle, not apply mode: with the rig closed (which is why the user
   -- was asked in the first place) a toggle opens the active layout.
   if open_view then
-    local view = reaper.GetResourcePath() .. "/Scripts/EON Scripts/EON Swing Dock View.lua"
+    -- Ships next to this file (the dock rig is in .Scripts since 2026-09-04).
+    local view = dir .. "/EON_Swing_Dock_View.lua"
     local vf = io.open(view, "r")
     if vf then
       vf:close()

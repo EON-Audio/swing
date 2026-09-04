@@ -107,6 +107,8 @@ import libs/rk_drumkit_fx.jsfx-inc
 import libs/rk_delay.jsfx-inc
 import libs/rk_reverb.jsfx-inc
 import libs/rk_compressor.jsfx-inc
+import libs/rk_vu.jsfx-inc
+import libs/rk_weld_face.jsfx-inc
 import libs/rk_swing_core.jsfx-inc
 import libs/rk_swing_defaults.jsfx-inc
 import libs/rk_swing_popup.jsfx-inc
@@ -733,6 +735,7 @@ km_master_vol = freemem; freemem += KS;
 // keeps drag state in the slot, so two knobs sharing one would grab together.
 KM_CON_PER_PAD = 11;
 km_console  = freemem; freemem += NUM_PADS * KM_CON_PER_PAD * KS;
+km_comp     = freemem; freemem += 12 * KS;   // master COMP card: 6 knobs x 2 surfaces (big view, LCD)
 
 // ─── Send bus accumulators (cleared each sample) ────────────────────────
 snd_dly_accL = freemem; freemem += 1;
@@ -2675,6 +2678,7 @@ _send_fx_mem = s_audio_start + NUM_PADS * SLOT_SIZE;
 _send_fx_mem = dly_init(_send_fx_mem);
 _send_fx_mem = rvb_init(_send_fx_mem);
 _send_fx_mem = cmp_init(_send_fx_mem);
+cmp_vu.rk_vu_init_gr();   // the master comp's GR needle (Weld's card on the COMP page)
 dly_recalc();
 rvb_recalc();
 cmp_recalc();
@@ -4535,7 +4539,9 @@ _sat_drv_sm > 0.01 ? (
   cmp_process(_gL, _gR);
   _gL = cmp_outL;
   _gR = cmp_outR;
+  cmp_vu.rk_vu_sample_gr(cmp_last_lin);    // GR needle: linear gain in, no transcendental
 ) : (
+  (cmp_vu.pos > 0 || cmp_vu.hold > 0) ? cmp_vu.rk_vu_sample_gr(1);   // out of circuit: needle AND hold needle fall to rest, then the branch is inert
   // Bypassed master comp costs nothing — but a re-engage must start from
   // CLEAN state, not a stale capacitor charge (audit 2026-08-24). One
   // compare per sample while bypassed; reset fires once, then both caps
@@ -4633,7 +4639,8 @@ _moR > master_meterR ? master_meterR = _moR : master_meterR *= _mst_meter_decay;
 // below as a harmless idempotent re-set).
 is_read = file_avail(0) >= 0;
 // Version tag for forward-compat
-ser_ver = 69;   // 69 = dock_want: the wordmark's "dock me" intent, so a closed
+ser_ver = 70;   // 70 = cmp_auto: the master comp's AUTO release (Weld's card on the COMP page)
+                // 69 = dock_want: the wordmark's "dock me" intent, so a closed
                 // and reopened Swing goes back to its pane.
                 // 68 = the rail/list SPLITTER width, as an offset from 150.
                 // 67 = mini browser FOLDER TREE rail. 66 = strip state (open / subfolders / LCD skin /
@@ -5165,6 +5172,7 @@ is_read && ser_ver < 24 ? (
   cmp_thresh = 0; cmp_ratio = 4; cmp_attack = 10; cmp_release = 100;
   cmp_knee = 6; cmp_makeup = 0; cmp_mix = 1.0; cmp_bypass = 1;
 );
+is_read && ser_ver < 70 ? ( cmp_auto = 0; );
 is_read && ser_ver >= 24 ? ( cmp_recalc(); );
 is_read && ser_ver < 25 ? (
   rvb_predelay = 0; rvb_hpf = 0;
@@ -5765,6 +5773,7 @@ ser_ver >= 68 ? file_var(0, fb_tw_off);
 // floated with nobody remembering it had been docked. Zero default, assigned
 // nowhere in @init, same rule as everything above.
 ser_ver >= 69 ? file_var(0, dock_want);
+ser_ver >= 70 ? file_var(0, cmp_auto);
 
 // ─── Graphics ─────────────────────────────────────────────────────────────
 // Default height 720 -> 780: at 720 the master section overflowed the window.

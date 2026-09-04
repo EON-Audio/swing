@@ -200,7 +200,15 @@ one. Threshold, ratio, attack, release, makeup and mix on a G-series face,
 light or dark, with an AUTO release and the real GR needle. It sits on the
 drum bus after MULTI, and works anywhere else you put it.
 
+Swing's own master compressor has been this engine all along; its COMP page
+now wears the same card, on the big view and on the LCD, with the GR needle
+and an AUTO release of its own.
+
 ![EON Weld](screenshots/weld.png)
+
+![Swing's COMP page, Weld's card in the big view](screenshots/comp_big.png)
+
+![The same card on Swing's LCD](screenshots/comp_lcd.png)
 
 ### EON Anvil
 

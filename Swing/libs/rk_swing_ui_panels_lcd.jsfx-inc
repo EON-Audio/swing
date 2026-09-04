@@ -772,225 +772,208 @@ function swing_panels_draw_reverb() (
     );
 );
 
-function swing_panels_draw_comp() (
-    _fx_y0 = _lcd_cy + 2;
-    _fx_avail_h = _lcd_ch - 6;
-    _fx_label_w = (_lcd_cw * 0.30)|0;
-    _fx_bar_x = _lcd_cx + _fx_label_w;
-    _fx_bar_w = _lcd_cw - _fx_label_w - 4;
-    gfx_setfont(1, "Arial", 9, 'b');
-    _fx_row_h = (_fx_avail_h / 9)|0;  // 9 rows: ON, THR, RAT, ATK, REL, KNEE, MIX, GAIN, GR
+// ── Master COMP page: Weld's console card ──────────────────────────────────
+// Swing's master compressor IS the EON Weld engine (rk_compressor.jsfx-inc),
+// and since 2026-09-04 the page says so: the same card Weld draws in its own
+// window, from libs/rk_weld_face.jsfx-inc, on both surfaces. The big view
+// (VIEW_COMP, ~465x600 at the default window) stacks it PORTRAIT the way
+// Weld's floating window does; the compact LCD page (~326x108) lays it out
+// LANDSCAPE: meter and the two buttons on the left, six knobs in two rows on
+// the right. One drawer, one rect (_lcd_c*), the aspect picks the layout.
+//
+// Writes go the house way: cmp_* in real units, cmp_recalc() for the engine,
+// mark_dirty_kit() for undo. Knob travel for RATIO / ATTACK / RELEASE is
+// ln-mapped exactly as Weld's (the ladders are printed for those positions).
+// KNEE (the diode trim) is off the face on purpose, like Weld: right-click the
+// RATIO knob to reach it. The GR needle is an rk_vu instance (cmp_vu) fed in
+// @sample; its face follows the header VU selector when one is set, else
+// Weld's cream. Per-surface knob memory: km_comp + 0..5 (big) / 6..11 (LCD),
+// so a drag anchored on one surface never fights the other (Weld's lesson).
 
-    // ── Row 0: COMP ON/OFF ──
-    _fx_ry = _fx_y0;
-    gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 0.85);
-    gfx_x = _lcd_cx + 2; gfx_y = _fx_ry; gfx_drawstr("COMP:");
-    !cmp_bypass ? gfx_set(0.25, 0.65, 0.35, 0.8) : gfx_set(0.06, 0.16, 0.20, 0.6);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, _fx_bar_w, _fx_row_h - 3);
-    gfx_set(1, 1, 1, 0.9);
-    !cmp_bypass ? strcpy(#_fxv, "ON") : strcpy(#_fxv, "OFF");
-    gfx_measurestr(#_fxv, tw, th);
-    gfx_x = _fx_bar_x + (_fx_bar_w - tw) / 2; gfx_y = _fx_ry; gfx_drawstr(#_fxv);
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1400, "Master compressor on/off. Toggles the whole COMP section.");
-    lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
-      cmp_bypass = !cmp_bypass; mark_dirty_kit();
-    );
+function swing_panels_comp_knob(ki, cx, cy, kr, km) local(_lv, _nv) (
+  // Interact in Weld's units and travel, write to Swing's cmp_* params, and
+  // set the display value + strings for the face lib. Returns nothing; the
+  // caller draws the cell.
+  ki == 0 ? (
+    _nv = ssl_knob_interact(km, cx, cy, kr, cmp_thresh, -40, 0, -12, 0);
+    _nv != cmp_thresh ? ( cmp_thresh = _nv; cmp_recalc(); mark_dirty_kit(); );
+    _cpc_dv = cmp_thresh; _cpc_dmin = -40; _cpc_dmax = 0; _cpc_dsym = 0;
+    strcpy(#wface_lbl, "THRESHOLD"); sprintf(#wface_val, "%.1fdB", cmp_thresh);
+  ) :
+  ki == 1 ? (
+    _lv = log(max(1, cmp_ratio));
+    _nv = ssl_knob_interact(km, cx, cy, kr, _lv, 0, 2.99573227355, 1.38629436112, 0);
+    _nv != _lv ? ( cmp_ratio = exp(_nv); cmp_recalc(); mark_dirty_kit(); );
+    _cpc_dv = _nv; _cpc_dmin = 0; _cpc_dmax = 2.99573227355; _cpc_dsym = 0;
+    strcpy(#wface_lbl, "RATIO");
+    cmp_ratio >= 20 ? strcpy(#wface_val, "LIM") : sprintf(#wface_val, "%.1f:1", cmp_ratio);
+  ) :
+  ki == 2 ? (
+    _lv = log(max(0.1, cmp_attack));
+    _nv = ssl_knob_interact(km, cx, cy, kr, _lv, -2.30258509299, 4.60517018599, 2.30258509299, 0);
+    _nv != _lv ? ( cmp_attack = exp(_nv); cmp_recalc(); mark_dirty_kit(); );
+    _cpc_dv = _nv; _cpc_dmin = -2.30258509299; _cpc_dmax = 4.60517018599; _cpc_dsym = 0;
+    strcpy(#wface_lbl, "ATTACK"); sprintf(#wface_val, "%.1fms", cmp_attack);
+  ) :
+  ki == 3 ? (
+    _lv = log(max(100, cmp_release));
+    _nv = ssl_knob_interact(km, cx, cy, kr, _lv, 4.60517018599, 7.09007683578, 5.29831736655, 0);
+    _nv != _lv ? ( cmp_release = exp(_nv); cmp_recalc(); mark_dirty_kit(); );
+    _cpc_dv = _nv; _cpc_dmin = 4.60517018599; _cpc_dmax = 7.09007683578; _cpc_dsym = 0;
+    strcpy(#wface_lbl, "RELEASE");
+    cmp_auto ? strcpy(#wface_val, "AUTO") : sprintf(#wface_val, "%.0fms", cmp_release);
+  ) :
+  ki == 4 ? (
+    _nv = ssl_knob_interact(km, cx, cy, kr, cmp_makeup, -12, 12, 0, 0);
+    _nv != cmp_makeup ? ( cmp_makeup = _nv; cmp_recalc(); mark_dirty_kit(); );
+    _cpc_dv = cmp_makeup; _cpc_dmin = -12; _cpc_dmax = 12; _cpc_dsym = 1;
+    strcpy(#wface_lbl, "MAKEUP"); sprintf(#wface_val, "%+.1fdB", cmp_makeup);
+  ) : (
+    _nv = ssl_knob_interact(km, cx, cy, kr, cmp_mix, 0, 1, 1, 0);
+    _nv != cmp_mix ? ( cmp_mix = _nv; cmp_recalc(); mark_dirty_kit(); );
+    _cpc_dv = cmp_mix; _cpc_dmin = 0; _cpc_dmax = 1; _cpc_dsym = 0;
+    strcpy(#wface_lbl, "MIX"); sprintf(#wface_val, "%.0f%%", cmp_mix * 100);
+  );
+  // (the hover-wheel is ssl_knob_interact's own: it nudges in the knob's
+  // travel units, the same as Weld -- a second wheel path here doubled it)
+  // right-click the RATIO knob: the knee (diode trim) lives behind the face
+  ki == 1 && rmb_down && dist(mx, my, cx, cy) <= kr ? (
+    cmp_knee = cmp_knee >= 12 ? 0 : cmp_knee + 3; cmp_recalc(); mark_dirty_kit();
+  );
+  dist(mx, my, cx, cy) <= kr ? (
+    ki == 0 ? swing_tooltip_check(1401, "Threshold (-40 to 0 dB). Compression engages above this signal level.") :
+    ki == 1 ? swing_tooltip_check(1402, "Ratio, 1:1 to 20:1 (LIM). Right-click cycles the knee: the diode trim, 6 dB = the stock part.") :
+    ki == 2 ? swing_tooltip_check(1403, "Attack, 0.1 to 100 ms, on the hardware ladder.") :
+    ki == 3 ? swing_tooltip_check(1404, "Release, 100 ms to 1.2 s, the switch's span. AUTO hands it to the programme-dependent network.") :
+    ki == 4 ? swing_tooltip_check(1407, "Makeup gain (-12 to +12 dB) after the compressor.") :
+              swing_tooltip_check(1406, "Mix: dry to compressed. 100% = the whole signal through the compressor.");
+  );
+);
 
-    // ── Row 1: THRESHOLD (-40 to 0 dB) ──
-    _fx_ry += _fx_row_h;
-    gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 0.85);
-    gfx_x = _lcd_cx + 2; gfx_y = _fx_ry; gfx_drawstr("THR:");
-    gfx_set(0.06, 0.16, 0.20, 0.6);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, _fx_bar_w, _fx_row_h - 3);
-    _fx_fill = ((cmp_thresh + 40) / 40 * _fx_bar_w)|0;
-    gfx_set(0.65, 0.45, 0.20, 0.7);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, max(1, _fx_fill), _fx_row_h - 3);
-    gfx_set(1, 1, 1, 1);
-    sprintf(#_fxv, "%.1f dB", cmp_thresh);
-    gfx_measurestr(#_fxv, tw, th);
-    gfx_x = _fx_bar_x + (_fx_bar_w - tw) / 2; gfx_y = _fx_ry; gfx_drawstr(#_fxv);
-    active_id == 300 ? ( LMB ? (
-      cmp_thresh = max(-40, min(0, -40 + (mx - _fx_bar_x) / _fx_bar_w * 40));
-      cmp_recalc(); mark_dirty_kit();
-    ) : active_id = -1; );
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1401, "Threshold (-40 to 0 dB). Compression engages above this signal level.");
-    active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
-      active_id = 300;
-    );
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
-      cmp_thresh = max(-40, min(0, cmp_thresh + frame_wheel * 1)); cmp_recalc(); mark_dirty_kit();
-    );
+function swing_panels_draw_comp()
+local(x, y, w, h, s, land, top, vu_r, vu_cx, vu_cy, vu_bot, vg, sep1, sep2, ky1, ky2, kr,
+      ki, kcx, kcy, km, kp, bw, bh, bx, ax, by, hv, tw, th, face, lx, lw, rx, rw, colw, rowh) (
+  x = _lcd_cx; y = _lcd_cy; w = _lcd_cw; h = _lcd_ch;
+  land = h < 240;   // the LCD canvas is 108 tall; any big view is taller -- absolute, so a wide window never flips the big view into the LCD layout
+  s = land ? max(0.5, min(w / 420, h / 140)) : max(0.6, min(w / 420, h / 700));
+  wface_palette();
+  wface_sc = s;
+  kp = big_view_id == VIEW_COMP ? km_comp : km_comp + 6 * KS;   // per-surface knob memory
+  face = swing_vu_style >= 0 ? swing_vu_style : 0;               // header selector, else Weld's cream
 
-    // ── Row 2: RATIO (1:1 to 20:1) ──
-    _fx_ry += _fx_row_h;
-    gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 0.85);
-    gfx_x = _lcd_cx + 2; gfx_y = _fx_ry; gfx_drawstr("RAT:");
-    gfx_set(0.06, 0.16, 0.20, 0.6);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, _fx_bar_w, _fx_row_h - 3);
-    _fx_fill = ((cmp_ratio - 1) / 19 * _fx_bar_w)|0;
-    gfx_set(0.65, 0.45, 0.20, 0.7);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, max(1, _fx_fill), _fx_row_h - 3);
-    gfx_set(1, 1, 1, 1);
-    cmp_ratio >= 20 ? strcpy(#_fxv, "LIM") : sprintf(#_fxv, "%.1f:1", cmp_ratio);
-    gfx_measurestr(#_fxv, tw, th);
-    gfx_x = _fx_bar_x + (_fx_bar_w - tw) / 2; gfx_y = _fx_ry; gfx_drawstr(#_fxv);
-    active_id == 301 ? ( LMB ? (
-      cmp_ratio = max(1, min(20, 1 + (mx - _fx_bar_x) / _fx_bar_w * 19));
-      cmp_recalc(); mark_dirty_kit();
-    ) : active_id = -1; );
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1402, "Compression ratio (1:1 = none, 20:1 = limiting). Slope above threshold.");
-    active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
-      active_id = 301;
-    );
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
-      cmp_ratio = max(1, min(20, cmp_ratio + frame_wheel * 0.5)); cmp_recalc(); mark_dirty_kit();
-    );
+  // ── the plate ──
+  gfx_set(wface_bg_r, wface_bg_g, wface_bg_b, 1); gfx_rect(x, y, w, h);
+  // rack screws: in the corners; the LCD card tucks them tighter so they stay
+  // clear of the wordmark and the IN lamp
+  kr = land ? 5 : floor(8 * s);
+  wface_screw(x + kr,     y + kr,     max(2, floor((land ? 3 : 4) * s)));
+  wface_screw(x + w - kr, y + kr,     max(2, floor((land ? 3 : 4) * s)));
+  wface_screw(x + kr,     y + h - kr, max(2, floor((land ? 3 : 4) * s)));
+  wface_screw(x + w - kr, y + h - kr, max(2, floor((land ? 3 : 4) * s)));
 
-    // ── Row 3: ATTACK (0.1–100 ms) ──
-    _fx_ry += _fx_row_h;
-    gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 0.85);
-    gfx_x = _lcd_cx + 2; gfx_y = _fx_ry; gfx_drawstr("ATK:");
-    gfx_set(0.06, 0.16, 0.20, 0.6);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, _fx_bar_w, _fx_row_h - 3);
-    _fx_fill = (cmp_attack / 100 * _fx_bar_w)|0;
-    gfx_set(0.65, 0.45, 0.20, 0.7);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, max(1, _fx_fill), _fx_row_h - 3);
-    gfx_set(1, 1, 1, 1);
-    sprintf(#_fxv, "%.1f ms", cmp_attack);
-    gfx_measurestr(#_fxv, tw, th);
-    gfx_x = _fx_bar_x + (_fx_bar_w - tw) / 2; gfx_y = _fx_ry; gfx_drawstr(#_fxv);
-    active_id == 302 ? ( LMB ? (
-      cmp_attack = max(0.1, min(100, (mx - _fx_bar_x) / _fx_bar_w * 100));
-      cmp_recalc(); mark_dirty_kit();
-    ) : active_id = -1; );
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1403, "Attack time (0.1-100 ms). How quickly compression engages after threshold is crossed.");
-    active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
-      active_id = 302;
-    );
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
-      cmp_attack = max(0.1, min(100, cmp_attack + frame_wheel * 2)); cmp_recalc(); mark_dirty_kit();
-    );
+  !land ? (
+    // ── PORTRAIT: Weld's floating stack, scaled to the big view ──
+    gfx_setfont(3, "Arial", max(14, floor(26 * s)), 'b');
+    gfx_set(wface_tx_r, wface_tx_g, wface_tx_b, 1);
+    gfx_x = x + floor(16 * s); gfx_y = y + floor(5 * s);
+    gfx_drawstr("EON WELD");
+    gfx_setfont(4, "Arial", max(10, floor(13 * s)));
+    gfx_set(wface_td_r, wface_td_g, wface_td_b, 0.9);
+    gfx_drawstr("  BUS COMPRESSOR");
+    top = floor(32 * s);
+    vu_r  = floor(96 * s);
+    vu_cx = x + w * 0.5;
+    vu_cy = y + top + floor(8 * s) + vu_r * 1.4;
+    vu_bot = vu_cy + vu_r * 0.3;
+    kr  = floor(30 * s);
+    vg = max(0.85, min(2.75, (h - floor(112 * s) - (vu_bot - y)) / (329 * s)));
+    sep1 = vu_bot + floor(39 * s * vg);
+    ky1 = sep1 + floor(76 * s * vg);
+    ky2 = ky1 + floor(150 * s * vg);
+    sep2 = ky2 + kr + floor(52 * s * vg);
 
-    // ── Row 4: RELEASE (10–1000 ms) ──
-    _fx_ry += _fx_row_h;
-    gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 0.85);
-    gfx_x = _lcd_cx + 2; gfx_y = _fx_ry; gfx_drawstr("REL:");
-    gfx_set(0.06, 0.16, 0.20, 0.6);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, _fx_bar_w, _fx_row_h - 3);
-    _fx_fill = ((cmp_release - 10) / 990 * _fx_bar_w)|0;
-    gfx_set(0.65, 0.45, 0.20, 0.7);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, max(1, _fx_fill), _fx_row_h - 3);
-    gfx_set(1, 1, 1, 1);
-    sprintf(#_fxv, "%.0f ms", cmp_release);
-    gfx_measurestr(#_fxv, tw, th);
-    gfx_x = _fx_bar_x + (_fx_bar_w - tw) / 2; gfx_y = _fx_ry; gfx_drawstr(#_fxv);
-    active_id == 303 ? ( LMB ? (
-      cmp_release = max(10, min(1000, 10 + (mx - _fx_bar_x) / _fx_bar_w * 990));
-      cmp_recalc(); mark_dirty_kit();
-    ) : active_id = -1; );
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1404, "Release time (10-1000 ms). How quickly compression lets go after the signal drops below threshold.");
-    active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
-      active_id = 303;
-    );
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
-      cmp_release = max(10, min(1000, cmp_release + frame_wheel * 20)); cmp_recalc(); mark_dirty_kit();
-    );
+    rk_vu_theme(face);
+    rk_vu_pal_rgb(2, wface_bg_r, wface_bg_g, wface_bg_b);
+    cmp_vu.rk_vu_draw_at(vu_cx, vu_cy, vu_r, 1, -1, "GR");
+    sprintf(#wface_val, "%.1f dB GR", cmp_vu.pos > 0.05 ? -cmp_vu.pos : 0);
+    wface_readout(vu_cx, vu_bot + floor(9 * s), floor(min(110 * s, w - 20)), floor(18 * s),
+                  0.82, 0.68, 0.40);
+    wface_sep(x, sep1, w);
 
-    // ── Row 5: KNEE (0–12 dB) ──
-    _fx_ry += _fx_row_h;
-    gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 0.85);
-    gfx_x = _lcd_cx + 2; gfx_y = _fx_ry; gfx_drawstr("KNEE:");
-    gfx_set(0.06, 0.16, 0.20, 0.6);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, _fx_bar_w, _fx_row_h - 3);
-    _fx_fill = (cmp_knee / 12 * _fx_bar_w)|0;
-    gfx_set(0.65, 0.45, 0.20, 0.7);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, max(1, _fx_fill), _fx_row_h - 3);
-    gfx_set(1, 1, 1, 1);
-    sprintf(#_fxv, "%.1f dB", cmp_knee);
-    gfx_measurestr(#_fxv, tw, th);
-    gfx_x = _fx_bar_x + (_fx_bar_w - tw) / 2; gfx_y = _fx_ry; gfx_drawstr(#_fxv);
-    active_id == 304 ? ( LMB ? (
-      cmp_knee = max(0, min(12, (mx - _fx_bar_x) / _fx_bar_w * 12));
-      cmp_recalc(); mark_dirty_kit();
-    ) : active_id = -1; );
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1405, "Knee softness (0 dB = hard, 12 dB = smooth gradual onset around the threshold).");
-    active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
-      active_id = 304;
-    );
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
-      cmp_knee = max(0, min(12, cmp_knee + frame_wheel * 0.5)); cmp_recalc(); mark_dirty_kit();
+    ki = 0;
+    loop(6,
+      kcx = x + (w / 3) * (ki % 3) + (w / 6);
+      kcy = ki < 3 ? ky1 : ky2;
+      km = kp + ki * KS;
+      swing_panels_comp_knob(ki, kcx, kcy, kr, km);
+      wface_knob_cell(ki, kcx, kcy, kr, _cpc_dv, _cpc_dmin, _cpc_dmax, _cpc_dsym, km[0]);
+      ki += 1;
     );
 
-    // ── Row 6: MIX (0–100%) ──
-    _fx_ry += _fx_row_h;
-    gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 0.85);
-    gfx_x = _lcd_cx + 2; gfx_y = _fx_ry; gfx_drawstr("MIX:");
-    gfx_set(0.06, 0.16, 0.20, 0.6);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, _fx_bar_w, _fx_row_h - 3);
-    _fx_fill = (cmp_mix * _fx_bar_w)|0;
-    gfx_set(0.65, 0.45, 0.20, 0.7);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, max(1, _fx_fill), _fx_row_h - 3);
-    gfx_set(1, 1, 1, 1);
-    sprintf(#_fxv, "%.0f%%", cmp_mix * 100);
-    gfx_measurestr(#_fxv, tw, th);
-    gfx_x = _fx_bar_x + (_fx_bar_w - tw) / 2; gfx_y = _fx_ry; gfx_drawstr(#_fxv);
-    active_id == 305 ? ( LMB ? (
-      cmp_mix = max(0, min(1, (mx - _fx_bar_x) / _fx_bar_w));
-      cmp_recalc(); mark_dirty_kit();
-    ) : active_id = -1; );
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1406, "Parallel compression blend (0=uncompressed, 100%=fully compressed). NY-style mix.");
-    active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
-      active_id = 305;
-    );
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
-      cmp_mix = max(0, min(1, cmp_mix + frame_wheel * 0.05)); cmp_recalc(); mark_dirty_kit();
-    );
+    wface_sep(x, sep2, w);
+    bw = floor(74 * s); bh = floor(46 * s);
+    bx = x + w * 0.5 - bw - floor(17 * s);
+    ax = x + w * 0.5 + floor(17 * s);
+    by = sep2 + floor(12 * s * vg);
+  ) : (
+    // ── LANDSCAPE: the LCD card. Meter + buttons left, 2x3 knobs right ──
+    lx = x + floor(6 * s); lw = floor(w * 0.40);
+    rx = x + lw + floor(10 * s); rw = w - lw - floor(14 * s);
+    gfx_setfont(3, "Arial", max(8, floor(11 * s)), 'b');
+    gfx_set(wface_tx_r, wface_tx_g, wface_tx_b, 1);
+    gfx_x = lx + floor(14 * s); gfx_y = y + floor(3 * s);
+    gfx_drawstr("EON WELD");
+    vu_r  = max(16, floor(min(lw / 2.7, h * 0.30)));
+    vu_cx = lx + lw * 0.5;
+    vu_cy = y + floor(14 * s) + vu_r * 1.4;
+    vu_bot = vu_cy + vu_r * 0.3;
+    rk_vu_theme(face);
+    rk_vu_pal_rgb(2, wface_bg_r, wface_bg_g, wface_bg_b);
+    cmp_vu.rk_vu_draw_at(vu_cx, vu_cy, vu_r, 1, -1, "GR");
+    sprintf(#wface_val, "%.1f dB GR", cmp_vu.pos > 0.05 ? -cmp_vu.pos : 0);
+    wface_readout(vu_cx, vu_bot + floor(3 * s), floor(min(80 * s, lw - 8)), max(10, floor(12 * s)),
+                  0.82, 0.68, 0.40);
+    bw = max(28, floor(lw * 0.36)); bh = max(14, floor(18 * s));
+    bw = min(bw, floor((lw - floor(30 * s)) * 0.5) - floor(6 * s));   // two caps + lamps inside lw
+    bx = lx + floor(22 * s);                 // the lamp sits 8*s left of the cap: clear of the screw
+    ax = bx + bw + floor(14 * s);
+    by = y + h - bh - floor(4 * s);
 
-    // ── Row 7: MAKEUP GAIN (-12 to +12 dB) ──
-    _fx_ry += _fx_row_h;
-    gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 0.85);
-    gfx_x = _lcd_cx + 2; gfx_y = _fx_ry; gfx_drawstr("GAIN:");
-    gfx_set(0.06, 0.16, 0.20, 0.6);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, _fx_bar_w, _fx_row_h - 3);
-    _fx_fill = ((cmp_makeup + 12) / 24 * _fx_bar_w)|0;
-    gfx_set(0.65, 0.45, 0.20, 0.7);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, max(1, _fx_fill), _fx_row_h - 3);
-    gfx_set(1, 1, 1, 1);
-    sprintf(#_fxv, "%+.1f dB", cmp_makeup);
-    gfx_measurestr(#_fxv, tw, th);
-    gfx_x = _fx_bar_x + (_fx_bar_w - tw) / 2; gfx_y = _fx_ry; gfx_drawstr(#_fxv);
-    active_id == 306 ? ( LMB ? (
-      cmp_makeup = max(-12, min(12, -12 + (mx - _fx_bar_x) / _fx_bar_w * 24));
-      cmp_recalc(); mark_dirty_kit();
-    ) : active_id = -1; );
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1407, "Makeup gain (-12 to +12 dB) — compensates for level reduction caused by compression.");
-    active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
-      active_id = 306;
+    colw = rw / 3; rowh = h / 2;
+    kr = max(8, floor(min(colw * 0.30, rowh * 0.25)));
+    ki = 0;
+    loop(6,
+      kcx = rx + colw * (ki % 3) + colw * 0.5;
+      kcy = y + rowh * ((ki / 3) | 0) + floor(rowh * 0.50);
+      km = kp + ki * KS;
+      swing_panels_comp_knob(ki, kcx, kcy, kr, km);
+      wface_knob_cap(ki);
+      rk_knob_draw(21, kcx, kcy, kr, _cpc_dv, _cpc_dmin, _cpc_dmax, _cpc_dsym, km[0],
+                   sk_kbr, sk_kbg, sk_kbb, 0, wface_bg_r, wface_bg_g, wface_bg_b);
+      // short label above, value window below: the strip's embed grammar
+      gfx_setfont(5, "Arial", max(7, floor(8 * s)), 'b');
+      gfx_set(wface_tx_r, wface_tx_g, wface_tx_b, 0.95);
+      ki == 0 ? strcpy(#wface_lbl, "THR") : ki == 1 ? strcpy(#wface_lbl, "RAT") :
+      ki == 2 ? strcpy(#wface_lbl, "ATK") : ki == 3 ? strcpy(#wface_lbl, "REL") :
+      ki == 4 ? strcpy(#wface_lbl, "MKP") :            strcpy(#wface_lbl, "MIX");
+      gfx_measurestr(#wface_lbl, tw, th);
+      gfx_x = kcx - tw * 0.5; gfx_y = kcy - kr - th - floor(1 * s);
+      gfx_drawstr(#wface_lbl);
+      wface_readout(kcx, kcy + kr + floor(2 * s), floor(colw * 0.86), max(9, floor(11 * s)),
+                    wface_ac_r, wface_ac_g, wface_ac_b);
+      ki += 1;
     );
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
-      cmp_makeup = max(-12, min(12, cmp_makeup + frame_wheel * 0.5)); cmp_recalc(); mark_dirty_kit();
-    );
+  );
 
-    // ── Row 8: GR METER (display only) ──
-    _fx_ry += _fx_row_h;
-    gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 0.85);
-    gfx_x = _lcd_cx + 2; gfx_y = _fx_ry; gfx_drawstr("GR:");
-    gfx_set(0.06, 0.16, 0.20, 0.6);
-    gfx_rect(_fx_bar_x, _fx_ry + 1, _fx_bar_w, _fx_row_h - 3);
-    !cmp_bypass && cmp_gr_smooth < -0.1 ? (
-      _gr_norm = min(1.0, abs(cmp_gr_smooth) / 24);
-      _gr_fill = (_gr_norm * _fx_bar_w)|0;
-      gfx_set(0.85, 0.35, 0.20, 0.8);
-      gfx_rect(_fx_bar_x, _fx_ry + 1, _gr_fill, _fx_row_h - 3);
-      gfx_set(1, 1, 1, 1);
-      sprintf(#_fxv, "%.1f dB", cmp_gr_smooth);
-    ) : (
-      gfx_set(0.4, 0.5, 0.4, 0.6);
-      strcpy(#_fxv, "0.0 dB");
-    );
-    gfx_measurestr(#_fxv, tw, th);
-    gfx_x = _fx_bar_x + (_fx_bar_w - tw) / 2; gfx_y = _fx_ry; gfx_drawstr(#_fxv);
-    mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1408, "Gain Reduction meter — shows how much the compressor is attenuating in real time.");
+  // ── IN / AUTO, both layouts ──
+  hv = wface_btn_labeled(bx, by, bw, bh, !cmp_bypass, "IN", land ? "" : "COMP");
+  hv ? swing_tooltip_check(1400, "IN: the compressor is in circuit. Out = bypassed, and the engine rests clean.");
+  hv && lmb_down ? ( cmp_bypass = !cmp_bypass; mark_dirty_kit(); );
+  hv = wface_btn_labeled(ax, by, bw, bh, cmp_auto, "AUTO", land ? "" : "RELEASE");
+  hv ? swing_tooltip_check(1405, "AUTO release: the programme-dependent dual-RC recovery owns the release; the RELEASE knob rests.");
+  hv && lmb_down ? ( cmp_auto = !cmp_auto; cmp_recalc(); mark_dirty_kit(); );
+
+  gfx_setfont(1, "Arial", 9, 'b');   // hand slot 1 back to the LCD
 );
 
 // ── Full-size EQ big view — scale-up of the compact EQ curve editor ────────

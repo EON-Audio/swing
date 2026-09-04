@@ -55,6 +55,17 @@ end
 local _SCRIPT_DIR = _get_script_dir()
 local _sep = package.config:sub(1,1)
 
+-- Path of a companion script that ships NEXT TO this file. Every script the
+-- bridge launches (strip sync, the FX picker bridge, the dock rig) lives in the
+-- same folder as the bridge on every install -- the installer, ReaPack and the
+-- dev tree all keep them together -- so "next to me" is the only lookup that is
+-- right everywhere. ⛔ Never a hard-coded resource-path folder: the dock rig
+-- shipped pointing at the author's own Scripts/EON Scripts/ and was unreachable
+-- on every customer install (portable-install report, 2026-09-04).
+function eon_sibling_script(name)
+  return _SCRIPT_DIR:gsub("[/\\]+", "/"):gsub("/+$", "") .. "/" .. name
+end
+
 package.path = _SCRIPT_DIR .. _sep .. "?.lua;" .. (package.path or "")
 local core = require("rk_lua_core")
 
@@ -2604,8 +2615,8 @@ end
 -- Registering is idempotent -- the same path always yields the same _RS
 -- command id, no duplicates -- so the worst cost is one stable Action List
 -- entry per script, which is exactly what keeps user bindings alive. The ONE
--- deliberate unregister left in the bundle is EON_FloatSize_Watch's RETIREMENT
--- of a renamed path (wiki §11.3) -- that one is correct.
+-- deliberate unregister left in the bundle is EON Floatter's RETIREMENT of the
+-- FloatSize pair it replaced (wiki §11.3) -- that one is correct.
 function eon_preset_browser_launch_tick()
   local gr = reaper.gmem_read
   local req = math.floor((gr(26046100) or 0) + 0.5)        -- EON_SS_BROWSER_OPEN_REQ
@@ -2697,8 +2708,7 @@ function eon_strip_sync_ensure_tick()
     return
   end
 
-  local path = _SCRIPT_DIR:gsub("[/\\]+", "/"):gsub("/+$", "")
-                          .. "/EON_Swing_Strip_Sync.lua"
+  local path = eon_sibling_script("EON_Swing_Strip_Sync.lua")
   local f = io.open(path, "r")
   if not f then
     eon_ss_state = 'unresponsive'
@@ -2717,6 +2727,154 @@ function eon_strip_sync_ensure_tick()
   reaper.Main_OnCommand(cmd_id, 0)
   eon_ss_state    = 'launched'
   eon_ss_launch_t = now
+end
+
+-- ── Start EON Floatter if nothing else has ───────────────────────────────────
+-- The floating-window sizer: EON plugins open at the size EON set for them.
+-- Same contract as strip_sync above -- heartbeat, grace, launch at most ONCE
+-- per session, never unregister -- with one addition: the launch stamps
+-- core.FLOATTER_LAUNCH_KEY first, so the instance knows the bridge (not the
+-- user) started it and keeps its panel closed. Floatter's own set_action_options
+-- makes a launch-while-alive a restart, so the heartbeat gate is what keeps
+-- this from ever restarting a healthy instance.
+-- GLOBALS by necessity: the main chunk sits at Lua's 200-local ceiling.
+eon_fl_state        = 'init'
+eon_fl_ensure_first = nil
+eon_fl_launch_t     = nil
+eon_fl_stale_since  = nil
+function eon_floatter_ensure_tick()
+  if eon_fl_state == 'confirmed' or eon_fl_state == 'unresponsive' then return end
+  local now = reaper.time_precise()
+
+  if eon_fl_state == 'launched' then
+    local stamp = tonumber(reaper.GetExtState(core.ALIVE_FLOATTER_SECTION,
+                                              core.ALIVE_FLOATTER_KEY) or "")
+    if stamp and (now - stamp) < core.ALIVE_STALE_S then
+      eon_fl_state = 'confirmed'
+      return
+    end
+    if (now - eon_fl_launch_t) > 8.0 then
+      eon_fl_state = 'unresponsive'
+      reaper.ShowConsoleMsg("[EON] EON_Floatter.lua was launched but is not writing " ..
+        "heartbeats -- it likely exited on startup (js_ReaScriptAPI extension missing?).\n" ..
+        "  EON plugins will open at their default window size.\n")
+    end
+    return
+  end
+
+  if not eon_fl_ensure_first then eon_fl_ensure_first = now; return end
+  if (now - eon_fl_ensure_first) < 5.0 then return end
+
+  local stamp = tonumber(reaper.GetExtState(core.ALIVE_FLOATTER_SECTION,
+                                            core.ALIVE_FLOATTER_KEY) or "")
+  if stamp and (now - stamp) < core.ALIVE_STALE_S then
+    eon_fl_state = 'confirmed'         -- already running (startup entry, or by hand)
+    eon_fl_stale_since = nil
+    return
+  end
+  -- The user switched "starts with REAPER" off in Floatter's panel: respect it.
+  if reaper.GetExtState(core.ALIVE_FLOATTER_SECTION, "autostart") == "0" then
+    eon_fl_state = 'unresponsive'
+    return
+  end
+  -- A stale stamp right after a main-thread stall belongs to a LIVE instance
+  -- that has not had its tick yet; launching would restart it (Floatter's
+  -- set_action_options makes a launch-while-alive a restart) and close its
+  -- panel. Only a stamp that stays stale for 3 s more is a dead one.
+  if not eon_fl_stale_since then eon_fl_stale_since = now; return end
+  if (now - eon_fl_stale_since) < 3.0 then return end
+
+  local path = eon_sibling_script("EON_Floatter.lua")
+  local f = io.open(path, "r")
+  if not f then
+    eon_fl_state = 'unresponsive'      -- not installed here: nothing to say, nothing to do
+    return
+  end
+  f:close()
+  local cmd_id = reaper.AddRemoveReaScript(true, 0, path, true)
+  if not cmd_id or cmd_id <= 0 then
+    eon_fl_state = 'unresponsive'
+    reaper.ShowConsoleMsg("[EON] Could not add EON_Floatter.lua to the Action List -- " ..
+      "EON plugins will open at their default window size.\n")
+    return
+  end
+  reaper.SetExtState(core.ALIVE_FLOATTER_SECTION, core.FLOATTER_LAUNCH_KEY,
+                     "bridge:" .. reaper.time_precise(), false)
+  reaper.Main_OnCommand(cmd_id, 0)
+  eon_fl_state    = 'launched'
+  eon_fl_launch_t = now
+end
+
+-- ── Start EON_FXPicker_Bridge if nothing else has ────────────────────────────
+-- The FX picker (Swing's FX / INST / VEND panel and the Console's compact
+-- picker) is fed by its own defer script, EON_FXPicker_Bridge.lua. Like every
+-- background companion it only writes itself into __startup.lua after it has
+-- been run ONCE — and, exactly as with strip_sync above, nothing ever ran it
+-- for a customer: not the installer, not the guide, not this bridge. Dev
+-- machines had the startup entry from an old manual run, so the panel filled
+-- here and sat on "waiting for the bridge..." on every fresh install
+-- (portable-install report, 2026-09-04). Same fix, same shape: the one script
+-- customers ARE told to run launches it, once per session, and its own
+-- self-register then makes it a startup action from the next launch on.
+--
+-- Liveness is the picker's own toggle flag: it sets EON_FXPICK/running to "1"
+-- synchronously at the top of its file and clears it in atexit. Non-persistent
+-- ExtState, so a crashed REAPER cannot leave it stale across launches.
+-- ⛔ That flag is a TOGGLE — running the script while it reads "1" STOPS the
+-- live copy. Hence the grace period (a startup entry may not have ticked yet)
+-- and the hard rule of launching only while the flag says nobody is running.
+-- ⛔ Launched at most ONCE per bridge session, never retried: a second launch
+-- against a live copy is either the toggle-off above or REAPER's "already
+-- running" task-control modal.
+-- One table, not three locals: this file sits under Lua's 200-top-level-local cap.
+local eon_fxp = { state = 'init', ensure_first = nil, launch_t = nil }
+                 -- state: 'init' → 'launched' → 'confirmed' | 'unresponsive'
+function eon_fxpick_ensure_tick()
+  if eon_fxp.state == 'confirmed' or eon_fxp.state == 'unresponsive' then return end
+  local now     = reaper.time_precise()
+  local running = reaper.GetExtState("EON_FXPICK", "running") == "1"
+
+  if eon_fxp.state == 'launched' then
+    if running then eon_fxp.state = 'confirmed'; return end
+    if (now - eon_fxp.launch_t) > 8.0 then
+      eon_fxp.state = 'unresponsive'
+      reaper.ShowConsoleMsg("[EON] EON_FXPicker_Bridge.lua was launched but never reported " ..
+        "running -- it likely exited on startup.\n" ..
+        "  The FX picker will show 'waiting for the bridge'. Run it from the Action List " ..
+        "to see its error.\n")
+    end
+    return
+  end
+
+  -- Grace period: both scripts can sit in __startup.lua, and this bridge may
+  -- tick before the picker's startup entry has set its flag.
+  if not eon_fxp.ensure_first then eon_fxp.ensure_first = now; return end
+  if (now - eon_fxp.ensure_first) < 5.0 then return end
+
+  if running then
+    eon_fxp.state = 'confirmed'        -- already running (startup entry, or by hand)
+    return
+  end
+
+  local path = eon_sibling_script("EON_FXPicker_Bridge.lua")
+  local f = io.open(path, "r")
+  if not f then
+    eon_fxp.state = 'unresponsive'
+    reaper.ShowConsoleMsg("[EON] EON_FXPicker_Bridge.lua is missing (" .. path ..
+      ")\n  The FX picker will show 'waiting for the bridge'. Reinstall Swing.\n")
+    return
+  end
+  f:close()
+  local cmd_id = reaper.AddRemoveReaScript(true, 0, path, true)
+  if not cmd_id or cmd_id <= 0 then
+    eon_fxp.state = 'unresponsive'
+    reaper.ShowConsoleMsg("[EON] Could not add EON_FXPicker_Bridge.lua to the Action List " ..
+      "-- the FX picker will show 'waiting for the bridge'.\n")
+    return
+  end
+  reaper.Main_OnCommand(cmd_id, 0)
+  eon_fxp.state    = 'launched'
+  eon_fxp.launch_t = now
 end
 
 -- GROOVE S3: the StepSeq groove menu's "Import grooves..." row bumps GRV_OPEN_REQ
@@ -3668,8 +3826,8 @@ end
 -- and gives back exactly that much, so a window the user dragged wider while
 -- the strip was open keeps that size after the strip closes.
 --
--- Interop: EON_FloatSize_Watch.lua also sizes float windows, but only ONCE as
--- each window first appears, so it cannot fight a growth that happens later.
+-- Interop: EON Floatter also sizes float windows, but only ONCE as each
+-- window first appears, so it cannot fight a growth that happens later.
 
 -- param 3 = slider4 = instance_id, the same routing key CMD 63 uses. The name
 -- check is not redundant: another plugin's param 3 can hold the same number.
@@ -4332,11 +4490,13 @@ function eon_dock_layout_tick()
   local req = math.floor((reaper.gmem_read(DLR) or 0) + 0.5)
   if req <= 0 then return end
   reaper.gmem_write(DLR, 0)
-  local path = reaper.GetResourcePath() .. "/Scripts/EON Scripts/EON Dock Layout.lua"
+  -- Ships next to this file (see eon_sibling_script) -- the dock rig is part
+  -- of the bundle since 2026-09-04, not a separate install.
+  local path = eon_sibling_script("EON_Dock_Layout.lua")
   local f = io.open(path, "r")
   if not f then
-    reaper.ShowConsoleMsg("[EON] EON Dock Layout.lua not found (" .. path ..
-      ")\n  The wordmark menu's DOCK LAYOUT section needs the dock-rig scripts installed.\n")
+    reaper.ShowConsoleMsg("[EON] EON_Dock_Layout.lua not found (" .. path ..
+      ")\n  The wordmark menu's DOCK LAYOUT section needs it. Reinstall Swing.\n")
     return
   end
   f:close()
@@ -4374,11 +4534,11 @@ function eon_redock_tick()
     return (reaper.time_precise() - hb) < 2
   end
   local function launch_pane(name)
-    local path = reaper.GetResourcePath() .. "/Scripts/EON Scripts/" .. name
+    local path = eon_sibling_script(name)   -- ships next to this file
     local f = io.open(path, "r")
     if not f then
       reaper.ShowConsoleMsg("[EON] " .. name .. " not found (" .. path .. ")\n"
-        .. "  The wordmark dock toggle needs the dock-rig scripts installed.\n")
+        .. "  The wordmark dock toggle needs it. Reinstall Swing.\n")
       return
     end
     f:close()
@@ -4395,7 +4555,7 @@ function eon_redock_tick()
     local id = math.floor(reaper.gmem_read(GM.GS_REDOCK_ID_SWING) or 0)
     local tr = eon_padcat_track_for_slot(ss_resolve_slot(id))
     if tr then reaper.SetOnlyTrackSelected(tr) end
-    if not pane_alive("EON_SwingDock") then launch_pane("EON Swing Dock.lua") end
+    if not pane_alive("EON_SwingDock") then launch_pane("EON_Swing_Dock.lua") end
   end
   rq = math.floor(reaper.gmem_read(GM.GS_REDOCK_REQ_STEPPA) or 0)
   if rq > 0 then
@@ -4405,7 +4565,7 @@ function eon_redock_tick()
       local tr = eon_padcat_track_for_slot(slot)   -- paired Swing's track = Steppa's home
       if tr then reaper.SetOnlyTrackSelected(tr) end
     end
-    if not pane_alive("EON_SteppaDock") then launch_pane("EON Steppa Dock.lua") end
+    if not pane_alive("EON_SteppaDock") then launch_pane("EON_Steppa_Dock.lua") end
   end
 end
 
@@ -13798,7 +13958,9 @@ do
   -- 6 = registrar path normalisation completed. 5 collapsed separator RUNS but
   --     left base_dir's trailing one, so the join re-doubled it and every
   --     script got a fresh non-canonical twin. Now proven to converge.
-  local ACTIONS_VER = "6"
+  -- 7 = the dock rig ships (EON_Swing_Dock / EON_Steppa_Dock / EON_Dock_Layout /
+  --     EON_Swing_Dock_View / EON_Chain_Dock / EON_Dock_Debug), 2026-09-04.
+  local ACTIONS_VER = "7"
   if reaper.GetExtState("EON_Actions", "registered_ver") ~= ACTIONS_VER then
     local _, bp = reaper.get_action_context()
     local bdir = bp and bp:match("^(.*)[/\\]")
@@ -19331,6 +19493,10 @@ local function poll()
   pcall(eon_redock_tick)
   -- Start the Drum Strip sync companion if no one else has (once per session).
   pcall(eon_strip_sync_ensure_tick)
+  -- Start EON Floatter (window sizes) if no one else has (once per session).
+  pcall(eon_floatter_ensure_tick)
+  -- Start the FX picker bridge if no one else has (once per session).
+  pcall(eon_fxpick_ensure_tick)
   -- StepSeq SETTINGS: Open Swing / Drum Matrix command buttons.
   pcall(eon_ss_commands_tick)
   -- Toolbar lit-state for the EON toggle buttons (Grid/Paint/StepSeq/PadFX/Media/Browser).
@@ -19357,6 +19523,35 @@ end
 pcall(eon_padcat_pext_restore)   -- kit-categories: saved pad jobs -> PADCAT band before any kit load
 pcall(G.KITLIST.publish)         -- kits view: startup roster publish (covers a REQ bump that
                                  -- happened while the bridge was down — tick baselines stale)
+
+-- ── Extension preflight ──────────────────────────────────────────────────────
+-- Swing leans on three free extensions, and a missing one used to fail
+-- quietly, feature by feature: the browser never opened, multi-out grew no
+-- strips, the dock toggle did nothing. This bridge is the one script every
+-- install runs, so it is the place to say so -- ONCE per session, and only
+-- when something is actually missing (a console line on every launch would
+-- pop the console open for a background service with nothing to say).
+-- Each line names the feature that stops working, so the user can decide
+-- whether they care. Nothing is gated on it: everything that can run, runs.
+pcall(function()
+  local missing = {}
+  if not reaper.ImGui_CreateContext then
+    missing[#missing + 1] = "ReaImGui -- the sample browser, Pad FX and the dock layout picker"
+  end
+  if not reaper.JS_Window_Find then
+    missing[#missing + 1] = "js_ReaScriptAPI -- the dock rig and window sizing"
+  end
+  if not reaper.BR_GetMediaTrackSendInfo_Track then
+    missing[#missing + 1] = "SWS -- Drum Strip sync on multi-out tracks, clipboard actions"
+  end
+  if #missing > 0 then
+    local msg = "[EON] Swing: " .. #missing .. " extension(s) not installed. " ..
+                "Install from ReaPack (Extensions) and restart REAPER:\n"
+    for _, m in ipairs(missing) do msg = msg .. "  - " .. m .. "\n" end
+    reaper.ShowConsoleMsg(msg)
+  end
+end)
+
 reaper.defer(poll)
 reaper.atexit(function()
   reaper.gmem_write(G.BRIDGE_ALIVE, 0)

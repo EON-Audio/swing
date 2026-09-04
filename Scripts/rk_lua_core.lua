@@ -67,6 +67,14 @@ core.ALIVE_STRIP_SYNC_KEY     = "alive_t"
 -- ticks of slack -- generous enough that a heavy project-load stall cannot be
 -- mistaken for a dead script and get a second copy launched on top of it.
 core.ALIVE_STALE_S            = 2.0
+-- EON Floatter (the floating-window sizer) heartbeats the same way; the
+-- bridge starts it for Swing users. It ships as ONE file (ReaPack), so these
+-- strings are DUPLICATED at the top of EON_Floatter.lua -- keep them in step.
+-- FLOATTER_LAUNCH_KEY is stamped "bridge:<time>" right before Main_OnCommand
+-- so the instance knows it was not the user and keeps its panel closed.
+core.ALIVE_FLOATTER_SECTION   = "EON_Floatter"
+core.ALIVE_FLOATTER_KEY       = "alive_t"
+core.FLOATTER_LAUNCH_KEY      = "launch_src"
 
 -- ── JSFX add-name resolution ─────────────────────────────────────────────────
 -- TrackFX_AddByName wants "JS:<path relative to <resource>/Effects>", and that

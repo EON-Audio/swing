@@ -97,6 +97,7 @@ inserts band, sends and faders below.*
 | | |
 |---|---|
 | ![EON Weld — bus compressor with a GR needle](screenshots/weld.png)<br>*EON Weld — the bus compressor, on your drum bus after MULTI.* | ![EON Anvil — FET limiting amplifier, Blackface voice](screenshots/anvil.png)<br>*EON Anvil — the FET limiter, driving the Smash return.* |
+| ![Swing's COMP page — Weld's card in the big view](screenshots/comp_big.png)<br>*Swing's master compressor is Weld too, and its COMP page wears the same card: GR needle, six knobs, IN and AUTO.* | ![Swing's COMP page on the LCD — the card at strip size](screenshots/comp_lcd.png)<br>*The same card on the LCD, meter and buttons left, knobs right.* |
 
 | | |
 |---|---|
@@ -127,8 +128,10 @@ Strip embedded on every one, returns included.*
 
 3. **Synchronize packages**, install **EON Swing 3**, and **restart REAPER**.
 
-Also via ReaPack, free and required: **SWS**, **ReaImGui**, and
-**js_ReaScriptAPI**.
+Also via ReaPack, free and required: **SWS** (Drum Strip sync on multi-out
+tracks), **ReaImGui** (the sample browser, Pad FX, dock layouts) and
+**js_ReaScriptAPI** (the dock rig). Install them first; the Kit Bridge names
+any that are missing in the console.
 
 ## First run
 
@@ -170,10 +173,12 @@ Plain answers, because you shouldn't have to read source to know:
 
 - **Startup action.** That one-time Swing_Kit_Bridge run adds a small block to
   `Scripts/__startup.lua` in your REAPER resource folder so the bridge starts
-  with REAPER (the Drum Strip sync helper registers itself the same way). The
-  blocks are self-cleaning: uninstall the scripts and each block removes
-  itself and its settings on the next launch. The file is rewritten through a
-  temp file + rename, so other scripts' startup lines are never at risk.
+  with REAPER. The bridge then starts its two companions itself, the Drum
+  Strip sync helper and the FX picker bridge, and each registers itself the
+  same way, so all three come up with REAPER from then on. The blocks are
+  self-cleaning: uninstall the scripts and each block removes itself and its
+  settings on the next launch. The file is rewritten through a temp file +
+  rename, so other scripts' startup lines are never at risk.
 - **Network: none, by default.** A ReaPack install of Swing makes no network
   requests — updates come from ReaPack Synchronize, which only talks to this
   repository. (The Windows .exe channel ships an update checker that asks
