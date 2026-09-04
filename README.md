@@ -103,10 +103,9 @@ inserts band, sends and faders below.*
 | ![Drum Bus Options — returns, and a card for each compressor on the bus and the Smash return](screenshots/rack_dialog.png)<br>*MULTI asks once: returns on or off, and which compressor goes on the bus and on the Smash return.* | ![EON: New Song — tempo, sections, an arrangement bar, and genre templates](screenshots/new_song.png)<br>*New Song: tempo, sections and bars, or a template — Pop, Hip-Hop, Trap, Techno, Drum & Bass and more.* |
 | ![The dock layout picker — Full, Beatmaking, Sound design, Pads only, Ableton, Bitwig, Custom](screenshots/dock_layout.png)<br>*Dock layouts: seven arrangements of the EON panes around the arrange, one of them yours.* | ![The note picker — a pad's note chosen on a keyboard of pads](screenshots/note_picker.png)<br>*The note picker: every pad on a keyboard, a wheel to scroll octaves.* |
 
-![The FX picker — banks and categories on the left, the plugin list with cards, the chain on the right](screenshots/fxpicker.png)
-
-*The FX picker: every plugin you own, sorted into categories with a card each,
-and the pad's chain on the right, one drum at a time.*
+| | |
+|---|---|
+| ![The FX picker — banks and categories on the left, the plugin list with cards, the chain on the right](screenshots/fxpicker.png)<br>*The FX picker: every plugin you own, sorted into categories with a card each, and the pad's chain on the right.* | ![The FX picker's GRID view — a wall of plugin cards](screenshots/fxpicker_cards.png)<br>*GRID: the same catalogue as a wall of cards, each drawn to look like the plugin it stands for.* |
 
 ![REAPER's mixer with sixteen drum channels, each carrying an embedded Drum Strip](screenshots/hand_mixer.png)
 

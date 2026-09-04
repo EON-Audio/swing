@@ -241,6 +241,8 @@ hundred others get one too.
 
 ![The FX picker](screenshots/fxpicker.png)
 
+![The FX picker's card wall](screenshots/fxpicker_cards.png)
+
 ### Docking
 
 Click the SWING wordmark and Swing moves into a docker pane, folding into a
