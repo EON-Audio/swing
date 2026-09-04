@@ -12829,17 +12829,33 @@ function rk_ops.do_build_multiout(opts)
         -- CreateImage defers the file load to render time, so a missing
         -- PNG errors INSIDE the dialog's frame, past any pcall here
         -- (seen live 2026-08-25). Only files proven present become images.
-        local shipped = rk_img_base
-          and (rk_img_base .. "icons" .. _sep .. "card_" .. kind .. ".png") or nil
+        --
+        -- WHERE THE CARDS ARE (2026-09-04): the installer and ReaPack both put
+        -- icons/ beside the LUA -- Scripts/<pkg>/EON/Swing/icons -- while the
+        -- plugins land under Effects/. Looking next to EON_Weld.jsfx only ever
+        -- worked in the repo, where the two trees are one; every shipped
+        -- install showed this dialog with blank spacers where the cards go.
+        -- Same three candidates rk_lua_icons uses: beside the script, the
+        -- repo's Scripts/Swing sibling layout, and only then the plugin's dir.
+        local sd = _SCRIPT_DIR:gsub("[/\\]+", "/"):gsub("/+$", "")
+        local card = "card_" .. kind .. ".png"
+        local shipped_tries = {
+          sd .. "/icons/" .. card,
+          sd .. "/../Swing/icons/" .. card,
+          rk_img_base and (rk_img_base .. "icons" .. _sep .. card) or nil,
+        }
         local shot = rk_thumb_dir() .. _sep .. kind .. ".png"
         local tries = {}
+        local function add_shipped()
+          for _, p in ipairs(shipped_tries) do tries[#tries + 1] = p end
+        end
         if RK_DESIGNED[kind] then
-          tries[#tries + 1] = shipped
+          add_shipped()
         elseif rk_prefer_shots then
           tries[#tries + 1] = shot
-          tries[#tries + 1] = shipped
+          add_shipped()
         else
-          tries[#tries + 1] = shipped
+          add_shipped()
           tries[#tries + 1] = shot   -- fallback only where no card ships
         end
         for _, fp in ipairs(tries) do
