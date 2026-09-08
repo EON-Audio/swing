@@ -10,6 +10,59 @@ project like it belongs there. Because it does.
 > would, make some drums, and try to break it. Everything you notice is a
 > report we want.
 
+## In pictures
+
+![The Swing workspace — 16 pads with synth voices, per-pad mixer, kit artwork](screenshots/01_pads.png)
+
+*The workspace: 16 pads, synth or sample per pad, mixer meters, kit art,
+master drive.*
+
+| | |
+|---|---|
+| ![The Drum Synth editor — a 3D drum above the voice controls](screenshots/06_synth.png)<br>*The Drum Synth — nine families, thirty voices, and a 3D drum that moves as you tune it.* | ![The key-range editor — drag a pad across the keyboard](screenshots/13_range.png)<br>*Key ranges — drag a pad's edges and it plays melodically across the keys.* |
+| ![Steppa — the song strip across the top, sections drawn to length, a beat in the grid](screenshots/steppa_song.png)<br>*Steppa — the song strip: Intro, Verse, Chorus, Outro drawn to length, the playhead moving through them, one pattern per section.* | ![The Drum Strip — EQ graph, VU, filters, FX, sends](screenshots/35_drumstrip.png)<br>*Drum Strip — a channel per drum: EQ graph, VU, filters, drive, comp, and the DLY / RVB / SMSH sends.* |
+
+![Swing and Steppa docked under the arrange, the four song sections above them](screenshots/dock.png)
+
+*Docked: Swing's rack face and Steppa's dock face side by side under the
+arrange, the song's four sections above them. Both come back docked when the
+project reopens.*
+
+![The Drum Matrix — sixteen lanes in the arrange, one note block per hit](screenshots/dm_arrange.png)
+
+*The Drum Matrix: your patterns as real REAPER MIDI items, one lane per drum,
+named and coloured from the kit. Edit here or in Steppa; the other follows.*
+
+![The Console — sixteen strips, the inserts band with FX cards, sends and faders](screenshots/console.png)
+
+*The Console: sixteen strips on one desk, every pad's FX chain as cards in the
+inserts band, sends and faders below.*
+
+| | |
+|---|---|
+| ![The compact picker open over the desk — banks, categories and the plugin list](screenshots/console_picker.png)<br>*Click an empty slot and the picker opens right there on the desk: banks, category chips, the list with a card per plugin.* | ![The MACRO tab — eight macro knobs above the pad grid, with snapshots](screenshots/macro_tab.png)<br>*Kit macros — eight knobs above the grid, four snapshots and a morph slider.* |
+| ![The macro editor — PUNCH mapped to four pads' comp](screenshots/macros_punch.png)<br>*The macro editor: PUNCH mapped to the comp on four pads, each with its own range.* | ![The macro editor — DECAY mapped across eight pads](screenshots/macros_decay.png)<br>*DECAY across eight pads, every mapping with a range of its own.* |
+
+| | |
+|---|---|
+| ![EON Weld — bus compressor with a GR needle](screenshots/weld.png)<br>*EON Weld — the bus compressor, on your drum bus after MULTI.* | ![EON Anvil — FET limiting amplifier, Blackface voice](screenshots/anvil.png)<br>*EON Anvil — the FET limiter, driving the Smash return.* |
+| ![Swing's COMP page — Weld's card in the big view](screenshots/comp_big.png)<br>*Swing's master compressor is Weld too, and its COMP page wears the same card: GR needle, six knobs, IN and AUTO.* | ![Swing's COMP page on the LCD — the card at strip size](screenshots/comp_lcd.png)<br>*The same card on the LCD, meter and buttons left, knobs right.* |
+
+| | |
+|---|---|
+| ![Drum Bus Options — returns, and a card for each compressor on the bus and the Smash return](screenshots/rack_dialog.png)<br>*MULTI asks once: returns on or off, and which compressor goes on the bus and on the Smash return.* | ![EON: New Song — tempo, sections, an arrangement bar, and genre templates](screenshots/new_song.png)<br>*New Song: tempo, sections and bars, or a template — Pop, Hip-Hop, Trap, Techno, Drum & Bass and more.* |
+| ![The dock layout picker — Full, Beatmaking, Sound design, Pads only, Ableton, Bitwig, Custom](screenshots/dock_layout.png)<br>*Dock layouts: seven arrangements of the EON panes around the arrange, one of them yours.* | ![The note picker — a pad's note chosen on a keyboard of pads](screenshots/note_picker.png)<br>*The note picker: every pad on a keyboard, a wheel to scroll octaves.* |
+
+| | |
+|---|---|
+| ![The FX picker — banks and categories on the left, the plugin list with cards, the chain on the right](screenshots/fxpicker.png)<br>*The FX picker: every plugin you own, sorted into categories with a card each, and the pad's chain on the right.* | ![The FX picker's GRID view — a wall of plugin cards](screenshots/fxpicker_cards.png)<br>*GRID: the same catalogue as a wall of cards, each drawn to look like the plugin it stands for.* |
+
+![REAPER's mixer with sixteen drum channels, each carrying an embedded Drum Strip](screenshots/hand_mixer.png)
+
+*Hit MULTI: sixteen named, colored channels in REAPER's own mixer, a Drum
+Strip embedded on every one, returns included.*
+
+
 ## 📖 The Manual
 
 **[Swing 3.0 Manual — PDF, 51 pages](Swing_3.0_Manual.pdf)** — quickstart to
@@ -66,57 +119,6 @@ inside Swing, 14 console themes, 18 knob styles, kit cover art, multiple
 instances per project, and Swing's own undo engine — Ctrl+Z can't wipe a kit
 anymore.
 
-## In pictures
-
-![The Swing workspace — 16 pads with synth voices, per-pad mixer, kit artwork](screenshots/01_pads.png)
-
-*The workspace: 16 pads, synth or sample per pad, mixer meters, kit art,
-master drive.*
-
-| | |
-|---|---|
-| ![The Drum Synth editor — a 3D drum above the voice controls](screenshots/06_synth.png)<br>*The Drum Synth — nine families, thirty voices, and a 3D drum that moves as you tune it.* | ![The key-range editor — drag a pad across the keyboard](screenshots/13_range.png)<br>*Key ranges — drag a pad's edges and it plays melodically across the keys.* |
-| ![Steppa — the song strip across the top, sections drawn to length, a beat in the grid](screenshots/steppa_song.png)<br>*Steppa — the song strip: Intro, Verse, Chorus, Outro drawn to length, the playhead moving through them, one pattern per section.* | ![The Drum Strip — EQ graph, VU, filters, FX, sends](screenshots/35_drumstrip.png)<br>*Drum Strip — a channel per drum: EQ graph, VU, filters, drive, comp, and the DLY / RVB / SMSH sends.* |
-
-![Swing and Steppa docked under the arrange, the four song sections above them](screenshots/dock.png)
-
-*Docked: Swing's rack face and Steppa's dock face side by side under the
-arrange, the song's four sections above them. Both come back docked when the
-project reopens.*
-
-![The Drum Matrix — sixteen lanes in the arrange, one note block per hit](screenshots/dm_arrange.png)
-
-*The Drum Matrix: your patterns as real REAPER MIDI items, one lane per drum,
-named and coloured from the kit. Edit here or in Steppa; the other follows.*
-
-![The Console — sixteen strips, the inserts band with FX cards, sends and faders](screenshots/console.png)
-
-*The Console: sixteen strips on one desk, every pad's FX chain as cards in the
-inserts band, sends and faders below.*
-
-| | |
-|---|---|
-| ![The compact picker open over the desk — banks, categories and the plugin list](screenshots/console_picker.png)<br>*Click an empty slot and the picker opens right there on the desk: banks, category chips, the list with a card per plugin.* | ![The MACRO tab — eight macro knobs above the pad grid, with snapshots](screenshots/macro_tab.png)<br>*Kit macros — eight knobs above the grid, four snapshots and a morph slider.* |
-| ![The macro editor — PUNCH mapped to four pads' comp](screenshots/macros_punch.png)<br>*The macro editor: PUNCH mapped to the comp on four pads, each with its own range.* | ![The macro editor — DECAY mapped across eight pads](screenshots/macros_decay.png)<br>*DECAY across eight pads, every mapping with a range of its own.* |
-
-| | |
-|---|---|
-| ![EON Weld — bus compressor with a GR needle](screenshots/weld.png)<br>*EON Weld — the bus compressor, on your drum bus after MULTI.* | ![EON Anvil — FET limiting amplifier, Blackface voice](screenshots/anvil.png)<br>*EON Anvil — the FET limiter, driving the Smash return.* |
-| ![Swing's COMP page — Weld's card in the big view](screenshots/comp_big.png)<br>*Swing's master compressor is Weld too, and its COMP page wears the same card: GR needle, six knobs, IN and AUTO.* | ![Swing's COMP page on the LCD — the card at strip size](screenshots/comp_lcd.png)<br>*The same card on the LCD, meter and buttons left, knobs right.* |
-
-| | |
-|---|---|
-| ![Drum Bus Options — returns, and a card for each compressor on the bus and the Smash return](screenshots/rack_dialog.png)<br>*MULTI asks once: returns on or off, and which compressor goes on the bus and on the Smash return.* | ![EON: New Song — tempo, sections, an arrangement bar, and genre templates](screenshots/new_song.png)<br>*New Song: tempo, sections and bars, or a template — Pop, Hip-Hop, Trap, Techno, Drum & Bass and more.* |
-| ![The dock layout picker — Full, Beatmaking, Sound design, Pads only, Ableton, Bitwig, Custom](screenshots/dock_layout.png)<br>*Dock layouts: seven arrangements of the EON panes around the arrange, one of them yours.* | ![The note picker — a pad's note chosen on a keyboard of pads](screenshots/note_picker.png)<br>*The note picker: every pad on a keyboard, a wheel to scroll octaves.* |
-
-| | |
-|---|---|
-| ![The FX picker — banks and categories on the left, the plugin list with cards, the chain on the right](screenshots/fxpicker.png)<br>*The FX picker: every plugin you own, sorted into categories with a card each, and the pad's chain on the right.* | ![The FX picker's GRID view — a wall of plugin cards](screenshots/fxpicker_cards.png)<br>*GRID: the same catalogue as a wall of cards, each drawn to look like the plugin it stands for.* |
-
-![REAPER's mixer with sixteen drum channels, each carrying an embedded Drum Strip](screenshots/hand_mixer.png)
-
-*Hit MULTI: sixteen named, colored channels in REAPER's own mixer, a Drum
-Strip embedded on every one, returns included.*
 
 ## Install (ReaPack, all platforms)
 
