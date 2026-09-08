@@ -165,7 +165,7 @@ swing_popup_active ? (
 function swing_ui_export_tick()
 local(_ki, _mb, _li_base, _lidx, _lj, _lo, _lpb, _pbase, _plen, _ci, _cj, _cn, _cnl,
       _knl, _gb, _j, _dump_off, _l_alen, _l_src, _lp, _lpl, _s_alen, _s_src, _tpath,
-      _syb)
+      _syb, _n, _dump_over)
 // local() list added 2026-07-09 — same @gfx/@block scratch-global race class as
 // swing_ui_import_tick (this one runs @gfx; its _ki loops clobbered the @block
 // import's index). _ex_undo_busy_prev deliberately global (cross-invocation).
@@ -451,36 +451,62 @@ kit_export_state == 11 ? (
   // sum of l_len per layer (layered). Both halves agree on the layout.
   KIT_GMEM_AUDIO_DUMP = KIT_GMEM_AUDIO + NUM_PADS * 260 + NUM_PADS * MAX_LAYERS * 260;
   _dump_off = 0;
+  // Band guard (Spec_Swing_Long_Pad_Layer_Cap §4.4): the dump must stay under
+  // KIT_GMEM_AUDIO_DUMP_END — the Stretch rings start there, and the bridge's
+  // paper bound for this band (64M) was four times the real room (~16.75M
+  // cells for the WHOLE kit). The first blob that would cross it stops the
+  // dump for good (a partial dump would desync the bridge's cumulative
+  // offsets) and GS_EXPORT_OVER tells the bridge to refuse the save.
+  // Loop cap: every copy walks in KIT_DUMP_CHUNK pieces, so a plain pad's
+  // full slot (up to SLOT_SIZE cells) never meets EEL2's 2^20 iteration cap.
+  _dump_over = 0;
   _ki = 0; loop(NUM_PADS,
     p_layer_cnt[_ki] > 0 ? (
       // Layered: dump each active layer in order
       _lj = 0; loop(p_layer_cnt[_ki],
         _lidx = _ki * MAX_LAYERS + _lj;
         _l_alen = l_len[_lidx];
-        _l_alen > 0 ? (
-          _l_src = s_audio_start + _ki * SLOT_SIZE + _lj * LAYER_SIZE;
-          _j = 0; loop(_l_alen,
-            gmem[KIT_GMEM_AUDIO_DUMP + _dump_off + _j] = _l_src[_j];
-            _j += 1;
+        _l_alen > 0 && !_dump_over ? (
+          KIT_GMEM_AUDIO_DUMP + _dump_off + _l_alen > KIT_GMEM_AUDIO_DUMP_END ? (
+            _dump_over = 1;
+          ) : (
+            _l_src = s_audio_start + _ki * SLOT_SIZE + _lj * LAYER_SIZE;
+            _j = 0;
+            while(_j < _l_alen) (
+              _n = min(_l_alen - _j, KIT_DUMP_CHUNK);
+              loop(_n,
+                gmem[KIT_GMEM_AUDIO_DUMP + _dump_off + _j] = _l_src[_j];
+                _j += 1;
+              );
+            );
+            _dump_off += _l_alen;
           );
-          _dump_off += _l_alen;
         );
         _lj += 1;
       );
     ) : (
-      // Non-layered: dump pad-main audio (covers Choppa, drag-drop, etc.)
+      // Plain pad: dump the pad-main audio — the whole slot is its sample
       _s_alen = s_len[_ki];
-      _s_alen > 0 ? (
-        _s_src = s_audio_start + _ki * SLOT_SIZE;
-        _j = 0; loop(_s_alen,
-          gmem[KIT_GMEM_AUDIO_DUMP + _dump_off + _j] = _s_src[_j];
-          _j += 1;
+      _s_alen > 0 && !_dump_over ? (
+        KIT_GMEM_AUDIO_DUMP + _dump_off + _s_alen > KIT_GMEM_AUDIO_DUMP_END ? (
+          _dump_over = 1;
+        ) : (
+          _s_src = s_audio_start + _ki * SLOT_SIZE;
+          _j = 0;
+          while(_j < _s_alen) (
+            _n = min(_s_alen - _j, KIT_DUMP_CHUNK);
+            loop(_n,
+              gmem[KIT_GMEM_AUDIO_DUMP + _dump_off + _j] = _s_src[_j];
+              _j += 1;
+            );
+          );
+          _dump_off += _s_alen;
         );
-        _dump_off += _s_alen;
       );
     );
     _ki += 1;
   );
+  gmem[GS_EXPORT_OVER] = _dump_over;
 
   gmem[KIT_GMEM_VER] = 200;   // v2/v3/v4 marker (Lua decides format from gmem state)
   // Distinct completion signal (2026-07-09): 84 = silent undo-dump ready (bridge
@@ -520,6 +546,41 @@ kit_export_state == 3 ? (
 // Pad/kit names are not preserved (same kit on reopen → same names; live
 // renames are a known minor limitation). Globals are preserved by gating the
 // kit-import globals block on !kit_preserve_live.
+// Blank-casualty test for the preserve-live reload: the pad's metadata claims
+// audio but the buffer reads zero at three points (the same probe the
+// audio-repair detector in @serialize uses). Layered pads probe every authored
+// layer region; a plain pad probes its slot. Returns 1 only when EVERY
+// audio-bearing region is zero -- i.e. the chunk truncated, or a marker save
+// whose disk source is gone. A pad with no audio metadata is NOT a casualty:
+// the user emptied it and the kit file must not refill it.
+function swing_pad_audio_blank(p)
+local(_b, _n, _lj, _lidx, _len, _any, _blank)
+(
+  _any = 0; _blank = 1;
+  p_layer_cnt[p] > 0 ? (
+    _lj = 0; loop(MAX_LAYERS,
+      _lidx = p * MAX_LAYERS + _lj;
+      _len = l_len[_lidx];
+      _len > 100 ? (
+        _any = 1;
+        _b = s_audio_start + p * SLOT_SIZE + _lj * LAYER_SIZE;
+        _n = min(_len, LAYER_SIZE);
+        (_b[0] != 0 || _b[1] != 0 || _b[2] != 0 || _b[(_n / 2) | 0] != 0 || _b[_n - 1] != 0) ? _blank = 0;
+      );
+      _lj += 1;
+    );
+  ) : (
+    _len = s_len[p];
+    _len > 100 ? (
+      _any = 1;
+      _b = s_audio_start + p * SLOT_SIZE;
+      _n = min(_len, SLOT_SIZE);
+      (_b[0] != 0 || _b[1] != 0 || _b[2] != 0 || _b[(_n / 2) | 0] != 0 || _b[_n - 1] != 0) ? _blank = 0;
+    );
+  );
+  _any && _blank;
+);
+
 function swing_kit_preserve_snapshot() (
   memcpy(sv_p_gain,        p_gain,        NUM_PADS);
   memcpy(sv_p_pan,         p_pan,         NUM_PADS);
@@ -679,7 +740,7 @@ local(_ki, _mb, _li_base, _lidx, _lj, _lo, _lpb, _pbase, _plen, _ci, _cj, _cc, _
 // _udo_cap_depth (undo engine), _xf_active/_xf_len/_xf_pos
 // (read by @sample), kit_*/hs_* (persist across blocks), _undo_pad (mailbox).
 (
-kit_import_state == 0 && !_pr88_active ? _udo_cap_depth = 0;  // Phase 2: clear any leaked capture-depth while idle (P4: the CMD-88 reload pump holds its own suppression)
+kit_import_state == 0 && !_pr88_active && !_bl_job_pending ? _udo_cap_depth = 0;  // Phase 2: clear any leaked capture-depth while idle (P4: the CMD-88 reload pump holds its own suppression; a sliced CMD-63/64 load holds its bracket across blocks)
 kit_import_state == 1 ? (
   // Phase 1: waiting for the bridge to STAGE the kit. CMD==3 alone is NOT
   // "data ready" — load_swing_dispatch_now raises CMD=3 as a mirror latch
@@ -744,6 +805,23 @@ kit_import_state == 2 ? (
   // restore them over the kit's own params.
   kit_preserve_live = (gmem[GS_KIT_PRESERVE_LIVE] | 0) && _has_deserialized;
   kit_preserve_live ? swing_kit_preserve_snapshot();
+  // Which pads this reload may touch. The sidecar is a copy of the kit FILE,
+  // not of the live kit: a pad that already holds audio after @serialize
+  // (embedded, or reloaded from its own path) is the user's truth -- a pad
+  // they replaced, added, or kept -- and so is a pad they emptied. Only blank
+  // casualties (metadata says audio, buffer is zero: chunk truncation, or a
+  // marker whose disk source is gone) take the kit's copy. Decided ONCE here,
+  // before the META sweep below would replace the lengths the test reads.
+  // Legacy packed kits (VER < 26) stream audio at the KIT's lengths, so a
+  // skipped pad would desync the stream -- they keep the old all-pads reload.
+  // Found live 2026-09-08 (probe 7): a pad replaced with the user's own sample
+  // and saved embedded came back as the kit's original on the next real open.
+  _ki = 0; loop(NUM_PADS,
+    kit_keep_pad[_ki] = kit_preserve_live &&
+                        (gmem[KIT_GMEM_VER] == 26 || gmem[KIT_GMEM_VER] == 201) &&
+                        !swing_pad_audio_blank(_ki);
+    _ki += 1;
+  );
   // Kit name — staged into #kit_name_pending, COMMITTED in state 4 (Phase 2
   // 2026-07-17). Writing #kit_name here (staging time, before ANY audio has
   // moved) meant a stalled/aborted state-3 left the NEW name over the OLD
@@ -837,7 +915,9 @@ kit_import_state == 2 ? (
     // the adopt gates): kit loads skip this pad. Now it does here too.
     // Saves stay honest via the META republish sweep (:244), which re-publishes
     // the pad's KEPT state rather than the kit's staging.
-    gmem[EON_PADCAT_BASE + _reg_my_slot*EON_PADCAT_STRIDE + _ki*4 + 3] <= 0.5 ? (
+    // A kept pad (preserve-live reload, kit_keep_pad) is skipped the same way:
+    // its lengths describe the audio the adopt below will refuse to replace.
+    gmem[EON_PADCAT_BASE + _reg_my_slot*EON_PADCAT_STRIDE + _ki*4 + 3] <= 0.5 && !kit_keep_pad[_ki] ? (
     _mb = KIT_GMEM_META + _ki * KIT_GMEM_META_PP;
     _li_base = _ki * MAX_LAYERS;
     p_gain[_ki]      = gmem[_mb + 0];
@@ -1128,6 +1208,7 @@ kit_import_state == 2 ? (
   kit_copy_pad = 0;
   kit_copy_retry = 0;  // fresh import — clear any leftover from an aborted retry
   kit_copy_layer = 0;
+  kit_ldr_pass_pad = -1; kit_ldr_pass_try = -1; kit_ldr_done = 0;  // sliced loads: no pass yet
   kit_copy_pos = 0;
   kit_audio_off = 0;
   kit_copied_audio = 0;
@@ -1162,16 +1243,21 @@ kit_import_state == 3 ? (
         ) : (
           // First blob for this pad: zero ONLY this pad's slot. Every other
           // pad keeps its old audio until its own blobs arrive.
-          hs_flags & 1 ? memset(s_audio_start + hs_pad * SLOT_SIZE, 0, SLOT_SIZE);
+          // ...unless the pad is kept (preserve-live reload): its audio stays.
+          hs_flags & 1 && !kit_keep_pad[hs_pad] ? memset(s_audio_start + hs_pad * SLOT_SIZE, 0, SLOT_SIZE);
         );
       );
       kit_import_state == 3 && !(hs_flags & 2) ? (
         _hbatch = min(KIT_COPY_CHUNK, hs_len - hs_copy_pos);
         _hdst = s_audio_start + hs_pad * SLOT_SIZE + hs_layer * LAYER_SIZE + hs_copy_pos;
         _hsrc = KIT_GMEM_AUDIO + hs_copy_pos;
-        _hj = 0; loop(_hbatch,
-          _hdst[_hj] = gmem[_hsrc + _hj];
-          _hj += 1;
+        // A kept pad consumes the blob without writing it (the echo still
+        // advances the bridge); everything else copies as before.
+        !kit_keep_pad[hs_pad] ? (
+          _hj = 0; loop(_hbatch,
+            _hdst[_hj] = gmem[_hsrc + _hj];
+            _hj += 1;
+          );
         );
         hs_copy_pos += _hbatch;
         kit_copied_audio += _hbatch;
@@ -1203,7 +1289,9 @@ kit_import_state == 3 ? (
     // Gate on kit_copy_retry==0 too: if pad 0's open misses and we retry it on
     // the next @block (kit_copy_pad stays 0), this one-time setup must NOT
     // re-run — re-killing voices every retry block would dropout the audio.
-    kit_copy_pad == 0 && kit_copy_retry == 0 ? (
+    // ...and not on the later blocks of pad 0's own sliced load either: the
+    // pass registration below turns kit_ldr_pass_pad to 0 on the first one.
+    kit_copy_pad == 0 && kit_copy_retry == 0 && kit_ldr_pass_pad != 0 ? (
       kit_stage_gap_bits = 0;  // per-load: pads where kit META says audio but no path was staged
       _xf_vi = 0; loop(MAX_VOICES + 1,
         v_pos[_xf_vi] = -1; v_env[_xf_vi] = 0; v_stage[_xf_vi] = 0;
@@ -1221,11 +1309,22 @@ kit_import_state == 3 ? (
       // its whole adopt (paths, clears, meta). Internal p_* state is kept and
       // the META republish sweep (:236) restores the truth cells, so a later
       // SAVE writes the pad's real (kept) data, not the skipped kit's staging.
-      gmem[EON_PADCAT_BASE + _reg_my_slot*EON_PADCAT_STRIDE + _ki*4 + 3] > 0.5 ? (
+      // A kept pad (preserve-live reload, kit_keep_pad) takes the same exit:
+      // no path adopt, no clear, no load -- its audio is the user's truth.
+      gmem[EON_PADCAT_BASE + _reg_my_slot*EON_PADCAT_STRIDE + _ki*4 + 3] > 0.5 || kit_keep_pad[_ki] ? (
         kit_copy_retry = 0;
         kit_copy_pad += 1;
       ) : (
-      kit_pad_open_failed = 0;  // cleared per pad; the loaders SET it on a transient open miss
+      // ── Sliced loads: a pad-pass may span several @blocks. The pass identity
+      // is (pad, retry attempt); a new pass resets the per-layer done bits and
+      // the open-miss flag. A load still in flight makes the pass YIELD: no
+      // META re-apply, no advance, re-enter next block and pump it again.
+      (kit_ldr_pass_pad != _ki || kit_ldr_pass_try != kit_copy_retry) ? (
+        kit_ldr_pass_pad = _ki; kit_ldr_pass_try = kit_copy_retry;
+        kit_ldr_done = 0;
+        kit_pad_open_failed = 0;  // cleared per pass; the loaders SET it on a transient open miss
+      );
+      kit_ldr_yield = 0;
       _mb = KIT_GMEM_META + _ki * KIT_GMEM_META_PP;
       _v201_lc = gmem[_mb + 32] | 0;
       _v201_lc > MAX_LAYERS ? _v201_lc = MAX_LAYERS;
@@ -1236,55 +1335,66 @@ kit_import_state == 3 ? (
           _lpb = KIT_GMEM_AUDIO + NUM_PADS * 260 + (_ki * MAX_LAYERS + _lj) * 260;
           _plen = gmem[_lpb] | 0;
           _plen > 0 && _plen < 259 ? (
-            strcpy(#_kit_tmp_path, "");
-            _ci = 0; loop(_plen,
-              str_setchar(#_kit_tmp_path, _ci, gmem[_lpb + 1 + _ci] | 0);
-              _ci += 1;
-            );
-            str_setlen(#_kit_tmp_path, _plen);
-            load_layer_from_path(_ki, _lj, #_kit_tmp_path);
             _v201_any = 1;
+            !kit_ldr_yield && !(kit_ldr_done & 2^_lj) ? (
+              strcpy(#_kit_tmp_path, "");
+              _ci = 0; loop(_plen,
+                str_setchar(#_kit_tmp_path, _ci, gmem[_lpb + 1 + _ci] | 0);
+                _ci += 1;
+              );
+              str_setlen(#_kit_tmp_path, _plen);
+              swing_ldr_step_layer(_ki, _lj, #_kit_tmp_path) ?
+                ( kit_ldr_done |= 2^_lj; ) : ( kit_ldr_yield = 1; );
+            );
           ) : (
-            // Kit authored NO layer in this slot — wipe any residue the
-            // previous kit left here (a recorded-but-failed LPATH, or a
-            // still-audible audio ghost). "Leave untouched slots alone" is
-            // the right call for pads the import never REACHES; within a
-            // reached pad, staged-empty = kit truth. Without this, a stale
-            // LPATH with l_len 0 strands the pad's fail bit across every
-            // subsequent kit load (relink banner on a healthy pad).
-            // STAGE-GAP CONTRADICTION (2026-07-19): the kit's OWN meta says
-            // this layer carries audio (staged len at _mb+40+_lj*10) yet no
-            // path cell was staged — every producer stages a path for every
-            // audio-carrying layer, so this means the delivery was lost or
-            // consumed early. Record it in the ack failbits so the bridge's
-            // retry backstop re-dispatches instead of the pad going silently
-            // blank-but-"clean" (the failbits=0x0 blank-pad class).
-            gmem[_mb + 40 + _lj * 10] > 0 ? kit_stage_gap_bits |= 2 ^ _ki;
-            (l_len[_ki * MAX_LAYERS + _lj] > 0 ||
-             strlen(LPATH_STR_BASE + _ki * MAX_LAYERS + _lj) > 0) ? clear_layer(_ki, _lj);
+            !(kit_ldr_done & 2^_lj) ? (
+              // Kit authored NO layer in this slot — wipe any residue the
+              // previous kit left here (a recorded-but-failed LPATH, or a
+              // still-audible audio ghost). "Leave untouched slots alone" is
+              // the right call for pads the import never REACHES; within a
+              // reached pad, staged-empty = kit truth. Without this, a stale
+              // LPATH with l_len 0 strands the pad's fail bit across every
+              // subsequent kit load (relink banner on a healthy pad).
+              // STAGE-GAP CONTRADICTION (2026-07-19): the kit's OWN meta says
+              // this layer carries audio (staged len at _mb+40+_lj*10) yet no
+              // path cell was staged — every producer stages a path for every
+              // audio-carrying layer, so this means the delivery was lost or
+              // consumed early. Record it in the ack failbits so the bridge's
+              // retry backstop re-dispatches instead of the pad going silently
+              // blank-but-"clean" (the failbits=0x0 blank-pad class).
+              gmem[_mb + 40 + _lj * 10] > 0 ? kit_stage_gap_bits |= 2 ^ _ki;
+              (l_len[_ki * MAX_LAYERS + _lj] > 0 ||
+               strlen(LPATH_STR_BASE + _ki * MAX_LAYERS + _lj) > 0) ? clear_layer(_ki, _lj);
+              kit_ldr_done |= 2^_lj;
+            );
           );
           _lj += 1;
         );
-        !_v201_any ? clear_pad(_ki);  // kit says layered but staged no paths
+        !kit_ldr_yield && !_v201_any ? clear_pad(_ki);  // kit says layered but staged no paths
       ) : (
-        // Non-layered pad: single pad-main path (VER-200 shape).
-        _pbase = KIT_GMEM_AUDIO + _ki * 260;
-        _plen = gmem[_pbase] | 0;
-        _plen > 0 && _plen < 259 ? (
-          strcpy(#_kit_tmp_path, "");
-          _ci = 0; loop(_plen,
-            str_setchar(#_kit_tmp_path, _ci, gmem[_pbase + 1 + _ci] | 0);
-            _ci += 1;
+        !(kit_ldr_done & 256) ? (
+          // Non-layered pad: single pad-main path (VER-200 shape).
+          _pbase = KIT_GMEM_AUDIO + _ki * 260;
+          _plen = gmem[_pbase] | 0;
+          _plen > 0 && _plen < 259 ? (
+            strcpy(#_kit_tmp_path, "");
+            _ci = 0; loop(_plen,
+              str_setchar(#_kit_tmp_path, _ci, gmem[_pbase + 1 + _ci] | 0);
+              _ci += 1;
+            );
+            str_setlen(#_kit_tmp_path, _plen);
+            swing_ldr_step_pad(_ki, #_kit_tmp_path) ?
+              ( kit_ldr_done |= 256; ) : ( kit_ldr_yield = 1; );
+          ) : (
+            // STAGE-GAP CONTRADICTION (see the layered branch above): kit meta
+            // says this pad carries audio (_mb+34) but no path was staged.
+            gmem[_mb + 34] > 0 ? kit_stage_gap_bits |= 2 ^ _ki;
+            clear_pad(_ki);  // pad is empty in the new kit
+            kit_ldr_done |= 256;
           );
-          str_setlen(#_kit_tmp_path, _plen);
-          load_from_path(_ki, #_kit_tmp_path);
-        ) : (
-          // STAGE-GAP CONTRADICTION (see the layered branch above): kit meta
-          // says this pad carries audio (_mb+34) but no path was staged.
-          gmem[_mb + 34] > 0 ? kit_stage_gap_bits |= 2 ^ _ki;
-          clear_pad(_ki);  // pad is empty in the new kit
         );
       );
+      !kit_ldr_yield ? (
       // ── Re-apply kit metadata over what the loaders clobbered (auto-name,
       // auto-ADSR, layer defaults). The gmem META region persists through
       // state 3, so read it back directly (same pattern as VER-200).
@@ -1337,6 +1447,7 @@ kit_import_state == 3 ? (
         kit_copy_retry = 0;
         kit_copy_pad += 1;
       );
+      );  // close the !kit_ldr_yield gate (sliced loads)
       );  // close the ② lock-gate else-branch (unlocked-pad adopt body)
     );
     kit_copy_pad >= NUM_PADS ? (
@@ -1368,8 +1479,8 @@ kit_import_state == 3 ? (
       _ki = kit_copy_pad;
       // ② LOCK gate, legacy v26 path: skip the WHOLE pad body — its else-branch
       // is clear_pad and the tail re-applies name/META, all of which must not
-      // touch a locked pad.
-      gmem[EON_PADCAT_BASE + _reg_my_slot*EON_PADCAT_STRIDE + _ki*4 + 3] > 0.5 ? (
+      // touch a locked pad. A kept pad (preserve-live reload) exits the same way.
+      gmem[EON_PADCAT_BASE + _reg_my_slot*EON_PADCAT_STRIDE + _ki*4 + 3] > 0.5 || kit_keep_pad[_ki] ? (
         kit_copy_pad += 1;
       ) : (
       _pbase = KIT_GMEM_AUDIO + _ki * 260;
@@ -1381,11 +1492,11 @@ kit_import_state == 3 ? (
           _ci += 1;
         );
         str_setlen(#_kit_tmp_path, _plen);
-        load_from_path(_ki, #_kit_tmp_path);
+        swing_ldr_run(ldr_job0, _ki, -1, #_kit_tmp_path);  // legacy path: synchronous on the block bank
       ) : (
         clear_pad(_ki);
       );
-      // Re-apply pad name from gmem (load_from_path auto-named it)
+      // Re-apply pad name from gmem (the loader auto-named it)
       _cn = get_cname_slot(_ki);
       str_setlen(_cn, 0);
       _cj = 0; _cnl = 0;
@@ -3241,6 +3352,19 @@ function swing_ui_draw_lcd_frame() (
     swing_warning_overlay("Kit Bridge not running!",
                           "Run Swing_Kit_Bridge.lua in Actions",
                           0.95, 0.40, 0.30) ? kit_bridge_warn = 0;
+  ) :
+  //   1b. A plain pad longer than a layer was promoted (a layer >= 1 landed
+  //      on it) and cut to LAYER_SIZE. swing_pad_promote (rk_swing_core) arms
+  //      this; the cut is undoable while the undo slot is backed. Session-
+  //      volatile and self-expiring; a click dismisses it.
+  (pad_cut_warn_pad >= 0 && time_precise() < pad_cut_warn_until) ? (
+    sprintf(#_cut_title, "Pad %d cut to %.1f s", pad_cut_warn_pad + 1, pad_cut_warn_after);
+    _udo_ready ?
+      sprintf(#_cut_sub, "%.1f s sample - a layer holds %.1f s. Undo restores it.",
+              pad_cut_warn_before, pad_cut_warn_after) :
+      sprintf(#_cut_sub, "%.1f s sample - a layer holds %.1f s. Undo cannot restore it here.",
+              pad_cut_warn_before, pad_cut_warn_after);
+    swing_warning_overlay(#_cut_title, #_cut_sub, 0.95, 0.65, 0.30) ? pad_cut_warn_pad = -1;
   ) :
   gmem[GS_REAIMGUI_MISSING] == 1 ? (
     swing_warning_overlay("ReaImGui not installed",

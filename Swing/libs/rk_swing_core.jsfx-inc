@@ -429,75 +429,253 @@ function clear_pad_syn(i) local() (
   ps_mac4[i] = 0.5; ps_mac5[i] = 0.5; ps_mac6[i] = 0.5; ps_mac7[i] = 0.5;
 );
 
+// ─── Plain pads, layers, and the promotion cut ────────────────────────────
+// (Spec_Swing_Long_Pad_Layer_Cap.md) A pad holding ONE sample is a PLAIN pad:
+// p_layer_cnt = 0, the audio at the slot base, s_len up to SLOT_SIZE (45 s at
+// 44.1k). It becomes a layered pad only when a layer >= 1 receives audio, and
+// a layer holds LAYER_SIZE (11.3 s), so promoting a pad longer than that CUTS
+// it. The cut is announced (LCD banner, rk_swing_ui_state) and undoable
+// (whole-slot backup). Until 2026-09-08 every load promoted the pad to a
+// one-layer pad, which capped every pad at 11.3 s in playback, @serialize, the
+// kit export and the kit import while s_len kept the true length — the
+// header/blob mismatch of the 2026-09-07 audit.
+
+// Layer index an "add a layer" gesture should target: a plain pad with audio
+// stacks on layer 1 (layer 0 is its sample); otherwise the next free slot,
+// clamped so a full pad stacks on its last layer rather than doing nothing.
+function swing_pad_next_layer(pad) (
+  p_layer_cnt[pad] == 0 && s_len[pad] > 0 ? 1 : min(p_layer_cnt[pad], MAX_LAYERS - 1);
+);
+
+// Promote a plain pad's sample into layer 0. The audio already sits at the
+// layer-0 offset, so this is metadata — plus the cut when the sample is
+// longer than a layer. Safe inside an existing undo capture or standalone
+// (captures are depth-counted; the outermost caller records the backup).
+// Idempotent: a layered or empty pad is left alone.
+function swing_pad_promote(pad)
+local(_lidx, _old_len, _sr)
+(
+  pad >= 0 && pad < NUM_PADS && p_layer_cnt[pad] == 0 && s_len[pad] > 0 ? (
+    undo_begin_pad(pad);
+    _lidx = pad * MAX_LAYERS;
+    _old_len = s_len[pad];
+    _old_len > LAYER_SIZE ? (
+      // The cut. Trim fractions are relative to the length: a trim that lies
+      // inside the surviving 11.3 s stays where it is, the rest clamps to
+      // the new end; an inverted pair falls back to the whole layer.
+      s_start[pad] = min(1.0, s_start[pad] * _old_len / LAYER_SIZE);
+      s_end[pad]   = min(1.0, s_end[pad]   * _old_len / LAYER_SIZE);
+      s_start[pad] >= s_end[pad] ? ( s_start[pad] = 0; s_end[pad] = 1.0; );
+      s_len[pad] = LAYER_SIZE;
+      _sr = s_sr[pad] > 0 ? s_sr[pad] : srate;
+      pad_cut_warn_pad    = pad;
+      pad_cut_warn_before = _old_len / (2 * _sr);
+      pad_cut_warn_after  = LAYER_SIZE / (2 * _sr);
+      pad_cut_warn_until  = time_precise() + 8;
+      sp_src_gen[pad] += 1;   // the Extension re-captures this pad's source
+    );
+    l_len[_lidx]       = s_len[pad];
+    l_start[_lidx]     = s_start[pad];
+    l_end[_lidx]       = s_end[pad];
+    l_sr[_lidx]        = s_sr[pad];
+    l_norm[_lidx]      = s_norm[pad];
+    l_norm_gain[_lidx] = s_norm_gain[pad];
+    l_gain[_lidx]      = 1.0;
+    l_vel_lo[_lidx]    = 0;
+    l_vel_hi[_lidx]    = 1.0;
+    l_rr_order[_lidx]  = 0;
+    strcpy(LPATH_STR_BASE + _lidx, get_path_slot(pad));
+    p_layer_cnt[pad] = 1;
+    p_layer_mode[pad] == 0 ? p_layer_mode[pad] = 3;
+    s_dirty[pad] = 1;
+    undo_cap_end();
+  );
+);
+
 // ─── Waveform-aware ADSR analysis ─────────────────────────────────────────
 // Derives ADSR parameters from actual waveform shape. Runs at load time
 // (never in @sample — sqrt is intentional and safe here).
-// buf     = interleaved stereo buffer pointer (L0,R0,L1,R1,...)
-// buf_len = total floats in buffer (stereo frames = buf_len/2)
-// buf_sr  = buffer sample rate
-// pad_idx = pad index to write ADSR results to
-function analyze_adsr(buf, buf_len, buf_sr, pad_idx)
-local(_tot_frames, _dur_ms, _win_frames, _win_interleaved, _win_ms,
-      _num_wins, _w, _fi, _sum, _rms_buf,
-      _peak_rms, _peak_win, _post_peak,
-      _tail_start, _sus_sum, _sus_cnt, _sus_rms, _sus,
-      _body_start, _body_end, _body_sum, _body_cnt, _body_avg,
-      _dec_tgt, _dec_win, _dec_found,
-      _rel_tgt, _rel_win,
+// ─── Sliced sample loader ─────────────────────────────────────────────────
+// One resumable load JOB per bank. Job 0 belongs to @block (kit import, the
+// CMD-88 reload pump, CMD 63/64) and is pumped one bounded slice per block;
+// job 1 belongs to the UI side (@gfx drops, @serialize reloads) and is run to
+// completion in one call by the load_from_path / load_layer_from_path
+// wrappers. The banks never share state, so a drop during a kit load cannot
+// corrupt the in-flight job. A job walks: open + header (begin) → read in
+// slices with the peak folded in → zero the unused tail → RMS windows for the
+// waveform-aware ADSR → finish (metadata, names, layer promotion, ADSR
+// results, flags). Every loop inside one slice stays far under EEL2's 2^20
+// iteration cap; the old one-shot loader tripped it on samples longer than
+// 2^20 cells (its peak scan saw only the first 1,048,576 cells, and a mono file
+// lost everything past 1,048,576 frames) — measured 2026-09-07 with
+// .dev_tests/EON_Probe_LdrSlice_*. Job records live in host-allocated memory
+// (swing_ldr_init) — this inc claims no freemem itself (wiki 2.4).
+LDR_F_PHASE   = 0;   // 0 idle · 1 read · 2 zero tail · 3 RMS windows · 4 finish
+LDR_F_PAD     = 1;
+LDR_F_LAYER   = 2;   // -1 = pad main
+LDR_F_HANDLE  = 3;
+LDR_F_NCH     = 4;
+LDR_F_SR      = 5;
+LDR_F_BUF     = 6;
+LDR_F_CAP     = 7;
+LDR_F_POS     = 8;   // cells landed so far
+LDR_F_PEAK    = 9;
+LDR_F_ZPOS    = 10;  // zero-tail cursor
+LDR_F_WFR     = 11;  // RMS window: frames
+LDR_F_WIL     = 12;  // RMS window: interleaved cells
+LDR_F_NWIN    = 13;
+LDR_F_W       = 14;  // RMS window cursor
+LDR_F_PKRMS   = 15;
+LDR_F_PKWIN   = 16;
+LDR_F_ADSR    = 17;  // 1 = the analyzer owns this pad's ADSR after the load
+LDR_F_PREVCNT = 18;  // layer loads: p_layer_cnt before the load
+LDR_F_OPENED  = 19;  // file_open succeeded
+LDR_F_LEN     = 20;  // final cell count
+LDR_F_RMS     = 32;  // 200-cell RMS scratch (LDR_JOB_STRIDE is 256)
+
+function swing_ldr_init(fm) (
+  ldr_job0 = fm;
+  ldr_job1 = fm + LDR_JOB_STRIDE;
+  memset(fm, 0, 2 * LDR_JOB_STRIDE);   // an @init re-run drops any in-flight job
+  ldr_job0[LDR_F_HANDLE] = -1;
+  ldr_job1[LDR_F_HANDLE] = -1;
+  ldr_budget = LDR_BUDGET_MIN;         // @block rescales it from samplesblock
+  fm + 2 * LDR_JOB_STRIDE;
+);
+
+// Drop an in-flight job: a newer job for the same bank, or a state machine the
+// bridge abandoned mid-flight. The pad keeps the zero length begin() gave it.
+function swing_ldr_abort(jb) (
+  jb[LDR_F_PHASE] > 0 ? (
+    jb[LDR_F_HANDLE] >= 0 ? file_close(jb[LDR_F_HANDLE]);
+    jb[LDR_F_HANDLE] = -1;
+    swing_pad_fail_recompute(jb[LDR_F_PAD]);
+    undo_cap_end();
+    jb[LDR_F_PHASE] = 0;
+  );
+);
+
+function swing_ldr_begin(jb, pad, layer, path_str)
+local(f, nch, fsr, lidx)
+(
+  jb[LDR_F_PHASE] > 0 ? swing_ldr_abort(jb);   // a new job always wins
+  jb[LDR_F_PAD] = pad; jb[LDR_F_LAYER] = layer;
+  jb[LDR_F_HANDLE] = -1; jb[LDR_F_NCH] = 0; jb[LDR_F_SR] = 0;
+  jb[LDR_F_POS] = 0; jb[LDR_F_PEAK] = 0.00001; jb[LDR_F_ZPOS] = 0; jb[LDR_F_LEN] = 0;
+  jb[LDR_F_OPENED] = 0; jb[LDR_F_ADSR] = 0; jb[LDR_F_PREVCNT] = 0; jb[LDR_F_NWIN] = 0;
+  undo_begin_pad(pad);  // Phase 2: back up this pad (audio+meta+names) for scoped structural undo
+  layer < 0 ? (
+    s_len[pad] = 0;  // reset before load; stays 0 if load fails
+    s_sr[pad]  = 0;
+    strcpy(get_path_slot(pad), path_str);
+    jb[LDR_F_BUF] = s_audio_start + pad * SLOT_SIZE;
+    jb[LDR_F_CAP] = SLOT_SIZE;
+  ) : (
+    lidx = pad * MAX_LAYERS + layer;
+    jb[LDR_F_PREVCNT] = p_layer_cnt[pad];  // snapshot before update
+    // Freshly loaded layer = original (unbaked) audio: clear the bake anchor (so
+    // the residual tracks full tune until a new bake lands, and the bridge can
+    // re-capture this layer's source) and re-arm the overlay waveform capture.
+    sp_baked_tune[lidx] = 0;
+    ov_cap[lidx] = 0;
+    // Full reset before attempting load (prevents stale state on failure)
+    l_len[lidx] = 0; l_start[lidx] = 0; l_end[lidx] = 1.0; l_sr[lidx] = 0;
+    l_norm[lidx] = 0; l_norm_gain[lidx] = 1.0; l_vel_lo[lidx] = 0; l_vel_hi[lidx] = 1.0;
+    l_rr_order[lidx] = layer; l_gain[lidx] = 1.0;
+    strcpy(LPATH_STR_BASE + lidx, path_str);  // layer file path for serialization
+    jb[LDR_F_BUF] = s_audio_start + pad * SLOT_SIZE + layer * LAYER_SIZE;
+    jb[LDR_F_CAP] = LAYER_SIZE;
+  );
+  f = file_open(path_str);
+  // Transient open miss (AV/indexer read-lock on a valid file): flag it so the
+  // kit-import loop retries THIS pad next @block instead of leaving it blank
+  // (2026-07-19). SET only — the loop clears it per pass.
+  f < 0 ? kit_pad_open_failed = 1;
+  f >= 0 ? (
+    jb[LDR_F_OPENED] = 1;
+    file_riff(f, nch, fsr);
+    nch > 0 && nch < 3 ? (
+      jb[LDR_F_HANDLE] = f;
+      jb[LDR_F_NCH] = nch;
+      jb[LDR_F_SR] = fsr > 0 ? fsr : srate;
+      layer < 0 ? ( s_sr[pad] = jb[LDR_F_SR]; ) : ( l_sr[pad * MAX_LAYERS + layer] = jb[LDR_F_SR]; );
+      // A plain pad receiving a layer (only once the file really opened, so
+      // a missed open leaves the plain pad intact): a layer >= 1 promotes its
+      // sample to layer 0 first — the cut and the banner live in
+      // swing_pad_promote; a layer-0 load replaces the plain sample outright,
+      // so its pad-main length goes with it (playback, the kit header and the
+      // Extension capture follow l_len[0] from here on).
+      layer >= 1 ? swing_pad_promote(pad) :
+      (layer == 0 && p_layer_cnt[pad] == 0 ? s_len[pad] = 0);
+      jb[LDR_F_PHASE] = 1;
+    ) : (
+      file_close(f);        // unsupported channel count: finish records the failure
+      jb[LDR_F_PHASE] = 4;
+    );
+  ) : (
+    jb[LDR_F_PHASE] = 4;
+  );
+);
+
+// Window setup for the waveform-aware ADSR pass (the old analyze_adsr
+// preamble). Which loads analyze: a pad-main load unless the user tuned the
+// pad's ADSR (right-click on the overlay clears that flag); a layer-0 load
+// onto a pad that had no layers.
+function swing_ldr_adsr_setup(jb)
+local(pad, layer, len, sr, tot, dur, wfr, wil, nw)
+(
+  pad = jb[LDR_F_PAD]; layer = jb[LDR_F_LAYER]; len = jb[LDR_F_LEN]; sr = jb[LDR_F_SR];
+  jb[LDR_F_ADSR] = layer < 0 ? !p_adsr_user[pad] : (layer == 0 && jb[LDR_F_PREVCNT] == 0);
+  jb[LDR_F_NWIN] = 0;
+  jb[LDR_F_PHASE] = 4;
+  jb[LDR_F_ADSR] ? (
+    tot = (len / 2)|0;
+    dur = tot / max(1, sr) * 1000.0;
+    // Too short → percussive defaults at finish (no windows). Otherwise cover
+    // the FULL sample in up to 200 windows: ~5 ms for short hits, ~25 ms at 5 s.
+    !(tot < 128 || dur < 10) ? (
+      wfr = max((sr * 0.005)|0, (tot / 200)|0);
+      wil = wfr * 2;
+      nw  = max(1, min(200, (len / wil)|0));
+      jb[LDR_F_WFR] = wfr; jb[LDR_F_WIL] = wil; jb[LDR_F_NWIN] = nw; jb[LDR_F_W] = 0;
+      jb[LDR_F_PKRMS] = 0.00001; jb[LDR_F_PKWIN] = 0;
+      jb[LDR_F_PHASE] = 3;
+    );
+  );
+);
+
+// The old analyze_adsr result derivation, reading the job's RMS windows.
+function swing_ldr_adsr_finish(jb)
+local(pad, _rms_buf, _num_wins, _peak_rms, _peak_win, _win_ms, _dur_ms, _post_peak,
+      _body_start, _body_end, _body_sum, _body_cnt, _body_avg, _sus,
+      _dec_tgt, _dec_win, _dec_found, _rel_tgt, _rel_win, _w,
       _atk_ms, _dec_ms, _rel_ms, _is_percussive)
 (
-  _tot_frames = (buf_len / 2)|0;
-  _dur_ms     = _tot_frames / max(1, buf_sr) * 1000.0;
-
-  // Too short — percussive defaults, no analysis
-  _tot_frames < 128 || _dur_ms < 10 ? (
-    p_attack[pad_idx]  = 0.1;
-    p_decay[pad_idx]   = 50;
-    p_sustain[pad_idx] = 1.0;  // drum sampler: one-shots play through at full amplitude
-    p_release[pad_idx] = 30;
-    p_adsr_user[pad_idx] = 0;  // analyzer owns these values
-    recalc_pad(pad_idx);
+  pad = jb[LDR_F_PAD];
+  _num_wins = jb[LDR_F_NWIN];
+  _num_wins <= 0 ? (
+    // Too short — percussive defaults, no analysis
+    p_attack[pad]  = 0.1;
+    p_decay[pad]   = 50;
+    p_sustain[pad] = 1.0;  // drum sampler: one-shots play through at full amplitude
+    p_release[pad] = 30;
+    p_adsr_user[pad] = 0;  // analyzer owns these values
+    recalc_pad(pad);
   ) : (
-
-    // Adaptive window size: cover the FULL sample in up to 200 windows
-    // Short samples (~100ms): ~5ms windows. Long samples (5s): ~25ms windows.
-    _win_frames      = max((buf_sr * 0.005)|0, (_tot_frames / 200)|0);
-    _win_interleaved = _win_frames * 2;
-    _win_ms          = _win_frames / max(1, buf_sr) * 1000.0;
-    _num_wins        = max(1, min(200, (buf_len / _win_interleaved)|0));
-
-    // RMS scratch — reuse _swap_tmp_buf (safe: swap never runs during load)
-    _rms_buf  = _swap_tmp_buf;
-    _peak_rms = 0.00001;
-    _peak_win = 0;
-
-    // ── Per-window RMS (mono mix L+R / 2) ────────────────────────
-    _w = 0;
-    loop(_num_wins,
-      _sum = 0;
-      _fi  = _w * _win_interleaved;
-      loop(_win_frames,
-        _sum += ((buf[_fi] + buf[_fi+1]) * 0.5) * ((buf[_fi] + buf[_fi+1]) * 0.5);
-        _fi  += 2;
-      );
-      _rms_buf[_w] = sqrt(_sum / max(1, _win_frames));
-      _rms_buf[_w] > _peak_rms ? (
-        _peak_rms = _rms_buf[_w];
-        _peak_win = _w;
-      );
-      _w += 1;
-    );
-
-    // Edge case: silent buffer — conservative middle defaults
+    _rms_buf  = jb + LDR_F_RMS;
+    _peak_rms = jb[LDR_F_PKRMS];
+    _peak_win = jb[LDR_F_PKWIN];
+    _win_ms   = jb[LDR_F_WFR] / max(1, jb[LDR_F_SR]) * 1000.0;
+    _dur_ms   = ((jb[LDR_F_LEN] / 2)|0) / max(1, jb[LDR_F_SR]) * 1000.0;
     _peak_rms < 0.0001 ? (
-      p_attack[pad_idx]  = 5;
-      p_decay[pad_idx]   = 500;
-      p_sustain[pad_idx] = 1.0;  // drum sampler: one-shots play through at full amplitude
-      p_release[pad_idx] = 300;
-      p_adsr_user[pad_idx] = 0;  // analyzer owns these values
-      recalc_pad(pad_idx);
+      // Edge case: silent buffer — conservative middle defaults
+      p_attack[pad]  = 5;
+      p_decay[pad]   = 500;
+      p_sustain[pad] = 1.0;  // drum sampler: one-shots play through at full amplitude
+      p_release[pad] = 300;
+      p_adsr_user[pad] = 0;  // analyzer owns these values
+      recalc_pad(pad);
     ) : (
-
       // ── Attack: time from start to peak window ────────────────
       _atk_ms = max(0.1, min(500.0, _peak_win * _win_ms));
       _post_peak = _num_wins - _peak_win - 1;
@@ -555,8 +733,8 @@ local(_tot_frames, _dur_ms, _win_frames, _win_interleaved, _win_ms,
       _rel_ms = max(_rel_ms, min(50.0, _dur_ms * 0.1));
 
       // ── Write results ─────────────────────────────────────────
-      p_attack[pad_idx]  = _atk_ms;
-      p_decay[pad_idx]   = _dec_ms;
+      p_attack[pad]  = _atk_ms;
+      p_decay[pad]   = _dec_ms;
       // Sustain: percussive vs sustained heuristic.
       //   Percussive (kick/snare/hat): body-RMS/peak-RMS is near zero, which
       //   would clamp the post-decay tail to ~5% and gut the sample. So for
@@ -568,151 +746,244 @@ local(_tot_frames, _dur_ms, _win_frames, _win_interleaved, _win_ms,
       //   even quiet sustained sources don't disappear.
       _is_percussive = _dur_ms < 250 || (_peak_win < _num_wins * 0.05 && _dur_ms < 1000);
       _is_percussive ? (
-        p_sustain[pad_idx] = 1.0;
+        p_sustain[pad] = 1.0;
       ) : (
-        p_sustain[pad_idx] = max(0.10, _sus);
+        p_sustain[pad] = max(0.10, _sus);
       );
-      p_release[pad_idx] = _rel_ms;
-      p_adsr_user[pad_idx] = 0;  // analyzer owns these values
-      recalc_pad(pad_idx);
+      p_release[pad] = _rel_ms;
+      p_adsr_user[pad] = 0;  // analyzer owns these values
+      recalc_pad(pad);
     );
   );
 );
 
-// ─── Sample loader ────────────────────────────────────────────────────────
-function load_from_path(idx, path_str)
-local(f, nch, file_sr, i, char, last_p, tbuf, tname, tpath, peak, val, _lidx, _wl)
+// Everything the old loaders did after the read: normalization gain from the
+// folded-in peak, names, layer promotion / layer metadata, ADSR results,
+// the retry + fail flags, the bridge's source generation, the undo bracket.
+function swing_ldr_finish(jb)
+local(pad, layer, lidx, len, gain, tpath, tname, last_p, i, char, _wl, _lp)
 (
-  idx >= 0 && idx < NUM_PADS ? (
-    undo_begin_pad(idx);  // Phase 2: back up this pad (audio+meta+names) for scoped structural undo
-    // Pad audio changed → bump the source generation so the Kit Bridge re-captures
-    // this pad's bake/preload source for the Extension (stale-source guard).
-    sp_src_gen[idx] += 1;
-    s_len[idx] = 0;  // reset before load; stays 0 if load fails
-    s_sr[idx]  = 0;
-    tbuf  = s_audio_start + idx * SLOT_SIZE;
-    tname = get_name_slot(idx);
-    tpath = get_path_slot(idx);
-    strcpy(tpath, path_str);
-    f = file_open(tpath);
-    // Transient open miss (AV/indexer read-lock on a valid file): flag it so
-    // the kit-import loop retries THIS pad next @block instead of leaving it
-    // blank (2026-07-19). SET only — the loop clears it per pad.
-    f < 0 ? kit_pad_open_failed = 1;
-    f >= 0 ? (
-      file_riff(f, nch, file_sr);
-      nch > 0 && nch < 3 ? (
-        s_sr[idx] = file_sr > 0 ? file_sr : srate;
-        memset(tbuf, 0, SLOT_SIZE);
-        nch == 2 ? s_len[idx] = file_mem(f, tbuf, SLOT_SIZE);
-        nch == 1 ? (
-          s_len[idx] = min((file_avail(f) * 2)|0, SLOT_SIZE);
-          s_len[idx] = s_len[idx] - (s_len[idx] % 2);  // force even
-          i = 0; loop(s_len[idx] / 2,
-            file_var(f, val);
-            tbuf[i] = val; tbuf[i+1] = val;
-            i += 2;
-          );
+  pad = jb[LDR_F_PAD]; layer = jb[LDR_F_LAYER]; len = jb[LDR_F_LEN];
+  jb[LDR_F_HANDLE] >= 0 ? ( file_close(jb[LDR_F_HANDLE]); jb[LDR_F_HANDLE] = -1; );
+  jb[LDR_F_NCH] > 0 ? (
+    gain = 1.0;
+    jb[LDR_F_PEAK] > 0.000001 ? ( gain = min(1.0 / jb[LDR_F_PEAK], 100.0); );
+    layer < 0 ? (
+      s_len[pad] = len;
+      s_norm_gain[pad] = gain;
+      // Extract filename → name slot, then auto-name the pad from keywords
+      tname = get_name_slot(pad);
+      tpath = get_path_slot(pad);
+      last_p = -1; i = 0;
+      while((char = str_getchar(tpath, i)) > 0) (
+        (char == 47 || char == 92) ? last_p = i; i += 1;
+      );
+      last_p >= 0 ? strcpy_from(tname, tpath, last_p + 1) : strcpy(tname, tpath);
+      auto_name_from_file(pad);
+      // A single-sample load is authoritative: the pad becomes a PLAIN pad
+      // (p_layer_cnt = 0 — the whole slot is its sample) and every layer's
+      // metadata is wiped, layer 0's included. The wipe is what fixes the
+      // "load a new sample after a kit and it's quieter" bug: with the old
+      // kit's l_len still nonzero, Sum-mode voice launch divided the gain by
+      // sqrt(_active_cnt). Until 2026-09-08 this promoted the pad to ONE
+      // layer instead, and a layer holds LAYER_SIZE, so every pad was silently
+      // cut to 11.3 s (Spec_Swing_Long_Pad_Layer_Cap). Promotion now lives in
+      // swing_pad_promote and runs only when a layer >= 1 receives audio.
+      len > 0 ? (
+        _wl = 0;
+        loop(MAX_LAYERS,
+          _lp = pad * MAX_LAYERS + _wl;
+          l_len[_lp]       = 0;
+          l_start[_lp]     = 0;
+          l_end[_lp]       = 1.0;
+          l_sr[_lp]        = 0;
+          l_norm[_lp]      = 0;
+          l_norm_gain[_lp] = 1.0;
+          l_gain[_lp]      = 1.0;
+          l_vel_lo[_lp]    = _wl / MAX_LAYERS;
+          l_vel_hi[_lp]    = (_wl + 1) / MAX_LAYERS;
+          l_rr_order[_lp]  = _wl;
+          strcpy(LPATH_STR_BASE + _lp, "");
+          _wl += 1;
         );
-        // Normalization gain
-        peak = 0.00001; i = 0; loop(s_len[idx],
-          val = abs(tbuf[i]); val > peak ? peak = val; i += 1;
-        );
-        s_norm_gain[idx] = 1.0;
-        peak > 0.000001 ? ( s_norm_gain[idx] = min(1.0 / peak, 100.0); );
-        // Extract filename
+        p_layer_cnt[pad]   = 0;
+        p_layer_mode[pad]  = 3;  // Sum = the safe default once layers arrive
+      );
+    ) : (
+      lidx = pad * MAX_LAYERS + layer;
+      l_len[lidx] = len;
+      l_norm_gain[lidx] = gain;
+      l_start[lidx] = 0;
+      l_end[lidx] = 1.0;
+      // Update pad layer count
+      p_layer_cnt[pad] < layer + 1 ? p_layer_cnt[pad] = layer + 1;
+      // Auto-name pad from first layer's filename (layer 0 only)
+      layer == 0 ? (
+        tname = get_name_slot(pad);
+        tpath = get_path_slot(pad);
+        strcpy(tpath, LPATH_STR_BASE + lidx);
         last_p = -1; i = 0;
-        while((char = str_getchar(path_str, i)) > 0) (
-          (char == '/' || char == 92) ? last_p = i; i += 1;
+        while((char = str_getchar(tpath, i)) > 0) (
+          (char == 47 || char == 92) ? last_p = i; i += 1;
         );
         last_p >= 0 ? strcpy_from(tname, tpath, last_p + 1) : strcpy(tname, tpath);
-        // Auto-name pad from filename keywords
-        auto_name_from_file(idx);
-        // Auto-promote to layer 0 so layered modes (Sum/VelSplit/RR) always work.
-        // Single-sample load is authoritative: force pad to exactly 1 layer and
-        // wipe stale layers 1..MAX_LAYERS-1. This is critical when the pad was
-        // previously part of a loaded kit with multiple layers — without this,
-        // p_layer_cnt persists at (e.g.) 4 and Sum-mode voice launch divides
-        // gain by sqrt(_active_cnt) because the old layers' l_len metadata is
-        // still nonzero even though their audio buffers were just memset'd.
-        // That's the "load a new sample after a kit and it's quieter" bug.
-        s_len[idx] > 0 ? (
-          _lidx = idx * MAX_LAYERS;
-          l_len[_lidx]       = min(s_len[idx], LAYER_SIZE);
-          l_start[_lidx]     = s_start[idx];
-          l_end[_lidx]       = s_end[idx];
-          l_sr[_lidx]        = s_sr[idx];
-          l_norm[_lidx]      = s_norm[idx];
-          l_norm_gain[_lidx] = s_norm_gain[idx];
-          l_gain[_lidx]      = 1.0;
-          l_vel_lo[_lidx]    = 0;
-          l_vel_hi[_lidx]    = 1.0;
-          // Wipe layers 1..MAX_LAYERS-1 so they don't count as active in Sum mode
-          _wl = 1;
-          loop(MAX_LAYERS - 1,
-            l_len[idx * MAX_LAYERS + _wl]       = 0;
-            l_start[idx * MAX_LAYERS + _wl]     = 0;
-            l_end[idx * MAX_LAYERS + _wl]       = 1.0;
-            l_sr[idx * MAX_LAYERS + _wl]        = 0;
-            l_norm[idx * MAX_LAYERS + _wl]      = 0;
-            l_norm_gain[idx * MAX_LAYERS + _wl] = 1.0;
-            l_gain[idx * MAX_LAYERS + _wl]      = 1.0;
-            l_vel_lo[idx * MAX_LAYERS + _wl]    = _wl / MAX_LAYERS;
-            l_vel_hi[idx * MAX_LAYERS + _wl]    = (_wl + 1) / MAX_LAYERS;
-            strcpy(LPATH_STR_BASE + idx * MAX_LAYERS + _wl, "");
-            _wl += 1;
-          );
-          p_layer_cnt[idx]   = 1;
-          p_layer_mode[idx]  = 3;  // Sum mode = safe default for 1 layer
-        );
-        // Build waveform thumbnail
-        s_dirty[idx] = 1;
-        // Waveform-aware ADSR — derive from actual transient/body/tail shape.
-        // Skip when the user has manually tuned this pad's ADSR (p_adsr_user=1):
-        // dropping a new sample on a tuned pad keeps the user's A/D/S/R intact.
-        // Right-click on the ADSR overlay forces re-analysis (clears the flag).
-        !p_adsr_user[idx] ? (
-          analyze_adsr(tbuf, s_len[idx], s_sr[idx], idx);
+        auto_name_from_file(pad);
+      );
+    );
+    jb[LDR_F_ADSR] ? swing_ldr_adsr_finish(jb);
+    s_dirty[pad] = 1;  // rebuild the waveform cache
+  );
+  // A file that OPENS but yields no audio (file_riff nch=0 when the decoder
+  // init loses the same transient AV/indexer race file_open can, or a read of
+  // 0) is the same transient class as an open miss — flag it for the
+  // kit-import loop's per-pad retry (2026-07-19, sibling of the f<0 retry).
+  jb[LDR_F_OPENED] && len <= 0 ? kit_pad_open_failed = 1;
+  // Pad audio changed → bump the source generation so the Kit Bridge re-captures
+  // this pad's bake/preload source for the Extension (stale-source guard).
+  // Bumped at the END of the load so a capture never sees a partial buffer.
+  sp_src_gen[pad] += 1;
+  // P4 step 3: record the disk-load outcome (covers file_open failure AND
+  // unsupported channel count — both leave the length 0 with the path retained).
+  swing_pad_fail_recompute(pad);
+  undo_cap_end();
+  jb[LDR_F_PHASE] = 0;
+);
+
+// One bounded slice of work on a job. Returns 1 when the job is idle after the
+// call (finished, failed, or nothing in flight), 0 while it is still running.
+// `budget` is in cells and is also the loop ceiling of every loop below.
+function swing_ldr_step(jb, budget)
+local(ph, f, nch, tbuf, cap, pos, left, m, n, i, src, v, peak, wfr, wil, nw, w, fi, sum, rms, rmsbuf)
+(
+  ph = jb[LDR_F_PHASE];
+  ph == 1 ? (
+    f = jb[LDR_F_HANDLE]; nch = jb[LDR_F_NCH];
+    tbuf = jb[LDR_F_BUF]; cap = jb[LDR_F_CAP]; pos = jb[LDR_F_POS];
+    peak = jb[LDR_F_PEAK];
+    left = cap - pos;
+    n = 0;
+    nch == 2 ? (
+      m = min(budget, left);
+      m > 0 ? ( n = file_mem(f, tbuf + pos, m); );
+      n > 0 ? (
+        i = 0;
+        loop(n,
+          v = abs(tbuf[pos + i]); v > peak ? peak = v;
+          i += 1;
         );
       );
-      file_close(f);  // always close regardless of nch
+    ) : (
+      // Mono: read m samples into the upper half of the destination window,
+      // then expand L=R forward in place — every write lands at or below its
+      // source cell, so nothing unread is overwritten.
+      m = min((budget / 2)|0, (left / 2)|0);
+      m > 0 ? ( n = file_mem(f, tbuf + pos + m, m); );
+      n > 0 ? (
+        src = tbuf + pos + m;
+        i = 0;
+        loop(n,
+          v = src[i];
+          tbuf[pos + 2 * i] = v; tbuf[pos + 2 * i + 1] = v;
+          v = abs(v); v > peak ? peak = v;
+          i += 1;
+        );
+        n = n * 2;
+      );
     );
-    // A file that OPENS but yields no audio (file_riff nch=0 when the decoder
-    // init loses the same transient AV/indexer race file_open can, or
-    // file_mem reading 0) is the same transient class as an open miss —
-    // without this the kit-import loop advanced past a VALID store WAV and
-    // left the pad silently blank (2026-07-19, sibling of the f<0 retry).
-    f >= 0 && s_len[idx] <= 0 ? kit_pad_open_failed = 1;
-    // P4 step 3: record the disk-load outcome (covers file_open failure AND
-    // unsupported channel count — both leave s_len==0 with the path retained).
-    swing_pad_fail_recompute(idx);
-    undo_cap_end();
-  );
+    jb[LDR_F_PEAK] = peak;
+    pos += n;
+    jb[LDR_F_POS] = pos;
+    (n <= 0 || pos >= cap) ? (
+      file_close(f); jb[LDR_F_HANDLE] = -1;
+      jb[LDR_F_LEN] = pos; jb[LDR_F_ZPOS] = pos;
+      jb[LDR_F_PHASE] = 2;
+    );
+    0;
+  ) :
+  ph == 2 ? (
+    // Zero the unused tail of the slot / layer region. memset is native and
+    // ~50x cheaper per cell than the read slice, so it gets 16x the budget:
+    // a whole 4M-cell slot clears in ~4 blocks instead of ~60, which is what
+    // keeps a one-shot drum hit feeling instant (measured 2026-09-07: 14 defer
+    // ticks for a 0.25 s file at the plain budget).
+    tbuf = jb[LDR_F_BUF]; cap = jb[LDR_F_CAP]; pos = jb[LDR_F_ZPOS];
+    m = min(budget * 16, cap - pos);
+    m > 0 ? memset(tbuf + pos, 0, m);
+    pos += m;
+    jb[LDR_F_ZPOS] = pos;
+    pos >= cap ? swing_ldr_adsr_setup(jb);
+    0;
+  ) :
+  ph == 3 ? (
+    // RMS windows (mono mix L+R / 2): as many as cover ~budget cells, min one
+    tbuf = jb[LDR_F_BUF];
+    wfr = jb[LDR_F_WFR]; wil = jb[LDR_F_WIL]; nw = jb[LDR_F_NWIN]; w = jb[LDR_F_W];
+    rmsbuf = jb + LDR_F_RMS;
+    m = max(1, (budget / max(1, wil))|0);
+    m = min(m, nw - w);
+    loop(m,
+      sum = 0; fi = w * wil;
+      loop(wfr,
+        v = (tbuf[fi] + tbuf[fi + 1]) * 0.5;
+        sum += v * v;
+        fi += 2;
+      );
+      rms = sqrt(sum / max(1, wfr));
+      rmsbuf[w] = rms;
+      rms > jb[LDR_F_PKRMS] ? ( jb[LDR_F_PKRMS] = rms; jb[LDR_F_PKWIN] = w; );
+      w += 1;
+    );
+    jb[LDR_F_W] = w;
+    w >= nw ? jb[LDR_F_PHASE] = 4;
+    0;
+  ) :
+  ph == 4 ? (
+    swing_ldr_finish(jb);
+    1;
+  ) : 1;
+);
+
+// @block entry points: begin the job on first sight of (pad, layer), then pump
+// one ldr_budget slice. Return 1 once the load has landed (or failed) so the
+// caller can move on, 0 while it should hold its place and call again next
+// block with the same arguments.
+function swing_ldr_step_pad(pad, path_str) (
+  (ldr_job0[LDR_F_PHASE] == 0 || ldr_job0[LDR_F_PAD] != pad || ldr_job0[LDR_F_LAYER] != -1) ?
+    swing_ldr_begin(ldr_job0, pad, -1, path_str);
+  swing_ldr_step(ldr_job0, ldr_budget);
+);
+function swing_ldr_step_layer(pad, layer, path_str) (
+  (ldr_job0[LDR_F_PHASE] == 0 || ldr_job0[LDR_F_PAD] != pad || ldr_job0[LDR_F_LAYER] != layer) ?
+    swing_ldr_begin(ldr_job0, pad, layer, path_str);
+  swing_ldr_step(ldr_job0, ldr_budget);
+);
+
+// Run a job to completion in one call (UI-side callers and the legacy VER-200
+// import). Each step stays under the loop cap; a full slot takes ~8 steps.
+function swing_ldr_run(jb, pad, layer, path_str) (
+  swing_ldr_begin(jb, pad, layer, path_str);
+  while (swing_ldr_step(jb, LDR_BUDGET_MAX) == 0) ( 0; );
+);
+
+// ─── Sample loader (synchronous wrappers on the UI-side job bank) ─────────
+function load_from_path(idx, path_str) (
+  idx >= 0 && idx < NUM_PADS ? swing_ldr_run(ldr_job1, idx, -1, path_str);
 );
 
 // Set a pad's layer playback mode (0=single 1=vel-split 2=round-robin 3=sum).
-// Mirrors the layer-mode popup in rk_swing_ui_grid_overlay.jsfx-inc: promotes a
-// legacy single sample to layer 0, resets the RR cursor, and — for vel-split —
-// auto-assigns even velocity ranges when the layers still have default 0-1
-// ranges. Self-contained (no GUI dependency) so the RS5k importer can drive it
-// over the INCMD_LMODE channel after stacking layers via CMD 64.
+// Mirrors the layer-mode popup in rk_swing_ui_grid_overlay.jsfx-inc: resets the
+// RR cursor and — for vel-split — auto-assigns even velocity ranges when the
+// layers still have default 0-1 ranges. A mode change never promotes a plain
+// pad: it has nothing to sum or split yet, and promoting a pad longer than a
+// layer would cut it (swing_pad_promote runs when a layer >= 1 lands).
+// Self-contained (no GUI dependency) so the RS5k importer can drive it over
+// the INCMD_LMODE channel after stacking layers via CMD 64.
 function swing_layer_set_mode(pad_idx, mode)
-local(_lidx, _all_default, _ncnt, _base, _li)
+local(_all_default, _ncnt, _base, _li)
 (
   pad_idx >= 0 && pad_idx < NUM_PADS ? (
     p_layer_mode[pad_idx] = max(0, min(3, mode));
     p_rr_idx[pad_idx] = 0;
-    // Promote a legacy single sample (audio already at layer-0 offset) → layer 0.
-    p_layer_cnt[pad_idx] == 0 && s_len[pad_idx] > 0 ? (
-      _lidx = pad_idx * MAX_LAYERS;
-      l_len[_lidx]       = min(s_len[pad_idx], LAYER_SIZE);
-      l_start[_lidx]     = s_start[pad_idx];
-      l_end[_lidx]       = s_end[pad_idx];
-      l_sr[_lidx]        = s_sr[pad_idx];
-      l_norm[_lidx]      = s_norm[pad_idx];
-      l_norm_gain[_lidx] = s_norm_gain[pad_idx];
-      p_layer_cnt[pad_idx] = 1;
-    );
     // Even vel-split ranges when entering Vel-Split, only if every layer still
     // has the default 0-1 range (don't stomp user/preset edits).
     mode == 1 && p_layer_cnt[pad_idx] > 1 ? (
@@ -734,93 +1005,9 @@ local(_lidx, _all_default, _ncnt, _base, _li)
   );
 );
 
-function load_layer_from_path(pad_idx, layer_idx, path_str)
-local(f, nch, file_sr, i, val, tbuf, _lidx, peak, _ln_name, _ln_path, _ln_lastp, _ln_i, _ln_ch, _adsr_dur_ms, _adsr_prev_cnt)
-(
-  pad_idx >= 0 && pad_idx < NUM_PADS && layer_idx >= 0 && layer_idx < MAX_LAYERS ? (
-    undo_begin_pad(pad_idx);  // Phase 2: back up this pad (audio+meta+names) for scoped structural undo
-    _adsr_prev_cnt = p_layer_cnt[pad_idx];  // snapshot before update
-    _lidx = pad_idx * MAX_LAYERS + layer_idx;
-    // Freshly loaded layer = original (unbaked) audio: clear the bake anchor (so
-    // the residual tracks full tune until a new bake lands, and the bridge can
-    // re-capture this layer's source) and re-arm the overlay waveform capture.
-    sp_baked_tune[_lidx] = 0;
-    ov_cap[_lidx] = 0;
-    // Pad audio changed → bump the source generation so the Kit Bridge re-captures
-    // this pad's bake/preload source for the Extension (stale-source guard).
-    sp_src_gen[pad_idx] += 1;
-    // Full reset before attempting load (prevents stale state on failure)
-    l_len[_lidx] = 0;
-    l_start[_lidx] = 0;
-    l_end[_lidx] = 1.0;
-    l_sr[_lidx] = 0;
-    l_norm[_lidx] = 0;
-    l_norm_gain[_lidx] = 1.0;
-    l_vel_lo[_lidx] = 0;
-    l_vel_hi[_lidx] = 1.0;
-    l_rr_order[_lidx] = layer_idx;
-    l_gain[_lidx] = 1.0;
-    tbuf = s_audio_start + pad_idx * SLOT_SIZE + layer_idx * LAYER_SIZE;
-    // Store layer file path for serialization
-    strcpy(LPATH_STR_BASE + _lidx, path_str);
-    f = file_open(path_str);
-    f < 0 ? kit_pad_open_failed = 1;  // transient open miss — loop retries this pad
-    f >= 0 ? (
-      file_riff(f, nch, file_sr);
-      nch > 0 && nch < 3 ? (
-        l_sr[_lidx] = file_sr > 0 ? file_sr : srate;
-        memset(tbuf, 0, LAYER_SIZE);
-        nch == 2 ? l_len[_lidx] = min(file_mem(f, tbuf, LAYER_SIZE), LAYER_SIZE);
-        nch == 1 ? (
-          l_len[_lidx] = min((file_avail(f) * 2)|0, LAYER_SIZE);
-          l_len[_lidx] = l_len[_lidx] - (l_len[_lidx] % 2);
-          i = 0; loop(l_len[_lidx] / 2,
-            file_var(f, val);
-            tbuf[i] = val; tbuf[i+1] = val;
-            i += 2;
-          );
-        );
-        // Normalization gain
-        peak = 0.00001; i = 0; loop(l_len[_lidx],
-          val = abs(tbuf[i]); val > peak ? peak = val; i += 1;
-        );
-        l_norm_gain[_lidx] = 1.0;
-        peak > 0.000001 ? ( l_norm_gain[_lidx] = min(1.0 / peak, 100.0); );
-        l_start[_lidx] = 0;
-        l_end[_lidx] = 1.0;
-        // Update pad layer count
-        p_layer_cnt[pad_idx] < layer_idx + 1 ? p_layer_cnt[pad_idx] = layer_idx + 1;
-        // Auto-name pad from first layer's filename (layer 0 only)
-        layer_idx == 0 ? (
-          _ln_name = get_name_slot(pad_idx);
-          _ln_path = get_path_slot(pad_idx);
-          strcpy(_ln_path, path_str);
-          // Extract filename from path
-          _ln_lastp = -1; _ln_i = 0;
-          while((_ln_ch = str_getchar(path_str, _ln_i)) > 0) (
-            (_ln_ch == 47 || _ln_ch == 92) ? _ln_lastp = _ln_i; _ln_i += 1;
-          );
-          _ln_lastp >= 0 ? strcpy_from(_ln_name, _ln_path, _ln_lastp + 1) : strcpy(_ln_name, _ln_path);
-          auto_name_from_file(pad_idx);
-
-          // Waveform-aware ADSR — only on empty pads (don't overwrite existing envelope)
-          _adsr_prev_cnt == 0 ? (
-            analyze_adsr(tbuf, l_len[_lidx], l_sr[_lidx], pad_idx);
-          );
-        );
-        s_dirty[pad_idx] = 1;  // rebuild waveform cache after layer load
-      );
-      file_close(f);
-    );
-    // Opened-but-no-audio = same transient class as an open miss (see
-    // load_from_path above) — flag for the kit-import loop's per-pad retry.
-    f >= 0 && l_len[_lidx] <= 0 ? kit_pad_open_failed = 1;
-    // P4 step 3: record the disk-load outcome. During a sequential multi-layer
-    // restore the bit may be transiently set (later layers not yet loaded);
-    // the recompute after the LAST layer settles it.
-    swing_pad_fail_recompute(pad_idx);
-    undo_cap_end();
-  );
+function load_layer_from_path(pad_idx, layer_idx, path_str) (
+  pad_idx >= 0 && pad_idx < NUM_PADS && layer_idx >= 0 && layer_idx < MAX_LAYERS ?
+    swing_ldr_run(ldr_job1, pad_idx, layer_idx, path_str);
 );
 
 // ─── Waveform cache builder ─────────────────────────────────────────────
@@ -943,10 +1130,10 @@ function build_wv_cache(idx) local(buf, step, i, _wi, val, si, ptr, ptr_R, _wlen
 // touch pad_flash or p_held: those belong to a pad TRIGGER. An audition is
 // one drum on its own, and its caller owns the visual feedback.
 //
-// ⚠️ Defined BEFORE launch_voices_for_pad on purpose — EEL2 resolves function
+// ⚠️ Defined BEFORE launch_voices_for_pad_ofs on purpose — EEL2 resolves function
 // references at DEFINITION time, so a call to a later-defined function
 // silently kills the whole file (feedback_jsfx_import_order).
-function launch_syn_for_pad(_sy_pad, _sy_midi, _sy_vel, _sy_gaindiv)
+function launch_syn_for_pad(_sy_pad, _sy_midi, _sy_vel, _sy_gaindiv, _sy_ofs)
   local(vi, max_age, _oldest_vi, j, _syn_st) (
   vi = -1; max_age = -1; _oldest_vi = -1;
   j = 0; loop(MAX_VOICES,
@@ -991,14 +1178,16 @@ function launch_syn_for_pad(_sy_pad, _sy_midi, _sy_vel, _sy_gaindiv)
     // pad TUNE + chromatic offset -> engine pitch (Tuned-mode-native, spec §0.4)
     rk_syn_reset(ps_engine[_sy_pad], _syn_st, _syn_mac_scratch,
                  p_tune[_sy_pad] + (_sy_midi - p_note[_sy_pad]), _sy_vel / 127.0);
-    v_pos[vi] = 0; v_inc[vi] = 0; v_startpos[vi] = 0;
+    // _sy_ofs > 0 parks the voice pending for that many samples (note repeat
+    // firing mid-block). v_startpos 0 = a SYN voice always resumes at its start.
+    v_pos[vi] = _sy_ofs > 0 ? -(_sy_ofs + 1) : 0; v_inc[vi] = 0; v_startpos[vi] = 0;
     v_quiet[vi] = 0;   // silence counter starts fresh, or a reused slot would
                        // arrive already "quiet" and retire on its first sample
     // max(1,...) so a future caller passing 0 can never divide by zero here;
     // every real divisor is sqrt(count) >= 1.
     v_gain[vi] = apply_vel_curve(_sy_vel / 127.0, vel_curve) * ps_level[_sy_pad]
                  / max(1, _sy_gaindiv);
-    v_sg[vi] = strip_takeover ? 1.0 : p_gain[_sy_pad];
+    v_sg[vi] = strip_tk[_sy_pad] ? 1.0 : p_gain[_sy_pad];
     v_note[vi] = _sy_midi;
     v_age[vi] = 0;
     v_env[vi] = 0;
@@ -1012,11 +1201,14 @@ function launch_syn_for_pad(_sy_pad, _sy_midi, _sy_vel, _sy_gaindiv)
 // p_note[pad] (offset 0). For a chromatic pad it's the actual key, and the
 // voice pitches by (_lv_midi - p_note[pad]) semitones. Non-MIDI callers
 // (browser/preview/repeat) pass p_note[pad] so behavior is unchanged.
-function launch_voices_for_pad(_lv_pad, _lv_midi, _lv_vel, _lv_flash)
+// _lv_ofs delays the whole launch by that many samples inside the current
+// block -- the sub-block accuracy note repeat needs. 0 = start immediately,
+// which is what the 4-arg launch_voices_for_pad wrapper below passes.
+function launch_voices_for_pad_ofs(_lv_pad, _lv_midi, _lv_vel, _lv_flash, _lv_ofs)
   local(_is_sum, _sum_cnt, _sum_cur, _active_cnt, _sel_layer, _skip_voice, vi, _lidx,
         _slen, _sstart, _send, _ssr, max_age, _oldest_vi, j, _delay, _end_i, _start_i,
         _lv_choke, _pt_eff, _st_off, _sr_base_t, _new_rpos, _bt_lidx, _tie_pg,
-        _sel_syn, _syn_go, _syn_v, _syn_st, _has_smp) (
+        _sel_syn, _syn_go, _syn_v, _syn_st, _has_smp, _comp_sum) (
   // Step 3b: Mode=Stretch diverts to the Extension's audio_hook. Don't
   // allocate a local sinc voice; instead bump the per-pad trigger counter
   // (Extension diffs against its shadow to detect new triggers), publish
@@ -1058,6 +1250,9 @@ function launch_voices_for_pad(_lv_pad, _lv_midi, _lv_vel, _lv_flash)
       stretch_read_pos[_lv_pad] = _new_rpos;
       atomic_set(gmem[_sr_base_t + STRETCH_OFF_READ_POS], _new_rpos);
     );
+    // Held back by the @sample consumer, not here: the Extension has not seen
+    // this trigger yet and will not until its next audio_hook.
+    stretch_hold[_lv_pad] = _lv_ofs;
     pad_flash[_lv_pad] = _lv_flash;
   ) : (
   // Only mode 3 (Sum) stacks all layers; mode 0 uses single-layer selection
@@ -1065,11 +1260,20 @@ function launch_voices_for_pad(_lv_pad, _lv_midi, _lv_vel, _lv_flash)
   _sel_syn = 0;
   // Count active (non-empty) layers for gain compensation. The SYN slot counts
   // as one more active layer in sum mode (spec §7: generalize the hard-coded 4).
+  // A PLAIN pad (no layers, its sample at the slot base) counts as one active
+  // layer too, so a plain pad + SYN slot in Sum mode keeps the 1/sqrt(2) split
+  // it had while every load promoted the pad to a one-layer pad
+  // (Spec_Swing_Long_Pad_Layer_Cap §4.2). _is_sum still gates the voice loop.
+  _comp_sum = p_layer_mode[_lv_pad] == 3;
   _active_cnt = 0;
-  _is_sum ? (
-    j = 0; loop(p_layer_cnt[_lv_pad],
-      l_len[_lv_pad * MAX_LAYERS + j] > 0 ? _active_cnt += 1;
-      j += 1;
+  _comp_sum ? (
+    p_layer_cnt[_lv_pad] > 0 ? (
+      j = 0; loop(p_layer_cnt[_lv_pad],
+        l_len[_lv_pad * MAX_LAYERS + j] > 0 ? _active_cnt += 1;
+        j += 1;
+      );
+    ) : (
+      s_len[_lv_pad] > SILENCE_T + 4 ? _active_cnt += 1;
     );
     ps_enable[_lv_pad] ? _active_cnt += 1;
   );
@@ -1187,13 +1391,19 @@ function launch_voices_for_pad(_lv_pad, _lv_midi, _lv_vel, _lv_flash)
         // Sum mode loose timing: delay non-primary layers by random 0-40 samples
         // Store real start position so delayed voice resumes at correct trim point
         v_startpos[vi] = v_pos[vi];
+        // Sub-block start offset and sum-mode looseness are the same mechanism
+        // -- a negative v_pos the renderer counts up -- so they simply add.
+        // The +1 is the encoding, not a fudge: the renderer increments BEFORE it
+        // tests, so v_pos = -N first sounds at sample N-1. Measured, not reasoned:
+        // without it every repeat landed exactly one sample ahead of its step.
+        _delay = _lv_ofs > 0 ? _lv_ofs + 1 : 0;
         _is_sum && _sum_cur > 0 && p_sum_tight[_lv_pad] > 0.001 ? (
-          _delay = (rand(40) * p_sum_tight[_lv_pad])|0;
-          _delay > 0 ? v_pos[vi] = -_delay;
+          _delay += (rand(40) * p_sum_tight[_lv_pad])|0;
         );
+        _delay > 0 ? v_pos[vi] = -_delay;
         v_gain[vi] = apply_vel_curve(_lv_vel / 127.0, vel_curve);
         // Sum mode: compensate gain by active (non-empty) layer count
-        _is_sum && _active_cnt > 1 ? ( v_gain[vi] = v_gain[vi] / sqrt(_active_cnt); );
+        _comp_sum && _active_cnt > 1 ? ( v_gain[vi] = v_gain[vi] / sqrt(_active_cnt); );
         v_note[vi] = _lv_midi;   // PLAYED note (was p_note[pad]) so note-off matches the actual key
         v_age[vi] = 0;
         v_env[vi] = 0;
@@ -1204,7 +1414,7 @@ function launch_voices_for_pad(_lv_pad, _lv_midi, _lv_vel, _lv_flash)
         // p_gain here too would square the gain. Layer/norm gains stay:
         // they're sample identity, not mix. Baked at launch (matches the
         // existing p_gain semantics; takeover flips affect new hits only).
-        _tie_pg = strip_takeover ? 1.0 : p_gain[_lv_pad];
+        _tie_pg = strip_tk[_lv_pad] ? 1.0 : p_gain[_lv_pad];
         _sel_layer >= 0 && p_layer_cnt[_lv_pad] > 0 ? (
           _lidx = _lv_pad * MAX_LAYERS + _sel_layer;
           v_sg[vi] = _tie_pg * l_gain[_lidx] * (l_norm[_lidx] ? l_norm_gain[_lidx] : 1.0);
@@ -1252,7 +1462,8 @@ function launch_voices_for_pad(_lv_pad, _lv_midi, _lv_vel, _lv_flash)
     // layers; every other mode plays the synth at full level, divisor 1.
     _syn_go ? (
       launch_syn_for_pad(_lv_pad, _lv_midi, _lv_vel,
-                         _is_sum && _active_cnt > 1 ? sqrt(_active_cnt) : 1);
+                         _comp_sum && _active_cnt > 1 ? sqrt(_active_cnt) : 1,
+                         _lv_ofs);
     );
   );
   pad_flash[_lv_pad] = _lv_flash;
@@ -1271,4 +1482,11 @@ function launch_voices_for_pad(_lv_pad, _lv_midi, _lv_vel, _lv_flash)
     j += 1;
   );
   );  // end of Mode != Stretch branch (Step 3b launch_voices divert)
+);
+
+// Every caller that wants a hit NOW keeps the four-argument name. EEL2 has no
+// overloading, so the offset-aware version needs its own -- rather than touch
+// all 20 existing call sites to append a 0.
+function launch_voices_for_pad(_lv_pad, _lv_midi, _lv_vel, _lv_flash) (
+  launch_voices_for_pad_ofs(_lv_pad, _lv_midi, _lv_vel, _lv_flash, 0);
 );

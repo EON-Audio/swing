@@ -486,7 +486,10 @@ function S.self_register()
     "  local p=reaper.GetResourcePath()..\"/Scripts/__startup.lua\"\n" ..
     "  local f=io.open(p,'r'); if f then local c=f:read('*a'); f:close()\n" ..
     "    c=c:gsub('\\n?%-%- EON:" .. SCRIPT_NAME .. " BEGIN.-%-%- EON:" .. SCRIPT_NAME .. " END\\n?','')\n" ..
-    "    local fw=io.open(p,'w'); if fw then fw:write(c); fw:close() end end\n" ..
+    "    local t,b=p..'.eon-tmp',p..'.eon-prev'; local fw=io.open(t,'w'); local ok=false\n" ..
+    "    if fw then ok=fw:write(c) and true or false; if not fw:close() then ok=false end end\n" ..
+    "    if ok then os.remove(b); local h=os.rename(p,b); if os.rename(t,p) then os.remove(b) elseif h then os.rename(b,p) end end\n" ..
+    "    os.remove(t) end\n" ..
     "  reaper.SetExtState('" .. EXT_F .. "','" .. key .. "','',true)\n" ..
     "end end\n" ..
     marker .. " END\n"

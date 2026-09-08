@@ -65,14 +65,26 @@ local GS_LATEST_VER_BASE   = 1714  -- 5 slots: 1714–1718
 -- the same helper rides in every EON self-registering script, and in the Kit
 -- Bridge a top-level local would count against Lua's 200-local ceiling.
 function eon_write_startup(path, content)
-  local tmp = path .. ".eon-tmp"
+  local tmp, prev = path .. ".eon-tmp", path .. ".eon-prev"
   local f = io.open(tmp, "w")
   if not f then return false end
   local wok = f:write(content)
   local cok = f:close()
   if not wok or not cok then os.remove(tmp) return false end
-  os.remove(path)                    -- Windows os.rename won't overwrite
-  return os.rename(tmp, path) and true or false
+  -- Windows os.rename won't overwrite, so the old file steps aside first --
+  -- and steps back if the new one cannot take its place. Nothing is ever
+  -- deleted before the replacement is in (2026-09-07: the old remove-then-
+  -- rename left the shared file GONE whenever the rename failed, e.g. an
+  -- antivirus hold on the freshly written tmp file).
+  os.remove(prev)
+  local had_old = os.rename(path, prev)
+  if os.rename(tmp, path) then
+    os.remove(prev)
+    return true
+  end
+  if had_old then os.rename(prev, path) end
+  os.remove(tmp)
+  return false
 end
 
 local function self_register()
@@ -134,7 +146,10 @@ local function self_register()
     "  local p=reaper.GetResourcePath()..\"/Scripts/__startup.lua\"\n" ..
     "  local f=io.open(p,'r'); if f then local c=f:read('*a'); f:close()\n" ..
     "    c=c:gsub('\\n?%-%- EON:" .. SCRIPT_NAME .. " BEGIN.-%-%- EON:" .. SCRIPT_NAME .. " END\\n?','')\n" ..
-    "    local fw=io.open(p,'w'); if fw then fw:write(c); fw:close() end end\n" ..
+    "    local t,b=p..'.eon-tmp',p..'.eon-prev'; local fw=io.open(t,'w'); local ok=false\n" ..
+    "    if fw then ok=fw:write(c) and true or false; if not fw:close() then ok=false end end\n" ..
+    "    if ok then os.remove(b); local h=os.rename(p,b); if os.rename(t,p) then os.remove(b) elseif h then os.rename(b,p) end end\n" ..
+    "    os.remove(t) end\n" ..
     "  reaper.SetExtState('" .. SCRIPT_NAME .. "','" .. SCRIPT_NAME .. "_registered_v3','',true)\n" ..
     "end end\n" ..
     marker .. " END\n"

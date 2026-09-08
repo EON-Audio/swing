@@ -103,6 +103,18 @@ FXC_M_EQ3        = 38;
 FXC_M_TUNER      = 39;
 FXC_M_NOTEREP    = 40;
 FXC_M_DELAYBAYS  = 41;
+// REAPER's own plugin dialog — the face of every stock JSFX that never drew
+// one of its own. ⚠️ Must stay in step with "m-dialog" in the generator's
+// MOTIF map (.dev_fxpicker/gen_fxcard_data.py).
+FXC_M_DIALOG     = 42;
+// A reverb should read as a reverb. Every generic face we had for one said
+// "EQ" instead -- a curve with node dots over a couple of lines.
+FXC_M_VERB       = 43;
+// Pitch correction has its own language (note lanes + the stepped retune
+// line), and it is NOT the piano roll every MIDI utility wears.
+FXC_M_AUTOTUNE   = 44;
+// A sub generator's identity is the low sine, not the keyboard underneath it.
+FXC_M_SUB        = 45;
 
 // Secondary elements, one bit each (the sheet allows at most two per card).
 FXC_E_BTNS   = 1;
@@ -293,13 +305,31 @@ function _fxc_arc_top(cx, cy, rx, ry, th, c1, c2, split, a)
   // of the arc, visibly broken down the sides. Stamping an antialiased dot at
   // each sample gives a constant-width stroke all the way round instead.
   n = max(12, (rx * 2.2) | 0);
+  qx = max(0.6, th * 0.5);                  // the stamp radius
   i = 0;
-  loop(n + 1,
-    t  = $pi - ($pi * i / n);
-    px = cx + cos(t) * rx;  py = cy - sin(t) * ry;
-    (c2 >= 0 && i / n >= 1 - split) ? _fxc_set(c2, a) : _fxc_set(c1, a);
-    gfx_circle(px, py, max(0.6, th * 0.5), 1, 1);
-    i += 1;
+  // ⚠️⚠️ BELOW ~1.2 px THE DOT STAMP IS THE BUG. An antialiased circle of
+  // radius 0.75 is not a thin line, it is a grey smudge spread over four
+  // pixels, and a chain of them is a smear -- which is exactly what "ReaEQ
+  // looks blurry" was on the 48 px console chip. Under that size draw the
+  // polyline instead: one pixel wide by construction, and crisp. Above it the
+  // stamped stroke still wins, for the reason in the note above.
+  qx < 1.2 ? (
+    px = cx - rx; py = cy;
+    loop(n,
+      i += 1;
+      t  = $pi - ($pi * i / n);
+      (c2 >= 0 && i / n >= 1 - split) ? _fxc_set(c2, a) : _fxc_set(c1, a);
+      gfx_line(px, py, cx + cos(t) * rx, cy - sin(t) * ry, 0);
+      px = cx + cos(t) * rx; py = cy - sin(t) * ry;
+    );
+  ) : (
+    loop(n + 1,
+      t  = $pi - ($pi * i / n);
+      px = cx + cos(t) * rx;  py = cy - sin(t) * ry;
+      (c2 >= 0 && i / n >= 1 - split) ? _fxc_set(c2, a) : _fxc_set(c1, a);
+      gfx_circle(px, py, qx, 1, 1);
+      i += 1;
+    );
   );
 );
 
@@ -687,12 +717,23 @@ m == FXC_M_FLAT3 ? (
 
   m == FXC_M_SPECTRUM ? (
     acc < 0 ? acc = 0x5ec46a;
-    i = 0;
-    loop(6,
-      _fxc_set(acc, 0.07 * (1 - i / 6));
-      _fxc_ellipse(x + w * 0.50, y + h * 0.98,
-                   w * 0.40 * (1 + i * 0.14), h * 0.42 * (1 + i * 0.14));
-      i += 1;
+    // ⚠️ THE GLOW MUST STAY INSIDE THE CARD. It used to be centred ON the
+    // bottom edge (y + h * 0.98) with radii up to 0.68 w / 0.71 h, so most of
+    // every ring was drawn OUTSIDE the card -- and there is no clip rect in
+    // gfx, so in the picker's grid that bled through the 8 px gap onto the
+    // neighbouring card. Same silhouette, centred at 0.70 h with radii that
+    // reach the edges exactly at the last ring (0.5 ± 0.493 w, 0.70 + 0.30 h).
+    // ⚠️ The glow is a SOFT wash: six rings at 7% alpha. That reads at 191 px
+    // and is a pink fog at 48, where it covers the whole chip and leaves the
+    // skyline underneath looking blurred. Chips get the skyline alone.
+    w >= 96 ? (
+      i = 0;
+      loop(6,
+        _fxc_set(acc, 0.07 * (1 - i / 6));
+        _fxc_ellipse(x + w * 0.50, y + h * 0.70,
+                     w * 0.29 * (1 + i * 0.14), h * 0.176 * (1 + i * 0.14));
+        i += 1;
+      );
     );
     _fxc_spec(x + w * 0.06, y + h * 0.51, w * 0.88, h * 0.44, acc, 0.7);
   ) :
@@ -766,11 +807,16 @@ m == FXC_M_FLAT3 ? (
   ) :
 
   m == FXC_M_REAEQ ? (
-    gfx_set(0, 0, 0, 0.06);                                // the plot grid
-    i = 0;
-    loop(7, gfx_rect(x + w * (i * 0.14), y, 1, h * 0.68); i += 1;);
-    i = 0;
-    loop(3, gfx_rect(x, y + h * (0.22 + i * 0.22), w, 1); i += 1;);
+    // ⚠️ The grid is ten 1 px hairlines at 6% alpha. On the console chip they
+    // land between pixels and the whole plot greys over, so the curve -- the
+    // one thing that says EQ -- stops reading. Grid only where there is room.
+    w >= 96 ? (
+      gfx_set(0, 0, 0, 0.06);                              // the plot grid
+      i = 0;
+      loop(7, gfx_rect(x + w * (i * 0.14), y, 1, h * 0.68); i += 1;);
+      i = 0;
+      loop(3, gfx_rect(x, y + h * (0.22 + i * 0.22), w, 1); i += 1;);
+    );
     _fxc_set(0xa8a8a2, 1); gfx_rect(x, y + h * 0.68, w, h * 0.32);
     _fxc_arc_top(x + w * 0.50, y + h * 0.54, w * 0.42, h * 0.24,
                  max(1.5, w * 0.014), 0x3c3c3c, -1, 0, 0.85);
@@ -780,8 +826,10 @@ m == FXC_M_FLAT3 ? (
     gfx_circle(x + w * 0.82, y + h * 0.42, max(1.5, w * 0.020), 1, 1);
     _fxc_set(0x2aa8c8, 1);
     gfx_circle(x + w * 0.62, y + h * 0.32, max(2, w * 0.024), 1, 1);
-    _fxc_set(0x585858, 1); gfx_rect(x + w * 0.14, y + h * 0.80, w * 0.38, h * 0.05);
-    _fxc_set(0x6e6e6e, 1); gfx_rect(x + w * 0.14, y + h * 0.91, w * 0.58, h * 0.05);
+    _fxc_set(0x585858, 1);
+    gfx_rect(x + w * 0.14, y + h * 0.80, w * 0.38, max(1, h * 0.05));
+    _fxc_set(0x6e6e6e, 1);
+    gfx_rect(x + w * 0.14, y + h * 0.91, w * 0.58, max(1, h * 0.05));
   ) :
 
   m == FXC_M_REAVERB ? (
@@ -1504,6 +1552,155 @@ m == FXC_M_FLAT3 ? (
                 w * 0.060, c, -1, 0xf2f2ee, 0, -1);
       i += 1;
     );
+  ) :
+
+  m == FXC_M_DIALOG ? (
+    // REAPER'S OWN PLUGIN WINDOW -- which is what most of the JSFX that ship
+    // with REAPER actually look like. Of the 223 installed stock JS, 172
+    // declare no @gfx at all: a caption bar, rows of horizontal sliders, and
+    // REAPER's level-meter column down the right edge is the WHOLE face.
+    // Source: .dev_fxpicker/shots_stock/_sheet*.png.
+    // ⭐ The generic blank card was giving these knobs and VU meters they do
+    // not have -- it picks one of five faces from a name hash, so four fifths
+    // of the time it invents hardware. A plain dialog is not a fallback here,
+    // it is the truth.
+    // ⭐ FXC_SL is the readout strip: the ~50 stock JS that DO have an @gfx
+    // mostly use it for one dark status bar (Liteon green, LOSER cyan), so
+    // "has a strip" is exactly the line between the two halves of the set.
+    // FXC_VAR v2 = the taller dialogs, five rows instead of four.
+    bx = x + w * 0.06; bw = w * 0.72;
+    acc >= 0 ? (                               // caption bar, category tinted
+      _fxc_set(acc, 0.55); gfx_rect(x + w * 0.04, y + h * 0.06, w * 0.80, h * 0.13);
+    ) : (
+      gfx_set(0, 0, 0, 0.13); gfx_rect(x + w * 0.04, y + h * 0.06, w * 0.80, h * 0.13);
+    );
+    gfx_set(0, 0, 0, 0.30);
+    gfx_rect(x + w * 0.04, y + h * 0.19, w * 0.80, max(1, h * 0.014));
+    n = rec[FXC_VAR] & FXC_V_V2 ? 5 : 4;
+    t = rec[FXC_SL] >= 0 ? 0.46 : 0.62;        // rows stop above the strip
+    i = 0;
+    loop(n,
+      by = y + h * (0.26 + i * (t / n));
+      gfx_set(0, 0, 0, 0.26);                  // the groove
+      gfx_rect(bx, by + h * 0.028, bw, max(1, h * 0.020));
+      _fxc_set(k < 0 ? 0xb8bcc0 : k, 1);       // the handle
+      gfx_rect(bx + bw * (0.16 + 0.17 * (i % 3)), by,
+               max(3, w * 0.032), max(4, h * 0.078));
+      i += 1;
+    );
+    gfx_set(0, 0, 0, 0.55);                    // REAPER's meter column
+    gfx_rect(x + w * 0.885, y + h * 0.06, w * 0.075, h * 0.88);
+    _fxc_set(0x3ac07a, 0.85);
+    gfx_rect(x + w * 0.897, y + h * 0.46, w * 0.051, h * 0.46);
+    rec[FXC_SL] >= 0 ? (
+      _fxc_set(0x0a0c0a, 1);
+      gfx_rect(x + w * 0.04, y + h * 0.78, w * 0.80, h * 0.16);
+      _fxc_set(rec[FXC_SL], 0.9);
+      i = 0;
+      loop(3,
+        gfx_rect(x + w * (0.07 + i * 0.20), y + h * 0.835,
+                 w * 0.13, max(1, h * 0.032));
+        i += 1;
+      );
+    );
+  ) :
+
+  m == FXC_M_VERB ? (
+    // THE DECAY TAIL: one bright impulse, a few early reflections, then a comb
+    // that dies away over a dark room. Source: what a reverb IS -- the user's
+    // note was that the reverbs "are just a bunch of nodes over lines", which
+    // is the curve motif saying EQ on every one of them.
+    // ⭐ The shape is the identity, so the card carries no knobs at all: at 55
+    // px on a console chip the tail is still legible and nothing else is.
+    c = acc >= 0 ? acc : 0x9a6ad0;
+    bx = x + w * 0.08; bw = w * 0.84; by = y + h * 0.16; bh = h * 0.62;
+    gfx_set(0, 0, 0, 0.32);                    // the floor
+    gfx_rect(x + w * 0.05, by + bh, w * 0.90, max(1, h * 0.020));
+    _fxc_set(c, 0.16);                         // room glow behind the tail
+    _fxc_ellipse(bx + bw * 0.30, by + bh * 0.78, bw * 0.34, bh * 0.30);
+    _fxc_set(c, 1);                            // the impulse
+    gfx_rect(bx, by, max(2, w * 0.020), bh);
+    n = max(12, (w * 0.13) | 0);
+    i = 1;
+    loop(n,
+      t = i / n;
+      u = exp(-t * 2.9);
+      // early reflections stand proud of the smooth tail for the first third
+      t < 0.34 && (i % 3) == 0 ? u = min(1, u * 1.55);
+      _fxc_set(c, 0.30 + 0.55 * u);
+      gfx_rect(bx + bw * t, by + bh * (1 - u), max(1, w * 0.011), bh * u);
+      i += 1;
+    );
+  ) :
+
+  m == FXC_M_AUTOTUNE ? (
+    // Auto-Tune's language: horizontal NOTE LANES, the stepped retune line
+    // that scoops between them, and the note letter at the left. EON Tune wore
+    // a plain piano roll, which is also what every MIDI tool on the deck wears.
+    c = acc >= 0 ? acc : 0x2f6fd0;
+    i = 0;
+    loop(6,                                    // the lanes
+      gfx_set(1, 1, 1, (i % 2) ? 0.045 : 0.085);
+      gfx_rect(x + w * 0.22, y + h * (0.14 + i * 0.125), w * 0.72, h * 0.105);
+      i += 1;
+    );
+    _fxc_set(c, 0.85);                         // the target lane, lit
+    gfx_rect(x + w * 0.22, y + h * 0.515, w * 0.72, max(2, h * 0.028));
+    // the sung line: three held steps joined by scoops
+    n = max(18, (w * 0.22) | 0);
+    i = 0;
+    loop(n,
+      t = i / (n - 1);
+      u = t < 0.30 ? 0.72 : t < 0.42 ? 0.72 - (t - 0.30) / 0.12 * 0.30 :
+          t < 0.68 ? 0.42 : t < 0.78 ? 0.42 - (t - 0.68) / 0.10 * 0.16 : 0.26;
+      _fxc_set(0xf0f4f8, 0.92);
+      gfx_rect(x + w * (0.22 + 0.72 * t), y + h * u,
+               max(1, w * 0.016), max(2, h * 0.030));
+      i += 1;
+    );
+    _fxc_set(c, 1);                            // the note block
+    gfx_rect(x + w * 0.05, y + h * 0.32, w * 0.13, h * 0.30);
+    gfx_set(0, 0, 0, 0.55);
+    gfx_rect(x + w * 0.075, y + h * 0.38, w * 0.055, h * 0.18);
+  ) :
+
+  m == FXC_M_SUB ? (
+    // A SUB generator: one fat low sine, a short trim row, and a PLAIN key
+    // strip. ⚠️ It used to wear the Note Repeater's face -- the same knob grid
+    // over the same four-colour zoned keyboard -- so the two were one card at
+    // any size. The zones belong to the Repeater; the sine belongs here.
+    c = acc >= 0 ? acc : 0xe08a2a;
+    bx = x + w * 0.05; bw = w * 0.90; by = y + h * 0.46; bh = h * 0.22;
+    j = 0;
+    loop(2,                                    // glow pass, then the core
+      _fxc_set(c, j ? 1 : 0.22);
+      i = 0;
+      n = max(24, (w * 0.24) | 0);
+      loop(n,
+        t = i / (n - 1);
+        gfx_rect(bx + bw * t,
+                 by - sin(t * 2 * $pi) * bh * (j ? 1 : 1.35),
+                 max(1, bw / n + 1), max(j ? 2 : 5, h * (j ? 0.045 : 0.085)));
+        i += 1;
+      );
+      j += 1;
+    );
+    i = 0;
+    loop(3,                                    // the trim row, up top
+      _fxc_knob(x + w * (0.18 + i * 0.32), y + h * 0.20, w * 0.055,
+                k < 0 ? 0x5a6068 : k, -1, 0xeaf0f4, 0, -1);
+      i += 1;
+    );
+    bx = x + w * 0.05; bw = w * 0.90; by = y + h * 0.80; bh = h * 0.16;
+    _fxc_set(0xd8dce2, 1); gfx_rect(bx, by, bw, bh);
+    i = 1;
+    loop(11,                                   // plain white keys, no zones
+      gfx_set(0, 0, 0, 0.35);
+      gfx_rect(bx + bw * i / 12, by, max(1, w * 0.005), bh);
+      i += 1;
+    );
+    _fxc_set(c, 1);                            // the sub's own range, lit
+    gfx_rect(bx, by, bw * 0.25, bh);
   );
 );
 

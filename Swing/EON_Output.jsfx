@@ -1,0 +1,209 @@
+desc:EON Output
+//tags: EON ReaKit swing master volume limiter output bus
+options:gfx_hz=60 gfx_idle no_meter gmem=Swing_Media_Transfer
+// EON Studios — EON Output
+// The last stage of Swing's master section as a plugin for the Audio bus in
+// Multi-Out: master volume, then the feed-forward peak limiter, in that order,
+// exactly as Swing runs them -- the volume BEFORE the limiter so the limiter
+// always sees the final level. Third of the three pieces that put the master
+// section on the Audio folder: Tone -> comp -> Output. (The folder's own fader
+// is the user's post-limiter trim; it is not part of this.)
+//
+// THE LINK. Given a Swing instance id (bridge-set at build, stable across
+// sessions unlike a registry slot), Output finds that Swing's registry slot
+// itself each block and follows the MASTER VOLUME in the master-link record
+// Swing publishes there. Turn Swing's MASTER VOL in Multi-Out and this is
+// what moves. The LIMITER follows Swing's COMP view (its LIMITER section) the
+// same way: ceiling, release and in/out are set there while linked, and the
+// knobs here are locked and say so. Unlinked, they are ordinary controls.
+// With no id, or a Swing that has stopped publishing, the volume is a normal
+// slider too.
+//
+// The limiter is Swing's, verbatim: instant attack, one-pole auto release.
+
+slider1:ou_vol=0<-48,12,0.1>-Volume (dB)
+slider2:ou_lim_on=1<0,1,1>-Limiter
+slider3:ou_lim_thr=0<-12,0,0.1>-Limiter Threshold (dB)
+slider4:ou_lim_rel=100<10,1000,1>-Limiter Release (ms)
+slider5:ou_link_inst=0<0,99999999,1>-Link Instance (internal; the Swing instance id to follow, bridge-set at build; 0 = standalone)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+import libs/knobs_kbsg.jsfx-inc
+
+@init
+
+// The instance registry and the master-link band. Canonical map:
+// .refs/swing_gmem_bridge_protocol.md and .refs/gmem_regions_supplement.tsv.
+OU_REG_BASE   = 2556;
+OU_REG_STRIDE = 4;
+OU_REG_MAX    = 16;
+OU_LINK_BASE   = 26005248;   // EON_MASTER_LINK, slot * 32
+OU_LINK_STRIDE = 32;
+OU_LINK_HB      = 0;   // Swing's block counter, written LAST
+OU_LINK_VOL     = 1;   // master volume, dB
+OU_LINK_LIM_ON  = 2;
+OU_LINK_LIM_THR = 3;   // linear (1.0 = 0 dBFS), as Swing keeps it
+OU_LINK_LIM_REL = 4;   // ms
+OU_STALL_MAX    = 8;   // blocks without a heartbeat before the link is dead
+
+freemem = 0;
+OU_KNOBS = 3;
+ou_kmem = freemem; freemem += OU_KNOBS * 16;
+
+_ou_sm      = 1.0 - exp(-1.0 / max(1, 0.0045 * srate));   // Swing's 4.5 ms
+ou_gain     = -1;   // seated from the target on the first @block, no fade-in on load
+ou_lim_env  = 1;
+ou_lim_gr   = 1;
+_ou_hb_prev = -1;
+_ou_stall   = OU_STALL_MAX;
+ou_linked   = 0;
+
+function ou_recalc() (
+  ou_gain_t  = ou_vol <= -48 ? 0 : exp(ou_vol * 0.11512925465);
+  ou_thr_lin = exp(ou_lim_thr * 0.11512925465);
+  ou_rel_c   = exp(-1.0 / max(1, ou_lim_rel * 0.001 * srate));
+);
+ou_recalc();
+
+@slider
+ou_recalc();
+
+@block
+
+srate != _ou_srate_seen ? (
+  _ou_srate_seen = srate;
+  _ou_sm = 1.0 - exp(-1.0 / max(1, 0.0045 * srate));
+  ou_recalc();
+);
+
+// ─── The link: find the Swing with our instance id, follow its record ──────
+ou_linked = 0;
+ou_link_inst > 0 ? (
+  _ou_slot = -1;
+  _ou_s = 0;
+  loop(OU_REG_MAX,
+    (_ou_slot < 0 && (gmem[OU_REG_BASE + _ou_s * OU_REG_STRIDE] | 0) == (ou_link_inst | 0)) ? _ou_slot = _ou_s;
+    _ou_s += 1;
+  );
+  _ou_slot >= 0 ? (
+    _ou_b = OU_LINK_BASE + _ou_slot * OU_LINK_STRIDE;
+    _ou_hb = gmem[_ou_b + OU_LINK_HB];
+    _ou_hb != _ou_hb_prev ? ( _ou_hb_prev = _ou_hb; _ou_stall = 0; ) : ( _ou_stall += 1; );
+    _ou_stall < OU_STALL_MAX ? (
+      ou_linked = 1;
+      // Adopt all four into the sliders, so the face and the host show what is
+      // in force. Swing's COMP view has the LIMITER section: that is where these
+      // are set while linked (the knobs here are locked and say so). Threshold
+      // comes as Swing's linear value; the slider is dB.
+      _ou_nv = max(-48, min(12, gmem[_ou_b + OU_LINK_VOL]));
+      _ou_nv != ou_vol ? ( ou_vol = _ou_nv; ou_recalc(); );
+      _ou_non = gmem[_ou_b + OU_LINK_LIM_ON] > 0.5 ? 1 : 0;
+      _ou_non != ou_lim_on ? ou_lim_on = _ou_non;
+      _ou_rth = gmem[_ou_b + OU_LINK_LIM_THR];
+      _ou_nth = _ou_rth > 0 ? max(-12, min(0, 20 * log(_ou_rth) / 2.30258509299)) : -12;
+      abs(_ou_nth - ou_lim_thr) > 0.001 ? ( ou_lim_thr = _ou_nth; ou_recalc(); );
+      _ou_nrl = max(10, min(1000, gmem[_ou_b + OU_LINK_LIM_REL]));
+      _ou_nrl != ou_lim_rel ? ( ou_lim_rel = _ou_nrl; ou_recalc(); );
+    );
+  );
+);
+
+ou_gain < 0 ? ou_gain = ou_gain_t;   // first block: seat, do not fade in
+
+@sample
+
+// ─── Master volume, smoothed (Swing's _vol_sm), BEFORE the limiter ─────────
+ou_gain += (ou_gain_t - ou_gain) * _ou_sm;
+_ou_l = spl0 * ou_gain;
+_ou_r = spl1 * ou_gain;
+
+// ─── Limiter: Swing's, verbatim. Instant attack, one-pole auto release ─────
+ou_lim_on ? (
+  _ou_peak = max(abs(_ou_l), abs(_ou_r));
+  _ou_peak > ou_thr_lin ? (
+    _ou_g = ou_thr_lin / _ou_peak;
+    ou_lim_env = min(ou_lim_env, _ou_g);   // instant attack
+  );
+  ou_lim_env += (1.0 - ou_lim_env) * (1.0 - ou_rel_c);   // approaches 1, cannot overshoot
+  _ou_l *= ou_lim_env;
+  _ou_r *= ou_lim_env;
+  ou_lim_gr = min(ou_lim_gr, ou_lim_env);   // held for the readout
+);
+
+spl0 = _ou_l; spl1 = _ou_r;
+
+@gfx 420 170
+
+// A working face; the final face is Swing's own master controls driving this
+// over the link. This one exists so Output is complete on its own.
+gfx_set(0.15, 0.16, 0.18, 1);
+gfx_rect(0, 0, gfx_w, gfx_h);
+gfx_setfont(1, "Arial", 13);
+gfx_set(0.88, 0.89, 0.92, 1);
+gfx_x = 14; gfx_y = 12; gfx_drawstr("EON OUTPUT");
+gfx_set(0.55, 0.58, 0.63, 1);
+gfx_x = 110; gfx_y = 12; gfx_drawstr("Swing's master volume + limiter, for the Audio bus");
+
+// link lamp
+ou_linked ? gfx_set(0.35, 0.80, 0.84, 1) : (ou_link_inst > 0 ? gfx_set(0.85, 0.55, 0.15, 1) : gfx_set(0.40, 0.42, 0.46, 1));
+gfx_circle(gfx_w - 118, 18, 4, 1, 1);
+gfx_set(0.70, 0.72, 0.76, 1);
+gfx_x = gfx_w - 108; gfx_y = 12;
+gfx_drawstr(ou_linked ? "linked to Swing" : (ou_link_inst > 0 ? "Swing not answering" : "standalone"));
+
+_kr = 24; _ky = 92;
+_ou_mdown = (mouse_cap & 1) ? 1 : 0;
+_ou_click = _ou_mdown && !_ou_mprev;
+_ou_mprev = _ou_mdown;
+
+// VOL
+_cx = 70;
+_nv = ssl_knob_interact(ou_kmem + 0 * 16, _cx, _ky, _kr, ou_vol, -48, 12, 0, 0);
+_nv != ou_vol && !ou_linked ? ( ou_vol = _nv; slider_automate(ou_vol); ou_recalc(); );
+rk_knob_draw(1, _cx, _ky, _kr, ou_vol, -48, 12, 0, (ou_kmem + 0 * 16)[0], 0.80, 0.82, 0.86, 0, 0.15, 0.16, 0.18);
+gfx_set(0.70, 0.72, 0.76, 1);
+gfx_x = _cx - 16; gfx_y = _ky + 34; gfx_drawstr("VOL");
+gfx_x = _cx - 28; gfx_y = _ky + 50; gfx_printf("%+.1f dB", ou_vol);
+
+// THRESHOLD
+_cx = 180;
+_nv = ssl_knob_interact(ou_kmem + 1 * 16, _cx, _ky, _kr, ou_lim_thr, -12, 0, 0, 0);
+_nv != ou_lim_thr && !ou_linked ? ( ou_lim_thr = _nv; slider_automate(ou_lim_thr); ou_recalc(); );
+rk_knob_draw(1, _cx, _ky, _kr, ou_lim_thr, -12, 0, 0, (ou_kmem + 1 * 16)[0], 0.93, 0.62, 0.30, 0, 0.15, 0.16, 0.18);
+gfx_set(0.70, 0.72, 0.76, 1);
+gfx_x = _cx - 20; gfx_y = _ky + 34; gfx_drawstr("CEILING");
+gfx_x = _cx - 28; gfx_y = _ky + 50; gfx_printf("%+.1f dB", ou_lim_thr);
+
+// RELEASE (log 10..1000)
+_cx = 290;
+_t = log(max(10, min(1000, ou_lim_rel)) / 10) / log(100);
+_nt = ssl_knob_interact(ou_kmem + 2 * 16, _cx, _ky, _kr, _t, 0, 1, 0.5, 0);
+_nt != _t && !ou_linked ? ( ou_lim_rel = floor(10 * pow(100, max(0, min(1, _nt))) + 0.5); slider_automate(ou_lim_rel); ou_recalc(); );
+rk_knob_draw(1, _cx, _ky, _kr, _nt, 0, 1, 0, (ou_kmem + 2 * 16)[0], 0.80, 0.82, 0.86, 0, 0.15, 0.16, 0.18);
+gfx_set(0.70, 0.72, 0.76, 1);
+gfx_x = _cx - 24; gfx_y = _ky + 34; gfx_drawstr("RELEASE");
+gfx_x = _cx - 22; gfx_y = _ky + 50; gfx_printf("%d ms", ou_lim_rel);
+
+// limiter in/out + GR readout
+_bx = 350; _by = 76; _bw = 56; _bh = 22;
+_ou_click && !ou_linked && mouse_x >= _bx && mouse_x <= _bx + _bw && mouse_y >= _by && mouse_y <= _by + _bh ? (
+  ou_lim_on = ou_lim_on ? 0 : 1; slider_automate(ou_lim_on);
+);
+ou_lim_on ? gfx_set(0.26, 0.55, 0.36, 1) : gfx_set(0.26, 0.28, 0.32, 1);
+gfx_rect(_bx, _by, _bw, _bh);
+gfx_set(0.92, 0.93, 0.95, 1);
+gfx_x = _bx + 10; gfx_y = _by + 4; gfx_drawstr(ou_lim_on ? "LIM IN" : "LIM OUT");
+gfx_set(0.70, 0.72, 0.76, 1);
+gfx_x = _bx - 2; gfx_y = _by + 34;
+ou_lim_gr < 0.999 ? gfx_printf("%.1f dB GR", 20 * log(ou_lim_gr) / 2.30258509299) : gfx_drawstr("0.0 dB GR");
+ou_lim_gr = 1;   // held since the last frame; release it
+
+ou_linked ? (
+  gfx_set(0.42, 0.46, 0.53, 1);
+  gfx_x = 14; gfx_y = gfx_h - 20;
+  gfx_drawstr("Linked: set VOL on Swing, and the limiter in Swing's COMP view (LIMITER section).");
+);

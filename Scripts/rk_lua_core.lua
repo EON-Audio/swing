@@ -344,6 +344,10 @@ core.GMEM = {
   MAX_LAYERS    = 4,
   SLOT_SIZE     = 4000000,
   LAYER_SIZE    = 1000000,
+  -- Where the audio band (AUDIO_BASE+) really ends: the Stretch rings start at
+  -- 16,777,216 (protocol md §3). The JSFX kit-export dump stops here
+  -- (KIT_GMEM_AUDIO_DUMP_END) and the bridge's audio clamps derive from it.
+  AUDIO_DUMP_END = 16777216,
 
   -- Global state addresses
   GS_LOCK_BITMASK     = 1380,
@@ -478,6 +482,12 @@ core.GMEM = {
                                     -- deliberately left alone: misc_cmds eats it in ms
                                     -- and that consume doubles as the pad name/color
                                     -- refresh signal. Stamp written BEFORE CMD.
+  GS_EXPORT_OVER       = 26090343,  -- JSFX → bridge: 1 = the state-11 audio dump stopped
+                                    -- at the export band's ceiling (AUDIO_DUMP_END): the
+                                    -- kit holds more audio than the band carries. The
+                                    -- bridge refuses the save (CMD 98) / skips the undo
+                                    -- snapshot instead of writing a short kit. Claimed
+                                    -- 2026-09-08 (Spec_Swing_Long_Pad_Layer_Cap §4.4).
   -- Bridge → browser: 0-based FX-chain index of the active target. Paired
   -- with GS_TRACK_NUM so the browser can disambiguate stacked Swings on
   -- the same track (track_num collides; fx_index doesn't).
@@ -627,6 +637,7 @@ core.GMEM = {
   -- 600 = VU_REQ). Swing writes 1 per publish; 0 = old build → tie inert.
   GS_STRIP_OFF_TIE_VER  = 601,
   GS_STRIP_OFF_VU_REQ   = 600,  -- Swing→Lua: header VU selector → (style+2); past the pad region (8..519)
+  GS_STRIP_OFF_ALIVE_MASK = 602, -- Lua→Swing: bit i = pad i has a live Drum Strip (per-pad takeover). 0 from an old script = all pads
 
   -- ─── Unified theme bus (one selector → all four EON tools) ───────────────
   -- The Lua theme publisher resolves a palette (EON/Dark/Light/REAPER) and
@@ -1800,6 +1811,132 @@ function core.hub_notify(event, role, tr, fx)
   reaper.SetExtState("EON_HUB_IPC", "msg_" .. (seq % 16), msg, false)
   reaper.SetExtState("EON_HUB_IPC", "seq", tostring(seq), false)
   reaper.Main_OnCommand(hub_nudge_cmd, 0)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- MACRO LINKS -- Swing's macros driving any plugin parameter
+-- ═══════════════════════════════════════════════════════════════════════════
+-- REAPER's parameter links only join plugins on the SAME track. On Swing's own
+-- track the source is Swing's Macro N slider itself (Macro 1 = param 31). On a
+-- Multi-Out pad track it is EON Macros, a relay plugin that follows Swing over
+-- the master-link record and re-announces each macro to the host. macro_link
+-- sets the link the way REAPER's own parameter-modulation dialog would:
+-- baseline 0, scale 1, offset 0 -- the macro is the parameter's full travel.
+-- Links are applied on the audio thread and survive chain reordering (REAPER
+-- re-points the source index); verified by .dev_tests/EON_Probe_LinkChunk_run.ps1.
+
+function core.ensure_macros(tr, swing_tr, swing_fx)
+  if not tr then return -1 end
+  local name = core.jsfx_addname("EON_Macros.jsfx", swing_tr, swing_fx)
+  if not name then return -1 end
+  local fx = reaper.TrackFX_AddByName(tr, name, false, 0)
+  if fx < 0 then
+    fx = reaper.TrackFX_AddByName(tr, name, false, 1)
+    if fx < 0 then return -1 end
+  end
+  local inst = 0
+  if swing_tr and swing_fx then
+    inst = math.floor((reaper.TrackFX_GetParam(swing_tr, swing_fx, 3) or 0) + 0.5)
+  end
+  for i = 0, reaper.TrackFX_GetNumParams(tr, fx) - 1 do
+    local ok, nm = reaper.TrackFX_GetParamName(tr, fx, i, "")
+    if ok and nm:find("Link Instance", 1, true) then
+      if math.floor((reaper.TrackFX_GetParam(tr, fx, i) or 0) + 0.5) ~= inst then
+        reaper.TrackFX_SetParam(tr, fx, i, inst)
+      end
+      break
+    end
+  end
+  return fx
+end
+
+--- The source of a link to macro `macro` (1..8) for a plugin on `tr`:
+-- returns src_fx, src_param, or nil + reason.
+--- A relay INSIDE container `cidx` (top-level index) on `tr`: found, or added
+-- as child 0 with Swing's id baked in. Returns its CHILD position (what a
+-- plink.effect inside that container expects), or -1.
+function core.ensure_macros_in(tr, cidx, swing_tr, swing_fx)
+  if not tr or not cidx then return -1 end
+  local ok, cnt = reaper.TrackFX_GetNamedConfigParm(tr, cidx, "container_count")
+  cnt = (ok and tonumber(cnt)) and math.floor(tonumber(cnt)) or 0
+  local function child(pos)
+    local ok2, v = reaper.TrackFX_GetNamedConfigParm(tr, cidx, "container_item." .. pos)
+    return (ok2 and tonumber(v)) and math.floor(tonumber(v)) or -1
+  end
+  for k = 0, cnt - 1 do
+    local e = child(k)
+    local _, nm = reaper.TrackFX_GetFXName(tr, e, "")
+    if (nm or ""):find("EON Macros", 1, true) then return k, e end
+  end
+  local name = core.jsfx_addname("EON_Macros.jsfx", swing_tr, swing_fx)
+  if not name then return -1 end
+  -- Appended LAST inside the container: the children already there keep
+  -- their encoded indices (the encoding is by position), so the caller's
+  -- target index -- the plugin the user just touched -- stays valid.
+  local pos = cnt
+  local encp = 0x2000000 + (cidx + 1) + (pos + 1) * (reaper.TrackFX_GetCount(tr) + 1)
+  reaper.TrackFX_AddByName(tr, name, false, -1000 - encp)
+  local e = child(pos)
+  if e < 0 then return -1 end
+  local _, nm = reaper.TrackFX_GetFXName(tr, e, "")
+  if not (nm or ""):find("EON Macros", 1, true) then return -1 end
+  local inst = 0
+  if swing_tr and swing_fx then
+    inst = math.floor((reaper.TrackFX_GetParam(swing_tr, swing_fx, 3) or 0) + 0.5)
+  end
+  for i = 0, reaper.TrackFX_GetNumParams(tr, e) - 1 do
+    local okp, pn = reaper.TrackFX_GetParamName(tr, e, i, "")
+    if okp and pn:find("Link Instance", 1, true) then reaper.TrackFX_SetParam(tr, e, i, inst) break end
+  end
+  return pos, e
+end
+
+--- The source of a link to macro `macro` (1..8) for a plugin on `tr`
+-- (`tgt_fx`, when given, is the plugin's index -- encoded if it sits inside
+-- a container): returns src_fx, src_param, or nil + reason.
+--   Swing's track, top level ........ Swing's own macro slider (Macro 1 = 31)
+--   inside a container (any track) ... an EON Macros relay INSIDE it, since a
+--                                     REAPER link never crosses a container
+--                                     wall (child-relative index)
+--   a pad track, top level ........... the track's EON Macros relay
+function core.macro_source(tr, macro, swing_tr, swing_fx, tgt_fx)
+  if not tr or not swing_tr or not swing_fx then return nil, "no Swing" end
+  local on_swing = reaper.GetTrackGUID(tr) == reaper.GetTrackGUID(swing_tr)
+  local _, tag = reaper.GetSetMediaTrackInfo_String(tr, "P_EXT:EON_PAD_IDX", "", false)
+  if not on_swing and tag == "" then return nil, "not Swing's track or one of its pad tracks" end
+  if tgt_fx and tgt_fx >= 0x2000000 then
+    local okc, pc = reaper.TrackFX_GetNamedConfigParm(tr, tgt_fx, "parent_container")
+    local cidx = (okc and tonumber(pc)) and math.floor(tonumber(pc)) or -1
+    if cidx < 0 then return nil, "could not find the plugin's container" end
+    local pos = core.ensure_macros_in(tr, cidx, swing_tr, swing_fx)
+    if pos < 0 then return nil, "EON Macros could not be added inside the container" end
+    return pos, macro - 1
+  end
+  if on_swing then return swing_fx, 31 + (macro - 1) end
+  local fx = core.ensure_macros(tr, swing_tr, swing_fx)
+  if fx < 0 then return nil, "EON Macros could not be added to the pad track" end
+  return fx, macro - 1
+end
+
+--- Link target (tgt_tr, tgt_fx, tgt_param) to source (src_fx, src_param) on
+-- the same track. Returns true when every key was accepted.
+function core.macro_link(tgt_tr, tgt_fx, tgt_param, src_fx, src_param)
+  if not tgt_tr or not tgt_fx or not tgt_param or not src_fx or not src_param then return false end
+  local base = "param." .. tgt_param .. "."
+  local ok = true
+  local function setp(k, v)
+    if not reaper.TrackFX_SetNamedConfigParm(tgt_tr, tgt_fx, base .. k, tostring(v)) then ok = false end
+  end
+  reaper.Undo_BeginBlock()
+  setp("mod.active", 1)
+  setp("mod.baseline", 0)
+  setp("plink.active", 1)
+  setp("plink.effect", src_fx)
+  setp("plink.param", src_param)
+  setp("plink.scale", 1)
+  setp("plink.offset", 0)
+  reaper.Undo_EndBlock("EON: link a macro to a parameter", -1)
+  return ok
 end
 
 return core

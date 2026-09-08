@@ -704,7 +704,8 @@ end
 
 function M.remove(tr, idx)
   if not tr then return nil, "remove: no track" end
-  if idx < 0 or idx >= r.TrackFX_GetCount(tr) then
+  -- an encoded container child (>= 0x2000000) is never "out of range" here
+  if idx < 0 or (idx < 0x2000000 and idx >= r.TrackFX_GetCount(tr)) then
     return nil, "remove: index out of range"
   end
   undo_begin()
@@ -743,7 +744,7 @@ end
 
 function M.set_enabled(tr, idx, on)
   if not tr then return nil, "bypass: no track" end
-  if idx < 0 or idx >= r.TrackFX_GetCount(tr) then
+  if idx < 0 or (idx < 0x2000000 and idx >= r.TrackFX_GetCount(tr)) then
     return nil, "bypass: index out of range"
   end
   undo_begin()
@@ -1130,22 +1131,621 @@ end
 
 --- Write the track's chain out as a normal .RfxChain, so it stays visible to
 --- REAPER's own FX browser (spec). Reads the track chunk's <FXCHAIN> block.
-function M.chain_save(tr, rel)
+--- The track's <FXCHAIN as one entry per plugin: { text = {lines}, guid }.
+-- ⚠️ A track chunk has NO indentation and EVERY block closes with a bare ">",
+-- so the old first-"\n>" pattern stopped INSIDE the first plugin's block and
+-- every saved chain was an unloadable fragment (found 2026-09-07 by the
+-- chunk probe). Walk it depth-aware: the chain's own ">" is the one that
+-- brings the depth back to zero, and a plugin entry starts at a depth-0
+-- BYPASS line (then <VST/<JS ...>, its state blocks, FLOATPOS, FXID, WAK).
+local function fxchain_blocks(tr)
+  local ok, chunk = r.GetTrackStateChunk(tr, "", false)
+  if not ok or not chunk then return nil, "could not read the track chunk" end
+  local all = {}
+  for line in (chunk .. "\n"):gmatch("([^\n]*)\n") do all[#all + 1] = (line:gsub("\r$", "")) end
+  local s0, e0, depth = nil, nil, 0
+  for k, l in ipairs(all) do
+    if not s0 then
+      if l == "<FXCHAIN" then s0 = k; depth = 1 end
+    else
+      if l:sub(1, 1) == "<" then depth = depth + 1
+      elseif l == ">" then depth = depth - 1; if depth == 0 then e0 = k break end end
+    end
+  end
+  if not s0 or not e0 then return nil, "this track has no FX chain" end
+  local blocks, cur = {}, nil
+  depth = 0
+  for k = s0 + 1, e0 - 1 do
+    local l = all[k]
+    if depth == 0 and l:match("^BYPASS ") then cur = { text = {} }; blocks[#blocks + 1] = cur end
+    if cur then cur.text[#cur.text + 1] = l end
+    if l:sub(1, 1) == "<" then depth = depth + 1 elseif l == ">" then depth = depth - 1 end
+    local guid = l:match("^FXID (%b{})")
+    if guid and cur then cur.guid = guid end
+  end
+  return blocks
+end
+
+--- Save the track's chain as `rel` (.RfxChain appended). `guids`, when given,
+-- keeps only the plugins whose FXID is in that set. The window-state
+-- preamble (WNDRECT / SHOW / LASTSEL / DOCKED) never makes it into the file.
+function M.chain_save(tr, rel, guids)
   if not tr then return nil, "chain save: no track" end
   if not rel or rel == "" then return nil, "chain save: no name given" end
   if not rel:lower():find("%.rfxchain$") then rel = rel .. ".RfxChain" end
-  local ok, chunk = r.GetTrackStateChunk(tr, "", false)
-  if not ok or not chunk then return nil, "chain save: could not read the track chunk" end
-  local body = chunk:match("<FXCHAIN\n(.-)\n>%s*\n") or chunk:match("<FXCHAIN\r?\n(.-)\r?\n>")
-  if not body then return nil, "chain save: this track has no FX chain" end
-  -- Drop the window-state preamble: a saved chain should not carry one track's
-  -- window position into every project that loads it.
-  body = body:gsub("^WNDRECT[^\n]*\n", ""):gsub("^SHOW[^\n]*\n", "")
-             :gsub("^LASTSEL[^\n]*\n", ""):gsub("^DOCKED[^\n]*\n", "")
+  local blocks, err = fxchain_blocks(tr)
+  if not blocks then return nil, "chain save: " .. err end
+  local keep = {}
+  for _, b in ipairs(blocks) do
+    if not guids or (b.guid and guids[b.guid]) then
+      keep[#keep + 1] = table.concat(b.text, "\n")
+    end
+  end
+  if #keep == 0 then return nil, "chain save: nothing to save" end
   local path = M.chain_dir() .. SEP .. rel
   local f = io.open(path, "wb")
   if not f then return nil, "chain save: could not write " .. path end
-  f:write(body, "\n")
+  f:write(table.concat(keep, "\n"), "\n")
+  f:close()
+  return true
+end
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- PAD VIEWS — one pad's slice of Swing's OWN track (Wired)
+-- ═══════════════════════════════════════════════════════════════════════════
+-- In Wired a pad has no track of its own: its plugins sit on Swing's track
+-- between Swing and the EON Patchbay, on the pad's channel pair ((pad+1)*2,
+-- +1). A VIEW is that slice as a list of chain indices in signal order, and
+-- every operation below takes indices IN THE VIEW and maps them, so the picker
+-- can treat "pad 5 on Swing's track" exactly like a track.
+--
+-- v2 (REAPER 7+): the slice is a CONTAINER, one per pad, named for it and
+-- pinned to the pair ONCE. The plugins inside see plain stereo, so nothing
+-- inside ever carries a pin -- a plugin dropped in through REAPER's own FX
+-- browser is routed the moment it lands. Children are addressed with REAPER's
+-- encoded index, 0x2000000 + (container+1) + (pos+1) * (top-level count+1).
+-- v1 plugins (flat, pinned to the pair) are still part of the view, in chain
+-- order, so an older project keeps working; new inserts always go into the
+-- container. Research: .dev_tests/EON_Probe_Container_run.ps1 -- and note a
+-- REAPER parameter link does NOT cross the container wall; a relay inside
+-- does (core.macro_source handles that).
+--
+-- pad = -1 is the MASTER view: everything after Swing that is neither
+-- pad-pinned (flat or container) nor the Patchbay -- a plugin on channels 1/2
+-- there is a master insert whichever side of the Patchbay it sits.
+--
+-- A track with no Swing on it has no views: every function falls back to the
+-- whole-chain call of the same name, so callers need not special-case it.
+local NUM_PADS = 16
+local CENC = 0x2000000
+
+local function is_enc(i) return i ~= nil and i >= CENC end
+
+--- Containers need REAPER 7. Below that the flat, pinned layout is used.
+function M.containers_ok()
+  local v = tonumber((r.GetAppVersion() or "0"):match("^(%d+)")) or 0
+  return v >= 7
+end
+
+function M.is_container(tr, i)
+  if not r.TrackFX_GetNamedConfigParm then return false end
+  local ok, v = r.TrackFX_GetNamedConfigParm(tr, i, "container_count")
+  return ok and v ~= nil and v ~= ""
+end
+
+function M.container_count(tr, c)
+  local ok, v = r.TrackFX_GetNamedConfigParm(tr, c, "container_count")
+  return (ok and tonumber(v)) and math.floor(tonumber(v)) or 0
+end
+
+--- Encoded address of child `pos` of top-level container `c` (pos may equal
+-- the count: the append slot).
+function M.enc(tr, c, pos)
+  return CENC + (c + 1) + (pos + 1) * (r.TrackFX_GetCount(tr) + 1)
+end
+
+--- The encoded index of the child at `pos`, or -1.
+function M.container_child(tr, c, pos)
+  local ok, v = r.TrackFX_GetNamedConfigParm(tr, c, "container_item." .. pos)
+  return (ok and tonumber(v)) and math.floor(tonumber(v)) or -1
+end
+
+local function container_children(tr, c)
+  local out = {}
+  for k = 0, M.container_count(tr, c) - 1 do
+    local e = M.container_child(tr, c, k)
+    if e >= 0 then out[#out + 1] = e end
+  end
+  return out
+end
+
+function M.is_swing(tr, i)
+  local ident = fx_ident(tr, i) or ""
+  if ident:find("Swing_ReaKit", 1, true) or ident:find("DrumKit_ReaKit", 1, true) then
+    return true
+  end
+  local _, disp = r.TrackFX_GetFXName(tr, i, "")
+  disp = disp or ""
+  if disp:find("Patchbay", 1, true) or disp:find("EON Tone", 1, true)
+     or disp:find("EON Output", 1, true) or disp:find("EON Macros", 1, true) then return false end
+  return disp:match("^JS: Swing") ~= nil
+end
+
+function M.find_swing(tr)
+  if not tr then return -1 end
+  for i = 0, r.TrackFX_GetCount(tr) - 1 do
+    if M.is_swing(tr, i) then return i end
+  end
+  return -1
+end
+
+function M.find_patchbay(tr)
+  if not tr then return -1 end
+  for i = 0, r.TrackFX_GetCount(tr) - 1 do
+    local ident = fx_ident(tr, i) or ""
+    local _, disp = r.TrackFX_GetFXName(tr, i, "")
+    if ident:find("EON_Patchbay", 1, true) or (disp or ""):find("EON Patchbay", 1, true) then
+      return i
+    end
+  end
+  return -1
+end
+
+--- The pad whose Wired pair a plugin's (or container's) FIRST INPUT PIN reads,
+-- or -1. Same reading the kit bridge's Wired -> Multi-Out inventory uses. Pad
+-- 15's pair (channels 32/33) lives in the HIGH word.
+function M.pad_of(tr, i)
+  local lo, hi = r.TrackFX_GetPinMappings(tr, i, 0, 0)
+  lo = math.floor(lo or 0); hi = math.floor(hi or 0)
+  local ch = -1
+  if lo ~= 0 then
+    for b = 0, 31 do if lo & (1 << b) ~= 0 then ch = b break end end
+  elseif hi ~= 0 then
+    for b = 0, 31 do if hi & (1 << b) ~= 0 then ch = 32 + b break end end
+  end
+  if ch < 2 then return -1 end
+  local pad = math.floor(ch / 2) - 1
+  if pad < 0 or pad >= NUM_PADS then return -1 end
+  return pad
+end
+
+local function pin_mask(ch)
+  if ch < 32 then return 1 << ch, 0 end
+  return 0, 1 << (ch - 32)
+end
+
+--- Pin a plugin's (or container's) inputs AND outputs to a pad's Wired pair.
+function M.pin_pad(tr, i, pad)
+  local c = (pad + 1) * 2
+  for io = 0, 1 do
+    local l0, h0 = pin_mask(c);     r.TrackFX_SetPinMappings(tr, i, io, 0, l0, h0)
+    local l1, h1 = pin_mask(c + 1); r.TrackFX_SetPinMappings(tr, i, io, 1, l1, h1)
+  end
+end
+
+--- Plain stereo pins (1/2) -- what a container child should carry.
+function M.pin_stereo(tr, i)
+  for io = 0, 1 do
+    r.TrackFX_SetPinMappings(tr, i, io, 0, 1, 0)
+    r.TrackFX_SetPinMappings(tr, i, io, 1, 2, 0)
+  end
+end
+
+--- The pad's container on Swing's track (top-level index), or -1.
+function M.pad_container(tr, pad)
+  if not tr or pad == nil or pad < 0 then return -1 end
+  local si = M.find_swing(tr)
+  if si < 0 then return -1 end
+  local pb = M.find_patchbay(tr)
+  local last = (pb >= 0) and pb or r.TrackFX_GetCount(tr)
+  for i = si + 1, last - 1 do
+    if M.is_container(tr, i) and M.pad_of(tr, i) == pad then return i end
+  end
+  return -1
+end
+
+--- Make sure the pad has a container: created directly above the Patchbay
+-- (or last), 2 in / 2 out, pinned to the pair, named. Returns its index.
+function M.ensure_pad_container(tr, pad, name)
+  local c = M.pad_container(tr, pad)
+  if c >= 0 then return c end
+  local pb = M.find_patchbay(tr)
+  local n0 = r.TrackFX_GetCount(tr)
+  local at = r.TrackFX_AddByName(tr, "Container", false, (pb >= 0) and (-1000 - pb) or -1)
+  if at < 0 or r.TrackFX_GetCount(tr) <= n0 then return -1 end
+  -- AddByName's return is not reliable for a positional insert, but the slot
+  -- is: the new container sits where the Patchbay was (it moved down one),
+  -- or last when there is no Patchbay. Never guess from "an empty container
+  -- somewhere" -- that could be one the user made.
+  c = (pb >= 0) and pb or (r.TrackFX_GetCount(tr) - 1)
+  if not (M.is_container(tr, c) and M.container_count(tr, c) == 0 and M.pad_of(tr, c) < 0) then
+    return -1
+  end
+  r.TrackFX_SetNamedConfigParm(tr, c, "container_nch", "2")
+  r.TrackFX_SetNamedConfigParm(tr, c, "container_nch_in", "2")
+  r.TrackFX_SetNamedConfigParm(tr, c, "container_nch_out", "2")
+  M.pin_pad(tr, c, pad)
+  r.TrackFX_SetNamedConfigParm(tr, c, "renamed_name",
+    (name and name ~= "" and name or "Pad") .. " (pad " .. (pad + 1) .. ")")
+  return c
+end
+
+--- Rename the pad's container when the pad's name changed (cheap, idempotent).
+function M.name_pad_container(tr, pad, name)
+  if not name or name == "" then return false end          -- nothing published yet: leave it
+  local c = M.pad_container(tr, pad)
+  if c < 0 then return false end
+  local _, cur = r.TrackFX_GetFXName(tr, c, "")
+  cur = cur or ""
+  -- Only a name WE gave ("... (pad N)") follows the pad. A container the user
+  -- renamed by hand keeps their name.
+  if not cur:match("%(pad %d+%)$") then return false end
+  local want = name .. " (pad " .. (pad + 1) .. ")"
+  if cur ~= want then r.TrackFX_SetNamedConfigParm(tr, c, "renamed_name", want) end
+  return true
+end
+
+--- { swing, pb, pad, container, idx = { chain indices, encoded for children } },
+-- or nil (no Swing here). Signal order: a container is expanded in place.
+function M.view(tr, pad)
+  if not tr or pad == nil then return nil end
+  local si = M.find_swing(tr)
+  if si < 0 then return nil end
+  local pb = M.find_patchbay(tr)
+  local n = r.TrackFX_GetCount(tr)
+  local idx, container = {}, -1
+  if pad >= 0 then
+    local last = (pb >= 0) and pb or n          -- pad plugins live ABOVE the Patchbay
+    for i = si + 1, last - 1 do
+      if M.pad_of(tr, i) == pad then
+        if M.is_container(tr, i) then
+          if container < 0 then container = i end
+          for _, e in ipairs(container_children(tr, i)) do idx[#idx + 1] = e end
+        else
+          idx[#idx + 1] = i
+        end
+      end
+    end
+  else
+    for i = si + 1, n - 1 do
+      if i ~= pb and M.pad_of(tr, i) < 0 then idx[#idx + 1] = i end
+    end
+  end
+  return { swing = si, pb = pb, pad = pad, container = container, idx = idx }
+end
+
+--- One picker slot for any index, encoded included (M.chain's shape).
+function M.entry(tr, i)
+  local _, disp = r.TrackFX_GetFXName(tr, i, "")
+  local name, vendor, fmt = M.parse_name(disp, fx_ident(tr, i))
+  return {
+    idx = i, name = name, vendor = vendor, fmt = fmt,
+    ident = fx_ident(tr, i), disp = disp or "",
+    cat = M.category_fx(tr, i),
+    sub = M.subcategory(name, fx_ident(tr, i)),
+    enabled = r.TrackFX_GetEnabled(tr, i),
+    offline = r.TrackFX_GetOffline and r.TrackFX_GetOffline(tr, i) or false,
+  }
+end
+
+--- The view as chain entries (`idx` chain/encoded index, `vi` in-view).
+-- Second result is the view, nil when the whole chain came back instead.
+function M.chain_view(tr, pad)
+  local v = M.view(tr, pad)
+  if not v then return M.chain(tr), nil end
+  local out = {}
+  for k, i in ipairs(v.idx) do
+    local e = M.entry(tr, i)
+    e.vi = k - 1
+    out[#out + 1] = e
+  end
+  return out, v
+end
+
+-- Position of encoded child `e` inside container `c`, or -1.
+local function child_pos(tr, c, e)
+  for k = 0, M.container_count(tr, c) - 1 do
+    if M.container_child(tr, c, k) == e then return k end
+  end
+  return -1
+end
+
+-- Move a child inside its container so it ends up AT `to_pos`. Verified by
+-- reading the order back; retried with the other reading of `dest` (the same
+-- guard move_raw carries for flat chains).
+local function cmove(tr, c, from_pos, to_pos)
+  if from_pos == to_pos then return true end
+  local e = M.container_child(tr, c, from_pos)
+  if e < 0 then return nil, "move: no child at " .. from_pos end
+  local guid = r.TrackFX_GetFXGUID(tr, e)
+  for attempt = 1, 2 do
+    local dest = (attempt == 1) and to_pos or ((to_pos > from_pos) and (to_pos + 1) or to_pos)
+    r.TrackFX_CopyToTrack(tr, e, tr, M.enc(tr, c, dest), true)
+    if r.TrackFX_GetFXGUID(tr, M.container_child(tr, c, to_pos)) == guid then return true end
+    -- find where it landed and try again from there
+    local landed = -1
+    for k = 0, M.container_count(tr, c) - 1 do
+      if r.TrackFX_GetFXGUID(tr, M.container_child(tr, c, k)) == guid then landed = k break end
+    end
+    if landed < 0 then break end
+    e = M.container_child(tr, c, landed)
+    from_pos = landed
+  end
+  return nil, "move: could not place the child at " .. to_pos
+end
+
+-- Where a flat (v1) newcomer lands, in chain terms: after view slot `after`,
+-- else after the view's last plugin, else right above the Patchbay; nil = append.
+local function view_insert_pos(v, after)
+  if after and after >= 0 and v.idx[after + 1] and not is_enc(v.idx[after + 1]) then return v.idx[after + 1] + 1 end
+  local lastflat = nil
+  for _, i in ipairs(v.idx) do if not is_enc(i) then lastflat = i end end
+  if lastflat then return lastflat + 1 end
+  if v.pad >= 0 and v.pb >= 0 then return v.pb end
+  return nil
+end
+
+--- Insert `add` into the view (after view slot `after`, or at its end).
+-- Pads on REAPER 7: into the pad's container (made on demand, `name` names
+-- it), at the child position after `after` when that slot is a child, else
+-- appended inside. Otherwise the flat, pinned v1 placement. Returns the
+-- index of the newcomer (encoded for a child).
+function M.view_insert(tr, pad, add, after, name)
+  local v = M.view(tr, pad)
+  if not v then return M.insert(tr, add, (after and after >= 0) and (after + 1) or nil) end
+  if type(add) ~= "string" or add == "" then return nil, "insert: no plugin given" end
+  undo_begin()
+  local at, err
+  if pad >= 0 and M.containers_ok() then
+    local c = M.ensure_pad_container(tr, pad, name)
+    if c < 0 then undo_end("insert"); return nil, "insert: could not make the pad's container" end
+    local pos = M.container_count(tr, c)
+    if after and after >= 0 and v.idx[after + 1] and is_enc(v.idx[after + 1]) then
+      local p = child_pos(tr, c, v.idx[after + 1])
+      if p >= 0 then pos = p + 1 end
+    end
+    local before = M.container_count(tr, c)
+    r.TrackFX_AddByName(tr, add, false, -1000 - M.enc(tr, c, pos))
+    if M.container_count(tr, c) <= before then
+      -- the positional insert refused (a chain file, or a name REAPER only
+      -- resolves at top level): append at top level and move it in
+      local n0 = r.TrackFX_GetCount(tr)
+      local top = r.TrackFX_AddByName(tr, add, false, -1)
+      if top < 0 or r.TrackFX_GetCount(tr) <= n0 then
+        undo_end("insert"); return nil, "insert: '" .. tostring(add) .. "' not found or refused"
+      end
+      top = r.TrackFX_GetCount(tr) - 1
+      c = M.pad_container(tr, pad)                       -- indices unchanged, but be safe
+      r.TrackFX_CopyToTrack(tr, top, tr, M.enc(tr, c, pos), true)
+    end
+    at = M.container_child(tr, c, pos)
+    if at >= 0 then M.pin_stereo(tr, at) end
+    err = (at < 0) and "insert: the child did not land" or nil
+  else
+    at, err = insert_raw(tr, add, view_insert_pos(v, after))
+    if at and pad >= 0 then M.pin_pad(tr, at, pad) end
+  end
+  undo_end("insert " .. tostring(add) .. (pad >= 0 and (" on pad " .. (pad + 1)) or ""))
+  return at, err
+end
+
+--- Replace view slot `vidx` with `add`, in place, keeping the slice's routing.
+function M.view_swap(tr, pad, vidx, add)
+  local v = M.view(tr, pad)
+  if not v then return M.swap(tr, vidx, add) end
+  if type(add) ~= "string" or add == "" then return nil, "swap: no plugin given" end
+  local target = v.idx[vidx + 1]
+  if not target then return nil, "swap: slot " .. tostring(vidx) .. " is not in this view" end
+  undo_begin()
+  local at, err
+  if is_enc(target) then
+    local c = v.container
+    local pos = child_pos(tr, c, target)
+    local before = M.container_count(tr, c)
+    r.TrackFX_AddByName(tr, add, false, -1000 - M.enc(tr, c, pos + 1))
+    if M.container_count(tr, c) <= before then
+      undo_end("swap slot"); return nil, "swap: '" .. tostring(add) .. "' not found or refused"
+    end
+    r.TrackFX_Delete(tr, M.container_child(tr, c, pos))   -- the newcomer drops into pos
+    at = M.container_child(tr, c, pos)
+    if at >= 0 then M.pin_stereo(tr, at) end
+  else
+    at, err = insert_raw(tr, add, target + 1)
+    if not at then undo_end("swap slot"); return nil, err end
+    local ok = r.TrackFX_Delete(tr, target)
+    if ok and pad >= 0 then M.pin_pad(tr, target, pad) end
+    at = ok and target or nil
+    if not ok then err = "swap: could not delete the outgoing plugin" end
+  end
+  undo_end("swap slot")
+  return at, err
+end
+
+--- Move view slot `vfrom` so it ends up AT view slot `vto`. Children move
+-- inside their container; a flat v1 plugin moved onto a child slot migrates
+-- INTO the container (and loses its pad pins, as a child should).
+function M.view_move(tr, pad, vfrom, vto)
+  local v = M.view(tr, pad)
+  if not v then return M.move(tr, vfrom, vto) end
+  local a, b = v.idx[vfrom + 1], v.idx[vto + 1]
+  if not a or not b then return nil, "move: slot out of this view" end
+  if is_enc(a) and is_enc(b) then
+    local c = v.container
+    undo_begin()
+    local ok, err = cmove(tr, c, child_pos(tr, c, a), child_pos(tr, c, b))
+    undo_end("move slot")
+    return ok, err
+  elseif not is_enc(a) and is_enc(b) then
+    local c = v.container
+    -- "Ends up AT view slot vto": once the flat plugin has left the view,
+    -- everything after it moves up one, so a move DOWN lands after b's child
+    -- position and a move UP lands at it.
+    local pos = child_pos(tr, c, b) + ((vfrom < vto) and 1 or 0)
+    local guid = r.TrackFX_GetFXGUID(tr, a)
+    undo_begin()
+    -- A flat plugin ABOVE the container shifts the container down one the
+    -- moment it leaves the top level, and the encoded destination would name
+    -- the wrong slot. Park it at the end of the chain first (a verified flat
+    -- move), so it always enters from below.
+    if a < c then
+      move_raw(tr, a, r.TrackFX_GetCount(tr) - 1)
+      a = r.TrackFX_GetCount(tr) - 1
+      c = M.pad_container(tr, pad)
+    end
+    r.TrackFX_CopyToTrack(tr, a, tr, M.enc(tr, c, pos), true)
+    c = M.pad_container(tr, pad)
+    -- verify by GUID: landed at pos, or somewhere inside (then walk it there)
+    local e = M.container_child(tr, c, pos)
+    if e < 0 or r.TrackFX_GetFXGUID(tr, e) ~= guid then
+      e = -1
+      for k = 0, M.container_count(tr, c) - 1 do
+        local ck = M.container_child(tr, c, k)
+        if r.TrackFX_GetFXGUID(tr, ck) == guid then
+          cmove(tr, c, k, pos)
+          e = M.container_child(tr, c, pos)
+          break
+        end
+      end
+    end
+    if e >= 0 then M.pin_stereo(tr, e) end
+    undo_end("move slot into the pad's container")
+    return e >= 0
+  elseif is_enc(a) and not is_enc(b) then
+    return nil, "move: a container child cannot take a flat slot -- move the other one in instead"
+  end
+  return M.move(tr, a, b)
+end
+
+--- Apply a .RfxChain to the view: "replace" clears the view's own plugins
+-- first. Pads on REAPER 7 load into the container (tried in place, else
+-- appended at top level and moved in); flat otherwise, walked above the
+-- Patchbay and pinned.
+function M.view_chain_apply(tr, pad, rel, mode, name)
+  local v = M.view(tr, pad)
+  if not v then return M.chain_apply(tr, rel, mode) end
+  if not rel or rel == "" then return nil, "chain: no chain given" end
+  local abs = M.chain_dir() .. SEP .. rel
+  undo_begin()
+  if mode == "replace" then
+    for k = #v.idx, 1, -1 do
+      local i = v.idx[k]
+      if is_enc(i) then
+        -- children re-encode as siblings vanish: delete by position, last first
+        local c = v.container
+        local p = child_pos(tr, c, i)
+        if p >= 0 then r.TrackFX_Delete(tr, M.container_child(tr, c, p)) end
+      else
+        r.TrackFX_Delete(tr, i)
+      end
+    end
+    v = M.view(tr, pad)
+  end
+  if pad >= 0 and M.containers_ok() then
+    local c = M.ensure_pad_container(tr, pad, name)
+    if c < 0 then undo_end("add chain"); return nil, "chain: could not make the pad's container" end
+    local before = M.container_count(tr, c)
+    r.TrackFX_AddByName(tr, abs, false, -1000 - M.enc(tr, c, before))
+    if M.container_count(tr, c) <= before then
+      r.TrackFX_AddByName(tr, rel, false, -1000 - M.enc(tr, c, before))
+    end
+    if M.container_count(tr, c) <= before then
+      -- top level, then walk each newcomer in, in order
+      local n0 = r.TrackFX_GetCount(tr)
+      r.TrackFX_AddByName(tr, abs, false, -1)
+      if r.TrackFX_GetCount(tr) <= n0 then r.TrackFX_AddByName(tr, rel, false, -1) end
+      local n1 = r.TrackFX_GetCount(tr)
+      if n1 <= n0 then undo_end("add chain"); return nil, "chain: '" .. rel .. "' could not be inserted" end
+      for k = 0, n1 - n0 - 1 do
+        c = M.pad_container(tr, pad)
+        r.TrackFX_CopyToTrack(tr, n0, tr, M.enc(tr, c, M.container_count(tr, c)), true)   -- n0 again: the rest shift down
+      end
+    end
+    c = M.pad_container(tr, pad)
+    for k = before, M.container_count(tr, c) - 1 do
+      local e = M.container_child(tr, c, k)
+      if e >= 0 then M.pin_stereo(tr, e) end
+    end
+    undo_end(mode == "replace" and "replace chain" or "add chain")
+    return M.container_count(tr, c) > before
+  end
+  local before = r.TrackFX_GetCount(tr)
+  r.TrackFX_AddByName(tr, abs, false, -1)
+  if r.TrackFX_GetCount(tr) <= before then
+    r.TrackFX_AddByName(tr, rel, false, -1)
+  end
+  local after = r.TrackFX_GetCount(tr)
+  if after <= before then
+    undo_end("add chain")
+    return nil, "chain: '" .. rel .. "' could not be inserted"
+  end
+  if pad >= 0 then
+    local dest = view_insert_pos(v)
+    for k = 0, after - before - 1 do
+      if dest and dest + k < before + k then
+        move_raw(tr, before + k, dest + k)
+        M.pin_pad(tr, dest + k, pad)
+      else
+        M.pin_pad(tr, before + k, pad)
+      end
+    end
+  end
+  undo_end(mode == "replace" and "replace chain" or "add chain")
+  return true
+end
+
+--- Save one pad view's inserts as a chain. A pad container's children are
+-- lifted straight out of the container's block (they carry no pad pins).
+-- Flat v1 plugins go through a scratch track: pins TRAVEL in a chain file
+-- (both VST and JS, per the chunk probe), so they are copied there, given
+-- default 1/2 pins where no audio runs, saved, and the track deleted again.
+function M.view_chain_save(tr, pad, rel)
+  local v = M.view(tr, pad)
+  if not v then return M.chain_save(tr, rel) end
+  if #v.idx == 0 then return nil, "chain save: this pad has no inserts" end
+  if not rel or rel == "" then return nil, "chain save: no name given" end
+  if not rel:lower():find("%.rfxchain$") then rel = rel .. ".RfxChain" end
+  local keep = {}
+  if v.container >= 0 then
+    local blocks, err = fxchain_blocks(tr)
+    if not blocks then return nil, "chain save: " .. err end
+    local cguid = r.TrackFX_GetFXGUID(tr, v.container)
+    for _, b in ipairs(blocks) do
+      if b.guid == cguid then
+        -- inside the <CONTAINER ...> block: its own BYPASS-led entries, depth 1
+        local depth, inner, cur = 0, false, nil
+        for _, l in ipairs(b.text) do
+          if not inner then
+            if l:match("^<CONTAINER") then inner = true; depth = 1 end
+          else
+            if depth == 1 and l:match("^BYPASS ") then cur = {}; keep[#keep + 1] = cur end
+            if l:sub(1, 1) == "<" then depth = depth + 1 end
+            if l == ">" then depth = depth - 1; if depth == 0 then inner = false; cur = nil end end
+            if cur and depth >= 1 then cur[#cur + 1] = l end
+          end
+        end
+      end
+    end
+    for k, c in ipairs(keep) do keep[k] = table.concat(c, "\n") end
+  end
+  local flat = {}
+  for _, i in ipairs(v.idx) do if not is_enc(i) then flat[#flat + 1] = i end end
+  if #flat > 0 then
+    local n = r.CountTracks(0)
+    r.PreventUIRefresh(1)
+    r.InsertTrackAtIndex(n, false)
+    local tmp = r.GetTrack(0, n)
+    for k, i in ipairs(flat) do r.TrackFX_CopyToTrack(tr, i, tmp, k - 1, false) end
+    for k = 0, r.TrackFX_GetCount(tmp) - 1 do M.pin_stereo(tmp, k) end
+    local blocks = fxchain_blocks(tmp)
+    if blocks then for _, b in ipairs(blocks) do keep[#keep + 1] = table.concat(b.text, "\n") end end
+    r.DeleteTrack(tmp)
+    r.PreventUIRefresh(-1)
+  end
+  if #keep == 0 then return nil, "chain save: nothing to save" end
+  local path = M.chain_dir() .. SEP .. rel
+  local f = io.open(path, "wb")
+  if not f then return nil, "chain save: could not write " .. path end
+  f:write(table.concat(keep, "\n"), "\n")
   f:close()
   return true
 end

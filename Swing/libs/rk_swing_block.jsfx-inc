@@ -111,30 +111,147 @@ function swing_block_sync_fx_params()
 // Tempo-synced re-trigger of held pads, with swing. Global repeat
 // (repeat_div) overrides per-pad repeats (p_rpt_div[]). Persistent state
 // lives in rpt_counter / rpt_swing_phase / p_rpt_ctr[] / p_rpt_swph[].
+//
+// The counters are in SAMPLES but this runs once per block, so a step is only
+// ever noticed at a block boundary. Left there, a 1/64 roll at 2048 samples
+// jitters by up to 46 ms and the swing that is the whole point of the feature
+// is smeared into the buffer grid. Each fire therefore computes WHERE inside
+// the block it actually fell and hands that to launch_voices_for_pad_ofs,
+// which parks the voice pending for exactly that many samples -- the same
+// negative-v_pos mechanism sum mode already uses for layer looseness.
+//
+// The threshold is also recomputed per step rather than once per block: the
+// swing phase flips on every fire, so a hoisted threshold gave the 2nd and
+// later steps of a fast roll the previous step's swing.
+//
+// Mode=Stretch pads cannot take the offset at the trigger -- they go through the
+// Extension's audio_hook, which only services a trigger on its NEXT callback, so
+// their audio always turns up at a buffer boundary. They carry it on the consumer
+// side instead: launch_voices_for_pad_ofs parks stretch_hold[], and the @sample
+// ring reader burns it once there is audio to hold back. The Extension's own
+// round-trip latency stays, but it is constant, so the SPACING comes out exact.
+// ─── Repeat feel ────────────────────────────────────────────────────────
+// A roll that repeats the struck velocity forever is the mechanical part of a
+// note repeat. These three shape it, and every one is a no-op at its default,
+// so a roll with them down plays exactly what it always did.
+
+// One die per pad per repeat. A skipped hit thins the roll; nothing about the
+// schedule changes, so the groove keeps its shape instead of stalling.
+function swing_rpt_roll() (
+  rpt_prob >= 1 || rand(1) < rpt_prob;
+);
+
+// Pressure swell first -- that is what the player is doing right now -- then
+// humanise around the result. p_press is seeded from the strike at note-on, so
+// a controller that sends no aftertouch leaves this alone rather than
+// collapsing the roll to velocity 1.
+function swing_rpt_vel(_pad)
+local(v) (
+  v = p_held_vel[_pad];
+  rpt_press > 0 ? v = v + (p_press[_pad] - v) * rpt_press;
+  rpt_hum   > 0 ? v = v + (rand(2) - 1) * rpt_hum * v * 0.5;
+  max(1, min(127, floor(v + 0.5)));
+);
+
+// Where step `_n` of the repeat grid falls, in absolute samples from the project
+// start. Swing pushes every odd step late; the pair still spans two whole steps,
+// which is what keeps a swung roll in time overall. Parity comes from floor
+// rather than a modulo so a negative `_n` (count-in) behaves.
+function swing_rpt_step_pos(_n, _step, _sw) (
+  _n * _step + ((_n - 2 * floor(_n * 0.5)) ? _sw : 0);
+);
+
+// First grid step at or after `_pos`. Swing displacement is at most half a step,
+// so the true index is never more than two below the naive one.
+function swing_rpt_first_step(_pos, _step, _sw)
+local(_n, _guard) (
+  _n = floor(_pos / _step) - 2;
+  _guard = 0;
+  while(swing_rpt_step_pos(_n, _step, _sw) < _pos && _guard < 8) (
+    _n += 1; _guard += 1;
+  );
+  _n;
+);
+
+// Fire every held, playable pad `_ofs` samples into this block. `_mingap` is the
+// grid-entry guard in samples -- 0 in free mode, where the roll starts at the pad
+// hit and so cannot flam against it.
+function swing_rpt_fire_pads(_ofs, _mingap)
+local(i, blocked) (
+  i = 0; loop(NUM_PADS,
+    p_held[i] && !_blk_trig[i] && p_rpt_hold[i] >= _mingap ? (
+      blocked = p_mute[i] || (any_solo && !p_solo[i]) || !pad_is_playable(i) || s_skip[i];
+      !blocked && swing_rpt_roll() ? launch_voices_for_pad_ofs(i, p_held_note[i], swing_rpt_vel(i), 4, _ofs);
+    );
+    i += 1;
+  );
+);
+
 function swing_block_process_note_repeat()
-local(rpt_interval, rpt_threshold, _rpt_iters, i, blocked, _pp_interval, _pp_thr)
+local(rpt_interval, rpt_threshold, _rpt_iters, i, blocked, _pp_interval, _pp_thr,
+      _rpt_ofs, _ofs_max, _grid, _sw, _pos0, _pos1, _n, _sp)
 (
+  // Renderer treats v_pos <= -9999 as "not a pending voice", so an offset can
+  // never reach it. Real buffers are far below this.
+  _ofs_max = max(0, min(samplesblock - 1, 8192));
+
+  // How long each pad has been held, for the grid-entry guard. Block resolution
+  // is enough -- the guard is 30% of a step, not a timing decision.
+  i = 0; loop(NUM_PADS,
+    p_held[i] ? p_rpt_hold[i] += samplesblock : p_rpt_hold[i] = 0;
+    i += 1;
+  );
+
+  // Grid sync needs a running transport to have a grid at all. Stopped, or
+  // switched off, the roll free-runs from the pad hit exactly as it always did.
+  _grid = rpt_grid && (play_state & 1);
+  _grid ? (
+    _pos0 = beat_position * (60.0 / (tempo > 0 ? tempo : 120)) * srate;
+    _pos1 = _pos0 + samplesblock;
+  );
   // Global repeat overrides per-pad repeats
   repeat_div > 0 ? (
     repeat_div = max(0, min(15, repeat_div|0));
     rpt_interval = max(1, get_rpt_interval(repeat_div));
-    rpt_threshold = rpt_interval;
-    rpt_swing_phase ? rpt_threshold += swing_amt * rpt_interval * 0.5;
+    _grid ? (
+      // Step positions come off the project timeline, so the roll cannot drift
+      // and the swung step always lands in the same place in the bar -- unlike
+      // the free-running counter, whose swing phase depended on when you began.
+      _sw = swing_amt * rpt_interval * 0.5;
+      _n = swing_rpt_first_step(_pos0, rpt_interval, _sw);
+      _rpt_iters = 0;
+      while((_sp = swing_rpt_step_pos(_n, rpt_interval, _sw)) < _pos1 && _rpt_iters < 32) (
+        _rpt_iters += 1;
+        _rpt_ofs = max(0, min(_ofs_max, (_sp - _pos0)|0));
+        // Keep the free-run state aligned, so toggling grid off mid-roll (or a
+        // transport stop) does not invert the swing or land a short first step.
+        rpt_swing_phase = _n - 2 * floor(_n * 0.5);
+        rpt_counter = 0;
+        _n += 1;
+        swing_rpt_fire_pads(_rpt_ofs, rpt_interval * RPT_GRID_GRACE);
+      );
+    ) : (
     rpt_counter += samplesblock;
     _rpt_iters = 0;
+    rpt_threshold = rpt_interval + (rpt_swing_phase ? swing_amt * rpt_interval * 0.5 : 0);
     while(rpt_counter >= rpt_threshold && _rpt_iters < 32) (
       _rpt_iters += 1;
+      // rpt_counter is the elapsed count measured at the END of this block, so
+      // the step landed (rpt_counter - rpt_threshold) samples before that.
+      _rpt_ofs = max(0, min(_ofs_max, (samplesblock - (rpt_counter - rpt_threshold))|0));
       rpt_counter -= rpt_interval;
       rpt_swing_phase = !rpt_swing_phase;
+      rpt_threshold = rpt_interval + (rpt_swing_phase ? swing_amt * rpt_interval * 0.5 : 0);
       i = 0; loop(NUM_PADS,
         p_held[i] && !_blk_trig[i] ? (  // skip pads that JUST triggered this block
           blocked = p_mute[i] || (any_solo && !p_solo[i]) || !pad_is_playable(i) || s_skip[i];
-          !blocked ? launch_voices_for_pad(i, p_held_note[i], p_held_vel[i], 4);
+          !blocked && swing_rpt_roll() ? launch_voices_for_pad_ofs(i, p_held_note[i], swing_rpt_vel(i), 4, _rpt_ofs);
         );
         i += 1;
       );
     );
     _rpt_iters >= 32 ? rpt_counter = rpt_threshold - 1;
+    );  // end free-running branch
   );
 
   // Per-pad note repeat (only when global repeat is OFF)
@@ -143,18 +260,36 @@ local(rpt_interval, rpt_threshold, _rpt_iters, i, blocked, _pp_interval, _pp_thr
       p_rpt_div[i] > 0 && p_held[i] && !_blk_trig[i] ? (  // skip pads just triggered
         p_rpt_div[i] = max(0, min(15, p_rpt_div[i]|0));
         _pp_interval = max(1, get_rpt_interval(p_rpt_div[i]));
-        _pp_thr = _pp_interval;
-        p_rpt_swph[i] ? _pp_thr += swing_amt * _pp_interval * 0.5;
+        _grid ? (
+          _sw = swing_amt * _pp_interval * 0.5;
+          p_rpt_hold[i] >= _pp_interval * RPT_GRID_GRACE ? (
+            _n = swing_rpt_first_step(_pos0, _pp_interval, _sw);
+            _rpt_iters = 0;
+            while((_sp = swing_rpt_step_pos(_n, _pp_interval, _sw)) < _pos1 && _rpt_iters < 32) (
+              _rpt_iters += 1;
+              _rpt_ofs = max(0, min(_ofs_max, (_sp - _pos0)|0));
+              p_rpt_swph[i] = _n - 2 * floor(_n * 0.5);
+              p_rpt_ctr[i] = 0;
+              _n += 1;
+              blocked = p_mute[i] || (any_solo && !p_solo[i]) || !pad_is_playable(i) || s_skip[i];
+          !blocked && swing_rpt_roll() ? launch_voices_for_pad_ofs(i, p_held_note[i], swing_rpt_vel(i), 4, _rpt_ofs);
+            );
+          );
+        ) : (
         p_rpt_ctr[i] += samplesblock;
         _rpt_iters = 0;
+        _pp_thr = _pp_interval + (p_rpt_swph[i] ? swing_amt * _pp_interval * 0.5 : 0);
         while(p_rpt_ctr[i] >= _pp_thr && _rpt_iters < 32) (
           _rpt_iters += 1;
+          _rpt_ofs = max(0, min(_ofs_max, (samplesblock - (p_rpt_ctr[i] - _pp_thr))|0));
           p_rpt_ctr[i] -= _pp_interval;
           p_rpt_swph[i] = !p_rpt_swph[i];
+          _pp_thr = _pp_interval + (p_rpt_swph[i] ? swing_amt * _pp_interval * 0.5 : 0);
           blocked = p_mute[i] || (any_solo && !p_solo[i]) || !pad_is_playable(i) || s_skip[i];
-          !blocked ? launch_voices_for_pad(i, p_held_note[i], p_held_vel[i], 4);
+          !blocked && swing_rpt_roll() ? launch_voices_for_pad_ofs(i, p_held_note[i], swing_rpt_vel(i), 4, _rpt_ofs);
         );
         _rpt_iters >= 32 ? p_rpt_ctr[i] = _pp_thr - 1;
+        );  // end free-running branch
       ) : (
         // Reset counter when pad not held or repeat off
         p_rpt_ctr[i] = 0; p_rpt_swph[i] = 0;

@@ -27,6 +27,23 @@ function swing_panels_mix_bevel(_bx, _by, _bw, _bh) (
   gfx_rect(_bx, _by + _bh - 1, _bw, 1);
 );
 
+// House plugins the pad insert rows hide unless the console option SHOW EON
+// PLUGINS is on: the Drum Strip and the Macros relay the bridge puts on every
+// pad track. Matched by the hash the bridge publishes per slot (the shared
+// swing_fxcard_hash over the parsed display name: "EON Drum Strip" = 841833,
+// "EON Macros" = 394141) and, should a desc ever change, by the published
+// name prefix. They stay in the chain and in the picker's chain column.
+CI_HOUSE_H1 = 841833; CI_HOUSE_H2 = 394141;
+function swing_panels_ins_is_house(_q, _k) local(_h, _np) (
+  _h = _q[CI_HASH + _k];
+  _h == CI_HOUSE_H1 || _h == CI_HOUSE_H2 ? 1 : (
+    _np = _q + CI_NAME + _k * CI_NAMEW;
+    (_np[0] | 0) >= 9 && _np[1] == 69 && _np[2] == 79 && _np[3] == 78 && _np[4] == 32
+      && ((_np[5] == 68 && _np[6] == 114 && _np[7] == 117 && _np[8] == 109)         // "EON Drum"
+       || (_np[5] == 77 && _np[6] == 97 && _np[7] == 99 && _np[8] == 114)) ? 1 : 0;  // "EON Macr"
+  );
+);
+
 // ─── Console inserts: read the bridge's summary ───────────────────────────
 // Seqlock. Odd = the bridge is mid-write, so the frame is skipped entirely
 // rather than drawn from half a picture. The seq is re-read AFTER the copy:
@@ -63,6 +80,7 @@ function swing_panels_conins_read() local(_b, _s, _p, _q, _pad, _k, _hb) (
     // a header special case; making it a record means one copy loop, one
     // draw call and one decode, so none of them can drift from the others.
     _conins_maxn = 0;
+    _conins_padmax = 0;   // pads only (no master): does ANY pad hold an insert?
     _pad = 0;
     loop(CI_RECS,
       _p = _b + CI_HDR + _pad * CI_PREC;
@@ -89,7 +107,21 @@ function swing_panels_conins_read() local(_b, _s, _p, _q, _pad, _k, _hb) (
       // The FULLEST channel decides how many slots every strip draws --
       // per-strip counts would give per-strip heights, which is the one
       // thing the desk cannot have.
-      _q[CI_COUNT] > _conins_maxn ? _conins_maxn = _q[CI_COUNT];
+      // VISIBLE rows: the filled slots, minus the house plugins when the
+      // console hides them (pads only -- the master strip shows all). Rows
+      // map to REAL slots through CI_VIS, so every click, drag and menu
+      // still names the slot the bridge published.
+      _ci_vn = 0; _k = 0;
+      loop(CI_NSLOT,
+        _q[CI_SLOT + _k] >= 0 && !(!con_ins_house && _pad < 16 && swing_panels_ins_is_house(_q, _k)) ? (
+          _q[CI_VIS + _ci_vn] = _k; _ci_vn += 1;
+        );
+        _k += 1;
+      );
+      _k = _ci_vn; loop(CI_NSLOT - _ci_vn, _q[CI_VIS + _k] = -1; _k += 1; );
+      _q[CI_VISN] = _ci_vn;
+      _ci_vn > _conins_maxn ? _conins_maxn = _ci_vn;
+      _pad < 16 && _ci_vn > _conins_padmax ? _conins_padmax = _ci_vn;
       _pad += 1;
     );
     gmem[_b + CI_SEQ] == _s ? _conins_seq = _s;
@@ -128,6 +160,12 @@ function swing_panels_ins_aim(_pad, _slot, _filled) local(_b) (
   gmem[_b + FXP_TGT_PAD]  = _pad >= 16 ? -1 : _pad;
   gmem[_b + FXP_TGT_SLOT] = _slot;
   gmem[_b + FXP_TGT_SEQ]  = gmem[_b + FXP_TGT_SEQ] + 1;   // SEQ LAST
+  // STEREO with Wired OFF: an ADD on a pad is also the request to switch
+  // Wired on. The insert lands on Swing's own track pinned to the pad's pair
+  // either way (the bridge's pad view); Wired is what makes it audible.
+  // Consumed in Swing's @gfx as CMD 41 -- the raise function lives in a
+  // later import, so it cannot be called from here at compile time.
+  !_filled && _pad < 16 && (_conins_flags & 4) && (_conins_flags & 8) ? _ins_want_wired = 1;
   // ⭐ Tell the PICKER what a pick should mean, directly -- both live in this
   // same JSFX, so this needs no protocol and cannot arrive a frame late.
   // A FILLED slot is a SWAP of that slot; an EMPTY one is an INSERT, which
@@ -173,8 +211,10 @@ function swing_panels_ins_band(_pi, _bx, _by, _bw, _n, _sh, _full)
       // (con_ins_scroll) is GLOBAL — all sixteen strips scroll together,
       // because per-strip scroll would give per-strip rows, the one thing
       // the desk cannot have. Everything that names a slot uses _ks.
-      _ks = _k + con_ins_scroll;
-      _w = _ks < CI_NSLOT ? _q[CI_SLOT + _ks] : -1;
+      _ci_kr = _k + con_ins_scroll;                          // the visible ROW
+      _ci_vcnt = _q[CI_VISN] | 0;
+      _ks = _ci_kr < _ci_vcnt ? (_q[CI_VIS + _ci_kr] | 0) : -1;   // its REAL slot; -1 = an empty row
+      _w = _ks >= 0 ? _q[CI_SLOT + _ks] : -1;
       // Decode ONCE, here, so the tooltip, the menu and the paint below all
       // read the same answer. Each used to decode separately, which is how
       // two views of one slot start disagreeing.
@@ -202,8 +242,9 @@ function swing_panels_ins_band(_pi, _bx, _by, _bw, _n, _sh, _full)
           "Run the 'EON: FX Picker bridge' action.");
       _hov ? (
         _w < 0 ? (
-          swing_tooltip_check(1100 + _pi * 8 + _ks,
-            "Empty insert slot — click to add a plugin here.");
+          swing_tooltip_check(1100 + _pi * 8 + _ci_kr,
+            (_conins_flags & 8) ? "Empty insert slot — click to add a plugin on this pad. Wired switches on with it."
+                                : "Empty insert slot — click to add a plugin here.");
         ) : (
           // Name it. The bridge publishes a truncated display name per slot,
           // so the tooltip can say WHICH plugin rather than only what kind.
@@ -214,7 +255,7 @@ function swing_panels_ins_band(_pi, _bx, _by, _bw, _n, _sh, _full)
           _byp ? strcat(#_ins_tip, " — bypassed") :
                  strcat(#_ins_tip, "");
           strcat(#_ins_tip, ". Click to open · right-click for options.");
-          swing_tooltip_check(1100 + _pi * 8 + _ks, #_ins_tip);
+          swing_tooltip_check(1100 + _pi * 8 + _ci_kr, #_ins_tip);
         );
       );
       // ⭐ A FILLED slot FLOATS its plugin; an empty one opens the picker.
@@ -316,13 +357,23 @@ function swing_panels_ins_band(_pi, _bx, _by, _bw, _n, _sh, _full)
         // does not -- which also shows coverage at a glance: a flat block
         // means no art for that plugin.
         _ins_card = _q[CI_CARD + _ks];
-        _ins_card > 0 ? (
+        // ⚠️ >= 0, not > 0. -1 is the miss; 0 is a real card (the first record
+        // in the deck), and testing > 0 sent it to the fallback.
+        _ins_card >= 0 ? (
           gfx_a = _off ? 0.22 : (_byp ? 0.42 : 1);
           swing_fxcard_draw(_bx, _sy, _bw, _sh, _ins_card);
           gfx_a = 1;
         ) : (
-          swing_panels_ins_col(_cat, _off ? 0.20 : (_byp ? 0.35 : 0.92));
-          gfx_rect(_bx, _sy, _bw, _sh);
+          // ⭐ The SAME blank card the picker's list draws -- a category-
+          // coloured face plus the category glyph -- not a flat rectangle.
+          // The desk was the one place a plugin without art lost its card
+          // entirely and became a colour block, which is why the colour-coded
+          // ones stopped showing up here.
+          gfx_a = _off ? 0.20 : (_byp ? 0.35 : 1);
+          swing_fxview_blank_card(_bx, _sy, _bw, _sh,
+                                  swing_fxview_bucket_hex(_cat),
+                                  _q[CI_HASH + _ks], _cat);
+          gfx_a = 1;
         );
         gfx_set(0, 0, 0, 0.45);
         gfx_rect(_bx, _sy, _bw, 1); gfx_rect(_bx, _sy + _sh - 1, _bw, 1);
@@ -350,7 +401,7 @@ function swing_panels_ins_band(_pi, _bx, _by, _bw, _n, _sh, _full)
         // the chain owns. Must match the drop's own arithmetic exactly --
         // an outline that promises a different slot than the drop takes is
         // worse than no outline.
-        _ks == max(0, min(max(0, _cnt - 1),
+        _ci_kr == max(0, min(max(0, _ci_vcnt - 1),
                  (((my - _by) / (_sh + 2)) | 0) + con_ins_scroll)) ? (
           gfx_set(0.45, 0.80, 0.90, 0.95);
           gfx_rect(_bx, _sy, _bw, 1); gfx_rect(_bx, _sy + _sh - 1, _bw, 1);
@@ -1155,10 +1206,13 @@ function swing_panels_draw_mixer() (
         _insd_on ? (
           // Target from the pointer, clamped to slots the chain OWNS —
           // count is the band's own published record for this pad.
-          _insd_cnt = _conins_buf[_insd_pad * CIF_REC] | 0;
-          _insd_tgt = max(0, min(max(0, _insd_cnt - 1),
+          // Rows -> real slots through the record's visible map (house
+          // plugins may be hidden), clamped to rows the pad actually shows.
+          _insd_cnt = _conins_buf[_insd_pad * CIF_REC + CI_VISN] | 0;
+          _insd_row = max(0, min(max(0, _insd_cnt - 1),
                         (((my - _mix_ins_y) / (_mix_ins_sh + 2)) | 0)
                         + con_ins_scroll));
+          _insd_tgt = _insd_cnt > 0 ? (_conins_buf[_insd_pad * CIF_REC + CI_VIS + _insd_row] | 0) : _insd_slot;
           _insd_tgt != _insd_slot ? (
             swing_panels_ins_aim(_insd_pad, _insd_slot, 1);
             swing_fxview_act(FXA_MOVE, _insd_slot, _insd_tgt);
@@ -1613,7 +1667,7 @@ function swing_panels_draw_mixer() (
       // Post-fader estimate: under the console tie (strip_takeover) p_gain is
       // NOT in the internal audio path — the child fader carries it — so the
       // activity glow drops the factor there to stay honest.
-      _mix_meter = min(1.0, max(pad_meterL[_mix_i], pad_meterR[_mix_i]) * (strip_takeover ? 1.0 : p_gain[_mix_i]));
+      _mix_meter = min(1.0, max(pad_meterL[_mix_i], pad_meterR[_mix_i]) * (strip_tk[_mix_i] ? 1.0 : p_gain[_mix_i]));
       _mix_meter_fill = (_mix_meter * _mix_fh)|0;
       _mix_meter_fill > 0 && _mix_has_audio && _mix_g_meter ? (
         gfx_set(col_rgba[_cb], col_rgba[_cb+1], col_rgba[_cb+2], 0.95);
@@ -1866,10 +1920,34 @@ function swing_panels_draw_mixer() (
         ? "The FX Picker bridge is out of date — stop and restart that action."
         : (_conins_flags & 2)
         ? "Insert slots need the SWS extension."
-        : "Pads have no tracks of their own yet — build MULTI-OUT tracks to give them inserts.";
+        : "Pads have nowhere to put inserts yet — the FX Picker bridge could not map them.";
       gfx_measurestr(_mix_msg, tw, th);
       gfx_x = _lcd_cx + _mix_gut + ((_mix_wtot - tw) / 2)|0;
       gfx_y = _mix_ins_y + ((_mix_ins_h - th) / 2)|0;
+      gfx_drawstr(_mix_msg);
+    );
+
+    // ── Stereo: where the inserts live, said ONCE ─────────────────────────
+    // In stereo a pad's inserts are its WIRED slice of Swing's own track
+    // (bridge flag bit2). The strips are live either way; this line says
+    // what a click does, and turns amber when inserts exist but Wired is
+    // off (bit3) -- they are silent then, and a row of lit chips would
+    // claim otherwise.
+    _mix_g_ins && !_conins_stale && !_conins_oldfmt && (_conins_flags & 4) ? (
+      gfx_setfont(1, "Arial", 11, 'b');
+      (_conins_flags & 8) && _conins_padmax > 0 ? (
+        _mix_ink ? gfx_set(0.62, 0.42, 0.06, 0.95) : gfx_set(0.93, 0.68, 0.22, 0.95);
+        _mix_msg = "WIRED is off — these pad inserts are silent. Add a plugin, or OUT > Wired, to switch it on.";
+      ) : (_conins_flags & 8) ? (
+        _mix_ink ? swing_panels_console_ink(0.55) : gfx_set(0.55, 0.62, 0.68, 0.75);
+        _mix_msg = "Stereo — click a slot to put a plugin on that pad. Wired switches on by itself.";
+      ) : (
+        _mix_ink ? gfx_set(0.10, 0.45, 0.48, 0.90) : gfx_set(0.35, 0.80, 0.84, 0.75);
+        _mix_msg = "WIRED — pad inserts run on Swing's own track, above the Patchbay.";
+      );
+      gfx_measurestr(_mix_msg, tw, th);
+      gfx_x = _lcd_cx + _mix_gut + ((_mix_wtot - tw) / 2)|0;
+      gfx_y = _mix_ins_y + _mix_ins_h - th - 3;
       gfx_drawstr(_mix_msg);
     );
 
@@ -2015,7 +2093,7 @@ function swing_panels_console_opts_rect(_cx, _cy, _cw) (
   _copt_pw = 200;
   _copt_px = _cx + _cw - _copt_pw - 10;
   _copt_py = _cy + 20;
-  _copt_ph = 24 + 16 * 9 + (con_ins && con_ins_full ? 16 : 0)
+  _copt_ph = 24 + 16 * 9 + (con_ins && con_ins_full ? 32 : 0)
                 + 22 + 16 * 2 + 22 + 20 + 18 + 8;
 );
 
@@ -2069,6 +2147,12 @@ function swing_panels_console_opts(_cx, _cy, _cw)
         ( con_slots = _n; mark_dirty(); _ate = 1; );
       _i += 1;
     );
+    _y += 16;
+    // SHOW EON PLUGINS: the Drum Strip and the Macros relay the bridge puts
+    // on every pad track. Off by default: the rows are for what YOU added.
+    // Flipping it re-decodes the published records on the next frame.
+    swing_panels_copt_row(_px + 14, _y, _pw - 14, con_ins_house, "SHOW EON PLUGINS", 0) ?
+      ( con_ins_house = !con_ins_house; mark_dirty(); _conins_seq = -1; _ate = 1; );
     _y += 16;
   );
 
@@ -2171,7 +2255,7 @@ function swing_panels_pick_rect(_cx, _cy, _cw, _ch) (
 function swing_panels_pick_draw(_cx, _cy, _cw, _ch)
          local(_x, _y, _w, _h, _ate, _i, _ry, _rh, _n, _p, _hov, _len, _j,
                _vis, _card, _cx2, _cy2, _cw2, _crow, _more, _bp, _blen,
-               _bsel, _chh) (
+               _bsel, _chh, _mw, _mk_x, _mk_row) (
   swing_panels_pick_rect(_cx, _cy, _cw, _ch);
   _x = _cpk_x; _y = _cpk_y; _w = _cpk_w; _h = _cpk_h;
 
@@ -2326,6 +2410,13 @@ function swing_panels_pick_draw(_cx, _cy, _cw, _ch)
   // the width is what the plugin NAMES need.
   _cy2 = _y + 42; _cx2 = _x + 6; _crow = 0; _more = 0;   // 42: header + search row
   gfx_setfont(1, "Arial", 11, 'b');
+  // The "+N" overflow marker needs a seat of its own. It used to sit at a fixed
+  // _w - 30, which is UNDER whatever chip happens to end there -- on the shipped
+  // build "+23" showed as a lone "3" poking out past the last chip. Measured
+  // once, at the widest count it can show, and reserved on the last row only
+  // for a chip that still has successors; the final chip may run to the edge.
+  gfx_measurestr("+88", _mw, th);
+  _mk_x = _cx2; _mk_row = 0;
   _i = -1;
   loop(_fxv_bn + 1,
     // -1 is the ALL chip, which is "no bank" rather than a published row --
@@ -2347,6 +2438,7 @@ function swing_panels_pick_draw(_cx, _cy, _cw, _ch)
     // Wrap to a second row, then stop: two rows is the most this can spend
     // before it is taller than the list it filters.
     _cx2 + _cw2 > _x + _w - 6 ? ( _crow += 1; _cx2 = _x + 6; );
+    _crow == 1 && _i < _fxv_bn - 1 && _cx2 + _cw2 > _x + _w - 6 - _mw - 3 ? _crow = 2;
     _crow > 1 ? ( _more += 1; ) : (
       _ry = _cy2 + _crow * 17;
       _hov = mx >= _cx2 && mx <= _cx2 + _cw2 && my >= _ry && my <= _ry + 14;
@@ -2379,14 +2471,14 @@ function swing_panels_pick_draw(_cx, _cy, _cw, _ch)
         _ate = 1;
       );
       _cx2 += _cw2 + 3;
+      _mk_x = _cx2; _mk_row = _crow;   // where "+N" goes: right after the last chip drawn
     );
     _i += 1;
   );
-  // No silent truncation: say how many did not fit.
+  // No silent truncation: say how many did not fit -- in the seat reserved above.
   _more > 0 ? (
-    gfx_setfont(1, "Arial", 10, 0);
     gfx_set(0.55, 0.60, 0.66, 0.8);
-    gfx_x = _x + _w - 30; gfx_y = _cy2 + 20;
+    gfx_x = _mk_x; gfx_y = _cy2 + _mk_row * 17 + 2;
     gfx_drawstr("+"); gfx_drawnumber(_more, 0);
   );
 
@@ -2422,7 +2514,7 @@ function swing_panels_pick_draw(_cx, _cy, _cw, _ch)
       swing_tooltip_check(1240 + _i, #_cpk_tip);
     );
     _card = _p[FXP_R_CARD];
-    _card > 0 ? swing_fxcard_draw(_x + 6, _ry + 3, 40, 23, _card)
+    _card >= 0 ? swing_fxcard_draw(_x + 6, _ry + 3, 40, 23, _card)
               : swing_fxview_blank_card(_x + 6, _ry + 3, 40, 23,
                   swing_fxview_bucket_hex(_p[FXP_R_BUCKET] | 0),
                   _p[FXP_R_RIDX], _p[FXP_R_BUCKET] | 0);

@@ -1,0 +1,152 @@
+desc:EON Macros
+//tags: EON ReaKit swing macro relay link
+options:gfx_hz=30 gfx_idle no_meter gmem=Swing_Media_Transfer
+// EON Studios — EON Macros
+// Swing's eight macros as parameters on THIS track. REAPER's parameter links
+// only join plugins on the same track, so a plugin on a Multi-Out pad track
+// cannot follow Swing's macro directly; this relay can. It follows the Swing
+// whose instance id the bridge baked in (Link Instance) over the master-link
+// record Swing publishes every block, and re-announces each macro to the host
+// when it moves (sliderchange), which is what a parameter link listens for.
+// Link "Macro 3 -> ReaComp threshold" on the pad track, from Swing's macro
+// editor (LEARN) or from REAPER's own parameter-modulation dialog, and the
+// macro drives it: one block behind Swing, automation-safe, no polling.
+//
+// No audio processing: samples pass straight through (no @sample).
+
+slider1:mc1=0<0,1,0.001>Macro 1
+slider2:mc2=0<0,1,0.001>Macro 2
+slider3:mc3=0<0,1,0.001>Macro 3
+slider4:mc4=0<0,1,0.001>Macro 4
+slider5:mc5=0<0,1,0.001>Macro 5
+slider6:mc6=0<0,1,0.001>Macro 6
+slider7:mc7=0<0,1,0.001>Macro 7
+slider8:mc8=0<0,1,0.001>Macro 8
+slider9:mc_link_inst=0<0,99999999,1>-Link Instance (internal; the Swing instance id to follow, bridge-set; 0 = free knobs)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+
+gfx_ext_retina == 0 ? gfx_ext_retina = 1;
+gfx_ext_flags |= 0x100 | 0x400;   // embed support; no MCP hover tooltip
+
+// The instance registry and the master-link band (canonical map:
+// .refs/swing_gmem_bridge_protocol.md, .refs/gmem_regions_supplement.tsv).
+MC_REG_BASE    = 2556;
+MC_REG_STRIDE  = 4;
+MC_REG_MAX     = 16;
+MC_LINK_BASE   = 26005248;   // EON_MASTER_LINK, slot * 32
+MC_LINK_STRIDE = 32;
+MC_LINK_HB     = 0;          // Swing's block counter, written LAST
+MC_LINK_MACRO  = 5;          // +5..+12 = macro 1..8
+MC_STALL_MAX   = 8;
+
+_mc_hb_prev = -1;
+_mc_stall   = MC_STALL_MAX;
+mc_linked   = 0;
+
+@block
+
+mc_linked = 0;
+mc_link_inst > 0 ? (
+  _mc_slot = -1;
+  _mc_s = 0;
+  loop(MC_REG_MAX,
+    (_mc_slot < 0 && (gmem[MC_REG_BASE + _mc_s * MC_REG_STRIDE] | 0) == (mc_link_inst | 0)) ? _mc_slot = _mc_s;
+    _mc_s += 1;
+  );
+  _mc_slot >= 0 ? (
+    _mc_b = MC_LINK_BASE + _mc_slot * MC_LINK_STRIDE;
+    _mc_hb = gmem[_mc_b + MC_LINK_HB];
+    _mc_hb != _mc_hb_prev ? ( _mc_hb_prev = _mc_hb; _mc_stall = 0; ) : ( _mc_stall += 1; );
+    _mc_stall < MC_STALL_MAX ? (
+      mc_linked = 1;
+      // Adopt, and TELL THE HOST which sliders moved: a parameter link follows
+      // the value REAPER sees, and sliderchange is how a JSFX announces one.
+      _mc_mask = 0;
+      _mc_v = max(0, min(1, gmem[_mc_b + MC_LINK_MACRO + 0])); _mc_v != mc1 ? ( mc1 = _mc_v; _mc_mask |= 1; );
+      _mc_v = max(0, min(1, gmem[_mc_b + MC_LINK_MACRO + 1])); _mc_v != mc2 ? ( mc2 = _mc_v; _mc_mask |= 2; );
+      _mc_v = max(0, min(1, gmem[_mc_b + MC_LINK_MACRO + 2])); _mc_v != mc3 ? ( mc3 = _mc_v; _mc_mask |= 4; );
+      _mc_v = max(0, min(1, gmem[_mc_b + MC_LINK_MACRO + 3])); _mc_v != mc4 ? ( mc4 = _mc_v; _mc_mask |= 8; );
+      _mc_v = max(0, min(1, gmem[_mc_b + MC_LINK_MACRO + 4])); _mc_v != mc5 ? ( mc5 = _mc_v; _mc_mask |= 16; );
+      _mc_v = max(0, min(1, gmem[_mc_b + MC_LINK_MACRO + 5])); _mc_v != mc6 ? ( mc6 = _mc_v; _mc_mask |= 32; );
+      _mc_v = max(0, min(1, gmem[_mc_b + MC_LINK_MACRO + 6])); _mc_v != mc7 ? ( mc7 = _mc_v; _mc_mask |= 64; );
+      _mc_v = max(0, min(1, gmem[_mc_b + MC_LINK_MACRO + 7])); _mc_v != mc8 ? ( mc8 = _mc_v; _mc_mask |= 128; );
+      _mc_mask ? sliderchange(_mc_mask);
+    );
+  );
+);
+
+@gfx 300 150
+
+micro = gfx_ext_flags & 1;
+ret = max(1, gfx_ext_retina);
+W = gfx_w; H = gfx_h;
+sc = micro ? ret : max(0.6, min(W / 300, H / 150));
+// No control here takes a click: linked knobs are Swing's, free knobs are
+// the host's sliders. The embed always passes the mouse through.
+gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
+micro ? gfx_ext_flags |= 0x200;
+
+gfx_set(0.13, 0.14, 0.16, 1);
+gfx_rect(0, 0, W, H);
+
+function mc_val(i) ( i == 0 ? mc1 : i == 1 ? mc2 : i == 2 ? mc3 : i == 3 ? mc4 : i == 4 ? mc5 : i == 5 ? mc6 : i == 6 ? mc7 : mc8; );
+
+function mc_bar(x, y, w, h, i) local(v) (
+  v = mc_val(i);
+  gfx_set(0.09, 0.10, 0.12, 1);
+  gfx_rect(x, y, w, h);
+  mc_linked ? gfx_set(0.35, 0.80, 0.84, 0.95) : gfx_set(0.62, 0.66, 0.72, 0.9);
+  gfx_rect(x, y + h - v * h, w, v * h);
+);
+
+micro ? (
+  _mc_gap = 2 * ret;
+  _mc_bw = (W - _mc_gap * 9) / 8;
+  _mc_i = 0;
+  loop(8,
+    mc_bar(_mc_gap + _mc_i * (_mc_bw + _mc_gap), _mc_gap, _mc_bw, H - 2 * _mc_gap, _mc_i);
+    _mc_i += 1;
+  );
+) : (
+  gfx_setfont(1, "Arial", max(10, floor(14 * sc)), 'b');
+  gfx_set(0.90, 0.91, 0.94, 1);
+  gfx_x = 14 * sc; gfx_y = 10 * sc; gfx_drawstr("EON MACROS");
+  gfx_setfont(1, "Arial", max(8, floor(10 * sc)), 0);
+  gfx_set(0.52, 0.56, 0.62, 1);
+  gfx_x = 118 * sc; gfx_y = 13 * sc; gfx_drawstr("Swing's macros on this track, for parameter links");
+  mc_linked ? gfx_set(0.35, 0.80, 0.84, 1) : (mc_link_inst > 0 ? gfx_set(0.85, 0.55, 0.15, 1) : gfx_set(0.40, 0.42, 0.46, 1));
+  gfx_circle(W - 14 * sc, 16 * sc, 4 * sc, 1, 1);
+
+  _mc_lx = 14 * sc; _mc_ly = 40 * sc;
+  _mc_lw = (W - 28 * sc) / 8; _mc_lh = 64 * sc;
+  gfx_setfont(1, "Arial", max(8, floor(9 * sc)), 'b');
+  _mc_i = 0;
+  loop(8,
+    _mc_x = _mc_lx + _mc_i * _mc_lw;
+    mc_bar(_mc_x + 4 * sc, _mc_ly, _mc_lw - 8 * sc, _mc_lh, _mc_i);
+    gfx_set(0.62, 0.66, 0.72, 0.9);
+    sprintf(#_mc_s, "M%d", _mc_i + 1);
+    gfx_measurestr(#_mc_s, tw, th);
+    gfx_x = _mc_x + (_mc_lw - tw) / 2; gfx_y = _mc_ly + _mc_lh + 4 * sc;
+    gfx_drawstr(#_mc_s);
+    sprintf(#_mc_s, "%d", floor(mc_val(_mc_i) * 100 + 0.5));
+    gfx_measurestr(#_mc_s, tw, th);
+    gfx_set(0.72, 0.75, 0.80, 0.8);
+    gfx_x = _mc_x + (_mc_lw - tw) / 2; gfx_y = _mc_ly + _mc_lh + 16 * sc;
+    gfx_drawstr(#_mc_s);
+    _mc_i += 1;
+  );
+
+  gfx_setfont(1, "Arial", max(8, floor(9 * sc)), 0);
+  gfx_set(0.42, 0.46, 0.53, 0.9);
+  gfx_x = 14 * sc; gfx_y = H - 16 * sc;
+  gfx_drawstr(mc_linked ? "Following Swing. Link a plugin's parameter to one of these (Swing's macro editor: LEARN)."
+            : (mc_link_inst > 0 ? "Swing not answering -- is it loaded and running?"
+                                : "Not linked to a Swing: the sliders are free knobs."));
+);

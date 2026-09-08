@@ -74,6 +74,38 @@ local(_p) (
 // Build the global RPT popup, feel-first: OFF, then all straights (blue), all
 // triplets (green), all dotted (amber) — five speeds each. '||' separates the
 // groups; the current division gets the '> ' marker.
+// The note-repeat feel controls, as menu rows rather than knobs: the PLAY row
+// has no space for four more, and they are set-and-forget rather than performed.
+// _rpt_feel_which records which row opened the ladder.
+//   0 = swing   1 = probability   2 = humanise   3 = pressure
+function swing_panels_feel_val(_w) (
+  _w == 0 ? swing_amt : _w == 1 ? rpt_prob : _w == 2 ? rpt_hum : rpt_press;
+);
+function swing_panels_feel_set(_w, _v) (
+  _w == 0 ? swing_amt = _v : _w == 1 ? rpt_prob = _v : _w == 2 ? rpt_hum = _v : rpt_press = _v;
+);
+// One ladder for all four -- every one of them reads as a percentage, so a
+// shared list is less to learn than four bespoke ones.
+function swing_panels_feel_pct(_p) (
+  _p ==  1 ? 0   : _p ==  2 ? 10  : _p ==  3 ? 20  : _p ==  4 ? 25  :
+  _p ==  5 ? 33  : _p ==  6 ? 40  : _p ==  7 ? 50  : _p ==  8 ? 60  :
+  _p ==  9 ? 67  : _p == 10 ? 75  : _p == 11 ? 90  : 100;
+);
+function swing_panels_build_feel_menu()
+local(_i, _cur, _pv) (
+  strcpy(#_feel_menu, "");
+  _cur = floor(swing_panels_feel_val(_rpt_feel_which) * 100 + 0.5);
+  _i = 1;
+  loop(12,
+    _i > 1 ? strcat(#_feel_menu, "|");
+    _pv = swing_panels_feel_pct(_i);
+    strcat(#_feel_menu, _cur == _pv ? "^b > " : "^b   ");
+    sprintf(#_feel_row, "%d%%", _pv);
+    strcat(#_feel_menu, #_feel_row);
+    _i += 1;
+  );
+);
+
 function swing_panels_build_rpt_menu()
 local(_g, _rd, _bn)
 (
@@ -107,6 +139,21 @@ local(_g, _rd, _bn)
     strcat(#_rpt_menu, " D");
     _g += 1;
   );
+  // Position 17, appended so every existing index still maps through
+  // swing_panels_rpt_pos2div untouched. The click handler intercepts it.
+  strcat(#_rpt_menu, "||");
+  strcat(#_rpt_menu, rpt_grid ? "^b > GRID SYNC" : "^b   GRID SYNC");
+  // Positions 18-21. Appended for the same reason GRID SYNC was: every existing
+  // index keeps mapping through swing_panels_rpt_pos2div untouched.
+  _g = 0;
+  loop(4,
+    _bn = _g == 0 ? "SWING" : _g == 1 ? "PROBABILITY" : _g == 2 ? "HUMANIZE" : "PRESSURE";
+    strcat(#_rpt_menu, _g == 0 ? "||" : "|");
+    strcat(#_rpt_menu, swing_panels_feel_val(_g) > 0 ? "^a   " : "^g   ");
+    sprintf(#_rpt_row, "%s  %d%%", _bn, floor(swing_panels_feel_val(_g) * 100 + 0.5));
+    strcat(#_rpt_menu, #_rpt_row);
+    _g += 1;
+  );
 );
 
 // Multi-out build PREP — flip to MULTI routing, auto-assign one channel per
@@ -114,6 +161,25 @@ local(_g, _rd, _bn)
 // (do_build_multiout reads these before creating the destination tracks).
 // Shared by the STEREO/MULTI right-click builder and the MATRIX build menu so
 // the gmem publish format stays in lockstep. Caller sets KIT_GMEM_CMD after.
+// Raise a routing command for the BRIDGE from Swing's own window -- Wired on/off
+// (41), the Wired tap point (42), Wired -> Multi-Out (43), Multi-Out -> Wired
+// (44). Same gate as the multi-out builder: bridge alive, lock free or ours,
+// lock taken so the bridge routes to THIS instance. Deliberately NO kit_busy /
+// kit_import_state: those latch until a 99/98 terminal, which only the build
+// sends, and 41/42/44 end at CMD 0 -- a latched busy would freeze the window.
+function swing_panels_raise_bridge_cmd(_cmd) (
+  gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+    gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id ? (
+      gmem[KIT_GMEM_LOCK] = instance_id;
+      gmem[KIT_GMEM_CMD] = _cmd;
+    ) : (
+      kit_bridge_warn = 2;   // bridge busy with another instance
+    );
+  ) : (
+    kit_bridge_warn = 1;     // no bridge running
+  );
+);
+
 function swing_panels_multiout_prep()
 local(_ki, _cj, _cn, _cnl, gi)  // localized 2026-07-09: these globals raced the @block kit-import loop (phantom-pad-16 pad-0 poison)
 (
@@ -590,7 +656,14 @@ function swing_panels_draw_controls() (
   // STEREO / MULTI toggle button — hidden when color panel open
   _btn2_y = _btn1_y;
   !col_panel_open ? (
-  multi_out ? gfx_set(btn_blue_r, btn_blue_g, btn_blue_b, 0.9) : gfx_set(btn_red_r, btn_red_g, btn_red_b, 0.9);
+  // Wired paints its own colour: teal when the Patchbay is answering, amber
+  // when the switch is on but the loopback is dead (Patchbay missing or moved
+  // above the inserts) -- the one failure a user cannot otherwise see.
+  patch_on ? (
+    patch_live ? gfx_set(0.16, 0.60, 0.64, 0.9) : gfx_set(0.85, 0.55, 0.15, 0.9);
+  ) : (
+    multi_out ? gfx_set(btn_blue_r, btn_blue_g, btn_blue_b, 0.9) : gfx_set(btn_red_r, btn_red_g, btn_red_b, 0.9);
+  );
   gfx_rect(_btn2_x, _btn2_y, _btn_w, _btn_h);
   gfx_set(pad_well_r, pad_well_g, pad_well_b, 1);
   gfx_rect(_btn2_x, _btn2_y, _btn_corner, 1); gfx_rect(_btn2_x, _btn2_y, 1, _btn_corner);
@@ -606,17 +679,27 @@ function swing_panels_draw_controls() (
   gfx_rect(_btn2_x + 1, _btn2_y + 1, _btn_w - 2, 1);
   gfx_setfont(1, "Arial", 8, 'b');
   gfx_set(1, 1, 1, 1);
+  patch_on ? strcpy(#_mo_lbl, patch_live ? "WIRED" : "WIRED?") :
   multi_out ? strcpy(#_mo_lbl, "MULTI") : strcpy(#_mo_lbl, "STEREO");
   gfx_measurestr(#_mo_lbl, tw, th);
   gfx_x = _btn2_x + (_btn_w - tw) / 2; gfx_y = _btn2_y + (_btn_h - th) / 2; gfx_drawstr(#_mo_lbl);
   _in_multi = mx >= _btn2_x && mx <= _btn2_x+_btn_w && my >= _btn2_y && my <= _btn2_y+_btn_h;
-  _in_multi ? swing_tooltip_check(14, "Toggle output routing. STEREO = all pads to channels 1-2; MULTI = each pad to its own stereo pair (1-2, 3-4, ... 31-32) for per-pad track mixing. Use the MULTI builder via LOAD right-click to create child tracks.");
+  _in_multi ? (
+    patch_on && !patch_live ?
+      swing_tooltip_check(1421, "WIRED, but the EON Patchbay is not answering: it must be LAST in this track's FX chain and enabled. Until it is, pads sum inside Swing as in STEREO.") :
+    patch_on ?
+      swing_tooltip_check(1422, "WIRED: each pad leaves on its own channel pair (3-4, 5-6 ...), through whatever you put there, and the EON Patchbay brings it back ahead of the master bus. Left-click switches Wired off. Right-click: tap point and conversions.") :
+      swing_tooltip_check(14, "Toggle output routing. STEREO = all pads to channels 1-2; MULTI = each pad to its own stereo pair (1-2, 3-4, ... 31-32) for per-pad track mixing. Right-click for WIRED (your plugins on pads, one track) and the multi-out builder.");
+  );
   // Shift+click opens the full-size OUTPUTS routing matrix over the pad grid.
   _in_multi && lmb_down && SHIFT ? (
     swing_bigview_open(VIEW_OUTPUTS);
   );
   // Left-click: toggle — immediately enforce outputs on all pads
-  _in_multi && lmb_down && !SHIFT ? (
+  _in_multi && lmb_down && !SHIFT && patch_on ? (
+    swing_panels_raise_bridge_cmd(41);
+  );
+  _in_multi && lmb_down && !SHIFT && !patch_on ? (
     multi_out = !multi_out;
     multi_out ? (
       // Switching to MULTI: auto-assign 1 per pad
@@ -628,11 +711,14 @@ function swing_panels_draw_controls() (
     mark_dirty_kit();
   );
   // Right-click: output & routing options (migrated to Swing popup).
-  // Indices: 1=Auto Assign, 2=Reset All, 3=Build Multi-Out (separator '||'
-  // between Reset and Build is NOT counted in result).
+  // Indices: 1=Auto Assign, 2=Reset All, 3=Build Multi-Out, 4=Wired on/off,
+  // 5=Wired tap point, 6=Wired -> Multi-Out, 7=Multi-Out -> Wired (the '||'
+  // separators are NOT counted in the result).
   _in_multi && rmb_down ? (
     swing_popup_open(mx, my,
-      "Auto Assign (1 per pad)|Reset All to Out 1||Build Multi-Out Tracks",
+      patch_on
+        ? "Auto Assign (1 per pad)|Reset All to Out 1||Build Multi-Out Tracks||Wired: switch OFF|Wired tap: channel / bus|Wired -> Multi-Out|Multi-Out -> Wired"
+        : "Auto Assign (1 per pad)|Reset All to Out 1||Build Multi-Out Tracks||Wired: switch ON|Wired tap: channel / bus|Wired -> Multi-Out|Multi-Out -> Wired",
       SP_POPUP_CALLER_MULTIOUT);
   );
   swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_MULTIOUT ? (
@@ -663,6 +749,12 @@ function swing_panels_draw_controls() (
         kit_bridge_warn = 1;
       );
     );
+    // Wired lives in the bridge: these just raise the command and let the
+    // bridge build, pin, and flip the switch. The face follows patch_on.
+    resp == 4 ? swing_panels_raise_bridge_cmd(41);
+    resp == 5 ? swing_panels_raise_bridge_cmd(42);
+    resp == 6 ? swing_panels_raise_bridge_cmd(43);
+    resp == 7 ? swing_panels_raise_bridge_cmd(44);
   );
   swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_MULTIOUT ? (
     swing_popup_result = 0;
@@ -1112,11 +1204,12 @@ function swing_panels_draw_controls() (
   gfx_set(1, 1, 1, 1);
   repeat_div == 0 ? strcpy(#_rpt_lbl, "RPT OFF") : (
     get_rpt_div_name(repeat_div); strcpy(#_rpt_lbl, #_rpt_name);
+    rpt_grid ? strcat(#_rpt_lbl, " G");   // locked to the project grid
   );
   gfx_measurestr(#_rpt_lbl, tw, th);
   gfx_x = _btn1_x + (_btn_w - tw) / 2; gfx_y = _btn5_y + (_btn_h - th) / 2; gfx_drawstr(#_rpt_lbl);
   _in_rpt = mx >= _btn1_x && mx <= _btn1_x+_btn_w && my >= _btn5_y && my <= _btn5_y+_btn_h;
-  _in_rpt ? swing_tooltip_check(1, "Repeat division for held notes — left-click cycles OFF/1/4/1/8/1/16/1/32/1/64; right-click for full menu (straight/triplet/dotted)");
+  _in_rpt ? swing_tooltip_check(1, "Repeat division for held notes — left-click cycles OFF/1/4/1/8/1/16/1/32/1/64; right-click for full menu (straight/triplet/dotted), GRID SYNC, which locks the roll to the project grid instead of starting it at your hit (shown as a G on the button), and the feel rows — SWING, PROBABILITY, HUMANIZE, PRESSURE");
   // Left-click: cycle straight divisions (OFF→1/4→1/8→1/16→1/32→1/64→OFF)
   _in_rpt && lmb_down ? (
     repeat_div == 0  ? repeat_div = 1  :  // OFF → 1/4
@@ -1136,9 +1229,29 @@ function swing_panels_draw_controls() (
     swing_popup_open(mx, my, #_rpt_menu, SP_POPUP_CALLER_RPT_DIV);
   );
   swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_RPT_DIV ? (
-    repeat_div = swing_panels_rpt_pos2div(swing_popup_result);  // feel-first menu order -> enum
+    swing_popup_result == 17 ? (
+      rpt_grid = !rpt_grid;     // trailing GRID SYNC toggle, not a division
+      swing_popup_result = 0;
+      rpt_counter = 0; mark_dirty_kit();
+    ) : swing_popup_result >= 18 && swing_popup_result <= 21 ? (
+      // A feel row: hand straight on to the shared percentage ladder.
+      _rpt_feel_which = swing_popup_result - 18;
+      swing_popup_result = 0;
+      swing_panels_build_feel_menu();
+      swing_popup_open(mx, my, #_feel_menu, SP_POPUP_CALLER_RPT_FEEL);
+    ) : (
+      repeat_div = swing_panels_rpt_pos2div(swing_popup_result);  // feel-first menu order -> enum
+      swing_popup_result = 0;
+      rpt_counter = 0; mark_dirty_kit();
+    );
+  );
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_RPT_FEEL ? (
+    swing_panels_feel_set(_rpt_feel_which, swing_panels_feel_pct(swing_popup_result) * 0.01);
     swing_popup_result = 0;
-    rpt_counter = 0; mark_dirty_kit();
+    mark_dirty_kit();
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_RPT_FEEL ? (
+    swing_popup_result = 0;
   );
   swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_RPT_DIV ? (
     swing_popup_result = 0;

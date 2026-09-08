@@ -641,14 +641,35 @@ local ci_tgt, ci_tgt_seq, ci_pads = {}, {}, {}
 local TGT_PIN = 54
 local ci_pin = {}
 
+-- A pad's name as Swing publishes it (INST_PADNAME: slot*512 + pad*32 chars,
+-- 0-terminated). "" when Swing has published nothing for that pad. Read here,
+-- above publish_chain, for the same compile-time reason as ci_tgt below.
+local PN_BASE, PN_STRIDE, PN_LEN = 26010000, 512, 32
+local function ci_pad_name(slot, pad)
+  local b = PN_BASE + slot * PN_STRIDE + pad * PN_LEN
+  local t = {}
+  for i = 0, PN_LEN - 1 do
+    local c = math.floor(reaper.gmem_read(b + i) or 0)
+    if c <= 0 then break end
+    if c < 32 or c > 126 then c = 63 end
+    t[#t + 1] = string.char(c)
+  end
+  return table.concat(t)
+end
+
 -- ⭐ ONE resolver, so drawing and acting can never aim at different tracks.
 -- ci_tgt still wins: aiming at a console slot is an EXPLICIT choice and a pin
 -- must not out-rank the thing the user just clicked. The pin only displaces
 -- the last-touched fallback, which is the drift it exists to stop.
 local function resolve_target(slot)
-  local tr = ci_tgt[slot] or ci_pin[slot] or reaper.GetLastTouchedTrack()
+  -- A target is { tr = MediaTrack, pad = nil | 0..15 | -1 }: nil = the whole
+  -- track; a pad = that pad's Wired slice of Swing's own track (fx.view);
+  -- -1 = the master slice of it. The last-touched fallback is a whole track.
+  local t = ci_tgt[slot] or ci_pin[slot]
+  local tr, pad
+  if t then tr, pad = t.tr, t.pad else tr = reaper.GetLastTouchedTrack() end
   if tr and not reaper.ValidatePtr2(0, tr, "MediaTrack*") then return nil end
-  return tr
+  return tr, pad
 end
 
 -- ⚠️ A FROZEN track's FX chain is not editable in any meaningful sense --
@@ -669,8 +690,15 @@ end
 local function do_action(slot, verb, a, bnum)
   -- ⚠️ THE SAME RESOLVER THE PUBLISH USES. Acting on a different track than
   -- the one on screen is not a wrong result, it is an invisible one.
-  local tr = resolve_target(slot)
+  local tr, pad = resolve_target(slot)
   if not tr then return end
+  -- A PAD VIEW (Wired, stereo): the target is one pad's slice of Swing's own
+  -- track and every index the face sends is a slot IN THAT SLICE. Map it to
+  -- the chain index here, once, so no verb below can reach the wrong plugin.
+  -- (pad == -1 is the master slice; nil is a whole track, unmapped.)
+  local v = (pad ~= nil) and fx.view(tr, pad) or nil
+  local ai = a
+  if v and a >= 0 then ai = v.idx[a + 1] or -1 end
   -- FLOAT and EMBED only LOOK at a plugin, so they stay allowed on a frozen
   -- track. Everything else CHANGES the chain and is refused: the edit would
   -- not be what you hear, and would vanish on unfreeze.
@@ -681,24 +709,24 @@ local function do_action(slot, verb, a, bnum)
     return
   end
   if verb == A_FLOAT then
+    if ai < 0 then return end
     -- ⭐ TOGGLE, not just open. Clicking the same plugin again closes its
     -- window, which is what a click on an already-open thing means -- and
     -- without it there is no way to dismiss the float from the face at all.
-    --
-    -- GetFloatingWindow is the precise question ("is it floating RIGHT NOW"),
-    -- and it is the one that matters: TrackFX_GetOpen also returns true for an
-    -- FX merely selected in the chain window, so toggling on that would refuse
-    -- to open a float for a plugin whose chain window happens to be up.
+    -- GetFloatingWindow is the precise question ("is it floating RIGHT NOW");
+    -- TrackFX_GetOpen also answers true for an FX merely selected in the
+    -- chain window.
     local open = false
     if reaper.TrackFX_GetFloatingWindow then
-      open = reaper.TrackFX_GetFloatingWindow(tr, a) ~= nil
+      open = reaper.TrackFX_GetFloatingWindow(tr, ai) ~= nil
     elseif reaper.TrackFX_GetOpen then
-      open = reaper.TrackFX_GetOpen(tr, a)
+      open = reaper.TrackFX_GetOpen(tr, ai)
     end
-    reaper.TrackFX_Show(tr, a, open and 2 or 3)   -- 2 = hide float, 3 = show
+    reaper.TrackFX_Show(tr, ai, open and 2 or 3)   -- 2 = hide float, 3 = show
     return
   elseif verb == A_EMBED_TCP or verb == A_EMBED_MCP then
-    embed_fx(tr, a, verb == A_EMBED_TCP)
+    if ai < 0 then return end
+    embed_fx(tr, ai, verb == A_EMBED_TCP)
     return
   elseif verb == A_CHAIN_APPLY or verb == A_CHAIN_SAVE then
     local row = view[a + 1]
@@ -707,35 +735,43 @@ local function do_action(slot, verb, a, bnum)
       -- send this for a folder row; refusing again here means a stray
       -- action from anywhere cannot wipe a chain with a directory name.
       if row and row.kindix == K_CHAIN then
-        fx.chain_apply(tr, row.rel, "replace")
+        if v then fx.view_chain_apply(tr, pad, row.rel, "replace", pad >= 0 and ci_pad_name(slot, pad) or nil)
+        else fx.chain_apply(tr, row.rel, "replace") end
         ch_fp[slot] = nil          -- the chain definitely moved
       end
     else
       -- SAVE writes the target's CURRENT chain into the folder being
-      -- browsed, so "save here" means the folder you are looking at.
-      fx.chain_save(tr, ch_rel[slot] or "")
+      -- browsed, so "save here" means the folder you are looking at. A pad
+      -- view saves just that pad's slice, with the pad pins stripped.
+      if v then fx.view_chain_save(tr, pad, ch_rel[slot] or "")
+      else fx.chain_save(tr, ch_rel[slot] or "") end
     end
     return
   elseif verb == A_OFFLINE then
+    if ai < 0 then return end
     -- The picker engine reads offline but has never written it; one call
     -- rather than a new engine function, since nothing else needs it yet.
     local ch = fx.chain(tr)
-    local e = ch[a + 1]
+    local e = ch[ai + 1]
     if e and reaper.TrackFX_SetOffline then
-      reaper.TrackFX_SetOffline(tr, a, not e.offline)
+      reaper.TrackFX_SetOffline(tr, ai, not e.offline)
     end
     return
   end
   if verb == A_ENABLE then
+    if ai < 0 then return end
     local ch = fx.chain(tr)
-    local e = ch[a + 1]
-    if e then fx.set_enabled(tr, a, not e.enabled) end
+    local e = ch[ai + 1]
+    if e then fx.set_enabled(tr, ai, not e.enabled) end
   elseif verb == A_REMOVE then
-    fx.remove(tr, a)
+    if ai < 0 then return end
+    fx.remove(tr, ai)
   elseif verb == A_MOVE then
     -- M.move is the best-evidenced call in the engine: the REAPER harness
     -- covers down-by-one, 0->3, 3->0 and the duplicate-safe case.
-    if bnum >= 0 then fx.move(tr, a, bnum) end
+    if bnum >= 0 then
+      if v then fx.view_move(tr, pad, a, bnum) else fx.move(tr, a, bnum) end
+    end
   elseif verb == A_SWAP or verb == A_INSERT then
     local row = view[bnum + 1]
     if not row then return end
@@ -755,9 +791,12 @@ local function do_action(slot, verb, a, bnum)
     end
     if not add or add == "" then add = row.name end
     if verb == A_SWAP and a >= 0 then
-      fx.swap(tr, a, add)
+      if v then fx.view_swap(tr, pad, a, add) else fx.swap(tr, a, add) end
     else
-      fx.insert(tr, add, a >= 0 and a + 1 or nil)
+      -- The pad's name goes along: on REAPER 7 the first insert on a pad makes
+      -- its container, named "KICK (pad 1)" from Swing's published pad names.
+      if v then fx.view_insert(tr, pad, add, (a >= 0) and a or nil, pad >= 0 and ci_pad_name(slot, pad) or nil)
+      else fx.insert(tr, add, a >= 0 and a + 1 or nil) end
     end
   end
 end
@@ -787,8 +826,17 @@ local function consume_target(slot)
   local pads = ci_pads[slot]
   -- -1 = the master/bus strip. Anything else indexes the pad tracks the
   -- console publisher already resolved this tick, so the two sides cannot
-  -- disagree about which track a pad means.
-  ci_tgt[slot] = (pad >= 0 and pads) and pads[pad] or (pads and pads.master) or nil
+  -- disagree about which track a pad means. A pad with NO track (stereo) is
+  -- a VIEW of Swing's own track: its Wired slice, pinned to the pad's pair
+  -- (fx.view) -- the publisher stashed that track as pads.swing_tr.
+  if pad >= 0 then
+    if pads and pads[pad] then ci_tgt[slot] = { tr = pads[pad] }
+    elseif pads and pads.swing_tr then ci_tgt[slot] = { tr = pads.swing_tr, pad = pad }
+    else ci_tgt[slot] = nil end
+  else
+    ci_tgt[slot] = (pads and pads.master)
+      and { tr = pads.master, pad = pads.master_pad } or nil
+  end
   local sel = math.floor(reaper.gmem_read(b + TGT_SLOT) or -1)
   reaper.gmem_write(b + CH_SEL, sel)
   ch_fp[slot] = nil            -- force a republish for the new target
@@ -797,22 +845,30 @@ end
 local function publish_chain(slot)
   -- ⚠️ Resolve the pin BEFORE the fingerprint gate below, which returns early:
   -- latching has to happen on every tick, not only on ticks that republish.
+  -- The pin latches the whole target, view included, so a pinned pad stays
+  -- that pad's slice and not the Swing track it lives on.
   local pin = math.floor(reaper.gmem_read(BASE + slot * STRIDE + TGT_PIN) or 0)
   if pin == 1 then
-    ci_pin[slot] = ci_pin[slot] or ci_tgt[slot] or reaper.GetLastTouchedTrack()
+    if not ci_pin[slot] then
+      local t = ci_tgt[slot]
+      if t then ci_pin[slot] = { tr = t.tr, pad = t.pad }
+      else ci_pin[slot] = { tr = reaper.GetLastTouchedTrack() } end
+    end
   else
     ci_pin[slot] = nil
   end
-  if ci_pin[slot] and not reaper.ValidatePtr2(0, ci_pin[slot], "MediaTrack*") then
+  if ci_pin[slot] and not (ci_pin[slot].tr
+     and reaper.ValidatePtr2(0, ci_pin[slot].tr, "MediaTrack*")) then
     ci_pin[slot] = nil
   end
   -- ⭐ THE SHARED RESOLVER — the one do_action fires at. What is drawn and
-  -- what is acted on are now the same track by construction.
-  local tr = resolve_target(slot)
+  -- what is acted on are now the same track (and the same slice) by construction.
+  local tr, pad = resolve_target(slot)
   -- A target that has since been deleted must not be handed to the API.
   if not tr then
     tr = reaper.GetLastTouchedTrack()
     ci_tgt[slot] = nil
+    pad = nil
     if tr and not reaper.ValidatePtr2(0, tr, "MediaTrack*") then tr = nil end
   end
   local tname, tnum, tcol = "", 0, -1
@@ -822,11 +878,6 @@ local function publish_chain(slot)
     -- colour", which must stay distinguishable from black. ColorFromNative
     -- because the packing is OS-dependent -- reading the bytes directly works
     -- on Windows and gives blue-for-red on Mac.
-    -- ⚠️ A PLAIN `if`. This was written `c ~= 0 and (function() ... end)()`,
-    -- which is EEL2's ternary habit in a language that does not have it: Lua
-    -- statements are assignments, calls or control structures, and a bare
-    -- expression is a syntax error. Half this session is spent in the other
-    -- language and it shows.
     local c = math.floor(reaper.GetMediaTrackInfo_Value(tr, "I_CUSTOMCOLOR") or 0)
     if c ~= 0 then
       local cr, cg, cb = reaper.ColorFromNative(c % 0x1000000)
@@ -839,16 +890,31 @@ local function publish_chain(slot)
   -- already gates -- not per tick. The chunk of a loaded track is not small.
   tgt_frozen[slot] = track_frozen(tr)
   tgt_none[slot]   = (tr == nil)
-  local ch = tr and fx.chain(tr) or {}
+  local ch, v = {}, nil
+  if tr then
+    if pad ~= nil then ch, v = fx.chain_view(tr, pad) else ch = fx.chain(tr) end
+  end
+  -- A view is named for what it is, so the chain column says WHOSE inserts
+  -- these are: "KICK (pad 1)", not the name of the track they all share.
+  if v then
+    if pad >= 0 then
+      local pn = ci_pad_name(slot, pad)
+      tname = ascii_fold((pn ~= "" and pn or "Pad") .. " (pad " .. (pad + 1) .. ")")
+    else
+      tname = ascii_fold(tname .. " (master)")
+    end
+  end
   -- ⚠️ tnum IS IN THE FINGERPRINT. Reordering tracks changes the number while
   -- the name stays put; without it here the republish never fires and the face
-  -- shows a number that moved.
-  local parts = { tname, tnum, tcol, #ch }
+  -- shows a number that moved. The view's absolute indices are in it too: a
+  -- re-pin moves a plugin between slices without changing any name.
+  local parts = { tname, tnum, tcol, #ch, tostring(pad) }
   for _, e in ipairs(ch) do
     -- Offline belongs in the fingerprint too: without it, toggling offline
     -- changes nothing the bridge can see and the republish never happens.
     parts[#parts + 1] = e.name .. (e.enabled and "1" or "0")
                                 .. (e.offline and "F" or "-")
+                                .. ":" .. tostring(e.idx)
   end
   local fp = table.concat(parts, string.char(31))
   if fp == ch_fp[slot] then return end
@@ -959,22 +1025,28 @@ local function card_hash(name)
   return h
 end
 
-local function ci_pad_words(tr)
-  local out, nm, hs, ch = {}, {}, {}, fx.chain(tr)
+local function ci_words(tr, ch)
+  local out, nm, hs = {}, {}, {}
   for i = 1, math.min(CI_NSLOT, #ch) do
     local e = ch[i]
-    local cat = BUCKET_IX[fx.category_fx(tr, i - 1)] or 0
+    -- e.idx is the ABSOLUTE chain index: a view's entries are a subset of the
+    -- track's chain, so the category lookup must not use the list position.
+    local cat = BUCKET_IX[fx.category_fx(tr, e.idx)] or 0
     out[i] = cat + (e.enabled and 0 or 64) + (e.offline and 128 or 0)
     -- e.name is ALREADY the shortened display name the picker list uses
     -- (fx.parse_name strips vendor and format). Truncating that beats
     -- inventing a second way to abbreviate, which would eventually disagree
     -- with the picker about what a plugin is called.
     nm[i] = (e.name or ""):sub(1, CI_NCHAR)
-    -- Hash the FULL name, never the truncated one.
-    hs[i] = card_hash(e.name or "")
+    -- ⚠️⚠️ FORTY CHARACTERS, not the whole string. The card table is keyed on
+    -- `hkey(name[:40])` and the face hashes `min(40, len)` -- both because the
+    -- published name field is 40 wide -- so hashing the FULL name here missed
+    -- every plugin with a longer name than that.
+    hs[i] = card_hash((e.name or ""):sub(1, 40))
   end
   return out, #ch, nm, hs
 end
+local function ci_pad_words(tr) return ci_words(tr, fx.chain(tr)) end
 
 local function publish_console_inserts()
   -- Find every live Swing instance and the pad tracks it feeds.
@@ -1002,14 +1074,33 @@ local function publish_console_inserts()
               -- ⚠️ BR_GetMediaTrackSendInfo_Track is SWS. Without it this
               -- resolved NOTHING and every pad published as "owns no
               -- track" -- indistinguishable from a project that simply is
-              -- not in multi-out, with no error anywhere. The dependency
-              -- is not new (the kit bridge walks sends the same way) but it
-              -- was UNDECLARED, which is the part that made it a bug.
+              -- not in multi-out, with no error anywhere.
               if pad >= 0 and pad < 16 then
                 if reaper.BR_GetMediaTrackSendInfo_Track then
                   pads[pad] = reaper.BR_GetMediaTrackSendInfo_Track(tr, 0, s, 1)
                 else
                   no_sws = true
+                end
+              end
+            end
+
+            -- STEREO: no pad tracks at all. A pad's inserts are then its
+            -- WIRED slice of Swing's OWN track -- the plugins between Swing
+            -- and the Patchbay pinned to the pad's channel pair (fx.view) --
+            -- so that is what the strips show, and what a click on one will
+            -- target (consume_target reads pads.swing_tr). Whether Wired is
+            -- actually ON goes out as a flag: the slots are live either way,
+            -- but inserts under a switched-off Wired are silent and the face
+            -- has to say so.
+            local stereo = nsend < 16
+            local wired = false
+            if stereo then
+              pads.swing_tr, pads.swing_fx = tr, fxi
+              for i = 0, reaper.TrackFX_GetNumParams(tr, fxi) - 1 do
+                local ok, nm = reaper.TrackFX_GetParamName(tr, fxi, i, "")
+                if ok and nm:find("Wired (", 1, true) then
+                  wired = (reaper.TrackFX_GetParam(tr, fxi, i) or 0) >= 0.5
+                  break
                 end
               end
             end
@@ -1026,6 +1117,13 @@ local function publish_console_inserts()
                 rec[pad] = { n = n, w = w, nm = nm, hs = hs }
                 fpp[#fpp + 1] = pad .. ":" .. n .. ":" .. table.concat(w, ",")
                                     .. ":" .. table.concat(nm, ",")
+              elseif stereo then
+                -- A pad container follows the pad's name (renamed pads, kit loads).
+                fx.name_pad_container(tr, pad, ci_pad_name(slot, pad))
+                local w, n, nm, hs = ci_words(tr, (fx.chain_view(tr, pad)))
+                rec[pad] = { n = n, w = w, nm = nm, hs = hs }
+                fpp[#fpp + 1] = pad .. ":" .. n .. ":" .. table.concat(w, ",")
+                                    .. ":" .. table.concat(nm, ",")
               else
                 rec[pad] = { n = -1, w = {}, nm = {}, hs = {} }
                 fpp[#fpp + 1] = pad .. ":-1"
@@ -1037,35 +1135,49 @@ local function publish_console_inserts()
             --   multi-out — the pads left as 16 separate outputs and sum on
             --     their PARENT track. That folder is the desk's master.
             --   stereo    — they summed inside Swing, so the master is the
-            --     rest of the chain on Swing's own track.
-            -- Same rule the insert slots follow: what a strip shows is decided
-            -- by how the audio is routed, never by a setting.
-            local mtr
+            --     rest of Swing's own chain: minus Swing itself, minus the
+            --     Patchbay, minus every pad-pinned plugin (those are the pad
+            --     slices above). A view too, so a click targets the same slice.
+            local mtr, mrec
             for pad = 0, 15 do
               if pads[pad] then mtr = reaper.GetParentTrack(pads[pad]) break end
             end
-            mtr = mtr or tr
+            if mtr then
+              pads.master, pads.master_pad = mtr, nil
+              local mw, mn, mnm, mhs = ci_pad_words(mtr)
+              mrec = { n = mn, w = mw, nm = mnm, hs = mhs }
+            elseif stereo then
+              pads.master, pads.master_pad = tr, -1
+              local mw, mn, mnm, mhs = ci_words(tr, (fx.chain_view(tr, -1)))
+              mrec = { n = mn, w = mw, nm = mnm, hs = mhs }
+            else
+              pads.master, pads.master_pad = tr, nil
+              local mw, mn, mnm, mhs = ci_pad_words(tr)
+              mrec = { n = mn, w = mw, nm = mnm, hs = mhs }
+            end
             -- Hand the resolved tracks to the targeting path so a console
             -- click and this publish cannot disagree about which track a pad
             -- means. Re-stashed every publish, never cached across one: a pad
             -- track can be deleted or rebuilt underneath us.
-            pads.master = mtr
             ci_pads[slot] = pads
-            local mw, mn, mnm, mhs = ci_pad_words(mtr)
-            rec[16] = { n = mn, w = mw, nm = mnm, hs = mhs }  -- master = rec 16
-            fpp[#fpp + 1] = "M:" .. mn .. ":" .. table.concat(mw, ",")
-                                .. ":" .. table.concat(mnm, ",")
+            rec[16] = mrec   -- master = rec 16
+            fpp[#fpp + 1] = "M:" .. mrec.n .. ":" .. table.concat(mrec.w, ",")
+                                .. ":" .. table.concat(mrec.nm, ",")
+            -- bit0: pads can take inserts (multi-out tracks, or the Wired
+            --       slices of Swing's own track in stereo).
+            -- bit1: could not look the pad tracks up at all (no SWS).
+            -- bit2: stereo -- the inserts live on Swing's own track.
+            -- bit3: ...and Wired is OFF, so they are silent right now.
+            -- The face needs to tell these apart -- "you are not in
+            -- multi-out" and "I cannot see" are different sentences.
+            local flags = ((nsend >= 16 or stereo) and 1 or 0) + (no_sws and 2 or 0)
+                        + (stereo and 4 or 0) + ((stereo and not wired) and 8 or 0)
+            fpp[#fpp + 1] = "F:" .. flags
 
             -- ⚠️ HEARTBEAT IS UNCONDITIONAL, outside the change gate below.
-            -- It used to live inside it, which meant a project where nothing
-            -- changed froze the beat and the face would call a perfectly
-            -- healthy bridge dead — a false alarm precisely when everything is
-            -- fine. A heartbeat says "I am here", never "something happened".
-            --
+            -- A heartbeat says "I am here", never "something happened".
             -- A COUNTER, not a clock: the face has no wall clock to compare
-            -- against, and os.time()'s one-second resolution made two publishes
-            -- in the same second indistinguishable. All the face needs is
-            -- whether the number moved.
+            -- against; all it needs is whether the number moved.
             ci_beat = (ci_beat or 0) + 1
             reaper.gmem_write(CI_BASE + slot * CI_STRIDE + CI_HB, ci_beat)
 
@@ -1075,13 +1187,8 @@ local function publish_console_inserts()
               local b = CI_BASE + slot * CI_STRIDE
               local seq = math.floor((reaper.gmem_read(b + CI_SEQ) or 0) / 2) * 2 + 2
               reaper.gmem_write(b + CI_SEQ, seq - 1)     -- ODD: mid-write
-              -- bit0: this instance has multi-out tracks.
-              -- bit1: we could not look them up at all (no SWS).
-              -- The face needs to tell those apart -- "you are not in
-              -- multi-out" and "I cannot see" are different sentences.
               reaper.gmem_write(b + CI_FMT, CI_FMT_VER)
-              reaper.gmem_write(b + CI_FLAGS,
-                (nsend >= 16 and 1 or 0) + (no_sws and 2 or 0))
+              reaper.gmem_write(b + CI_FLAGS, flags)
               -- One loop for all 17. The master stopped being a special
               -- case the moment it became a record like any other.
               for ri = 0, CI_RECS - 1 do
@@ -1208,14 +1315,26 @@ end
 -- and a crash mid-write must not be able to eat them. Global, not local —
 -- the same helper rides in every EON self-registering script.
 function eon_write_startup(path, content)
-  local tmp = path .. ".eon-tmp"
+  local tmp, prev = path .. ".eon-tmp", path .. ".eon-prev"
   local f = io.open(tmp, "w")
   if not f then return false end
   local wok = f:write(content)
   local cok = f:close()
   if not wok or not cok then os.remove(tmp) return false end
-  os.remove(path)                    -- Windows os.rename won't overwrite
-  return os.rename(tmp, path) and true or false
+  -- Windows os.rename won't overwrite, so the old file steps aside first --
+  -- and steps back if the new one cannot take its place. Nothing is ever
+  -- deleted before the replacement is in (2026-09-07: the old remove-then-
+  -- rename left the shared file GONE whenever the rename failed, e.g. an
+  -- antivirus hold on the freshly written tmp file).
+  os.remove(prev)
+  local had_old = os.rename(path, prev)
+  if os.rename(tmp, path) then
+    os.remove(prev)
+    return true
+  end
+  if had_old then os.rename(prev, path) end
+  os.remove(tmp)
+  return false
 end
 
 local function fxpick_self_register()
@@ -1269,7 +1388,10 @@ local function fxpick_self_register()
     "  local p=reaper.GetResourcePath()..\"/Scripts/__startup.lua\"\n" ..
     "  local f=io.open(p,'r'); if f then local c=f:read('*a'); f:close()\n" ..
     "    c=c:gsub('\\n?%-%- EON:" .. NAME .. " BEGIN.-%-%- EON:" .. NAME .. " END\\n?','')\n" ..
-    "    local fw=io.open(p,'w'); if fw then fw:write(c); fw:close() end end\n" ..
+    "    local t,b=p..'.eon-tmp',p..'.eon-prev'; local fw=io.open(t,'w'); local ok=false\n" ..
+    "    if fw then ok=fw:write(c) and true or false; if not fw:close() then ok=false end end\n" ..
+    "    if ok then os.remove(b); local h=os.rename(p,b); if os.rename(t,p) then os.remove(b) elseif h then os.rename(b,p) end end\n" ..
+    "    os.remove(t) end\n" ..
     "  reaper.SetExtState('" .. NAME .. "','" .. NAME .. "_registered_v3','',true)\n" ..
     "end end\n" ..
     marker .. " END\n"

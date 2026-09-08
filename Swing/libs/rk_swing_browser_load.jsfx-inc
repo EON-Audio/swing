@@ -32,63 +32,19 @@
 // after undo. Documented as a known limitation.
 
 @init
-
-// ─── CMD 63 — single-pad sample load ────────────────────────────────────
-// Fully resets the pad (clear_pad) before loading: leaving stale layers
-// would cause Sum-mode mixing with the previous sample, and stale per-pad
-// gain/pan/tune would leak the old kit's mix into the new sound.
-function swing_browser_load_pad()
-local(_bp_pad, _bp_len, _xf_vi, _ci, _cn, _cnl)
+// Sliced loads (2026-09-07): the file read is pumped one bounded slice per
+// @block by rk_swing_core's swing_ldr_*, so a handler may span several blocks.
+// First entry does the setup and starts the load; while it is in flight the
+// handler leaves CMD set, records the job in _bl_job_*, and returns; each later
+// block re-enters (same dispatch gate), pumps, and on the block where the load
+// lands runs the completion half below. The @gfx stall-fallback enters the same
+// way and pumps the same job, so an engine that stopped mid-load still finishes.
+// _bl_job_pending is also read by the stale-job guard in @block and by the
+// import tick's capture-depth leak guard.
+// ─── CMD 63 — single-pad sample load: completion half ───────────────────────
+function swing_browser_load_pad_done(_bp_pad)
+local(_ci, _cn, _cnl)
 (
-  // In-flight latch (2026-07-27 double-dispatch fix): both dispatch sites
-  // (@block + @gfx stall-fallback) check !_bl_inflight, so a handler that is
-  // mid-disk-load on one thread can't be re-entered from the other.
-  _bl_inflight = 1;
-  // Multi-instance gate: only respond if browser targets this instance
-  // (or no specific target is set). Without this, a second Swing instance
-  // would also load the sample, hijacking the user's intended target.
-  _is_browser_target() ? (
-  _bp_pad = gmem[GS_BROWSE_PAD]|0;
-  _bp_len = gmem[GS_BROWSER_PATH_LEN]|0;
-  _bp_pad >= 0 && _bp_pad < NUM_PADS && _bp_len > 0 && _bp_len < GS_BROWSER_PATH_MAX ? (
-    // Tukan-style undo: REAPER's chunk diff captures the load via
-    // mark_dirty_pad(_bp_pad) below. Audio is in @serialize.
-    // Kill any active voices on this pad + activate crossfade before overwriting buffer
-    _xf_vi = 0; loop(MAX_VOICES + 1,
-      v_slot[_xf_vi] == _bp_pad ? ( v_pos[_xf_vi] = -1; v_env[_xf_vi] = 0; v_stage[_xf_vi] = 0; );
-      _xf_vi += 1;
-    );
-    // Gate threshold -40 dB: only arm crossfade when residue is clearly
-    // audible. Below -40 dB, snap-cut is masked by noise floor — and arming
-    // for sub-audible residue means the ramp attenuates the next hit's
-    // transient before the @sample short-circuit (-80 dB) can deactivate.
-    !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
-      _xf_pos = 0;
-      _xf_len = max(1, (0.010 * srate)|0);  // 10ms crossfade for single pad
-      _xf_active = 1;
-    );
-    strcpy(#_browser_path, "");
-    _ci = 0; loop(_bp_len,
-      str_setchar(#_browser_path, _ci, gmem[GS_BROWSER_PATH + _ci]);
-      _ci += 1;
-    );
-    str_setlen(#_browser_path, _bp_len);
-    // Single-sample drop semantics: fully reset the pad before loading.
-    // (Leaving stale layers causes Sum-mode mixing with the old kit sound;
-    //  leaving stale per-pad gain/pan/tune leaks kit mix into the new sample.)
-    //
-    // ⚠️ ONE outer undo bracket around clear_pad + load_from_path. Without it,
-    // each captures a structural snapshot at depth 0 independently, and
-    // undo_capture_pad OVERWRITES on every depth-0 capture — so the surviving
-    // snapshot is the state AFTER clear_pad (an EMPTY pad), and the in-plugin
-    // UNDO restores the pad to empty instead of its prior content, dropping
-    // the layer paths the 8435847 backup was meant to preserve (verified
-    // 2026-07-13). The outer undo_begin_pad captures the pre-edit (layered)
-    // state ONCE with names+LPATH; the inner clear_pad/load_from_path calls
-    // run at depth >= 1, so their captures no-op.
-    undo_begin_pad(_bp_pad);
-    clear_pad(_bp_pad);
-    load_from_path(_bp_pad, #_browser_path);
     // ④ FILL naming (consume-once): a requester that staged a DISPLAY name
     // (the kit pad's name) into KIT_GMEM_PADNAMES sets GS_BROWSE_NAME_ADOPT=1
     // just before CMD 63 — adopt it as cname over the auto_name_from_file
@@ -121,8 +77,8 @@ local(_bp_pad, _bp_len, _xf_vi, _ci, _cn, _cnl)
                           // params so stale coefs are unreachable, but keep
                           // the state tree consistent for debugging/display).
     s_dirty[_bp_pad] = 1;
-    // Pad name → gmem PADNAME: auto_name_from_file() (called inside
-    // load_from_path) already set cname. Push it to gmem now so:
+    // Pad name → gmem PADNAME: auto_name_from_file() (called inside the
+    // loader) already set cname. Push it to gmem now so:
     //   (a) browser sees the new name on its very next read,
     //   (b) reverse-sync can't copy a stale @block-clobbered gmem
     //       value back into cname on the next @gfx frame.
@@ -169,42 +125,46 @@ local(_bp_pad, _bp_len, _xf_vi, _ci, _cn, _cnl)
     // load ever gets analysed. Four gmem writes; the bridge does the work and
     // throttles it to one file per tick.
     swing_lcd_rootnote_request(_bp_pad);
-  ) : (
-    // Validation failed (bad pad index or path length) — still consume CMD
-    // so the bridge isn't stuck waiting on an in-flight command. Also drop
-    // a staged-name flag so it can't rename a LATER unrelated browse load.
-    gmem[GS_BROWSE_NAME_ADOPT] = 0;
-    gmem[KIT_GMEM_CMD] = 0;
-  );
-  );  // _is_browser_target gate
-  _bl_inflight = 0;
 );
-
-// ─── CMD 64 — per-layer sample load ─────────────────────────────────────
-// Same protocol as CMD 63 with the addition of GS_BROWSE_LAYER. Does NOT
-// clear the pad: layer load is additive. Pad name is only refreshed when
-// layer 0 is targeted (layers 1..3 keep the existing display name).
-function swing_browser_load_layer()
-local(_bp_pad, _bp_layer, _bp_len, _xf_vi, _ci, _cn, _cnl)
+// ─── CMD 63 — single-pad sample load ────────────────────────────────────
+// Fully resets the pad (clear_pad) before loading: leaving stale layers
+// would cause Sum-mode mixing with the previous sample, and stale per-pad
+// gain/pan/tune would leak the old kit's mix into the new sound.
+function swing_browser_load_pad()
+local(_bp_pad, _bp_len, _xf_vi, _ci)
 (
-  _bl_inflight = 1;   // double-dispatch latch (see swing_browser_load_pad)
-  // Multi-instance gate (see swing_browser_load_pad)
+  // In-flight latch (2026-07-27 double-dispatch fix): both dispatch sites
+  // (@block + @gfx stall-fallback) check !_bl_inflight, so a handler that is
+  // mid-disk-load on one thread can't be re-entered from the other.
+  _bl_inflight = 1;
+  // Multi-instance gate: only respond if browser targets this instance
+  // (or no specific target is set). Without this, a second Swing instance
+  // would also load the sample, hijacking the user's intended target.
   _is_browser_target() ? (
+  _bl_job_pending && _bl_job_cmd == 63 ? (
+    // Resume: pump the load begun on an earlier block; complete when it lands.
+    swing_ldr_step_pad(_bl_job_pad, #_browser_path) ? (
+      _bl_job_pending = 0;
+      swing_browser_load_pad_done(_bl_job_pad);
+    );
+  ) : (
   _bp_pad = gmem[GS_BROWSE_PAD]|0;
-  _bp_layer = gmem[GS_BROWSE_LAYER]|0;
   _bp_len = gmem[GS_BROWSER_PATH_LEN]|0;
-  _bp_pad >= 0 && _bp_pad < NUM_PADS && _bp_layer >= 0 && _bp_layer < MAX_LAYERS && _bp_len > 0 && _bp_len < GS_BROWSER_PATH_MAX ? (
+  _bp_pad >= 0 && _bp_pad < NUM_PADS && _bp_len > 0 && _bp_len < GS_BROWSER_PATH_MAX ? (
     // Tukan-style undo: REAPER's chunk diff captures the load via
     // mark_dirty_pad(_bp_pad) below. Audio is in @serialize.
-    // Kill active voices on this pad + crossfade
+    // Kill any active voices on this pad + activate crossfade before overwriting buffer
     _xf_vi = 0; loop(MAX_VOICES + 1,
       v_slot[_xf_vi] == _bp_pad ? ( v_pos[_xf_vi] = -1; v_env[_xf_vi] = 0; v_stage[_xf_vi] = 0; );
       _xf_vi += 1;
     );
-    // Gate threshold -40 dB (see CMD 63 above for rationale).
+    // Gate threshold -40 dB: only arm crossfade when residue is clearly
+    // audible. Below -40 dB, snap-cut is masked by noise floor — and arming
+    // for sub-audible residue means the ramp attenuates the next hit's
+    // transient before the @sample short-circuit (-80 dB) can deactivate.
     !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
       _xf_pos = 0;
-      _xf_len = max(1, (0.010 * srate)|0);
+      _xf_len = max(1, (0.010 * srate)|0);  // 10ms crossfade for single pad
       _xf_active = 1;
     );
     strcpy(#_browser_path, "");
@@ -213,7 +173,42 @@ local(_bp_pad, _bp_layer, _bp_len, _xf_vi, _ci, _cn, _cnl)
       _ci += 1;
     );
     str_setlen(#_browser_path, _bp_len);
-    load_layer_from_path(_bp_pad, _bp_layer, #_browser_path);
+    // Single-sample drop semantics: fully reset the pad before loading.
+    // (Leaving stale layers causes Sum-mode mixing with the old kit sound;
+    //  leaving stale per-pad gain/pan/tune leaks kit mix into the new sample.)
+    //
+    // ⚠️ ONE outer undo bracket around clear_pad + the load. Without it,
+    // each captures a structural snapshot at depth 0 independently, and
+    // undo_capture_pad OVERWRITES on every depth-0 capture — so the surviving
+    // snapshot is the state AFTER clear_pad (an EMPTY pad), and the in-plugin
+    // UNDO restores the pad to empty instead of its prior content, dropping
+    // the layer paths the 8435847 backup was meant to preserve (verified
+    // 2026-07-13). The outer undo_begin_pad captures the pre-edit (layered)
+    // state ONCE with names+LPATH; the inner clear_pad / loader calls run at
+    // depth >= 1, so their captures no-op. The bracket closes in the
+    // completion half — possibly several blocks later.
+    undo_begin_pad(_bp_pad);
+    clear_pad(_bp_pad);
+    _bl_job_pending = 1; _bl_job_cmd = 63; _bl_job_pad = _bp_pad;
+    swing_ldr_step_pad(_bp_pad, #_browser_path) ? (
+      _bl_job_pending = 0;
+      swing_browser_load_pad_done(_bp_pad);
+    );
+  ) : (
+    // Validation failed (bad pad index or path length) — still consume CMD
+    // so the bridge isn't stuck waiting on an in-flight command. Also drop
+    // a staged-name flag so it can't rename a LATER unrelated browse load.
+    gmem[GS_BROWSE_NAME_ADOPT] = 0;
+    gmem[KIT_GMEM_CMD] = 0;
+  );
+  );  // resume / start
+  );  // _is_browser_target gate
+  _bl_inflight = 0;
+);
+// ─── CMD 64 — per-layer sample load: completion half ────────────────────
+function swing_browser_load_layer_done(_bp_pad, _bp_layer)
+local(_ci, _cn, _cnl)
+(
     recalc_pad(_bp_pad);
     s_dirty[_bp_pad] = 1;
     // Pad name → gmem PADNAME (same as CMD 63 — see comment there).
@@ -250,11 +245,58 @@ local(_bp_pad, _bp_layer, _bp_len, _xf_vi, _ci, _cn, _cnl)
     // decides the root note; layers 1..n are velocity/RR variants of the same
     // drum and must not re-trigger analysis — same rule the category post uses.
     _bp_layer == 0 ? swing_lcd_rootnote_request(_bp_pad);
+);
+// ─── CMD 64 — per-layer sample load ─────────────────────────────────────
+// Same protocol as CMD 63 with the addition of GS_BROWSE_LAYER. Does NOT
+// clear the pad: layer load is additive. Pad name is only refreshed when
+// layer 0 is targeted (layers 1..3 keep the existing display name).
+function swing_browser_load_layer()
+local(_bp_pad, _bp_layer, _bp_len, _xf_vi, _ci)
+(
+  _bl_inflight = 1;   // double-dispatch latch (see swing_browser_load_pad)
+  // Multi-instance gate (see swing_browser_load_pad)
+  _is_browser_target() ? (
+  _bl_job_pending && _bl_job_cmd == 64 ? (
+    // Resume: pump the load begun on an earlier block; complete when it lands.
+    swing_ldr_step_layer(_bl_job_pad, _bl_job_layer, #_browser_path) ? (
+      _bl_job_pending = 0;
+      swing_browser_load_layer_done(_bl_job_pad, _bl_job_layer);
+    );
+  ) : (
+  _bp_pad = gmem[GS_BROWSE_PAD]|0;
+  _bp_layer = gmem[GS_BROWSE_LAYER]|0;
+  _bp_len = gmem[GS_BROWSER_PATH_LEN]|0;
+  _bp_pad >= 0 && _bp_pad < NUM_PADS && _bp_layer >= 0 && _bp_layer < MAX_LAYERS && _bp_len > 0 && _bp_len < GS_BROWSER_PATH_MAX ? (
+    // Tukan-style undo: REAPER's chunk diff captures the load via
+    // mark_dirty_pad(_bp_pad) below. Audio is in @serialize.
+    // Kill active voices on this pad + crossfade
+    _xf_vi = 0; loop(MAX_VOICES + 1,
+      v_slot[_xf_vi] == _bp_pad ? ( v_pos[_xf_vi] = -1; v_env[_xf_vi] = 0; v_stage[_xf_vi] = 0; );
+      _xf_vi += 1;
+    );
+    // Gate threshold -40 dB (see CMD 63 above for rationale).
+    !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
+      _xf_pos = 0;
+      _xf_len = max(1, (0.010 * srate)|0);
+      _xf_active = 1;
+    );
+    strcpy(#_browser_path, "");
+    _ci = 0; loop(_bp_len,
+      str_setchar(#_browser_path, _ci, gmem[GS_BROWSER_PATH + _ci]);
+      _ci += 1;
+    );
+    str_setlen(#_browser_path, _bp_len);
+    _bl_job_pending = 1; _bl_job_cmd = 64; _bl_job_pad = _bp_pad; _bl_job_layer = _bp_layer;
+    swing_ldr_step_layer(_bp_pad, _bp_layer, #_browser_path) ? (
+      _bl_job_pending = 0;
+      swing_browser_load_layer_done(_bp_pad, _bp_layer);
+    );
   ) : (
     // Validation failed (bad pad index or path length) — still consume CMD
     // so the bridge isn't stuck waiting on an in-flight command.
     gmem[KIT_GMEM_CMD] = 0;
   );
+  );  // resume / start
   );  // _is_browser_target gate
   _bl_inflight = 0;
 );

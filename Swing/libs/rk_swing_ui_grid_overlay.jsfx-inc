@@ -293,18 +293,10 @@ function _ov_draw_layers_and_mode() (
           // a previous RR pass. Harmless when mode != RR (cursor is
           // unread in Sum/Vel-Split).
           p_rr_idx[oi] = 0;
-          // Auto-promote legacy single sample → layer 0 when switching modes
-          // Audio data is already at layer 0 offset (SLOT_SIZE + 0*LAYER_SIZE), just copy metadata
-          p_layer_cnt[oi] == 0 && s_len[oi] > 0 ? (
-            _lidx = oi * MAX_LAYERS;
-            l_len[_lidx]       = min(s_len[oi], LAYER_SIZE);
-            l_start[_lidx]     = s_start[oi];
-            l_end[_lidx]       = s_end[oi];
-            l_sr[_lidx]        = s_sr[oi];
-            l_norm[_lidx]      = s_norm[oi];
-            l_norm_gain[_lidx] = s_norm_gain[oi];
-            p_layer_cnt[oi]    = 1;
-          );
+          // A mode change never promotes a plain pad (it has nothing to sum or
+          // split yet, and promoting a pad longer than a layer cuts it):
+          // swing_pad_promote runs when a layer >= 1 lands
+          // (Spec_Swing_Long_Pad_Layer_Cap).
           // Auto-assign even vel-split ranges when switching to Vel-Split
           // (only if all layers still have default 0-1 ranges)
           resp == 1 && p_layer_cnt[oi] > 1 ? (
@@ -559,30 +551,24 @@ function _ov_draw_drop_and_close() (
         li += 1;
       );
 
-      // Legacy load: empty pad with L1 selected — load directly into legacy slot
-      overlay_layer == 0 && p_layer_cnt[oi] == 0 && s_len[oi] == 0 ? (
-        // Reset per-pad mix params so stale kit values don't leak into the new sample
-        p_gain[oi] = 1.0; p_pan[oi] = 0; p_tune[oi] = 0;
-        p_panL[oi] = 1.0; p_panR[oi] = 1.0;
-        s_start[oi] = 0; s_end[oi] = 1.0;
+      // A plain or empty pad with L1 selected: plain load — the whole slot is
+      // the sample, no promotion (Spec_Swing_Long_Pad_Layer_Cap). A layered
+      // pad's L1, or any L2-L4, goes through the layer loader; a plain pad
+      // receiving L2-L4 is promoted (and cut, with the banner) inside
+      // swing_ldr_begin.
+      overlay_layer == 0 && p_layer_cnt[oi] == 0 ? (
+        s_len[oi] == 0 ? (
+          // Empty pad: reset per-pad mix params so stale kit values don't leak
+          // into the new sample. A replace keeps them, as a layer replace does.
+          p_gain[oi] = 1.0; p_pan[oi] = 0; p_tune[oi] = 0;
+          p_panL[oi] = 1.0; p_panR[oi] = 1.0;
+        );
+        s_start[oi] = 0; s_end[oi] = 1.0;   // a new sample starts untrimmed
         load_from_path(oi, #df);
         recalc_pad(oi);
         s_dirty[oi] = 1;
       ) : (
-        // Layer-aware load — replace current layer
-        p_layer_cnt[oi] == 0 && s_len[oi] > 0 ? (
-          // Promote legacy audio into layer 0 first
-          _lidx = oi * MAX_LAYERS;
-          l_len[_lidx] = min(s_len[oi], LAYER_SIZE);
-          l_start[_lidx] = s_start[oi];
-          l_end[_lidx] = s_end[oi];
-          l_sr[_lidx] = s_sr[oi];
-          l_norm[_lidx] = s_norm[oi];
-          l_norm_gain[_lidx] = s_norm_gain[oi];
-          strcpy(LPATH_STR_BASE + _lidx, get_path_slot(oi));
-          p_layer_cnt[oi] = 1;
-          p_layer_mode[oi] == 0 ? ( p_layer_mode[oi] = 3; );
-        );
+        // Layer-aware load — replace the selected layer
         load_layer_from_path(oi, overlay_layer, #df);
         p_layer_mode[oi] == 0 ? ( p_layer_mode[oi] = 3; );
         recalc_pad(oi);

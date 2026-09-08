@@ -68,6 +68,10 @@ end
 
 package.path = _SCRIPT_DIR .. _sep .. "?.lua;" .. (package.path or "")
 local core = require("rk_lua_core")
+-- The FX picker engine: pad views (Wired inserts), containers on REAPER 7.
+-- Optional -- without it the conversions fall back to the flat, pinned layout.
+local fxe = nil
+do local okf, m = pcall(require, "rk_lua_fxpicker"); if okf then fxe = m end end
 
 -- Styled dialog module (ReaImGui). pcall'd: a missing file or missing ReaImGui
 -- is fine -- every call site keeps its native GetUserInputs/ShowMessageBox
@@ -5360,7 +5364,12 @@ local STRETCH_MODE_STRETCH = 2
 -- Per-instance identity band constants are read inside the consumer function
 -- (function scope) via G.* — NOT as module-level locals, to stay under Lua's
 -- 200-local-per-function limit on this large bridge main chunk.
-local GMEM_AUDIO_MAX = G.NUM_PADS * G.SLOT_SIZE  -- 64M max total audio in gmem
+-- The audio band's REAL room, measured from AUDIO_BASE: it ends where the
+-- Stretch rings begin (AUDIO_DUMP_END), ~16.77M cells — not NUM_PADS *
+-- SLOT_SIZE (64M), the paper bound this used to be, four times the truth.
+-- The JSFX state-11 dump enforces the same ceiling and raises GS_EXPORT_OVER
+-- when a kit would cross it (Spec_Swing_Long_Pad_Layer_Cap §4.4).
+local GMEM_AUDIO_MAX = G.AUDIO_DUMP_END - G.AUDIO_BASE
 
 -- ─── EON Swing pitch protocol — per-pad path publish to Extension ─────────
 -- The Extension's BakeWorker (Tuned mode) needs the file path of each pad's
@@ -10202,6 +10211,16 @@ function rk_export.do_export_write_file()
   -- Opt in to v5: reaper.SetExtState("EON_Swing", "save_format", "v5", false)
   local ver = math.floor(reaper.gmem_read(G.KIT_GMEM_VER))
   if ver == 200 then
+    -- The JSFX stops its audio dump at the export band's real ceiling and
+    -- raises GS_EXPORT_OVER (Spec_Swing_Long_Pad_Layer_Cap §4.4). The dump is
+    -- partial from that blob on, so a kit written from it would be silently
+    -- short: refuse instead. 98 = the cancel ack the state-3 waiter expects.
+    if math.floor(reaper.gmem_read(G.GS_EXPORT_OVER) or 0) ~= 0 then
+      eon_notice("This kit holds more audio than a kit file can carry (about 190 seconds in total).\nNothing was saved. Shorten or clear some pads and save again.")
+      reaper.gmem_write(G.CMD, 98)
+      pending_export = nil
+      return
+    end
     local fmt = (reaper.GetExtState("EON_Swing", "save_format") or ""):lower()
     if fmt == "v5" then
       write_kit_v5(info.filepath, info)
@@ -11969,6 +11988,26 @@ function rk_ops.do_build_multiout(opts)
     return
   end
 
+  -- Wired and Multi-Out are exclusive. A plain Build on a Swing that is in
+  -- Wired used to leave BOTH on: the Patchbay ringing, the OUT button reading
+  -- WIRED, the child tracks hearing the pads -- the state survived into the
+  -- saved project and read as "Wired is on by default". Hand it to the
+  -- conversion instead: Wired off, this build, then the pad plugins moved onto
+  -- their tracks. The conversion switches Wired off BEFORE it calls back in
+  -- here, so this does not recurse; the caller's on_done rides through it.
+  if swing_fx then
+    for p = 0, reaper.TrackFX_GetNumParams(swing_track, swing_fx) - 1 do
+      local ok, nm = reaper.TrackFX_GetParamName(swing_track, swing_fx, p, "")
+      if ok and nm:find("Wired (", 1, true) then
+        if (reaper.TrackFX_GetParam(swing_track, swing_fx, p) or 0) >= 0.5 then
+          rk_ops.do_wired_to_multiout(opts)
+          return
+        end
+        break
+      end
+    end
+  end
+
   -- Put Swing into MULTI before the tracks exist. Swing's own right-click
   -- builder calls swing_panels_multiout_prep() before it raises CMD 40, so it
   -- is already in MULTI by the time we finish. Every route that lands here from
@@ -12348,6 +12387,76 @@ function rk_ops.do_build_multiout(opts)
     if not tail then return false end
     return reaper.SetTrackStateChunk(tr, chunk:sub(1, tail - 1) .. body .. ">" .. nl, false)
   end
+  -- Swing's master EQ + drive on the Audio bus (EON Tone), FIRST in the
+  -- sub-folder's chain so the comp below it hears what Swing's own comp hears
+  -- in stereo mode: Tone -> comp -> fader -> Output. Transparent at its
+  -- defaults, so a build that never touches it sounds as before; idempotent
+  -- on a Rebuild (query first, and the P_EXT mark is for the layout tools).
+  local function ensure_tone(tr)
+    if not tr then return end
+    local name = core.jsfx_addname("EON_Tone.jsfx", swing_track, swing_fx)
+    if not name then
+      reaper.ShowConsoleMsg("[Swing] EON_Tone.jsfx not found -- master EQ on the Audio bus skipped" .. string.char(10))
+      return
+    end
+    if reaper.TrackFX_AddByName(tr, name, false, 0) >= 0 then return end
+    -- instantiate <= -1000 inserts at |instantiate| - 1000: -1000 is slot 0,
+    -- ahead of a comp that may already be there on a Rebuild.
+    local fx = reaper.TrackFX_AddByName(tr, name, false, -1000)
+    if fx < 0 then
+      reaper.ShowConsoleMsg("[Swing] Could not insert EON Tone (" .. tostring(name) .. ")" .. string.char(10))
+      return
+    end
+    reaper.GetSetMediaTrackInfo_String(tr, "P_EXT:EON_TONE", "1", true)
+  end
+
+  -- The output stage on the Audio bus (EON Output): Swing's master volume then
+  -- its limiter, LAST in the sub-folder's chain so it sees the comp's output
+  -- as Swing's own limiter does: Tone -> comp -> Output. Swing's stable
+  -- instance id is baked into it, and from then on Output follows Swing's
+  -- MASTER VOL and limiter over the master-link record (a registry slot is
+  -- session-volatile; the id survives a reload). Idempotent on a Rebuild; if a
+  -- comp was added after it, it moves itself back to the end.
+  local function ensure_output(tr)
+    if not tr then return end
+    local name = core.jsfx_addname("EON_Output.jsfx", swing_track, swing_fx)
+    if not name then
+      reaper.ShowConsoleMsg("[Swing] EON_Output.jsfx not found -- master volume + limiter on the Audio bus skipped" .. string.char(10))
+      return
+    end
+    local fx = reaper.TrackFX_AddByName(tr, name, false, 0)
+    if fx < 0 then
+      fx = reaper.TrackFX_AddByName(tr, name, false, 1)   -- 1 = add if missing (appends)
+      if fx < 0 then
+        reaper.ShowConsoleMsg("[Swing] Could not insert EON Output (" .. tostring(name) .. ")" .. string.char(10))
+        return
+      end
+    end
+    -- Stay last -- but only jump over OUR OWN plugins (a comp or Tone that a
+    -- Rebuild appended after it). A plugin the user put after Output on
+    -- purpose, a meter say, keeps its place.
+    local last = reaper.TrackFX_GetCount(tr) - 1
+    if fx < last then
+      local _, lname = reaper.TrackFX_GetFXName(tr, last, "")
+      lname = lname or ""
+      if lname:find("EON Weld", 1, true) or lname:find("EON Anvil", 1, true)
+         or lname:find("EON Tone", 1, true) then
+        reaper.TrackFX_CopyToTrack(tr, fx, tr, last, true)   -- move to the end
+        fx = last
+      end
+    end
+    -- Bake the link: Swing's instance id (param 3 = slider4), by name.
+    local inst = reaper.TrackFX_GetParam(swing_track, swing_fx, 3) or 0
+    for i = 0, reaper.TrackFX_GetNumParams(tr, fx) - 1 do
+      local ok, nm = reaper.TrackFX_GetParamName(tr, fx, i, "")
+      if ok and nm:find("Link Instance", 1, true) then
+        reaper.TrackFX_SetParam(tr, fx, i, math.floor(inst + 0.5))
+        break
+      end
+    end
+    reaper.GetSetMediaTrackInfo_String(tr, "P_EXT:EON_OUTPUT", "1", true)
+  end
+
   local function ensure_rack_comp(tr, sel, weld_defaults)
     if not tr then return end
     sel = sel or { kind = "weld" }
@@ -12543,8 +12652,16 @@ function rk_ops.do_build_multiout(opts)
 
   local swing_idx = math.floor(reaper.GetMediaTrackInfo_Value(swing_track, "IP_TRACKNUMBER")) - 1
 
+  -- The mutation runs under xpcall so the undo block and PreventUIRefresh
+  -- are ALWAYS closed. Before this, a Lua error anywhere in the ~200 lines
+  -- below left REAPER not repainting (PreventUIRefresh still at 1), the undo
+  -- block open and CMD parked -- and the caller's on_done never fired.
+  -- `created` is hoisted out of the guarded body because the success path
+  -- and the undo label read it afterwards.
+  local created = {}
   reaper.Undo_BeginBlock()
   reaper.PreventUIRefresh(1)
+  local built, fault = xpcall(function()
 
   -- Create parent folder track above Swing (skip if one already exists).
   -- Layout target (names applied by update_folder_track_name):
@@ -12614,7 +12731,6 @@ function rk_ops.do_build_multiout(opts)
   end
 
   -- Create 16 multi-out child tracks INSIDE the audio sub-folder
-  local created = {}
   local _bwt = bridge_lane_policy(swing_track)  -- write_tracks: gate lane paint
   for i = 0, G.NUM_PADS - 1 do
     local insert_idx = audio_sub_idx + 1 + i
@@ -12651,8 +12767,18 @@ function rk_ops.do_build_multiout(opts)
     -- P4-2: explicit pad identity on the child — srcchan stops identifying
     -- the pad once the output mirror can retarget sends.
     reaper.GetSetMediaTrackInfo_String(tr, "P_EXT:EON_PAD_IDX", tostring(i), true)
+    -- EON Macros relay: Swing's eight macros as parameters on this track, so
+    -- REAPER parameter links (same-track only) can follow a macro here.
+    core.ensure_macros(tr, swing_track, swing_fx)
 
     created[#created + 1] = tr
+  end
+  -- A build is 16 tracks or it is not a build. The nil-track `break` above
+  -- used to fall through to CMD 99 with fewer children, and every pad past
+  -- the shortfall would then play silently. Raise into the guard instead:
+  -- the undo block closes, CMD goes to 98, on_done(false) fires.
+  if #created ~= G.NUM_PADS then
+    error(("only %d of %d multi-out tracks could be created"):format(#created, G.NUM_PADS), 0)
   end
 
   -- ── FX return tracks (opt-in) ───────────────────────────────────────────
@@ -12709,6 +12835,9 @@ function rk_ops.do_build_multiout(opts)
   -- Step sequencer above Swing (opt-in; embedded-first on fresh inserts).
   if want_stepseq then ensure_stepseq() end
 
+  -- Swing's master EQ + drive, ahead of the glue.
+  ensure_tone(audio_sub)
+
   -- Serial glue on the drum submix parent (the separate want_buscomp opt-in;
   -- gentler defaults than the smash-return instance).
   if want_buscomp then
@@ -12717,6 +12846,9 @@ function rk_ops.do_build_multiout(opts)
       ["Release"] = 200, ["Knee"] = 6, ["Makeup"] = 0, ["Mix"] = 1,
     })
   end
+
+  -- Swing's master volume + limiter, last, following Swing over the link.
+  ensure_output(audio_sub)
 
   if #created > 0 then
     reaper.SetMediaTrackInfo_Value(swing_track, "B_MAINSEND", 0)
@@ -12739,8 +12871,22 @@ function rk_ops.do_build_multiout(opts)
   -- already exists alongside — the reorganiser figures it out.
   if folder_layout then folder_layout.EnsureSwingParentLayout(swing_track) end
 
+  end, debug.traceback)   -- guarded mutation
+
   reaper.PreventUIRefresh(-1)
   reaper.TrackList_AdjustWindows(false)
+  if not built then
+    fault = tostring(fault)
+    reaper.Undo_EndBlock("Swing: Build multi-out tracks (did not complete)", -1)
+    reaper.gmem_write(G.CMD, 98)
+    reaper.ShowConsoleMsg("[Swing] Multi-Out build failed:\n" .. fault .. "\n")
+    eon_notice("The Multi-Out build did not complete, so it was not published.\n\n" ..
+               (fault:match("^[^\n]*") or fault) .. "\n\n" ..
+               "Undo (Ctrl+Z) removes whatever it managed to build; " ..
+               "the console has the full trace.")
+    done(false)
+    return
+  end
   reaper.Undo_EndBlock("Swing: Build " .. #created .. " multi-out tracks", -1)
 
   reaper.gmem_write(G.CMD, 99)
@@ -12753,9 +12899,11 @@ function rk_ops.do_build_multiout(opts)
     summary = summary .. "\n  + EON Verb Return  (ch 33/34)\n  + EON Delay Return (ch 35/36)\n"
     summary = summary .. "  + EON Smash Return (ch 37/38 -> " .. rack_sel_name(smash_sel) .. ")\n"
   end
+  summary = summary .. "  + EON Tone on the Audio bus (Swing's master EQ + drive)" .. string.char(10)
   if want_buscomp then
     summary = summary .. "  + " .. rack_sel_name(bus_sel) .. " on the Audio bus\n"
   end
+  summary = summary .. "  + EON Output on the Audio bus (Swing's master volume + limiter, linked)" .. string.char(10)
   if want_stepseq then
     summary = summary .. "  + EON StepSeq above Swing (embedded)\n"
   end
@@ -13822,6 +13970,663 @@ end
 -- AUTO-COLOR PADS (CMD 23)
 -- ═════════════════════════════════════════════════════════════════════════════
 
+-- ═════════════════════════════════════════════════════════════════════════════
+-- WIRED (the EON Patchbay loopback) — CMD 41 toggles it on the focused Swing
+--
+-- Per-pad third-party FX on ONE track. Swing emits each pad on its own channel
+-- pair (2..33), the user's plugins sit between Swing and an EON Patchbay that
+-- must be LAST in the chain, and the Patchbay hands the processed audio back
+-- through gmem so Swing can sum it into the main bus BEFORE its master section.
+-- The JSFX side is Swing's slider "Wired" + EON_Patchbay.jsfx;
+-- this is the only place that builds or tears the pair down, so a user never
+-- opens a pin matrix or hunts for the Patchbay in the FX browser.
+-- The mode is called WIRED in every user-facing string: Stereo · Wired · Multi-Out.
+--
+-- ON  = ensure 38 track channels (the multi-out+returns count), add the
+--       Patchbay if missing, move it to the END of the chain, point its
+--       link_slot at this instance's registry slot, flip Swing's switch.
+--       Also repairs a half state (switch on but Patchbay gone, or the reverse).
+-- OFF = flip the switch, delete the Patchbay. The user's own insert plugins are
+--       left exactly where they are -- deleting their FX is not this action's
+--       call, and with the switch off Swing sums internally so they simply
+--       stop hearing anything until switched back on.
+--
+-- The loopback costs exactly one audio buffer (measured, bb72ac5), declared by
+-- Swing as PDC. It is a MIXING feature: leave it off while finger drumming.
+-- ═════════════════════════════════════════════════════════════════════════════
+
+local function eon_find_patchbay(tr)
+  for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
+    local _, nm = reaper.TrackFX_GetFXName(tr, fx, "")
+    if nm:find("EON Patchbay", 1, true) then return fx end
+  end
+  return -1
+end
+
+-- Resolve a Swing param BY NAME. Slider numbers are sparse, so an index derived
+-- from the slider number is the documented way to hit the wrong control.
+local function eon_param_by_name(tr, fx, needle)
+  for i = 0, reaper.TrackFX_GetNumParams(tr, fx) - 1 do
+    local ok, nm = reaper.TrackFX_GetParamName(tr, fx, i, "")
+    if ok and nm:find(needle, 1, true) then return i end
+  end
+  return -1
+end
+
+-- Registry slot for an instance id. The id-1 shortcut diverges after churn
+-- (see the padcat writer above), so this always walks the registry.
+local function eon_reg_slot_of(inst_id)
+  if inst_id <= 0 then return -1 end
+  for s = 0, core.GMEM.GS_INST_REG_MAX - 1 do
+    local id = math.floor(reaper.gmem_read(
+      core.GMEM.GS_INST_REG_BASE + s * core.GMEM.GS_INST_REG_STRIDE
+      + core.GMEM.GS_INST_REG_OFF_ID) or 0)
+    if id == inst_id then return s end
+  end
+  return -1
+end
+
+function rk_ops.do_toggle_wired()
+  local tr, fx = find_swing_track()
+  if not tr then reaper.gmem_write(G.CMD, 0) return end
+
+  local p_on = eon_param_by_name(tr, fx, "Wired (")
+  if p_on < 0 then
+    reaper.ShowConsoleMsg("[EON] This Swing has no Wired control -- " ..
+                          "it predates the Patchbay. Update Swing and try again.\n")
+    reaper.gmem_write(G.CMD, 0) return
+  end
+
+  local on_now = (reaper.TrackFX_GetParam(tr, fx, p_on) or 0) >= 0.5
+  local pb = eon_find_patchbay(tr)
+
+  reaper.Undo_BeginBlock()
+  reaper.PreventUIRefresh(1)
+  local undo_name
+
+  if on_now and pb >= 0 then
+    reaper.TrackFX_SetParam(tr, fx, p_on, 0)
+    reaper.TrackFX_Delete(tr, pb)
+    undo_name = "Swing: Wired OFF"
+  else
+    local inst_id = math.floor(reaper.TrackFX_GetParam(tr, fx, 3) or 0)
+    local slot = eon_reg_slot_of(inst_id)
+    if slot < 0 then
+      reaper.PreventUIRefresh(-1)
+      reaper.Undo_EndBlock("Swing: Wired (no registry slot)", -1)
+      reaper.ShowConsoleMsg("[EON] Swing has not claimed a registry slot yet -- " ..
+                            "give it a moment with the transport running and try again.\n")
+      reaper.gmem_write(G.CMD, 0) return
+    end
+
+    if reaper.GetMediaTrackInfo_Value(tr, "I_NCHAN") < 38 then
+      reaper.SetMediaTrackInfo_Value(tr, "I_NCHAN", 38)
+    end
+
+    if pb < 0 then
+      -- Resolved the same way the STEP SEQ button resolves its JSFX: the
+      -- installer and ReaPack put it under Effects/<index>/EON/Swing/, and a
+      -- bare "JS:EON_Patchbay.jsfx" is only true on a dev machine.
+      local name, _, why = core.jsfx_addname("EON_Patchbay.jsfx", tr, fx)
+      if not name then
+        reaper.PreventUIRefresh(-1)
+        reaper.Undo_EndBlock("Swing: Wired (Patchbay not found)", -1)
+        reaper.ShowConsoleMsg("[EON] Could not locate EON_Patchbay.jsfx: " ..
+                              tostring(why) .. "\n")
+        reaper.gmem_write(G.CMD, 0) return
+      end
+      pb = reaper.TrackFX_AddByName(tr, name, false, -1)
+      if pb < 0 then
+        reaper.PreventUIRefresh(-1)
+        reaper.Undo_EndBlock("Swing: Wired (add failed)", -1)
+        reaper.ShowConsoleMsg("[EON] REAPER refused to add " .. name .. "\n")
+        reaper.gmem_write(G.CMD, 0) return
+      end
+    end
+
+    -- LAST in the chain, always. Anything below it would see zeroed pad
+    -- channels, and anything the user later drops below it is simply a normal
+    -- master insert -- which is fine. Above it is where pad inserts go.
+    local last = reaper.TrackFX_GetCount(tr) - 1
+    if pb ~= last then
+      reaper.TrackFX_CopyToTrack(tr, pb, tr, last, true)
+      pb = last
+    end
+
+    reaper.TrackFX_SetParam(tr, pb, 0, slot)      -- link_slot
+    reaper.TrackFX_SetParam(tr, fx, p_on, 1)
+    undo_name = "Swing: Wired ON"
+  end
+
+  reaper.PreventUIRefresh(-1)
+  reaper.TrackList_AdjustWindows(false)
+  reaper.Undo_EndBlock(undo_name, -1)
+  reaper.gmem_write(G.CMD, 0)
+end
+
+-- CMD 42: flip Wired's tap point on the focused Swing. Kit-wide, a slider the
+-- JSFX reads directly, so this is nothing but a by-name param flip:
+--   0  on the channel  -- pad leaves pre-pan, pan + pre-pan sends on return
+--                         (default; a console insert)
+--   1  on the bus      -- pad leaves post-pan, exactly what a child track hears
+--                         (kept so a plugin moved between a child track and a
+--                          pad insert sounds the same)
+function rk_ops.do_toggle_wired_tap()
+  local tr, fx = find_swing_track()
+  if not tr then reaper.gmem_write(G.CMD, 0) return end
+  local p_tap = eon_param_by_name(tr, fx, "Wired tap point")
+  if p_tap < 0 then
+    reaper.ShowConsoleMsg("[EON] This Swing has no Wired tap point control -- update Swing." .. string.char(10))
+    reaper.gmem_write(G.CMD, 0) return
+  end
+  local on_bus = (reaper.TrackFX_GetParam(tr, fx, p_tap) or 0) >= 0.5
+  reaper.Undo_BeginBlock()
+  reaper.TrackFX_SetParam(tr, fx, p_tap, on_bus and 0 or 1)
+  reaper.Undo_EndBlock(on_bus and "Swing: Wired tap on the channel" or "Swing: Wired tap on the bus", -1)
+  reaper.gmem_write(G.CMD, 0)
+end
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- WIRED -> MULTI-OUT (CMD 43)
+--
+-- Wired and Multi-Out put a pad's plugins at the same point in the signal --
+-- on the pad's own channel pair in Wired, on the pad's own child track in
+-- Multi-Out -- so converting is a MOVE, not a rebuild: every plugin sitting
+-- between Swing and the Patchbay is identified by the pair its input pins read
+-- (Wired: pad N rides channels (N+1)*2, (N+1)*2+1), Wired is switched off, the
+-- normal Multi-Out build runs, and each plugin is moved onto the child track
+-- tagged with its pad, pins reset to the child's stereo pair, chain order kept.
+--
+-- The inventory is taken FIRST, while the pins still mean something: the
+-- moment Wired is off the pairs no longer identify pads. Anything between
+-- Swing and the Patchbay that is not on a pad pair (a master insert on 1/2, an
+-- odd mapping) stays where it is and is named in the summary. The build's own
+-- FX-returns prompt still appears -- it is the Multi-Out build, unchanged.
+--
+-- One honest note in the summary: with the tap ON THE CHANNEL the plugins
+-- were hearing the pad pre-pan; a child track hears it post-pan. Centred pans
+-- sound identical, hard pans will not. Tap ON THE BUS converts losslessly,
+-- which is the reason that tap point exists.
+-- ═════════════════════════════════════════════════════════════════════════════
+
+-- Which pad a Wired insert belongs to, from the track channel its first input
+-- pin reads. -1 for anything not on a pad pair.
+local function eon_wired_pad_of_fx(tr, i)
+  local lo, hi = reaper.TrackFX_GetPinMappings(tr, i, 0, 0)
+  lo = math.floor(lo or 0); hi = math.floor(hi or 0)
+  local ch = -1
+  if lo ~= 0 then
+    for b = 0, 31 do if lo & (1 << b) ~= 0 then ch = b break end end
+  elseif hi ~= 0 then
+    for b = 0, 31 do if hi & (1 << b) ~= 0 then ch = 32 + b break end end
+  end
+  if ch < 2 then return -1 end
+  local pad = math.floor(ch / 2) - 1
+  if pad < 0 or pad >= G.NUM_PADS then return -1 end
+  return pad
+end
+
+-- Moving FX shifts every index after it; re-resolve by GUID each time.
+local function eon_fx_index_by_guid(tr, guid)
+  for i = 0, reaper.TrackFX_GetCount(tr) - 1 do
+    if reaper.TrackFX_GetFXGUID(tr, i) == guid then return i end
+  end
+  return -1
+end
+
+-- ...and at any level: a container child answers with its ENCODED index.
+local function eon_fx_index_any(tr, guid)
+  local i = eon_fx_index_by_guid(tr, guid)
+  if i >= 0 or not fxe then return i end
+  for c = 0, reaper.TrackFX_GetCount(tr) - 1 do
+    if fxe.is_container(tr, c) then
+      for k = 0, fxe.container_count(tr, c) - 1 do
+        local e = fxe.container_child(tr, c, k)
+        if e >= 0 and reaper.TrackFX_GetFXGUID(tr, e) == guid then return e end
+      end
+    end
+  end
+  return -1
+end
+
+-- outer: optional { on_done = fn(ok) } from a Build that found Swing in Wired
+-- and handed itself over (see do_build_multiout); fired after the move.
+function rk_ops.do_wired_to_multiout(outer)
+  local tr, fx = find_swing_track()
+  if not tr then reaper.gmem_write(G.CMD, 0) if outer and outer.on_done then outer.on_done(false) end return end
+
+  local p_on  = eon_param_by_name(tr, fx, "Wired (")
+  local p_tap = eon_param_by_name(tr, fx, "Wired tap point")
+  local pb    = eon_find_patchbay(tr)
+  local wired_on = p_on >= 0 and (reaper.TrackFX_GetParam(tr, fx, p_on) or 0) >= 0.5
+  if not wired_on and pb < 0 then
+    eon_notice("Swing is not in Wired, so there is nothing to convert.\n\n" ..
+               "Wired to Multi-Out moves the plugins on each pad's channel pair " ..
+               "onto that pad's own track.", "Wired to Multi-Out")
+    reaper.gmem_write(G.CMD, 0)
+    if outer and outer.on_done then outer.on_done(false) end
+    return
+  end
+  local tap_channel = p_tap >= 0 and (reaper.TrackFX_GetParam(tr, fx, p_tap) or 0) < 0.5
+
+  -- 1) Inventory, while the pins still identify pads.
+  local plan, stay, shells = {}, {}, {}
+  local last = (pb >= 0) and pb or reaper.TrackFX_GetCount(tr)
+  for i = fx + 1, last - 1 do
+    local _, nm = reaper.TrackFX_GetFXName(tr, i, "")
+    local pad = eon_wired_pad_of_fx(tr, i)
+    if pad >= 0 and fxe and fxe.is_container(tr, i) then
+      -- v2: the pad's CONTAINER. Its children move (they carry no pad pins);
+      -- the empty shell is deleted once they are out.
+      for k = 0, fxe.container_count(tr, i) - 1 do
+        local e = fxe.container_child(tr, i, k)
+        local _, cn = reaper.TrackFX_GetFXName(tr, e, "")
+        plan[#plan + 1] = { guid = reaper.TrackFX_GetFXGUID(tr, e), pad = pad, name = cn }
+      end
+      shells[#shells + 1] = reaper.TrackFX_GetFXGUID(tr, i)
+    elseif pad >= 0 then
+      plan[#plan + 1] = { guid = reaper.TrackFX_GetFXGUID(tr, i), pad = pad, name = nm }
+    else
+      stay[#stay + 1] = nm
+    end
+  end
+
+  -- 2) Wired off. Its own undo step, because the build that follows owns its
+  --    own blocks and can park on a dialog.
+  reaper.Undo_BeginBlock()
+  if pb >= 0 then reaper.TrackFX_Delete(tr, pb) end
+  if p_on >= 0 then reaper.TrackFX_SetParam(tr, fx, p_on, 0) end
+  reaper.Undo_EndBlock("Swing: Wired off (converting to Multi-Out)", -1)
+
+  -- 3) The normal Multi-Out build, then the move once it reports done.
+  rk_ops.do_build_multiout({ on_done = function(ok)
+    if not ok then
+      eon_notice("The Multi-Out build did not complete, so nothing was moved.\n\n" ..
+                 "Wired is off and your pad plugins are still on the Swing track -- " ..
+                 "switch Wired back on to keep using them there.", "Wired to Multi-Out")
+      if outer and outer.on_done then outer.on_done(false) end
+      return
+    end
+
+    local child = {}
+    for t in core.iter_all_tracks() do
+      local _, tag = reaper.GetSetMediaTrackInfo_String(t, "P_EXT:EON_PAD_IDX", "", false)
+      if tag ~= "" then child[math.floor(tonumber(tag) or -1)] = t end
+    end
+
+    reaper.Undo_BeginBlock()
+    reaper.PreventUIRefresh(1)
+    local moved, lost = 0, {}
+    for _, item in ipairs(plan) do
+      local src = eon_fx_index_any(tr, item.guid)
+      local dst = child[item.pad]
+      if src >= 0 and dst then
+        local n = reaper.TrackFX_GetCount(dst)
+        reaper.TrackFX_CopyToTrack(tr, src, dst, n, true)
+        -- The child is a stereo track; the Wired pins would point at channels
+        -- it does not have.
+        for io = 0, 1 do
+          reaper.TrackFX_SetPinMappings(dst, n, io, 0, 1, 0)
+          reaper.TrackFX_SetPinMappings(dst, n, io, 1, 2, 0)
+        end
+        moved = moved + 1
+      else
+        lost[#lost + 1] = item.name
+      end
+    end
+    -- the pad containers are empty shells now: take them down
+    for _, g in ipairs(shells) do
+      local ci = eon_fx_index_by_guid(tr, g)
+      if ci >= 0 and fxe and fxe.container_count(tr, ci) == 0 then reaper.TrackFX_Delete(tr, ci) end
+    end
+    reaper.PreventUIRefresh(-1)
+    reaper.TrackList_AdjustWindows(false)
+    reaper.Undo_EndBlock("Swing: Wired to Multi-Out (move pad plugins)", -1)
+
+    local msg = string.format("Moved %d plugin%s onto the pad tracks.",
+                              moved, moved == 1 and "" or "s")
+    if #stay > 0 then
+      msg = msg .. "\n\nLeft on the Swing track (not on a pad's channel pair):\n  " ..
+            table.concat(stay, "\n  ")
+    end
+    if #lost > 0 then
+      msg = msg .. "\n\nCould not place (no track for the pad):\n  " .. table.concat(lost, "\n  ")
+    end
+    if tap_channel and moved > 0 then
+      msg = msg .. "\n\nWired's tap was on the channel, so these plugins were hearing " ..
+            "the pad before its pan. A pad track hears it after the pan: centred pans " ..
+            "sound the same, hard pans will not."
+    end
+    eon_notice(msg, "Wired to Multi-Out")
+    if outer and outer.on_done then outer.on_done(true) end
+  end })
+end
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- MACRO LEARN (CMD 47 — not 46, which is the structural-op undo handshake)
+--
+-- Swing's macro editor pressed LEARN for macro N (master-link record +13).
+-- Listen for the next parameter the user touches on any plugin
+-- (GetTouchedOrFocusedFX) and link it to that macro through REAPER's own
+-- parameter link: on Swing's track the source is Swing's macro slider, on a
+-- pad track it is the EON Macros relay (added on demand). State goes back
+-- through the record: +14 = 1 listening, 2 linked, 3 timed out, 4 wrong
+-- track; +15/+16.. = the linked plugin + parameter, for the editor's caption.
+-- Resolution and the link itself live in rk_lua_core (macro_source /
+-- macro_link) so a probe can exercise them without this loop.
+local ML_REQ, ML_STATE, ML_LEN, ML_NAME = 13, 14, 15, 16
+local ML_BASE, ML_STRIDE = 26005248, 32
+local ML_TIMEOUT = 20
+local macro_learn = nil
+
+local function ml_touch_sig()
+  if not reaper.GetTouchedOrFocusedFX then return nil end
+  local ok, tidx, iidx, _, fxidx, parm = reaper.GetTouchedOrFocusedFX(0)
+  if not ok or iidx ~= -1 then return nil end                 -- take FX: not ours
+  local tr = (tidx == -1) and reaper.GetMasterTrack(0) or reaper.GetTrack(0, tidx)
+  if not tr then return nil end
+  -- The VALUE is part of the signature. "Last touched" has no timestamp, so
+  -- the knob the user wiggled just before pressing LEARN would read as the
+  -- same touch when they wiggle it again -- and never link. A moved knob has
+  -- a new value; that is the edge we listen for.
+  local v = reaper.TrackFX_GetParam(tr, fxidx, parm) or 0
+  return { tr = tr, fx = fxidx, parm = parm,
+           key = reaper.GetTrackGUID(tr) .. ":" .. tostring(fxidx) .. ":" .. tostring(parm)
+                 .. ":" .. string.format("%.6f", v) }
+end
+
+local function ml_write_name(b, s)
+  s = s or ""
+  local n = math.min(16, #s)
+  reaper.gmem_write(b + ML_LEN, n)
+  for i = 1, n do reaper.gmem_write(b + ML_NAME + i - 1, s:byte(i)) end
+end
+
+function rk_ops.do_macro_learn()
+  local tr, fx = find_swing_track()
+  if not tr then reaper.gmem_write(G.CMD, 0) return end
+  local inst = math.floor(reaper.TrackFX_GetParam(tr, fx, 3) or 0)
+  local slot = eon_reg_slot_of(inst)
+  if not slot or slot < 0 then reaper.gmem_write(G.CMD, 0) return end
+  local b = ML_BASE + slot * ML_STRIDE
+  local macro = math.floor(reaper.gmem_read(b + ML_REQ) or 0)
+  if macro < 1 or macro > 8 then reaper.gmem_write(G.CMD, 0) return end
+  local sig = ml_touch_sig()
+  macro_learn = { tr = tr, fx = fx, band = b, macro = macro,
+                  base = sig and sig.key or "", t0 = reaper.time_precise() }
+  ml_write_name(b, "")
+  reaper.gmem_write(b + ML_STATE, 1)
+  reaper.gmem_write(G.CMD, 0)
+end
+
+function eon_macro_learn_tick()
+  local L = macro_learn
+  if not L then return end
+  if not reaper.ValidatePtr2(0, L.tr, "MediaTrack*") then macro_learn = nil return end
+  if reaper.time_precise() - L.t0 > ML_TIMEOUT then
+    reaper.gmem_write(L.band + ML_STATE, 3)
+    macro_learn = nil
+    return
+  end
+  local sig = ml_touch_sig()
+  if not sig or sig.key == L.base then return end
+  -- Touching Swing itself, or a relay, is not a target: keep listening.
+  local _, tgt_name = reaper.TrackFX_GetFXName(sig.tr, sig.fx, "")
+  tgt_name = tgt_name or ""
+  if reaper.GetTrackGUID(sig.tr) == reaper.GetTrackGUID(L.tr) and sig.fx == L.fx then return end
+  if tgt_name:find("EON Macros", 1, true) then return end
+  local src_fx, src_param = core.macro_source(sig.tr, L.macro, L.tr, L.fx, sig.fx)
+  if not src_fx then
+    ml_write_name(L.band, tostring(src_param))
+    reaper.gmem_write(L.band + ML_STATE, 4)
+    macro_learn = nil
+    return
+  end
+  local ok = core.macro_link(sig.tr, sig.fx, sig.parm, src_fx, src_param)
+  local _, pname = reaper.TrackFX_GetParamName(sig.tr, sig.fx, sig.parm, "")
+  local short = tgt_name:gsub("^[A-Z0-9]+: ", ""):gsub(" %(.-%)$", "")
+  ml_write_name(L.band, (short:sub(1, 7) .. " " .. (pname or "")):sub(1, 16))
+  reaper.gmem_write(L.band + ML_STATE, ok and 2 or 3)
+  macro_learn = nil
+end
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- MULTI-OUT -> WIRED (CMD 44) -- the collapse
+--
+-- The mirror of CMD 43. Every pad track's plugins move back onto the Swing
+-- track pinned to that pad's Wired pair, chain order kept; the pad tracks, any
+-- return tracks and the Audio sub-folder are deleted; Swing goes back on the
+-- main mix and into Wired with the tap ON THE BUS -- the plugins came from
+-- child tracks, which hear the pad post-pan, so that tap reproduces exactly
+-- what they were hearing.
+--
+-- Three things a pad track holds that a pad insert cannot, handled in order of
+-- how much they cost to get wrong:
+--   * recorded items, sends to other tracks, receives from other tracks --
+--     REFUSED outright, nothing changed, each named. A deleted track is not
+--     undone by a dialog.
+--   * the track's fader -- CARRIED, as a stock Volume plugin at the end of that
+--     pad's insert. Swing's pad fader is pre-insert, so it cannot hold this
+--     value without changing what the plugins hear.
+--   * the track's pan and mute -- NOT carried (Swing's are per pad, on the pad),
+--     named in the summary so the user re-sets them.
+--
+-- Swing is told to leave multi-out by companion CMD 6, addressed to this
+-- instance. That is consumed in Swing's @gfx, so it lands only once the window
+-- is open; meanwhile Wired's own routing takes precedence in @sample and
+-- fx_returns is cleared here, so the audio is right straight away.
+-- ═════════════════════════════════════════════════════════════════════════════
+
+-- Pin a stereo plugin's ins and outs to track channels c, c+1 (0-based).
+-- Channel 32 and up live in the HIGH word of the pin mask (pad 15's pair).
+local function eon_pin_pair(tr, fx, c)
+  local function mask(ch)
+    if ch < 32 then return 1 << ch, 0 end
+    return 0, 1 << (ch - 32)
+  end
+  for io = 0, 1 do
+    local l0, h0 = mask(c);     reaper.TrackFX_SetPinMappings(tr, fx, io, 0, l0, h0)
+    local l1, h1 = mask(c + 1); reaper.TrackFX_SetPinMappings(tr, fx, io, 1, l1, h1)
+  end
+end
+
+function rk_ops.do_multiout_to_wired()
+  local tr, fx = find_swing_track()
+  if not tr then reaper.gmem_write(G.CMD, 0) return end
+
+  -- Multi-Out = sends from Swing to child tracks tagged with their pad.
+  local nsends = reaper.GetTrackNumSends(tr, 0)
+  local child, dests, returns = {}, {}, 0
+  for s = 0, nsends - 1 do
+    local dest = reaper.BR_GetMediaTrackSendInfo_Track(tr, 0, s, 1)
+    if dest then
+      dests[#dests + 1] = dest
+      local _, tag = reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:EON_PAD_IDX", "", false)
+      if tag ~= "" then child[math.floor(tonumber(tag) or -1)] = dest
+      else returns = returns + 1 end
+    end
+  end
+  local npads = 0
+  for _ in pairs(child) do npads = npads + 1 end
+  if npads == 0 then
+    eon_notice("Swing is not in Multi-Out, so there is nothing to collapse.\n\n" ..
+               "Multi-Out to Wired moves each pad track's plugins back onto the Swing " ..
+               "track and removes the pad tracks.", "Multi-Out to Wired")
+    reaper.gmem_write(G.CMD, 0) return
+  end
+
+  -- Guards: refuse, name everything, change nothing.
+  local blockers = {}
+  for pad = 0, G.NUM_PADS - 1 do
+    local ct = child[pad]
+    if ct then
+      local _, nm = reaper.GetSetMediaTrackInfo_String(ct, "P_NAME", "", false)
+      if reaper.CountTrackMediaItems(ct) > 0 then
+        blockers[#blockers + 1] = nm .. " has recorded items on it"
+      end
+      if reaper.GetTrackNumSends(ct, 0) > 0 then
+        blockers[#blockers + 1] = nm .. " sends to another track"
+      end
+      for rcv = 0, reaper.GetTrackNumSends(ct, -1) - 1 do
+        local from = reaper.BR_GetMediaTrackSendInfo_Track(ct, -1, rcv, 0)
+        if from and from ~= tr then
+          blockers[#blockers + 1] = nm .. " receives from another track"
+          break
+        end
+      end
+    end
+  end
+  if #blockers > 0 then
+    eon_notice("Not collapsing -- these would be lost with the pad tracks:\n\n  " ..
+               table.concat(blockers, "\n  ") ..
+               "\n\nMove or remove them, then run Multi-Out to Wired again. Nothing has been changed.",
+               "Multi-Out to Wired")
+    reaper.gmem_write(G.CMD, 0) return
+  end
+
+  -- Inventory, in pad order: every plugin, and the fader / pan / mute the
+  -- track gave it.
+  local plan = {}
+  for pad = 0, G.NUM_PADS - 1 do
+    local ct = child[pad]
+    if ct then
+      local fxs = {}
+      for i = 0, reaper.TrackFX_GetCount(ct) - 1 do fxs[#fxs + 1] = reaper.TrackFX_GetFXGUID(ct, i) end
+      local _, nm = reaper.GetSetMediaTrackInfo_String(ct, "P_NAME", "", false)
+      plan[#plan + 1] = { pad = pad, tr = ct, fx = fxs, name = nm,
+        vol  = reaper.GetMediaTrackInfo_Value(ct, "D_VOL"),
+        pan  = reaper.GetMediaTrackInfo_Value(ct, "D_PAN"),
+        mute = reaper.GetMediaTrackInfo_Value(ct, "B_MUTE") }
+    end
+  end
+
+  reaper.Undo_BeginBlock()
+  reaper.PreventUIRefresh(1)
+
+  -- Pins on channels 32/33 need the channels to exist.
+  if reaper.GetMediaTrackInfo_Value(tr, "I_NCHAN") < 38 then
+    reaper.SetMediaTrackInfo_Value(tr, "I_NCHAN", 38)
+  end
+
+  -- Move, pad by pad, appending to the Swing track -- there is no Patchbay
+  -- yet, so "the end" is exactly where Wired's inserts belong -- pinned to the
+  -- pad's Wired pair. A negative instantiate to AddByName always creates a
+  -- new instance (a positive one would hand back the first Volume already
+  -- on the track and bake every fader into it).
+  local moved, baked, pans, mutes = 0, 0, {}, {}
+  for _, e in ipairs(plan) do
+    local base = (e.pad + 1) * 2
+    -- v2 (REAPER 7): the pad's CONTAINER, named for the pad track, pinned
+    -- once; the plugins go inside with plain pins. Flat + pinned otherwise.
+    local c = -1
+    if fxe and fxe.containers_ok() then c = fxe.ensure_pad_container(tr, e.pad, e.name) end
+    for _, guid in ipairs(e.fx) do
+      local s = eon_fx_index_by_guid(e.tr, guid)
+      if s >= 0 then
+        if c >= 0 then
+          local pos = fxe.container_count(tr, c)
+          reaper.TrackFX_CopyToTrack(e.tr, s, tr, fxe.enc(tr, c, pos), true)
+          local ch = fxe.container_child(tr, c, pos)
+          if ch >= 0 then fxe.pin_stereo(tr, ch) end
+        else
+          local n = reaper.TrackFX_GetCount(tr)
+          reaper.TrackFX_CopyToTrack(e.tr, s, tr, n, true)
+          eon_pin_pair(tr, n, base)
+        end
+        moved = moved + 1
+      end
+    end
+    if math.abs(e.vol - 1.0) > 0.0005 then
+      local vi = -1
+      if c >= 0 then
+        -- inside the container, last: a child, so no pad pins on it
+        local pos = fxe.container_count(tr, c)
+        reaper.TrackFX_AddByName(tr, "utility/volume", false, -1000 - fxe.enc(tr, c, pos))
+        if fxe.container_count(tr, c) <= pos then
+          reaper.TrackFX_AddByName(tr, "JS: Volume Adjustment", false, -1000 - fxe.enc(tr, c, pos))
+        end
+        vi = fxe.container_child(tr, c, pos)
+      else
+        vi = reaper.TrackFX_AddByName(tr, "utility/volume", false, -1)
+        if vi < 0 then vi = reaper.TrackFX_AddByName(tr, "JS: Volume Adjustment", false, -1) end
+      end
+      if vi >= 0 then
+        local db = (e.vol > 0) and (20 * math.log(e.vol, 10)) or -150
+        db = math.max(-150, math.min(150, db))
+        reaper.TrackFX_SetParam(tr, vi, 0, db)
+        reaper.TrackFX_SetNamedConfigParm(tr, vi, "renamed_name",
+                                          string.format("%s fader (%+.1f dB)", e.name, db))
+        if c >= 0 then fxe.pin_stereo(tr, vi) else eon_pin_pair(tr, vi, base) end
+        baked = baked + 1
+      end
+    end
+    if math.abs(e.pan) > 0.001 then
+      pans[#pans + 1] = string.format("%s (pan %+d%%)", e.name, math.floor(e.pan * 100 + 0.5))
+    end
+    if e.mute > 0 then mutes[#mutes + 1] = e.name end
+  end
+
+  -- Tear down: Swing's sends, then every destination (pad tracks and any
+  -- return tracks) and the Audio sub-folder, highest index first so nothing
+  -- shifts under the loop.
+  for s = nsends - 1, 0, -1 do reaper.RemoveTrackSend(tr, 0, s) end
+  local del = {}
+  for _, d in ipairs(dests) do del[#del + 1] = d end
+  local sub = find_audio_subfolder(tr)
+  if sub then del[#del + 1] = sub end
+  table.sort(del, function(a, b)
+    return reaper.GetMediaTrackInfo_Value(a, "IP_TRACKNUMBER") >
+           reaper.GetMediaTrackInfo_Value(b, "IP_TRACKNUMBER")
+  end)
+  for _, d in ipairs(del) do reaper.DeleteTrack(d) end
+
+  -- Swing back on the main mix; the reverb and delay fold inside again.
+  reaper.SetMediaTrackInfo_Value(tr, "B_MAINSEND", 1)
+  local p_ret = eon_param_by_name(tr, fx, "FX Returns")
+  if p_ret >= 0 then reaper.TrackFX_SetParam(tr, fx, p_ret, 0) end
+  if folder_layout and folder_layout.EnsureSwingParentLayout then
+    folder_layout.EnsureSwingParentLayout(tr)
+  end
+
+  reaper.PreventUIRefresh(-1)
+  reaper.TrackList_AdjustWindows(false)
+  reaper.Undo_EndBlock("Swing: Multi-Out to Wired", -1)
+
+  -- Swing leaves multi-out (companion CMD 6, addressed to this instance) ...
+  local inst_id = math.floor(reaper.TrackFX_GetParam(tr, fx, 3) or 0)
+  if G.GS_COMPANION_TARGET then reaper.gmem_write(G.GS_COMPANION_TARGET, inst_id) end
+  reaper.gmem_write(G.GS_COMPANION_CMD, 6)
+
+  -- ... and enters Wired with the tap on the bus. do_toggle_wired sees the
+  -- switch off and no Patchbay, so it takes the ON branch: 38 channels, the
+  -- Patchbay appended LAST -- below every insert just moved -- and the switch.
+  local p_tap = eon_param_by_name(tr, fx, "Wired tap point")
+  if p_tap >= 0 then reaper.TrackFX_SetParam(tr, fx, p_tap, 1) end
+  rk_ops.do_toggle_wired()
+
+  local msg = string.format(
+    "Moved %d plugin%s from %d pad track%s onto the Swing track and removed the tracks.\n" ..
+    "Wired is on, tap on the bus.",
+    moved, moved == 1 and "" or "s", npads, npads == 1 and "" or "s")
+  if baked > 0 then
+    msg = msg .. string.format(
+      "\n\n%d pad fader%s not at 0 dB now ride%s as a Volume plugin at the end of that pad's insert.",
+      baked, baked == 1 and "" or "s", baked == 1 and "s" or "")
+  end
+  if #pans > 0 then
+    msg = msg .. "\n\nPans on the pad tracks are not carried over -- set them on Swing's pads:\n  " ..
+          table.concat(pans, "\n  ")
+  end
+  if #mutes > 0 then
+    msg = msg .. "\n\nThese tracks were muted; the pads are not:\n  " .. table.concat(mutes, "\n  ")
+  end
+  if returns > 0 then
+    msg = msg .. string.format("\n\n%d return track%s removed -- the reverb and delay are back inside Swing.",
+                               returns, returns == 1 and " was" or "s were")
+  end
+  eon_notice(msg, "Multi-Out to Wired")
+end
+
 function rk_ops.do_auto_color()
   local colored = 0
   for i = 0, G.NUM_PADS - 1 do
@@ -13867,14 +14672,26 @@ end
 -- this chunk runs at Lua's 200-local ceiling (same helper rides in every EON
 -- self-registering script).
 function eon_write_startup(path, content)
-  local tmp = path .. ".eon-tmp"
+  local tmp, prev = path .. ".eon-tmp", path .. ".eon-prev"
   local f = io.open(tmp, "w")
   if not f then return false end
   local wok = f:write(content)
   local cok = f:close()
   if not wok or not cok then os.remove(tmp) return false end
-  os.remove(path)                    -- Windows os.rename won't overwrite
-  return os.rename(tmp, path) and true or false
+  -- Windows os.rename won't overwrite, so the old file steps aside first --
+  -- and steps back if the new one cannot take its place. Nothing is ever
+  -- deleted before the replacement is in (2026-09-07: the old remove-then-
+  -- rename left the shared file GONE whenever the rename failed, e.g. an
+  -- antivirus hold on the freshly written tmp file).
+  os.remove(prev)
+  local had_old = os.rename(path, prev)
+  if os.rename(tmp, path) then
+    os.remove(prev)
+    return true
+  end
+  if had_old then os.rename(prev, path) end
+  os.remove(tmp)
+  return false
 end
 
 local function self_register()
@@ -13942,7 +14759,10 @@ local function self_register()
     "  local p=reaper.GetResourcePath()..\"/Scripts/__startup.lua\"\n" ..
     "  local f=io.open(p,'r'); if f then local c=f:read('*a'); f:close()\n" ..
     "    c=c:gsub('\\n?%-%- EON:" .. SCRIPT_NAME .. " BEGIN.-%-%- EON:" .. SCRIPT_NAME .. " END\\n?','')\n" ..
-    "    local fw=io.open(p,'w'); if fw then fw:write(c); fw:close() end end\n" ..
+    "    local t,b=p..'.eon-tmp',p..'.eon-prev'; local fw=io.open(t,'w'); local ok=false\n" ..
+    "    if fw then ok=fw:write(c) and true or false; if not fw:close() then ok=false end end\n" ..
+    "    if ok then os.remove(b); local h=os.rename(p,b); if os.rename(t,p) then os.remove(b) elseif h then os.rename(b,p) end end\n" ..
+    "    os.remove(t) end\n" ..
     "  reaper.SetExtState('" .. SCRIPT_NAME .. "','" .. SCRIPT_NAME .. "_registered_v3','',true)\n" ..
     "end end\n" ..
     marker .. " END\n"
@@ -17343,8 +18163,15 @@ function eon_sidecar_ensure_ok(swing)
   if not swing.guid or swing.guid == "" then return false end
   local dest = get_sidecar_path(swing.guid)
   if not dest then return false end          -- unsaved project: no sidecar home
-  if eon_sidecar_plausible(dest) then return true end
   local src = kit_sources[swing.guid]
+  if eon_sidecar_plausible(dest) then
+    -- Present -- but is it the CURRENT kit? A plausible recorded source of a
+    -- different size means a kit landed since this copy was made and the
+    -- project has not been saved yet. The JSFX writes a marker-only save on
+    -- this verdict (AUTO, 2026-09-08), so refresh the copy first; until the
+    -- copy lands the verdict stays 0 and the JSFX embeds as before.
+    if not (eon_sidecar_plausible(src) and _file_size(src) ~= _file_size(dest)) then return true end
+  end
   if not eon_sidecar_plausible(src) and swing.tr
      and reaper.ValidatePtr2(0, swing.tr, "MediaTrack*") then
     local _, p2 = reaper.GetSetMediaTrackInfo_String(swing.tr, "P_EXT:swing_kit_src", "", false)
@@ -17352,7 +18179,10 @@ function eon_sidecar_ensure_ok(swing)
   end
   if eon_sidecar_plausible(src) and file_copy(src, dest)
      and eon_sidecar_plausible(dest) then
-    reaper.ShowConsoleMsg(("[EON sidecar] restored %s\n  from %s\n"):format(dest, src))
+    -- Loader log, not the console: this now also fires on every kit switch in
+    -- a named project (the refresh above), and ShowConsoleMsg would pop the
+    -- console window at a customer each time.
+    eon_load_report(("sidecar written: %s <- %s"):format(dest, src))
     return true
   end
   return false
@@ -18204,7 +19034,11 @@ function eon_perf_tick_end()
   if now - P.w0 >= 5.0 then eon_perf_flush(now) end
 end
 
-local function poll()
+-- The per-tick body. GLOBAL (200-local-limit escape hatch, same as
+-- poll_layer_export) so the guarded loop below can call it without spending
+-- a top-level local. Everything that used to be poll() is in here unchanged;
+-- only the exit_req check and the re-arm moved out to the wrapper.
+function _eon_poll_body()
   eon_perf_tick_begin()                 -- perf profiler (no-op unless armed)
   eon_perf_mark("loader")
   -- EON Loader protocol v1 — file-based external sample loader
@@ -18508,7 +19342,12 @@ local function poll()
       -- kit-undo snapshot silently never existed). Backfill from the live
       -- gmem name here — the one site both silent paths flow through.
       pending_export.kit_name = pending_export.kit_name or read_kit_name_from_gmem()
-      local ok = pcall(write_kit_v4, pending_export.filepath, pending_export, true)
+      -- A dump that hit the export band's ceiling (GS_EXPORT_OVER, see
+      -- do_export_write_file) is partial: a snapshot written from it would
+      -- restore silent pads. Skip the write — no undo coverage for this op,
+      -- exactly like a failed write — and still advance + ack below.
+      local over = math.floor(reaper.gmem_read(G.GS_EXPORT_OVER) or 0) ~= 0
+      local ok = (not over) and pcall(write_kit_v4, pending_export.filepath, pending_export, true)
       if ok and kit_undo_job then kit_undo_avail[kit_undo_job.guid] = pending_export.filepath end
       pending_export = nil
       if kit_undo_job then
@@ -18704,6 +19543,20 @@ local function poll()
   -- Routing ops
   elseif cmd == 40 then
     rk_ops.do_build_multiout()
+  elseif cmd == 41 then
+    rk_ops.do_toggle_wired()
+  elseif cmd == 42 then
+    rk_ops.do_toggle_wired_tap()
+  elseif cmd == 43 then
+    rk_ops.do_wired_to_multiout()
+  elseif cmd == 44 then
+    rk_ops.do_multiout_to_wired()
+  elseif cmd == 47 then
+    -- Macro LEARN. ⛔ Was 46, which is the structural-op undo handshake
+    -- (handler further down): this branch sat first in the chain and ate
+    -- every Clear Pad / Clear Layer / New Kit / swap request, so those ops
+    -- waited forever for an UNDO_ACK that never came (2026-09-08).
+    rk_ops.do_macro_learn()
 
   -- UI ops
   elseif cmd == 45 then
@@ -19513,17 +20366,44 @@ local function poll()
   pcall(eon_floatter_ensure_tick)
   -- Start the FX picker bridge if no one else has (once per session).
   pcall(eon_fxpick_ensure_tick)
+  -- Macro LEARN: link the next touched plugin parameter to a Swing macro.
+  pcall(eon_macro_learn_tick)
   -- StepSeq SETTINGS: Open Swing / Drum Matrix command buttons.
   pcall(eon_ss_commands_tick)
   -- Toolbar lit-state for the EON toggle buttons (Grid/Paint/StepSeq/PadFX/Media/Browser).
   pcall(eon_update_toggle_states)
 
   eon_perf_tick_end()                   -- perf profiler window close (no-op unless armed)
-  -- Ops: graceful self-exit for headless bridge restarts (dev workflow — the
+end
+
+-- The defer loop, with the fault boundary the body never had. The subsystems
+-- inside the body are pcall'd one by one, but the body itself was bare: one
+-- uncaught error anywhere in it ended the defer chain and the bridge died
+-- silently -- audio kept running while every bridge-side feature (kit loads,
+-- browser drops, routing, strip sync) went quiet until the action was run
+-- again. Now the tick runs under xpcall, a fault is reported to the console
+-- (once per distinct message, at most one print per 3 s, with a running
+-- count so throttled repeats are still accounted for) and the loop re-arms.
+-- State lives in three bare globals (_poll_fault_*), the _ident_active idiom.
+local function poll()
+  local ok, err = xpcall(_eon_poll_body, debug.traceback)
+  if not ok then
+    err = tostring(err)
+    _poll_fault_n = (_poll_fault_n or 0) + 1
+    local now = reaper.time_precise()
+    if err ~= _poll_fault_msg and (not _poll_fault_t or now - _poll_fault_t >= 3.0) then
+      _poll_fault_msg, _poll_fault_t = err, now
+      reaper.ShowConsoleMsg("[Swing] bridge tick error (#" .. _poll_fault_n ..
+                            ", loop kept alive):\n" .. err .. "\n")
+    end
+  end
+  -- Ops: graceful self-exit for headless bridge restarts (dev workflow -- the
   -- Lua source has no hot-reload). Set ExtState EON_Bridge/exit_req=1: the
   -- loop ends WITHOUT re-arming, so the script terminates through atexit
   -- (BRIDGE_ALIVE -> 0, temp sweeps, courier cleanup) with no ReaScript
   -- task-control dialog. A restarter then just runs the bridge action again.
+  -- Sits OUTSIDE the guarded body so a restart is honored even while the
+  -- body faults on every tick.
   if reaper.GetExtState("EON_Bridge", "exit_req") == "1" then
     reaper.SetExtState("EON_Bridge", "exit_req", "", false)
     reaper.ShowConsoleMsg("[Swing] bridge exit_req honored — exiting cleanly (restart via action)\n")

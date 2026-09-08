@@ -1,0 +1,65 @@
+// rk_swing_patchbay.jsfx-inc — shared map for the pad-insert loopback.
+//
+// Imported by BOTH sides so the protocol exists in exactly one place:
+//   producer — EON_Patchbay.jsfx, last in a Swing chain
+//   consumer — Swing_ReaKit.jsfx, draining at the top of its next block
+//
+// WHY A LOOPBACK AT ALL
+//   Swing's master section (EQ, saturation, compressor, master volume,
+//   limiter) reads and writes spl(0)/spl(1) only. A pad routed to any other
+//   bus exits raw. That is fine when the destination is a child track with its
+//   own processing, but it is exactly wrong when the user wants their own
+//   compressor on the snare AND Swing's master bus — today that costs them the
+//   master bus without saying so.
+//
+//   So the pad leaves on its own channel pair, the user's plugin processes it,
+//   and this ring hands it back to Swing one block later, early enough to be
+//   summed in BEFORE the master section. One track, sixteen pads, each with a
+//   real plugin chain, all still hitting the master bus.
+//
+// TIMING
+//   The round trip is exactly ONE block — measured, not assumed
+//   (.dev_tests/EON_Probe_ChainRT_*, 2026-09-06: max delay equalled max block
+//   size to the sample). A latent plugin sitting between Swing and the
+//   Patchbay adds exactly its own reported PDC on top, which is a readable
+//   constant rather than a silent smear.
+//
+//   Every pad takes the identical path, so pads stay aligned with EACH OTHER
+//   for free. Alignment with the rest of the project is Swing's job, via PDC.
+//
+// CHANNEL LAYOUT
+//   Pad N rides track channels (N+1)*2 and (N+1)*2+1 — channels 2..33 for pads
+//   0..15. Channels 0/1 are deliberately left clear: they are what the drained
+//   ring is summed INTO, and a pad sharing them would arrive undelayed and flam
+//   against the fifteen that did make the trip.
+
+@init
+
+// ── gmem band (claimed in .refs/gmem_regions_supplement.tsv) ───────────────
+PATCH_BASE          = 26804224;   // 409 * 65536, block-aligned
+PATCH_INST_STRIDE   = 262144;     // 4 blocks per instance slot
+PATCH_HEADER_SLOTS  = 256;
+PATCH_CHANS         = 32;         // 16 pads, stereo
+PATCH_FRAMES        = 8184;       // (262144 - 256) / 32 — any buffer up to 8184
+
+// Header offsets
+PATCH_OFF_WPOS  = 0;   // producer (Patchbay) writes
+PATCH_OFF_RPOS  = 1;   // consumer (Swing) writes
+PATCH_OFF_HB    = 2;   // producer bumps once per block
+PATCH_OFF_OWNER = 3;   // slot echo, so a mis-set link_slot is visible
+PATCH_OFF_NCH   = 4;   // channels the producer actually moved
+PATCH_OFF_CONS_HB = 5; // consumer (Swing) bumps once per LIVE block: the Patchbay's "Swing is reading" lamp
+
+// First pad channel. Pads start at track channel 2 — see CHANNEL LAYOUT above.
+PATCH_CH0 = 2;
+
+// A producer that has not bumped its heartbeat for this many consumer blocks is
+// treated as gone, and Swing falls back to summing pads internally. Generous on
+// purpose: going silent because a heartbeat was a beat late would be a far worse
+// failure than carrying on with the loopback for a few extra blocks.
+PATCH_HB_STALL_MAX = 16;
+
+function swing_patch_base(slot) global(PATCH_BASE, PATCH_INST_STRIDE)
+(
+  PATCH_BASE + slot * PATCH_INST_STRIDE;
+);

@@ -583,7 +583,35 @@ local function scan_structure()
                   local dest = reaper.BR_GetMediaTrackSendInfo_Track(tr, 0, s, 1)
                   if dest then
                     local ch = inst.children[pad]
-                    local fxidx, pmap, was_new = ensure_strip(dest)
+                    -- A strip the USER took out stays out. A tracked strip
+                    -- (guid mark) that is gone while no strip at all is on the
+                    -- track was removed on purpose -- REAPER's FX window or the
+                    -- picker's swap -- so remember that instead of re-adding
+                    -- it. Putting one back by hand lifts the mark. A pad with
+                    -- no strip leaves inst.children: Swing processes that pad's
+                    -- FX, gain and pan itself (per-pad takeover mask below).
+                    local _, removed = reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:eon_strip_user_removed", "", false)
+                    local sname0 = strip_addname(dest, 0)
+                    local has_strip = sname0 and reaper.TrackFX_AddByName(dest, sname0, false, 0) >= 0
+                    if removed ~= "1" then
+                      local _, g0 = reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:eon_strip_guid", "", false)
+                      -- sname0 nil = the JSFX could not even be located, so
+                      -- "no strip found" proves nothing: never mark on that.
+                      if sname0 and g0 ~= "" and not has_strip and find_fx_by_guid(dest, g0) < 0 then
+                        reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:eon_strip_user_removed", "1", true)
+                        removed = "1"
+                        DBG(string.format("[strip_sync] pad %d: Drum Strip removed by the user -- not re-adding\n", pad))
+                      end
+                    elseif has_strip then
+                      reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:eon_strip_user_removed", "", true)
+                      removed = ""
+                    end
+                    local fxidx, pmap, was_new
+                    if removed == "1" then
+                      inst.report = inst.report .. string.format("  pad %d: no strip (removed by the user) -- Swing processes it\n", pad)
+                    else
+                      fxidx, pmap, was_new = ensure_strip(dest)
+                    end
                     if not fxidx then
                       inst.report = inst.report .. string.format("  pad %d: SKIPPED — %s\n", pad, tostring(pmap))
                     end
@@ -644,6 +672,12 @@ local function scan_structure()
               end
             end
             inst.hb_ok = next(inst.children) ~= nil
+            -- Per-pad takeover mask: bit i = pad i has a live strip. Swing
+            -- keeps the pads that are NOT in it processing internally, so a
+            -- pad whose strip the user replaced never goes dry.
+            local mask = 0
+            for pad in pairs(inst.children) do mask = mask | (1 << pad) end
+            reaper.gmem_write(inst.band + G.GS_STRIP_OFF_ALIVE_MASK, mask)
             local n = 0; for _ in pairs(inst.children) do n = n + 1 end
             local rep = string.format("[strip_sync] inst %d: multi-out, %d/%d strips ready%s\n",
               id, n, NUM_PADS, inst.hb_ok and " — takeover LIVE" or " — idle (no strips)") .. inst.report
@@ -654,6 +688,7 @@ local function scan_structure()
           else
             inst.children = {}
             inst.hb_ok = false
+            reaper.gmem_write(inst.band + G.GS_STRIP_OFF_ALIVE_MASK, 0)
             local rep = string.format("[strip_sync] inst %d: not multi-out — idle\n", id)
             if rep ~= inst.last_report then
               inst.last_report = rep
@@ -988,14 +1023,26 @@ end
 -- only once the new content is fully on disk under `path`. Global on purpose:
 -- same helper as the other EON self-registering scripts.
 function eon_write_startup(path, content)
-  local tmp = path .. ".eon-tmp"
+  local tmp, prev = path .. ".eon-tmp", path .. ".eon-prev"
   local f = io.open(tmp, "w")
   if not f then return false end
   local wok = f:write(content)
   local cok = f:close()
   if not wok or not cok then os.remove(tmp) return false end
-  os.remove(path)                    -- Windows os.rename won't overwrite
-  return os.rename(tmp, path) and true or false
+  -- Windows os.rename won't overwrite, so the old file steps aside first --
+  -- and steps back if the new one cannot take its place. Nothing is ever
+  -- deleted before the replacement is in (2026-09-07: the old remove-then-
+  -- rename left the shared file GONE whenever the rename failed, e.g. an
+  -- antivirus hold on the freshly written tmp file).
+  os.remove(prev)
+  local had_old = os.rename(path, prev)
+  if os.rename(tmp, path) then
+    os.remove(prev)
+    return true
+  end
+  if had_old then os.rename(prev, path) end
+  os.remove(tmp)
+  return false
 end
 
 -- ── Self-register as startup action (one-time, first manual run) ──────────
@@ -1041,7 +1088,10 @@ local function self_register()
     "  local p=reaper.GetResourcePath()..\"/Scripts/__startup.lua\"\n" ..
     "  local f=io.open(p,'r'); if f then local c=f:read('*a'); f:close()\n" ..
     "    c=c:gsub('\\n?%-%- EON:" .. SCRIPT_NAME .. " BEGIN.-%-%- EON:" .. SCRIPT_NAME .. " END\\n?','')\n" ..
-    "    local fw=io.open(p,'w'); if fw then fw:write(c); fw:close() end end\n" ..
+    "    local t,b=p..'.eon-tmp',p..'.eon-prev'; local fw=io.open(t,'w'); local ok=false\n" ..
+    "    if fw then ok=fw:write(c) and true or false; if not fw:close() then ok=false end end\n" ..
+    "    if ok then os.remove(b); local h=os.rename(p,b); if os.rename(t,p) then os.remove(b) elseif h then os.rename(b,p) end end\n" ..
+    "    os.remove(t) end\n" ..
     "  reaper.SetExtState('" .. SCRIPT_NAME .. "','" .. key .. "','',true)\n" ..
     "end end\n" ..
     marker .. " END\n"

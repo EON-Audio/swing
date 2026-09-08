@@ -64,6 +64,15 @@ M.CAT.build = {
   -- drum carrying both), so it needs Multi-Out first and replaces MIDI Lanes,
   -- not Multi-Out. Listed last so the three classic layouts keep their order.
   { "Merged (1 track/drum)", "EON_Swing_BuildMerged.lua" },
+  -- Wired is the one-track alternative to all of the above: third-party FX
+  -- on individual pads WITHOUT child tracks, pads still hitting Swing's master
+  -- bus (Stereo · Wired · Multi-Out). A toggle, not a build -- it adds or
+  -- removes the EON Patchbay at the end of the Swing chain. Costs one audio
+  -- buffer while on.
+  { "Wired (toggle)",        "EON_Swing_ToggleWired.lua" },
+  { "Wired tap: channel / bus", "EON_Swing_WiredTapPoint.lua" },
+  { "Wired to Multi-Out",     "EON_Swing_WiredToMultiOut.lua" },
+  { "Multi-Out to Wired",     "EON_Swing_MultiOutToWired.lua" },
 }
 
 M.CAT.kit = {

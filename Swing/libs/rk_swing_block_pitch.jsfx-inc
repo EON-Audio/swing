@@ -201,6 +201,12 @@ local(_ar_base _ar_i)
   );
 );
 
+// EEL2 loop()/while() silently stop at 2^20 = 1,048,576 iterations (wiki 01
+// §1.7): a loop that reaches the cap just ends, no error. Cell copies whose
+// count can reach SLOT_SIZE (4,000,000) run in pieces of at most this many
+// cells — half the cap.
+SP_SWAP_CHUNK = 524288;
+
 // ─── CMD 65 — single-pad audio swap (Tuned-mode bake injection) ─────────
 // The Lua bridge's poll_pitch_bake_results fires this CMD after writing
 // a freshly baked WAV's audio to gmem (via load_audio_to_pad). Unlike the
@@ -223,7 +229,7 @@ local(_ar_base _ar_i)
 // bakes the length equals the source length (Signalsmith preserves
 // duration at rate_ratio=1.0), so audio_off for other pads doesn't shift.
 function swing_pad_audio_swap()
-local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j)
+local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j, _sp_n)
 (
   _bl_inflight = 1;   // double-dispatch latch (2026-07-27; see rk_swing_browser_load)
   _sp_pad = gmem[KIT_GMEM_PARAM1] | 0;
@@ -248,11 +254,20 @@ local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j)
       );
       // Payload staged at AUDIO+0 (single transient staging, one swap per
       // bridge tick — same as CMD 67).
+      // Chunked: _sp_len runs up to SLOT_SIZE = 4,000,000 and a single
+      // loop(_sp_len) stopped at the 2^20 cap — the first 1,048,576 cells
+      // arrived, s_len below still claimed the full length, and the tail kept
+      // the old pre-bake audio (fix 2026-09-08). Outer while over pieces of at
+      // most SP_SWAP_CHUNK cells (at most 8 passes), inner loop per piece. The
+      // staging protocol (payload at AUDIO+0, length via NAMELEN) is unchanged.
       _sp_dst = s_audio_start + _sp_pad * SLOT_SIZE;
       _sp_j = 0;
-      loop(_sp_len,
-        _sp_dst[_sp_j] = gmem[KIT_GMEM_AUDIO + _sp_j];
-        _sp_j += 1;
+      while(_sp_j < _sp_len) (
+        _sp_n = min(_sp_len - _sp_j, SP_SWAP_CHUNK);
+        loop(_sp_n,
+          _sp_dst[_sp_j] = gmem[KIT_GMEM_AUDIO + _sp_j];
+          _sp_j += 1;
+        );
       );
       s_len[_sp_pad] = _sp_len;
       // Post-v201 kits deliver every pad as LAYERED (layer_cnt 1) — playback
@@ -329,7 +344,7 @@ local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j)
 // auto-capture (Swing_Kit_Bridge poll_layer_export) reads this during the
 // bake-settle window, before any layer bake lands, so it always sees original.
 function swing_pad_audio_export()
-local(_ep_comb _ep_pad _ep_layer _ep_lidx _ep_len _ep_src _ep_sr _ep_j _ep_ok)
+local(_ep_comb _ep_pad _ep_layer _ep_lidx _ep_len _ep_src _ep_sr _ep_j _ep_ok _ep_n)
 (
   _bl_inflight = 1;   // double-dispatch latch (2026-07-27; see rk_swing_browser_load)
   _ep_comb  = gmem[KIT_GMEM_PARAM1] | 0;
@@ -373,10 +388,19 @@ local(_ep_comb _ep_pad _ep_layer _ep_lidx _ep_len _ep_src _ep_sr _ep_j _ep_ok)
       );
     );
     _ep_len > 0 ? (
+      // Chunked (fix 2026-09-08, same 2^20 cap as CMD 65 above): layer 0
+      // exports s_len, which runs up to SLOT_SIZE = 4,000,000, and a single
+      // loop(_ep_len) stopped at 1,048,576 cells while NPADS below reported
+      // the full length — the bridge's source WAV carried a stale tail. Outer
+      // while over pieces of at most SP_SWAP_CHUNK cells, inner loop per
+      // piece; the return slots and the staging band are unchanged.
       _ep_j = 0;
-      loop(_ep_len,
-        gmem[KIT_GMEM_AUDIO + _ep_j] = _ep_src[_ep_j];
-        _ep_j += 1;
+      while(_ep_j < _ep_len) (
+        _ep_n = min(_ep_len - _ep_j, SP_SWAP_CHUNK);
+        loop(_ep_n,
+          gmem[KIT_GMEM_AUDIO + _ep_j] = _ep_src[_ep_j];
+          _ep_j += 1;
+        );
       );
     );
   );

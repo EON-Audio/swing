@@ -628,7 +628,7 @@ function redo_do() local(ei, pad) (
 
 // ─── Swap two pads (all metadata, FX, layers, audio) ─────────────────────
 function swap_pads(a, b)
-  local(tmp, li, la, lb, j, _swap_len_a, _swap_len_b, _swap_len)
+  local(tmp, li, la, lb, j, _swap_len_a, _swap_len_b, _swap_len, _sw_a, _sw_b, _sw_p, _sw_n)
 (
   a == b ? 0 : (
     udo_struct_begin_swap(a, b);  // Phase 2: self-inverse swap entry (1-level structural undo)
@@ -732,10 +732,20 @@ function swap_pads(a, b)
     _swap_len = max(_swap_len_a, _swap_len_b);
     _swap_len = min(_swap_len, SLOT_SIZE);  // clamp
     _swap_len > 0 ? (
-      // Use _swap_tmp_buf (allocated after send FX memory) for temp storage
-      memcpy(_swap_tmp_buf, s_audio_start + a * SLOT_SIZE, _swap_len);
-      memcpy(s_audio_start + a * SLOT_SIZE, s_audio_start + b * SLOT_SIZE, _swap_len);
-      memcpy(s_audio_start + b * SLOT_SIZE, _swap_tmp_buf, _swap_len);
+      // Chunked three-way swap through _swap_tmp_buf, which is ONE SWAP_CHUNK
+      // (allocated under the undo slot, always backed). The old whole-slot
+      // scratch sat above the backed ceiling; EEL2's memcpy stops at the first
+      // unbacked cell, so long samples lost their tail (2026-09-07 audit).
+      _sw_a = s_audio_start + a * SLOT_SIZE;
+      _sw_b = s_audio_start + b * SLOT_SIZE;
+      _sw_p = 0;
+      while (_sw_p < _swap_len) (
+        _sw_n = min(SWAP_CHUNK, _swap_len - _sw_p);
+        memcpy(_swap_tmp_buf, _sw_a + _sw_p, _sw_n);
+        memcpy(_sw_a + _sw_p, _sw_b + _sw_p, _sw_n);
+        memcpy(_sw_b + _sw_p, _swap_tmp_buf, _sw_n);
+        _sw_p += _sw_n;
+      );
     );
 
     // NOTE: pad name strings must be swapped by caller (get_cname_slot defined in main file)
