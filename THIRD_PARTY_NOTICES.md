@@ -30,7 +30,14 @@ shoulders. Everything not listed here is (c) EON Studios and covered by
   [ReaImGui](https://github.com/cfillion/reaimgui) project (LGPL-3.0).
   Bundled so Swing's dialogs bind to the ReaImGui extension you install via
   ReaPack; the extension itself is a separate install, not part of this
-  package.
+  package. Swing binds API version 0.9.3.2 (the shim ships unmodified from
+  that release line).
+- **megababy** v3 by jnif, with the community modifications by NandyC ("nm"),
+  ajaym (Akai/APC support) and prbmod (probability) — the step-sequencer
+  engine that Steppa (`Swing/EON_StepSeq.jsfx`) was forked from, shared on
+  the REAPER forum. Forked with thanks and credited here; the EON fork adds
+  the Swing kit sync, the pattern library, dock mode, CC lanes, the song
+  and section sync, and the EON UI.
 - **REAPER Toolkit (rtk)** by Jason Tackaberry — MIT
   ([reapertoolkit.dev](https://reapertoolkit.dev)). No longer used by Swing;
   `Scripts/rtk.lua` stays fetchable for a while so older cached package

@@ -1021,14 +1021,23 @@ function swing_panels_draw_mixer() (
     _mix_ins_h  = _mix_g_ins
       ? (con_ins_full ? (_mix_ins_n * (_mix_ins_sh + 2) - 2) : 16) : 0;
     _mix_pill_y  = _mix_ind_y;
-    _mix_ins_y   = _mix_ind_y + _mix_pill_h + _mix_pill_gap;
+    // ⭐ BAND ORDER IS SIGNAL ORDER (2026-09-09). Swing's own FX band sits ABOVE
+    // the inserts because that is the path: the pad runs through its HPF/LPF/EQ/
+    // drive/bitcrush/comp FIRST, and only then leaves on its channel pair through
+    // whatever you pinned in the insert slots (Swing_ReaKit.jsfx: both wired tap
+    // points send _pfx*, post-FX). Until today the strip stacked INS above FX and
+    // read as the exact opposite. The one case this still simplifies is the BUS
+    // tap, where the pad leaves post-pan so the honest order would be FX, PAN,
+    // INS -- said in words in the band's message line rather than by rearranging
+    // the strip under the user.
     _mix_ins_gap = _mix_ins_h > 0 ? 5 : 0;
 
-    _mix_sw_y   = _mix_ins_y + _mix_ins_h + _mix_ins_gap;
+    _mix_sw_y    = _mix_ind_y + _mix_pill_h + _mix_pill_gap;
+    _mix_ins_y   = _mix_sw_y + _mix_sw_h + _mix_sw_gap;
 
     // The knob rows start BELOW both bands: on a desk the channel's own
     // EQ/dynamics sits above the aux sends, not beside them.
-    _mix_rows_y = _mix_sw_y + _mix_sw_h + _mix_sw_gap;
+    _mix_rows_y = _mix_ins_y + _mix_ins_h + _mix_ins_gap;
     _mix_y_pan = _mix_rows_y;
     _mix_y_dly = _mix_rows_y + _mix_nr_pan * (_mix_sl_h + _mix_sl_gap) + _mix_sep_h;
     _mix_y_rvb = _mix_y_dly + (_mix_sl_h + _mix_sl_gap);
@@ -1373,9 +1382,28 @@ function swing_panels_draw_mixer() (
       // ═══ INSERTS: the pad's own REAPER track chain ═══
       // Drawn per strip, but when NOTHING can own a track the band says so
       // ONCE (below the loop) instead of 128 dead boxes explaining nothing.
-      _mix_g_ins && ((_conins_flags & 1) || _conins_stale) && !_conins_oldfmt ?
+      _mix_g_ins && ((_conins_flags & 1) || _conins_stale) && !_conins_oldfmt ? (
         swing_panels_ins_band(_mix_i, _mix_x, _mix_ins_y,
                        _mix_bar_w, _mix_ins_n, _mix_ins_sh, con_ins_full);
+        // ⭐ WIRED OFF = THIS pad's inserts are not in the path (2026-09-09).
+        // In stereo with Wired off a pad never leaves on its own channel pair,
+        // so anything pinned here is silent and a fully lit card says otherwise.
+        // ⚠ Only strips that actually HOLD something: an empty slot with Wired
+        // off is not a lie, it is the invitation -- clicking one is what adds the
+        // plugin AND switches Wired on, so greying it would dim the very control
+        // that fixes the state. First cut veiled the whole band and did exactly
+        // that. Flags, not patch_on/multi_out, so this can never disagree with
+        // the message line below: bit2 = stereo, bit3 = Wired off, and both are
+        // published by the same bridge tick that filled these records.
+        // Painted here rather than inside swing_panels_ins_band because
+        // swing_panels_console_bg is defined AFTER that function, and an EEL2
+        // forward reference is a silent whole-file compile kill (wiki 01).
+        (_conins_flags & 4) && (_conins_flags & 8) && !_conins_stale &&
+        (_conins_buf[_mix_i * CIF_REC + CI_VISN] | 0) > 0 ? (
+          swing_panels_console_bg(0.62);
+          gfx_rect(_mix_x, _mix_ins_y, _mix_bar_w, _mix_ins_h);
+        );
+      );
 
       // ═══ SWING chain band: the channel's own EQ/dynamics section ═══
       _mix_g_sw ? swing_panels_sw_band(_mix_i, _mix_x, _mix_sw_y, _mix_bar_w,
@@ -1937,13 +1965,20 @@ function swing_panels_draw_mixer() (
       gfx_setfont(1, "Arial", 11, 'b');
       (_conins_flags & 8) && _conins_padmax > 0 ? (
         _mix_ink ? gfx_set(0.62, 0.42, 0.06, 0.95) : gfx_set(0.93, 0.68, 0.22, 0.95);
-        _mix_msg = "WIRED is off — these pad inserts are silent. Add a plugin, or OUT > Wired, to switch it on.";
+        _mix_msg = "WIRED is off — the greyed inserts are silent. Switch WIRED on with the button in TOOLS (or OUT > Wired).";
       ) : (_conins_flags & 8) ? (
         _mix_ink ? swing_panels_console_ink(0.55) : gfx_set(0.55, 0.62, 0.68, 0.75);
-        _mix_msg = "Stereo — click a slot to put a plugin on that pad. Wired switches on by itself.";
+        _mix_msg = "Stereo — click a slot to put a plugin on that pad; WIRED switches on with it.";
       ) : (
         _mix_ink ? gfx_set(0.10, 0.45, 0.48, 0.90) : gfx_set(0.35, 0.80, 0.84, 0.75);
-        _mix_msg = "WIRED — pad inserts run on Swing's own track, above the Patchbay.";
+        // The band sits UNDER Swing's own FX band because that is the order the
+        // audio runs in, and the tap point is the one thing the stack cannot
+        // show: on the channel the pad leaves pre-pan, so PAN below is genuinely
+        // after these inserts; on the bus it left post-pan and the honest order
+        // would be FX, PAN, INS. Said here rather than by rearranging the strip.
+        _mix_msg = patch_tap
+          ? "WIRED — inserts run after Swing's FX, post-pan (bus tap: the same point a multi-out track hears)."
+          : "WIRED — inserts run after Swing's FX, pre-pan; the PAN row below is applied on the way back.";
       );
       gfx_measurestr(_mix_msg, tw, th);
       gfx_x = _lcd_cx + _mix_gut + ((_mix_wtot - tw) / 2)|0;

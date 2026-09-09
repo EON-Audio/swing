@@ -23,13 +23,16 @@
 // round-trip per pad, but this avoids CMD=52 colliding with kit-load
 // or other bridge commands the user triggers right after a drag.
 //
-// Undo coverage: opens an Undo_BeginBlock via CMD 46 (UNDO_DESC=3 →
-// "Swing: Load Sample") and runs synchronously. The block is closed by
-// the bridge's leak-timer (10s) — full undo with audio buffer restore
-// requires the v2 internal undo system. Until then, Ctrl+Z restores the
-// path-string metadata via REAPER's chunk diff but the freemem audio
-// buffer stays loaded; pads play the new sample with the old path label
-// after undo. Documented as a known limitation.
+// Undo coverage: the v2 internal undo (undo_begin_pad / undo_cap_end below)
+// captures audio + meta + names for every drop, so Swing's own UNDO restores
+// the whole pad. No REAPER undo point is minted for a drop -- the CMD 46 host
+// block this comment once described was retired -- so Ctrl+Z right after a
+// drop changes nothing (REAPER restores the previous point's snapshot, and
+// an FX whose chunk did not differ between snapshots is not reloaded). When
+// REAPER does reload this FX's chunk (undoing an older point that captured a
+// Swing change), @serialize restores names AND audio together; the old
+// "new sample with the old path label" limitation no longer exists.
+// Measured 2026-09-08: .dev_tests/EON_Probe_Undo_probe.lua, verdicts C + A2.
 
 @init
 // Sliced loads (2026-09-07): the file read is pumped one bounded slice per
@@ -147,7 +150,11 @@ local(_bp_pad, _bp_len, _xf_vi, _ci)
       _bl_job_pending = 0;
       swing_browser_load_pad_done(_bl_job_pad);
     );
-  ) : (
+  ) :
+  // A level-204 Kit Bridge consumes CMD 63 itself and streams the decoded file
+  // (EON_PADPCM, rk_swing_padpcm.jsfx-inc): the job begins on the stream's FIRST
+  // chunk and resumes above. Only an old bridge leaves the file read to us.
+  gmem[EON_PADPCM_HDR + PP_BRIDGE_LEVEL] >= EON_PADPCM_LEVEL ? ( 0; ) : (
   _bp_pad = gmem[GS_BROWSE_PAD]|0;
   _bp_len = gmem[GS_BROWSER_PATH_LEN]|0;
   _bp_pad >= 0 && _bp_pad < NUM_PADS && _bp_len > 0 && _bp_len < GS_BROWSER_PATH_MAX ? (
@@ -262,7 +269,9 @@ local(_bp_pad, _bp_layer, _bp_len, _xf_vi, _ci)
       _bl_job_pending = 0;
       swing_browser_load_layer_done(_bl_job_pad, _bl_job_layer);
     );
-  ) : (
+  ) :
+  // A level-204 Kit Bridge streams CMD 64 too (see swing_browser_load_pad).
+  gmem[EON_PADPCM_HDR + PP_BRIDGE_LEVEL] >= EON_PADPCM_LEVEL ? ( 0; ) : (
   _bp_pad = gmem[GS_BROWSE_PAD]|0;
   _bp_layer = gmem[GS_BROWSE_LAYER]|0;
   _bp_len = gmem[GS_BROWSER_PATH_LEN]|0;

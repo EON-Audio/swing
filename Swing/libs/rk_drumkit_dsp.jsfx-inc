@@ -475,11 +475,36 @@ function undo_commit_gesture() local(p, pushed, k, _changed, _b) (
 // would move get_name_slot earlier, or relocate the engine after core).
 
 // Back up ONE pad's slot (audio + metadata) — the reversible record for a
-// per-pad structural op. Full-slot audio copy (no per-layer offset math, the
-// source of the old last-pad bugs). Scoped: restore touches only this pad.
+// per-pad structural op. The audio copy is addressed from the slot base (no
+// per-layer offset math, the source of the old last-pad bugs), and it runs
+// either up front or a slice at a time -- see the SLICED note below. Scoped:
+// restore touches only this pad.
 function undo_capture_pad(pad) local(l, _li) (
+  _udo_cap_lazy = 0;
   _udo_ready ? (
-    memcpy(udo_s2_audio, s_audio_start + pad * SLOT_SIZE, SLOT_SIZE);
+    // Back up only the cells the pad USES, not the whole 4 M-cell slot: a full-slot
+    // memcpy is 32 MB on the audio thread at every drop (10-40 ms; measured 2026-09-08,
+    // most of what looked like the file-open stall). Plain pad = s_len; layered = the
+    // last layer's region end. The restore copies back the same cells; the length
+    // fields it restores keep everything beyond them unread.
+    _udo_cap_goal = s_len[pad];
+    l = 0; loop(MAX_LAYERS,
+      _li = pad * MAX_LAYERS + l;
+      l_len[_li] > 0 ? _udo_cap_goal = max(_udo_cap_goal, l * LAYER_SIZE + l_len[_li]);
+      l += 1;
+    );
+    _udo_cap_goal = max(0, min(_udo_cap_goal, SLOT_SIZE)) | 0;
+    // SLICED (2026-09-09): a caller that pumps udo_cow_upto before every write into
+    // this slot saves nothing here -- each region is copied out a bounded slice at a
+    // time, in the block before a writer destroys it, so the drop's first block costs
+    // nothing instead of up to 32 MB. Everyone else still gets the copy up front,
+    // because their writers (clear_pad's memsets, the file loader's read) trample the
+    // slot without asking. udo_s2_extent is "cells saved" either way.
+    _udo_cap_lazy = _udo_cap_lazy_req;
+    _udo_cap_lazy ? ( udo_s2_extent = 0; ) : (
+      udo_s2_extent = _udo_cap_goal;
+      udo_s2_extent > 0 ? memcpy(udo_s2_audio, s_audio_start + pad * SLOT_SIZE, udo_s2_extent);
+    );
     undo_pack(udo_st_meta, pad);
     udo_s2_aud[0] = s_len[pad]; udo_s2_aud[1] = s_sr[pad]; udo_s2_aud[2] = p_layer_cnt[pad];
     l = 0; loop(MAX_LAYERS,
@@ -494,6 +519,42 @@ function undo_capture_pad(pad) local(l, _li) (
   // any structural op drops the param branch + pending gestures (1-level rule)
   _udo_uc = 0; _udo_rc = 0;
   l = 0; loop(NUM_PADS, _udo_pend[l] = 0; l += 1;);
+);
+
+// Sliced-capture barrier. "Cells [0, limit) of `pad`'s slot are about to be
+// destroyed" -- this saves whatever the sliced capture has not saved yet, at most
+// one _udo_cow_budget per call, and returns the highest cell the caller may write
+// NOW (exclusive). A caller handed back less than it asked for writes only that
+// much and asks again next block: that throttle IS the mechanism, since a writer
+// that could outrun the backup would leave undo holding half-new audio. Returns
+// `limit` unchanged whenever no sliced capture covers this pad, so every writer
+// that does not participate (and every eagerly-captured load) is untouched.
+//
+// THE INVARIANT the depth test protects: a sliced capture only ever reaches its
+// goal when the whole slot gets destroyed, so after a LAYER drop (or a job the
+// bridge aborted) _udo_cap_lazy can outlive its op with the save incomplete. Both
+// participating writers run INSIDE the structural bracket -- the stream copy
+// between swing_padpcm_begin and the completion half, the zero-tail phase inside
+// swing_ldr_begin_gmem's bracket (closed in swing_ldr_finish) -- and the import
+// tick's leak guard cannot zero the depth under them because a sliced load holds
+// _bl_job_pending the whole time. So requiring an open bracket can only refuse a
+// barrier no live writer is asking for, and it stops a finished op's flag from
+// throttling, or half-extending, an unrelated later one.
+function udo_cow_upto(pad, limit)
+local(_g, _n)
+(
+  (_udo_cap_lazy && _udo_cap_depth > 0 && _udo_st_valid && udo_s2_type == 1 && udo_s2_pad == pad) ? (
+    _g = min(limit, _udo_cap_goal);
+    _g > udo_s2_extent ? (
+      _n = min(_g - udo_s2_extent, _udo_cow_budget);
+      _n > 0 ? (
+        memcpy(udo_s2_audio + udo_s2_extent,
+               s_audio_start + pad * SLOT_SIZE + udo_s2_extent, _n);
+        udo_s2_extent += _n;
+      );
+    );
+    udo_s2_extent >= _g ? limit : udo_s2_extent;
+  ) : limit;
 );
 
 // Per-pad structural op (load/clear/clear-layer): outermost call records the
@@ -547,7 +608,12 @@ function undo_restore_struct() local(pad, l, _li, _vi) (
         sp_baked_tune[_li] = udo_s2_aud[11 + l];
         l += 1;
       );
-      memcpy(s_audio_start + pad * SLOT_SIZE, udo_s2_audio, SLOT_SIZE);
+      // Exactly the cells the capture SAVED (see undo_capture_pad). Eager: the pad's
+      // whole used extent. Sliced: the prefix a writer had reached -- everything above
+      // it was never written, so the slot still holds the original there. Beyond both,
+      // the restored s_len / l_len leave the tail unread.
+      udo_s2_extent > 0 ? memcpy(s_audio_start + pad * SLOT_SIZE, udo_s2_audio, udo_s2_extent);
+      _udo_cap_lazy = 0;   // entry consumed: stop throttling any writer still in flight
       sp_src_gen[pad] += 1;       // invalidate Extension cache / Tuned-Stretch re-bake
       recalc_pad(pad); recalc_fx(pad);
       s_dirty[pad] = 1; col_dirty = 1;

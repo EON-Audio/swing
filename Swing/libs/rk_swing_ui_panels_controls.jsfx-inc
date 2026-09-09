@@ -1391,7 +1391,7 @@ function swing_panels_draw_controls() (
     swing_popup_result = 0;
   );
 
-  // ── TOOLS: STEP SEQ | PAD FX (row A) · MATRIX | PAINT (row B) · DM GRID (row C) ──
+  // ── TOOLS: STEP SEQ | PAD FX (A) · STEREO/MULTI | WIRED (B) · DM GRID | PAINT (C) ──
   // The launchers route through the bridge CMD protocol (JSFX can't insert FX or
   // run scripts). _tool_a_y / _tool_b_y / _tool_c_y come from the section layout.
 
@@ -1531,42 +1531,79 @@ function swing_panels_draw_controls() (
     swing_popup_result = 0;
   );
 
-  // PAINT (right, row B) — toggles Drum Matrix paint mode (lit green when ON).
-  // The bridge publishes the live paint state to GS_DM_PAINT each poll (so an
-  // external key-toggle reflects here too); the click fires CMD 75 to flip it.
-  _dm_paint = gmem[GS_DM_PAINT] > 0.5;
-  _dm_paint ? swing_panels_toolbtn_chrome(_btn2_x, _tool_b_y, _btn_w, _btn_h, 0.30, 0.75, 0.45, 1)
+  // WIRED (right, row B) — the routing switch that decides whether the pad
+  // inserts are in the path at all (2026-09-09). It was reachable only by
+  // right-clicking OUT and picking the fourth menu item, which is far too
+  // buried for a mode that governs whether your plugins make sound and whether
+  // the Patchbay loopback is costing you latency. THREE states, because two
+  // would hide the worst one: off (idle grey), on and the Patchbay answering
+  // (teal), on but the Patchbay silent (amber) -- the same vocabulary the OUT
+  // button already paints, so a user who learned it there reads this for free.
+  // Left-click toggles via the bridge (CMD 41); the OUT right-click menu keeps
+  // every path it had -- this is an additional surface, not a replacement.
+  _wr_amber = patch_on && !patch_live;
+  _wr_amber ? swing_panels_toolbtn_chrome(_btn2_x, _tool_b_y, _btn_w, _btn_h, 0.85, 0.62, 0.20, 1) :
+  patch_on  ? swing_panels_toolbtn_chrome(_btn2_x, _tool_b_y, _btn_w, _btn_h, 0.25, 0.72, 0.78, 1)
             : swing_panels_toolbtn_chrome(_btn2_x, _tool_b_y, _btn_w, _btn_h, 0.30, 0.32, 0.36, 0);
   gfx_setfont(1, "Arial", 8, 'b');
   gfx_set(1, 1, 1, 1);
-  gfx_measurestr("PAINT", tw, th);
-  gfx_x = _btn2_x + (_btn_w - tw) / 2; gfx_y = _tool_b_y + (_btn_h - th) / 2; gfx_drawstr("PAINT");
-  _in_paint = mx >= _btn2_x && mx <= _btn2_x+_btn_w && my >= _tool_b_y && my <= _tool_b_y+_btn_h;
-  _in_paint ? swing_tooltip_check(29, "Drum Matrix paint — opens the grid overlay if it isn't running, then toggles click/drag note painting on the lanes. Lit green = painting. Close the grid from its own X.");
-  _in_paint && lmb_down ? (
-    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
-      gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_CMD] = 75; );
-    ) : ( kit_bridge_warn = 1; );
+  strcpy(#_wr_lbl, _wr_amber ? "WIRED?" : "WIRED");
+  gfx_measurestr(#_wr_lbl, tw, th);
+  gfx_x = _btn2_x + (_btn_w - tw) / 2; gfx_y = _tool_b_y + (_btn_h - th) / 2; gfx_drawstr(#_wr_lbl);
+  _in_wired = mx >= _btn2_x && mx <= _btn2_x+_btn_w && my >= _tool_b_y && my <= _tool_b_y+_btn_h;
+  _in_wired ? (
+    _wr_amber ?
+      swing_tooltip_check(31, "WIRED is on but the EON Patchbay is not answering: it must be LAST in this track's FX chain and enabled. Until it is, pads sum inside Swing and your pad inserts are silent. Click to switch Wired off.") :
+    patch_on ?
+      swing_tooltip_check(32, "WIRED is on: each pad leaves on its own channel pair, through the plugins in its insert slots, and the EON Patchbay brings it back ahead of the master bus. Costs the loopback's latency. Click to switch it off.") :
+      swing_tooltip_check(33, "WIRED is off: every pad sums to channels 1-2 inside Swing, so anything in the pad insert slots is silent (the console greys them). No loopback, no added latency. Click to switch it on.");
   );
+  _in_wired && lmb_down ? swing_panels_raise_bridge_cmd(41);
 
   // GRID (full width, row C) — toggles the Drum Matrix grid overlay on/off.
   // Lit when the overlay is running (GS_DM_OVERLAY, published by the bridge from
   // the overlay's singleton lock). Click fires CMD 76 (open if closed / close if
   // open). MATRIX builds the lanes; PAINT paints once the grid is up.
-  _tool_full_w = _full_w;
+  // Row C is SPLIT (2026-09-09): GRID keeps the left half and PAINT joins it on
+  // the right. They are one tool -- the grid is where you paint -- and PAINT had
+  // been sitting a row above beside something unrelated, which is why it read as
+  // a mode switch rather than as part of the Drum Matrix. Its old cell now holds
+  // WIRED. The label drops to "DM GRID" at half width: the lit state already
+  // carries on/off, and a truncated "DM GRID - O..." would say less than the
+  // colour does.
+  _tool_hw = ((_full_w - 2) * 0.5)|0;
+  _grid_x  = _btn1_x;
+  _paint_x = _btn1_x + _tool_hw + 2;
+  _paint_w = _full_w - _tool_hw - 2;
   _dm_grid = gmem[GS_DM_OVERLAY] > 0.5;
-  _dm_grid ? swing_panels_toolbtn_chrome(_btn1_x, _tool_c_y, _tool_full_w, _btn_h, 0.55, 0.40, 0.85, 1)
-           : swing_panels_toolbtn_chrome(_btn1_x, _tool_c_y, _tool_full_w, _btn_h, 0.30, 0.32, 0.36, 0);
-  gfx_setfont(1, "Arial", 9, 'b');
+  _dm_grid ? swing_panels_toolbtn_chrome(_grid_x, _tool_c_y, _tool_hw, _btn_h, 0.55, 0.40, 0.85, 1)
+           : swing_panels_toolbtn_chrome(_grid_x, _tool_c_y, _tool_hw, _btn_h, 0.30, 0.32, 0.36, 0);
+  gfx_setfont(1, "Arial", 8, 'b');
   gfx_set(1, 1, 1, 1);
-  strcpy(#_grid_lbl, _dm_grid ? "DM GRID — ON" : "DM GRID — OFF");
-  gfx_measurestr(#_grid_lbl, tw, th);
-  gfx_x = _btn1_x + (_tool_full_w - tw) / 2; gfx_y = _tool_c_y + (_btn_h - th) / 2; gfx_drawstr(#_grid_lbl);
-  _in_grid = mx >= _btn1_x && mx <= _btn1_x+_tool_full_w && my >= _tool_c_y && my <= _tool_c_y+_btn_h;
-  _in_grid ? swing_tooltip_check(30, "Drum Matrix grid overlay on/off — opens the ReaImGui grid over the arrange view, or closes it. Lit = overlay running. (Build lanes with MATRIX, paint with PAINT.)");
+  gfx_measurestr("DM GRID", tw, th);
+  gfx_x = _grid_x + (_tool_hw - tw) / 2; gfx_y = _tool_c_y + (_btn_h - th) / 2; gfx_drawstr("DM GRID");
+  _in_grid = mx >= _grid_x && mx < _grid_x+_tool_hw && my >= _tool_c_y && my <= _tool_c_y+_btn_h;
+  _in_grid ? swing_tooltip_check(30, "Drum Matrix grid overlay on/off — opens the ReaImGui grid over the arrange view, or closes it. Lit = overlay running. (Build lanes with MATRIX, paint with PAINT beside it.)");
   _in_grid && lmb_down ? (
     gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
       gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_CMD] = 76; );
+    ) : ( kit_bridge_warn = 1; );
+  );
+
+  // PAINT (right half, row C) — toggles Drum Matrix paint mode (lit green when
+  // ON). The bridge publishes the live paint state to GS_DM_PAINT each poll (so
+  // an external key-toggle reflects here too); the click fires CMD 75 to flip it.
+  _dm_paint = gmem[GS_DM_PAINT] > 0.5;
+  _dm_paint ? swing_panels_toolbtn_chrome(_paint_x, _tool_c_y, _paint_w, _btn_h, 0.30, 0.75, 0.45, 1)
+            : swing_panels_toolbtn_chrome(_paint_x, _tool_c_y, _paint_w, _btn_h, 0.30, 0.32, 0.36, 0);
+  gfx_set(1, 1, 1, 1);
+  gfx_measurestr("PAINT", tw, th);
+  gfx_x = _paint_x + (_paint_w - tw) / 2; gfx_y = _tool_c_y + (_btn_h - th) / 2; gfx_drawstr("PAINT");
+  _in_paint = mx >= _paint_x && mx <= _paint_x+_paint_w && my >= _tool_c_y && my <= _tool_c_y+_btn_h;
+  _in_paint ? swing_tooltip_check(29, "Drum Matrix paint — opens the grid overlay if it isn't running, then toggles click/drag note painting on the lanes. Lit green = painting. Close the grid from its own X.");
+  _in_paint && lmb_down ? (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+      gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_CMD] = 75; );
     ) : ( kit_bridge_warn = 1; );
   );
 

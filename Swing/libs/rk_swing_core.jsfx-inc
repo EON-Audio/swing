@@ -363,7 +363,12 @@ function clear_layer(pad_idx, layer_idx) local(_lidx, li) (
   l_rr_order[_lidx] = layer_idx;
   l_gain[_lidx] = 1.0;
   strcpy(LPATH_STR_BASE + _lidx, "");
-  memset(s_audio_start + pad_idx * SLOT_SIZE + layer_idx * LAYER_SIZE, 0, LAYER_SIZE);
+  // The audio memset is 8 MB per layer, 32 MB per clear_pad, on the audio thread. A stream
+  // drop (rk_swing_padpcm) sets _clr_skip_audio around its clear_pad because the stream
+  // overwrites [0, total) and the loader's sliced phase 2 zeroes [total, SLOT_SIZE) anyway
+  // (measured 2026-09-08: this memset + the undo capture were most of a drop's first-block
+  // stall, not the file open). Every other caller still gets the memset.
+  !_clr_skip_audio ? memset(s_audio_start + pad_idx * SLOT_SIZE + layer_idx * LAYER_SIZE, 0, LAYER_SIZE);
   // Recalculate layer count (find highest non-empty layer)
   p_layer_cnt[pad_idx] = 0;
   li = 0; loop(MAX_LAYERS,
@@ -617,6 +622,57 @@ local(f, nch, fsr, lidx)
   );
 );
 
+// Stream-fed twin of swing_ldr_begin (EON_PADPCM, rk_swing_padpcm.jsfx-inc; go-live
+// hardening Phase 2, 2026-09-08). The Kit Bridge already opened and decoded the
+// file on the UI thread and hands the PCM over as interleaved stereo, so this
+// does everything begin() does EXCEPT file_open / file_riff -- the ~30 ms stall
+// that used to sit on the audio thread once per drop. `total` = the interleaved
+// cell count the bridge will deliver, `fsr` its sample rate. Phase 5 = "fed by
+// the stream": swing_padpcm_tick copies the cells straight into LDR_F_BUF and
+// folds the peak, then hands the job to phase 2 at the stream's LAST chunk, and
+// phases 2/3/4 (zero tail, RMS/ADSR, finish) run exactly as for a file read.
+function swing_ldr_begin_gmem(jb, pad, layer, path_str, fsr, total)
+local(lidx)
+(
+  jb[LDR_F_PHASE] > 0 ? swing_ldr_abort(jb);   // a new job always wins
+  jb[LDR_F_PAD] = pad; jb[LDR_F_LAYER] = layer;
+  jb[LDR_F_HANDLE] = -1; jb[LDR_F_NCH] = 0; jb[LDR_F_SR] = 0;
+  jb[LDR_F_POS] = 0; jb[LDR_F_PEAK] = 0.00001; jb[LDR_F_ZPOS] = 0; jb[LDR_F_LEN] = 0;
+  jb[LDR_F_OPENED] = 0; jb[LDR_F_ADSR] = 0; jb[LDR_F_PREVCNT] = 0; jb[LDR_F_NWIN] = 0;
+  undo_begin_pad(pad);
+  lidx = pad * MAX_LAYERS + max(layer, 0);
+  layer < 0 ? (
+    s_len[pad] = 0;
+    s_sr[pad]  = 0;
+    strcpy(get_path_slot(pad), path_str);
+    jb[LDR_F_BUF] = s_audio_start + pad * SLOT_SIZE;
+    jb[LDR_F_CAP] = SLOT_SIZE;
+  ) : (
+    jb[LDR_F_PREVCNT] = p_layer_cnt[pad];
+    sp_baked_tune[lidx] = 0;
+    ov_cap[lidx] = 0;
+    l_len[lidx] = 0; l_start[lidx] = 0; l_end[lidx] = 1.0; l_sr[lidx] = 0;
+    l_norm[lidx] = 0; l_norm_gain[lidx] = 1.0; l_vel_lo[lidx] = 0; l_vel_hi[lidx] = 1.0;
+    l_rr_order[lidx] = layer; l_gain[lidx] = 1.0;
+    strcpy(LPATH_STR_BASE + lidx, path_str);
+    jb[LDR_F_BUF] = s_audio_start + pad * SLOT_SIZE + layer * LAYER_SIZE;
+    jb[LDR_F_CAP] = LAYER_SIZE;
+  );
+  total > 0 ? (
+    jb[LDR_F_OPENED] = 1;
+    jb[LDR_F_NCH] = 2;                       // the stream is always interleaved stereo
+    jb[LDR_F_SR] = fsr > 0 ? fsr : srate;
+    layer < 0 ? ( s_sr[pad] = jb[LDR_F_SR]; ) : ( l_sr[lidx] = jb[LDR_F_SR]; );
+    layer >= 1 ? swing_pad_promote(pad) :
+    (layer == 0 && p_layer_cnt[pad] == 0 ? s_len[pad] = 0);
+    jb[LDR_F_PHASE] = 5;
+  ) : (
+    // the bridge could not decode it: the same transient class as an open miss
+    kit_pad_open_failed = 1;
+    jb[LDR_F_PHASE] = 4;
+  );
+);
+
 // Window setup for the waveform-aware ADSR pass (the old analyze_adsr
 // preamble). Which loads analyze: a pad-main load unless the user tuned the
 // pad's ADSR (right-click on the overlay clears that flag); a layer-0 load
@@ -853,7 +909,8 @@ local(pad, layer, lidx, len, gain, tpath, tname, last_p, i, char, _wl, _lp)
 // call (finished, failed, or nothing in flight), 0 while it is still running.
 // `budget` is in cells and is also the loop ceiling of every loop below.
 function swing_ldr_step(jb, budget)
-local(ph, f, nch, tbuf, cap, pos, left, m, n, i, src, v, peak, wfr, wil, nw, w, fi, sum, rms, rmsbuf)
+local(ph, f, nch, tbuf, cap, pos, left, m, n, i, src, v, peak, wfr, wil, nw, w, fi, sum, rms, rmsbuf,
+      zbase, zlim)
 (
   ph = jb[LDR_F_PHASE];
   ph == 1 ? (
@@ -908,6 +965,14 @@ local(ph, f, nch, tbuf, cap, pos, left, m, n, i, src, v, peak, wfr, wil, nw, w, 
     // ticks for a 0.25 s file at the plain budget).
     tbuf = jb[LDR_F_BUF]; cap = jb[LDR_F_CAP]; pos = jb[LDR_F_ZPOS];
     m = min(budget * 16, cap - pos);
+    // Sliced-undo barrier (rk_drumkit_dsp udo_cow_upto): the tail this is about to
+    // zero can still be the only copy of the pad's OLD audio when the capture was
+    // sliced. It saves what we are about to destroy and hands back how far we may
+    // go; a short answer means we zero less this block and pick the rest up next
+    // block. A no-op for every load whose capture copied up front.
+    zbase = jb[LDR_F_LAYER] < 0 ? 0 : jb[LDR_F_LAYER] * LAYER_SIZE;
+    zlim = udo_cow_upto(jb[LDR_F_PAD], zbase + pos + m) - (zbase + pos);
+    zlim < m ? m = max(zlim, 0);
     m > 0 ? memset(tbuf + pos, 0, m);
     pos += m;
     jb[LDR_F_ZPOS] = pos;
@@ -937,6 +1002,7 @@ local(ph, f, nch, tbuf, cap, pos, left, m, n, i, src, v, peak, wfr, wil, nw, w, 
     w >= nw ? jb[LDR_F_PHASE] = 4;
     0;
   ) :
+  ph == 5 ? 0 :   // fed by the EON_PADPCM stream (rk_swing_padpcm); its LAST chunk hands the job to phase 2
   ph == 4 ? (
     swing_ldr_finish(jb);
     1;

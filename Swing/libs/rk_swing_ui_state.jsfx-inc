@@ -159,6 +159,21 @@ overlay_pad >= 0 || big_view_id != VIEW_NONE || rng_ov_pad >= 0 || cat_ov_pad >=
 swing_popup_active ? (
   lmb_down = 0; rmb_down = 0; frame_wheel = 0;
   LMB = 0; RMB = 0;
+  // ⚠️⚠️ ...and the SAVED copies too, which is what was still missing. Every
+  // big view RESTORES this mouse state so its own controls work under the gate
+  // (swing_panels_draw_mixer_big, swing_fxview_draw, the colours overlay, the
+  // grid overlay). The block above had already stashed the REAL click into
+  // _ov_* before zeroing the live vars, so a popup opened OVER one of those
+  // views handed the click straight back on restore: pick "Delete" on a console
+  // insert slot and the same click also landed on whatever sat under the menu.
+  // Reported 2026-09-09 on the console; it was true of every overlay. Zeroing
+  // the saves here means no restore site has to know about popups at all --
+  // the alternative was the same guard copied into four files, and the fifth
+  // would have been written without it. The popup itself is untouched: it reads
+  // _raw_lmb_down / _raw_LMB / _raw_wheel, preserved at the top of this gate
+  // before any of this runs. _ov_mx / _ov_my stay live on purpose so hover
+  // still tracks under an open menu.
+  _ov_lmb_down = 0; _ov_rmb_down = 0; _ov_LMB = 0; _ov_RMB = 0; _ov_wheel = 0;
 );
 );
 
@@ -3348,10 +3363,43 @@ function swing_ui_draw_lcd_frame() (
   //      returns on the next open.
   //   4. First-run welcome — only on a fresh empty-pads instance,
   //      dismissable per-instance via _welcome_dismissed (ser_ver 42).
-  (kit_bridge_warn || gmem[KIT_GMEM_BRIDGE_ALIVE] == 0) ? (
+  // Bridge heartbeat AGE (2026-09-08): the bridge stamps os.time() at ~1 Hz.
+  // The JSFX has no unix clock, so "stale" = the value has not MOVED for 5 s.
+  // == 0 alone never caught an uncleanly exited bridge (its last stamp stays).
+  _hb_v = gmem[KIT_GMEM_BRIDGE_ALIVE];
+  _hb_v != _hb_seen ? ( _hb_seen = _hb_v; _hb_seen_t = time_precise(); );
+  _hb_stale = _hb_v == 0 || (time_precise() - _hb_seen_t > 5);
+  (kit_bridge_warn || _hb_stale) ? (
     swing_warning_overlay("Kit Bridge not running!",
                           "Run Swing_Kit_Bridge.lua in Actions",
                           0.95, 0.40, 0.30) ? kit_bridge_warn = 0;
+  ) :
+  //   1c. Too many instances (2026-09-08): the 16-slot registry is full and this
+  //      instance holds no slot, so no bridge service (kits, browser, multi-out,
+  //      change maps) can address it. _regfull_since is latched in @block; the
+  //      3 s settle keeps a re-claim after a collision from flashing it.
+  //      Session-volatile dismiss (the _relink_dismissed pattern, no ser_ver bump).
+  (_reg_my_slot < 0 && _regfull_since > 0 && time_precise() - _regfull_since > 3 && !_regfull_dismissed) ? (
+    swing_warning_overlay("Too many Swing instances",
+                          "16 are registered -- this one gets no Kit Bridge services",
+                          0.95, 0.60, 0.30) ? _regfull_dismissed = 1;
+  ) :
+  //   1d. Extensions the bridge found missing at boot (GS_EXT_MISSING bitfield,
+  //      bit0 ReaImGui, bit1 js_ReaScriptAPI, bit2 SWS). The console line the
+  //      preflight prints is invisible to a user who never opens the console.
+  (gmem[GS_EXT_MISSING] > 0 && !_ext_dismissed) ? (
+    _ext_bits = gmem[GS_EXT_MISSING] | 0;
+    strcpy(#_ext_sub, "Install via ReaPack, restart REAPER:");
+    _ext_bits & 1 ? strcat(#_ext_sub, " ReaImGui");
+    _ext_bits & 2 ? strcat(#_ext_sub, " js_ReaScriptAPI");
+    _ext_bits & 4 ? strcat(#_ext_sub, " SWS");
+    swing_warning_overlay("Extension missing", #_ext_sub, 0.95, 0.75, 0.30) ? _ext_dismissed = 1;
+  ) :
+  //   1e. A dropped file the bridge could not decode (EON_PADPCM FAILED before anything
+  //      landed): the pad kept its old sample; say so for 4 s. rk_swing_padpcm arms the
+  //      timer and fills the name; the click is ignored (it expires on its own).
+  (time_precise() < _pp_fail_until) ? (
+    swing_warning_overlay("Couldn't read that file", #_pp_fail_name, 0.95, 0.60, 0.30);
   ) :
   //   1b. A plain pad longer than a layer was promoted (a layer >= 1 landed
   //      on it) and cut to LAYER_SIZE. swing_pad_promote (rk_swing_core) arms

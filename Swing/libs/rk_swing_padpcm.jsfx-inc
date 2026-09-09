@@ -1,0 +1,368 @@
+// rk_swing_padpcm.jsfx-inc -- EON_PADPCM: the bridge streams decoded PCM into a gmem window;
+// the JSFX adopts it here in @block, a bounded slice per block. No file is ever opened on
+// the audio thread.
+// (c) EON Studios -- All Rights Reserved
+//
+// THE RULE this exists for (go-live hardening plan, Phase 2, 2026-09-08): the first slice of
+// a drop was a fixed ~30 ms stall -- file_open + the OS's first read on the audio thread --
+// five periods at 256 samples, twenty at 64 (.docs/audits/Swing_Phase0_Findings_2026-09-08.md
+// section 0.4). The bridge already owns a decoder with exact file_riff parity (REAPER's
+// PCM_source through an AudioAccessor), so it reads; we copy.
+//
+// Protocol (.refs/gmem_regions_supplement.tsv row EON_PADPCM; mirrors the KIT_HS handshake):
+//   header block 473 = EON_PADPCM_HDR, window A block 474 = EON_PADPCM_WIN (65 536 cells,
+//   interleaved STEREO always -- the bridge asks the accessor for 2 channels, so mono arrives
+//   L==R), window B block 475 reserved.
+//   bridge per chunk: GEN odd -> payload -> OFF/LEN/FLAGS -> GEN even (LAST). Job start also
+//   writes JOB/PAD/LAYER/KIND/TOTAL/SR/NCH/PEAK/INST/PATH before the first GEN flip.
+//   JSFX: a new even GEN addressed to THIS instance latches the chunk; _pp_budget cells per
+//   block are copied into the job's destination; ECHO = GEN only when the chunk is complete;
+//   FIRST runs the setup before any cell lands, LAST runs the finish BEFORE the echo.
+//   A republished chunk (fresh GEN, same content) is idempotent: a FIRST re-runs the setup.
+//   FAILED / ABORT on a job that never began leaves every pad exactly as it was and acks the
+//   CMD; an ABORT mid-job drops the half-landed job (zero length, path kept).
+//   +15 JSFX_LEVEL: this build writes 204 every block. +16 BRIDGE_LEVEL: the bridge writes
+//   its level every tick and 0 at exit; the CMD 63/64/69 file paths in Swing_ReaKit.jsfx and
+//   rk_swing_browser_load run only while this reads < 204 (version skew: a ReaPack sync
+//   leaves the OLD bridge running until REAPER restarts).
+//
+// Kinds: 2 = CMD 69 preview -> _prv_buf (route 1). 0 = CMD 63 drop, 1 = CMD 64 layer
+// (route 2): the stream is phase 5 of rk_swing_core's four-phase loader --
+// swing_ldr_begin_gmem replaces begin()'s file_open/file_riff, the cells land straight in
+// LDR_F_BUF, and the stream's LAST hands the job to phase 2 so zero tail, RMS/ADSR, names,
+// path stamp, sp_src_gen, the undo bracket and the completion half that acks the CMD run
+// exactly as for a file read. Kinds 3 (kit blob) and 4 (repair) are not adopted yet.
+
+@init
+
+EON_PADPCM_HDR     = 30998528;   // block 473: header + path record
+EON_PADPCM_WIN     = 31064064;   // block 474: window A, EON_PADPCM_CHUNK cells
+EON_PADPCM_WIN_B   = 31129600;   // block 475: window B (reserved double-buffer)
+EON_PADPCM_CHUNK   = 65536;
+EON_PADPCM_LEVEL   = 204;        // protocol level this build speaks (== KIT_HS_CAP)
+
+// header offsets (bridge writes unless noted)
+PP_JOB = 0;        // monotonic job id; a new value = a new job
+PP_GEN = 1;        // chunk generation: odd = filling, even = published (written LAST)
+PP_ECHO = 2;       // JSFX: last GEN fully copied
+PP_PAD = 3;        // target pad (-1 for a preview)
+PP_LAYER = 4;      // target layer (-1 = pad main)
+PP_KIND = 5;       // 0 drop (CMD 63), 1 layer (CMD 64), 2 preview (CMD 69), 3 kit blob, 4 repair
+PP_TOTAL = 6;      // interleaved cells in the whole job, pre-clamped by the bridge
+PP_SR = 7;         // source sample rate
+PP_NCH = 8;        // source channel count (information; payload is always 2ch)
+PP_PEAK = 9;       // 0 = "JSFX folds the peak while copying"
+PP_OFF = 10;       // this chunk's first cell within the destination
+PP_LEN = 11;       // cells in this chunk (<= EON_PADPCM_CHUNK)
+PP_FLAGS = 12;     // bit0 FIRST, bit1 LAST, bit2 FAILED, bit3 ABORT, bit4 kit-done sentinel
+PP_INST = 13;      // target instance_id
+PP_DONE = 14;      // JSFX: job id whose finish ran (negative = failed / aborted)
+PP_JSFX_LEVEL = 15;   // JSFX: EON_PADPCM_LEVEL, every block
+PP_BRIDGE_LEVEL = 16; // bridge: its level every tick, 0 at exit
+PP_PRV_ON = 17;       // JSFX diagnostics, every block: the preview player's state
+PP_PRV_LEN = 18;      //   (_prv_on, _prv_len frames, fb_prv_loop) -- probes read them
+PP_PRV_LOOP = 19;
+PP_PATH = 64;      // len-prefixed path record (eon_write_gmem_path convention), +64..+323
+
+PP_KIND_DROP = 0; PP_KIND_LAYER = 1; PP_KIND_PREVIEW = 2; PP_KIND_KIT = 3; PP_KIND_REPAIR = 4;
+PP_F_FIRST = 1; PP_F_LAST = 2; PP_F_FAILED = 4; PP_F_ABORT = 8; PP_F_KITDONE = 16;
+
+// adopter state (file scope; @init is one-shot per instance under ext_noinit)
+_pp_job = -1;        // job being adopted, -1 = idle
+_pp_gen_seen = 0;    // last GEN fully copied (mirrors what we echoed)
+_pp_gen_cur = 0;     // GEN being copied right now, 0 = none
+_pp_pos = 0;         // cells of the current chunk already copied
+_pp_len = 0; _pp_off = 0; _pp_flags = 0; _pp_kind = -1; _pp_total = 0;
+_pp_dst = -1;        // destination base in local memory, -1 = nothing adopted for this job
+_pp_cap = 0;         // destination capacity in cells
+_pp_peak = 0;        // folded |peak| of everything that landed for this job
+_pp_cmd = 0;         // the CMD this job carries when THIS file acks it (preview only)
+_pp_idle_t = 0;      // bridge-dead guard: when a streamable CMD first sat unadopted
+_pp_budget = 2048;   // cells copied per block (recomputed every block from samplesblock)
+_pp_pad = -1; _pp_layer = -1;   // the pad job's target
+_pp_base = 0;        // the job's destination as a SLOT offset (layer * LAYER_SIZE, 0 for a pad)
+_pp_defer = 0;       // begin() declined because a kit import owns the pad bank
+_pp_deferring = 0;   // ... and the FIRST chunk is being left unlatched on purpose
+_pp_landed = 0;
+_pp_fail_until = 0;  // LCD notice "couldn't read that file" (rk_swing_ui_state rung 1e)
+_pp_pl = 0; _pp_ci = 0; _pp_vi = 0; _pp_fresh = 0;
+_clr_skip_audio = 0; // rk_swing_core clear_layer skips its memset while this is 1 (stream drops)
+
+// Prefault the three blocks: NSEEL allocates gmem lazily on the first JSFX write, and the
+// first touch must not happen inside a real-time copy (the EON_FXPICK precedent).
+gmem[EON_PADPCM_HDR] = gmem[EON_PADPCM_HDR];
+gmem[EON_PADPCM_WIN] = gmem[EON_PADPCM_WIN];
+gmem[EON_PADPCM_WIN_B] = gmem[EON_PADPCM_WIN_B];
+
+// ── The header's PATH record -> #_browser_path (the resume halves pass it on). ──
+function swing_padpcm_read_path()
+(
+  _pp_pl = gmem[EON_PADPCM_HDR + PP_PATH] | 0;
+  strcpy(#_browser_path, "");
+  _pp_pl > 0 && _pp_pl < 259 ? (
+    _pp_ci = 0;
+    loop(_pp_pl,
+      str_setchar(#_browser_path, _pp_ci, gmem[EON_PADPCM_HDR + PP_PATH + 1 + _pp_ci]);
+      _pp_ci += 1;
+    );
+    str_setlen(#_browser_path, _pp_pl);
+  );
+);
+
+// ── "Couldn't read that file": the record's basename, shown for 4 s by the LCD ladder. ──
+function swing_padpcm_fail_notice()
+local(_n, _i, _c, _last, _len)
+(
+  _n = gmem[EON_PADPCM_HDR + PP_PATH] | 0;
+  _n < 0 || _n > 258 ? _n = 0;
+  _last = -1; _i = 0;
+  loop(_n,
+    _c = gmem[EON_PADPCM_HDR + PP_PATH + 1 + _i] | 0;
+    (_c == 47 || _c == 92) ? _last = _i;
+    _i += 1;
+  );
+  _len = max(0, min(_n - _last - 1, 60));
+  strcpy(#_pp_fail_name, "");
+  _i = 0;
+  loop(_len,
+    str_setchar(#_pp_fail_name, _i, gmem[EON_PADPCM_HDR + PP_PATH + 1 + _last + 1 + _i] | 0);
+    _i += 1;
+  );
+  str_setlen(#_pp_fail_name, _len);
+  _pp_fail_until = time_precise() + 4;
+);
+
+// ── Job setup at FIRST: choose and prepare the destination for this kind. ────
+function swing_padpcm_begin(job)
+(
+  _pp_defer = 0;
+  _pp_dst = -1; _pp_cap = 0; _pp_cmd = 0; _pp_peak = 0; _pp_base = 0;
+  _pp_kind == PP_KIND_PREVIEW ? (
+    _pp_job = job;
+    // The mini browser's audition buffer: no pad, no undo, no kit state (that is the whole
+    // point, as swing_fb_prv_load says). The payload is interleaved stereo whatever the file.
+    _prv_on = 0; _prv_len = 0; _prv_pos = 0;
+    _prv_ch = 2;
+    _prv_sr = gmem[EON_PADPCM_HDR + PP_SR] > 0 ? gmem[EON_PADPCM_HDR + PP_SR] : srate;
+    _prv_rate = _prv_sr / srate;
+    _pp_dst = _prv_buf; _pp_cap = FB_PRV_MAX;
+    _pp_cmd = 69;
+  ) :
+  (_pp_kind == PP_KIND_DROP || _pp_kind == PP_KIND_LAYER) ? (
+    kit_busy ? (
+      // A kit import owns the pad bank (the same gate the file path used). Leave the
+      // chunk unlatched; the bridge republishes it until we are free (~10 s of tries).
+      _pp_defer = 1;
+    ) : (
+      _pp_job = job;
+      _pp_pad = gmem[EON_PADPCM_HDR + PP_PAD] | 0;
+      _pp_layer = _pp_kind == PP_KIND_DROP ? -1 : (gmem[EON_PADPCM_HDR + PP_LAYER] | 0);
+      _pp_base = _pp_layer < 0 ? 0 : _pp_layer * LAYER_SIZE;   // barrier coords are slot-relative
+      _pp_pad >= 0 && _pp_pad < NUM_PADS && _pp_layer < MAX_LAYERS ? (
+        swing_padpcm_read_path();
+        // Kill the pad's voices + 10 ms crossfade -- the start half of
+        // swing_browser_load_pad, verbatim (rk_swing_browser_load has the rationale).
+        _pp_vi = 0; loop(MAX_VOICES + 1,
+          v_slot[_pp_vi] == _pp_pad ? ( v_pos[_pp_vi] = -1; v_env[_pp_vi] = 0; v_stage[_pp_vi] = 0; );
+          _pp_vi += 1;
+        );
+        !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
+          _xf_pos = 0;
+          _xf_len = max(1, (0.010 * srate)|0);
+          _xf_active = 1;
+        );
+        // ONE outer undo bracket around clear_pad + the load (browser_load's rationale:
+        // undo_capture_pad overwrites on every depth-0 capture). It closes in the
+        // completion half, possibly many blocks later.
+        // SLICED capture (2026-09-09): this route pumps udo_cow_upto before every
+        // write into the slot -- the copy loop below, and the loader's zero-tail
+        // phase -- so the pad's backup is saved a bounded slice per block instead
+        // of one up-to-32 MB memcpy right here. That copy was the last big
+        // audio-thread cost on a drop once route 2 landed (10 ms for a 40 s pad).
+        _udo_cap_lazy_req = 1;
+        undo_begin_pad(_pp_pad);
+        _udo_cap_lazy_req = 0;
+        // clear_pad without its four 8 MB layer memsets: the stream overwrites the head
+        // and the loader's sliced phase 2 zeroes the tail (rk_swing_core clear_layer).
+        _clr_skip_audio = 1;
+        _pp_kind == PP_KIND_DROP ? clear_pad(_pp_pad);
+        _clr_skip_audio = 0;
+        swing_ldr_begin_gmem(ldr_job0, _pp_pad, _pp_layer, #_browser_path,
+                             gmem[EON_PADPCM_HDR + PP_SR], _pp_total);
+        // The resume halves in rk_swing_browser_load pump phases 2..4 and run the
+        // completion half (which acks the CMD) once the stream has handed over.
+        _bl_job_pending = 1;
+        _bl_job_cmd = _pp_kind == PP_KIND_DROP ? 63 : 64;
+        _bl_job_pad = _pp_pad; _bl_job_layer = _pp_layer;
+        _pp_dst = ldr_job0[LDR_F_BUF]; _pp_cap = ldr_job0[LDR_F_CAP];
+      );
+      // an invalid target keeps _pp_dst = -1: the tick fails the job (acks the CMD)
+    );
+  ) : (
+    _pp_job = job;   // a kind this build does not adopt: failed below, CMD acked
+  );
+);
+
+// ── Job finish at LAST (runs BEFORE the echo). ───────────────────────────────
+function swing_padpcm_finish()
+(
+  _pp_kind == PP_KIND_PREVIEW ? (
+    _prv_len = (_pp_total / 2) | 0;          // frames of interleaved stereo
+    _prv_len > _pp_cap / 2 ? _prv_len = (_pp_cap / 2) | 0;
+    // audition means "let me hear it": a one-chunk file starts here; a longer one is
+    // already playing progressively and just learns its final length
+    !_prv_on ? ( _prv_pos = 0; _prv_on = _prv_len > 0 ? 1 : 0; );
+  );
+  (_pp_kind == PP_KIND_DROP || _pp_kind == PP_KIND_LAYER) && _pp_dst >= 0 ? (
+    // Hand the loader job to phase 2 with what landed. From here the resume half in
+    // rk_swing_browser_load pumps zero tail -> RMS/ADSR -> finish, and the completion
+    // half acks the CMD -- byte for byte the file-read path.
+    _pp_landed = min(_pp_off + _pp_len, _pp_cap);
+    ldr_job0[LDR_F_POS]  = _pp_landed;
+    ldr_job0[LDR_F_LEN]  = _pp_landed;
+    ldr_job0[LDR_F_ZPOS] = _pp_landed;
+    ldr_job0[LDR_F_PEAK] = max(_pp_peak, 0.00001);
+    ldr_job0[LDR_F_PHASE] = 2;
+  );
+  gmem[EON_PADPCM_HDR + PP_DONE] = _pp_job;
+  _pp_cmd > 0 && (gmem[KIT_GMEM_CMD] | 0) == _pp_cmd ? gmem[KIT_GMEM_CMD] = 0;
+  _pp_job = -1; _pp_dst = -1;
+);
+
+// ── Job failure: FAILED / ABORT from the bridge, an invalid target, or an unadopted kind.
+//    A job that never began leaves the pads exactly as they were; a begun one is dropped
+//    (swing_ldr_abort: zero length, path kept, undo bracket closed). The CMD is acked. ──
+function swing_padpcm_fail(job)
+local(_cmd)
+(
+  _cmd = _pp_kind == PP_KIND_PREVIEW ? 69 : _pp_kind == PP_KIND_DROP ? 63 : _pp_kind == PP_KIND_LAYER ? 64 : 0;
+  _pp_kind == PP_KIND_PREVIEW ? ( _prv_on = 0; );
+  (_pp_kind == PP_KIND_DROP || _pp_kind == PP_KIND_LAYER) ? (
+    _pp_dst >= 0 && _pp_job == job ? (
+      swing_ldr_abort(ldr_job0);
+      _bl_job_pending = 0;
+    ) : (
+      swing_padpcm_fail_notice();   // the old sample stays; say why for 4 s
+    );
+    _pp_kind == PP_KIND_DROP ? gmem[GS_BROWSE_NAME_ADOPT] = 0;
+  );
+  gmem[EON_PADPCM_HDR + PP_DONE] = -job;
+  _cmd > 0 && (gmem[KIT_GMEM_CMD] | 0) == _cmd ? gmem[KIT_GMEM_CMD] = 0;
+  _pp_job = -1; _pp_dst = -1;
+);
+
+// ── @block: advertise, latch a published chunk, copy a bounded slice, echo. ──
+function swing_padpcm_tick()
+local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim)
+(
+  gmem[EON_PADPCM_HDR + PP_JSFX_LEVEL] = EON_PADPCM_LEVEL;
+  gmem[EON_PADPCM_HDR + PP_PRV_ON] = _prv_on;
+  gmem[EON_PADPCM_HDR + PP_PRV_LEN] = _prv_len;
+  gmem[EON_PADPCM_HDR + PP_PRV_LOOP] = fb_prv_loop;
+  // Bridge-dead guard: a streamable CMD that a level-204 bridge should turn into a job but
+  // never does (it died between posting and streaming) must not wedge the browser queue --
+  // the bridge's own stale-CMD watchdog is dead with it. 3 s unadopted -> ack. Not while
+  // we are deliberately deferring a drop behind a kit import.
+  _c = gmem[KIT_GMEM_CMD] | 0;
+  (_c == 69 || _c == 63 || _c == 64) && _pp_job < 0 && _pp_gen_cur == 0 && !_pp_deferring &&
+  gmem[EON_PADPCM_HDR + PP_BRIDGE_LEVEL] >= EON_PADPCM_LEVEL ? (
+    _pp_idle_t == 0 ? _pp_idle_t = time_precise() :
+    (time_precise() - _pp_idle_t > 3 ? ( gmem[KIT_GMEM_CMD] = 0; _pp_idle_t = 0; ));
+  ) : ( _pp_idle_t = 0; );
+  _pp_gen_cur == 0 ? (
+    _gen = gmem[EON_PADPCM_HDR + PP_GEN] | 0;
+    _gen > 0 && (_gen & 1) == 0 && _gen != _pp_gen_seen &&
+    (gmem[EON_PADPCM_HDR + PP_INST] | 0) == (instance_id | 0) ? (
+      _job = gmem[EON_PADPCM_HDR + PP_JOB] | 0;
+      _pp_flags = gmem[EON_PADPCM_HDR + PP_FLAGS] | 0;
+      _pp_kind = gmem[EON_PADPCM_HDR + PP_KIND] | 0;
+      _pp_off = gmem[EON_PADPCM_HDR + PP_OFF] | 0;
+      _pp_len = gmem[EON_PADPCM_HDR + PP_LEN] | 0;
+      _pp_total = gmem[EON_PADPCM_HDR + PP_TOTAL] | 0;
+      _pp_fresh = _job != _pp_job;
+      (_pp_flags & (PP_F_FAILED | PP_F_ABORT)) ? (
+        // failure before anything landed leaves the pads untouched; an abort mid-job
+        // drops the begun job -- either way the CMD is acked and the chunk echoed
+        swing_padpcm_fail(_job);
+        _pp_deferring = 0;
+        _pp_gen_seen = _gen;
+        gmem[EON_PADPCM_HDR + PP_ECHO] = _gen;
+      ) : (
+        (_pp_fresh || (_pp_flags & PP_F_FIRST)) ? swing_padpcm_begin(_job);
+        _pp_defer ? (
+          _pp_deferring = 1;             // leave GEN unseen: try again next block
+        ) : _pp_dst < 0 ? (
+          swing_padpcm_fail(_job);       // nothing to copy into: ack and move on
+          _pp_deferring = 0;
+          _pp_gen_seen = _gen;
+          gmem[EON_PADPCM_HDR + PP_ECHO] = _gen;
+        ) : (
+          _pp_deferring = 0;
+          _pp_gen_cur = _gen; _pp_pos = 0;
+        );
+      );
+    );
+  );
+  _pp_gen_cur != 0 ? (
+    // Copy budget per block. NOT ldr_budget: that one was tuned for file_mem (a native
+    // bulk read) and reaches 65 536 cells per block at 256 samples -- copied cell by
+    // cell out of gmem that alone costs ~6 ms in a 5.8 ms period (first acceptance run,
+    // 2026-09-08). At ~90 ns per copied cell, 12 cells per sample of block is ~5 % of the
+    // period at every size (768 at 64, 3 072 at 256, 12 288 at 1024). A 1 M-cell preview
+    // still lands in ~3 s because the bridge's tick per 65 536-cell chunk is the slower
+    // side, and the audition starts on the first chunk anyway.
+    // A pad drop is not heard until its completion half runs, so it gets ~3x the budget
+    // (~15 % of the period: a 4 M-cell file lands in ~4 s instead of ~12); a preview is
+    // audible from its first chunk and can afford the slow lane.
+    _pp_budget = _pp_kind == PP_KIND_PREVIEW ? max(1024, min(samplesblock * 12, 16384))
+                                             : max(2560, min(samplesblock * 40, 40960));
+    _w = min(_pp_budget, _pp_len - _pp_pos);
+    // Sliced-undo barrier (pad jobs only -- a preview writes _prv_buf, never a pad).
+    // The cells we are about to overwrite may still be the only copy of the pad's old
+    // audio: udo_cow_upto saves them a slice at a time and returns how far we may
+    // write. A short answer holds the rest of this chunk for the next block; those
+    // cells are NOT counted as consumed, so the protocol just resumes where it left off.
+    _pp_kind != PP_KIND_PREVIEW ? (
+      _lim = udo_cow_upto(_pp_pad, _pp_base + _pp_off + _pp_pos + _w) - (_pp_base + _pp_off + _pp_pos);
+      _lim < _w ? _w = max(_lim, 0);
+    );
+    _w > 0 ? (
+      _n = _w;
+      _room = _pp_cap - (_pp_off + _pp_pos);        // never write past the destination
+      _room < _n ? _n = max(_room, 0);
+      _src = EON_PADPCM_WIN + _pp_pos;
+      _i = 0;
+      _pp_kind == PP_KIND_PREVIEW ? (
+        // no peak fold for an audition -- nothing reads it, and it doubles the copy cost
+        loop(_n,
+          _pp_dst[_pp_off + _pp_pos + _i] = gmem[_src + _i];
+          _i += 1;
+        );
+      ) : (
+        loop(_n,
+          _v = gmem[_src + _i];
+          _pp_dst[_pp_off + _pp_pos + _i] = _v;
+          _v = abs(_v);
+          _v > _pp_peak ? _pp_peak = _v;
+          _i += 1;
+        );
+      );
+      // cells that did not FIT the destination still count as consumed so the protocol
+      // completes; cells the undo barrier held back were never in _w at all.
+      _pp_pos += _w;
+    );
+    _pp_pos >= _pp_len ? (
+      // Progressive audition (KIND 2): the stream lands ~2.5-4x faster than playback
+      // consumes it, so the player may start on the first chunk and chase a growing
+      // _prv_len instead of waiting seconds for a long file. LAST stamps the final length.
+      _pp_kind == PP_KIND_PREVIEW && !(_pp_flags & PP_F_LAST) ? (
+        _prv_len = min((_pp_off + _pp_len) / 2, _pp_cap / 2) | 0;
+        !_prv_on && _prv_len > 0 ? ( _prv_pos = 0; _prv_on = 1; );
+      );
+      (_pp_flags & PP_F_LAST) ? swing_padpcm_finish();   // finish BEFORE the echo
+      _pp_gen_seen = _pp_gen_cur;
+      _pp_gen_cur = 0;
+      gmem[EON_PADPCM_HDR + PP_ECHO] = _pp_gen_seen;
+    );
+  );
+);

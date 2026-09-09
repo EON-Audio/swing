@@ -562,6 +562,8 @@ core.GMEM = {
   -- (rk_swing_ui_state.jsfx-inc, alongside the bridge-not-running
   -- overlay). Cleared on next successful browser launch.
   GS_REAIMGUI_MISSING  = 2624,
+  GS_EXT_MISSING       = 2635,   -- bridge preflight -> JSFX: bitfield of extensions NOT
+                                 -- installed (bit0 ReaImGui, bit1 js_ReaScriptAPI, bit2 SWS)
 
   -- ─── Pad FX panel channel (Swing JSFX ↔ ReaImGui "Pad FX" window) ─────────
   -- Browser-target Swing publishes the FX-focused pad + that pad's live FX
@@ -1149,6 +1151,16 @@ core.GMEM = {
   -- +2 HEALTH_STAMP (bridge), +3 HEALTH_GEN (bridge), +4 REBASE_UNFIXED
   -- (bridge), +5 REBASE_DONE (bridge), +6..7 reserved.
   REB_SLOT_BASE     = 26342000,  -- ..26342127
+  -- EON_DIAG RT self-instrumentation (Swing_ReaKit.jsfx EON_DIAG_*, 2026-09-08):
+  -- header +0 ARM (write 1 to arm; unarmed = no writes at all), +1 RESET_GEN
+  -- (bump to zero the counters). Per-slot record DIAG_SLOT_BASE + slot*16:
+  -- +0 SEQ (written LAST), +1 samplesblock, +2 srate, +3 stall_n, +4 pause_n,
+  -- +5 gap_max, +6 cost_last, +7 cost_max, +8 cost_ema, +9 ratio_max,
+  -- +10 reset_echo, +11 overrun_n, +12 blocks. Read by the loader-stress and
+  -- @sample-cost rigs (.dev_tests/EON_Probe_LdrStress_*, EON_Probe_SampleCost_*).
+  DIAG_BASE         = 26342400,  -- ..26342415 header
+  DIAG_SLOT_BASE    = 26342416,  -- + slot*16, ..26342671
+  DIAG_SLOT_STRIDE  = 16,
   REB_SLOT_STRIDE   = 8,
 }
 
@@ -1597,22 +1609,35 @@ function core.write_pad_name(pad, name)
   end
 end
 
-function core.pad_has_audio(pad)
-  return reaper.gmem_read(core.GMEM.AUDIOLEN_BASE + pad) > 0
+-- Does this pad hold something playable?  slot = the instance's registry slot
+-- (0-15) or nil.
+--   With a slot: the instance's OWN IDENT audio flag (1 = playable, -1 = blank),
+--   published every @block since 2026-07-29. The flag is authoritative: the
+--   shared AUDIOLEN band is rewritten by EVERY instance every @block (last
+--   writer wins), so in a multi-instance project it can describe a neighbour's
+--   pad. Only a flag of 0 (a pre-flag build, or a record never written) falls
+--   through to the shared band.
+--   Without a slot: the shared band, as before (single-instance callers).
+-- 2026-09-08: callers that know their slot must pass it; the old shared-band
+-- OR in front of the flag is gone.
+function core.pad_has_audio(pad, slot)
+  if slot ~= nil then
+    local f = reaper.gmem_read(core.GMEM.INST_IDENT_BASE
+      + slot * core.GMEM.INST_IDENT_INST_STRIDE
+      + pad * core.GMEM.INST_IDENT_PAD_FIELDS
+      + core.GMEM.IDENT_OFF_AUDIO) or 0
+    if f > 0.5 then return true end
+    if f < -0.5 then return false end
+  end
+  return (reaper.gmem_read(core.GMEM.AUDIOLEN_BASE + pad) or 0) > 0
 end
 
--- Playable = has audio OR an enabled SYN slot. AUDIOLEN stays a pure AUDIO
--- signal (save/stream paths depend on 0-for-synth-only), so synth playability
--- comes from the per-instance IDENT AUDIO flag (1 = playable, -1 = blank —
--- the JSFX publishes pad_is_playable there since 2026-07-29). slot = registry
--- slot 0-15 or nil (nil falls back to the audio-only answer).
+-- Playable = has audio OR an enabled SYN slot. The IDENT audio flag already
+-- carries that meaning (the JSFX publishes pad_is_playable there), so with a
+-- slot this is the same answer as pad_has_audio; without one it is the shared
+-- band's audio-only answer, as before.
 function core.pad_is_playable(pad, slot)
-  if reaper.gmem_read(core.GMEM.AUDIOLEN_BASE + pad) > 0 then return true end
-  if slot == nil then return false end
-  return (reaper.gmem_read(core.GMEM.INST_IDENT_BASE
-    + slot * core.GMEM.INST_IDENT_INST_STRIDE
-    + pad * core.GMEM.INST_IDENT_PAD_FIELDS
-    + core.GMEM.IDENT_OFF_AUDIO) or 0) > 0.5
+  return core.pad_has_audio(pad, slot)
 end
 
 function core.get_pad_layer_count(pad)

@@ -467,8 +467,12 @@ eon_chgmap_seq = 0
 
 -- codes = { [0..15] = code }, counts = { chg, lock, custom, nomatch, surplus }
 function eon_chgmap_publish(inst_id, op, codes, counts)
-  local slot = math.floor(inst_id or 0) - 1
-  if slot < 0 or slot > 15 then return end
+  -- The band is per REGISTRY SLOT, not per instance id. Ids are monotonic (a
+  -- re-inserted Swing is #17 in a three-instance project), so `id - 1` aimed
+  -- the map at a stranger's slot or off the band. Resolve through the registry
+  -- and refuse when the target is unregistered or stale (2026-09-08).
+  local slot = ss_resolve_slot(math.floor(inst_id or 0))
+  if not slot then return end
   local b = EON_CHGMAP_BASE + slot * EON_CHGMAP_STRIDE
   codes  = codes  or {}
   counts = counts or {}
@@ -6442,6 +6446,22 @@ end
 -- .Scripts/*.lua as a manifest root, so the module is included regardless of
 -- how it is referenced. Its LUA_LITERAL_RE only matters for files nested
 -- deeper, which are reached solely through .lua string literals.)
+-- ── EON_PADPCM decoded-PCM stream (rk_padpcm.lua, go-live hardening Phase 2) ──
+-- The bridge decodes sample files on this thread through REAPER's own PCM_source
+-- and streams the PCM into a gmem window; Swing adopts it in @block a bounded
+-- slice per block, so no file is ever opened on the audio thread. Route 1 = the
+-- mini browser's preview (CMD 69). Module-GLOBAL, same reason as eon_rootnote.
+eon_padpcm = nil
+do
+  local ok, m = pcall(dofile, _SCRIPT_DIR .. _sep .. "rk_padpcm.lua")
+  if ok and type(m) == "table" and m.init then
+    eon_padpcm = m
+    eon_padpcm.init(G)
+  else
+    reaper.ShowConsoleMsg("[Swing] rk_padpcm.lua failed to load -- previews fall back to the JSFX file read: " .. tostring(m) .. "\n")
+  end
+end
+
 eon_rootnote = nil   -- { mod = <rk_root_note>, q = {}, req_seq = 0 } or nil
 do
   local ok, m = pcall(dofile, _SCRIPT_DIR .. _sep .. "rk_root_note.lua")
@@ -7391,6 +7411,19 @@ end
 -- Resolve the instance that owns the current operation (mirrors
 -- load_swing_dispatch's order: LOCK -> PENDING_LOAD_INST -> INSTANCE) and its
 -- track GUID. Returns inst_id, guid (either may be nil).
+-- The registry slot of the instance a SAVE is for. The saving JSFX holds LOCK
+-- (= its instance id) from the save gesture until the CMD 99 ack, so the slot
+-- is captured where pending_export is created and rides in pending_export.slot;
+-- write_kit_v5's empty-kit guard then asks THAT instance's IDENT audio flag
+-- instead of the shared AUDIOLEN band (last writer wins across instances).
+-- nil when nothing holds LOCK (a dev export): the guard logs and falls back.
+-- GLOBAL: the main chunk is near Lua's 200-local ceiling.
+function eon_save_target_slot()
+  local lock_id = math.floor(reaper.gmem_read(G.LOCK) or 0)
+  if lock_id <= 0 then return nil end
+  return ss_resolve_slot(lock_id)
+end
+
 local function resolve_undo_target()
   local lock_id    = math.floor(reaper.gmem_read(G.LOCK) or 0)
   local pending_id = math.floor(reaper.gmem_read(G.GS_PENDING_LOAD_INST) or 0)
@@ -7418,13 +7451,17 @@ local function start_kit_undo_dump(after)
   local inst, guid = resolve_undo_target()
   local upath = guid and get_undo_sidecar_path(guid)
   if not upath then after(false) return end
-  -- nothing loaded = nothing to undo to; skip (e.g. fresh-instance auto-808)
-  local any_audio = 0
+  -- nothing loaded = nothing to undo to; skip (e.g. fresh-instance auto-808).
+  -- Asked of THIS instance (IDENT audio flag at its registry slot); the shared
+  -- AUDIOLEN band is last-writer-wins across instances and only the fallback
+  -- while the instance is still unregistered.
+  local slot = ss_resolve_slot(inst or 0)
+  local any_audio = false
   for pad = 0, G.NUM_PADS - 1 do
-    any_audio = any_audio + (reaper.gmem_read(G.AUDIOLEN_BASE + pad) or 0)
+    if core.pad_has_audio(pad, slot) then any_audio = true break end
   end
-  if any_audio <= 0 then after(false) return end
-  pending_export = { filepath = upath, undo_dump = true, author = "", desc = "kit-undo snapshot" }
+  if not any_audio then after(false) return end
+  pending_export = { filepath = upath, undo_dump = true, author = "", desc = "kit-undo snapshot", slot = slot }
   kit_undo_job = { phase = 1, guid = guid, inst = inst, upath = upath,
                    after = after, deadline = reaper.time_precise() + 2.5 }
   reaper.gmem_write(G.CMD, 83)
@@ -7800,7 +7837,7 @@ local function do_export_name_prompt()
       core.gmem_write_string(kit_name, NAME_BASE, G.NAMELEN, 32)
 
       pending_export = {
-        filepath = filepath, kit_name = kit_name,
+        filepath = filepath, kit_name = kit_name, slot = eon_save_target_slot(),
         author = author, desc = desc, filename = filename
       }
 
@@ -7895,7 +7932,7 @@ local function do_save_in_place()
   local filename = filepath:match("([^/\\]+)%.[Ss][Ww][Ii][Nn][Gg]$") or kit_name
 
   pending_export = {
-    filepath = filepath, kit_name = kit_name,
+    filepath = filepath, kit_name = kit_name, slot = eon_save_target_slot(),
     -- Recovered from the file, not asked for — a silent save must not blank
     -- the kit's credit line or description just because no dialog collected them.
     author = eon_kit_author_from_file(filepath),
@@ -7951,7 +7988,7 @@ local function do_export_browse()
     core.gmem_write_string(kit_name, NAME_BASE, G.NAMELEN, 32)
 
     pending_export = {
-      filepath = filepath, kit_name = kit_name,
+      filepath = filepath, kit_name = kit_name, slot = eon_save_target_slot(),
       author = "", desc = "", filename = kit_name
     }
 
@@ -7998,7 +8035,7 @@ function rk_export.do_export_sfz_browse()
 
     pending_export = {
       filepath = filepath, kit_name = kit_name,
-      author = "", desc = "", filename = kit_name, format = "sfz"
+      author = "", desc = "", filename = kit_name, format = "sfz", slot = eon_save_target_slot()
     }
 
     reaper.gmem_write(G.CMD, 11)  -- reuse the same per-pad dump the .swing saves use
@@ -8037,7 +8074,7 @@ function rk_export.do_export_rs5k_browse()
 
   pending_export = {
     dest_dir = dest_dir, kit_name = kit_name,
-    author = "", desc = "", filename = kit_name, format = "rs5k"
+    author = "", desc = "", filename = kit_name, format = "rs5k", slot = eon_save_target_slot()
   }
 
   reaper.gmem_write(G.CMD, 11)  -- same per-pad dump the .swing / SFZ exports use
@@ -9271,10 +9308,10 @@ end
 local function write_kit_v4(filepath, info, silent)
   -- Empty-kit refusal. Check the JSFX-owned META truth cells (s_len at +34,
   -- layer_cnt at +32) — same reason pad_has_audio below reads META, not
-  -- AUDIOLEN_BASE: the latter is a @gfx blast-mirror gated by
-  -- _is_browser_target (rk_swing_ui_state.jsfx-inc:1794), so on a fresh
-  -- session or cold-start save it can read zero and false-positive-refuse
-  -- a save of a kit that actually holds audio. If every pad reports zero
+  -- AUDIOLEN_BASE: the latter is the SHARED band every instance rewrites
+  -- every @block (ungated since the blank-signal fix; last writer wins), so
+  -- in a multi-instance project it answers for whichever instance wrote
+  -- last, not for the one being saved. If every pad reports zero
   -- audio AND zero layers, the resulting file would be a 27KB metadata-
   -- only shell — almost never what the user wants, and destructive when
   -- the destination is an existing real kit (e.g. they typed "808" into
@@ -9361,12 +9398,11 @@ local function write_kit_v4(filepath, info, silent)
     -- 8/10-13/15, 2026-07-16). A missing source the user still wants should
     -- be relinked BEFORE saving — the kit file records what the kit plays.
     -- Read from JSFX-owned META cells (s_len at +34, layer_cnt at +32) —
-    -- AUDIOLEN_BASE is a @gfx blast-mirror written only when this instance
-    -- is the browser target (rk_swing_ui_state.jsfx-inc:1794 gated by
-    -- _is_browser_target), so on a fresh session or immediately after JSFX
-    -- re-instantiation it can read zero on a pad that holds audio, and
-    -- write_kit_v4 would silently save the pad as empty (wiping paths +
-    -- name + layer_cnt). Layered pads store audio per-layer (s_len == 0),
+    -- AUDIOLEN_BASE is the SHARED band every instance rewrites every @block
+    -- (last writer wins across instances), so in a multi-instance project it
+    -- can describe another instance's pads, and write_kit_v4 would silently
+    -- save a pad as empty (wiping paths + name + layer_cnt) or as full.
+    -- Layered pads store audio per-layer (s_len == 0),
     -- so a nonzero layer_cnt is equivalent presence for them.
     local _mb = G.META_BASE + pad * G.META_PP
     local _pad_slen = math.floor(reaper.gmem_read(_mb + 34) or 0)
@@ -9862,18 +9898,29 @@ local function write_kit_v5(filepath, info, silent)
     reaper.ShowConsoleMsg("=== end SAVE DEBUG ===\n")
   end
 
-  -- Empty-kit guard. Uses BOTH META s_len (slot 34) AND AUDIOLEN_BASE — if
-  -- either source says any pad has audio, allow the save. Single-source is
-  -- fragile because META is written only at JSFX state 11 (by the saving
-  -- instance) while AUDIOLEN_BASE is written every @gfx frame (by the
-  -- browser-target instance). Multi-instance projects or fast SAVE clicks
-  -- can leave one source empty even when the other is populated.
+  -- Empty-kit guard. Uses BOTH META s_len (slot 34) AND a per-pad presence
+  -- count — if either source says any pad has audio, allow the save.
+  -- Single-source is fragile because META is written only at JSFX state 11
+  -- (by the saving instance). The presence leg is asked of the SAVING
+  -- instance (its IDENT audio flag at info.slot, captured with LOCK held when
+  -- pending_export was created, 2026-09-08); the shared AUDIOLEN band every
+  -- instance rewrites each @block (last writer wins) is only the fallback
+  -- when no slot is known. snap_audiolen itself keeps the shared values: the
+  -- path-less pad capture below still needs them as LENGTHS.
   do
     local total_meta = 0
     local total_audiolen = 0
+    local save_slot = info and info.slot
+    if save_slot == nil and not (info and info.undo_dump) then
+      eon_load_report("save guard: no registry slot for the saving instance -- using the shared AUDIOLEN band")
+    end
     for pad = 0, G.NUM_PADS - 1 do
       total_meta = total_meta + math.floor(snap_meta[pad][34] or 0)
-      total_audiolen = total_audiolen + snap_audiolen[pad]
+      if save_slot ~= nil then
+        total_audiolen = total_audiolen + (core.pad_has_audio(pad, save_slot) and 1 or 0)
+      else
+        total_audiolen = total_audiolen + snap_audiolen[pad]
+      end
       local lc = math.floor(snap_meta[pad][32] or 0)
       if lc > 0 then
         for layer = 0, lc - 1 do
@@ -16611,8 +16658,8 @@ end
 -- their own reasons rather than "changed".
 -- GLOBAL: the main chunk is at Lua's 200-local ceiling.
 function eon_chgmap_publish_load(inst_id)
-  local slot = math.floor(inst_id or 0) - 1
-  if slot < 0 or slot > 15 then return end
+  local slot = ss_resolve_slot(math.floor(inst_id or 0))   -- slot, not id - 1 (see eon_chgmap_publish)
+  if not slot then return end
   local codes = {}
   for p = 0, G.NUM_PADS - 1 do
     local b = EON_PADCAT_BASE + slot * EON_PADCAT_STRIDE + p * 4
@@ -16623,7 +16670,9 @@ function eon_chgmap_publish_load(inst_id)
     if locked then codes[p] = 3
     elseif custom then codes[p] = 4
     else
-      codes[p] = ((reaper.gmem_read(G.AUDIOLEN_BASE + p) or 0) > 0) and 1 or 0
+      -- THIS instance's answer (IDENT audio flag at its slot), not the shared
+      -- AUDIOLEN band every instance rewrites each @block.
+      codes[p] = core.pad_has_audio(p, slot) and 1 or 0
     end
   end
   -- No "no match" and no surplus for a positional load: every pad the kit
@@ -16633,8 +16682,8 @@ end
 
 -- Gate + parse + match + arm. Runs only from eon_fill_tick on an idle tick.
 function eon_fill_begin(filepath, inst_id)
-  local slot = inst_id - 1
-  if slot < 0 or slot > 15 then
+  local slot = ss_resolve_slot(inst_id or 0)   -- registry slot, never id - 1
+  if not slot then
     eon_load_report("FILL refused: no target Swing instance")
     return
   end
@@ -18852,7 +18901,8 @@ local function poll_sidecar_events()
     -- abort on wake; the 98 arm then finishes the job if nobody consumes.
     -- State lives in a GLOBAL (main chunk is at Lua's 200-local ceiling).
     if _eon_cmd_wd == nil then _eon_cmd_wd = { v = 0, t = 0 } end
-    if current_load or eon_pp_stream or _eon_autoexport or _eon_layer.export then
+    if current_load or eon_pp_stream or _eon_autoexport or _eon_layer.export
+       or (eon_padpcm and eon_padpcm.busy()) then
       _eon_cmd_wd.v = -1     -- channel legitimately owned; re-latch when free
     elseif cmd_now ~= _eon_cmd_wd.v then
       _eon_cmd_wd.v = cmd_now
@@ -19254,6 +19304,15 @@ function _eon_poll_body()
   end
 
   local cmd = math.floor(reaper.gmem_read(G.CMD))
+
+  -- EON_PADPCM: when the JSFX speaks level 204 the bridge consumes CMD 69 (the
+  -- preview) itself -- reads the path bus, decodes, streams -- and the CMD stays
+  -- on the bus until the JSFX acks it at the stream's LAST chunk. An old JSFX
+  -- (level < 204) never sees the stream and reads the file as before.
+  if eon_padpcm and (cmd == 63 or cmd == 64 or cmd == 69) then
+    eon_padpcm.consume_cmd(cmd, current_load ~= nil or eon_pp_stream ~= nil
+                                or math.floor(reaper.gmem_read(G.LOCK) or 0) ~= 0)
+  end
 
   -- 98/99 are COMPLETION codes (op cancelled/done), left on the bus for the
   -- armed JSFX that raised the op to consume (it clears kit_busy and writes
@@ -20278,6 +20337,8 @@ function _eon_poll_body()
   -- load is in flight (no-op otherwise). See Spec_Swing_PerPad_Sidecar_Load.
   eon_perf_mark("pumps")
   eon_pp_pump()
+  -- EON_PADPCM stream: advance / republish / abort one chunk per tick (no-op when idle).
+  if eon_padpcm then eon_padpcm.tick() end
 
   -- P3 eager capture: deferred chop WAV writes (one slice per tick, then a
   -- VER-201 path dispatch; no-op when eon_chop_state is nil).
@@ -20431,15 +20492,23 @@ pcall(G.KITLIST.publish)         -- kits view: startup roster publish (covers a 
 -- whether they care. Nothing is gated on it: everything that can run, runs.
 pcall(function()
   local missing = {}
+  local bits = 0
   if not reaper.ImGui_CreateContext then
     missing[#missing + 1] = "ReaImGui -- the sample browser, Pad FX and the dock layout picker"
+    bits = bits + 1
   end
   if not reaper.JS_Window_Find then
     missing[#missing + 1] = "js_ReaScriptAPI -- the dock rig and window sizing"
+    bits = bits + 2
   end
   if not reaper.BR_GetMediaTrackSendInfo_Track then
     missing[#missing + 1] = "SWS -- Drum Strip sync on multi-out tracks, clipboard actions"
+    bits = bits + 4
   end
+  -- The same verdict for the JSFX (GS_EXT_MISSING, 0 = all present) so the LCD
+  -- can show an "Extension missing" banner: the console line below is invisible
+  -- to a user who never opens the console (2026-09-08).
+  reaper.gmem_write(G.GS_EXT_MISSING, bits)
   if #missing > 0 then
     local msg = "[EON] Swing: " .. #missing .. " extension(s) not installed. " ..
                 "Install from ReaPack (Extensions) and restart REAPER:\n"
@@ -20451,6 +20520,9 @@ end)
 reaper.defer(poll)
 reaper.atexit(function()
   reaper.gmem_write(G.BRIDGE_ALIVE, 0)
+  -- EON_PADPCM: drop the advertised level so a JSFX left running reads files
+  -- itself again, and abort any stream in flight (acks its CMD).
+  if eon_padpcm then pcall(eon_padpcm.shutdown) end
   -- Sync playback ownership (eon_sync_mute_pass): deliberately NOT released
   -- here. A synced StepSeq keeps playing after the bridge exits, so its project
   -- copy must stay muted; the P_EXT:EON_SYNC_MUTE marker makes the state

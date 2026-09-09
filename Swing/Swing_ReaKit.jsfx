@@ -132,6 +132,7 @@ import libs/rk_swing_tooltips.jsfx-inc
 import libs/rk_swing_browser_load.jsfx-inc
 import libs/rk_theme.jsfx-inc
 import libs/rk_swing_ui_minibrowser.jsfx-inc
+import libs/rk_swing_padpcm.jsfx-inc
 import libs/rk_swing_ui_state.jsfx-inc
 // AFTER state (uses swing_bigview_open/close), BEFORE panels_controls (its
 // LOAD button calls swing_kitsview_open) — EEL resolves fn refs at def-time.
@@ -292,6 +293,20 @@ _patch_on_seen  = -1;   // -1 = not yet observed; the first @block only records,
 
 _last_block_time = time_precise();  // gap detector init (prevents false flush on first block)
 
+// EON_DIAG counters (constants + layout at EON_DIAG_BASE below). ext_noinit
+// keeps these one-shot per instance; a probe zeroes them through RESET_GEN.
+diag_armed = 0; diag_t0 = 0; diag_t0_prev = 0; diag_t1 = 0; diag_spl = 0;
+diag_blocks = 0; diag_stall_n = 0; diag_pause_n = 0; diag_gap_max = 0;
+diag_cost_last = 0; diag_cost_max = 0; diag_cost_ema = 0; diag_ratio_max = 0;
+diag_overrun_n = 0; diag_reset_seen = 0;
+
+// LCD banner state (rk_swing_ui_state, 2026-09-08): bridge heartbeat AGE tracking
+// (-1 = no value seen yet, so the first frame counts as movement and never
+// flashes the banner), the registry-full latch, and the session-volatile
+// dismiss flags (deliberately not serialized).
+_hb_seen = -1; _hb_seen_t = time_precise(); _hb_stale = 0;
+_regfull_since = 0; _regfull_dismissed = 0; _ext_dismissed = 0;
+
 // ─── Constants ────────────────────────────────────────────────────────────
 NUM_PADS    = 16;
 MAX_VOICES  = 16;
@@ -304,6 +319,13 @@ LDR_CELLS_PER_SPL = 256;
 LDR_BUDGET_MIN    = 16384;
 LDR_BUDGET_MAX    = 524288;
 LDR_JOB_STRIDE    = 256;    // cells per loader job record (fields + 200-cell RMS scratch)
+// Sliced undo capture (udo_cow_upto, rk_drumkit_dsp): cells of BACKUP copy per
+// @block. memcpy runs ~350 cells/us here, so 384 cells per sample of block is
+// ~5% of the period at every buffer size (24 576 at 64, 98 304 at 256, 393 216
+// at 1024) -- a whole 4 M-cell slot saves in ~40 blocks instead of one stall.
+UDO_COW_PER_SPL   = 384;
+UDO_COW_MIN       = 24576;
+UDO_COW_MAX       = 393216;
 WV_RES      = 256;      // waveform cache points (higher = smoother LCD waveform)
 KS          = 16;       // knob memory slots
 SILENCE_T   = 10;
@@ -1291,6 +1313,22 @@ _udo_name_req = 0; _udo_name_pad = -1;  // deferred per-pad name-restore (proces
 _udo_kitundo_req = 0;    // engine → @gfx: fire CMD 82 (reload the undo sidecar)
 _udo_cap_depth = 0;      // re-entrancy depth (outermost op records the entry)
 _udo_ready = 0;          // set after udo_s2_audio is allocated + fits __memtop()
+udo_s2_extent = 0;       // cells the last one-pad capture has SAVED (undo_capture_pad)
+// Sliced capture (2026-09-09): a full-extent memcpy is up to 32 MB on the audio
+// thread at the head of a drop -- the last big one left after the EON_PADPCM
+// stream moved the file read off it (10 ms for a 40 s pad, measured 2026-09-08).
+// A caller that promises to pump udo_cow_upto before every write into the slot
+// sets _udo_cap_lazy_req; the capture then copies NOTHING up front and saves each
+// region a bounded slice at a time, just before a writer destroys it. That makes
+// udo_s2_extent "cells actually saved", and it grows -- the restore copies exactly
+// that prefix, because everything above it was never written and so still holds
+// the original audio.
+_udo_cap_lazy_req = 0;   // set around ONE undo_begin_pad call by a barrier-honouring caller
+_udo_cap_lazy = 0;       // the live entry is a sliced capture
+_udo_cap_goal = 0;       // cells that capture must reach before the slot is free to write
+_udo_cow_budget = UDO_COW_MIN;  // cells per barrier call; @block rescales from samplesblock.
+                                // Non-zero from @init so a capture can never stall before
+                                // the first block (swing_ldr_run pumps to completion inline).
 
 // Reconciler ghost-discrimination state: each registry slot's heartbeat as of
 // the PREVIOUS ~1Hz reconcile pass. A live duplicate's heartbeat advances
@@ -1539,7 +1577,10 @@ _con_defaults_done ? 0 : (
   con_ins_house = 0; // 1 = the pad rows also show the house plugins (Drum Strip, Macros); 0 = only what the user added
   con_slots    = 8;  // 4 / 6 / 8, or 0 = FIT (as many as the column allows)
   con_sw       = 1;  // Swing's own HPF/LPF/EQ/CMP/BIT/DRV band present
-  con_sw_full  = 0;  // 1 = six labelled rows · 0 = summary bar
+  con_sw_full  = 1;  // 1 = six labelled rows · 0 = summary bar. Open by default
+                     // (2026-09-09): the band IS the channel's own EQ/dynamics
+                     // and a fresh desk that hides it reads as if the pad has no
+                     // processing of its own.
   con_sends    = 1;  // DLY / RVB / SMS rotaries
   con_pan      = 1;
   con_cut      = 1;  // solo / mute / rec row
@@ -1550,12 +1591,19 @@ _con_defaults_done ? 0 : (
   con_focus    = 0;  // selected channel drawn WIDE (not taller) -- same
                      // height and same sections as every other strip, so
                      // the faders still share one zero and one throw.
-  con_master   = 0;  // master strip on the right
+  con_master   = 1;  // master strip on the right. ON by default (2026-09-09,
+                     // user): a console without its master reads as a fragment.
+                     // con_ins_house stays 0 beside it -- the pad rows show what
+                     // YOU added, not Swing's own house plugins.
   // Desk finish. 0 = the blue the console has always been, so zero-init IS
   // the old look. Finishes, not a colour picker: a desk has a finish, and 16
   // strips of hardware read as one object only while the ground behind them
   // stays a single considered surface.
-  con_bg       = 0;  // 0 blue · 1 graphite · 2 black · 3 slate · 4 walnut· 5 light
+  con_bg       = 5;  // 0 blue · 1 graphite · 2 black · 3 slate · 4 walnut· 5 light
+                     // Light is the shipped finish from 2026-09-09. The blue is
+                     // still there as finish 0; every project that already chose
+                     // one keeps it (con_bg is serialized, and this block only
+                     // runs for a genuinely new instance).
   con_wf       = 0;  // fader well fill: 0 full slab · 1 thin colour edge · 2 off
   // Insert-band viewport offset, ONE for all sixteen strips. Deliberately NOT
   // serialized: it is where you are looking, not what the project is. It is
@@ -1810,6 +1858,23 @@ GS_REB_LAYERCNT    = 26341720;  // + pad: p_layer_cnt (layered/promoted-single/l
 //   +4 REBASE_UNFIXED (bridge: pads still failed after auto-rebase — banner
 //                    short-circuit)  +5 REBASE_DONE stamp (bridge)  +6..7 rsvd
 GS_REB_SLOT_BASE   = 26342000;  // ..26342127
+// EON_DIAG: RT self-instrumentation (go-live hardening plan 0.1, 2026-09-08).
+// Header +0 ARM (a probe writes 1; unless armed nothing below runs -- the
+// unarmed cost is one gmem read and two branches per block, and NO writes),
+// +1 RESET_GEN (bump to zero the counters; echoed at +10 of the record).
+// Per-slot record at EON_DIAG_SLOT_BASE + _reg_my_slot*16: +0 SEQ (= the
+// _bl_blkctr heartbeat, written LAST), +1 samplesblock, +2 srate, +3 stall_n
+// (block gap > 2 periods and <= 50 ms), +4 pause_n (gap > 50 ms = the
+// engine-paused class the gap detector already flushes on), +5 gap_max s,
+// +6 cost_last s, +7 cost_max s, +8 cost_ema s (alpha 1/32), +9 ratio_max
+// (cost / block period), +10 reset_echo, +11 overrun_n (cost > period),
+// +12 blocks counted. Cost = t(last @sample of the block) - t(@block entry)
+// = THIS FX's wall time per block. Gaps are a stall PROXY only: anticipative
+// FX processing delivers @block in bursts. Cost is the loader metric.
+EON_DIAG_BASE        = 26342400;  // header ..26342415
+EON_DIAG_SLOT_BASE   = 26342416;  // + slot*EON_DIAG_SLOT_STRIDE ..26342671
+EON_DIAG_SLOT_STRIDE = 16;
+EON_DIAG_SLOT_MAX    = 16;
 KIT_GMEM_BRIDGE_ALIVE = 99;   // Lua bridge heartbeat (unix timestamp)
 KIT_GMEM_UNDO_ACK    = 95;    // bridge → JSFX: undo block is open (1=ready)
 KIT_GMEM_UNDO_DESC   = 96;    // undo description ID (read by Lua bridge CMD 46)
@@ -2271,6 +2336,10 @@ gmem[GS_PAD_TRACK_SELECT] = 0;
 // on a successful launch (i.e. after the user installs ReaImGui and tries
 // again). Persists across instances within a REAPER session.
 GS_REAIMGUI_MISSING  = 2624;
+// Kit Bridge preflight -> JSFX (2026-09-08): bitfield of extensions NOT
+// installed (bit0 ReaImGui, bit1 js_ReaScriptAPI, bit2 SWS); 0 = all present.
+// Written once per bridge boot; the LCD "Extension missing" rung reads it.
+GS_EXT_MISSING       = 2635;
 
 // ─── Pad FX panel channel (Swing JSFX ↔ external ReaImGui "Pad FX" window) ──
 // A standalone Lua/ReaImGui window edits the SELECTED pad's per-pad FX. The
@@ -2961,9 +3030,19 @@ swing_block_pitch_tick();
 
 // ─── Block: MIDI + DSP dirty ──────────────────────────────────────────────
 @block
+// EON_DIAG: arm state + block-entry stamp. The PREVIOUS block's cost is closed
+// out at the publish site near the end of @block (its last @sample stamped
+// diag_t1). Unarmed: one gmem read, one branch.
+diag_t0_prev = diag_t0;
+diag_armed = gmem[EON_DIAG_BASE] > 0.5;
+diag_armed ? diag_t0 = time_precise();
+
 // Sliced loader budget for this block (cells). Re-read every block so a
 // device buffer change is followed immediately.
 ldr_budget = min(LDR_BUDGET_MAX, max(LDR_BUDGET_MIN, samplesblock * LDR_CELLS_PER_SPL));
+// Sliced undo-capture budget (cells), same treatment: re-read every block so a
+// device buffer change is followed immediately.
+_udo_cow_budget = min(UDO_COW_MAX, max(UDO_COW_MIN, samplesblock * UDO_COW_PER_SPL));
 
 // ─── Master comp voice ─────────────────────────────────────────────────────
 // A change between ENGINES starts the incoming one clean (Weld's bypass path
@@ -3545,6 +3624,11 @@ _bl_job_pending && gmem[KIT_GMEM_CMD] != _bl_job_cmd ? (
   undo_cap_end();
   _bl_job_pending = 0;
 );
+// EON_PADPCM adopter (rk_swing_padpcm.jsfx-inc): copies a bounded slice of the
+// bridge's decoded-PCM stream per block. Route 1 = the preview; independent of
+// kit_busy (it lands in _prv_buf, never in pad state).
+swing_padpcm_tick();
+
 gmem[KIT_GMEM_CMD] == 63 && !kit_busy && !_bl_inflight ? swing_browser_load_pad();
 gmem[KIT_GMEM_CMD] == 64 && !kit_busy && !_bl_inflight ? swing_browser_load_layer();
 
@@ -3552,7 +3636,12 @@ gmem[KIT_GMEM_CMD] == 64 && !kit_busy && !_bl_inflight ? swing_browser_load_laye
 // the twin dispatch in @gfx must never do that. Gated on the same instance
 // check as 63/64, and it clears the command itself because nothing downstream
 // knows about it.
-gmem[KIT_GMEM_CMD] == 69 && !kit_busy && !_bl_inflight ? (
+// 2026-09-08: this file read is the OLD path, kept only for a bridge that does
+// not speak EON_PADPCM level 204 (a ReaPack sync leaves the old bridge running
+// until REAPER restarts). A level-204 bridge consumes CMD 69 itself and streams
+// the PCM; swing_padpcm_tick above adopts it and acks the CMD at LAST.
+gmem[KIT_GMEM_CMD] == 69 && !kit_busy && !_bl_inflight &&
+gmem[EON_PADPCM_HDR + PP_BRIDGE_LEVEL] < EON_PADPCM_LEVEL ? (
   gmem[KIT_GMEM_INSTANCE] == instance_id ? (
     _prv_pl = gmem[GS_BROWSER_PATH_LEN] | 0;
     _prv_pl > 0 && _prv_pl < GS_BROWSER_PATH_MAX ? (
@@ -3630,6 +3719,9 @@ loop(NUM_PADS,
 // the @block heartbeat block was gated _reg_my_slot >= 0, so a vacated
 // instance stayed silent. This is the missing re-claim.)
 swing_registry_claim();
+// Registry-full latch for the LCD banner (rk_swing_ui_state 1c): the moment
+// this instance found no free slot; cleared the block it gets one.
+_reg_my_slot < 0 ? ( _regfull_since == 0 ? _regfull_since = time_precise(); ) : ( _regfull_since = 0; );
 
 _reg_my_slot >= 0 ? (
   // B1c: allocate this instance's Stretch ring blocks once the registry
@@ -4395,12 +4487,44 @@ _pr88_active ? (
 //    reload + REB bands). Bridge checks >= threshold, so one cell covers
 //    all. A stale build never writes this → bridge falls back to the
 //    packed VER-24 layout (and to legacy CMD-86 cells below 202).
-gmem[KIT_HS_CAP] = 203;
+//    204 = EON_PADPCM: the bridge may stream decoded PCM (rk_swing_padpcm).
+gmem[KIT_HS_CAP] = 204;
 // P4 step 3: publish this instance's path-mutation counter into its
 // registry slot every @block (rewritten continuously = self-heals across
 // reg-slot re-adopt). The bridge invalidates its cached CMD-87 publish +
 // disk-health verdict whenever this moves.
 _reg_my_slot >= 0 ? ( gmem[GS_REB_SLOT_BASE + _reg_my_slot * 8] = paths_gen; );
+
+// ── EON_DIAG publish (armed only): close out the previous block's cost, then
+//    write this slot's record with SEQ last. Layout at the EON_DIAG_* constants.
+diag_armed ? (
+  gmem[EON_DIAG_BASE + 1] != diag_reset_seen ? (
+    diag_reset_seen = gmem[EON_DIAG_BASE + 1];
+    diag_blocks = 0; diag_stall_n = 0; diag_pause_n = 0; diag_gap_max = 0;
+    diag_cost_last = 0; diag_cost_max = 0; diag_cost_ema = 0; diag_ratio_max = 0;
+    diag_overrun_n = 0;
+  );
+  // A full previous block (armed at its entry, all its samples stamped).
+  diag_t0_prev > 0 && diag_t1 > diag_t0_prev && diag_spl >= samplesblock ? (
+    diag_cost_last = diag_t1 - diag_t0_prev;
+    _dg_ratio = diag_cost_last * srate / samplesblock;
+    diag_cost_last > diag_cost_max ? diag_cost_max = diag_cost_last;
+    _dg_ratio > diag_ratio_max ? diag_ratio_max = _dg_ratio;
+    _dg_ratio > 1 ? diag_overrun_n += 1;
+    diag_cost_ema = diag_blocks > 0 ? diag_cost_ema + (diag_cost_last - diag_cost_ema) / 32 : diag_cost_last;
+    diag_blocks += 1;
+  );
+  _reg_my_slot >= 0 && _reg_my_slot < EON_DIAG_SLOT_MAX ? (
+    _dg = EON_DIAG_SLOT_BASE + _reg_my_slot * EON_DIAG_SLOT_STRIDE;
+    gmem[_dg + 1]  = samplesblock;    gmem[_dg + 2]  = srate;
+    gmem[_dg + 3]  = diag_stall_n;    gmem[_dg + 4]  = diag_pause_n;   gmem[_dg + 5]  = diag_gap_max;
+    gmem[_dg + 6]  = diag_cost_last;  gmem[_dg + 7]  = diag_cost_max;  gmem[_dg + 8]  = diag_cost_ema;
+    gmem[_dg + 9]  = diag_ratio_max;  gmem[_dg + 10] = diag_reset_seen; gmem[_dg + 11] = diag_overrun_n;
+    gmem[_dg + 12] = diag_blocks;
+    gmem[_dg] = _bl_blkctr;   // SEQ, written LAST
+  );
+);
+diag_spl = 0;   // the coming block's @sample count
 
 
 // ── Run the kit-import state machine in @block so it runs whether the
@@ -4967,7 +5091,18 @@ gfx_lim_on ? (
   gfx_lim_gr = min(gfx_lim_gr, gfx_lim_env);
 );
 
+// ─── Output guard (2026-09-08) ────────────────────────────────────────────
+// A NaN/inf (or an absurd > +18 dBFS) from any voice/FX path must never reach
+// the host or the meters: master_meter* never recovers from a NaN (every
+// compare is false). !(abs(x) <= 8) is the NaN-safe test -- true for NaN, inf
+// and the impossible alike -- two compares per sample on the master, and the
+// same sweep over the pad buses only in multi-out / patchbay mode.
+!(abs(_gL) <= 8) ? _gL = 0;
+!(abs(_gR) <= 8) ? _gR = 0;
 spl(0) = _gL; spl(1) = _gR;
+(multi_out || patch_live) ? (
+  i = 2; loop(36, !(abs(spl(i)) <= 8) ? spl(i) = 0; i += 1;);
+);
 
 // Anti-pop crossfade: blend from previous output to current output after deserialize
 _xf_active ? (
@@ -4996,6 +5131,12 @@ _xf_active ? (
 _moL = abs(_gL); _moR = abs(_gR);
 _moL > master_meterL ? master_meterL = _moL : master_meterL *= _mst_meter_decay;
 _moR > master_meterR ? master_meterR = _moR : master_meterR *= _mst_meter_decay;
+
+// EON_DIAG: stamp the LAST @sample of the block (armed only; one branch unarmed).
+diag_armed ? (
+  diag_spl += 1;
+  diag_spl >= samplesblock ? diag_t1 = time_precise();
+);
 
 // ─── Serialize ────────────────────────────────────────────────────────────
 @serialize
