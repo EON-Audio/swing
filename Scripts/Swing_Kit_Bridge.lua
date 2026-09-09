@@ -210,7 +210,11 @@ function eon_padcat_from_load(pad, kit_cat, name, path)
            core.GMEM.GS_INST_REG_BASE + _s * core.GMEM.GS_INST_REG_STRIDE
            + core.GMEM.GS_INST_REG_OFF_ID) or 0) == _id then slot = _s break end
     end
-    if slot < 0 then slot = _id - 1 end
+    -- ⛔ NO id-1 FALLBACK. It used to guess `slot = _id - 1` "to match old
+    -- behaviour", but an instance that is not in the registry has NO knowable
+    -- slot, and the guess is wrong the moment slots have been reclaimed --
+    -- writing this instance's category straight into ANOTHER instance's band.
+    -- Failing cleanly loses one badge update; guessing corrupts a stranger's.
   end
   if slot < 0 or slot > 15 or pad < 0 or pad > 15 then return end
   local cat = kit_cat
@@ -305,7 +309,8 @@ function eon_padcat_from_rename(pad, name)
            core.GMEM.GS_INST_REG_BASE + _s * core.GMEM.GS_INST_REG_STRIDE
            + core.GMEM.GS_INST_REG_OFF_ID) or 0) == _id then slot = _s break end
     end
-    if slot < 0 then slot = _id - 1 end
+    -- Same rule as above: an unregistered instance has no knowable slot, and
+    -- eon_padcat_apply_rename bails on a negative one.
   end
   eon_padcat_apply_rename(slot, pad, name)
 end
@@ -17094,9 +17099,35 @@ function eon_sc_close(job, ok)
   if ok and job.total >= 0 and job.done ~= job.total then ok = false end
   pcall(function() job.src:close() end)
   pcall(function() job.dst:close() end)
-  if ok then
-    os.remove(job.path)
-    if os.rename(job.tmp, job.path) then return true end
+  if not ok then os.remove(job.tmp) return false end
+
+  -- ⚠⚠ MOVE THE OLD ONE ASIDE, do not delete it. The first cut did
+  --     os.remove(path); if os.rename(tmp, path) then return true end
+  --     os.remove(tmp)
+  -- which reads as safe and is not: os.rename can fail AFTER the remove
+  -- succeeded (antivirus hold, a cloud-sync client with the path open, a
+  -- permissions transition), and the fall-through then deleted the temp too --
+  -- leaving NO backup at all where a complete one had been. Exactly the
+  -- outcome the whole temp-file dance exists to prevent, and the comment here
+  -- used to claim it could not happen. Caught in review 2026-09-09, after it
+  -- had already shipped in 3.0.6.
+  -- os.rename will not overwrite on Windows, hence the shuffle rather than a
+  -- straight rename over the top.
+  local prev = job.path .. ".prev"
+  os.remove(prev)                              -- clear any stale one first
+  local had_old = os.rename(job.path, prev)    -- nil when there was no backup yet
+
+  if os.rename(job.tmp, job.path) then
+    os.remove(prev)
+    return true
+  end
+
+  -- Publish failed. Put the old backup back exactly as it was.
+  if had_old and not os.rename(prev, job.path) then
+    -- Could not even restore it. The file still EXISTS, under .prev -- say so,
+    -- because a silent failure here is the one case that loses a real backup.
+    reaper.ShowConsoleMsg(("[EON sidecar] could not restore the previous backup; " ..
+      "it is intact at %s -- rename it back by hand.\n"):format(prev))
   end
   os.remove(job.tmp)
   return false
