@@ -5885,6 +5885,28 @@ local kit_sources = {}
 -- (Kit-undo helpers live after is_swing_fx — they capture locals declared
 -- between here and there: pending_export, is_swing_fx.)
 
+-- ⚠⚠ A SIDECAR IS NEVER A KIT SOURCE. The sidecar is a COPY of the kit taken at
+-- project save, kept at <proj>/Swing/swing_<guid>.swing. If it ever gets
+-- recorded as the source, auto_save_all_sidecars copies the file onto itself,
+-- which is a no-op -- so the backup freezes at whatever kit it happened to hold
+-- and no later kit load can refresh it. Found live 2026-09-09: a project whose
+-- track ExtState pointed swing_kit_src at its own sidecar, still holding a
+-- months-old "Linn Drum" kit while the instance had 808 F loaded. The loop
+-- starts on its own, because loading a project reloads the pads FROM the
+-- sidecar, and a load registers what it loaded.
+-- Matches the shape the two sidecar path builders emit -- "swing_" + token +
+-- ".swing" inside a folder named "Swing" -- so the guid does not have to be in
+-- scope at either call site. A user file would have to be named that AND live
+-- in the sidecar folder, where it would be derived anyway.
+function eon_path_is_sidecar(fp)
+  if not fp or fp == "" then return false end
+  local dir, base = fp:match("^(.*)[/\\]([^/\\]+)$")
+  if not base then return false end
+  if not base:match("^swing_.+%.swing$") then return false end
+  local leaf = dir:match("([^/\\]+)$")
+  return leaf ~= nil and leaf:lower() == "swing"
+end
+
 -- Register a saved kit file as the kit source for the LOCK-holding instance.
 -- Called after every successful kit save so that:
 --   1. auto_save_all_sidecars() copies the right file on project save
@@ -5893,6 +5915,8 @@ local kit_sources = {}
 -- have no source path → no sidecar → blank pads after chunk truncation.
 local function register_kit_source_after_save(filepath)
   if not filepath or filepath == "" then return end
+  -- Never let the backup become its own source (see eon_path_is_sidecar).
+  if eon_path_is_sidecar(filepath) then return end
   -- Every bridge-side kit write funnels through here — bump the epoch that
   -- invalidates the sidecar skip-unchanged cache (see auto_save_all_sidecars)
   -- so a freshly saved kit ALWAYS re-copies on the next project save.
@@ -11839,8 +11863,13 @@ local function load_swing_dispatch_now(filepath, internal, no_attrib)
             local inst_id = math.floor(reaper.TrackFX_GetParam(tr, fx, 3) or 0)
             if inst_id == target_id then
               local guid = reaper.GetTrackGUID(tr)
-              if guid and guid ~= "" then kit_sources[guid] = filepath end
-              reaper.GetSetMediaTrackInfo_String(tr, "P_EXT:swing_kit_src", filepath, true)
+              -- Same rule as register_kit_source_after_save: a sidecar is a
+              -- copy, never a source (eon_path_is_sidecar). This is the path a
+              -- project REOPEN takes, which is how the loop starts.
+              if not eon_path_is_sidecar(filepath) then
+                if guid and guid ~= "" then kit_sources[guid] = filepath end
+                reaper.GetSetMediaTrackInfo_String(tr, "P_EXT:swing_kit_src", filepath, true)
+              end
               done = true
               break
             end
@@ -14860,7 +14889,40 @@ do
 end
 
 reaper.gmem_attach(core.GMEM_NAME)
+-- ── What this bridge can do, published for the JSFX ─────────────────────
+-- A ReaPack sync replaces the FILES but the bridge already RUNNING in memory
+-- keeps running until REAPER restarts, so a new JSFX routinely talks to an old
+-- bridge. Until now it had no way to ask: the 3.0.2 bridge had no Wired handler
+-- at all, so the WIRED button raised CMD 41 into silence and the user saw a dead
+-- button (reported 2026-09-09 on a portable install).
+-- The number only ever goes UP, and a bridge older than this one writes nothing,
+-- so the JSFX reads 0 and treats that as "too old to ask" — which is the honest
+-- answer, because a bridge that cannot say what it supports cannot be trusted to
+-- support anything new. 0 is also what atexit leaves behind.
+EON_BRIDGE_LEVEL = 305           -- 3.0.5. Bump on any release that adds a CMD.
+local GS_BRIDGE_LEVEL = 2636     -- gmem cell (claimed 2026-09-09; 2635 = GS_EXT_MISSING)
+
+-- Every command code this build takes part in -- both the ones it HANDLES and
+-- the ones it SENDS. ⚠⚠ The first version asked only "what does the dispatcher
+-- handle", which is the wrong question and shipped a real bug: the bridge also
+-- WRITES codes for the JSFX to consume (11, 51, 65, 66, 67, 83, 85, 86, 87, 88,
+-- 97) and then polls for them to clear. Eleven live codes were therefore
+-- "unknown", and the sweep below cleared them mid-flight -- kit staging, the
+-- kit-undo dump and the path rebase among them. Caught 2026-09-09 when a user on
+-- an up-to-date bridge was told, wrongly, that command 87 was unrecognised.
+-- If you add a command, add it here, whichever direction it travels in.
+local KNOWN_CMDS = {}
+for _, c in ipairs({1,2,3,10,11,12,15,16,17,18,19,20,21,22,23,24,30,40,41,42,43,
+                    44,45,46,47,48,50,51,52,60,61,62,63,64,65,66,67,68,69,70,71,
+                    73,74,75,76,77,78,80,81,82,83,84,85,86,87,88,89,90,91,92,97,
+                    98,99}) do KNOWN_CMDS[c] = true end
+local eon_unknown_cmd_said = {}
+local _unk_code, _unk_since = 0, 0
+
 reaper.gmem_write(G.BRIDGE_ALIVE, os.time())
+reaper.gmem_write(GS_BRIDGE_LEVEL, EON_BRIDGE_LEVEL)  -- publish at once, not on the
+                                                      -- first poll tick: alive-with-no-
+                                                      -- level reads as "out of date"
 -- ③ ADAPT seq: continue from the band's live value instead of restarting at 0.
 -- A bridge restart otherwise resets the counter, and if the first publish lands
 -- on the exact value a StepSeq last consumed, its edge-detect sees "no change"
@@ -16460,6 +16522,10 @@ local function enumerate_all_swings()
           -- session (we trust live loads over the persisted hint).
           if guid and guid ~= "" and not kit_sources[guid] then
             local _, src = reaper.GetSetMediaTrackInfo_String(tr, "P_EXT:swing_kit_src", "", false)
+            -- A project saved before the guard above can carry a self-
+            -- referential source. Drop it rather than adopting it: with no
+            -- source recorded, the next real kit load records a real one.
+            if eon_path_is_sidecar(src) then src = "" end
             if src and src ~= "" then
               kit_sources[guid] = src
             end
@@ -16964,10 +17030,11 @@ end
 -- with no kit, or a path we lost track of), the save is skipped — the
 -- chunk's truncated fallback covers small kits, and the user can re-
 -- load the kit manually to capture it for the next save.
-local function file_copy(src_path, dst_path)
-  if src_path == dst_path then return true end  -- self-copy = no-op
+-- Open + validate. Returns a JOB (handles + temp path) or nil, so the copy can
+-- run either in one go or a chunk at a time -- see eon_sc_step / eon_sc_close.
+function eon_sc_open(src_path, dst_path)
   local src = io.open(src_path, "rb")
-  if not src then return false end
+  if not src then return nil end
 
   -- Magic check: refuse to copy anything that doesn't look like a .swing
   -- file. Catches accidental ExtState corruption pointing at the wrong
@@ -16982,27 +17049,124 @@ local function file_copy(src_path, dst_path)
        and head:byte(4) == 0 and head:byte(5) == 0 and head:byte(6) == 0
        and head:byte(7) == 0 and head:byte(8) == 0 then
       src:close()
-      return false  -- looks like an empty/zeroed file, not a real kit
+      return nil   -- looks like an empty/zeroed file, not a real kit
     end
   end
+  -- Size up front so the finish can PROVE the copy is whole. Lua's read returns
+  -- nil both at end-of-file and on an I/O error, so "the read stopped" is not
+  -- evidence that everything arrived -- and this whole change exists to stop
+  -- half-written kits reaching the sidecar path.
+  local total = src:seek("end") or -1
   src:seek("set", 0)
 
-  local dst = io.open(dst_path, "wb")
-  if not dst then src:close(); return false end
+  -- ⭐ Write to a TEMP file and rename at the end (2026-09-09). The old code
+  -- wrote straight over the destination, so a copy interrupted by a crash, a
+  -- full disk or REAPER closing left a TRUNCATED .swing at the sidecar path --
+  -- and queue_sidecar_load_if_present accepts any file of 16 bytes or more, so
+  -- the next open would auto-load the wreckage over a good kit. A half-written
+  -- temp file is just litter; the previous sidecar stays valid until the new
+  -- one is complete.
+  local tmp_path = dst_path .. ".tmp"
+  local dst = io.open(tmp_path, "wb")
+  if not dst then src:close(); return nil end
+  return { src = src, dst = dst, tmp = tmp_path, path = dst_path,
+           done = 0, total = total }
+end
 
-  -- Chunked copy (4MB blocks) so large kits (200MB+) don't pin the
-  -- entire file into Lua string memory at once. Synchronous within the
-  -- defer cycle, but doesn't balloon RAM use proportionally to kit size.
-  local CHUNK = 4 * 1024 * 1024
-  local ok = true
-  while true do
-    local chunk = src:read(CHUNK)
-    if not chunk or #chunk == 0 then break end
-    if not dst:write(chunk) then ok = false; break end
+-- One bounded piece of work. Returns "more", "done" or "fail" -- never blocks
+-- for longer than a single chunk, which is the whole point of splitting this up.
+eon_sc_CHUNK = 1024 * 1024
+function eon_sc_step(job)
+  local chunk = job.src:read(eon_sc_CHUNK)
+  if not chunk or #chunk == 0 then return "done" end
+  if not job.dst:write(chunk) then return "fail" end
+  job.done = job.done + #chunk
+  return "more"
+end
+
+-- Close the handles and either publish the temp file or bin it. os.rename will
+-- not overwrite on Windows, so the old file goes first; if THAT fails (locked,
+-- read-only) we keep the previous sidecar and drop the temp, because a stale
+-- but complete kit is worth more than a fresh partial one.
+function eon_sc_close(job, ok)
+  -- Short of the source's length = a read that stopped early, not a file that
+  -- ended. Refuse to publish it.
+  if ok and job.total >= 0 and job.done ~= job.total then ok = false end
+  pcall(function() job.src:close() end)
+  pcall(function() job.dst:close() end)
+  if ok then
+    os.remove(job.path)
+    if os.rename(job.tmp, job.path) then return true end
   end
-  src:close()
-  dst:close()
-  return ok
+  os.remove(job.tmp)
+  return false
+end
+
+-- Synchronous copy, for the callers that need the answer before they continue
+-- (the size-mismatch repair, and the load path that tests the result inline).
+-- Same machinery, run to completion in one go.
+local function file_copy(src_path, dst_path)
+  if src_path == dst_path then return true end
+  local job = eon_sc_open(src_path, dst_path)
+  if not job then return false end
+  local r = "more"
+  while r == "more" do r = eon_sc_step(job) end
+  return eon_sc_close(job, r == "done")
+end
+
+-- ── The per-save sidecar copies, sliced across defer ticks ──────────────
+-- ⚠ A project save used to copy EVERY instance's whole kit file inside ONE
+-- defer call. Chunking fixed the memory but not the stall: reaper.defer runs on
+-- the main thread, so a 200 MB kit onto a USB drive, a NAS or a cloud-synced
+-- folder froze REAPER until the last byte landed. Now one chunk per tick.
+-- Ordering is safe because this pass runs when the poll NOTICES a completed
+-- save (dirty -> clean, or the project filename changed), never during it: the
+-- sidecar is a backstop for the NEXT open, so finishing a few frames later
+-- costs nothing.
+-- ⚠⚠ EXCEPT at exit. The closing save is exactly when the backstop matters
+-- and there are no more ticks coming, so atexit drains the queue synchronously.
+-- A stall while REAPER is already shutting down is the right trade.
+local _sc_queue, _sc_active = {}, nil
+
+function eon_sc_enqueue(key, src, dst, on_done, on_fail)
+  -- A newer save supersedes an older one for the same instance: finishing the
+  -- outdated copy would write a stale kit over the fresh one.
+  for i = #_sc_queue, 1, -1 do
+    if _sc_queue[i].key == key then table.remove(_sc_queue, i) end
+  end
+  if _sc_active and _sc_active.key == key then
+    eon_sc_close(_sc_active, false)
+    _sc_active = nil
+  end
+  _sc_queue[#_sc_queue + 1] =
+    { key = key, src = src, dst = dst, on_done = on_done, on_fail = on_fail }
+end
+
+function eon_sc_tick()
+  if not _sc_active then
+    local q = table.remove(_sc_queue, 1)
+    if not q then return end
+    if q.src == q.dst then if q.on_done then q.on_done() end return end
+    local job = eon_sc_open(q.src, q.dst)
+    if not job then if q.on_fail then q.on_fail() end return end
+    job.key, job.on_done, job.on_fail = q.key, q.on_done, q.on_fail
+    _sc_active = job
+  end
+  local r = eon_sc_step(_sc_active)
+  if r ~= "more" then
+    local job = _sc_active
+    _sc_active = nil
+    local ok = eon_sc_close(job, r == "done")
+    if ok then if job.on_done then job.on_done() end
+    else if job.on_fail then job.on_fail() end end
+  end
+end
+
+function eon_sc_drain()
+  local guard = 0
+  while (_sc_active or #_sc_queue > 0) and guard < 100000 do
+    eon_sc_tick(); guard = guard + 1
+  end
 end
 
 eon_sidecar_skip_warned = {}   -- global: bridge chunk is at the 200-local ceiling
@@ -17037,12 +17201,45 @@ local function auto_save_all_sidecars()
     local dest_path = get_sidecar_path(swing.guid)
     local ok = false
     if source_path and dest_path then
+      -- Already-frozen projects (saved before the guard): the backup IS the
+      -- recorded source, so the copy is a self-copy and nothing refreshes it.
+      -- The file is a real kit and still works as a backstop, so this is a
+      -- notice, not a failure -- but say it once, because the kit it holds may
+      -- not be the kit that is loaded.
+      if source_path == dest_path and not eon_sidecar_skip_warned[swing.guid or ""] then
+        eon_sidecar_skip_warned[swing.guid or ""] = true
+        reaper.ShowConsoleMsg(("[EON sidecar] Swing inst %d has its own backup recorded as its kit source, so the backup is frozen. Load a kit to record a real source.\n")
+          :format(swing.inst_id))
+      end
       local sig = source_path .. "|" .. _file_size(source_path)
       if _sidecar_copied[swing.guid] == sig and _file_size(dest_path) >= 0 then
         ok = true   -- dest present, source unchanged since OUR last copy
+        -- The complaint below latches once per instance so it cannot spam. That
+        -- also meant it never RETRACTED: an instance warned before its first
+        -- kit load stayed "no backstop" in the console for the rest of the
+        -- session even once it had one, which is exactly how it read after the
+        -- self-referential source was dropped (2026-09-09). Clearing the latch
+        -- on a good copy makes a later warning mean something again.
+        eon_sidecar_skip_warned[swing.guid or ""] = nil
       else
-        ok = file_copy(source_path, dest_path)
-        if ok then _sidecar_copied[swing.guid] = sig end
+        -- Queued, not copied: the stall this used to cause is the whole reason
+        -- (see eon_sc_enqueue). Treated as ok here because nothing has failed
+        -- yet -- a copy that DOES fail warns from its own on_fail below.
+        ok = true
+        local guid, isig = swing.guid, sig
+        local inst, spath = swing.inst_id, source_path
+        eon_sc_enqueue(guid, source_path, dest_path,
+          function()
+            _sidecar_copied[guid] = isig
+            eon_sidecar_skip_warned[guid or ""] = nil   -- it has a backstop now
+          end,
+          function()
+            if not eon_sidecar_skip_warned[guid or ""] then
+              eon_sidecar_skip_warned[guid or ""] = true
+              reaper.ShowConsoleMsg(("[EON sidecar] copy failed for Swing inst %d (%s) -- chunk stays/embeds until it succeeds\n")
+                :format(inst, spath))
+            end
+          end)
       end
     end
     -- A skipped/failed copy used to be silent ("the chunk's truncated
@@ -18796,8 +18993,8 @@ local function poll_sidecar_events()
   end
 
   -- Process the load queue (one at a time, waiting for JSFX completion).
-  -- Save is now synchronous (file copy in auto_save_all_sidecars), no
-  -- queue needed.
+  -- Saving needs no queue of its own: it copies sidecars, and those ride the
+  -- eon_sc_* chunk queue driven from the poll tail (drained at atexit).
   drive_load_queue()
 
   -- Stale LOCK detection. The bridge's general CMD-completion auto-
@@ -20062,6 +20259,32 @@ function _eon_poll_body()
   -- lock-release / undo-leak / heartbeat / defer tail below.
   ::cmd_done::
 
+  -- A command this build has never heard of -- normally a NEWER JSFX talking to
+  -- this older bridge, the usual state after a ReaPack sync until REAPER restarts.
+  -- This REPORTS and does not clear, which is a deliberate retreat from the first
+  -- version. That one cleared the slot at once, so a single omission from
+  -- KNOWN_CMDS destroyed a live command instead of merely mis-describing it --
+  -- which is exactly what happened. Reporting cannot do that at any list error, so
+  -- the list being right stopped being load-bearing. The clearing was never the
+  -- valuable half anyway: the stale-CMD watchdog already frees the slot, and what
+  -- the user needs is to be TOLD -- which is also why the WIRED button greys itself
+  -- and the LCD raises "Kit Bridge is out of date" off GS_BRIDGE_LEVEL.
+  -- Two seconds of the SAME unknown code before saying anything, so a handler that
+  -- runs a tick or two later is never talked over.
+  if cmd > 0 and not KNOWN_CMDS[cmd] then
+    local now = reaper.time_precise()
+    if _unk_code ~= cmd then _unk_code, _unk_since = cmd, now end
+    if now - _unk_since > 2.0 and not eon_unknown_cmd_said[cmd] then
+      eon_unknown_cmd_said[cmd] = true
+      reaper.ShowConsoleMsg(("[EON] Kit Bridge %d does not recognise command %d, " ..
+        "which usually means this Swing is newer than the running bridge. " ..
+        "Restart REAPER. (Left in place; the stale-command watchdog clears it.)")
+        :format(EON_BRIDGE_LEVEL, cmd) .. string.char(10))
+    end
+  else
+    _unk_code = 0
+  end
+
   -- Release instance lock for commands that fully complete in the bridge.
   -- Commands that write CMD=3 (data transfer) keep the lock held;
   -- the JSFX releases it once it finishes reading.
@@ -20085,10 +20308,15 @@ function _eon_poll_body()
   -- Drive any in-flight kit-undo dump (timeouts + post-ack continuation).
   kit_undo_job_tick()
 
+  -- One chunk of one queued sidecar copy. Bounded by design: this is the main
+  -- thread, and a project save can queue a copy per Swing instance.
+  eon_sc_tick()
+
   -- Heartbeat + periodic 32-channel check + track number
   heartbeat_counter = heartbeat_counter + 1
   if heartbeat_counter >= 30 then
     reaper.gmem_write(G.BRIDGE_ALIVE, os.time())
+    reaper.gmem_write(GS_BRIDGE_LEVEL, EON_BRIDGE_LEVEL)
     -- Perf profiler arm/disarm (dev flag — block comment above poll). Checked
     -- here at ~1Hz so toggling needs no bridge restart.
     if reaper.GetExtState("EON_Bridge", "perf") == "1" then
@@ -20519,7 +20747,11 @@ end)
 
 reaper.defer(poll)
 reaper.atexit(function()
+  -- The closing save queues sidecars and then there are no more ticks. Finish
+  -- them here: a pause during shutdown beats a missing or half-written backstop.
+  pcall(eon_sc_drain)
   reaper.gmem_write(G.BRIDGE_ALIVE, 0)
+  reaper.gmem_write(GS_BRIDGE_LEVEL, 0)   -- "nothing is listening"
   -- EON_PADPCM: drop the advertised level so a JSFX left running reads files
   -- itself again, and abort any stream in flight (acks its CMD).
   if eon_padpcm then pcall(eon_padpcm.shutdown) end

@@ -209,6 +209,15 @@ Plain answers, because you shouldn't have to read source to know:
 - **Audio cutting out when REAPER loses focus is a REAPER preference**, not
   Swing: Preferences → Audio → Device → *Close audio device when stopped and
   application is inactive*. Uncheck it.
+- **Sixteen Swing instances per project are fully supported.** A seventeenth
+  still plays — it is a normal instrument — but it gets no Kit Bridge services
+  (kit load and save, the browser, multi-out building, Wired, pairing), and it
+  says so on its own display rather than failing quietly. Delete an unused Swing
+  and the next one to ask takes the free slot.
+- **MIDI CC119 is reserved.** Steppa uses it to carry a step's probability, and
+  Swing consumes it rather than passing it on, so a hardware controller sending
+  CC119 into a Swing track will not reach anything downstream. Any other CC
+  passes through untouched.
 
 ## License
 

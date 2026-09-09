@@ -306,6 +306,9 @@ diag_overrun_n = 0; diag_reset_seen = 0;
 // dismiss flags (deliberately not serialized).
 _hb_seen = -1; _hb_seen_t = time_precise(); _hb_stale = 0;
 _regfull_since = 0; _regfull_dismissed = 0; _ext_dismissed = 0;
+_oldbr_dismissed = 0;  // "Kit Bridge is out of date" banner, session-volatile like the two
+                       // above. Re-armed by a click on the greyed WIRED button, so the one
+                       // control the skew actually breaks can always summon its own reason.
 
 // ─── Constants ────────────────────────────────────────────────────────────
 NUM_PADS    = 16;
@@ -369,7 +372,9 @@ p_adsr_user = freemem; freemem += NUM_PADS;  // 1 = user has manually tuned ADSR
 p_mute      = freemem; freemem += NUM_PADS;
 p_solo      = freemem; freemem += NUM_PADS;
 p_note      = freemem; freemem += NUM_PADS;
-p_output    = freemem; freemem += NUM_PADS;  // output bus 0-7
+p_output    = freemem; freemem += NUM_PADS;  // output bus 0-15 (clamped at every
+                                             // use; the "0-7" here predated the
+                                             // 16-bus multi-out)
 p_note_lock = freemem; freemem += NUM_PADS;  // 1 = custom MIDI note (survives root_note change)
 // ver 50: per-pad chromatic key RANGE, stored as SEMITONE OFFSETS from the
 // pad's root note (p_note). p_rng_lo = semis below root, p_rng_hi = semis
@@ -2340,6 +2345,19 @@ GS_REAIMGUI_MISSING  = 2624;
 // installed (bit0 ReaImGui, bit1 js_ReaScriptAPI, bit2 SWS); 0 = all present.
 // Written once per bridge boot; the LCD "Extension missing" rung reads it.
 GS_EXT_MISSING       = 2635;
+// ⭐ What the RUNNING bridge can do (2026-09-09). A ReaPack sync swaps the files
+// but the bridge already running in memory keeps running until REAPER restarts, so
+// a new JSFX routinely talks to an old bridge. The 3.0.2 bridge had no Wired
+// handler at all: WIRED raised CMD 41 into silence, the bus sat blocked for the
+// bridge's ~10 s stale-CMD fuse, and the button just looked broken (reported on a
+// portable install). The bridge now stamps its level here every tick and 0 at exit.
+// A bridge OLDER than 3.0.5 does not write the cell at all, so 0 means BOTH "no
+// bridge" and "a bridge that cannot tell us what it supports" -- and those deserve
+// the same answer, because we must not raise a command into a bridge that may not
+// know it. KIT_GMEM_BRIDGE_ALIVE separates the two for the banner ladder.
+GS_BRIDGE_LEVEL      = 2636;
+BRIDGE_LEVEL_WIRED   = 305;  // the level that first PUBLISHES a level, so it is the
+                             // floor for every bridge command we gate from here on
 
 // ─── Pad FX panel channel (Swing JSFX ↔ external ReaImGui "Pad FX" window) ──
 // A standalone Lua/ReaImGui window edits the SELECTED pad's per-pad FX. The
@@ -4553,8 +4571,10 @@ _xf_active ? (
 );
 
 // ─── Clear output channels ───────────────────────────────────────────────
-// 36 channels in multi-out: 16 stereo buses (0..31) + verb return (32/33) +
-// delay return (34/35). Returns are routed to dedicated pins when fx_returns is on.
+// 38 channels in multi-out: 16 stereo buses (0..31) + verb return (32/33) +
+// delay return (34/35) + SMASH return (36/37). Returns are routed to dedicated
+// pins when fx_returns is on. (Said 36 from before Smash had a return of its
+// own; the loop below has always cleared 38.)
 (multi_out || patch_live) ? (
   i = 0; loop(38, spl(i) = 0; i += 1;);
 ) : (
