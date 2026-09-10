@@ -639,7 +639,15 @@ core.GMEM = {
   -- 600 = VU_REQ). Swing writes 1 per publish; 0 = old build → tie inert.
   GS_STRIP_OFF_TIE_VER  = 601,
   GS_STRIP_OFF_VU_REQ   = 600,  -- Swing→Lua: header VU selector → (style+2); past the pad region (8..519)
-  GS_STRIP_OFF_ALIVE_MASK = 602, -- Lua→Swing: bit i = pad i has a live Drum Strip (per-pad takeover). 0 from an old script = all pads
+  GS_STRIP_OFF_ALIVE_MASK = 602, -- Lua→Swing: bit i = pad i has a live Drum Strip (per-pad takeover)
+  -- Mask DIALECT flag (603). 0 = written by a script that predates the mask, so
+  -- ALIVE_MASK 0 means "no information" and Swing widens it to all sixteen (the
+  -- pre-mask behaviour). 1 = the writer publishes an explicit mask, so 0 means
+  -- exactly what it says: NO pad has a live strip. Without this, deleting every
+  -- Drum Strip published 0 and Swing read it as "all pads handed off", leaving
+  -- them unprocessed until the heartbeat went stale. Written BEFORE the mask so
+  -- Swing never pairs a new mask with an old dialect.
+  GS_STRIP_OFF_MASK_VER = 603,
 
   -- ─── Unified theme bus (one selector → all four EON tools) ───────────────
   -- The Lua theme publisher resolves a palette (EON/Dark/Light/REAPER) and

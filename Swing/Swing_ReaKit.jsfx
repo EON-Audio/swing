@@ -2445,7 +2445,12 @@ GS_STRIP_PAD_OFF_PAN  = 26;
 // (b) carry the gain/pan DSP XOR — an old Swing leaves it 0 → tie fully inert
 // (no double-gain from a mixed-version deploy).
 GS_STRIP_OFF_TIE_VER  = 601;
-GS_STRIP_OFF_ALIVE_MASK = 602; // Lua→Swing: bit i = pad i has a live Drum Strip (per-pad takeover); 0 from an old script = all pads
+GS_STRIP_OFF_ALIVE_MASK = 602; // Lua→Swing: bit i = pad i has a live Drum Strip (per-pad takeover)
+// Mask DIALECT flag. 0 = a script that predates the mask, so ALIVE_MASK 0 means
+// "no information" and widens to all sixteen (the pre-mask behaviour). 1 = the
+// writer publishes an explicit mask, so 0 means NO pad has a live strip.
+// MUST match rk_lua_core.lua GS_STRIP_OFF_MASK_VER.
+GS_STRIP_OFF_MASK_VER = 603;
 
 // v48: per-band shelf Q
 FX_PID_EQ_LO_Q = 21;
@@ -3438,11 +3443,19 @@ strip_takeover_new != strip_takeover ? (
 
 // PER-PAD takeover. A pad whose Drum Strip the user replaced keeps its FX,
 // gain and pan INSIDE Swing while the other pads stay on their strips; the
-// sync script publishes the live-strip mask (bit i = pad i). 0 from an older
-// script that never wrote the cell means "every pad", the old behaviour.
+// sync script publishes the live-strip mask (bit i = pad i).
 // A pad whose bit flips gets its filter residue cleared, as the global toggle does.
+//
+// ⚠⚠ 0 IS AMBIGUOUS WITHOUT THE DIALECT FLAG. A script that predates the mask
+// never wrote the cell, so 0 there means "no information" and has to widen to
+// all sixteen or every pad's strip stops being honoured. But the current script
+// writes 0 to mean "NO pad has a live strip" -- delete every Drum Strip and it
+// says so honestly. Widening THAT handed all sixteen pads to strips that do not
+// exist, so they ran unprocessed until the stale-heartbeat failsafe caught it
+// ~100 blocks later. MASK_VER >= 1 says the writer speaks the explicit dialect;
+// only below that is 0 widened.
 _strip_mask = gmem[_strip_b + GS_STRIP_OFF_ALIVE_MASK] | 0;
-_strip_mask == 0 ? _strip_mask = 65535;
+_strip_mask == 0 && gmem[_strip_b + GS_STRIP_OFF_MASK_VER] < 1 ? _strip_mask = 65535;
 _sp_i = 0; _sp_bit = 1;
 loop(NUM_PADS,
   _sp_tk = (strip_takeover && (_strip_mask & _sp_bit)) ? 1 : 0;

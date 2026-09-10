@@ -69,7 +69,18 @@ PP_F_FIRST = 1; PP_F_LAST = 2; PP_F_FAILED = 4; PP_F_ABORT = 8; PP_F_KITDONE = 1
 
 // adopter state (file scope; @init is one-shot per instance under ext_noinit)
 _pp_job = -1;        // job being adopted, -1 = idle
-_pp_gen_seen = 0;    // last GEN fully copied (mirrors what we echoed)
+// ⚠⚠ Seeded from the LIVE header, not 0. gmem belongs to the REAPER process, not the
+// project: a completed drop's header stays published after its job is released, and
+// a NEW instance -- a reopened project, or a different project whose Swing carries the
+// same instance_id (they are small integers, so usually) -- would start at 0, see that
+// GEN as "unseen", adopt the finished job, clear_pad the target, stamp the OLD path and
+// wait for chunks nobody will send. The next CMD aborted it with the pad EMPTY. Found by
+// bisect 2026-09-09 (Sidecar8 D/E): a replaced pad came back blank on reopen, and a
+// drop in one song could wipe the same pad in the next song opened. Whatever is
+// published at the moment this instance is born predates it; only a GEN that advances
+// from here is addressed to it. (A job mid-flight at birth is a sub-second race the
+// bridge's own stall watchdog releases; adopting half of it would be worse.)
+_pp_gen_seen = gmem[EON_PADPCM_HDR + PP_GEN] | 0;   // last GEN fully copied (mirrors what we echoed)
 _pp_gen_cur = 0;     // GEN being copied right now, 0 = none
 _pp_pos = 0;         // cells of the current chunk already copied
 _pp_len = 0; _pp_off = 0; _pp_flags = 0; _pp_kind = -1; _pp_total = 0;
@@ -271,9 +282,14 @@ local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim)
   ) : ( _pp_idle_t = 0; );
   _pp_gen_cur == 0 ? (
     _gen = gmem[EON_PADPCM_HDR + PP_GEN] | 0;
+    _job = gmem[EON_PADPCM_HDR + PP_JOB] | 0;
+    // Second lock behind the seeded _pp_gen_seen: a job whose finish already ran -- by
+    // ANY instance, success (DONE = job) or failure (DONE = -job) -- is not a job. The
+    // header says so in PP_DONE and nothing read it. Only ever declines finished work,
+    // never live work, so it cannot stall a real stream.
     _gen > 0 && (_gen & 1) == 0 && _gen != _pp_gen_seen &&
+    abs(gmem[EON_PADPCM_HDR + PP_DONE] | 0) != _job &&
     (gmem[EON_PADPCM_HDR + PP_INST] | 0) == (instance_id | 0) ? (
-      _job = gmem[EON_PADPCM_HDR + PP_JOB] | 0;
       _pp_flags = gmem[EON_PADPCM_HDR + PP_FLAGS] | 0;
       _pp_kind = gmem[EON_PADPCM_HDR + PP_KIND] | 0;
       _pp_off = gmem[EON_PADPCM_HDR + PP_OFF] | 0;

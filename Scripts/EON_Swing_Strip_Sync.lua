@@ -675,8 +675,13 @@ local function scan_structure()
             -- Per-pad takeover mask: bit i = pad i has a live strip. Swing
             -- keeps the pads that are NOT in it processing internally, so a
             -- pad whose strip the user replaced never goes dry.
+            -- ⚠ DIALECT FLAG FIRST, mask second. Swing widens a 0 mask to all
+            -- sixteen pads unless the flag says the writer means it, so writing
+            -- the mask first would leave a one-tick window where an honest
+            -- "no strips" reads as "every pad handed off".
             local mask = 0
             for pad in pairs(inst.children) do mask = mask | (1 << pad) end
+            reaper.gmem_write(inst.band + G.GS_STRIP_OFF_MASK_VER, 1)
             reaper.gmem_write(inst.band + G.GS_STRIP_OFF_ALIVE_MASK, mask)
             local n = 0; for _ in pairs(inst.children) do n = n + 1 end
             local rep = string.format("[strip_sync] inst %d: multi-out, %d/%d strips ready%s\n",
@@ -688,6 +693,7 @@ local function scan_structure()
           else
             inst.children = {}
             inst.hb_ok = false
+            reaper.gmem_write(inst.band + G.GS_STRIP_OFF_MASK_VER, 1)   -- flag first, see above
             reaper.gmem_write(inst.band + G.GS_STRIP_OFF_ALIVE_MASK, 0)
             local rep = string.format("[strip_sync] inst %d: not multi-out — idle\n", id)
             if rep ~= inst.last_report then

@@ -200,8 +200,8 @@ function eon_padcat_from_load(pad, kit_cat, name, path)
   -- shortcut diverges after churn (add/delete/reopen reclaims slots out of id
   -- order) and then this writer + the ADAPT snapshot use a DIFFERENT band than
   -- pext_restore / the backfill / the Steppa badges (all registry-keyed) — the
-  -- exact trap the eon_padcat_track_for_slot comment documents. Fallback to
-  -- id - 1 only when the id is not in the registry (matches old behaviour).
+  -- exact trap the eon_padcat_track_for_slot comment documents. An id that is
+  -- not in the registry resolves to NO slot and this bails -- see below.
   local _id = math.floor((reaper.gmem_read(97) or 0) + 0.5)
   local slot = -1
   if _id > 0 then
@@ -13005,6 +13005,7 @@ function rk_ops.do_build_multiout(opts)
   -- are two REAL choices — "Keep on Main" is a valid outcome, not an abort —
   -- and dismissing the window (X / Escape) lands on keep-on-main, the
   -- current-behavior default.
+  local mo_auto = reaper.GetExtState("EON_Bridge", "multiout_auto")
   if opts and opts.fx_returns ~= nil then
     proceed_build(opts.fx_returns and true or false, have_buscomp, have_stepseq)
   elseif have_verb or have_delay or have_smash or have_buscomp then
@@ -13015,6 +13016,21 @@ function rk_ops.do_build_multiout(opts)
     -- build), and treating it as evidence silently skipped the dialog and
     -- built without returns or the EON Weld.
     proceed_build(have_verb or have_delay or have_smash, have_buscomp, have_stepseq)
+  elseif mo_auto ~= "" then
+    -- Dev override: ExtState EON_Bridge/multiout_auto = "R,B,S" (three 0/1 flags:
+    -- FX returns, bus comp, step sequencer) ANSWERS the dialog below without
+    -- showing it, so a headless probe can drive a build -- including the one
+    -- do_wired_to_multiout runs inside itself, which is otherwise undrivable
+    -- because the dialog parks the mailbox at CMD 97 waiting for a click.
+    -- Cleared after one use so it cannot leak into a session; same pattern as
+    -- chop_auto. ⚠ Deliberately the LAST branch before the dialog, not the
+    -- first: it stands in for a click, so it must never override a caller that
+    -- passed an explicit decision or a Rebuild preserving its opt-ins. A
+    -- malformed value matches nothing and lands on all-false, the same place
+    -- dismissing the window lands.
+    reaper.SetExtState("EON_Bridge", "multiout_auto", "", false)
+    local a, b, c = mo_auto:match("^%s*(%d)%s*,%s*(%d)%s*,%s*(%d)%s*$")
+    proceed_build(a == "1", b == "1", c == "1")
   else
     -- The comp picker: per slot, two cards (Weld / Anvil, pictures when the
     -- shipped card PNGs exist beside the JSFX icons) or one of the user's own
@@ -14230,19 +14246,48 @@ end
 -- which is the reason that tap point exists.
 -- ═════════════════════════════════════════════════════════════════════════════
 
--- Which pad a Wired insert belongs to, from the track channel its first input
--- pin reads. -1 for anything not on a pad pair.
+-- The ONE track channel an input pin reads, or -1 for "none, or more than one".
+-- Deliberately strict: a pin wired to several channels does not identify a pad.
+local function eon_pin_solo_ch(tr, i, pin)
+  local lo, hi = reaper.TrackFX_GetPinMappings(tr, i, 0, pin)
+  lo = math.floor(lo or 0) & 0xFFFFFFFF   -- REAPER hands back a signed word;
+  hi = math.floor(hi or 0) & 0xFFFFFFFF   -- bit 31 would read as negative
+  if lo ~= 0 and hi ~= 0 then return -1 end          -- spans both words
+  local w, base = lo, 0
+  if lo == 0 then w, base = hi, 32 end
+  if w == 0 or (w & (w - 1)) ~= 0 then return -1 end -- zero, or >1 bit set
+  local b = 0
+  while (w & (1 << b)) == 0 do b = b + 1 end
+  return base + b
+end
+
+-- Which pad a Wired insert belongs to. -1 for anything not sitting exactly on
+-- one pad's stereo pair.
+--
+-- ⚠ STRICT pair test. The first cut read only input pin 0 and took its LOWEST
+-- set bit, so a plugin with a sidechain, a multi-channel input or any hand-made
+-- pin map could be claimed by a pad whose channels it merely touches -- and
+-- do_wired_to_multiout MOVES what this claims, off the Swing track and onto a
+-- pad track. eon_pin_pair (the only thing that pins Wired inserts) always
+-- writes exactly one channel per pin, L then R, so requiring precisely that
+-- costs nothing on plugins Swing itself placed. Anything else stays on the
+-- Swing track and is reported in the conversion's "left behind" list, which is
+-- the conservative answer: a plugin in the wrong place is visible and fixable,
+-- a plugin silently moved off its sidechain is neither.
 local function eon_wired_pad_of_fx(tr, i)
-  local lo, hi = reaper.TrackFX_GetPinMappings(tr, i, 0, 0)
-  lo = math.floor(lo or 0); hi = math.floor(hi or 0)
-  local ch = -1
-  if lo ~= 0 then
-    for b = 0, 31 do if lo & (1 << b) ~= 0 then ch = b break end end
-  elseif hi ~= 0 then
-    for b = 0, 31 do if hi & (1 << b) ~= 0 then ch = 32 + b break end end
-  end
-  if ch < 2 then return -1 end
-  local pad = math.floor(ch / 2) - 1
+  local l = eon_pin_solo_ch(tr, i, 0)
+  if l < 2 or (l % 2) ~= 0 then return -1 end        -- pads start at 2, L is even
+  -- ⚠ A MONO insert has one input pin, and REAPER answers 0/0 for a pin the
+  -- plugin does not have -- indistinguishable from "wired to nothing". Reading
+  -- pin 1 unconditionally therefore disowned every mono plugin and quietly
+  -- stopped the conversion moving it (verified: ReaEQ reports 0/0 for pins 2-3,
+  -- which it also does not have). eon_pin_pair writes pin 1 blindly, so a mono
+  -- insert Swing placed itself has pin 0 on the pad's L and nothing else. Ask
+  -- how many inputs it really has before demanding a right channel.
+  local nin
+  if reaper.TrackFX_GetIOSize then nin = select(2, reaper.TrackFX_GetIOSize(tr, i)) end
+  if (nin or 2) >= 2 and eon_pin_solo_ch(tr, i, 1) ~= l + 1 then return -1 end
+  local pad = math.floor(l / 2) - 1
   if pad < 0 or pad >= G.NUM_PADS then return -1 end
   return pad
 end
@@ -14329,10 +14374,29 @@ function rk_ops.do_wired_to_multiout(outer)
       return
     end
 
+    -- ⚠⚠ THIS Swing's children ONLY. The first cut walked
+    -- core.iter_all_tracks() and keyed on EON_PAD_IDX alone -- but EVERY
+    -- Swing's Multi-Out rig tags its own children 0..15, so in a two-Swing
+    -- project the scan could resolve child[pad] to the OTHER Swing's pad
+    -- track, and the TrackFX_CopyToTrack(..., true) below is a MOVE: this
+    -- Swing's Wired plugins would be torn off and dropped onto a stranger's
+    -- track. Which Swing won depended on project traversal order.
+    -- Sends from `tr` are the ownership record the build itself just wrote
+    -- (do_build_multiout: CreateTrackSend, then the EON_PAD_IDX tag), and
+    -- do_multiout_to_wired already resolves children exactly this way --
+    -- the reverse conversion never had the bug. FX return tracks are sends
+    -- too but carry no EON_PAD_IDX, so they fall out on the tag test.
+    -- BR_* is SWS. The bridge depends on it elsewhere and preflights it at
+    -- boot, but if it is somehow missing here, no child resolves and every
+    -- plugin is reported as "could not place" -- nothing moves. That is the
+    -- fail-safe direction: a miss must never fall back to the global scan.
     local child = {}
-    for t in core.iter_all_tracks() do
-      local _, tag = reaper.GetSetMediaTrackInfo_String(t, "P_EXT:EON_PAD_IDX", "", false)
-      if tag ~= "" then child[math.floor(tonumber(tag) or -1)] = t end
+    for s = 0, (reaper.BR_GetMediaTrackSendInfo_Track and reaper.GetTrackNumSends(tr, 0) or 0) - 1 do
+      local dest = reaper.BR_GetMediaTrackSendInfo_Track(tr, 0, s, 1)
+      if dest then
+        local _, tag = reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:EON_PAD_IDX", "", false)
+        if tag ~= "" then child[math.floor(tonumber(tag) or -1)] = dest end
+      end
     end
 
     reaper.Undo_BeginBlock()
@@ -17098,7 +17162,26 @@ function eon_sc_close(job, ok)
   -- ended. Refuse to publish it.
   if ok and job.total >= 0 and job.done ~= job.total then ok = false end
   pcall(function() job.src:close() end)
-  pcall(function() job.dst:close() end)
+  -- ⚠ The DESTINATION close is the last chance to hear that buffered bytes
+  -- never reached the disk -- a full volume, a network share dropping, a
+  -- quota. job.done only proves we handed those bytes to write(); the flush
+  -- happens in close(), and discarding its result (as the first cut did) let
+  -- a SHORT temp file be published as "complete and verified". A close that
+  -- reports failure has to fail the copy BEFORE the old backup is moved.
+  local dok, dres = pcall(function() return job.dst:close() end)
+  if not dok or dres == nil or dres == false then ok = false end
+  -- Belt and braces: ask the filesystem what the temp file actually weighs
+  -- rather than trusting our own byte count. Cheap (one open + seek), and it
+  -- is the only check that survives a lying handle.
+  if ok and job.total >= 0 then
+    local vf = io.open(job.tmp, "rb")
+    if not vf then ok = false
+    else
+      local n = vf:seek("end")
+      vf:close()
+      if n ~= job.total then ok = false end
+    end
+  end
   if not ok then os.remove(job.tmp) return false end
 
   -- ⚠⚠ MOVE THE OLD ONE ASIDE, do not delete it. The first cut did
@@ -17114,11 +17197,45 @@ function eon_sc_close(job, ok)
   -- os.rename will not overwrite on Windows, hence the shuffle rather than a
   -- straight rename over the top.
   local prev = job.path .. ".prev"
-  os.remove(prev)                              -- clear any stale one first
+  -- ⚠⚠ .prev is NOT always stale. When a previous publish failed AND the
+  -- restore below failed too, .prev is the ONLY surviving copy of the user's
+  -- backup -- the console told them so and asked them to rename it by hand.
+  -- Blindly removing it here (on a rollover that can itself fail) throws that
+  -- rescue away: publish fails, restore fails, next autosave deletes the
+  -- rescue, its own publish fails, and now there is nothing. The tell for the
+  -- unresolved case is precise: .prev exists and the normal path does NOT.
+  -- Resolve it first, and if the restore still will not go, leave .prev
+  -- exactly where it is and refuse this rollover rather than destroy it.
+  local pf = io.open(prev, "rb")
+  if pf then
+    pf:close()
+    local lf = io.open(job.path, "rb")
+    if lf then
+      lf:close()
+      os.remove(prev)                          -- a real backup is in place: this one IS stale
+    elseif not os.rename(prev, job.path) then
+      -- Once per path per session. This state is persistent and every autosave
+      -- comes back through here, so an unguarded message would bury the console
+      -- in the same line -- and it is a line the user has to ACT on. GLOBAL on
+      -- purpose: the main chunk is at Lua's 200-local ceiling.
+      eon_sc_warned = eon_sc_warned or {}
+      if not eon_sc_warned[prev] then
+        eon_sc_warned[prev] = true
+        reaper.ShowConsoleMsg(("[EON sidecar] the previous backup is still stranded at %s and " ..
+          "could not be put back, so this backup was skipped rather than overwrite it -- " ..
+          "rename it by hand.\n"):format(prev))
+      end
+      os.remove(job.tmp)
+      return false
+    end
+  end
   local had_old = os.rename(job.path, prev)    -- nil when there was no backup yet
 
   if os.rename(job.tmp, job.path) then
     os.remove(prev)
+    -- Published cleanly, so any earlier "stranded" warning for this path is
+    -- spent: let it be said again if the situation ever comes back.
+    if eon_sc_warned then eon_sc_warned[prev] = nil end
     return true
   end
 
