@@ -290,6 +290,11 @@ _patch_hb_prev  = -1;
 _patch_hb_stall = PATCH_HB_STALL_MAX;   // assume dead until proven otherwise
 _patch_base     = -1;   // impossible base: forces the slot-change reset on first claim
 _patch_on_seen  = -1;   // -1 = not yet observed; the first @block only records, never acts
+// Cursor re-aim (2026-09-11, see PATCH_OFF_GEN in rk_swing_patchbay.jsfx-inc).
+patch_drain     = 0;    // patch_live AND the cursor is known good: what @sample reads on
+_patch_gen_seen = -1;   // last producer incarnation observed (-1 = none yet)
+_patch_live_prev = 0;   // to catch our own draining resuming after any gap
+_patch_prime    = 0;    // 2 = hold this block, 1 = aim at WPOS and drain, 0 = steady
 
 _last_block_time = time_precise();  // gap detector init (prevents false flush on first block)
 
@@ -3165,6 +3170,45 @@ _patch_hb = _reg_my_slot >= 0 ? gmem[_patch_base + PATCH_OFF_HB] : _patch_hb_pre
 _patch_hb != _patch_hb_prev ? ( _patch_hb_prev = _patch_hb; _patch_hb_stall = 0; )
                             : ( _patch_hb_stall < PATCH_HB_STALL_MAX ? _patch_hb_stall += 1; );
 patch_live = (patch_on && _reg_my_slot >= 0 && _patch_hb_stall < PATCH_HB_STALL_MAX) ? 1 : 0;
+
+// ── Re-aim the read cursor: a fresh producer, or our own draining resuming ──
+// The two cursors are private and neither reads the other (see PATCH_OFF_GEN),
+// so they hold their one-block spacing only while BOTH keep advancing. Ours
+// advances only while patch_live; the producer's advances whenever the Patchbay
+// runs. Any gap therefore leaves us a permanent, arbitrary distance behind --
+// wrong latency or stale audio for as long as Wired stays on, with PDC still
+// declaring one block. Both triggers below mean "the distance is now unknown":
+//   - the producer's incarnation changed (a new Patchbay -- which is what Wired
+//     off/on does, the bridge deletes and re-adds it -- or a relink), or
+//   - we were not draining last block and are now (a heartbeat stall coming
+//     back, the switch toggled with the Patchbay left in place, engine pauses).
+// Re-aiming takes ONE block: hold this one (the return is silent for about a
+// buffer -- what a Wired transition sounds like anyway, and far better than
+// replaying whatever stale ring content we would otherwise land on), then aim.
+_patch_gen_now = _reg_my_slot >= 0 ? (gmem[_patch_base + PATCH_OFF_GEN] | 0) : 0;
+patch_live && (!_patch_live_prev || _patch_gen_now != _patch_gen_seen) ? (
+  _patch_gen_seen = _patch_gen_now;
+  _patch_prime    = 2;
+);
+_patch_live_prev = patch_live;
+_patch_prime == 1 ? (
+  // The producer wrote last block's frames ending at WPOS, so exactly those
+  // frames are [WPOS - samplesblock, WPOS) -- one block of latency, which is
+  // what pdc_delay declares. (A block-size change across the gap lands this one
+  // buffer out; the full protocol in the plan doc carries the real length.)
+  _patch_rpos = (gmem[_patch_base + PATCH_OFF_WPOS] | 0) - samplesblock;
+  _patch_rpos < 0 ? _patch_rpos += PATCH_FRAMES;
+  _patch_rpos = max(0, min(PATCH_FRAMES - 1, _patch_rpos));
+  _patch_prime = 0;
+) : _patch_prime == 2 ? _patch_prime = 1;
+patch_drain = (patch_live && !_patch_prime) ? 1 : 0;
+// Publish the read cursor. The protocol has always documented this cell as
+// "consumer (Swing) writes" and nothing ever did -- which is the same omission
+// as the bug above, stated in the header. One write per block, from @block (the
+// CONS_HB precedent right below). Nothing consumes it yet; it is what makes the
+// cursor distance observable, so a probe can prove the loop is one block deep
+// instead of assuming it (.dev_tests/EON_Probe_WiredRing_probe.lua).
+_reg_my_slot >= 0 ? gmem[_patch_base + PATCH_OFF_RPOS] = _patch_rpos;
 // Tell the Patchbay we are reading (its "Swing is reading the ring" lamp):
 // a counter in the ring header, bumped every block the loopback is live.
 patch_live ? ( _patch_cons_hb += 1; gmem[_patch_base + PATCH_OFF_CONS_HB] = _patch_cons_hb; );
@@ -3667,22 +3711,30 @@ gmem[KIT_GMEM_CMD] == 64 && !kit_busy && !_bl_inflight ? swing_browser_load_laye
 // the twin dispatch in @gfx must never do that. Gated on the same instance
 // check as 63/64, and it clears the command itself because nothing downstream
 // knows about it.
-// 2026-09-08: this file read is the OLD path, kept only for a bridge that does
-// not speak EON_PADPCM level 204 (a ReaPack sync leaves the old bridge running
-// until REAPER restarts). A level-204 bridge consumes CMD 69 itself and streams
-// the PCM; swing_padpcm_tick above adopts it and acks the CMD at LAST.
-gmem[KIT_GMEM_CMD] == 69 && !kit_busy && !_bl_inflight &&
-gmem[EON_PADPCM_HDR + PP_BRIDGE_LEVEL] < EON_PADPCM_LEVEL ? (
+// 2026-09-08: this file read is the OLD path. A level-204 bridge consumes CMD 69
+// itself and streams the PCM; swing_padpcm_tick above adopts it and acks the CMD
+// at LAST. 2026-09-10 (plan Phase B): _bridge_state, decided in that same tick,
+// splits the rest -- a bridge that is running but predates this JSFX (every
+// ReaPack sync, until REAPER restarts) gets a REFUSAL and an LCD line saying
+// restart, not a file read on the audio thread for something a restart cures;
+// only NO bridge at all falls through to the read. A preview is not a pad load,
+// so the no-bridge case says nothing here -- the "not running" banner already
+// covers the state, and a line per browser click would be noise.
+gmem[KIT_GMEM_CMD] == 69 && !kit_busy && !_bl_inflight && _bridge_state != 2 ? (
   gmem[KIT_GMEM_INSTANCE] == instance_id ? (
-    _prv_pl = gmem[GS_BROWSER_PATH_LEN] | 0;
-    _prv_pl > 0 && _prv_pl < GS_BROWSER_PATH_MAX ? (
-      strcpy(#_prv_path, "");
-      _prv_ci = 0;
-      loop(_prv_pl, str_setchar(#_prv_path, _prv_ci, gmem[GS_BROWSER_PATH + _prv_ci]); _prv_ci += 1;);
-      str_setlen(#_prv_path, _prv_pl);
-      swing_fb_prv_load(#_prv_path);
-      // Audition means "let me hear it" -- loading one IS the request to play.
-      _prv_len > 0 ? ( _prv_pos = 0; _prv_on = 1; );
+    _bridge_state == 1 ? (
+      swing_ldr_bridge_notice(1);
+    ) : (
+      _prv_pl = gmem[GS_BROWSER_PATH_LEN] | 0;
+      _prv_pl > 0 && _prv_pl < GS_BROWSER_PATH_MAX ? (
+        strcpy(#_prv_path, "");
+        _prv_ci = 0;
+        loop(_prv_pl, str_setchar(#_prv_path, _prv_ci, gmem[GS_BROWSER_PATH + _prv_ci]); _prv_ci += 1;);
+        str_setlen(#_prv_path, _prv_pl);
+        swing_fb_prv_load(#_prv_path);
+        // Audition means "let me hear it" -- loading one IS the request to play.
+        _prv_len > 0 ? ( _prv_pos = 0; _prv_on = 1; );
+      );
     );
     gmem[KIT_GMEM_CMD] = 0;
   );
@@ -4860,7 +4912,7 @@ _fx_ret_pins = multi_out && fx_returns;
 //      insert lands at the identical point in the signal and sounds the same.
 // The pan uses the bus index as the pad index -- see the bus-walk note below;
 // strip_takeover is honoured the same way process_pad_fx honours it (no pan).
-patch_live ? (
+patch_drain ? (   // patch_live AND the cursor is aimed (see the re-aim in @block)
   _pt_row = _patch_base + PATCH_HEADER_SLOTS + _patch_rpos * PATCH_CHANS;
   // ⚠️ This walks BUSES, not pads. Ring slot i holds whatever p_output pointed
   // at bus i, and two pads can share a bus, so the mapping is not invertible.
@@ -4873,6 +4925,13 @@ patch_live ? (
   _pi = 0; loop(NUM_PADS,
     _pt_l = gmem[_pt_row + _pi * 2];
     _pt_r = gmem[_pt_row + _pi * 2 + 1];
+    // Belt and braces behind the Patchbay's own guard: these values come from
+    // third-party plugins, and everything below is stateful (sends into the
+    // delay and reverb, then the master chain). The output guard cannot clean a
+    // filter that has already eaten a NaN. A Patchbay older than this build --
+    // the ring outlives a ReaPack sync until REAPER restarts -- guards nothing.
+    !(abs(_pt_l) <= 8) ? _pt_l = 0;
+    !(abs(_pt_r) <= 8) ? _pt_r = 0;
     patch_retL[_pi] = _pt_l;
     patch_retR[_pi] = _pt_r;
 

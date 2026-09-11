@@ -62,6 +62,7 @@ PP_BRIDGE_LEVEL = 16; // bridge: its level every tick, 0 at exit
 PP_PRV_ON = 17;       // JSFX diagnostics, every block: the preview player's state
 PP_PRV_LEN = 18;      //   (_prv_on, _prv_len frames, fb_prv_loop) -- probes read them
 PP_PRV_LOOP = 19;
+PP_BRIDGE_STATE = 20; // JSFX diagnostics, every block: _bridge_state (0 no bridge / 1 older / 2 current) -- probes read it
 PP_PATH = 64;      // len-prefixed path record (eon_write_gmem_path convention), +64..+323
 
 PP_KIND_DROP = 0; PP_KIND_LAYER = 1; PP_KIND_PREVIEW = 2; PP_KIND_KIT = 3; PP_KIND_REPAIR = 4;
@@ -97,6 +98,14 @@ _pp_deferring = 0;   // ... and the FIRST chunk is being left unlatched on purpo
 _pp_landed = 0;
 _pp_fail_until = 0;  // LCD notice "couldn't read that file" (rk_swing_ui_state rung 1e)
 _pp_pl = 0; _pp_ci = 0; _pp_vi = 0; _pp_fresh = 0;
+// Bridge presence + capability for the load gates (2026-09-10, plan Phase B). Decided once
+// per block in swing_padpcm_tick and read by rk_swing_browser_load (CMD 63/64) and the
+// CMD-69 dispatch: 0 = no bridge, 1 = a bridge older than this JSFX, 2 = current. A global
+// rather than a function because browser_load is imported BEFORE this file and EEL2 binds
+// functions in file order.
+_bridge_state = 0;
+_bs_hb_seen = -1; _bs_hb_t = 0; _bs_v = 0;   // @block copy of the banner's "has the heartbeat moved" test
+_ld_notice_until = 0;   // LCD notice for a load the bridge could not take (rk_swing_ui_state rung 1f)
 _clr_skip_audio = 0; // rk_swing_core clear_layer skips its memset while this is 1 (stream drops)
 
 // Prefault the three blocks: NSEEL allocates gmem lazily on the first JSFX write, and the
@@ -274,9 +283,23 @@ local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim)
   // never does (it died between posting and streaming) must not wedge the browser queue --
   // the bridge's own stale-CMD watchdog is dead with it. 3 s unadopted -> ack. Not while
   // we are deliberately deferring a drop behind a kit import.
+  // Which bridge, if any, this block. "Alive" = the heartbeat VALUE has moved within 5 s --
+  // the LCD banner's own test (rk_swing_ui_state), redone here because @gfx does not run
+  // with the window closed and the load gates live in @block. Capability = the stream level
+  // in the header: an older bridge never writes it (0), a current one writes it every tick.
+  // Presence has to come from the heartbeat because that level alone reads 0 for BOTH "no
+  // bridge" and "old bridge", and those want opposite answers: with no bridge the file read
+  // is the only way to load anything (a fresh install), while an old bridge -- every ReaPack
+  // sync, until REAPER restarts -- is fixed by a restart, so the load is refused instead of
+  // stalling the audio thread for something a restart cures.
+  _bs_v = gmem[KIT_GMEM_BRIDGE_ALIVE];
+  _bs_v != _bs_hb_seen ? ( _bs_hb_seen = _bs_v; _bs_hb_t = time_precise(); );
+  _bridge_state = (_bs_v == 0 || time_precise() - _bs_hb_t > 5) ? 0 :
+                  (gmem[EON_PADPCM_HDR + PP_BRIDGE_LEVEL] >= EON_PADPCM_LEVEL ? 2 : 1);
+  gmem[EON_PADPCM_HDR + PP_BRIDGE_STATE] = _bridge_state;   // diagnostic: what the gates will see
   _c = gmem[KIT_GMEM_CMD] | 0;
   (_c == 69 || _c == 63 || _c == 64) && _pp_job < 0 && _pp_gen_cur == 0 && !_pp_deferring &&
-  gmem[EON_PADPCM_HDR + PP_BRIDGE_LEVEL] >= EON_PADPCM_LEVEL ? (
+  _bridge_state == 2 ? (
     _pp_idle_t == 0 ? _pp_idle_t = time_precise() :
     (time_precise() - _pp_idle_t > 3 ? ( gmem[KIT_GMEM_CMD] = 0; _pp_idle_t = 0; ));
   ) : ( _pp_idle_t = 0; );

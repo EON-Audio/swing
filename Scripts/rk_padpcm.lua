@@ -48,6 +48,15 @@ local KIND = { DROP = 0, LAYER = 1, PREVIEW = 2, KIT = 3, REPAIR = 4 }
 local F = { FIRST = 1, LAST = 2, FAILED = 4, ABORT = 8, KITDONE = 16 }
 local FRAMES_PER_CHUNK = CHUNK // 2          -- interleaved stereo
 M.LEVEL = 204                                 -- what this bridge speaks (== the JSFX's KIT_HS_CAP)
+-- Dev gate (2026-09-10, plan Phase B): ExtState EON_Bridge/padpcm_level = "N" makes this
+-- bridge PUBLISH level N and, when N is below M.LEVEL, stop consuming CMD 63/64/69 -- i.e.
+-- behave exactly like a bridge that predates the stream, which is what every ReaPack sync
+-- leaves running until REAPER restarts. The JSFX must then REFUSE the load and say restart
+-- (EON_Probe_BridgeState_probe.lua drives all three states). Session-only, cleared by the
+-- probe; a real old bridge has no such gate, it simply never wrote the cell.
+local function level_pub()
+  return tonumber(reaper.GetExtState("EON_Bridge", "padpcm_level")) or M.LEVEL
+end
 M.PREVIEW_MAX_CELLS = 1000000                 -- FB_PRV_MAX (rk_swing_ui_minibrowser.jsfx-inc)
 M.KIND, M.F = KIND, F
 
@@ -250,6 +259,7 @@ function M.consume_cmd(cmd, blocked)
   if job or blocked then return false end
   if cmd ~= 63 and cmd ~= 64 and cmd ~= 69 then return false end
   if M.jsfx_level() < M.LEVEL then return false end   -- old JSFX: it reads the file itself
+  if level_pub() < M.LEVEL then return false end      -- dev gate: an "old" bridge does not stream
   local path = read_browser_path()
   local inst = math.floor(gr(G_INSTANCE))
   if cmd == 69 then
@@ -268,7 +278,7 @@ end
 function M.tick()
   -- Advertise every tick (one gmem write): self-healing after anything zeroes it, and the
   -- segment is certainly attached by the time the poll loop runs.
-  gw(HDR + O.BRIDGE_LEVEL, M.LEVEL)
+  gw(HDR + O.BRIDGE_LEVEL, level_pub())
   local j = job
   if not j then return end
   -- A stopped audio engine has no @block to consume with: park, never time out.

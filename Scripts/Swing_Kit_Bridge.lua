@@ -19857,8 +19857,49 @@ function _eon_poll_body()
     local f = io.open(kit_path, "rb")
     if f then
       f:close()
-      reaper.SetExtState("Swing", "kit_load_path", kit_path, false)
-      reaper.gmem_write(G.GS_KIT_LOAD_REQ, 1)
+      -- ⚠⚠ CAPTURE THE REQUESTER HERE AND QUEUE THE LOAD NOW (2026-09-11).
+      -- This used to stage the path + REQ=1 and let the kit_req branch read
+      -- GS_LOAD_WANT one poll tick later. In that gap the request is acked but
+      -- not queued, so the stale-LOCK self-heal (no current_load, EMPTY queue,
+      -- CMD 0) saw an idle pipeline and released LOCK; the next fresh Swing,
+      -- gated on exactly LOCK == 0, posted and overwrote WANT. kit_req then
+      -- served the SECOND Swing for the first request, found WANT empty for
+      -- the second, fell back to PENDING -- the second Swing again -- and the
+      -- first was never served. The bridge's load_log.txt showed it in every
+      -- batch of new Swings: "4, 4 -- 3 never"; "7, 8, 6, 6 -- 5 never".
+      -- The JSFX writes WANT and LOCK before CMD=22, and no other instance can
+      -- post while CMD is 22, so both still name the requester at this point.
+      -- Queuing here keeps the queue non-empty, the self-heal off, and LOCK
+      -- held through the load, so the next Swing waits its turn.
+      local want_id = math.floor(reaper.gmem_read(G.GS_LOAD_WANT) or 0)
+      if want_id <= 0 then want_id = math.floor(reaper.gmem_read(G.LOCK) or 0) end
+      if want_id > 0 then
+        reaper.gmem_write(G.GS_LOAD_WANT, 0)
+        -- One kit per request: never serve an instance that is already queued
+        -- or loading (the double-serve above was the visible half of the bug).
+        local queued = current_load ~= nil and current_load.inst_id == want_id
+        for _, q in ipairs(pending_load_queue) do
+          if q.inst_id == want_id then queued = true end
+        end
+        if queued then
+          eon_load_report(("auto-kit for inst=%d already queued -- not queued twice"):format(want_id))
+        else
+          local item = { path = kit_path, preserve = false, inst_id = want_id }
+          for _, swing in ipairs(enumerate_all_swings()) do
+            if swing.inst_id == want_id then
+              item.tr, item.fx, item.guid = swing.tr, swing.fx, swing.guid
+              break
+            end
+          end
+          eon_kit_cover_load_slot = ss_resolve_slot(want_id)
+          pending_load_queue[#pending_load_queue + 1] = item
+        end
+      else
+        -- No requester named at all (an unknown poster): the old route, which
+        -- falls back through PENDING and the browser binding.
+        reaper.SetExtState("Swing", "kit_load_path", kit_path, false)
+        reaper.gmem_write(G.GS_KIT_LOAD_REQ, 1)
+      end
       local req_tr, req_fx = find_swing_track()
       if req_tr and req_fx then
         -- Only force the window open if it's currently closed. If the

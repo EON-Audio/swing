@@ -121,6 +121,12 @@ gmem[_pb_base + PATCH_OFF_WPOS]  = 0;
 gmem[_pb_base + PATCH_OFF_HB]    = 0;
 gmem[_pb_base + PATCH_OFF_OWNER] = link_slot | 0;
 gmem[_pb_base + PATCH_OFF_NCH]   = PATCH_CHANS;
+// A fresh producer for this band: the write cursor is back at 0 while Swing's
+// read cursor is wherever it stopped, so Swing must re-aim rather than carry on
+// a random distance behind (see PATCH_OFF_GEN). Read-modify-write so the count
+// keeps rising across incarnations -- Swing only ever compares it with the last
+// value it saw, never assumes a starting number.
+gmem[_pb_base + PATCH_OFF_GEN]   = (gmem[_pb_base + PATCH_OFF_GEN] | 0) + 1;
 
 @slider
 
@@ -134,6 +140,7 @@ _pb_new != _pb_base ? (
   gmem[_pb_base + PATCH_OFF_WPOS]  = 0;
   gmem[_pb_base + PATCH_OFF_OWNER] = link_slot | 0;
   gmem[_pb_base + PATCH_OFF_NCH]   = PATCH_CHANS;
+  gmem[_pb_base + PATCH_OFF_GEN]   = (gmem[_pb_base + PATCH_OFF_GEN] | 0) + 1;  // fresh producer here too
 );
 
 @block
@@ -161,10 +168,25 @@ _pb_row = _pb_base + PATCH_HEADER_SLOTS + _pb_wpos * PATCH_CHANS;
 _pb_c = 0;
 loop(PATCH_CHANS,
   _pb_v = spl(PATCH_CH0 + _pb_c);
+  // ⚠ THE TRUST BOUNDARY. Everything on these channels came out of arbitrary
+  // third-party code, and what Swing does with it next is STATEFUL: the drained
+  // audio feeds the reverb and delay buffers, the master filters and the
+  // compressor's detector. Swing's own guard sits at its OUTPUT, which is too
+  // late -- zeroing an output cannot clean a filter whose history already holds
+  // a NaN, and the plugin only has to misbehave once. Same policy Swing uses
+  // there (a NaN fails every comparison, so the test is written to catch it),
+  // The abs() is the peak meter's, one line down, so the guard costs one
+  // compare per channel.
+  // ⛔ NO SCIENTIFIC NOTATION. A denormal squelch written `< 1e-30` here made
+  // REAPER refuse to compile THIS SECTION ALONE -- @init and @block ran, @sample
+  // silently did not, so the ring filled with nothing and Wired went quiet. No
+  // static gate saw it (jsfx-lint and the audit both passed the file) and it is
+  // the only such literal the codebase has ever contained. Write decimals.
+  _pb_a = abs(_pb_v);
+  !(_pb_a <= 8) ? ( _pb_v = 0; _pb_a = 0; );
   atomic_set(gmem[_pb_row + _pb_c], _pb_v);
   // Peak per pad (both channels of the pair fold into one lane).
   _pb_pi = (_pb_c * 0.5) | 0;
-  _pb_a = abs(_pb_v);
   _pb_a > _pb_acc[_pb_pi] ? _pb_acc[_pb_pi] = _pb_a;
   // Zeroed on the way past. Anything left on these channels would reach the
   // track output alongside the returned copy Swing is about to sum in, so every
