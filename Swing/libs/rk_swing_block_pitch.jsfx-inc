@@ -504,23 +504,84 @@ local(_lp_pad _lp_layer _lp_len _lp_lidx _lp_dst _lp_j)
 // Tuned bake thrash (algo/PDC flicker + inst_N source cross-wiring).
 // 2026-06-04.
 //
-// Not truly atomic — JSFX gmem has no CAS, and the two gmem writes below
-// happen in sequence with a peer potentially scanning between them. The
-// existing check below ALSO treats `_id == 0 OR _hb == 0` as free, so a
-// peer reading mid-write could in principle see a half-claimed slot and
-// double-claim. Safe in practice because REAPER serializes FX @init on the
-// project-load thread (and on runtime drag-and-drop, the UI thread) — claims
-// don't actually interleave. The dup-slot reconciler in Swing_ReaKit.jsfx
-// (the loser-vacates-if-other-slot-holds-same-id pass) is belt-and-suspenders
-// for any residual case.
+// Not atomic, and it cannot be: JSFX has no lock shared between instances.
+// ⛔ EEL2's atomic_* functions do NOT help -- their mutex is PER INSTANCE
+// (effectProcessor::m_atomic_mutex in WDL eel_atomic.h), so they guard @gfx
+// against @block inside one Swing and never exclude a peer. @init claims do not
+// interleave (REAPER runs @init on the main thread, one plugin at a time), but
+// @block RE-claims run on parallel worker threads -- see the two-step claim below.
 //
 // Globals (resolved at call time; all assigned before this is ever called):
-//   instance_id, _reg_my_slot, GS_INST_REG_{BASE,STRIDE,MAX,TIMEOUT}.
-function swing_registry_claim()
-local(_si _base _id _hb _now _zj)
+//   instance_id, _reg_my_slot, _reg_try, _reg_try_t, _reg_claim_now,
+//   GS_INST_REG_{BASE,STRIDE,MAX,TIMEOUT,SETTLE}.
+
+// Zero a slot's inbound-command mailboxes (IN direction) as an instance takes
+// it: a recycled slot may carry stale commands from a previous session/project,
+// and a re-adopted own slot may carry commands addressed to the PREVIOUS
+// incarnation. Neither must ever be adopted by the new owner.
+function swing_registry_zero_incmd(slot)
+local(_zj)
 (
-  _reg_my_slot < 0 ? (
+  _zj = 0;
+  loop(INST_INCMD_STRIDE,
+    gmem[INST_INCMD_BASE + slot * INST_INCMD_STRIDE + _zj] = 0;
+    _zj += 1;
+  );
+);
+
+function swing_registry_claim()
+local(_si _base _id _hb _now _pick)
+(
+  // ⭐ OWNERSHIP RE-VALIDATION, and it has to come first (2026-09-12).
+  // _reg_my_slot is a LATCH. Everything below used to sit behind `< 0` alone, so
+  // an instance that once held a slot never asked again whether it still does --
+  // and the @block heartbeat writer downstream stamps id+time into that latched
+  // slot with no check of its own. An instance that goes dormant (its @block
+  // stops running) therefore freezes its heartbeat, its slot ages past
+  // GS_INST_REG_TIMEOUT, a peer legitimately takes it as stale -- and the moment
+  // the dormant one runs again it writes ITS id straight over the live incumbent.
+  // Both then stamp the same slot every block, and _reg_my_slot keys the strided
+  // per-instance bands (IDENT, PADMIX, INCMD, GS_STRIP, the stretch ring), so the
+  // two instances silently share all of them. Measured 2026-09-12: an undo-
+  // restored Swing woke up and knocked a Swing that had never been deleted
+  // offline (EON_Probe_QueueLifetime_probe).
+  // ⚠ This also covers the case where @init never ran at all: EEL2 zero-inits, so
+  // the latch reads 0 -- a VALID-looking slot index that passes every `>= 0` gate
+  // and points at whoever holds slot 0. Dropping the latch sends it through Pass
+  // A/B to a genuinely free slot instead.
+  // The reconciler below cannot substitute for this: it scans OTHER slots for OUR
+  // id and never asks whether our OWN slot still holds it.
+  (_reg_my_slot >= 0 &&
+   gmem[GS_INST_REG_BASE + _reg_my_slot * GS_INST_REG_STRIDE] != instance_id) ? (
+    _reg_my_slot = -1;   // our slot was reassigned while we were away -- re-claim
+  );
+  // ⭐ TWO-STEP @block CLAIM (2026-09-13). Several instances re-claiming in the
+  // same audio cycle (undo restore, a vacated slot, a mass wipe) can each pick
+  // the SAME free slot; the last id written wins. Claimed on the spot, the loser
+  // had already published into the winner's bands and zeroed its mailboxes by
+  // the time its next block noticed (measured: 320 of 320 claims used the slot
+  // before anyone could object). So an @block claim writes its id as an INTENT
+  // and takes the slot only if the id is still ours GS_INST_REG_SETTLE later.
+  // A competing write lands microseconds after its scan, so a loser always sees
+  // it and rescans having touched nothing. @init claims stay immediate
+  // (_reg_claim_now = 1): no interleaving there, and @block may not run yet.
+  // _reg_try = pending slot + 1, so EEL2 zero-init reads as "nothing pending".
+  (_reg_my_slot < 0 && _reg_try > 0) ? (
+    _base = GS_INST_REG_BASE + (_reg_try - 1) * GS_INST_REG_STRIDE;
+    gmem[_base] != instance_id ? (
+      _reg_try = 0;                       // a peer wrote after us: lost, rescan below
+    ) : (
+      (time_precise() - _reg_try_t) >= GS_INST_REG_SETTLE ? (
+        _reg_my_slot = _reg_try - 1;      // survived the settle: ours
+        _reg_try = 0;
+        gmem[_base + 1] = time_precise();
+        swing_registry_zero_incmd(_reg_my_slot);
+      );
+    );
+  );
+  (_reg_my_slot < 0 && _reg_try <= 0) ? (
     _now = time_precise();
+    _pick = -1;
     // Pass A — re-adopt our own previous slot. A slot already holding OUR
     // instance_id with a zero/stale heartbeat is this instance's previous
     // incarnation (reload/recompile — registry cells persist in gmem).
@@ -532,37 +593,35 @@ local(_si _base _id _hb _now _zj)
     _si = 0;
     loop(GS_INST_REG_MAX,
       _base = GS_INST_REG_BASE + _si * GS_INST_REG_STRIDE;
-      (_reg_my_slot < 0 && gmem[_base] == instance_id &&
+      (_pick < 0 && gmem[_base] == instance_id &&
        (gmem[_base + 1] == 0 || (_now - gmem[_base + 1]) > GS_INST_REG_TIMEOUT)) ? (
-        _reg_my_slot = _si;
+        _pick = _si;
       );
       _si += 1;
     );
-    // Pass B — first free/stale slot (original behavior).
+    // Pass B — first free/stale slot (original behavior). A peer's pending
+    // intent carries a fresh heartbeat, so it reads as taken.
     _si = 0;
-    _reg_my_slot < 0 ? loop(GS_INST_REG_MAX,
+    _pick < 0 ? loop(GS_INST_REG_MAX,
       _base = GS_INST_REG_BASE + _si * GS_INST_REG_STRIDE;
       _id = gmem[_base];
       _hb = gmem[_base + 1];
-      (_reg_my_slot < 0 &&
+      (_pick < 0 &&
        (_id == 0 || _hb == 0 || (_now - _hb) > GS_INST_REG_TIMEOUT)) ? (
-        _reg_my_slot = _si;
+        _pick = _si;
       );
       _si += 1;
     );
-    _reg_my_slot >= 0 ? (
-      _base = GS_INST_REG_BASE + _reg_my_slot * GS_INST_REG_STRIDE;
-      gmem[_base + 0] = instance_id;   // single-pass claim: register on the spot
+    _pick >= 0 ? (
+      _base = GS_INST_REG_BASE + _pick * GS_INST_REG_STRIDE;
+      gmem[_base + 0] = instance_id;
       gmem[_base + 1] = _now;
-      // Zero this slot's inbound-command mailboxes (IN direction): a recycled
-      // slot may carry stale commands from a previous session/project — and a
-      // re-adopted own slot may carry commands addressed to the PREVIOUS
-      // incarnation. Neither must ever be adopted by the new owner. Covers
-      // both call sites (@init claim and @block reclaim).
-      _zj = 0;
-      loop(INST_INCMD_STRIDE,
-        gmem[INST_INCMD_BASE + _reg_my_slot * INST_INCMD_STRIDE + _zj] = 0;
-        _zj += 1;
+      _reg_claim_now ? (
+        _reg_my_slot = _pick;             // @init: register on the spot
+        swing_registry_zero_incmd(_pick);
+      ) : (
+        _reg_try = _pick + 1;             // @block: intent, confirmed after the settle
+        _reg_try_t = _now;
       );
     );
   );

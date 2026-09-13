@@ -237,6 +237,62 @@ function core.atomic_write(path, writer)
   return os.rename(tmp, path)
 end
 
+-- Binary file copy that never lies about success. Streams in 1 MB chunks (a
+-- huge recording is never held whole in memory), checks every write and the
+-- close, and requires the byte count to match the source before it swaps the
+-- copy into place from dst.tmp. On ANY failure dst is left as it was, the tmp
+-- is removed, and it returns false + message -- so a caller may delete the
+-- source only on true. (core.atomic_write opens in TEXT mode; never use it
+-- for audio.)
+function core.copy_file(src, dst)
+  if not src or src == "" or not dst or dst == "" then return false, "bad path" end
+  local fin = io.open(src, "rb")
+  if not fin then return false, "cannot open source: " .. src end
+  local src_size = fin:seek("end")
+  fin:seek("set", 0)
+  local tmp = dst .. ".tmp"
+  local fout = io.open(tmp, "wb")
+  if not fout then fin:close(); return false, "cannot write: " .. tmp end
+  local total, err = 0, nil
+  while true do
+    local chunk = fin:read(1048576)
+    if not chunk then break end
+    local wok, werr = fout:write(chunk)
+    if not wok then err = "write failed: " .. tostring(werr); break end
+    total = total + #chunk
+  end
+  fin:close()
+  local cok, cerr = fout:close()
+  if not err and not cok then err = "close failed: " .. tostring(cerr) end
+  if not err and total ~= src_size then
+    err = "short copy: " .. total .. " of " .. tostring(src_size) .. " bytes"
+  end
+  if err then os.remove(tmp); return false, err end
+  -- A read-only destination is refused, not replaced: Windows lets a rename move
+  -- a read-only file aside, which would defeat the attribute.
+  local ro = io.open(dst, "rb")
+  if ro then
+    ro:close()
+    local ap = io.open(dst, "ab")
+    if not ap then os.remove(tmp); return false, "destination is read-only: " .. dst end
+    ap:close()
+  end
+  -- The old destination steps aside and comes BACK if the new copy cannot take its
+  -- place (an antivirus hold on the fresh .tmp, say). Removing it first lost both
+  -- files whenever that rename failed.
+  local prev = dst .. ".prev"
+  os.remove(prev)
+  local had_old = os.rename(dst, prev)
+  local rok, rerr = os.rename(tmp, dst)
+  if not rok then
+    if had_old then os.rename(prev, dst) end
+    os.remove(tmp)
+    return false, "rename failed: " .. tostring(rerr)
+  end
+  if had_old then os.remove(prev) end
+  return true
+end
+
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- FORMAT HELPERS
 -- ═══════════════════════════════════════════════════════════════════════════════

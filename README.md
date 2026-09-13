@@ -214,10 +214,9 @@ Plain answers, because you shouldn't have to read source to know:
   (kit load and save, the browser, multi-out building, Wired, pairing), and it
   says so on its own display rather than failing quietly. Delete an unused Swing
   and the next one to ask takes the free slot.
-- **MIDI CC119 is reserved.** Steppa uses it to carry a step's probability, and
-  Swing consumes it rather than passing it on, so a hardware controller sending
-  CC119 into a Swing track will not reach anything downstream. Any other CC
-  passes through untouched.
+- **MIDI CC119 carries Steppa's probability.** Swing uses a CC119 only when it
+  lands on the same sample as one of its pad notes; otherwise it passes through
+  to the next plugin like any other controller.
 
 ## License
 

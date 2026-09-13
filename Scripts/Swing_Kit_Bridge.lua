@@ -4973,10 +4973,22 @@ local swing_kit_v5 = (function()
     end
   end
 
+  -- Eight bytes per string.byte call: 2.5x the one-byte loop (30 MB in 0.6 s
+  -- vs 1.5 s, Lua 5.4, 2026-09-12), and the reader now pays this on every load.
   local function _crc32(s)
-    local c = 0xFFFFFFFF
-    for i = 1, #s do
-      c = (c >> 8) ~ _crc_tbl[((c ~ s:byte(i)) & 0xFF)]
+    local c, T, sb = 0xFFFFFFFF, _crc_tbl, string.byte
+    local n, i = #s, 1
+    while i + 7 <= n do
+      local b1, b2, b3, b4, b5, b6, b7, b8 = sb(s, i, i + 7)
+      c = (c >> 8) ~ T[(c ~ b1) & 0xFF]; c = (c >> 8) ~ T[(c ~ b2) & 0xFF]
+      c = (c >> 8) ~ T[(c ~ b3) & 0xFF]; c = (c >> 8) ~ T[(c ~ b4) & 0xFF]
+      c = (c >> 8) ~ T[(c ~ b5) & 0xFF]; c = (c >> 8) ~ T[(c ~ b6) & 0xFF]
+      c = (c >> 8) ~ T[(c ~ b7) & 0xFF]; c = (c >> 8) ~ T[(c ~ b8) & 0xFF]
+      i = i + 8
+    end
+    while i <= n do
+      c = (c >> 8) ~ T[(c ~ sb(s, i)) & 0xFF]
+      i = i + 1
     end
     return (c ~ 0xFFFFFFFF) & 0xFFFFFFFF
   end
@@ -5044,6 +5056,12 @@ local swing_kit_v5 = (function()
   end
 
   -- Returns: { {name=..., data=...}, ... }, err. STORE only.
+  -- A damaged or hand-made archive FAILS, it never half-loads: every header
+  -- and every entry's bytes must lie inside the file (bytes:sub silently
+  -- truncates, so an entry cut off by a partial download used to come back
+  -- short and still "load"), every entry's CRC must match, the local header
+  -- must agree with the central directory, and names must be flat.
+  zip.MAX_ENTRIES = 512   -- a full kit is 1 + 16 pads x 4 layers = 65
   function zip.read(bytes)
     if type(bytes) ~= "string" or #bytes < 22 then
       return nil, "zip: too short"
@@ -5062,37 +5080,63 @@ local swing_kit_v5 = (function()
     local cdir_size     = _read_u32(bytes, eocd_off + 12)
     local cdir_off      = _read_u32(bytes, eocd_off + 16)
 
-    if cdir_off + cdir_size > #bytes then
+    if cdir_off + cdir_size > eocd_off - 1 then
       return nil, "zip: truncated central directory"
+    end
+    if total_entries > zip.MAX_ENTRIES then
+      return nil, "zip: " .. total_entries .. " entries (limit " .. zip.MAX_ENTRIES .. ")"
     end
 
     local entries = {}
     local p = cdir_off + 1
+    local cdir_end = cdir_off + cdir_size   -- last central-directory byte (1-based)
 
     for _ = 1, total_entries do
-      if bytes:sub(p, p + 3) ~= "\x50\x4B\x01\x02" then
-        return nil, "zip: bad central directory entry signature"
+      if p + 45 > cdir_end or bytes:sub(p, p + 3) ~= "\x50\x4B\x01\x02" then
+        return nil, "zip: bad central directory entry"
       end
       local method   = _read_u16(bytes, p + 10)
+      local crc      = _read_u32(bytes, p + 16)
       local size     = _read_u32(bytes, p + 24)
       local name_len = _read_u16(bytes, p + 28)
       local extra    = _read_u16(bytes, p + 30)
       local comment  = _read_u16(bytes, p + 32)
       local lfh_off  = _read_u32(bytes, p + 42)
+      if p + 45 + name_len > cdir_end then
+        return nil, "zip: entry name runs past the central directory"
+      end
       local name     = bytes:sub(p + 46, p + 46 + name_len - 1)
 
+      if name == "" or name:find("[/\\]") or name:find("..", 1, true) then
+        return nil, "zip: bad entry name '" .. name .. "'"
+      end
       if method ~= 0 then
         return nil, "zip: entry '" .. name .. "' uses unsupported compression (method " .. method .. "); STORE only"
       end
 
       local lp = lfh_off + 1
-      if bytes:sub(lp, lp + 3) ~= "\x50\x4B\x03\x04" then
-        return nil, "zip: bad local file header signature for '" .. name .. "'"
+      if lp + 29 > #bytes or bytes:sub(lp, lp + 3) ~= "\x50\x4B\x03\x04" then
+        return nil, "zip: bad local file header for '" .. name .. "'"
       end
+      local lflags    = _read_u16(bytes, lp + 6)
       local lname_len = _read_u16(bytes, lp + 26)
       local lextra    = _read_u16(bytes, lp + 28)
+      -- Bit 3 = sizes/CRC live in a trailing data descriptor, zero here.
+      -- STORE: compressed size == uncompressed size, in both headers.
+      if _read_u32(bytes, p + 20) ~= size or
+         (lflags & 8 == 0 and
+          (_read_u32(bytes, lp + 14) ~= crc or _read_u32(bytes, lp + 18) ~= size or
+           _read_u32(bytes, lp + 22) ~= size)) then
+        return nil, "zip: '" .. name .. "' headers disagree"
+      end
       local data_off  = lp + 30 + lname_len + lextra
+      if data_off + size - 1 > #bytes then
+        return nil, "zip: '" .. name .. "' is cut off (file truncated)"
+      end
       local data = bytes:sub(data_off, data_off + size - 1)
+      if _crc32(data) ~= crc then
+        return nil, "zip: '" .. name .. "' failed its integrity check (damaged file)"
+      end
 
       entries[#entries + 1] = { name = name, data = data }
 
@@ -5169,6 +5213,14 @@ local swing_kit_v5 = (function()
     end
     local f, ferr = io.open(filepath, "rb")
     if not f then return nil, nil, "load_kit: cannot open '" .. filepath .. "': " .. tostring(ferr) end
+    -- The whole archive is read into one string and then decoded into tables
+    -- (~16 bytes per sample), so refuse sizes that could only end in an OOM.
+    local fsize = f:seek("end") or 0
+    f:seek("set", 0)
+    if fsize > 1073741824 then
+      f:close()
+      return nil, nil, string.format("load_kit: file is %.0f MB (limit 1024 MB)", fsize / 1048576)
+    end
     local bytes = f:read("*a")
     f:close()
     if not bytes or #bytes == 0 then return nil, nil, "load_kit: empty file" end
@@ -5241,6 +5293,32 @@ local swing_kit_v5 = (function()
     assert(e2[1].name == "kit.json" and e2[1].data == txt)
     assert(e2[2].name == "pad_01.wav" and e2[2].data == wb)
     assert(e2[3].name == "pad_02.wav" and e2[3].data == "small data")
+
+    -- Damaged archives must FAIL, never half-load.
+    local function patch32(s, pos, v)   -- pos 1-based
+      return s:sub(1, pos - 1) .. _le32(v) .. s:sub(pos + 4)
+    end
+    local function nth(s, sig, n)
+      local at = 0
+      for _ = 1, n do at = assert(s:find(sig, at + 1, true)) end
+      return at
+    end
+    local wat = assert(zb:find(wb, 1, true))
+    local flipped = zb:sub(1, wat + 9) .. string.char((zb:byte(wat + 10) + 1) % 256) .. zb:sub(wat + 11)
+    local r, rerr = zip.read(flipped)
+    assert(not r and rerr:find("integrity", 1, true), "flipped byte not caught: " .. tostring(rerr))
+    r = zip.read(zb:sub(1, #zb - 30))
+    assert(not r, "truncated archive not caught")
+    local huge = zb   -- both size fields in both headers, so only the bounds check can object
+    local lh, ch = nth(zb, "\x50\x4B\x03\x04", 3), nth(zb, "\x50\x4B\x01\x02", 3)
+    huge = patch32(patch32(huge, lh + 18, 0x7FFFFFF0), lh + 22, 0x7FFFFFF0)
+    huge = patch32(patch32(huge, ch + 20, 0x7FFFFFF0), ch + 24, 0x7FFFFFF0)
+    r, rerr = zip.read(huge)
+    assert(not r and rerr:find("cut off", 1, true), "oversized entry not caught: " .. tostring(rerr))
+    r, rerr = zip.read(patch32(zb, nth(zb, "\x50\x4B\x01\x02", 2) + 24, #wb + 1))
+    assert(not r and rerr:find("disagree", 1, true), "header mismatch not caught: " .. tostring(rerr))
+    r, rerr = zip.read(assert(zip.write({ { name = "../evil.wav", data = "x" } })))
+    assert(not r and rerr:find("bad entry name", 1, true), "bad name not caught: " .. tostring(rerr))
 
     return true
   end
@@ -5692,22 +5770,11 @@ function _eon_sweep_unsaved_store()
   return swept
 end
 
--- Binary file copy. Returns true on success. Reads entire src file into
--- memory (one Lua string) and writes to dst — fine for typical kit
--- samples (sub-50 MB); if we ever need to handle multi-hundred-MB
--- samples, switch to chunked I/O.
+-- Binary file copy. Returns true only for a complete, verified copy:
+-- core.copy_file streams in chunks (a multi-hundred-MB recording is never one
+-- Lua string) and checks every write, the close and the byte count.
 local function _eon_copy_file_bin(src, dst)
-  if not src or src == "" then return false end
-  local fin = io.open(src, "rb")
-  if not fin then return false end
-  local data = fin:read("*a")
-  fin:close()
-  if not data then return false end
-  local fout = io.open(dst, "wb")
-  if not fout then return false end
-  fout:write(data)
-  fout:close()
-  return true
+  return core.copy_file(src, dst) == true
 end
 
 -- Publish a pad path via temp copy. Used by drag-drop (load_audio_to_pad).
@@ -9876,14 +9943,17 @@ local function write_kit_v5(filepath, info, silent)
   -- come from another. Symptom: manifest says "pads 1-4 have audio" but
   -- the captured wavs are pad_01/pad_07/pad_10. Snapshotting everything
   -- now means the rest of the function works off frozen locals.
-  local snap_audiolen = {}    -- AUDIOLEN_BASE per pad
+  -- ⛔ Lengths come from META only (s_len +34, l_len +40+layer*10), which the
+  -- SAVING instance staged in state 11 under its LOCK. The shared AUDIOLEN band
+  -- is every instance's last write; falling back to it captured another Swing's
+  -- pad lengths (removed 2026-09-13). Other instances stay off META and the name
+  -- band while LOCK is held (swing_shared_bands_free in rk_swing_core.jsfx-inc).
   local snap_meta     = {}    -- full META block per pad (40 + MAX_LAYERS*10 doubles)
   local snap_padname  = {}    -- raw pad name characters per pad
   local snap_offset   = {}    -- sample offset per pad
   local snap_range    = {}    -- packed chromatic key-range (lo*128+hi) per pad
   local snap_smash    = {}    -- smash send per pad (overflow band; META is full)
   for pad = 0, G.NUM_PADS - 1 do
-    snap_audiolen[pad] = math.floor(reaper.gmem_read(G.AUDIOLEN_BASE + pad) or 0)
     local mb = G.META_BASE + pad * G.META_PP
     local row = {}
     for j = 0, G.META_PP - 1 do
@@ -9901,14 +9971,13 @@ local function write_kit_v5(filepath, info, silent)
 
   -- Optional gmem-state dump at save time. Enable via:
   --   reaper.SetExtState("EON_Swing", "save_debug", "1", false)
-  -- Prints AUDIOLEN, s_len from META, and pad name for every populated pad,
+  -- Prints s_len from META, layer count, path and pad name for every populated pad,
   -- so we can see exactly what gmem says at the moment SAVE fires (vs what
   -- the JSFX UI shows the user). Toggles off by setting to "0" or clearing.
   if reaper.GetExtState and reaper.GetExtState("EON_Swing", "save_debug") == "1" then
     reaper.ShowConsoleMsg("\n=== write_kit_v5 SAVE DEBUG @ " .. os.date() .. " ===\n")
     reaper.ShowConsoleMsg("Filepath: " .. tostring(filepath) .. "\n")
     for pad = 0, G.NUM_PADS - 1 do
-      local alen = snap_audiolen[pad]
       local slen = math.floor(snap_meta[pad][34] or 0)
       local lc = math.floor(snap_meta[pad][32] or 0)
       local pp = read_pad_path_from_gmem(pad)
@@ -9918,10 +9987,10 @@ local function write_kit_v5(filepath, info, silent)
         if c > 0 then name_chars[#name_chars + 1] = string.char(c) end
       end
       local name = table.concat(name_chars)
-      if alen > 0 or slen > 0 or lc > 0 or name ~= "" then
+      if slen > 0 or lc > 0 or name ~= "" then
         reaper.ShowConsoleMsg(string.format(
-          "  pad %2d (UI %2d): AUDIOLEN=%8d  s_len=%8d  layer_cnt=%d  path=%q  name=%q\n",
-          pad, pad + 1, alen, slen, lc, pp, name))
+          "  pad %2d (UI %2d): s_len=%8d  layer_cnt=%d  path=%q  name=%q\n",
+          pad, pad + 1, slen, lc, pp, name))
       end
     end
     reaper.ShowConsoleMsg("=== end SAVE DEBUG ===\n")
@@ -9932,23 +10001,19 @@ local function write_kit_v5(filepath, info, silent)
   -- Single-source is fragile because META is written only at JSFX state 11
   -- (by the saving instance). The presence leg is asked of the SAVING
   -- instance (its IDENT audio flag at info.slot, captured with LOCK held when
-  -- pending_export was created, 2026-09-08); the shared AUDIOLEN band every
-  -- instance rewrites each @block (last writer wins) is only the fallback
-  -- when no slot is known. snap_audiolen itself keeps the shared values: the
-  -- path-less pad capture below still needs them as LENGTHS.
+  -- pending_export was created, 2026-09-08). With no slot there is no second
+  -- leg: the shared AUDIOLEN band is every instance's last write, not ours.
   do
     local total_meta = 0
-    local total_audiolen = 0
+    local total_present = 0
     local save_slot = info and info.slot
     if save_slot == nil and not (info and info.undo_dump) then
-      eon_load_report("save guard: no registry slot for the saving instance -- using the shared AUDIOLEN band")
+      eon_load_report("save guard: no registry slot for the saving instance -- META lengths only")
     end
     for pad = 0, G.NUM_PADS - 1 do
       total_meta = total_meta + math.floor(snap_meta[pad][34] or 0)
       if save_slot ~= nil then
-        total_audiolen = total_audiolen + (core.pad_has_audio(pad, save_slot) and 1 or 0)
-      else
-        total_audiolen = total_audiolen + snap_audiolen[pad]
+        total_present = total_present + (core.pad_has_audio(pad, save_slot) and 1 or 0)
       end
       local lc = math.floor(snap_meta[pad][32] or 0)
       if lc > 0 then
@@ -9957,17 +10022,13 @@ local function write_kit_v5(filepath, info, silent)
         end
       end
     end
-    local total_audio = math.max(total_meta, total_audiolen)
-    -- Console warning when the two sources disagree — points at a state
-    -- machine bug (kit_import not done, instance race, etc.)
-    if total_meta == 0 and total_audiolen > 0 then
+    local total_audio = math.max(total_meta, total_present)
+    -- Console warning when the two legs disagree — points at a state
+    -- machine bug (kit_import not done, state 11 not staged, etc.)
+    if total_meta == 0 and total_present > 0 then
       reaper.ShowConsoleMsg(string.format(
-        "Swing SAVE: META s_len shows empty (0) but AUDIOLEN_BASE shows %d total — "
-        .. "state 11 didn't write META. Falling back to AUDIOLEN_BASE.\n", total_audiolen))
-    elseif total_meta > 0 and total_audiolen == 0 then
-      reaper.ShowConsoleMsg(string.format(
-        "Swing SAVE: META s_len shows %d total but AUDIOLEN_BASE is 0 — @gfx mirror "
-        .. "didn't update AUDIOLEN. Using META for capture.\n", total_meta))
+        "Swing SAVE: META shows no audio but the saving instance reports %d loaded pad(s) — "
+        .. "state 11 did not stage lengths; pads without a source file will be missing.\n", total_present))
     end
     if total_audio == 0 then
       eon_notice(
@@ -10140,14 +10201,29 @@ local function write_kit_v5(filepath, info, silent)
   end
 
   -- 3. Gather pad audio into pad_buffers keyed by wav filename.
-  -- IMPORTANT: AUDIOLEN_BASE is read from the snapshot taken at the top
-  -- of this function — NOT live gmem — so the alen the manifest used in
-  -- the loop above matches the alen this loop sees. Each successful
-  -- capture also stamps the manifest pad_entry.audio field, so manifest
-  -- audio references and zip wav contents are 1:1.
+  -- IMPORTANT: lengths are read from the META snapshot taken at the top of
+  -- this function — NOT live gmem — so the manifest and this loop agree. Each
+  -- successful capture also stamps the manifest pad_entry.audio field, so
+  -- manifest audio references and zip wav contents are 1:1.
   local pad_buffers = {}
   local layer_max_frames = math.floor(G.LAYER_SIZE / 2)
   local pad_max_frames   = math.floor(G.SLOT_SIZE / 2)
+  -- Where each plain pad's blob starts in the state-11 dump. Walk it exactly as
+  -- the JSFX wrote it (rk_swing_ui_state.jsfx-inc, export state 11): pads in
+  -- order, a layered pad advancing by each non-empty layer's l_len, a plain pad
+  -- by its s_len. The old prefix sum counted s_len only, so a path-less pad
+  -- after any layered pad read the layers' audio instead of its own.
+  local dump_at, dump_walk = {}, 0
+  for p = 0, G.NUM_PADS - 1 do
+    dump_at[p] = dump_walk
+    if layer_cnts[p] > 0 then
+      for layer = 0, layer_cnts[p] - 1 do
+        dump_walk = dump_walk + math.max(0, math.floor(snap_meta[p][40 + layer * 10] or 0))
+      end
+    else
+      dump_walk = dump_walk + math.max(0, math.floor(snap_meta[p][34] or 0))
+    end
+  end
   for pad = 0, G.NUM_PADS - 1 do
     local lc = layer_cnts[pad]
     local pad_entry = manifest.pads[pad + 1]
@@ -10165,30 +10241,15 @@ local function write_kit_v5(filepath, info, silent)
       end
     else
       local pp = pad_paths[pad]
-      -- Pick the audio-length source that has a value for this pad. Prefer
-      -- META s_len (slot 34) — written by THIS instance's state-11 export.
-      -- Fall back to AUDIOLEN_BASE if META is 0 — happens when state 11 didn't
-      -- write META (race, partial state) but the @gfx mirror is up-to-date.
-      local meta_len     = math.floor(snap_meta[pad][34] or 0)
-      local audiolen_len = snap_audiolen[pad]
-      local alen = meta_len > 0 and meta_len or audiolen_len
+      -- META s_len (slot 34), staged by THIS instance's state-11 export. There
+      -- is no fallback: 0 means the saving instance has no plain-pad audio here.
+      local alen = math.floor(snap_meta[pad][34] or 0)
       local samples, sr
       if (not pp or pp == "") and alen > 0 then
         -- Choppa pad: capture from the JSFX-dumped audio region (NOT the
         -- path-overlaid AUDIO_BASE + 0). JSFX state 11 writes s_audio_start[]
         -- to AUDIO_BASE + AUDIO_DUMP_OFFSET right before signalling CMD=1.
-        --
-        -- Use the SAME source (meta or audiolen) for the offset that we used
-        -- for the length — mixing would misalign the read.
-        local use_meta = (meta_len > 0)
-        local audio_off = 0
-        for p = 0, pad - 1 do
-          if use_meta then
-            audio_off = audio_off + math.floor(snap_meta[p][34] or 0)
-          else
-            audio_off = audio_off + snap_audiolen[p]
-          end
-        end
+        local audio_off = dump_at[pad]
         local capped = alen
         if audio_off + capped > GMEM_AUDIO_MAX then
           capped = math.max(0, GMEM_AUDIO_MAX - audio_off)
@@ -14818,6 +14879,11 @@ end
 -- self-registering script).
 function eon_write_startup(path, content)
   local tmp, prev = path .. ".eon-tmp", path .. ".eon-prev"
+  -- A read-only __startup.lua is the user's call. Windows would still let the
+  -- renames below replace it -- and strand a read-only .eon-prev that blocks
+  -- every later rewrite -- so refuse up front.
+  local ro = io.open(path, "r")
+  if ro then ro:close(); local ap = io.open(path, "a"); if not ap then return false end; ap:close() end
   local f = io.open(tmp, "w")
   if not f then return false end
   local wok = f:write(content)
@@ -14839,6 +14905,79 @@ function eon_write_startup(path, content)
   return false
 end
 
+-- ⭐ Strip one script's block from __startup.lua text, in WHOLE LINES. The file is
+-- shared with other vendors. The old gsub('\n?BEGIN.-END\n?') ate the newline on
+-- BOTH sides, gluing a neighbour line that had no trailing newline onto the next
+-- vendor's line (a comment then swallowed their command), and a stray BEGIN with
+-- no END stretched the match over foreign lines down to our real END. Here a block
+-- goes only when its BEGIN line is followed by its END line with no second BEGIN
+-- in between -- anything unmatched stays verbatim -- together with the one blank
+-- line we write above it, so re-registering never grows the file. The v1/v2 form
+-- (a bare "-- EON:<name>" line plus the line after it) goes too. Returns the text
+-- and whether anything was removed. Global, and identical in all five
+-- self-registering EON scripts: .dev_tests/startup_file_test.py holds them to it.
+function eon_strip_startup_block(text, name)
+  local B, E, OLD = "-- EON:" .. name .. " BEGIN", "-- EON:" .. name .. " END", "-- EON:" .. name
+  local out, pend, skip, hit = {}, nil, false, false
+  local nl = text:sub(-1) == "\n"
+  for l in (nl and text or text .. "\n"):gmatch("([^\n]*)\n") do
+    local k = l:gsub("\r$", "")
+    if skip then
+      skip, hit = false, true
+    elseif pend then
+      if k == E then
+        if out[#out] and out[#out]:gsub("\r$", "") == "" then out[#out] = nil end
+        pend, hit = nil, true
+      elseif k == B then
+        for _, x in ipairs(pend) do out[#out + 1] = x end
+        pend = { l }
+      else
+        pend[#pend + 1] = l
+      end
+    elseif k == B then
+      pend = { l }
+    elseif k == OLD then
+      skip = true
+    else
+      out[#out + 1] = l
+    end
+  end
+  if pend then for _, x in ipairs(pend) do out[#out + 1] = x end end
+  local s = table.concat(out, "\n")
+  if nl and #out > 0 then s = s .. "\n" end
+  return s, hit
+end
+
+-- The uninstall half of the block written into __startup.lua (the `else` branch,
+-- reached once the script's command no longer resolves). It removes the block by
+-- the same whole-line rule as eon_strip_startup_block -- inlined, because nothing
+-- of ours is left to call -- skips a read-only file, and clears the flag.
+function eon_startup_selfclean_src(name, section, key)
+  return
+    "  local p=reaper.GetResourcePath()..\"/Scripts/__startup.lua\"\n" ..
+    "  local f=io.open(p,'r'); local c=f and f:read('*a'); if f then f:close() end\n" ..
+    "  local w=c and io.open(p,'a'); if w then w:close()\n" ..
+    -- Markers assembled at run time: the literal "-- EON:<name> END" must never appear
+    -- INSIDE the block, or an older copy's lazy BEGIN.-END match would stop there and
+    -- leave half a block (broken Lua) behind.
+    "    local N='-- EON:'..'" .. name .. "'; local B,E,o,q=N..' BEGIN',N..' END',{}\n" ..
+    "    local nl=c:sub(-1)=='\\n'\n" ..
+    "    for l in (nl and c or c..'\\n'):gmatch('([^\\n]*)\\n') do local k=l:gsub('\\r$','')\n" ..
+    "      if q then\n" ..
+    "        if k==E then if o[#o] and o[#o]:gsub('\\r$','')=='' then o[#o]=nil end q=nil\n" ..
+    "        elseif k==B then for _,x in ipairs(q) do o[#o+1]=x end q={l}\n" ..
+    "        else q[#q+1]=l end\n" ..
+    "      elseif k==B then q={l} else o[#o+1]=l end\n" ..
+    "    end\n" ..
+    "    if q then for _,x in ipairs(q) do o[#o+1]=x end end\n" ..
+    "    c=table.concat(o,'\\n')..((nl and #o>0) and '\\n' or '')\n" ..
+    "    local t,b=p..'.eon-tmp',p..'.eon-prev'; local fw=io.open(t,'w'); local ok=false\n" ..
+    "    if fw then ok=fw:write(c) and true or false; if not fw:close() then ok=false end end\n" ..
+    "    if ok then os.remove(b); local h=os.rename(p,b); if os.rename(t,p) then os.remove(b) elseif h then os.rename(b,p) end end\n" ..
+    "    os.remove(t) end\n" ..
+    "  reaper.SetExtState('" .. section .. "','" .. key .. "','',true)\n"
+end
+
 local function self_register()
   -- Probe/host opt-out (kitpipe harness, any dofile host): registration
   -- records get_action_context()'s script path — the HOSTING script, not
@@ -14848,7 +14987,7 @@ local function self_register()
   -- exports, deleted fixture kits — kitpipe post-mortem 2026-07-17).
   if reaper.GetExtState("EON_Bridge", "no_self_register") == "1" then return end
   local _, script_path = reaper.get_action_context()
-  local key = SCRIPT_NAME .. "_registered_v3"
+  local key = SCRIPT_NAME .. "_registered_v4"
   local marker = "-- EON:" .. SCRIPT_NAME
 
   -- Check both ExtState AND __startup.lua. If the ExtState says registered
@@ -14881,9 +15020,8 @@ local function self_register()
   -- Strip ALL prior versions of our block so re-registration is idempotent:
   --   v3+: BEGIN...END block (new self-cleaning format)
   --   v1/v2: single-line format ("-- EON:NAME" marker + next line)
-  local esc = marker:gsub("([%-%.%+%*%?%[%]%^%$%(%)%%])", "%%%1")
-  existing = existing:gsub("\n?" .. esc .. " BEGIN.-" .. esc .. " END\n?", "")
-  existing = existing:gsub("\n?" .. esc .. "\n[^\n]*\n?", "")
+  local had_block
+  existing, had_block = eon_strip_startup_block(existing, SCRIPT_NAME)
 
   -- Resolve a stable command token. Named command IDs ("_RSxxxxx") survive
   -- action-list rebuilds; the raw int can change.
@@ -14901,14 +15039,7 @@ local function self_register()
     "\n" .. marker .. " BEGIN\n" ..
     "do local id=" .. cmd_token .. "\n" ..
     "if id~=0 then reaper.Main_OnCommand(id,0) else\n" ..
-    "  local p=reaper.GetResourcePath()..\"/Scripts/__startup.lua\"\n" ..
-    "  local f=io.open(p,'r'); if f then local c=f:read('*a'); f:close()\n" ..
-    "    c=c:gsub('\\n?%-%- EON:" .. SCRIPT_NAME .. " BEGIN.-%-%- EON:" .. SCRIPT_NAME .. " END\\n?','')\n" ..
-    "    local t,b=p..'.eon-tmp',p..'.eon-prev'; local fw=io.open(t,'w'); local ok=false\n" ..
-    "    if fw then ok=fw:write(c) and true or false; if not fw:close() then ok=false end end\n" ..
-    "    if ok then os.remove(b); local h=os.rename(p,b); if os.rename(t,p) then os.remove(b) elseif h then os.rename(b,p) end end\n" ..
-    "    os.remove(t) end\n" ..
-    "  reaper.SetExtState('" .. SCRIPT_NAME .. "','" .. SCRIPT_NAME .. "_registered_v3','',true)\n" ..
+    eon_startup_selfclean_src(SCRIPT_NAME, SCRIPT_NAME, key) ..
     "end end\n" ..
     marker .. " END\n"
 
@@ -14916,7 +15047,11 @@ local function self_register()
   -- leaves the ExtState clear so the next run simply retries.
   if eon_write_startup(startup_path, existing .. block) then
     reaper.SetExtState(SCRIPT_NAME, key, "1", true)
-    reaper.ShowConsoleMsg("[EON] " .. SCRIPT_NAME .. " registered as startup action (auto-cleans on uninstall).\n")
+    -- Only a genuine first registration speaks: replacing an existing block (every
+    -- updated install after a key bump) must not pop the console open for users.
+    if not had_block then
+      reaper.ShowConsoleMsg("[EON] " .. SCRIPT_NAME .. " registered as startup action (auto-cleans on uninstall).\n")
+    end
   end
 end
 self_register()
@@ -15064,31 +15199,28 @@ local function auto_migrate_kits()
   local ok = reaper.ShowMessageBox(msg, SCRIPT_NAME, 4)
   if ok ~= 6 then return end  -- user said No
 
-  -- Move files
-  local moved = 0
+  -- Move files. The source is deleted ONLY after a verified copy: the old
+  -- version never checked the write, so a full disk deleted the user's kit.
+  local moved, failed = 0, {}
   for _, fname in ipairs(to_move) do
     local src = script_dir .. fname
     local dest = kits_dir .. core.sep .. fname
-    -- Read source
-    local f_in = io.open(src, "rb")
-    if f_in then
-      local data = f_in:read("*a")
-      f_in:close()
-      -- Write destination
-      local f_out = io.open(dest, "wb")
-      if f_out then
-        f_out:write(data)
-        f_out:close()
-        -- Delete source
-        os.remove(src)
-        moved = moved + 1
-      end
+    if core.copy_file(src, dest) then
+      os.remove(src)
+      moved = moved + 1
+    else
+      failed[#failed + 1] = fname
     end
   end
 
   if moved > 0 then
     eon_notice(
       "Moved " .. moved .. " kit(s) to:\n" .. kits_dir)
+  end
+  if #failed > 0 then
+    eon_notice(
+      "Could not copy " .. #failed .. " kit(s), so the originals were left where they are:\n" ..
+      table.concat(failed, ", "))
   end
 end
 
@@ -17776,7 +17908,24 @@ local function drive_load_queue()
     -- track+fx refs are the durable key — re-read the CURRENT id (param 3)
     -- at dispatch so LOCK/PENDING never carry a stale id (a stale id makes
     -- the JSFX delivery gate never fire = the load silently times out).
-    if item.tr and reaper.ValidatePtr2(0, item.tr, "MediaTrack*") then
+    -- ⭐⭐ ValidatePtr2 IS NOT AN IDENTITY CHECK. It answers "is this a live
+    -- MediaTrack", not "is this still the SAME track". Delete a track and undo,
+    -- and REAPER recycles the freed track memory -- the stale pointer then
+    -- validates fine but refers to somebody ELSE, and the line below happily
+    -- reads that stranger's instance id and re-aims the kit at it. Measured
+    -- 2026-09-12 (EON_Probe_QueueLifetime_probe): inst=3 was queued, its pointer
+    -- came back as inst=7, and inst=7 was served TWICE while inst=3 got nothing.
+    -- The guid captured at enqueue is the identity; check it before trusting the
+    -- pointer. A mismatch falls through to the guid resolution below, which
+    -- re-binds / holds / drops on real evidence.
+    local tr_is_ours = item.tr and reaper.ValidatePtr2(0, item.tr, "MediaTrack*")
+    if tr_is_ours and (item.guid or "") ~= ""
+       and reaper.GetTrackGUID(item.tr) ~= item.guid then
+      eon_load_report(("queued inst=%d: its track pointer now belongs to another track -- re-resolving by guid")
+        :format(item.inst_id or 0))
+      tr_is_ours = false
+    end
+    if tr_is_ours then
       local live_id = math.floor(reaper.TrackFX_GetParam(item.tr, item.fx, 3) or 0)
       if live_id > 0 then item.inst_id = live_id end
     else
@@ -17799,6 +17948,64 @@ local function drive_load_queue()
       end
       local pick = exact
       if not pick and (item.inst_id or 0) <= 0 then pick = first_live end
+      -- ⭐ THE QUEUED ITEM'S TARGET IS NOT WHERE IT WAS (2026-09-12, found by
+      -- EON_Probe_QueueLifetime_probe: insert 8 Swings, delete 3 of them while
+      -- their starter kits are still queued).
+      -- Reaching this branch with a NON-NIL item.tr means the track snapshot
+      -- taken at enqueue no longer validates -- the track was deleted while the
+      -- load sat in the queue. That is positive evidence, and it is exactly what
+      -- separates a DEAD target from a BOOTING one: a booting instance reads
+      -- param 3 == 0 but its track is perfectly valid, which is the case the
+      -- honour-the-want-as-is contract below exists to protect. So this can only
+      -- ever drop work whose requester is genuinely gone.
+      -- Without it the item was dispatched at the corpse anyway: 2.5s of
+      -- no-consumer timeout with every load queued behind it stalled, and then
+      -- the retry handed the kit to the FIRST LIVE INSTANCE -- a Swing that never
+      -- asked for it. Near-invisible for a starter kit (same kit); for a chosen
+      -- kit it means another track's kit silently changes.
+      -- ONE scan answers both halves. The track snapshot is dead, so ask the
+      -- GUID -- it is the only durable key across a delete: REAPER restores an
+      -- undone track with the SAME guid but a NEW pointer.
+      --   guid live, different id  -> the instance came back and re-minted (it
+      --     duelled something that took its id while it was away). RE-BIND: this
+      --     is the same Swing, and resolving by id alone would miss it and let
+      --     the retry fall back to a bystander.
+      --   guid live, id still 0    -> it is BOOTING (param 3 lags registration).
+      --     Neither re-bind nor drop: fall through and let the honour-the-want
+      --     -as-is contract below give it another cycle.
+      --   guid gone                -> the requester is genuinely deleted. DROP,
+      --     rather than dispatch at a corpse for 2.5s and then hand the kit to
+      --     whichever Swing happens to be first.
+      if not pick and item.tr and (item.guid or "") ~= "" then
+        local by_guid
+        for _, swing in ipairs(enumerate_all_swings()) do
+          if swing.guid == item.guid then by_guid = swing break end
+        end
+        if by_guid and (by_guid.inst_id or 0) > 0 and by_guid.inst_id ~= item.inst_id then
+          eon_load_report(("target inst=%d came back as inst=%d (same track guid) -- re-bound")
+            :format(item.inst_id or 0, by_guid.inst_id))
+          pick = by_guid
+        elseif not by_guid then
+          -- ⚠ enumerate_all_swings() lists only instances that have REGISTERED
+          -- (it gates on param 3 > 0), so a restored-but-still-BOOTING Swing is
+          -- absent from it and "no by_guid" is NOT proof of deletion. Ask the
+          -- project instead: a track carrying this guid means the delete was
+          -- undone and the instance is on its way back, so leave the item to the
+          -- existing honour-the-want path rather than dropping its kit. Only a
+          -- guid with no track behind it at all is proof the requester is gone.
+          local guid_track = false
+          for _qi = 0, reaper.CountTracks(0) - 1 do
+            if reaper.GetTrackGUID(reaper.GetTrack(0, _qi)) == item.guid then guid_track = true break end
+          end
+          if not guid_track then
+            eon_load_report(("target inst=%d was deleted while its load was queued -- dropped %s")
+              :format(item.inst_id or 0, (item.path or ""):match("([^/\\]+)$") or "?"))
+            return
+          end
+          eon_load_report(("target inst=%d: its track is back but has not registered yet -- holding")
+            :format(item.inst_id or 0))
+        end
+      end
       -- Dead-target re-bind (2026-08-19, "808F art never published"): a want
       -- naming an id that is un-enumerated AND a registry corpse means the
       -- instance re-minted (identity duel / recompile fallout) while a stale
@@ -17851,6 +18058,13 @@ local function drive_load_queue()
     -- carries it; the cell write waits until the delivery is real.
     -- current_load keeps the original item so a failed dispatch can
     -- re-enqueue it with its retry budget intact.
+    -- ⭐ WHO ARE WE AIMING AT, as opposed to who ends up acking. The done: line
+    -- below reports GS_LOAD_ACK_INST -- the instance that actually CONSUMED the
+    -- delivery -- so without this pair you cannot tell a mis-AIMED load from a
+    -- correctly-aimed one that the wrong instance consumed. 2026-09-12: a run
+    -- queued inst=5 and acked inst=3 twice, and only this pair can say which.
+    eon_load_report(("dispatch -> inst=%d (retries=%d, queue depth %d)")
+      :format(item.inst_id or 0, item.retries or 0, #pending_load_queue))
     local dispatch_epoch = math.floor(reaper.gmem_read(G.GS_LOAD_EPOCH) or 0) + 1
     current_load = { inst_id = item.inst_id, tr = item.tr, fx = item.fx, path = item.path, guid = item.guid, started_at = reaper.time_precise(), preserve = (item.preserve ~= false), epoch = dispatch_epoch, item = item }
     reaper.gmem_write(G.LOCK, item.inst_id)
@@ -19893,10 +20107,24 @@ function _eon_poll_body()
           end
           eon_kit_cover_load_slot = ss_resolve_slot(want_id)
           pending_load_queue[#pending_load_queue + 1] = item
+          -- Log the EVIDENCE, not just the fact. Whether tr/guid were captured
+          -- here decides every later resolution: with them a dead target can be
+          -- told apart from a booting one; without them the item resolves by id
+          -- only and can fall through to the retry fallback.
+          eon_load_report(("auto-kit queued for inst=%d (tr=%s guid=%s) depth=%d")
+            :format(want_id, item.tr and "yes" or "NO",
+                    (item.guid or "") ~= "" and "yes" or "NO",
+                    #pending_load_queue))
         end
       else
         -- No requester named at all (an unknown poster): the old route, which
         -- falls back through PENDING and the browser binding.
+        -- ⚠ MIS-DELIVERY RISK, and silent until 2026-09-12: nobody is named, so
+        -- the kit lands wherever PENDING / the browser binding points -- which
+        -- under churn is not necessarily whoever asked. If one Swing comes back
+        -- kitless while another is served twice, look here FIRST.
+        eon_load_report(("auto-kit request named NOBODY (WANT=0, LOCK=0) -- PENDING/browser route: %s")
+          :format((kit_path or ""):match("([^/\\]+)$") or "?"))
         reaper.SetExtState("Swing", "kit_load_path", kit_path, false)
         reaper.gmem_write(G.GS_KIT_LOAD_REQ, 1)
       end

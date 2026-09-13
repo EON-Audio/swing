@@ -3,7 +3,7 @@
 desc: Swing
 tags: instrument, sampler, drums
 author: EON Studios
-version: 3.0
+version: 3.0.10
 
 slider1:root_note=36<0,127,1>-Base Note
 slider2:master_db=0<-48,12,0.1>-Master Volume (dB)
@@ -280,6 +280,7 @@ slider4 >= 1 ? (
 instance_id = slider4;
 _init_collision = _init_si = _init_id = _init_hb = 0;  // tidy locals
 _reg_my_slot = -1;  // -1 = registry slot not yet claimed; @block claims on first run
+_reg_try = 0;       // pending @block claim: slot + 1 (0 = none); see swing_registry_claim
 
 // Patchbay loopback consumer state. patch_live is the AND of "the user asked
 // for it" and "a Patchbay is actually alive out there" — the second half is
@@ -304,6 +305,7 @@ diag_armed = 0; diag_t0 = 0; diag_t0_prev = 0; diag_t1 = 0; diag_spl = 0;
 diag_blocks = 0; diag_stall_n = 0; diag_pause_n = 0; diag_gap_max = 0;
 diag_cost_last = 0; diag_cost_max = 0; diag_cost_ema = 0; diag_ratio_max = 0;
 diag_overrun_n = 0; diag_reset_seen = 0;
+diag_ts = 0; diag_bema = 0; diag_sema = 0;   // first-@sample stamp; @block / @sample split EMAs
 
 // LCD banner state (rk_swing_ui_state, 2026-09-08): bridge heartbeat AGE tracking
 // (-1 = no value seen yet, so the first frame counts as movement and never
@@ -1878,7 +1880,8 @@ GS_REB_SLOT_BASE   = 26342000;  // ..26342127
 // engine-paused class the gap detector already flushes on), +5 gap_max s,
 // +6 cost_last s, +7 cost_max s, +8 cost_ema s (alpha 1/32), +9 ratio_max
 // (cost / block period), +10 reset_echo, +11 overrun_n (cost > period),
-// +12 blocks counted. Cost = t(last @sample of the block) - t(@block entry)
+// +12 blocks counted, +13 @block-pass EMA s, +14 sample-loop EMA s (split at a
+// first-@sample stamp). Cost = t(last @sample of the block) - t(@block entry)
 // = THIS FX's wall time per block. Gaps are a stall PROXY only: anticipative
 // FX processing delivers @block in bursts. Cost is the loader metric.
 EON_DIAG_BASE        = 26342400;  // header ..26342415
@@ -2267,6 +2270,7 @@ GS_INST_REG_BASE   = 2556;
 GS_INST_REG_STRIDE = 4;
 GS_INST_REG_MAX    = 16;
 GS_INST_REG_TIMEOUT = 3.0;   // seconds — slots silent longer than this are reused
+GS_INST_REG_SETTLE  = 0.05;  // seconds an @block claim's id must survive before the slot is used
 
 // ─── EON_DRAG: browser drag-over, BROADCAST + self-identifying CLAIM ─────
 // Synthetic drag from Swing_Browser onto the pad grid (an ImGui drag never
@@ -3019,7 +3023,11 @@ swing_color_rebuild();
 // TOCTOU gap that let 2+ instances claim the SAME slot on project-open →
 // multi-instance Tuned bake thrash. (Was an inline scan that set the slot but
 // deferred the id/heartbeat write to @block.)
+// _reg_claim_now: @init claims are taken on the spot (no interleaving on the
+// main thread); only @block re-claims wait out GS_INST_REG_SETTLE.
+_reg_claim_now = 1;
 swing_registry_claim();
+_reg_claim_now = 0;
 
 // Belt-and-suspenders publish-from-@init — see note above. Safe to call
 // here because @init has finished setting up freemem arrays + constants,
@@ -3317,17 +3325,31 @@ _retrig_lockout = max(samplesblock * 2, (srate * 0.01)|0);
 // 2C "chance" controller: Steppa writes its probability lane into the item as CC 119
 // (the last undefined controller) on the step, ahead of that step's notes. One CC =
 // one roll, shared by every note-on at the same sample offset -- Steppa's own die is
-// per STEP, not per pad, and this matches it. Consumed here; never forwarded. Reset
-// per block so a stale roll can never reach a later block's notes.
+// per STEP, not per pad, and this matches it. Reset per block so a stale roll can
+// never reach a later block's notes.
+// ⭐ Consumed ONLY when it gated a pad note (2026-09-13, Design_CC119_Probability_Carrier
+// option A). It used to be eaten always, so a controller or recorded automation on
+// CC119 never reached the next plugin. Now it is HELD: a pad note-on at the same
+// offset marks it used; before the first event at a later offset, and after the loop,
+// an unused one is forwarded at its own offset (output stays in offset order). With
+// midi_thru everything is forwarded at once, as before.
 _prob_off = -1;
+_prob_held = 0;
 
 while(midirecv(offset, msg1, msg2, msg3)) (
   status = msg1 & 0xF0;
   _midi_consumed = 0;  // track whether Swing eats this event
+  // Settle a held CC119 once the events have moved past its offset (or before a
+  // second CC119 at the same offset replaces it).
+  _prob_held && (offset != _prob_off || (status == 0xB0 && msg2 == 119)) ? (
+    !_prob_used ? midisend(_prob_off, _prob_msg1, 119, _prob_val);
+    _prob_held = 0;
+  );
   status == 0xB0 && msg2 == 119 ? (
     _prob_off  = offset;
     _prob_skip = rand(127) > msg3;   // Steppa plays a step when rand(127) <= its value
     _midi_consumed = 1;
+    !midi_thru ? ( _prob_held = 1; _prob_used = 0; _prob_msg1 = msg1; _prob_val = msg3; );
   );
   status == 0x90 && msg3 > 0 ? (
     // MIDI learn: assign note to pad. The learned note becomes the pad's ROOT;
@@ -3359,6 +3381,7 @@ while(midirecv(offset, msg1, msg2, msg3)) (
     );
     pad >= 0 ? (
       _midi_consumed = 1;  // this note belongs to a Swing pad — eat it
+      _prob_off == offset ? _prob_used = 1;   // 2C: the roll gated a pad note -- keep it consumed
       _blk_last_off[pad] = 0;  // last event for this pad this block is now a note-ON (held)
       // Playable, not audio: an enabled SYN slot triggers from MIDI too
       blocked = p_mute[pad] || (any_solo && !p_solo[pad]) || !pad_is_playable(pad) || s_skip[pad]
@@ -3428,6 +3451,9 @@ while(midirecv(offset, msg1, msg2, msg3)) (
   // notes — so a downstream Swing on the same FX chain can layer the same hit.
   (!_midi_consumed || midi_thru) ? midisend(offset, msg1, msg2, msg3);
 );
+// 2C: a CC119 still held at the end of the block gated nothing -- pass it on.
+_prob_held && !_prob_used ? midisend(_prob_off, _prob_msg1, 119, _prob_val);
+_prob_held = 0;
 
 // ─── Browser pad trigger: play pad from browser click ──────────────────
 // Gate on _is_browser_target() so a pad click in the browser fires only
@@ -3769,7 +3795,8 @@ gmem[KIT_GMEM_CMD] == 67 && _reg_my_slot == gmem[GS_PENDING_PITCH_INST] && !kit_
 col_dirty ? (
   swing_color_rebuild();
   _hue_pi = 0;
-  loop(NUM_PADS,
+  // The rebuild is ours; the META+12 band is shared (swing_shared_bands_free).
+  swing_shared_bands_free() ? loop(NUM_PADS,
     gmem[KIT_GMEM_META + _hue_pi * KIT_GMEM_META_PP + 12] =
       col_auto_mode_id > 0 ? col_auto_hue[_hue_pi] : p_color[_hue_pi];
     _hue_pi += 1;
@@ -3797,11 +3824,12 @@ col_dirty ? (
 // colouring, Drum Matrix lane sync) plus the save path's LENGTH snapshot, which
 // is a deliberate call: the path-less pad capture needs lengths and IDENT
 // carries presence, not size.
-// ⇒ Do not add a new CORRECTNESS consumer of this band. The migration — move
-// length per-instance and retire the global, or mark it explicitly
-// browser-target-only — is a tracked job, not a licence to lean on it further.
+// ⇒ Do not add a new CORRECTNESS consumer of this band. Kit saves read lengths
+// from META s_len, which the saving instance stages itself in export state 11
+// (write_kit_v5's shared-band fallback was removed 2026-09-13), and nobody but
+// the LOCK holder writes here during a save or load (swing_shared_bands_free).
 _aud_pi = 0;
-loop(NUM_PADS,
+swing_shared_bands_free() ? loop(NUM_PADS,
   gmem[KIT_GMEM_AUDIOLEN + _aud_pi] =
     s_len[_aud_pi] > 0 ? s_len[_aud_pi] : (pad_has_audio(_aud_pi) ? 1 : 0);
   _aud_pi += 1;
@@ -3826,7 +3854,8 @@ _reg_my_slot >= 0 ? (
     sp_ring_alloc_slot = _reg_my_slot;
   );
   _reg_base = GS_INST_REG_BASE + _reg_my_slot * GS_INST_REG_STRIDE;
-  gmem[_reg_base + 0] = instance_id;
+  // The id cell is written ONLY by the claim. Re-stamping it here every block
+  // let a collision loser keep writing its id back over the winner's.
   gmem[_reg_base + 1] = time_precise();
   // Self-reported display fields (cheap, recomputed every block).
   _reg_pad_count = 0;
@@ -4087,8 +4116,9 @@ _reg_my_slot >= 0 ? (
   // is open, but when the targeted instance's window is closed @gfx
   // doesn't run and the browser would see stale data. Mirror from
   // @block so the browser stays in sync with the picked instance even
-  // with all FX windows closed.
-  _is_browser_target() ? (
+  // with all FX windows closed. Never while ANOTHER instance holds LOCK:
+  // these are the bands a save or load is staging (swing_shared_bands_free).
+  _is_browser_target() && swing_shared_bands_free() ? (
     // Kit name (16 chars at GS_KIT_NAME_BASE) — browser title
     _kn_len = strlen(#kit_name);
     _kn_i = 0;
@@ -4194,12 +4224,16 @@ _reg_my_slot >= 0 ? (
       _coll_si += 1;
     );
     (_coll_other_slot >= 0 && _coll_other_slot < _reg_my_slot) ? (
-      // We're the duplicate; mint a fresh id and vacate our slot
+      // We're the duplicate; vacate our slot, then mint a fresh id. Vacate only
+      // while the cell still holds the id we are giving up: a peer that took
+      // the slot in the meantime keeps it.
+      gmem[GS_INST_REG_BASE + _reg_my_slot * GS_INST_REG_STRIDE] == instance_id ? (
+        gmem[GS_INST_REG_BASE + _reg_my_slot * GS_INST_REG_STRIDE]     = 0;
+        gmem[GS_INST_REG_BASE + _reg_my_slot * GS_INST_REG_STRIDE + 1] = 0;
+      );
       gmem[KIT_GMEM_INSTANCE_NEXT] += 1;
       slider4 = gmem[KIT_GMEM_INSTANCE_NEXT];
       instance_id = slider4;
-      gmem[GS_INST_REG_BASE + _reg_my_slot * GS_INST_REG_STRIDE]     = 0;
-      gmem[GS_INST_REG_BASE + _reg_my_slot * GS_INST_REG_STRIDE + 1] = 0;
       _reg_my_slot = -1;  // force re-claim on next @block
     );
   );
@@ -4597,7 +4631,7 @@ diag_armed ? (
     diag_reset_seen = gmem[EON_DIAG_BASE + 1];
     diag_blocks = 0; diag_stall_n = 0; diag_pause_n = 0; diag_gap_max = 0;
     diag_cost_last = 0; diag_cost_max = 0; diag_cost_ema = 0; diag_ratio_max = 0;
-    diag_overrun_n = 0;
+    diag_overrun_n = 0; diag_bema = 0; diag_sema = 0;
   );
   // A full previous block (armed at its entry, all its samples stamped).
   diag_t0_prev > 0 && diag_t1 > diag_t0_prev && diag_spl >= samplesblock ? (
@@ -4607,6 +4641,12 @@ diag_armed ? (
     _dg_ratio > diag_ratio_max ? diag_ratio_max = _dg_ratio;
     _dg_ratio > 1 ? diag_overrun_n += 1;
     diag_cost_ema = diag_blocks > 0 ? diag_cost_ema + (diag_cost_last - diag_cost_ema) / 32 : diag_cost_last;
+    // Split at the first-@sample stamp: @block entry -> first sample = the @block pass,
+    // first sample -> last sample = the sample loop.
+    diag_ts > diag_t0_prev && diag_t1 > diag_ts ? (
+      diag_bema = diag_blocks > 0 ? diag_bema + ((diag_ts - diag_t0_prev) - diag_bema) / 32 : diag_ts - diag_t0_prev;
+      diag_sema = diag_blocks > 0 ? diag_sema + ((diag_t1 - diag_ts) - diag_sema) / 32 : diag_t1 - diag_ts;
+    );
     diag_blocks += 1;
   );
   _reg_my_slot >= 0 && _reg_my_slot < EON_DIAG_SLOT_MAX ? (
@@ -4616,6 +4656,7 @@ diag_armed ? (
     gmem[_dg + 6]  = diag_cost_last;  gmem[_dg + 7]  = diag_cost_max;  gmem[_dg + 8]  = diag_cost_ema;
     gmem[_dg + 9]  = diag_ratio_max;  gmem[_dg + 10] = diag_reset_seen; gmem[_dg + 11] = diag_overrun_n;
     gmem[_dg + 12] = diag_blocks;
+    gmem[_dg + 13] = diag_bema;       gmem[_dg + 14] = diag_sema;
     gmem[_dg] = _bl_blkctr;   // SEQ, written LAST
   );
 );
@@ -4632,6 +4673,9 @@ swing_ui_import_tick();
 
 // ─── Sample: full ADSR per-voice ──────────────────────────────────────────
 @sample
+// EON_DIAG: stamp the FIRST @sample of the block (armed only) -- splits the block's
+// cost into the @block pass and the sample loop. diag_spl is zeroed in @block.
+diag_armed && diag_spl == 0 ? diag_ts = time_precise();
 
 // ─── Anti-pop crossfade ramp after deserialize ──────────────────────────
 // Skip the ramp on first sample if there's no previous audio to fade from
@@ -5186,13 +5230,16 @@ gfx_lim_on ? (
     _lim_gain = gfx_lim_thr / _peak;
     gfx_lim_env = min(gfx_lim_env, _lim_gain);  // instant attack
   );
-  // Smooth release (one-pole: coeff near 1.0 = slow release)
-  // env approaches 1.0 asymptotically — can't overshoot (rel_c ∈ (0,1)).
-  gfx_lim_env += (1.0 - gfx_lim_env) * (1.0 - gfx_lim_rel_c);
+  // Apply BEFORE releasing. Releasing first raised the gain this peak needed,
+  // so it left above the ceiling: at the fastest (10 ms) release, +0.06 dB
+  // under 12 dB of reduction and +0.29 dB under 24 dB (simulated 2026-09-12).
   _gL *= gfx_lim_env;
   _gR *= gfx_lim_env;
   // GR metering for display
   gfx_lim_gr = min(gfx_lim_gr, gfx_lim_env);
+  // Smooth release for the NEXT sample (one-pole: coeff near 1.0 = slow).
+  // env approaches 1.0 asymptotically, never above it (rel_c in (0,1)).
+  gfx_lim_env += (1.0 - gfx_lim_env) * (1.0 - gfx_lim_rel_c);
 );
 
 // ─── Output guard (2026-09-08) ────────────────────────────────────────────

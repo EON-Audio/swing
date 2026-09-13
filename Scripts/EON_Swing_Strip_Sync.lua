@@ -1030,6 +1030,11 @@ end
 -- same helper as the other EON self-registering scripts.
 function eon_write_startup(path, content)
   local tmp, prev = path .. ".eon-tmp", path .. ".eon-prev"
+  -- A read-only __startup.lua is the user's call. Windows would still let the
+  -- renames below replace it -- and strand a read-only .eon-prev that blocks
+  -- every later rewrite -- so refuse up front.
+  local ro = io.open(path, "r")
+  if ro then ro:close(); local ap = io.open(path, "a"); if not ap then return false end; ap:close() end
   local f = io.open(tmp, "w")
   if not f then return false end
   local wok = f:write(content)
@@ -1051,6 +1056,79 @@ function eon_write_startup(path, content)
   return false
 end
 
+-- ⭐ Strip one script's block from __startup.lua text, in WHOLE LINES. The file is
+-- shared with other vendors. The old gsub('\n?BEGIN.-END\n?') ate the newline on
+-- BOTH sides, gluing a neighbour line that had no trailing newline onto the next
+-- vendor's line (a comment then swallowed their command), and a stray BEGIN with
+-- no END stretched the match over foreign lines down to our real END. Here a block
+-- goes only when its BEGIN line is followed by its END line with no second BEGIN
+-- in between -- anything unmatched stays verbatim -- together with the one blank
+-- line we write above it, so re-registering never grows the file. The v1/v2 form
+-- (a bare "-- EON:<name>" line plus the line after it) goes too. Returns the text
+-- and whether anything was removed. Global, and identical in all five
+-- self-registering EON scripts: .dev_tests/startup_file_test.py holds them to it.
+function eon_strip_startup_block(text, name)
+  local B, E, OLD = "-- EON:" .. name .. " BEGIN", "-- EON:" .. name .. " END", "-- EON:" .. name
+  local out, pend, skip, hit = {}, nil, false, false
+  local nl = text:sub(-1) == "\n"
+  for l in (nl and text or text .. "\n"):gmatch("([^\n]*)\n") do
+    local k = l:gsub("\r$", "")
+    if skip then
+      skip, hit = false, true
+    elseif pend then
+      if k == E then
+        if out[#out] and out[#out]:gsub("\r$", "") == "" then out[#out] = nil end
+        pend, hit = nil, true
+      elseif k == B then
+        for _, x in ipairs(pend) do out[#out + 1] = x end
+        pend = { l }
+      else
+        pend[#pend + 1] = l
+      end
+    elseif k == B then
+      pend = { l }
+    elseif k == OLD then
+      skip = true
+    else
+      out[#out + 1] = l
+    end
+  end
+  if pend then for _, x in ipairs(pend) do out[#out + 1] = x end end
+  local s = table.concat(out, "\n")
+  if nl and #out > 0 then s = s .. "\n" end
+  return s, hit
+end
+
+-- The uninstall half of the block written into __startup.lua (the `else` branch,
+-- reached once the script's command no longer resolves). It removes the block by
+-- the same whole-line rule as eon_strip_startup_block -- inlined, because nothing
+-- of ours is left to call -- skips a read-only file, and clears the flag.
+function eon_startup_selfclean_src(name, section, key)
+  return
+    "  local p=reaper.GetResourcePath()..\"/Scripts/__startup.lua\"\n" ..
+    "  local f=io.open(p,'r'); local c=f and f:read('*a'); if f then f:close() end\n" ..
+    "  local w=c and io.open(p,'a'); if w then w:close()\n" ..
+    -- Markers assembled at run time: the literal "-- EON:<name> END" must never appear
+    -- INSIDE the block, or an older copy's lazy BEGIN.-END match would stop there and
+    -- leave half a block (broken Lua) behind.
+    "    local N='-- EON:'..'" .. name .. "'; local B,E,o,q=N..' BEGIN',N..' END',{}\n" ..
+    "    local nl=c:sub(-1)=='\\n'\n" ..
+    "    for l in (nl and c or c..'\\n'):gmatch('([^\\n]*)\\n') do local k=l:gsub('\\r$','')\n" ..
+    "      if q then\n" ..
+    "        if k==E then if o[#o] and o[#o]:gsub('\\r$','')=='' then o[#o]=nil end q=nil\n" ..
+    "        elseif k==B then for _,x in ipairs(q) do o[#o+1]=x end q={l}\n" ..
+    "        else q[#q+1]=l end\n" ..
+    "      elseif k==B then q={l} else o[#o+1]=l end\n" ..
+    "    end\n" ..
+    "    if q then for _,x in ipairs(q) do o[#o+1]=x end end\n" ..
+    "    c=table.concat(o,'\\n')..((nl and #o>0) and '\\n' or '')\n" ..
+    "    local t,b=p..'.eon-tmp',p..'.eon-prev'; local fw=io.open(t,'w'); local ok=false\n" ..
+    "    if fw then ok=fw:write(c) and true or false; if not fw:close() then ok=false end end\n" ..
+    "    if ok then os.remove(b); local h=os.rename(p,b); if os.rename(t,p) then os.remove(b) elseif h then os.rename(b,p) end end\n" ..
+    "    os.remove(t) end\n" ..
+    "  reaper.SetExtState('" .. section .. "','" .. key .. "','',true)\n"
+end
+
 -- ── Self-register as startup action (one-time, first manual run) ──────────
 -- Same self-cleaning __startup.lua block the Kit Bridge uses: runs this
 -- script on every REAPER launch; if the file is removed (uninstall), the
@@ -1058,7 +1136,7 @@ end
 local SCRIPT_NAME = "EON_Swing_Strip_Sync"
 local function self_register()
   local _, script_path = reaper.get_action_context()
-  local key = SCRIPT_NAME .. "_registered_v1"
+  local key = SCRIPT_NAME .. "_registered_v2"
   local marker = "-- EON:" .. SCRIPT_NAME
 
   if reaper.GetExtState(SCRIPT_NAME, key) == "1" then
@@ -1079,8 +1157,8 @@ local function self_register()
   local fr = io.open(startup_path, "r")
   if fr then existing = fr:read("*a"); fr:close() end
 
-  local esc = marker:gsub("([%-%.%+%*%?%[%]%^%$%(%)%%])", "%%%1")
-  existing = existing:gsub("\n?" .. esc .. " BEGIN.-" .. esc .. " END\n?", "")
+  local had_block
+  existing, had_block = eon_strip_startup_block(existing, SCRIPT_NAME)
 
   local named_id = reaper.ReverseNamedCommandLookup(cmd_id)
   local cmd_token = named_id
@@ -1091,14 +1169,7 @@ local function self_register()
     "\n" .. marker .. " BEGIN\n" ..
     "do local id=" .. cmd_token .. "\n" ..
     "if id~=0 then reaper.Main_OnCommand(id,0) else\n" ..
-    "  local p=reaper.GetResourcePath()..\"/Scripts/__startup.lua\"\n" ..
-    "  local f=io.open(p,'r'); if f then local c=f:read('*a'); f:close()\n" ..
-    "    c=c:gsub('\\n?%-%- EON:" .. SCRIPT_NAME .. " BEGIN.-%-%- EON:" .. SCRIPT_NAME .. " END\\n?','')\n" ..
-    "    local t,b=p..'.eon-tmp',p..'.eon-prev'; local fw=io.open(t,'w'); local ok=false\n" ..
-    "    if fw then ok=fw:write(c) and true or false; if not fw:close() then ok=false end end\n" ..
-    "    if ok then os.remove(b); local h=os.rename(p,b); if os.rename(t,p) then os.remove(b) elseif h then os.rename(b,p) end end\n" ..
-    "    os.remove(t) end\n" ..
-    "  reaper.SetExtState('" .. SCRIPT_NAME .. "','" .. key .. "','',true)\n" ..
+    eon_startup_selfclean_src(SCRIPT_NAME, SCRIPT_NAME, key) ..
     "end end\n" ..
     marker .. " END\n"
 
@@ -1106,7 +1177,11 @@ local function self_register()
   -- leaves the ExtState clear so the next run simply retries.
   if eon_write_startup(startup_path, existing .. block) then
     reaper.SetExtState(SCRIPT_NAME, key, "1", true)
-    reaper.ShowConsoleMsg("[strip_sync] registered as startup action (auto-starts with REAPER).\n")
+    -- Only a genuine first registration speaks: replacing an existing block (every
+    -- updated install after a key bump) must not pop the console open for users.
+    if not had_block then
+      reaper.ShowConsoleMsg("[strip_sync] registered as startup action (auto-starts with REAPER).\n")
+    end
   end
 end
 self_register()
