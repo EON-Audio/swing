@@ -3,7 +3,7 @@
 desc: Swing
 tags: instrument, sampler, drums
 author: EON Studios
-version: 3.0.12
+version: 3.0.13
 
 slider1:root_note=36<0,127,1>-Base Note
 slider2:master_db=0<-48,12,0.1>-Master Volume (dB)
@@ -736,6 +736,24 @@ fx_hpf_stL  = freemem; freemem += NUM_PADS;  // HPF LP-state left
 fx_hpf_stR  = freemem; freemem += NUM_PADS;  // HPF LP-state right
 fx_lpf_stL  = freemem; freemem += NUM_PADS;  // LPF state left
 fx_lpf_stR  = freemem; freemem += NUM_PADS;  // LPF state right
+// Residual energy left in this pad's chain, refreshed inside the processing
+// branch from stages the sleep gate cannot see cheaply (right channel, EQ).
+// One compare in the gate instead of six abs() per pad per sample.
+fx_res      = freemem; freemem += NUM_PADS;  // max |state| across the pad's recursive stages
+// One-pole DC blocker state, TUBE only. Its curve is asymmetric BY DESIGN and
+// the DC that produces has nowhere to go: the chain is HPF -> ... -> Drive, so
+// the HPF its comment pointed at is five stages UPSTREAM.
+fx_dc_x1L   = freemem; freemem += NUM_PADS;
+fx_dc_y1L   = freemem; freemem += NUM_PADS;
+fx_dc_x1R   = freemem; freemem += NUM_PADS;
+fx_dc_y1R   = freemem; freemem += NUM_PADS;
+// Per-pad control smoothers. The MASTER saturator drive has had one since it
+// shipped (_sat_drv_sm); pan and the per-pad drive were written straight from
+// the UI drag handlers into coefficients @sample multiplies, which is a step,
+// which is a click.
+p_panL_sm   = freemem; freemem += NUM_PADS;
+p_panR_sm   = freemem; freemem += NUM_PADS;
+fx_sat_drv_sm = freemem; freemem += NUM_PADS;
 fx_bc_cnt    = freemem; freemem += NUM_PADS; // Bitcrush hold counter
 fx_bc_holdL  = freemem; freemem += NUM_PADS; // Bitcrush held sample L
 fx_bc_holdR  = freemem; freemem += NUM_PADS; // Bitcrush held sample R
@@ -1409,6 +1427,10 @@ i = 0; loop(NUM_PADS,
   p_pan[i]     = 0.0;
   p_panL[i]    = 1.0;
   p_panR[i]    = 1.0;
+  // The smoothers START at the coefficients, not at zero: a pad whose first
+  // hit had to ramp up from silence would click exactly where it must not.
+  p_panL_sm[i] = 1.0;
+  p_panR_sm[i] = 1.0;
   p_tune[i]    = 0.0;
   // Per-layer baked-tune anchors (MAX_LAYERS per pad) all start at 0 = original.
   _bti = 0; loop(MAX_LAYERS, sp_baked_tune[i * MAX_LAYERS + _bti] = 0.0; _bti += 1;);
@@ -1547,6 +1569,14 @@ syn_quiet_n = 0.06 * srate;         // 60 ms of continuous silence
 _pad_meter_decay = exp(-1.0 / max(1, 0.090 * srate));   // ~90ms pad meter fall
 _mst_meter_decay = exp(-1.0 / max(1, 0.450 * srate));   // ~450ms master meter fall
 _sm_coeff = 1.0 - exp(-1.0 / max(1, 0.0045 * srate));   // ~4.5ms (sat drive + master vol)
+_pad_sm_coeff = 1.0 - exp(-1.0 / max(1, 0.008 * srate));  // ~8ms (per-pad pan + drive)
+// Pad sleep-gate hold: how long a pad keeps processing after its chain last
+// showed energy. Only has to bridge a zero crossing, so 30 ms is generous --
+// and being derived from srate it is the same 30 ms at every rate.
+_fx_hold_n = max(1, 0.030 * srate) | 0;
+// TUBE DC blocker pole, y = x - x1 + R*y1. ~5 Hz: below the lowest drum
+// fundamental worth keeping, high enough to settle in a few tens of ms.
+_dc_r = exp(-2 * $pi * 5.0 / max(1, srate));
 last_srate = srate;
 
 _prev_play_state = 0;  // transport state tracker for retrigger reset
@@ -3935,13 +3965,21 @@ gmem[KIT_GMEM_CMD] == 69 && !kit_busy && !_bl_inflight && _bridge_state != 2 ? (
         _prv_ci = 0;
         loop(_prv_pl, str_setchar(#_prv_path, _prv_ci, gmem[GS_BROWSER_PATH + _prv_ci]); _prv_ci += 1;);
         str_setlen(#_prv_path, _prv_pl);
-        swing_fb_prv_load(#_prv_path);
-        // Audition means "let me hear it" -- loading one IS the request to play.
-        _prv_len > 0 ? ( _prv_pos = 0; _prv_on = 1; );
+        // Open + riff here; the read is pumped below, a budget of cells per
+        // block, so an audition click cannot stall the audio thread.
+        swing_fb_prv_begin(#_prv_path);
       );
     );
     gmem[KIT_GMEM_CMD] = 0;
   );
+);
+
+// Pump a sliced preview read. Same per-block cell budget the pad loader uses,
+// so the two cost the same per block. Audition means "let me hear it" -- the
+// load landing IS the request to play, which is why the transport starts here
+// rather than at the CMD-69 site that began it.
+_prv_loading ? (
+  swing_fb_prv_step(ldr_budget) ? ( _prv_len > 0 ? ( _prv_pos = 0; _prv_on = 1; ) );
 );
 
 // Face -> engine transport. @gfx must not own the read position, so it asks
@@ -5434,6 +5472,20 @@ _sat_drv_sm > 0.01 ? (
   drive_process(_gL * 8.0, _gR * 8.0, gfx_drv_mode | 0);
   _gL += (_doL - _gL) * _sat_drv_sm;
   _gR += (_doR - _gR) * _sat_drv_sm;
+  // TUBE is asymmetric and emits DC; see the per-pad blocker in
+  // rk_drumkit_fx.jsfx-inc for why the "HPF downstream" its curve comment
+  // promised does not exist. Same one-pole here so the MASTER curve cannot
+  // push an offset into the limiter and the meters.
+  gfx_drv_mode == 1 ? (
+    _mdc_yL = _gL - _mdc_x1L + _dc_r * _mdc_y1L;
+    _mdc_x1L = _gL; _mdc_y1L = _mdc_yL; _gL = _mdc_yL;
+    _mdc_yR = _gR - _mdc_x1R + _dc_r * _mdc_y1R;
+    _mdc_x1R = _gR; _mdc_y1R = _mdc_yR; _gR = _mdc_yR;
+  );
+) : (
+  _mdc_y1L != 0 || _mdc_y1R != 0 ? (
+    _mdc_x1L = 0; _mdc_y1L = 0; _mdc_x1R = 0; _mdc_y1R = 0;
+  );
 );
 
 // ─── Master compressor (after EQ + saturation, before volume + limiter) ──

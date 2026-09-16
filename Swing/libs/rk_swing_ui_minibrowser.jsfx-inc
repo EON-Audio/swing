@@ -194,6 +194,9 @@ _prv_sr   = 0;
 _prv_pos  = 0;    // fractional read position, owned by @sample
 _prv_on   = 0;    // @block owns this; @sample only reads it
 _prv_rate = 1;
+_prv_lf      = -1; // open handle while a sliced preview read is in flight
+_prv_rd      = 0;  // cells read into _prv_buf so far by that job
+_prv_loading = 0;  // 1 = a read is in flight; @block pumps it, @sample ignores it
 fb_prv_loop = 0;
 fb_prv_gain = 0.7;
 fb_prv_cmd  = 0;  // @gfx -> @block: 1 = play from the top, 2 = stop
@@ -212,24 +215,63 @@ function swing_fb_prv_init(mem_start)
 // Load a file into the preview buffer. Runs from @block (file I/O), never @gfx.
 // Mirrors load_from_path's reader, but into our own buffer and with no pad, no
 // undo capture and no kit state touched -- that is the entire point.
-function swing_fb_prv_load(path_str) local(f, nch, fsr, n)
+//
+// ⚠️ SLICED, in three parts. This used to be one function that opened the file,
+// memset the whole 8 MB buffer and then pulled up to FB_PRV_MAX cells in a
+// single @block -- an audition click cost a guaranteed dropout at any small
+// device buffer. The pad loader had been sliced (swing_ldr_step's per-block
+// budget) and this had not, so CMD 69 was the last unbounded read on the audio
+// thread. The memset is gone outright: file_mem's return bounds _prv_len, the
+// @sample reader is bounded by _prv_len, and nothing ever looks past it.
+//
+// Definition order matters -- EEL2 resolves function refs when a function is
+// DEFINED, so abort must come before the begin that calls it.
+
+// Drop a read in flight and close its handle. Safe to call when idle.
+function swing_fb_prv_abort()
 (
+  _prv_loading && _prv_lf >= 0 ? file_close(_prv_lf);
+  _prv_lf = -1; _prv_loading = 0; _prv_rd = 0;
+);
+
+// Open + riff only; the read is pumped by swing_fb_prv_step. Returns 1 if a job
+// started. A new request supersedes whatever was in flight.
+function swing_fb_prv_begin(path_str) local(nch, fsr)
+(
+  swing_fb_prv_abort();
   _prv_on = 0; _prv_len = 0; _prv_pos = 0; _prv_stopped = 0;   // a new preview is a new request to hear (D-7)
-  f = file_open(path_str);
-  f >= 0 ? (
-    file_riff(f, nch, fsr);
+  _prv_lf = file_open(path_str);
+  _prv_lf >= 0 ? (
+    file_riff(_prv_lf, nch, fsr);
     nch > 0 && nch < 3 ? (
-      _prv_ch = nch;
-      _prv_sr = fsr > 0 ? fsr : srate;
-      memset(_prv_buf, 0, FB_PRV_MAX);
-      n = file_mem(f, _prv_buf, FB_PRV_MAX);
-      // file_mem returns INTERLEAVED samples; frames is what the reader wants
-      _prv_len = (n / nch) | 0;
+      _prv_ch   = nch;
+      _prv_sr   = fsr > 0 ? fsr : srate;
       _prv_rate = _prv_sr / srate;
+      _prv_rd   = 0;
+      _prv_loading = 1;
+    ) : (
+      file_close(_prv_lf); _prv_lf = -1;   // not mono or stereo: nothing to audition
     );
-    file_close(f);
+  ) : ( _prv_lf = -1; );
+  _prv_loading;
+);
+
+// One slice, `budget` cells at most. Returns 1 once the load has landed or
+// failed -- the caller starts the audition on that edge.
+function swing_fb_prv_step(budget) local(m, n)
+(
+  !_prv_loading ? ( 1; ) : (
+    m = min(budget, FB_PRV_MAX - _prv_rd);
+    n = m > 0 ? file_mem(_prv_lf, _prv_buf + _prv_rd, m) : 0;
+    _prv_rd += n;
+    // A short read is end-of-file; a full buffer is the 11 s audition ceiling.
+    n < m || _prv_rd >= FB_PRV_MAX ? (
+      file_close(_prv_lf); _prv_lf = -1; _prv_loading = 0;
+      // file_mem returns INTERLEAVED samples; frames is what the reader wants
+      _prv_len = (_prv_rd / _prv_ch) | 0;
+      1;
+    ) : ( 0; );
   );
-  _prv_len > 0;
 );
 // ── state ───────────────────────────────────────────────────────────────────
 // ⚠️⚠️ fb_open is SERIALIZED (@serialize ver 66) and therefore must NOT be

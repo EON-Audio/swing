@@ -21,14 +21,24 @@ FX_CMP_DENORM = pow(10, -30);
 function process_pad_fx(i)
 local(_aL, _aR, _svf_base, _svf,
       _bc_hold, _bc_levels, _sm,
-      _cmp_det, _cmp_lev, _cmp_gr, _cmp_lin, _cmp_wet_L, _cmp_wet_R)
+      _cmp_det, _cmp_lev, _cmp_gr, _cmp_lin, _cmp_wet_L, _cmp_wet_R,
+      _dcx, _dcy, _drv)
 (
   _aL = pad_accL[i];
   _aR = pad_accR[i];
 
   // Only process if pad has signal (or filters have residual energy)
+  // ⚠️ fx_res[i] carries the rest of the chain. The gate used to look at
+  // fx_hpf_stL / fx_lpf_stL ONLY -- left channel, two stages -- so a tail
+  // living in the right channel or in one of the four EQ integrators was cut
+  // the instant the dry voice reached silence. Testing all of them here would
+  // be six more abs() per pad per sample; instead the processing branch keeps
+  // one residual scalar from values it already has in hand, and the gate reads
+  // that. Pan and drive smoothers keep the pad awake the same way while they
+  // are still travelling, so a release does not freeze mid-ramp.
   (abs(_aL) > 0.0000001 || abs(_aR) > 0.0000001 ||
-   abs(fx_hpf_stL[i]) > 0.0000001 || abs(fx_lpf_stL[i]) > 0.0000001) ? (
+   abs(fx_hpf_stL[i]) > 0.0000001 || abs(fx_lpf_stL[i]) > 0.0000001 ||
+   fx_res[i] > 0) ? (
 
     _svf_base = svf_pad + i * SVF_PER_PAD * SVF_STEREO_SIZE;
 
@@ -144,10 +154,36 @@ local(_aL, _aR, _svf_base, _svf,
     // ── Drive (5 modes: SOFT/TUBE/TAPE/FUZZ/CLIP) ──
     // Wet/dry mix: drive knob blends clean → fully saturated.
     // Fixed 8x gain into saturator for heavy harmonics at any mix level.
-    fx_sat_drv[i] > 0.01 ? (
+    // The amount is SMOOTHED, as the master's has been since it shipped
+    // (_sat_drv_sm): fx_sat_drv[i] is written straight from a UI drag, and
+    // stepping a wet/dry mix at block rate is a click.
+    _drv = fx_sat_drv_sm[i];
+    _drv += (fx_sat_drv[i] - _drv) * _pad_sm_coeff;
+    fx_sat_drv_sm[i] = _drv;
+    _drv > 0.0001 ? (
       drive_process(_aL * 8.0, _aR * 8.0, fx_drv_mode[i] | 0);
-      _aL += (_doL - _aL) * fx_sat_drv[i];
-      _aR += (_doR - _aR) * fx_sat_drv[i];
+      _aL += (_doL - _aL) * _drv;
+      _aR += (_doR - _aR) * _drv;
+      // ⚠️ TUBE (mode 1) only. Its curve is asymmetric BY DESIGN -- positive
+      // x/(1+|x|), negative x/(1+x*x*0.6) -- so it emits DC, and its own
+      // comment said that DC was "removed by HPF downstream". There is no HPF
+      // downstream: the chain is HPF -> LPF -> EQ -> COMP -> CRUSH -> DRIVE, so
+      // the filter it meant is the FIRST stage, five before this one. The
+      // offset went out to the pad bus, the multi-out tap and the send buses.
+      // FUZZ, sixteen lines below TUBE in the curve bank, subtracts its own
+      // bias -- TUBE never did. One-pole blocker, gated on the mode so no
+      // other curve pays for it.
+      fx_drv_mode[i] == 1 ? (
+        _dcx = fx_dc_x1L[i]; _dcy = _aL - _dcx + _dc_r * fx_dc_y1L[i];
+        fx_dc_x1L[i] = _aL; fx_dc_y1L[i] = _dcy; _aL = _dcy;
+        _dcx = fx_dc_x1R[i]; _dcy = _aR - _dcx + _dc_r * fx_dc_y1R[i];
+        fx_dc_x1R[i] = _aR; fx_dc_y1R[i] = _dcy; _aR = _dcy;
+      );
+    ) : (
+      // Drive off: park the blocker, or re-engaging steps off stale state.
+      fx_dc_y1L[i] != 0 || fx_dc_y1R[i] != 0 ? (
+        fx_dc_x1L[i] = 0; fx_dc_y1L[i] = 0; fx_dc_x1R[i] = 0; fx_dc_y1R[i] = 0;
+      );
     );
 
     );  // !strip_tk[i] (end of internal FX chain)
@@ -160,17 +196,52 @@ local(_aL, _aR, _svf_base, _svf,
     // One-Mixer console tie: under strip_takeover the child track's D_PAN is
     // the one audible pan stage (companion mirrors p_pan onto it) — emit
     // center here, same XOR the FX chain above uses. Multiply-select only.
-    strip_tk[i] ? (
-      _pfxL = _aL;
-      _pfxR = _aR;
-    ) : (
-      _pfxL = _aL * p_panL[i];
-      _pfxR = _aR * p_panR[i];
-    );
+    // SMOOTHED, like the drive above: p_panL/R are written straight from the
+    // grid drag, the LCD and the FX overlay, and @sample multiplied by them
+    // directly. Under takeover the target is centre, so the smoothers sit ready
+    // if the strip's heartbeat stalls and this chain resumes.
+    _sm = strip_tk[i] ? 1.0 : p_panL[i];
+    p_panL_sm[i] += (_sm - p_panL_sm[i]) * _pad_sm_coeff;
+    _sm = strip_tk[i] ? 1.0 : p_panR[i];
+    p_panR_sm[i] += (_sm - p_panR_sm[i]) * _pad_sm_coeff;
+    _pfxL = _aL * p_panL_sm[i];
+    _pfxR = _aR * p_panR_sm[i];
+
+    // Residual for the gate above, as a HOLD COUNTER rather than a decaying
+    // peak. An instantaneous test would read ~0 every cycle of a ringing tail
+    // and sleep the pad mid-decay, so something has to bridge the zero
+    // crossings -- but a leaky peak has to fall all the way from full scale to
+    // the 1e-7 threshold to let go, which is ~0.67 s at 48 k, and a fixed leak
+    // is sample-rate dependent besides (the same fall is 0.17 s at 192 k, short
+    // enough to cut the very tails this is meant to keep). A countdown is
+    // rate-independent, bounded, and cheaper: refreshed while anything is
+    // audible, counted down when nothing is. _fx_hold_n is 30 ms, which bridges
+    // a zero crossing well below the lowest note anyone will hear.
+    // _aL/_aR here is the whole chain's output, so an EQ integrator or a
+    // right-channel filter still ringing refreshes it without the gate testing
+    // any of them.
+    max(max(abs(_aL), abs(_aR)),
+        max(abs(fx_hpf_stR[i]), abs(fx_lpf_stR[i]))) > 0.0000001 ?
+      fx_res[i] = _fx_hold_n : (fx_res[i] > 0 ? fx_res[i] -= 1);
     1;
   ) : (
     _pfxL = 0; _pfxR = 0;
     _pfx_sendL = 0; _pfx_sendR = 0;
+    // Asleep: SNAP the smoothers to target rather than leaving them stranded.
+    // A pad whose pan moved while it was silent would otherwise sweep across
+    // the first 8 ms of its next hit, which is the opposite of the fix.
+    // (The master does the same for its own smoothers when idle.)
+    // GUARDED: this branch runs for every silent pad on every sample, and
+    // writing four cells unconditionally doubled the cost of the idle path.
+    // On target -- which is the whole of a quiet session -- it now writes
+    // nothing at all.
+    _sm = strip_tk[i] ? 1.0 : p_panL[i];
+    p_panL_sm[i] != _sm || fx_sat_drv_sm[i] != fx_sat_drv[i] ? (
+      p_panL_sm[i] = _sm;
+      p_panR_sm[i] = strip_tk[i] ? 1.0 : p_panR[i];
+      fx_sat_drv_sm[i] = fx_sat_drv[i];
+    );
+    fx_res[i] > 0 ? fx_res[i] = 0;
     0;
   );
 );

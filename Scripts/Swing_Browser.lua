@@ -447,7 +447,11 @@ local function load_kit_database(filepath)
   if not filepath then return nil end
   local chunk, err = loadfile(filepath, "t", {})
   if not chunk then return nil end
-  local ok, data = pcall(chunk)
+  -- Bounded, not just sandboxed: a v2 kit is Lua text the user may have
+  -- downloaded. The empty env stops it reaching io/os and pcall stops it
+  -- throwing, but neither stops `while true do end` -- which would wedge the
+  -- browser's defer loop with no error to show for it.
+  local ok, data = core.run_bounded(chunk)
   if not ok or type(data) ~= "table" then return nil end
   return data
 end

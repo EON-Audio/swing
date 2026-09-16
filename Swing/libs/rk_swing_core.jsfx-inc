@@ -402,7 +402,7 @@ function swing_pad_fail_recompute(pad) local(_m, _bad, _anylp, _anyl, _li, _lx) 
 );
 
 // ─── Clear a single layer slot ──────────────────────────────────────────
-function clear_layer(pad_idx, layer_idx) local(_lidx, li) (
+function clear_layer(pad_idx, layer_idx) local(_lidx, li, _zn) (
   undo_begin_pad(pad_idx);  // Phase 2: back up this pad (audio+meta+names) for scoped structural undo
   _lidx = pad_idx * MAX_LAYERS + layer_idx;
   // A cleared layer is unbaked + its overlay waveform must re-capture on reload.
@@ -411,6 +411,12 @@ function clear_layer(pad_idx, layer_idx) local(_lidx, li) (
   // Pad audio changed → bump the source generation so the Kit Bridge re-captures
   // this pad's bake/preload source for the Extension (stale-source guard).
   sp_src_gen[pad_idx] += 1;
+  // How much this layer actually HELD, captured before the reset below zeroes
+  // it: l_len counts INTERLEAVED CELLS (playback steps bptr by 2 per frame, so
+  // it is not a frame count) and every loader caps it at LAYER_SIZE, which
+  // makes it exactly the written region. The memset below uses it instead of
+  // the whole layer.
+  _zn = min(max(l_len[_lidx], 0), LAYER_SIZE);
   l_len[_lidx] = 0;
   l_start[_lidx] = 0;
   l_end[_lidx] = 1.0;
@@ -422,12 +428,18 @@ function clear_layer(pad_idx, layer_idx) local(_lidx, li) (
   l_rr_order[_lidx] = layer_idx;
   l_gain[_lidx] = 1.0;
   strcpy(LPATH_STR_BASE + _lidx, "");
-  // The audio memset is 8 MB per layer, 32 MB per clear_pad, on the audio thread. A stream
+  // The audio memset WAS 8 MB per layer, 32 MB per clear_pad, on the audio thread. A stream
   // drop (rk_swing_padpcm) sets _clr_skip_audio around its clear_pad because the stream
   // overwrites [0, total) and the loader's sliced phase 2 zeroes [total, SLOT_SIZE) anyway
   // (measured 2026-09-08: this memset + the undo capture were most of a drop's first-block
   // stall, not the file open). Every other caller still gets the memset.
-  !_clr_skip_audio ? memset(s_audio_start + pad_idx * SLOT_SIZE + layer_idx * LAYER_SIZE, 0, LAYER_SIZE);
+  // Now it zeroes what the layer HELD (_zn cells), not the whole layer: clearing a
+  // one-shot of a few thousand cells cost the full 8 MB, four times over for a pad,
+  // and an empty layer cost it for nothing. Beyond _zn the region is already zero
+  // or already unreachable -- playback is bounded by l_len (now 0), and every loader
+  // zeroes its own tail out to the end of the slot before publishing a length.
+  !_clr_skip_audio && _zn > 0 ?
+    memset(s_audio_start + pad_idx * SLOT_SIZE + layer_idx * LAYER_SIZE, 0, _zn);
   // Recalculate layer count (find highest non-empty layer)
   p_layer_cnt[pad_idx] = 0;
   li = 0; loop(MAX_LAYERS,
@@ -439,8 +451,13 @@ function clear_layer(pad_idx, layer_idx) local(_lidx, li) (
 );
 
 // ─── Clear entire pad (all layers + legacy + name/path) ─────────────────
-function clear_pad(i) local(li) (
+function clear_pad(i) local(li, _zs) (
   undo_begin_pad(i);  // Phase 2: back up this pad (audio+meta+names) for scoped structural undo
+  // A LEGACY (non-layered) pad keeps its audio in the slot itself, sized by
+  // s_len, with every l_len at 0 -- so the per-layer zeroing below would not
+  // touch a cell of it. Capture the written span before s_len is reset and
+  // zero exactly that, after the layers.
+  _zs = min(max(s_len[i], 0), SLOT_SIZE);
   s_len[i] = 0; s_start[i] = 0; s_end[i] = 1.0;
   // Eagerly clear the gmem blank signal too, so consumers (Kit Bridge
   // multi-out coloring, Drum Matrix lane sync) see the pad as blank on
@@ -456,6 +473,9 @@ function clear_pad(i) local(li) (
   p_layer_cnt[i] = 0;
   p_layer_mode[i] = 3;
   li = 0; loop(MAX_LAYERS, clear_layer(i, li); li += 1;);
+  // The legacy blob captured above. Layered pads leave _zs at 0 (their audio is
+  // per-layer and the loop just zeroed it), so this costs nothing there.
+  !_clr_skip_audio && _zs > 0 ? memset(s_audio_start + i * SLOT_SIZE, 0, _zs);
   // Reset FX to defaults
   fx_hpf_freq[i] = 20; fx_lpf_freq[i] = 20000;
   fx_eq_lo[i] = 0; fx_eq_mid[i] = 0; fx_eq_mid2[i] = 0; fx_eq_hi[i] = 0;
@@ -1412,12 +1432,21 @@ function launch_syn_for_pad(_sy_pad, _sy_midi, _sy_vel, _sy_gaindiv, _sy_ofs)
 // about choke groups (it gets mode, tune, algo and source only), so the consumer side
 // is where a Stretch pad can be choked at all. A Stretch pad's own retrigger needs no
 // duplicate-kill: its trigger-edge ring reset already drops the old tail.
-function swing_voice_choke_pass(_ck_pad) local(_ck_j, _ck_g, _ck_p) (
+// ⚠️ RANGED pads are MONOPHONIC -- the manual says so in five places, and the
+// scalar p_held / p_held_vel / p_held_note bookkeeping is built for exactly one
+// note at a time. The duplicate-kill below only released a same-pad voice
+// YOUNGER than the retrigger lockout, so an OLDER one survived a new key and
+// the pad played a chord: two voices sounding, one p_held between them, and a
+// note-off on either key clearing the repeat/pressure state while the other was
+// still down. A ranged pad now releases every voice it owns before the new
+// pitch launches, which makes the scalar state correct by construction.
+function swing_voice_choke_pass(_ck_pad) local(_ck_j, _ck_g, _ck_p, _ck_mono) (
   _ck_g = p_choke[_ck_pad];
+  _ck_mono = p_rng_lo[_ck_pad] > 0 || p_rng_hi[_ck_pad] > 0;
   _ck_j = 0; loop(MAX_VOICES,
     v_pos[_ck_j] >= 0 && v_age[_ck_j] > 0 ? (
       v_slot[_ck_j] == _ck_pad ? (
-        v_age[_ck_j] < _retrig_lockout ? ( v_stage[_ck_j] = 4; );  // duplicate-kill
+        _ck_mono || v_age[_ck_j] < _retrig_lockout ? ( v_stage[_ck_j] = 4; );  // duplicate-kill
       ) : (
         _ck_g > 0 && p_choke[v_slot[_ck_j]] == _ck_g ? ( v_stage[_ck_j] = 4; );  // choke group
       );

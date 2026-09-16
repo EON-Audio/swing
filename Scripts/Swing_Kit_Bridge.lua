@@ -4594,6 +4594,14 @@ end
 local swing_kit_v5 = (function()
   local M = {}
 
+  -- Load ceilings, derived from what the sampler can actually hold rather than
+  -- from round numbers. The JSFX slab is NUM_PADS(16) x SLOT_SIZE(4,000,000
+  -- interleaved cells) = 64M cells, so a kit that needs more than that cannot
+  -- be played whatever the archive says. 192 MB covers that slab at 24-bit
+  -- plus container overhead; anything larger is refused before it is read.
+  local MAX_DECODED_CELLS = 64000000
+  local MAX_ARCHIVE_BYTES = 192 * 1048576
+
   -- ── JSON  (encode + decode, no external dependencies) ────────────────────
   local json = {}
 
@@ -5216,11 +5224,18 @@ local swing_kit_v5 = (function()
     if not f then return nil, nil, "load_kit: cannot open '" .. filepath .. "': " .. tostring(ferr) end
     -- The whole archive is read into one string and then decoded into tables
     -- (~16 bytes per sample), so refuse sizes that could only end in an OOM.
+    -- The cap is derived from what the SAMPLER can actually hold, not from a
+    -- round number: 16 pads x SLOT_SIZE (4M interleaved cells) = 64M cells, so
+    -- 192 MB covers a full kit even at 24-bit, plus container overhead. The old
+    -- 1024 MB gate let a file four times larger than anything loadable reach
+    -- the decoder, where the archive string, the entry strings and the decoded
+    -- Lua sample tables are all live at once.
     local fsize = f:seek("end") or 0
     f:seek("set", 0)
-    if fsize > 1073741824 then
+    if fsize > MAX_ARCHIVE_BYTES then
       f:close()
-      return nil, nil, string.format("load_kit: file is %.0f MB (limit 1024 MB)", fsize / 1048576)
+      return nil, nil, string.format("load_kit: file is %.0f MB (limit %.0f MB)",
+                                     fsize / 1048576, MAX_ARCHIVE_BYTES / 1048576)
     end
     local bytes = f:read("*a")
     f:close()
@@ -5237,19 +5252,59 @@ local swing_kit_v5 = (function()
       local entries, zerr = zip.read(bytes)
       if not entries then return nil, nil, "zip read: " .. tostring(zerr) end
 
-      local mf, pb = nil, {}
+      -- kit.json FIRST, in its own pass. The manifest decides which WAVs are
+      -- worth decoding, so it has to be read before any of them -- and the
+      -- writer's ordering is not something a hostile archive has to honour.
+      local mf = nil
       for _, e in ipairs(entries) do
         if e.name == "kit.json" then
           local m, jerr = json.decode(e.data)
           if not m then return nil, nil, "bad kit.json: " .. tostring(jerr) end
           mf = m
-        elseif e.name:match("%.wav$") then
-          local samples, sr, ch, werr = wav.read(e.data)
-          if not samples then return nil, nil, "bad wav '" .. e.name .. "': " .. tostring(werr) end
-          pb[e.name] = { samples = samples, sample_rate = sr, channels = ch }
+          break
         end
       end
       if not mf then return nil, nil, "no kit.json in archive" end
+
+      -- Referenced-WAV allowlist. Every .wav in the archive used to be decoded
+      -- whether the kit named it or not, so unreferenced payload cost a full
+      -- decode -- entry string plus a Lua sample table at ~16 bytes a sample.
+      local want = {}
+      if type(mf.pads) == "table" then
+        for _, p in pairs(mf.pads) do
+          if type(p) == "table" then
+            if type(p.audio) == "string" then want[p.audio] = true end
+            if type(p.layers) == "table" then
+              for _, L in pairs(p.layers) do
+                if type(L) == "table" and type(L.audio) == "string" then want[L.audio] = true end
+              end
+            end
+          end
+        end
+      end
+
+      -- Budget the decode before allocating it, not after. Entries are STOREd,
+      -- so #e.data is the PCM size within a header's worth -- a good enough
+      -- proxy to refuse BEFORE wav.read builds the table. The decoded-cell
+      -- total is checked too, as the backstop that actually matches the slab.
+      local pb, raw, cells = {}, 0, 0
+      for _, e in ipairs(entries) do
+        if want[e.name] then
+          raw = raw + #e.data
+          if raw > MAX_ARCHIVE_BYTES then
+            return nil, nil, string.format("load_kit: referenced audio exceeds %.0f MB",
+                                           MAX_ARCHIVE_BYTES / 1048576)
+          end
+          local samples, sr, ch, werr = wav.read(e.data)
+          if not samples then return nil, nil, "bad wav '" .. e.name .. "': " .. tostring(werr) end
+          cells = cells + #samples
+          if cells > MAX_DECODED_CELLS then
+            return nil, nil, string.format("load_kit: kit needs more sample memory than Swing has (%d cells)",
+                                           MAX_DECODED_CELLS)
+          end
+          pb[e.name] = { samples = samples, sample_rate = sr, channels = ch }
+        end
+      end
       return mf, pb, nil
     end)
 
@@ -6272,24 +6327,38 @@ function G.KITLIST.classify(path)
     if lua_len > 0 and 16 + lua_len <= size and lua_len <= 2097152 then
       local text = f:read(lua_len)
       f:close()
-      -- cheap hostile-file check before load(): the writer's lua section is a
-      -- comment line + "return {" — require "return {" within the head
+      -- cheap hostile-file check: the writer's lua section is a comment line
+      -- + "return {" — require "return {" within the head
       if not text or not text:sub(1, 200):find("return%s*{") then return end
-      local chunk = load(text, "kit_scan", "t", {})
-      if not chunk then return end
-      local okc, kit = pcall(chunk)
-      if not okc or type(kit) ~= "table" or type(kit.pads) ~= "table" then return end
+      -- ⚠⚠ NEVER execute a kit file here. This used to load() + pcall() the
+      -- chunk, and classify() runs during a DIRECTORY SCAN: one .swing holding
+      -- `while true do end` anywhere in a browsed folder hung the bridge, and
+      -- an empty env + pcall stop capability and errors, not loops. The
+      -- scanner needs three numbers per pad and only ever sees files SWING
+      -- wrote (the SWINGv03/v04 magic is checked above), so READ them out of
+      -- the writer's own layout instead of running the file.
+      -- Both writers emit a pad as "\n    [N] = {" — four spaces, which is
+      -- what separates it from a nested layer at eight ("        [N] = {").
+      -- Anything that doesn't match classifies as unknown, exactly as a parse
+      -- failure did before.
       local smp, syn = false, false
+      local at = {}
+      for pos, idx in text:gmatch("()\n    %[(%d+)%]%s*=%s*{") do
+        local n = tonumber(idx)
+        if n and n >= 1 and n <= 16 then at[#at + 1] = pos end
+      end
       local i = 1
-      while i <= 16 do
-        local p = kit.pads[i]
-        if type(p) == "table" then
-          local s = (tonumber(p.s_len) or 0) > 0 or (tonumber(p.layer_cnt) or 0) > 0
-          local y = type(p.syn) == "table" and (tonumber(p.syn.enable) or 0) > 0.5
-          if s then smp = true end
-          if y then syn = true end
-          if s or y then pads = pads + 1 end
-        end
+      while i <= #at do
+        -- Everything up to the next pad header is this pad's block, layers
+        -- included; s_len / layer_cnt / syn.enable appear before them.
+        local seg = text:sub(at[i], (at[i + 1] and at[i + 1] - 1) or #text)
+        local s = (tonumber(seg:match("s_len%s*=%s*(%-?[%d%.eE%+%-]+)")) or 0) > 0
+               or (tonumber(seg:match("layer_cnt%s*=%s*(%-?[%d%.eE%+%-]+)")) or 0) > 0
+        -- Pre-synth kits have no syn block at all: nil -> 0 -> sample-only.
+        local y = (tonumber(seg:match("syn%s*=%s*{%s*enable%s*=%s*(%-?[%d%.eE%+%-]+)")) or 0) > 0.5
+        if s then smp = true end
+        if y then syn = true end
+        if s or y then pads = pads + 1 end
         i = i + 1
       end
       typ = (smp and syn) and 3 or (syn and 2) or (smp and 1) or 0
@@ -10722,7 +10791,10 @@ local function load_kit_v2(filepath, internal)
     reaper.gmem_write(G.CMD, 98)
     return
   end
-  local ok, kit = pcall(chunk)
+  -- Bounded, not just sandboxed: a v2 kit is Lua text the user may have
+  -- downloaded, and the empty env + pcall stop capability and errors but not
+  -- `while true do end`. The budget trip arrives here as an ordinary failure.
+  local ok, kit = core.run_bounded(chunk)
   if not ok or type(kit) ~= "table" then
     eon_notice("Invalid v2 kit data:\n" .. tostring(kit))
     reaper.gmem_write(G.CMD, 98)
@@ -10810,13 +10882,21 @@ local function load_kit_v2(filepath, internal)
     end
 
     -- Write file path to gmem audio area (for JSFX to load)
+    -- ⚠⚠ 258 bytes, and the cap must REFUSE, never truncate. This wrote the
+    -- length prefix from the FULL #path while copying only 258 bytes, so an
+    -- overlong path handed the JSFX a length that ran past the terminator into
+    -- the next pad's cells -- a wrong path, which is worse than none. Every
+    -- other staging site refuses (see the >258 checks below); match them: the
+    -- pad stages EMPTY. #path is BYTES, so a UTF-8 path reaches the wall well
+    -- before 258 characters.
     local path = p.path or ""
+    local staged = (#path > 258) and "" or path
     local pbase = G.AUDIO_BASE + pad * 260
-    reaper.gmem_write(pbase, #path)  -- length prefix
-    for i = 0, math.min(#path, 258) - 1 do
-      reaper.gmem_write(pbase + 1 + i, path:byte(i + 1))
+    reaper.gmem_write(pbase, #staged)  -- length prefix
+    for i = 0, #staged - 1 do
+      reaper.gmem_write(pbase + 1 + i, staged:byte(i + 1))
     end
-    reaper.gmem_write(pbase + 1 + math.min(#path, 258), 0)  -- null term
+    reaper.gmem_write(pbase + 1 + #staged, 0)  -- null term
 
     -- Store path in ExtState for future re-saves
     if path ~= "" then
@@ -10875,7 +10955,8 @@ local function load_kit_v4(filepath, internal)
     reaper.gmem_write(G.CMD, 98)
     return
   end
-  local ok, kit = pcall(chunk)
+  -- Bounded: see the v2 loader above. Same exposure, same five-line close.
+  local ok, kit = core.run_bounded(chunk)
   if not ok or type(kit) ~= "table" then
     eon_notice("Invalid v4 kit data:\n" .. tostring(kit))
     reaper.gmem_write(G.CMD, 98)
@@ -14760,22 +14841,68 @@ local function eon_pin_pair(tr, fx, c)
   end
 end
 
+-- One of Swing's own FX return tracks? mk_return stamps each of the three at
+-- build, so this is a read of the ownership record, not a guess. Module-GLOBAL
+-- (200-local ceiling).
+function eon_is_swing_return(dest)
+  local _, v = reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:EON_VERB_RETURN", "", false)
+  if v ~= "" then return true end
+  local _, d = reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:EON_DELAY_RETURN", "", false)
+  if d ~= "" then return true end
+  local _, s = reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:EON_SMASH_RETURN", "", false)
+  return s ~= ""
+end
+
 function rk_ops.do_multiout_to_wired()
   local tr, fx = find_swing_track()
   if not tr then reaper.gmem_write(G.CMD, 0) return end
 
   -- Multi-Out = sends from Swing to child tracks tagged with their pad.
+  -- ⚠⚠ THREE buckets, never one. This used to collect EVERY destination into
+  -- a single `dests` list and the teardown deleted the lot, so a user's own
+  -- send from Swing to a reverb / sidechain / print bus was destroyed and
+  -- reported back as "1 return track was removed". Swing stamps everything it
+  -- builds -- pads carry EON_PAD_IDX, the three FX returns carry EON_*_RETURN
+  -- (mk_return) -- so ownership was already written on the tracks; collapse
+  -- simply never read it. Anything carrying neither tag is FOREIGN: its track
+  -- and its send both survive, and the notice at the end names it.
+  -- Two sends can share one destination (a duplicate, or a pad re-sent after a
+  -- routing edit), so the lists are deduped: a track is deleted once and named
+  -- to the user once. `owned` is a set read by the send teardown; `doomed` is
+  -- the ordered, deduped delete list.
+  --
+  -- ⚠️ Keyed by GUID, NOT by the MediaTrack itself. Lua table lookup uses raw
+  -- identity for userdata and does not consult __eq, so a set keyed on the
+  -- pointer only works if REAPER hands back the SAME userdata object for every
+  -- call -- which is not a promise worth betting a delete path on. The teardown
+  -- below re-resolves each send's destination, and a silent miss there would
+  -- leave every send in place. GetTrackGUID is the identity the rest of this
+  -- tree already keys on. A track with no GUID falls through as foreign, which
+  -- is the safe direction.
   local nsends = reaper.GetTrackNumSends(tr, 0)
-  local child, dests, returns = {}, {}, 0
+  local child, rets, foreign = {}, {}, {}
+  local owned, seen, doomed = {}, {}, {}
   for s = 0, nsends - 1 do
     local dest = reaper.BR_GetMediaTrackSendInfo_Track(tr, 0, s, 1)
-    if dest then
-      dests[#dests + 1] = dest
+    local g = dest and reaper.GetTrackGUID(dest)
+    if dest and g and g ~= "" then
       local _, tag = reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:EON_PAD_IDX", "", false)
-      if tag ~= "" then child[math.floor(tonumber(tag) or -1)] = dest
-      else returns = returns + 1 end
+      local is_pad = (tag ~= "")
+      if is_pad then child[math.floor(tonumber(tag) or -1)] = dest end
+      local mine = is_pad or eon_is_swing_return(dest)
+      if mine then owned[g] = true end
+      if not seen[g] then
+        seen[g] = true
+        if mine then
+          doomed[#doomed + 1] = dest
+          if not is_pad then rets[#rets + 1] = dest end
+        else
+          foreign[#foreign + 1] = dest
+        end
+      end
     end
   end
+  local returns = #rets
   local npads = 0
   for _ in pairs(child) do npads = npads + 1 end
   if npads == 0 then
@@ -14785,24 +14912,25 @@ function rk_ops.do_multiout_to_wired()
     reaper.gmem_write(G.CMD, 0) return
   end
 
-  -- Guards: refuse, name everything, change nothing.
+  -- Guards: refuse, name everything, change nothing. Runs over the RETURNS
+  -- as well as the pads -- the sweep used to cover child[pad] only, so a take
+  -- printed onto the Verb Return went with it without a word. Swing never
+  -- gives a return an outgoing send or a foreign receive itself, so anything
+  -- these three checks find is the user's and worth stopping for.
   local blockers = {}
-  for pad = 0, G.NUM_PADS - 1 do
-    local ct = child[pad]
-    if ct then
-      local _, nm = reaper.GetSetMediaTrackInfo_String(ct, "P_NAME", "", false)
-      if reaper.CountTrackMediaItems(ct) > 0 then
-        blockers[#blockers + 1] = nm .. " has recorded items on it"
-      end
-      if reaper.GetTrackNumSends(ct, 0) > 0 then
-        blockers[#blockers + 1] = nm .. " sends to another track"
-      end
-      for rcv = 0, reaper.GetTrackNumSends(ct, -1) - 1 do
-        local from = reaper.BR_GetMediaTrackSendInfo_Track(ct, -1, rcv, 0)
-        if from and from ~= tr then
-          blockers[#blockers + 1] = nm .. " receives from another track"
-          break
-        end
+  for _, ct in ipairs(doomed) do
+    local _, nm = reaper.GetSetMediaTrackInfo_String(ct, "P_NAME", "", false)
+    if reaper.CountTrackMediaItems(ct) > 0 then
+      blockers[#blockers + 1] = nm .. " has recorded items on it"
+    end
+    if reaper.GetTrackNumSends(ct, 0) > 0 then
+      blockers[#blockers + 1] = nm .. " sends to another track"
+    end
+    for rcv = 0, reaper.GetTrackNumSends(ct, -1) - 1 do
+      local from = reaper.BR_GetMediaTrackSendInfo_Track(ct, -1, rcv, 0)
+      if from and from ~= tr then
+        blockers[#blockers + 1] = nm .. " receives from another track"
+        break
       end
     end
   end
@@ -14896,12 +15024,25 @@ function rk_ops.do_multiout_to_wired()
     if e.mute > 0 then mutes[#mutes + 1] = e.name end
   end
 
-  -- Tear down: Swing's sends, then every destination (pad tracks and any
-  -- return tracks) and the Audio sub-folder, highest index first so nothing
-  -- shifts under the loop.
-  for s = nsends - 1, 0, -1 do reaper.RemoveTrackSend(tr, 0, s) end
+  -- Tear down: only the sends Swing owns, then only the tracks Swing owns
+  -- (the pad children, its own FX returns) and the Audio sub-folder, highest
+  -- index first so nothing shifts under the loop. The send loop re-reads each
+  -- destination instead of sweeping the whole list -- a blanket
+  -- RemoveTrackSend took the user's own sends with it, leaving their bus fed
+  -- by nothing even in the runs where the track itself survived.
+  local foreign_names = {}
+  for _, d in ipairs(foreign) do
+    local _, fn = reaper.GetSetMediaTrackInfo_String(d, "P_NAME", "", false)
+    foreign_names[#foreign_names + 1] = (fn ~= "" and fn)
+      or string.format("track %d", math.floor(reaper.GetMediaTrackInfo_Value(d, "IP_TRACKNUMBER")))
+  end
+  for s = nsends - 1, 0, -1 do
+    local d = reaper.BR_GetMediaTrackSendInfo_Track(tr, 0, s, 1)
+    local g = d and reaper.GetTrackGUID(d)
+    if g and owned[g] then reaper.RemoveTrackSend(tr, 0, s) end
+  end
   local del = {}
-  for _, d in ipairs(dests) do del[#del + 1] = d end
+  for _, d in ipairs(doomed) do del[#del + 1] = d end
   local sub = find_audio_subfolder(tr)
   if sub then del[#del + 1] = sub end
   table.sort(del, function(a, b)
@@ -14953,6 +15094,15 @@ function rk_ops.do_multiout_to_wired()
   if returns > 0 then
     msg = msg .. string.format("\n\n%d return track%s removed -- the reverb and delay are back inside Swing.",
                                returns, returns == 1 and " was" or "s were")
+  end
+  -- Say it out loud. These survived precisely because Swing could not prove it
+  -- owned them, and silence is how deleting them went unnoticed for so long.
+  if #foreign_names > 0 then
+    msg = msg .. string.format(
+      "\n\n%d send%s to tracks Swing does not own %s left alone -- the track%s and the send%s are untouched:\n  ",
+      #foreign_names, #foreign_names == 1 and "" or "s", #foreign_names == 1 and "was" or "were",
+      #foreign_names == 1 and "" or "s", #foreign_names == 1 and "" or "s") ..
+      table.concat(foreign_names, "\n  ")
   end
   eon_notice(msg, "Multi-Out to Wired")
 end
@@ -15858,6 +16008,23 @@ end
 function eon_child_pad_idx(tr, s, dest)
   local _, ptag = reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:EON_PAD_IDX", "", false)
   if ptag ~= "" then return math.floor(tonumber(ptag) or -1) end
+  -- ⚠⚠ The TAG is the ownership record. Without one, I_SRCCHAN describes
+  -- TOPOLOGY, never ownership: REAPER's default for a hand-made send is
+  -- source 1/2, and core.srcchan_pad reads that as pad 0. So a user's own
+  -- send from Swing to a reverb / sidechain / print bus looked exactly like
+  -- pad 0 -- and the retro-tag below BRANDED it one for good, after which
+  -- the identity refresh renamed, recoloured and mute/solo-mirrored a
+  -- stranger's track, and do_multiout_to_wired DELETED it.
+  -- So: derive + retro-tag ONLY for a track that sits inside THIS Swing's
+  -- Audio sub-folder -- the structure the build itself creates. A miss here
+  -- leaves a pre-P4 lane unrenamed, which is visible and costs the user
+  -- nothing; the old miss cost them a track (guard lists fail safe).
+  local par = reaper.GetParentTrack(dest)
+  if not par then return -1 end          -- top-level: never a pad child
+  local _, af = reaper.GetSetMediaTrackInfo_String(par, "P_EXT:EON_AUDIO_KIT_FOLDER", "", false)
+  -- Builds before the folder tag existed still made the folder, so fall back
+  -- to the structural resolver rather than stranding those projects.
+  if af == "" and par ~= find_audio_subfolder(tr) then return -1 end
   local pad = core.srcchan_pad(reaper.GetTrackSendInfo_Value(tr, 0, s, "I_SRCCHAN"))
   if pad >= 0 and pad < G.NUM_PADS then
     reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:EON_PAD_IDX", tostring(pad), true)

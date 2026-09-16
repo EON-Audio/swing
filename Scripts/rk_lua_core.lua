@@ -2105,4 +2105,36 @@ function core.macro_link(tgt_tr, tgt_fx, tgt_param, src_fx, src_param)
   return ok
 end
 
+-- ⭐ Run an already-compiled chunk under an INSTRUCTION BUDGET.
+--
+-- Legacy .swing kits (v2/v4) are Lua text, so loading one executes a file the
+-- user may have downloaded. `load(text, name, "t", {})` gives it an empty
+-- environment -- no io, no os, no reaper -- and pcall catches what it throws.
+-- Neither stops `while true do end`: a kit with a loop (or a table constructor
+-- that never finishes) wedges REAPER's defer loop with no error and no way out
+-- but killing REAPER. That is the whole exposure, and it costs five lines to
+-- close.
+--
+-- debug.sethook's count hook fires every `budget` VM instructions; the error it
+-- raises unwinds like any other, so the caller's own pcall reports a clean load
+-- failure. The hook is cleared on BOTH paths -- leaving one armed would charge
+-- the budget to whatever ran next. Callers pass their own budget only when they
+-- have reason to; the default is ~100x what a full 16-pad kit costs to build.
+--
+-- Returns exactly what pcall returns, so it drops into existing call sites.
+function core.run_bounded(chunk, budget)
+  if type(chunk) ~= "function" then return false, "run_bounded: not a chunk" end
+  -- A stripped debug library is not a reason to refuse the load; it only means
+  -- this build cannot bound it. Behave exactly as before in that case.
+  if type(debug) ~= "table" or type(debug.sethook) ~= "function" then
+    return pcall(chunk)
+  end
+  debug.sethook(function()
+    error("instruction budget exceeded -- the file does not finish loading", 2)
+  end, "", budget or 5000000)
+  local ok, res = pcall(chunk)
+  debug.sethook()
+  return ok, res
+end
+
 return core
