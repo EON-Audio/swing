@@ -52,6 +52,14 @@
 local r = reaper
 local M = {}
 
+-- Live-dialog count (C-7, 2026-09-15): the Kit Bridge parks its command mailbox at
+-- 97 while one of these forms is up, and its CMD watchdog must know a dialog is
+-- really open before it treats a parked 97 as an orphan. Counted up when open()
+-- arms its frame, down in finish(). A frame that errors out never finishes and
+-- keeps the count -- the same wedge as before, only now it is named.
+local open_n = 0
+function M.busy() return open_n > 0 end
+
 -- Every ReaImGui function this file actually calls, in surface order. Checked
 -- up-front so a customer with an ancient ReaImGui that has CreateContext but is
 -- missing something newer falls through to GetUserInputs -- vs. what used to
@@ -135,6 +143,7 @@ function M.open(spec)
   local function finish(accepted)
     if finished then return end
     finished = true
+    open_n = math.max(0, open_n - 1)
     if accepted then
       local out = {}
       for _, f in ipairs(fields) do
@@ -336,6 +345,7 @@ function M.open(spec)
     if not finished then r.defer(frame) end
   end
 
+  open_n = open_n + 1
   r.defer(frame)
   return true
 end

@@ -18,7 +18,7 @@ _undo_pending > 0 && gmem[KIT_GMEM_UNDO_ACK] == 1 ? (
   _undo_pending == 1 ? (
     // CLEAR ALL — pads only. Kit name + FX chain preserved (vs. NEW which
     // wipes everything via _undo_pending == 6 → swing_new_kit_full_reset).
-    gi = 0; loop(NUM_PADS, clear_pad(gi); clear_pad_syn(gi); recalc_pad(gi); s_dirty[gi] = 1; gi += 1;);
+    gi = 0; loop(NUM_PADS, clear_pad(gi); clear_pad_syn(gi); swing_rcp_post_pad(gi); s_dirty[gi] = 1; gi += 1;);
   ) : _undo_pending == 2 ? (
     _undo_pad >= 0 && _undo_pad < NUM_PADS ? ( clear_pad(_undo_pad); clear_pad_syn(_undo_pad); );
   ) : _undo_pending == 6 ? (
@@ -140,7 +140,10 @@ _raw_wheel = frame_wheel;  // preserve for popup wheel navigation (gate zeroes f
 // popup in the plugin, that is just the first one whose underlay does something
 // visible on a click. The popup itself is unaffected: swing_popup_tick reads
 // the _raw_lmb_down / _raw_LMB copies preserved immediately above.
-overlay_pad >= 0 || big_view_id != VIEW_NONE || rng_ov_pad >= 0 || cat_ov_pad >= 0 || pk_ov_pad >= 0 || kmac_ed_open || swing_popup_active ? (
+// Published for the strip's keyboard (decision 6, 2026-09-15): the one place
+// that knows a modal is up, so no second list of modals exists to drift.
+_ui_modal_up = overlay_pad >= 0 || big_view_id != VIEW_NONE || rng_ov_pad >= 0 || cat_ov_pad >= 0 || pk_ov_pad >= 0 || kmac_ed_open || swing_popup_active;
+_ui_modal_up ? (
   _ov_pw = 420; _ov_ph = 560;
   _ov_px = (gfx_w - _ov_pw) / 2;
   _ov_py = 28 + ((gfx_h - 28 - _ov_ph) / 2);
@@ -190,7 +193,12 @@ local(_ki, _mb, _li_base, _lidx, _lj, _lo, _lpb, _pbase, _plen, _ci, _cj, _cn, _
 //    kit (name + globals + meta + audio) to gmem; state 11 ends with CMD=1 and
 //    the bridge writes the temp .swing. The bridge acks with CMD 85 (below),
 //    which — unlike 99 — leaves LOCK and any pending import state untouched.
-kit_export_state == 0 && gmem[KIT_GMEM_CMD] == 83 ? (
+//    Instance-gated (audit B-6): the producer writes LOCK = the target instance
+//    before CMD 83 (the parked bridge dump path must too when it is revived;
+//    the rigs do), so only that instance stages. Ungated, any Swing whose @gfx
+//    ran first took the dump and staged ITS kit under the requester's LOCK.
+kit_export_state == 0 && gmem[KIT_GMEM_CMD] == 83
+  && gmem[KIT_GMEM_LOCK] == instance_id ? (
   _ex_undo_busy_prev = kit_busy;  // state 11 sets kit_busy=1; CMD 85 restores this
   _ex_is_dump = 1;                // 2026-07-09: state 11 emits CMD 84 (not 1) so the
                                   // bridge disambiguates a silent-dump complete from a
@@ -209,6 +217,18 @@ kit_export_state == 1 ? (
   gmem[KIT_GMEM_LOCK] = instance_id;
   gmem[KIT_GMEM_CMD] = 10;  // ask Lua for name
   kit_export_state = 10;     // wait for name
+);
+
+// Safety net (audit B-5, 2026-09-14): a CMD 11 answered for THIS instance while
+// it sits in state 0 -- a producer that posted CMD 10 without arming, or an arm
+// lost to a chunk restore between the post and the reply -- is adopted here, so
+// a name reply can never strand the bus at CMD 11 with our LOCK held. The LOCK
+// test keeps another instance's save from being hijacked; the state-10 block
+// below consumes the 11 in this same evaluation.
+kit_export_state == 0 && !kit_busy && gmem[KIT_GMEM_CMD] == 11
+  && gmem[KIT_GMEM_LOCK] == instance_id ? (
+  kit_export_state = 10;
+  kit_busy = 1;
 );
 
 kit_export_state == 10 ? (
@@ -880,7 +900,10 @@ kit_import_state == 2 ? (
     gfx_eq_mid     = gmem[_gb + 17];
     gfx_eq_hi      = gmem[_gb + 18];
     gfx_lim_on     = gmem[_gb + 19];
-    gfx_lim_thr    = gmem[_gb + 20];
+    // The threshold is the knob's range, linear 0.251..1 (-12..0 dB); a 0 is a kit
+    // saved before the limiter existed and leaves the current value -- adopted as
+    // it was, it made the limiter divide by the peak and silence the master (B-4).
+    gmem[_gb + 20] > 0 ? gfx_lim_thr = max(0.251, min(1.0, gmem[_gb + 20]));
     gfx_lim_rel    = gmem[_gb + 21];
     gfx_eq_lo_freq  = gmem[_gb + 22];
     gfx_eq_mid_freq = gmem[_gb + 23];
@@ -980,7 +1003,7 @@ kit_import_state == 2 ? (
     p_rpt_div[_ki]   = gmem[_mb + 31];
     p_layer_cnt[_ki] = max(0, min(MAX_LAYERS, gmem[_mb + 32]|0));
     p_layer_mode[_ki] = max(0, min(3, gmem[_mb + 33]|0));
-    s_len[_ki]       = gmem[_mb + 34];
+    s_len[_ki]       = max(0, min(SLOT_SIZE, gmem[_mb + 34]));    // cells; a length past the slot copied into the next pad (B-4)
     s_start[_ki]     = gmem[_mb + 35];
     s_end[_ki]       = gmem[_mb + 36];
     s_sr[_ki]        = gmem[_mb + 37];
@@ -1000,7 +1023,7 @@ kit_import_state == 2 ? (
       _lo = _mb + 40 + _lj * _layer_stride;
       _lidx = _li_base + _lj;
       _lj < p_layer_cnt[_ki] ? (
-        l_len[_lidx]       = gmem[_lo + 0];
+        l_len[_lidx]       = max(0, min(LAYER_SIZE, gmem[_lo + 0]));   // cells; capped like s_len (B-4)
         l_start[_lidx]     = gmem[_lo + 1];
         l_end[_lidx]       = gmem[_lo + 2];
         l_sr[_lidx]        = gmem[_lo + 3];
@@ -1191,13 +1214,13 @@ kit_import_state == 2 ? (
   // Gate on _xf_prev being non-silent — kit-load while idle (no audio playing)
   // would otherwise attenuate the first hit's transient (~20ms ramp from silence
   // to new audio). Threshold -80dB rejects denormal/biquad ringtail residue.
-  _xf_vi = 0; loop(MAX_VOICES + 1,
+  _xf_vi = 0; loop(V_SLOTS,
     v_pos[_xf_vi] = -1; v_env[_xf_vi] = 0; v_stage[_xf_vi] = 0;
     _xf_vi += 1;
   );
   abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
     _xf_pos = 0;
-    _xf_len = max(1, (0.020 * srate)|0);  // 20ms crossfade
+    _xf_len = swing_xf_len(0.020);  // 20ms crossfade (+ a block under Wired, A-5)
     _xf_active = 1;
   );
   // Zero all audio buffers before import (prevents stale tail data from old kits).
@@ -1308,13 +1331,13 @@ kit_import_state == 3 ? (
     // pass registration below turns kit_ldr_pass_pad to 0 on the first one.
     kit_copy_pad == 0 && kit_copy_retry == 0 && kit_ldr_pass_pad != 0 ? (
       kit_stage_gap_bits = 0;  // per-load: pads where kit META says audio but no path was staged
-      _xf_vi = 0; loop(MAX_VOICES + 1,
+      _xf_vi = 0; loop(V_SLOTS,
         v_pos[_xf_vi] = -1; v_env[_xf_vi] = 0; v_stage[_xf_vi] = 0;
         _xf_vi += 1;
       );
       abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
         _xf_pos = 0;
-        _xf_len = max(1, (0.020 * srate)|0);
+        _xf_len = swing_xf_len(0.020);   // + a block under Wired (A-5)
         _xf_active = 1;
       );
     );
@@ -1385,7 +1408,11 @@ kit_import_state == 3 ? (
           );
           _lj += 1;
         );
-        !kit_ldr_yield && !_v201_any ? clear_pad(_ki);  // kit says layered but staged no paths
+        // kit says layered but staged no paths: a sliced clear (Phase 4, A O-2), held
+        // like a load until the slot is clean
+        !kit_ldr_yield && !_v201_any && !(kit_ldr_done & 256) ? (
+          swing_ldr_zero_pad(_ki) ? ( kit_ldr_done |= 256; ) : ( kit_ldr_yield = 1; );
+        );
       ) : (
         !(kit_ldr_done & 256) ? (
           // Non-layered pad: single pad-main path (VER-200 shape).
@@ -1404,8 +1431,11 @@ kit_import_state == 3 ? (
             // STAGE-GAP CONTRADICTION (see the layered branch above): kit meta
             // says this pad carries audio (_mb+34) but no path was staged.
             gmem[_mb + 34] > 0 ? kit_stage_gap_bits |= 2 ^ _ki;
-            clear_pad(_ki);  // pad is empty in the new kit
-            kit_ldr_done |= 256;
+            // pad is empty in the new kit: a sliced clear (Phase 4, A O-2), held like a
+            // load until the slot is clean -- the four synchronous 8 MB memsets were one
+            // audio-thread overrun per empty pad
+            swing_ldr_zero_pad(_ki) ?
+              ( kit_ldr_done |= 256; ) : ( kit_ldr_yield = 1; );
           );
         );
       );
@@ -1473,14 +1503,14 @@ kit_import_state == 3 ? (
   gmem[KIT_GMEM_VER] == 200 ? (
     // First frame: kill voices + clear all audio buffers
     kit_copy_pad == 0 ? (
-      _xf_vi = 0; loop(MAX_VOICES + 1,
+      _xf_vi = 0; loop(V_SLOTS,
         v_pos[_xf_vi] = -1; v_env[_xf_vi] = 0; v_stage[_xf_vi] = 0;
         _xf_vi += 1;
       );
       // Gate threshold -40 dB (see kit_import_state == 2 above for rationale).
       abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
         _xf_pos = 0;
-        _xf_len = max(1, (0.020 * srate)|0);
+        _xf_len = swing_xf_len(0.020);   // + a block under Wired (A-5)
         _xf_active = 1;
       );
       _ki = 0; loop(NUM_PADS,
@@ -1676,6 +1706,7 @@ kit_import_state == 4 ? (
   gmem[GS_KIT_PRESERVE_LIVE] = 0;
   kit_import_state = 0;
   _udo_cap_depth = 0;  // Phase 2: end the kit-import capture suppression
+  _udo_rebase_req = 1; // the @gfx head re-bases the param-undo snapshot on the new kit (D-8)
   kit_busy = 0;
   gmem[KIT_GMEM_LOCK] = 0;
   !_was_preserve ? mark_dirty_pad(_undo_pad);
@@ -1692,7 +1723,15 @@ kit_import_state == 4 ? (
 function swing_ui_misc_cmds()
 local(_ki, _cj, _cn, _cnl, _cc)  // localized 2026-07-09: raced the @block kit-import loop (see swing_ui_process_undo note)
 (
-!kit_busy && gmem[KIT_GMEM_CMD] == 99 ? (
+// Instance gate (audit B-6, 2026-09-14). A user save's 99 arrives with LOCK =
+// the saver -- the bridge no longer auto-releases LOCK on that ack -- so only
+// the saver may take it (its export state 3 does, above, and clears LOCK). An
+// orphan 99 (LOCK 0: the generic "done" of loads and builds) keeps the
+// broadcast refresh below. Before this gate the first idle @gfx to run took
+// ANY 99: another Swing adopted the saver's staged names and colours on all 16
+// pads, and the saver stayed wedged in export state 3 until a later 99.
+!kit_busy && gmem[KIT_GMEM_CMD] == 99
+  && (gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id) ? (
   // Re-read pad names from gmem
   _ki = 0; loop(NUM_PADS,
     _cn = get_cname_slot(_ki);
@@ -2065,8 +2104,8 @@ function swing_ui_draw_header() (
   _emb_by  = _btn_y;
   _emb_bh  = _btn_h;
 
-  // ── THEME selector (cycles EON → Dark → Light → REAPER) ──
-  // JSFX can't SetExtState, so a click writes the NEXT theme index to
+  // ── THEME selector ──
+  // JSFX can't SetExtState, so a pick writes the chosen theme index to
   // GS_THEME_REQ; the bridge writes the shared ExtState + republishes the
   // colour band, so every EON surface (Swing, StepSeq, Browser, Pad-FX)
   // re-skins in sync. Label reflects GS_THEME_CUR (bridge-published active
@@ -2096,13 +2135,13 @@ function swing_ui_draw_header() (
     rkth_draw_chip(11);
     _thm_hover = mx >= _thm_bx && mx <= _thm_bx + _thm_bw && my >= _btn_y && my <= _btn_y + _btn_h;
     _thm_hover ? (
-      #tooltip = "Theme: click cycles · right-click opens the list · hover+wheel cycles — syncs all EON tools";
+      #tooltip = "Theme — click / right-click for the list · hover+wheel cycles. Syncs all EON tools.";
     );
     // Caption drawn on Swing's side, NOT inside rkth_draw_chip: that widget is
     // shared with Drum Strip and ships in the ReaKit library, and this is a
     // Swing-layout decision. Consumed width shifts the TOOLBAR anchor below.
     _thm_capw = swing_ui_hdr_cap("THEME", _thm_bx, _btn_y, _btn_h, _thm_hover);
-  ) : ( _thm_capw = 0; );
+  ) : ( _thm_capw = 0; rkth_open = 0; );   // folded chip closes its list, or it paints on with nothing to close it
 
   // ── TOOLBAR button — open/close the EON toolbar (bridge CMD 78). Sits just left
   //    of THEME. The bridge finds the [Floating toolbar N] titled EON and toggles
@@ -2806,6 +2845,10 @@ function swing_rack_kitname() (
     && !kit_busy && gmem[GS_KIT_LOAD_REQ] != 2 ? (
     gmem[KIT_GMEM_LOCK] = instance_id;
     gmem[KIT_GMEM_CMD] = 10;
+    // Armed in the same evaluation as the post (see the LCD kit-name click in
+    // rk_swing_lcd.jsfx-inc for the wedge this prevents -- audit B-5).
+    kit_export_state = 10;
+    kit_busy = 1;
   ) : ( kit_bridge_warn = 1; );
 );
 

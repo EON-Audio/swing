@@ -67,72 +67,101 @@ function swing_panels_draw_eq() (
     ) : active_id = -1; );
 
     // Draw combined frequency response curve
-    // Pre-compute all biquad coefficients ONCE (not 80x per frame)
+    // Phase 4 (D O-2, 2026-09-15): the 80-point sweep, the three node magnitudes and the
+    // three node abscissae are cached in meq_cv against the eleven values they depend on
+    // (the Drum Strip's EQ-graph cache is the model). A page left open costs eleven
+    // compares per frame; the ~90 transcendentals run only when a band, a bell flag or
+    // the rate moves. The sweep's frequencies are fixed (80 log points, 20 Hz - 20 kHz),
+    // so the cache is width-independent and the compact page and the big view share it.
     _lcd_prev_x = -1; _lcd_prev_y = -1;
     _lcd_yr = _lcd_ch / 2 - 4;
+    (!meq_cv_valid || meq_cv_p0 != gfx_hpf_freq || meq_cv_p1 != gfx_lpf_freq
+     || meq_cv_p2 != gfx_eq_lo || meq_cv_p3 != gfx_eq_lo_freq || meq_cv_p4 != meq_lo_bell
+     || meq_cv_p5 != gfx_eq_mid || meq_cv_p6 != gfx_eq_mid_freq
+     || meq_cv_p7 != gfx_eq_hi || meq_cv_p8 != gfx_eq_hi_freq || meq_cv_p9 != meq_hi_bell
+     || meq_cv_sr != srate) ? (
+      // Pre-compute all biquad coefficients ONCE (not 80x per recompute)
+      // HPF coefficients
+      _cv_hpf_on = gfx_hpf_freq > 25;
+      _cv_hpf_on ? (
+        bq_calc_highpass(gfx_hpf_freq, 0.707);
+        _hpf_b0 = _tb0; _hpf_b1 = _tb1; _hpf_b2 = _tb2;
+        _hpf_a1 = _ta1; _hpf_a2 = _ta2;
+      );
+      // LPF coefficients
+      _cv_lpf_on = gfx_lpf_freq < 19500;
+      _cv_lpf_on ? (
+        bq_calc_lowpass(gfx_lpf_freq, 0.707);
+        _lpf_b0 = _tb0; _lpf_b1 = _tb1; _lpf_b2 = _tb2;
+        _lpf_a1 = _ta1; _lpf_a2 = _ta2;
+      );
+      // Lo band coefficients — NO ternary, fully flat if-blocks
+      _cv_lo_on = gfx_eq_lo != 0;
+      _lo_use_shelf = _cv_lo_on && (meq_lo_bell == 0);
+      _lo_use_bell  = _cv_lo_on && (meq_lo_bell != 0);
+      _lo_use_shelf ? (
+        bq_calc_lowshelf(gfx_eq_lo_freq, gfx_eq_lo, 1.0);
+        _lo_b0 = _tb0; _lo_b1 = _tb1; _lo_b2 = _tb2;
+        _lo_a1 = _ta1; _lo_a2 = _ta2;
+      );
+      _lo_use_bell ? (
+        bq_calc_peaking(gfx_eq_lo_freq, gfx_eq_lo, 0.8);
+        _lo_b0 = _tb0; _lo_b1 = _tb1; _lo_b2 = _tb2;
+        _lo_a1 = _ta1; _lo_a2 = _ta2;
+      );
+      // Mid band coefficients
+      _cv_md_on = gfx_eq_mid != 0;
+      _cv_md_on ? (
+        bq_calc_peaking(gfx_eq_mid_freq, gfx_eq_mid, 0.8);
+        _md_b0 = _tb0; _md_b1 = _tb1; _md_b2 = _tb2;
+        _md_a1 = _ta1; _md_a2 = _ta2;
+      );
+      // Hi band coefficients — NO ternary, fully flat if-blocks
+      _cv_hi_on = gfx_eq_hi != 0;
+      _hi_use_shelf = _cv_hi_on && (meq_hi_bell == 0);
+      _hi_use_bell  = _cv_hi_on && (meq_hi_bell != 0);
+      _hi_use_shelf ? (
+        bq_calc_highshelf(gfx_eq_hi_freq, gfx_eq_hi, 1.0);
+        _hi_b0 = _tb0; _hi_b1 = _tb1; _hi_b2 = _tb2;
+        _hi_a1 = _ta1; _hi_a2 = _ta2;
+      );
+      _hi_use_bell ? (
+        bq_calc_peaking(gfx_eq_hi_freq, gfx_eq_hi, 0.8);
+        _hi_b0 = _tb0; _hi_b1 = _tb1; _hi_b2 = _tb2;
+        _hi_a1 = _ta1; _hi_a2 = _ta2;
+      );
 
-    // HPF coefficients
-    _cv_hpf_on = gfx_hpf_freq > 25;
-    _cv_hpf_on ? (
-      bq_calc_highpass(gfx_hpf_freq, 0.707);
-      _hpf_b0 = _tb0; _hpf_b1 = _tb1; _hpf_b2 = _tb2;
-      _hpf_a1 = _ta1; _hpf_a2 = _ta2;
-    );
-    // LPF coefficients
-    _cv_lpf_on = gfx_lpf_freq < 19500;
-    _cv_lpf_on ? (
-      bq_calc_lowpass(gfx_lpf_freq, 0.707);
-      _lpf_b0 = _tb0; _lpf_b1 = _tb1; _lpf_b2 = _tb2;
-      _lpf_a1 = _ta1; _lpf_a2 = _ta2;
-    );
-    // Lo band coefficients — NO ternary, fully flat if-blocks
-    _cv_lo_on = gfx_eq_lo != 0;
-    _lo_use_shelf = _cv_lo_on && (meq_lo_bell == 0);
-    _lo_use_bell  = _cv_lo_on && (meq_lo_bell != 0);
-    _lo_use_shelf ? (
-      bq_calc_lowshelf(gfx_eq_lo_freq, gfx_eq_lo, 1.0);
-      _lo_b0 = _tb0; _lo_b1 = _tb1; _lo_b2 = _tb2;
-      _lo_a1 = _ta1; _lo_a2 = _ta2;
-    );
-    _lo_use_bell ? (
-      bq_calc_peaking(gfx_eq_lo_freq, gfx_eq_lo, 0.8);
-      _lo_b0 = _tb0; _lo_b1 = _tb1; _lo_b2 = _tb2;
-      _lo_a1 = _ta1; _lo_a2 = _ta2;
-    );
-    // Mid band coefficients
-    _cv_md_on = gfx_eq_mid != 0;
-    _cv_md_on ? (
-      bq_calc_peaking(gfx_eq_mid_freq, gfx_eq_mid, 0.8);
-      _md_b0 = _tb0; _md_b1 = _tb1; _md_b2 = _tb2;
-      _md_a1 = _ta1; _md_a2 = _ta2;
-    );
-    // Hi band coefficients — NO ternary, fully flat if-blocks
-    _cv_hi_on = gfx_eq_hi != 0;
-    _hi_use_shelf = _cv_hi_on && (meq_hi_bell == 0);
-    _hi_use_bell  = _cv_hi_on && (meq_hi_bell != 0);
-    _hi_use_shelf ? (
-      bq_calc_highshelf(gfx_eq_hi_freq, gfx_eq_hi, 1.0);
-      _hi_b0 = _tb0; _hi_b1 = _tb1; _hi_b2 = _tb2;
-      _hi_a1 = _ta1; _hi_a2 = _ta2;
-    );
-    _hi_use_bell ? (
-      bq_calc_peaking(gfx_eq_hi_freq, gfx_eq_hi, 0.8);
-      _hi_b0 = _tb0; _hi_b1 = _tb1; _hi_b2 = _tb2;
-      _hi_a1 = _ta1; _hi_a2 = _ta2;
+      // Sweep 80 frequency points into the cache (magnitudes only)
+      _lcd_px = 0;
+      loop(80,
+        _lcd_f = pow(10, _lcd_log_lo + (_lcd_px / 79) * _lcd_log_range);
+        _lcd_f = min(20000, _lcd_f);
+        _lcd_db = 0;
+        _cv_hpf_on ? ( _lcd_db += bq_mag_db(_lcd_f, _hpf_b0, _hpf_b1, _hpf_b2, _hpf_a1, _hpf_a2); );
+        _cv_lpf_on ? ( _lcd_db += bq_mag_db(_lcd_f, _lpf_b0, _lpf_b1, _lpf_b2, _lpf_a1, _lpf_a2); );
+        _cv_lo_on  ? ( _lcd_db += bq_mag_db(_lcd_f, _lo_b0, _lo_b1, _lo_b2, _lo_a1, _lo_a2); );
+        _cv_md_on  ? ( _lcd_db += bq_mag_db(_lcd_f, _md_b0, _md_b1, _md_b2, _md_a1, _md_a2); );
+        _cv_hi_on  ? ( _lcd_db += bq_mag_db(_lcd_f, _hi_b0, _hi_b1, _hi_b2, _hi_a1, _hi_a2); );
+        meq_cv[_lcd_px] = max(-18, min(18, _lcd_db));
+        _lcd_px += 1;
+      );
+      // Node magnitudes at the band frequencies (0 dB when a band is off: the node sits on
+      // the centre line) and the node abscissae in log space (the layout scales them per frame)
+      meq_cv[80] = _cv_lo_on ? max(-18, min(18, bq_mag_db(gfx_eq_lo_freq, _lo_b0, _lo_b1, _lo_b2, _lo_a1, _lo_a2))) : 0;
+      meq_cv[81] = _cv_md_on ? max(-18, min(18, bq_mag_db(gfx_eq_mid_freq, _md_b0, _md_b1, _md_b2, _md_a1, _md_a2))) : 0;
+      meq_cv[82] = _cv_hi_on ? max(-18, min(18, bq_mag_db(gfx_eq_hi_freq, _hi_b0, _hi_b1, _hi_b2, _hi_a1, _hi_a2))) : 0;
+      meq_cv[83] = log10(gfx_eq_lo_freq); meq_cv[84] = log10(gfx_eq_mid_freq); meq_cv[85] = log10(gfx_eq_hi_freq);
+      meq_cv_p0 = gfx_hpf_freq; meq_cv_p1 = gfx_lpf_freq;
+      meq_cv_p2 = gfx_eq_lo; meq_cv_p3 = gfx_eq_lo_freq; meq_cv_p4 = meq_lo_bell;
+      meq_cv_p5 = gfx_eq_mid; meq_cv_p6 = gfx_eq_mid_freq;
+      meq_cv_p7 = gfx_eq_hi; meq_cv_p8 = gfx_eq_hi_freq; meq_cv_p9 = meq_hi_bell;
+      meq_cv_sr = srate; meq_cv_valid = 1;
     );
 
-    // Sweep 80 frequency points — loop body is trivial (just mag lookups)
+    // Draw the cached curve
     _lcd_px = 0;
     loop(80,
-      _lcd_f = pow(10, _lcd_log_lo + (_lcd_px / 79) * _lcd_log_range);
-      _lcd_f = min(20000, _lcd_f);
-      _lcd_db = 0;
-      _cv_hpf_on ? ( _lcd_db += bq_mag_db(_lcd_f, _hpf_b0, _hpf_b1, _hpf_b2, _hpf_a1, _hpf_a2); );
-      _cv_lpf_on ? ( _lcd_db += bq_mag_db(_lcd_f, _lpf_b0, _lpf_b1, _lpf_b2, _lpf_a1, _lpf_a2); );
-      _cv_lo_on  ? ( _lcd_db += bq_mag_db(_lcd_f, _lo_b0, _lo_b1, _lo_b2, _lo_a1, _lo_a2); );
-      _cv_md_on  ? ( _lcd_db += bq_mag_db(_lcd_f, _md_b0, _md_b1, _md_b2, _md_a1, _md_a2); );
-      _cv_hi_on  ? ( _lcd_db += bq_mag_db(_lcd_f, _hi_b0, _hi_b1, _hi_b2, _hi_a1, _hi_a2); );
-      _lcd_db = max(-18, min(18, _lcd_db));
+      _lcd_db = meq_cv[_lcd_px];
       _lcd_cur_x = _lcd_cx + (_lcd_px / 79) * _lcd_cw;
       _lcd_cur_y = _lcd_mid_y - (_lcd_db / 14) * _lcd_yr;
 
@@ -155,35 +184,14 @@ function swing_panels_draw_eq() (
 
     // Draggable EQ nodes (larger in LCD, with frequency+gain X+Y drag)
     _lcd_nr = 6;
-    // Node positions: X from frequency (log scale), Y from actual biquad magnitude
-    // Nodes sit ON the curve line — for shelves the turnover freq shows ~half the set gain (correct)
-    _lcd_lo_nx = _lcd_cx + (log10(gfx_eq_lo_freq) - _lcd_log_lo) / _lcd_log_range * _lcd_cw;
-    _lcd_md_nx = _lcd_cx + (log10(gfx_eq_mid_freq) - _lcd_log_lo) / _lcd_log_range * _lcd_cw;
-    _lcd_hi_nx = _lcd_cx + (log10(gfx_eq_hi_freq) - _lcd_log_lo) / _lcd_log_range * _lcd_cw;
-    // Lo node Y — use precomputed coefficients to get real magnitude at node freq
-    _cv_lo_on ? (
-      _lcd_lo_db = bq_mag_db(gfx_eq_lo_freq, _lo_b0, _lo_b1, _lo_b2, _lo_a1, _lo_a2);
-      _lcd_lo_db = max(-18, min(18, _lcd_lo_db));
-      _lcd_lo_ny = _lcd_mid_y - (_lcd_lo_db / 14.0) * _lcd_yr;
-    ) : (
-      _lcd_lo_ny = _lcd_mid_y;
-    );
-    // Mid node Y — peaking: magnitude at center freq ≈ gain, but use real value for consistency
-    _cv_md_on ? (
-      _lcd_md_db = bq_mag_db(gfx_eq_mid_freq, _md_b0, _md_b1, _md_b2, _md_a1, _md_a2);
-      _lcd_md_db = max(-18, min(18, _lcd_md_db));
-      _lcd_md_ny = _lcd_mid_y - (_lcd_md_db / 14.0) * _lcd_yr;
-    ) : (
-      _lcd_md_ny = _lcd_mid_y;
-    );
-    // Hi node Y — same approach for shelf/bell
-    _cv_hi_on ? (
-      _lcd_hi_db = bq_mag_db(gfx_eq_hi_freq, _hi_b0, _hi_b1, _hi_b2, _hi_a1, _hi_a2);
-      _lcd_hi_db = max(-18, min(18, _lcd_hi_db));
-      _lcd_hi_ny = _lcd_mid_y - (_lcd_hi_db / 14.0) * _lcd_yr;
-    ) : (
-      _lcd_hi_ny = _lcd_mid_y;
-    );
+    // Node positions: X from frequency (log scale, cached), Y from the cached biquad magnitude.
+    // Nodes sit ON the curve line -- for shelves the turnover freq shows ~half the set gain (correct)
+    _lcd_lo_nx = _lcd_cx + (meq_cv[83] - _lcd_log_lo) / _lcd_log_range * _lcd_cw;
+    _lcd_md_nx = _lcd_cx + (meq_cv[84] - _lcd_log_lo) / _lcd_log_range * _lcd_cw;
+    _lcd_hi_nx = _lcd_cx + (meq_cv[85] - _lcd_log_lo) / _lcd_log_range * _lcd_cw;
+    _lcd_lo_ny = _lcd_mid_y - (meq_cv[80] / 14.0) * _lcd_yr;
+    _lcd_md_ny = _lcd_mid_y - (meq_cv[81] / 14.0) * _lcd_yr;
+    _lcd_hi_ny = _lcd_mid_y - (meq_cv[82] / 14.0) * _lcd_yr;
 
     // Node circles
     gfx_set(0.85, 0.65, 0.20, 1); gfx_circle(_lcd_lo_nx, _lcd_lo_ny, _lcd_nr, 1);
@@ -796,14 +804,14 @@ function swing_panels_comp_knob(ki, cx, cy, kr, km) local(_lv, _nv) (
   // caller draws the cell.
   ki == 0 ? (
     _nv = ssl_knob_interact(km, cx, cy, kr, cmp_thresh, -40, 0, -12, 0);
-    _nv != cmp_thresh ? ( cmp_thresh = _nv; cmp_recalc(); mark_dirty_kit(); );
+    _nv != cmp_thresh ? ( cmp_thresh = _nv; swing_rcp_post_cmp(); mark_dirty_kit(); );
     _cpc_dv = cmp_thresh; _cpc_dmin = -40; _cpc_dmax = 0; _cpc_dsym = 0;
     strcpy(#wface_lbl, "THRESHOLD"); sprintf(#wface_val, "%.1fdB", cmp_thresh);
   ) :
   ki == 1 ? (
     _lv = log(max(1, cmp_ratio));
     _nv = ssl_knob_interact(km, cx, cy, kr, _lv, 0, 2.99573227355, 1.38629436112, 0);
-    _nv != _lv ? ( cmp_ratio = exp(_nv); cmp_recalc(); mark_dirty_kit(); );
+    _nv != _lv ? ( cmp_ratio = exp(_nv); swing_rcp_post_cmp(); mark_dirty_kit(); );
     _cpc_dv = _nv; _cpc_dmin = 0; _cpc_dmax = 2.99573227355; _cpc_dsym = 0;
     strcpy(#wface_lbl, "RATIO");
     cmp_ratio >= 20 ? strcpy(#wface_val, "LIM") : sprintf(#wface_val, "%.1f:1", cmp_ratio);
@@ -811,26 +819,26 @@ function swing_panels_comp_knob(ki, cx, cy, kr, km) local(_lv, _nv) (
   ki == 2 ? (
     _lv = log(max(0.1, cmp_attack));
     _nv = ssl_knob_interact(km, cx, cy, kr, _lv, -2.30258509299, 4.60517018599, 2.30258509299, 0);
-    _nv != _lv ? ( cmp_attack = exp(_nv); cmp_recalc(); mark_dirty_kit(); );
+    _nv != _lv ? ( cmp_attack = exp(_nv); swing_rcp_post_cmp(); mark_dirty_kit(); );
     _cpc_dv = _nv; _cpc_dmin = -2.30258509299; _cpc_dmax = 4.60517018599; _cpc_dsym = 0;
     strcpy(#wface_lbl, "ATTACK"); sprintf(#wface_val, "%.1fms", cmp_attack);
   ) :
   ki == 3 ? (
     _lv = log(max(100, cmp_release));
     _nv = ssl_knob_interact(km, cx, cy, kr, _lv, 4.60517018599, 7.09007683578, 5.29831736655, 0);
-    _nv != _lv ? ( cmp_release = exp(_nv); cmp_recalc(); mark_dirty_kit(); );
+    _nv != _lv ? ( cmp_release = exp(_nv); swing_rcp_post_cmp(); mark_dirty_kit(); );
     _cpc_dv = _nv; _cpc_dmin = 4.60517018599; _cpc_dmax = 7.09007683578; _cpc_dsym = 0;
     strcpy(#wface_lbl, "RELEASE");
     cmp_auto ? strcpy(#wface_val, "AUTO") : sprintf(#wface_val, "%.0fms", cmp_release);
   ) :
   ki == 4 ? (
     _nv = ssl_knob_interact(km, cx, cy, kr, cmp_makeup, -12, 12, 0, 0);
-    _nv != cmp_makeup ? ( cmp_makeup = _nv; cmp_recalc(); mark_dirty_kit(); );
+    _nv != cmp_makeup ? ( cmp_makeup = _nv; swing_rcp_post_cmp(); mark_dirty_kit(); );
     _cpc_dv = cmp_makeup; _cpc_dmin = -12; _cpc_dmax = 12; _cpc_dsym = 1;
     strcpy(#wface_lbl, "MAKEUP"); sprintf(#wface_val, "%+.1fdB", cmp_makeup);
   ) : (
     _nv = ssl_knob_interact(km, cx, cy, kr, cmp_mix, 0, 1, 1, 0);
-    _nv != cmp_mix ? ( cmp_mix = _nv; cmp_recalc(); mark_dirty_kit(); );
+    _nv != cmp_mix ? ( cmp_mix = _nv; swing_rcp_post_cmp(); mark_dirty_kit(); );
     _cpc_dv = cmp_mix; _cpc_dmin = 0; _cpc_dmax = 1; _cpc_dsym = 0;
     strcpy(#wface_lbl, "MIX"); sprintf(#wface_val, "%.0f%%", cmp_mix * 100);
   );
@@ -838,7 +846,7 @@ function swing_panels_comp_knob(ki, cx, cy, kr, km) local(_lv, _nv) (
   // travel units, the same as Weld -- a second wheel path here doubled it)
   // right-click the RATIO knob: the knee (diode trim) lives behind the face
   ki == 1 && rmb_down && dist(mx, my, cx, cy) <= kr ? (
-    cmp_knee = cmp_knee >= 12 ? 0 : cmp_knee + 3; cmp_recalc(); mark_dirty_kit();
+    cmp_knee = cmp_knee >= 12 ? 0 : cmp_knee + 3; swing_rcp_post_cmp(); mark_dirty_kit();
   );
   dist(mx, my, cx, cy) <= kr ? (
     ki == 0 ? swing_tooltip_check(1401, "Threshold (-40 to 0 dB). Compression engages above this signal level.") :
@@ -1079,7 +1087,7 @@ local(x, y, w, h, s, land, top, vu_r, vu_cx, vu_cy, vu_bot, vg, sep1, sep2, ky1,
   cmp_voice == 0 ? (
     hv = wface_btn_labeled(ax, by, bw, bh, cmp_auto, "AUTO", land ? "" : "RELEASE");
     hv ? swing_tooltip_check(1405, "AUTO release: the programme-dependent dual-RC recovery owns the release; the RELEASE knob rests.");
-    hv && lmb_down ? ( cmp_auto = !cmp_auto; cmp_recalc(); mark_dirty_kit(); );
+    hv && lmb_down ? ( cmp_auto = !cmp_auto; swing_rcp_post_cmp(); mark_dirty_kit(); );
   ) : (
     // Anvil has no auto release; the slot shows the voice instead of a dead lamp
     hv = wface_btn_labeled(ax, by, bw, bh, 1, cmp_voice == 1 ? "BLK" : "BLU", land ? "" : "VOICE");

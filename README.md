@@ -142,10 +142,11 @@ any that are missing in the console.
 
 ## First run
 
-1. Insert **Swing_ReaKit** on a track (search "Swing" in the FX browser).
-   A kit loads on its own and the pads make sound immediately.
-2. Run **Swing_Kit_Bridge** once from the Action List (Actions → Show action
-   list). It registers itself and auto-starts from then on — one-time step.
+1. Insert **Swing** on a track. Search "Swing" in the FX browser; it is listed
+   as **JS: Swing**. A kit loads on its own and the pads make sound immediately.
+2. Open the Action List (Actions → Show action list), search
+   "Swing_Kit_Bridge" and run **Script: Swing_Kit_Bridge.lua** once. It
+   registers itself and auto-starts from then on — one-time step.
 3. That's it. The browser, sequencer and strips are all reachable from
    Swing's own UI.
 

@@ -43,7 +43,7 @@ local UPDATE_URL        = "https://api.github.com/repos/EON-Audio/swing/releases
 -- never fired only because no GitHub release exists yet. deploy.sh now refuses
 -- to publish when this does not match the version being released, so the drift
 -- cannot come back silently.
-local CURRENT_VERSION   = "3.0.10"
+local CURRENT_VERSION   = "3.0.12"
 local POLL_INTERVAL     = 5.0        -- seconds between heartbeat polls
 local HEARTBEAT_TIMEOUT = 2.0        -- seconds of stale counter = Swing gone
 

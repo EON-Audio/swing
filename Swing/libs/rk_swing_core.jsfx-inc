@@ -117,6 +117,16 @@ function get_cname_slot(idx) (
   idx==8?#cn8:idx==9?#cn9:idx==10?#cn10:idx==11?#cn11:
   idx==12?#cn12:idx==13?#cn13:idx==14?#cn14:#cn15;
 );
+// The name each pad LAST PUBLISHED into its IDENT band (Phase 4, A O-3, 2026-09-15):
+// @block compares the live cname against this with one strcmp per pad instead of
+// reading the band's 32 gmem cells back every block (512 reads), and rewrites the band
+// (VER bumped) only on a change. Written by the publisher alone; never a user string.
+function get_idname_slot(idx) (
+  idx==0?#idn0:idx==1?#idn1:idx==2?#idn2:idx==3?#idn3:
+  idx==4?#idn4:idx==5?#idn5:idx==6?#idn6:idx==7?#idn7:
+  idx==8?#idn8:idx==9?#idn9:idx==10?#idn10:idx==11?#idn11:
+  idx==12?#idn12:idx==13?#idn13:idx==14?#idn14:#idn15;
+);
 
 // ─── Shared pad swap (audio + metadata + name/path + layer paths) ─────────
 // Bridge-aware: when the bridge is idle, posts a named "Swap pads" undo (the
@@ -765,7 +775,7 @@ local(pad, _rms_buf, _num_wins, _peak_rms, _peak_win, _win_ms, _dur_ms, _post_pe
     p_sustain[pad] = 1.0;  // drum sampler: one-shots play through at full amplitude
     p_release[pad] = 30;
     p_adsr_user[pad] = 0;  // analyzer owns these values
-    recalc_pad(pad);
+    swing_rcp_post_pad(pad);   // @block performs (A-9a): the loader runs on either thread
   ) : (
     _rms_buf  = jb + LDR_F_RMS;
     _peak_rms = jb[LDR_F_PKRMS];
@@ -779,7 +789,7 @@ local(pad, _rms_buf, _num_wins, _peak_rms, _peak_win, _win_ms, _dur_ms, _post_pe
       p_sustain[pad] = 1.0;  // drum sampler: one-shots play through at full amplitude
       p_release[pad] = 300;
       p_adsr_user[pad] = 0;  // analyzer owns these values
-      recalc_pad(pad);
+      swing_rcp_post_pad(pad);   // @block performs (A-9a): the loader runs on either thread
     ) : (
       // ── Attack: time from start to peak window ────────────────
       _atk_ms = max(0.1, min(500.0, _peak_win * _win_ms));
@@ -857,7 +867,7 @@ local(pad, _rms_buf, _num_wins, _peak_rms, _peak_win, _win_ms, _dur_ms, _post_pe
       );
       p_release[pad] = _rel_ms;
       p_adsr_user[pad] = 0;  // analyzer owns these values
-      recalc_pad(pad);
+      swing_rcp_post_pad(pad);   // @block performs (A-9a): the loader runs on either thread
     );
   );
 );
@@ -1073,6 +1083,41 @@ function swing_ldr_step_layer(pad, layer, path_str) (
   swing_ldr_step(ldr_job0, ldr_budget);
 );
 
+// ─── A pad the new kit leaves EMPTY (Phase 4, A O-2, 2026-09-15) ─────────────
+// clear_pad's four 8 MB layer memsets ran on the audio thread for every kit-empty pad
+// of a VER-201 import: measured 2026-09-15 (EON_Probe_LdrStress, LdrSlice kit, 512
+// samples at 48 kHz) as thirteen 20 ms blocks against a 10.7 ms period -- one overrun
+// per empty pad. This runs the SAME clear_pad, minus the memsets (_clr_skip_audio, the
+// stream drop's pattern), and hands the slot to the loader's phase 2, which zeroes it
+// a bounded slice per block behind the sliced-undo barrier. The job has no file and no
+// audio: phase 2 -> 3 (no windows: len 0) -> 4, and finish() does the pad's bookkeeping
+// (source generation, fail bit, the undo bracket this opened). Inside an import the
+// capture depth is held, so nothing is captured; outside one the lazy capture saves a
+// slice ahead of the zeroing exactly as a drop does.
+function swing_ldr_begin_zero(jb, pad) (
+  jb[LDR_F_PHASE] > 0 ? swing_ldr_abort(jb);   // a new job always wins
+  jb[LDR_F_PAD] = pad; jb[LDR_F_LAYER] = -1;
+  jb[LDR_F_HANDLE] = -1; jb[LDR_F_NCH] = 0; jb[LDR_F_SR] = 0;
+  jb[LDR_F_POS] = 0; jb[LDR_F_PEAK] = 0.00001; jb[LDR_F_ZPOS] = 0; jb[LDR_F_LEN] = 0;
+  jb[LDR_F_OPENED] = 0; jb[LDR_F_ADSR] = 0; jb[LDR_F_PREVCNT] = 0; jb[LDR_F_NWIN] = 0;
+  _udo_cap_lazy_req = 1;
+  undo_begin_pad(pad);          // closed by swing_ldr_finish
+  _udo_cap_lazy_req = 0;
+  _clr_skip_audio = 1;
+  clear_pad(pad);               // nested: raises the depth, captures nothing new
+  _clr_skip_audio = 0;
+  jb[LDR_F_BUF] = s_audio_start + pad * SLOT_SIZE;
+  jb[LDR_F_CAP] = SLOT_SIZE;
+  jb[LDR_F_PHASE] = 2;
+);
+// @block entry point, the swing_ldr_step_pad shape: begin on first sight of the pad,
+// then pump one slice; 1 once the slot is clean, 0 while the caller must hold its place.
+function swing_ldr_zero_pad(pad) (
+  (ldr_job0[LDR_F_PHASE] == 0 || ldr_job0[LDR_F_PAD] != pad || ldr_job0[LDR_F_LAYER] != -1) ?
+    swing_ldr_begin_zero(ldr_job0, pad);
+  swing_ldr_step(ldr_job0, ldr_budget);
+);
+
 // Run a job to completion in one call (UI-side callers and the legacy VER-200
 // import). Each step stays under the loop cap; a full slot takes ~8 steps.
 function swing_ldr_run(jb, pad, layer, path_str) (
@@ -1251,6 +1296,43 @@ function build_wv_cache(idx) local(buf, step, i, _wi, val, si, ptr, ptr_R, _wlen
   );
 );
 
+// ─── Steal-fade park (A-2) ───────────────────────────────────────────────
+// A stolen voice is not cut: its state moves into one of the STEAL_FADES slots past
+// the pool (MAX_VOICES .. V_SLOTS - 1), where @sample runs it in release under
+// steal_coeff (~5 ms) until it falls silent. ONE such slot used to serve every steal,
+// so two steals in one block (eighteen note-ons against sixteen voices) cut the first
+// victim hard when the second overwrote it -- and its v_age was never set, so the
+// first-sample safety net in @sample zeroed the copied envelope: a click either way.
+// The slot taken is the quietest (a free one scores -1), so a fifth steal within
+// ~5 ms only ever truncates the fade that is already nearest silence.
+// Order is the audio-thread gate: the fade slot's v_stage goes to 4 LAST among its
+// writes, then the victim is parked before its slot is rewritten by the caller.
+function swing_voice_steal_park(_stl_vi) local(_stl_k, _stl_sf, _stl_best, _stl_score) (
+  _stl_sf = MAX_VOICES; _stl_best = 1000;
+  _stl_k = MAX_VOICES;
+  loop(STEAL_FADES,
+    _stl_score = v_stage[_stl_k] > 0 ? v_env[_stl_k] : -1;   // free = -1, else how loud its fade still is
+    _stl_score < _stl_best ? ( _stl_best = _stl_score; _stl_sf = _stl_k; );
+    _stl_k += 1;
+  );
+  v_slot[_stl_sf] = v_slot[_stl_vi]; v_pos[_stl_sf] = v_pos[_stl_vi];
+  v_startpos[_stl_sf] = v_startpos[_stl_vi];
+  v_gain[_stl_sf] = v_gain[_stl_vi];
+  v_env[_stl_sf] = v_env[_stl_vi]; v_note[_stl_sf] = v_note[_stl_vi];
+  v_inc[_stl_sf] = v_inc[_stl_vi]; v_decay_ct[_stl_sf] = 0;
+  v_sg[_stl_sf] = v_sg[_stl_vi]; v_layer[_stl_sf] = v_layer[_stl_vi];
+  v_quiet[_stl_sf] = v_quiet[_stl_vi];
+  v_age[_stl_sf] = max(1, v_age[_stl_vi]);   // never 0: @sample zeroes a voice's envelope on its first sample
+  // synth voices carry their engine state into the fade slot
+  v_kind[_stl_sf] = v_kind[_stl_vi];
+  v_kind[_stl_vi] == 1 ? memcpy(v_syn_state + _stl_sf * RK_SYN_STATE_SIZE,
+                                v_syn_state + _stl_vi * RK_SYN_STATE_SIZE, RK_SYN_STATE_SIZE);
+  v_stage[_stl_sf] = 4;   // LAST -- audio thread gate
+  // park the stolen slot NOW: @sample (concurrent with @gfx trigger paths) must
+  // never observe a live voice mid-rewrite (sweep finding)
+  v_stage[_stl_vi] = 0; v_pos[_stl_vi] = -1; v_env[_stl_vi] = 0;
+);
+
 // ─── SYN voice launch ────────────────────────────────────────────────────
 // Lifted out of launch_voices_for_pad so it has TWO callers: a full pad
 // trigger runs it underneath the sample voices as before, and the SYN view's
@@ -1284,18 +1366,7 @@ function launch_syn_for_pad(_sy_pad, _sy_midi, _sy_vel, _sy_gaindiv, _sy_ofs)
     v_pos[vi] < 0 ? (
       v_pos[vi] = -1; v_env[vi] = 0; v_stage[vi] = 0;
     ) : (
-      v_slot[MAX_VOICES] = v_slot[vi]; v_pos[MAX_VOICES] = v_pos[vi];
-      v_startpos[MAX_VOICES] = v_startpos[vi];
-      v_gain[MAX_VOICES] = v_gain[vi];
-      v_env[MAX_VOICES] = v_env[vi]; v_note[MAX_VOICES] = v_note[vi];
-      v_inc[MAX_VOICES] = v_inc[vi]; v_decay_ct[MAX_VOICES] = 0;
-      v_sg[MAX_VOICES] = v_sg[vi]; v_layer[MAX_VOICES] = v_layer[vi];
-      v_kind[MAX_VOICES] = v_kind[vi];
-      v_kind[vi] == 1 ? memcpy(v_syn_state + MAX_VOICES * RK_SYN_STATE_SIZE,
-                               v_syn_state + vi * RK_SYN_STATE_SIZE, RK_SYN_STATE_SIZE);
-      v_stage[MAX_VOICES] = 4; // LAST — audio thread gate
-      // park the stolen slot before any state rewrite (sweep finding)
-      v_stage[vi] = 0; v_pos[vi] = -1; v_env[vi] = 0;
+      swing_voice_steal_park(vi);   // into the quietest steal-fade slot, then park vi (A-2)
     );
   );
   vi >= 0 ? (
@@ -1331,6 +1402,37 @@ function launch_syn_for_pad(_sy_pad, _sy_midi, _sy_vel, _sy_gaindiv, _sy_ofs)
   );
 );
 
+// ─── Choke pass (A-7) ─────────────────────────────────────────────────────
+// Runs at every trigger, local or Stretch. Local voices: a voice on the SAME pad
+// younger than the retrigger lockout is released (duplicate-kill), a voice on another
+// pad of the same choke group is released (choke). Stretch pads of the same group are
+// marked choked: @sample's ring drain fades their frames under steal_coeff (~5 ms) and
+// then parks their read cursor at the write cursor, discarding what the Extension still
+// writes for that hit, until the pad's own next trigger. The Extension is never told
+// about choke groups (it gets mode, tune, algo and source only), so the consumer side
+// is where a Stretch pad can be choked at all. A Stretch pad's own retrigger needs no
+// duplicate-kill: its trigger-edge ring reset already drops the old tail.
+function swing_voice_choke_pass(_ck_pad) local(_ck_j, _ck_g, _ck_p) (
+  _ck_g = p_choke[_ck_pad];
+  _ck_j = 0; loop(MAX_VOICES,
+    v_pos[_ck_j] >= 0 && v_age[_ck_j] > 0 ? (
+      v_slot[_ck_j] == _ck_pad ? (
+        v_age[_ck_j] < _retrig_lockout ? ( v_stage[_ck_j] = 4; );  // duplicate-kill
+      ) : (
+        _ck_g > 0 && p_choke[v_slot[_ck_j]] == _ck_g ? ( v_stage[_ck_j] = 4; );  // choke group
+      );
+    );
+    _ck_j += 1;
+  );
+  _ck_g > 0 ? (
+    _ck_p = 0; loop(NUM_PADS,
+      _ck_p != _ck_pad && p_choke[_ck_p] == _ck_g && sp_pitch_mode[_ck_p] == SP_PITCH_MODE_STRETCH
+        && stretch_choked[_ck_p] == 0 ? stretch_choked[_ck_p] = 1;   // 1 = fading, 2 = parked
+      _ck_p += 1;
+    );
+  );
+);
+
 // ─── Voice launch helper (eliminates triplication across note-on + repeats) ──
 // _lv_midi = the played MIDI note. For single-note (drum) pads it equals
 // p_note[pad] (offset 0). For a chromatic pad it's the actual key, and the
@@ -1342,7 +1444,7 @@ function launch_syn_for_pad(_sy_pad, _sy_midi, _sy_vel, _sy_gaindiv, _sy_ofs)
 function launch_voices_for_pad_ofs(_lv_pad, _lv_midi, _lv_vel, _lv_flash, _lv_ofs)
   local(_is_sum, _sum_cnt, _sum_cur, _active_cnt, _sel_layer, _skip_voice, vi, _lidx,
         _slen, _sstart, _send, _ssr, max_age, _oldest_vi, j, _delay, _end_i, _start_i,
-        _lv_choke, _pt_eff, _st_off, _sr_base_t, _new_rpos, _bt_lidx, _tie_pg,
+        _pt_eff, _st_off, _sr_base_t, _new_rpos, _bt_lidx, _tie_pg,
         _sel_syn, _syn_go, _syn_v, _syn_st, _has_smp, _comp_sum) (
   // Step 3b: Mode=Stretch diverts to the Extension's audio_hook. Don't
   // allocate a local sinc voice; instead bump the per-pad trigger counter
@@ -1388,6 +1490,11 @@ function launch_voices_for_pad_ofs(_lv_pad, _lv_midi, _lv_vel, _lv_flash, _lv_of
     // Held back by the @sample consumer, not here: the Extension has not seen
     // this trigger yet and will not until its next audio_hook.
     stretch_hold[_lv_pad] = _lv_ofs;
+    // A retrigger un-chokes this pad (its ring was just parked at the write cursor,
+    // so the old tail is gone anyway), then the same choke pass as a local launch:
+    // a Stretch closed hat releases the open hat, local or Stretch (A-7).
+    stretch_choked[_lv_pad] = 0; stretch_gain[_lv_pad] = 1;
+    swing_voice_choke_pass(_lv_pad);
     pad_flash[_lv_pad] = _lv_flash;
   ) : (
   // Only mode 3 (Sum) stacks all layers; mode 0 uses single-layer selection
@@ -1447,20 +1554,7 @@ function launch_voices_for_pad_ofs(_lv_pad, _lv_midi, _lv_vel, _lv_flash, _lv_of
         v_pos[vi] < 0 ? (
           v_pos[vi] = -1; v_env[vi] = 0; v_stage[vi] = 0;
         ) : (
-          v_slot[MAX_VOICES] = v_slot[vi]; v_pos[MAX_VOICES] = v_pos[vi];
-          v_startpos[MAX_VOICES] = v_startpos[vi];
-          v_gain[MAX_VOICES] = v_gain[vi];
-          v_env[MAX_VOICES] = v_env[vi]; v_note[MAX_VOICES] = v_note[vi];
-          v_inc[MAX_VOICES] = v_inc[vi]; v_decay_ct[MAX_VOICES] = 0;
-          v_sg[MAX_VOICES] = v_sg[vi]; v_layer[MAX_VOICES] = v_layer[vi];
-          // synth voices carry their engine state into the steal-fade slot
-          v_kind[MAX_VOICES] = v_kind[vi];
-          v_kind[vi] == 1 ? memcpy(v_syn_state + MAX_VOICES * RK_SYN_STATE_SIZE,
-                                   v_syn_state + vi * RK_SYN_STATE_SIZE, RK_SYN_STATE_SIZE);
-          v_stage[MAX_VOICES] = 4; // LAST — audio thread gate
-          // park the stolen slot NOW: @sample (concurrent with @gfx trigger
-          // paths) must never observe a live voice mid-rewrite (sweep finding)
-          v_stage[vi] = 0; v_pos[vi] = -1; v_env[vi] = 0;
+          swing_voice_steal_park(vi);   // into the quietest steal-fade slot, then park vi (A-2)
         );
       );
       vi >= 0 ? (
@@ -1602,20 +1696,7 @@ function launch_voices_for_pad_ofs(_lv_pad, _lv_midi, _lv_vel, _lv_flash, _lv_of
     );
   );
   pad_flash[_lv_pad] = _lv_flash;
-  // Duplicate-kill + choke group (single pass)
-  // Duplicate-kill: choke voices on same pad younger than lockout window
-  // Choke group: kill voices on other pads sharing the same choke group
-  _lv_choke = p_choke[_lv_pad];
-  j = 0; loop(MAX_VOICES,
-    v_pos[j] >= 0 && v_age[j] > 0 ? (
-      v_slot[j] == _lv_pad ? (
-        v_age[j] < _retrig_lockout ? ( v_stage[j] = 4; );  // duplicate-kill
-      ) : (
-        _lv_choke > 0 && p_choke[v_slot[j]] == _lv_choke ? ( v_stage[j] = 4; );  // choke group
-      );
-    );
-    j += 1;
-  );
+  swing_voice_choke_pass(_lv_pad);   // duplicate-kill + choke group, local voices and Stretch pads (A-7)
   );  // end of Mode != Stretch branch (Step 3b launch_voices divert)
 );
 

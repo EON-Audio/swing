@@ -249,7 +249,7 @@ local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j, _sp_n)
       // CMD 63's heuristic — below that the noise floor masks the cut.
       !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
         _xf_pos    = 0;
-        _xf_len    = max(1, (0.010 * srate)|0);  // 10 ms crossfade
+        _xf_len    = swing_xf_len(0.010);  // 10 ms crossfade (+ a block under Wired, A-5)
         _xf_active = 1;
       );
       // Payload staged at AUDIO+0 (single transient staging, one swap per
@@ -292,7 +292,7 @@ local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j, _sp_n)
       // have all voices at v_layer 0, so this still kills them all. The crossfade
       // armed above masks the cut.
       _sp_j = 0;
-      loop(MAX_VOICES + 1,
+      loop(V_SLOTS,
         (v_slot[_sp_j] == _sp_pad && v_layer[_sp_j] == 0) ? ( v_pos[_sp_j] = -1; v_env[_sp_j] = 0; v_stage[_sp_j] = 0; );
         _sp_j += 1;
       );
@@ -439,7 +439,7 @@ local(_lp_pad _lp_layer _lp_len _lp_lidx _lp_dst _lp_j)
     // Arm anti-click crossfade BEFORE killing voices (mirrors CMD 65/63).
     !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
       _xf_pos    = 0;
-      _xf_len    = max(1, (0.010 * srate)|0);  // 10 ms crossfade
+      _xf_len    = swing_xf_len(0.010);  // 10 ms crossfade (+ a block under Wired, A-5)
       _xf_active = 1;
     );
     _lp_lidx = _lp_pad * MAX_LAYERS + _lp_layer;
@@ -459,7 +459,7 @@ local(_lp_pad _lp_layer _lp_len _lp_lidx _lp_dst _lp_j)
     // The cache still rebuilds on a real sample/layer (re)load via s_dirty there.
     // Kill active voices on this pad+layer — their buffer changed underneath.
     _lp_j = 0;
-    loop(MAX_VOICES + 1,
+    loop(V_SLOTS,
       (v_slot[_lp_j] == _lp_pad && v_layer[_lp_j] == _lp_layer) ? (
         v_pos[_lp_j] = -1; v_env[_lp_j] = 0; v_stage[_lp_j] = 0;
       );
@@ -529,32 +529,47 @@ local(_zj)
   );
 );
 
-function swing_registry_claim()
-local(_si _base _id _hb _now _pick)
+// ⭐ OWNERSHIP RE-VALIDATION (2026-09-12; its own function since 2026-09-15, C-3).
+// _reg_my_slot is a LATCH. Everything in the claim used to sit behind `< 0` alone, so
+// an instance that once held a slot never asked again whether it still does -- and
+// the @block heartbeat writer downstream stamps id+time into that latched slot with
+// no check of its own. An instance that goes dormant (its @block stops running: a
+// background project tab) freezes its heartbeat, its slot ages past
+// GS_INST_REG_TIMEOUT, a peer legitimately takes it as stale -- and the moment the
+// dormant one runs again it writes ITS id straight over the live incumbent. Both
+// then stamp the same slot every block, and _reg_my_slot keys the strided per-
+// instance bands (IDENT, PADMIX, INCMD, GS_STRIP, the stretch ring), so the two
+// instances silently share all of them. Measured 2026-09-12: an undo-restored
+// Swing woke up and knocked a Swing that had never been deleted offline
+// (EON_Probe_QueueLifetime_probe).
+// ⚠ This also covers the case where @init never ran at all: EEL2 zero-inits, so
+// the latch reads 0 -- a VALID-looking slot index that passes every `>= 0` gate
+// and points at whoever holds slot 0. Dropping the latch sends it through Pass
+// A/B to a genuinely free slot instead.
+// The reconciler cannot substitute for this: it scans OTHER slots for OUR id and
+// never asks whether our OWN slot still holds it.
+// C-3 (audit C, 2026-09-14): the claim asked this first, but the slot-keyed
+// publishers at the top of @block (master link, stretch control, patch ring, the
+// strip band's publish AND its mailbox consume) ran a whole block ahead of the
+// claim, so a woken instance wrote one block into the new owner's bands and
+// applied a Drum Strip edit addressed to the new owner to its own pad. Now it
+// runs at the very top of @block, before any of them, and first inside the claim.
+// It only ever drops the latch; the claim re-acquires as before.
+function swing_registry_check_owner()
 (
-  // ⭐ OWNERSHIP RE-VALIDATION, and it has to come first (2026-09-12).
-  // _reg_my_slot is a LATCH. Everything below used to sit behind `< 0` alone, so
-  // an instance that once held a slot never asked again whether it still does --
-  // and the @block heartbeat writer downstream stamps id+time into that latched
-  // slot with no check of its own. An instance that goes dormant (its @block
-  // stops running) therefore freezes its heartbeat, its slot ages past
-  // GS_INST_REG_TIMEOUT, a peer legitimately takes it as stale -- and the moment
-  // the dormant one runs again it writes ITS id straight over the live incumbent.
-  // Both then stamp the same slot every block, and _reg_my_slot keys the strided
-  // per-instance bands (IDENT, PADMIX, INCMD, GS_STRIP, the stretch ring), so the
-  // two instances silently share all of them. Measured 2026-09-12: an undo-
-  // restored Swing woke up and knocked a Swing that had never been deleted
-  // offline (EON_Probe_QueueLifetime_probe).
-  // ⚠ This also covers the case where @init never ran at all: EEL2 zero-inits, so
-  // the latch reads 0 -- a VALID-looking slot index that passes every `>= 0` gate
-  // and points at whoever holds slot 0. Dropping the latch sends it through Pass
-  // A/B to a genuinely free slot instead.
-  // The reconciler below cannot substitute for this: it scans OTHER slots for OUR
-  // id and never asks whether our OWN slot still holds it.
   (_reg_my_slot >= 0 &&
    gmem[GS_INST_REG_BASE + _reg_my_slot * GS_INST_REG_STRIDE] != instance_id) ? (
     _reg_my_slot = -1;   // our slot was reassigned while we were away -- re-claim
   );
+);
+
+function swing_registry_claim()
+local(_si _base _id _hb _now _pick)
+(
+  // Ownership re-validation first (swing_registry_check_owner above, with the
+  // 2026-09-12 measurement). @block runs it again at its very top since C-3, so a
+  // stale latch is dropped before the slot-keyed publishers, not only here.
+  swing_registry_check_owner();
   // ⭐ TWO-STEP @block CLAIM (2026-09-13). Several instances re-claiming in the
   // same audio cycle (undo restore, a vacated slot, a mass wipe) can each pick
   // the SAME free slot; the last id written wins. Claimed on the spot, the loser

@@ -11,8 +11,88 @@
 //   fx_eq_lo_freq, fx_eq_mid_freq, fx_eq_mid2_freq, fx_eq_hi_freq
 //   s_sr, root_note, srate
 //   gfx_hpf_freq, gfx_lpf_freq, gfx_sat_drv
+//   v_slot, v_pos, v_env, v_stage, _xf_active, _xf_pos, _xf_len, _xf_prev,
+//   patch_live (the voice kill + crossfade helpers below)
 
 @init
+
+// ─── Voice kill + anti-pop crossfade: one discipline for every structural edit ──
+// Every edit that rewrites a pad's audio while it may be sounding -- a browser or
+// stream load, a native drop, a swap, a structural undo, a bake, a kit load --
+// ends the pad's voices and arms the output crossfade through these two
+// functions, so the browser path's behaviour (rk_swing_browser_load, CMD 63) is
+// the behaviour everywhere (Audit A 2026-09-14: A-3 drops, A-4 swap and undo,
+// A-5 the Wired pad pairs).
+//
+// swing_xf_len(len_s): the crossfade length in samples for a nominal len_s
+//   seconds. Under Wired (patch_live) every pad leaves on channels 2..33 and
+//   comes back through the Patchbay ring ONE BLOCK later, so the blend is
+//   lengthened by a block: the pair's step still lands inside it when it
+//   returns (A-5). samplesblock is the host's block size, valid in every section.
+//
+// swing_voice_kill_pad_xf(pad): end every voice on pad -- stage FIRST, since
+//   @sample skips a stage-0 voice whatever its other cells hold, so a caller on
+//   the UI thread never exposes a half-written voice -- then arm a 10 ms
+//   crossfade when the last output was audible (-40 dB; below that the ramp
+//   would only attenuate the next hit's transient before the @sample
+//   short-circuit at -80 dB could end it). Touches globals only: callable from
+//   @block and @gfx and from every inc imported after this one.
+function swing_xf_len(len_s) (
+  max(1, (len_s * srate)|0) + (patch_live ? samplesblock : 0);
+);
+
+function swing_voice_kill_pad_xf(pad) local(_vk_i) (
+  _vk_i = 0; loop(V_SLOTS,
+    v_slot[_vk_i] == pad ? ( v_stage[_vk_i] = 0; v_env[_vk_i] = 0; v_pos[_vk_i] = -1; );
+    _vk_i += 1;
+  );
+  !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
+    _xf_pos = 0;
+    _xf_len = swing_xf_len(0.010);
+    _xf_active = 1;
+  );
+);
+
+// ─── Recalc REQUESTS: the UI thread asks, @block performs (A-9a) ───────────────
+// recalc_fx / recalc_pad / cmp_recalc / recalc_global_fx keep scratch in static
+// locals (rk_svf's setters, recalc_fx's _svf_base) and used to be entered from
+// both threads at once, so a knob drag under a macro morph or a strip edit could
+// hand one pad's targets to another (Audit A 2026-09-14, A-9). Every UI-thread
+// caller now posts a request through these four and swing_block_rcp_settle
+// (rk_swing_block) performs it at the top of the next @block. One block of
+// latency, no cross-thread call.
+//
+// Lossless without atomics: each counter has ONE writer. The UI increments
+// _rcp_req_*; @block owns _rcp_done_* and, when they differ, copies req into
+// done and performs -- a post landing mid-perform differs again next block. (The
+// macro engine's own kmac_rcp bits stay @block-private, as their comment says.)
+function swing_rcp_post_fx(pad) ( _rcp_req_fx[pad] += 1; );
+function swing_rcp_post_pad(pad) ( _rcp_req_pad[pad] += 1; );
+function swing_rcp_post_cmp() ( _rcp_req_cmp += 1; );
+function swing_rcp_post_master() ( _rcp_req_master += 1; );
+
+// ─── Pad clicks and releases: the UI thread posts, @block launches (A-9b) ──────
+// launch_voices_for_pad_ofs keeps scratch in static locals and writes the voice
+// cells, so a pad clicked in the UI while a MIDI note launched could merge two
+// launches (A-9). The UI's launch sites append here and @block performs the
+// launch within a block (swing_block_gt_consume, rk_swing_block); the gate-mode
+// mouse-up posts its release the same way (swing_block_gt_release). One writer
+// per index: the UI owns _gt_wr / _gtr_wr (bumped LAST, after the payload),
+// @block owns _gt_rd / _gtr_rd. A full ring drops the click.
+function swing_gt_post(pad, note, vel, flash) local(_gp_i) (
+  _gt_wr - _gt_rd < GT_RING ? (
+    _gp_i = _gt_wr % GT_RING;
+    _gt_pad[_gp_i] = pad; _gt_note[_gp_i] = note; _gt_vel[_gp_i] = vel; _gt_flash[_gp_i] = flash;
+    _gt_wr += 1;   // LAST
+  );
+);
+function swing_gt_post_release(pad) local(_gp_i) (
+  _gtr_wr - _gtr_rd < GT_RING ? (
+    _gp_i = _gtr_wr % GT_RING;
+    _gtr_pad[_gp_i] = pad;
+    _gtr_wr += 1;   // LAST
+  );
+);
 
 // ─── HSL → RGB conversion ──────────────────────────────────────────────
 // h = hue (0–1), s = saturation (0–1), l = lightness (0–1)
@@ -305,7 +385,8 @@ function recalc_global_fx() local(_bm) (
   );
 );
 
-function recalc_master_eq() ( recalc_global_fx(); );
+// The UI's master-chain recalc: a request, performed by @block next block (A-9a).
+function recalc_master_eq() ( swing_rcp_post_master(); );
 
 // ─── Check if pad has any audio loaded ─────────────────────────────────────
 // pad_has_audio = "has SAMPLE audio" (storage truth — blank-pad/embed logic
@@ -592,13 +673,14 @@ function udo_struct_begin_kit() local(l) (
 // Restore the structural undo entry (scoped). Dispatches by type:
 //   per-pad → restore just that pad's slot + metadata (no collateral)
 //   swap    → re-swap (self-inverse; capture suppressed via _udo_applying)
-function undo_restore_struct() local(pad, l, _li, _vi) (
+function undo_restore_struct() local(pad, l, _li) (
   _udo_st_valid ? (
     udo_s2_type == 1 ? (
       _udo_applying = 1;
-      // silence voices so none reads a half-restored slot (anti-garble)
-      _vi = 0; loop(MAX_VOICES + 1, v_pos[_vi] = -1; v_env[_vi] = 0; v_stage[_vi] = 0; _vi += 1;);
       pad = udo_s2_pad;
+      // End this pad's voices so none reads a half-restored slot, and fade the
+      // output instead of cutting it (A-4). Every other pad keeps sounding.
+      swing_voice_kill_pad_xf(pad);
       undo_unpack(udo_st_meta, pad);
       s_len[pad] = udo_s2_aud[0]; s_sr[pad] = udo_s2_aud[1]; p_layer_cnt[pad] = udo_s2_aud[2];
       l = 0; loop(MAX_LAYERS,
@@ -615,7 +697,7 @@ function undo_restore_struct() local(pad, l, _li, _vi) (
       udo_s2_extent > 0 ? memcpy(s_audio_start + pad * SLOT_SIZE, udo_s2_audio, udo_s2_extent);
       _udo_cap_lazy = 0;   // entry consumed: stop throttling any writer still in flight
       sp_src_gen[pad] += 1;       // invalidate Extension cache / Tuned-Stretch re-bake
-      recalc_pad(pad); recalc_fx(pad);
+      swing_rcp_post_pad(pad); swing_rcp_post_fx(pad);   // @block performs (A-9a)
       s_dirty[pad] = 1; col_dirty = 1;
       _udo_name_req = 1; _udo_name_pad = pad;  // names restored in @gfx (get_*_slot is core-only)
       _udo_st_valid = 0; _udo_rc = 0;
@@ -659,7 +741,7 @@ function undo_do() local(ei, pad) (
     // restore the undo entry into the live pad
     undo_unpack(udo_ust + ei * UDO_STRIDE, pad);
     _udo_uc = ei;
-    recalc_pad(pad); recalc_fx(pad);
+    swing_rcp_post_pad(pad); swing_rcp_post_fx(pad);   // @block performs (A-9a)
     s_dirty[pad] = 1; col_dirty = 1;
     gmem[GS_PROJ_DIRTY] = 1;  // Phase 1B: project-dirty (no REAPER undo point)
     _udo_applying = 0;
@@ -685,7 +767,7 @@ function redo_do() local(ei, pad) (
     _udo_uc += 1;
     undo_unpack(udo_urd + ei * UDO_STRIDE, pad);
     _udo_rc = ei;
-    recalc_pad(pad); recalc_fx(pad);
+    swing_rcp_post_pad(pad); swing_rcp_post_fx(pad);   // @block performs (A-9a)
     s_dirty[pad] = 1; col_dirty = 1;
     gmem[GS_PROJ_DIRTY] = 1;  // Phase 1B: project-dirty (no REAPER undo point)
     _udo_applying = 0;
@@ -698,6 +780,10 @@ function swap_pads(a, b)
 (
   a == b ? 0 : (
     udo_struct_begin_swap(a, b);  // Phase 2: self-inverse swap entry (1-level structural undo)
+    // A sounding voice would otherwise finish in the OTHER pad's audio once the
+    // slots move under it (A-4): end both pads' voices and fade the output first.
+    swing_voice_kill_pad_xf(a);
+    swing_voice_kill_pad_xf(b);
     // Helper macro-style: swap scalar array values
     // ── Sample metadata ──
     tmp = s_len[a]; s_len[a] = s_len[b]; s_len[b] = tmp;
@@ -816,9 +902,9 @@ function swap_pads(a, b)
 
     // NOTE: pad name strings must be swapped by caller (get_cname_slot defined in main file)
 
-    // Recalculate derived values
-    recalc_pad(a); recalc_pad(b);
-    recalc_fx(a); recalc_fx(b);
+    // Recalculate derived values -- requested, @block performs (A-9a)
+    swing_rcp_post_pad(a); swing_rcp_post_pad(b);
+    swing_rcp_post_fx(a); swing_rcp_post_fx(b);
     undo_cap_end();
   );
 );

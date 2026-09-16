@@ -3,7 +3,7 @@
 desc: Swing
 tags: instrument, sampler, drums
 author: EON Studios
-version: 3.0.10
+version: 3.0.12
 
 slider1:root_note=36<0,127,1>-Base Note
 slider2:master_db=0<-48,12,0.1>-Master Volume (dB)
@@ -306,6 +306,7 @@ diag_blocks = 0; diag_stall_n = 0; diag_pause_n = 0; diag_gap_max = 0;
 diag_cost_last = 0; diag_cost_max = 0; diag_cost_ema = 0; diag_ratio_max = 0;
 diag_overrun_n = 0; diag_reset_seen = 0;
 diag_ts = 0; diag_bema = 0; diag_sema = 0;   // first-@sample stamp; @block / @sample split EMAs
+diag_p87_t0 = 0; diag_p87_last = 0;          // +15: the CMD-87 path publish's own wall time
 
 // LCD banner state (rk_swing_ui_state, 2026-09-08): bridge heartbeat AGE tracking
 // (-1 = no value seen yet, so the first frame counts as movement and never
@@ -320,6 +321,8 @@ _oldbr_dismissed = 0;  // "Kit Bridge is out of date" banner, session-volatile l
 // ─── Constants ────────────────────────────────────────────────────────────
 NUM_PADS    = 16;
 MAX_VOICES  = 16;
+STEAL_FADES = 4;        // steal-fade slots past the pool: a stolen voice fades out in one of them (A-2)
+V_SLOTS     = MAX_VOICES + STEAL_FADES;   // every v_* array, and every kill / release loop, runs to here
 SLOT_SIZE   = 4000000;
 SWAP_CHUNK  = 16384;    // pad-swap scratch (cells): swap_pads() moves audio through ONE chunk, never a whole slot
 // Sliced sample loader (rk_swing_core swing_ldr_*): cells of load work per
@@ -449,6 +452,9 @@ sp_pitch_trigger_cnt = freemem; freemem += NUM_PADS;
 // at startup, perfectly aligned with the Extension's also-zero write_pos).
 stretch_read_pos     = freemem; freemem += NUM_PADS;
 stretch_hold         = freemem; freemem += NUM_PADS;  // sub-block start offset, in samples
+stretch_choked       = freemem; freemem += NUM_PADS;  // A-7: 0 sounding, 1 choked and fading, 2 parked (ring discarded)
+stretch_gain         = freemem; freemem += NUM_PADS;  // A-7: the drain's gain, 1 until choked
+i = 0; loop(NUM_PADS, stretch_gain[i] = 1; i += 1;);
 
 p_att_c     = freemem; freemem += NUM_PADS;  // precomputed coefficients
 p_dec_c     = freemem; freemem += NUM_PADS;
@@ -490,19 +496,19 @@ _blk_trig   = freemem; freemem += NUM_PADS;  // per-pad dedup: already triggered
 _blk_off    = freemem; freemem += NUM_PADS;  // note-off received this @block
 _blk_last_off = freemem; freemem += NUM_PADS;  // 1 if the pad's LAST midi event this @block was a note-off (order, not just presence)
 _retrig_cd  = freemem; freemem += NUM_PADS;  // per-pad retrigger cooldown (samples remaining)
-v_pos       = freemem; freemem += MAX_VOICES + 1;
-v_slot      = freemem; freemem += MAX_VOICES + 1;
-v_gain      = freemem; freemem += MAX_VOICES + 1;
-v_note      = freemem; freemem += MAX_VOICES + 1;
-v_inc       = freemem; freemem += MAX_VOICES + 1;
-v_age       = freemem; freemem += MAX_VOICES + 1;
-v_env       = freemem; freemem += MAX_VOICES + 1;
-v_stage     = freemem; freemem += MAX_VOICES + 1;  // 1=atk 2=dec 3=sus 4=rel
-v_startpos  = freemem; freemem += MAX_VOICES + 1;  // saved start pos for loose sum timing
-v_decay_ct  = freemem; freemem += MAX_VOICES + 1;
-v_sg        = freemem; freemem += MAX_VOICES + 1;  // sample gain (norm or pad gain)
-v_layer     = freemem; freemem += MAX_VOICES + 1;  // which layer the voice is playing
-v_quiet     = freemem; freemem += MAX_VOICES + 1;  // SYN: consecutive samples
+v_pos       = freemem; freemem += V_SLOTS;
+v_slot      = freemem; freemem += V_SLOTS;
+v_gain      = freemem; freemem += V_SLOTS;
+v_note      = freemem; freemem += V_SLOTS;
+v_inc       = freemem; freemem += V_SLOTS;
+v_age       = freemem; freemem += V_SLOTS;
+v_env       = freemem; freemem += V_SLOTS;
+v_stage     = freemem; freemem += V_SLOTS;  // 1=atk 2=dec 3=sus 4=rel
+v_startpos  = freemem; freemem += V_SLOTS;  // saved start pos for loose sum timing
+v_decay_ct  = freemem; freemem += V_SLOTS;
+v_sg        = freemem; freemem += V_SLOTS;  // sample gain (norm or pad gain)
+v_layer     = freemem; freemem += V_SLOTS;  // which layer the voice is playing
+v_quiet     = freemem; freemem += V_SLOTS;  // SYN: consecutive samples
                                                    // the engine has been silent
 
 // ─── SYN slot: per-pad synth layer (Spec_Swing_Synth_Layer §2) ────────────
@@ -528,8 +534,8 @@ ps_mac4 = freemem; freemem += NUM_PADS;
 ps_mac5 = freemem; freemem += NUM_PADS;
 ps_mac6 = freemem; freemem += NUM_PADS;
 ps_mac7 = freemem; freemem += NUM_PADS;
-v_kind      = freemem; freemem += MAX_VOICES + 1;                       // 0=sample, 1=synth
-v_syn_state = freemem; freemem += (MAX_VOICES + 1) * RK_SYN_STATE_SIZE; // per-voice engine state
+v_kind      = freemem; freemem += V_SLOTS;                       // 0=sample, 1=synth
+v_syn_state = freemem; freemem += V_SLOTS * RK_SYN_STATE_SIZE; // per-voice engine state
 _syn_mac_scratch = freemem; freemem += RK_SYN_MACROS;                   // trigger-time gather
 freemem = rk_syn_init(freemem);                                         // engine LUTs (once)
 freemem = swing_drum3d_init(freemem);                                   // SYN panel 3D meshes
@@ -614,6 +620,30 @@ kmac_force  = 0;
 // not a "defer recalc" flag on swing_fx_set, which @gfx also calls: a shared
 // flag would let a UI edit landing mid-pass have its recalc swallowed.
 kmac_rcp = freemem; freemem += NUM_PADS;
+// The UI thread's own recalc requests (A-9a): per-pad request counters written
+// only by @gfx (swing_rcp_post_* in rk_drumkit_dsp) and done counters written
+// only by @block (swing_block_rcp_settle in rk_swing_block); a difference is a
+// pending recalc. The two scalars cover the master comp and the master chain.
+_rcp_req_fx   = freemem; freemem += NUM_PADS;
+_rcp_req_pad  = freemem; freemem += NUM_PADS;
+_rcp_done_fx  = freemem; freemem += NUM_PADS;
+_rcp_done_pad = freemem; freemem += NUM_PADS;
+memset(_rcp_req_fx, 0, NUM_PADS); memset(_rcp_req_pad, 0, NUM_PADS);
+memset(_rcp_done_fx, 0, NUM_PADS); memset(_rcp_done_pad, 0, NUM_PADS);
+_rcp_req_cmp = 0; _rcp_done_cmp = 0; _rcp_req_master = 0; _rcp_done_master = 0;
+// Pad clicks and gate-mode releases from the UI thread (A-9b): two single-writer
+// rings. The UI appends (swing_gt_post / swing_gt_post_release in rk_drumkit_dsp,
+// the write index bumped LAST) and @block consumes (swing_block_gt_consume beside
+// the bridge's trigger, swing_block_gt_release at the block's end). Both indexes
+// only grow; wr - rd is the pending count, and a full ring drops the click rather
+// than overwrite one in flight.
+GT_RING = 16;
+_gt_pad   = freemem; freemem += GT_RING;
+_gt_note  = freemem; freemem += GT_RING;
+_gt_vel   = freemem; freemem += GT_RING;
+_gt_flash = freemem; freemem += GT_RING;
+_gtr_pad  = freemem; freemem += GT_RING;
+_gt_wr = 0; _gt_rd = 0; _gtr_wr = 0; _gtr_rd = 0;
 // (Slice-1 test mapping is seeded further down in @init, AFTER the
 // FX_PID_* constants are assigned — they are 0 at this point in the run.)
 
@@ -807,6 +837,10 @@ km_master_vol = freemem; freemem += KS;
 KM_CON_PER_PAD = 11;
 km_console  = freemem; freemem += NUM_PADS * KM_CON_PER_PAD * KS;
 km_comp     = freemem; freemem += 12 * KS;   // master COMP card: 6 knobs x 2 surfaces (big view, LCD)
+// Master EQ page curve cache (Phase 4, D O-2): 80 sweep magnitudes, 3 node magnitudes,
+// 3 node log-frequencies; keyed on the eleven values in swing_panels_draw_eq. @gfx only.
+meq_cv      = freemem; freemem += 88;
+meq_cv_valid = 0;
 
 // ─── Send bus accumulators (cleared each sample) ────────────────────────
 snd_dly_accL = freemem; freemem += 1;
@@ -1315,6 +1349,8 @@ _udo_st_valid = 0;       // 1 = a structural undo entry exists
 udo_s2_type = 0;         // 1 = per-pad, 2 = swap, 3 = kit (deferred)
 udo_s2_pad  = -1; udo_s2_pad2 = -1;
 _udo_swap_req = 0;       // deferred swap-undo request (processed in @gfx)
+_udo_nl_t = 0;           // wheel / right-button undo bracket: time of the last notch, 0 = none open (D-9)
+_udo_rebase_req = 0;     // a finished load asks the @gfx head to re-base the undo snapshot (D-8; set from @block)
 _udo_name_req = 0; _udo_name_pad = -1;  // deferred per-pad name-restore (processed in @gfx)
 
 // ─── Kit-level undo (disk-based) ────────────────────────────────────────────
@@ -1356,17 +1392,16 @@ _coll_hb_prev = freemem; freemem += 16;
 s_audio_start = freemem;
 // freemem += NUM_PADS * SLOT_SIZE;  -- do not advance; REAPER manages rest
 
-// ⚠️⚠️ HEADROOM GUARD. Everything allocated ABOVE this line shares one budget:
-// maxmem is 72,000,000 and the audio region below needs NUM_PADS * SLOT_SIZE
-// (64M) plus SLOT_SIZE for the undo slot (4M), so s_audio_start has to stay
-// under 4,000,000. Nothing enforced that -- _udo_ready checked only the undo
-// slot -- so any new allocation up here can push the last pads' audio past
-// 72M, where the maxmem note says writes land in a phantom page: same-frame
-// readbacks succeed and NOTHING PERSISTS. That does not crash and does not
-// warn. It presents as "kits stopped loading".
-_mem_need = s_audio_start + NUM_PADS * SLOT_SIZE + SLOT_SIZE;
-_mem_head = __memtop() - _mem_need;
-_mem_fits = _mem_head >= 0 ? 1 : 0;
+// ⚠️⚠️ HEADROOM BUDGET. Everything allocated ABOVE this line shares one budget
+// with everything the plugin addresses past it. maxmem is 72,000,000, and on
+// top of s_audio_start come, in order: the pad audio (NUM_PADS * SLOT_SIZE =
+// 64M), the send FX (delay, reverb, comp, Anvil tables), the swap chunk and the
+// undo slot (SLOT_SIZE = 4M). Any new allocation up here pushes all of that
+// higher, and past 72M the maxmem note says writes land in a phantom page:
+// same-frame readbacks succeed and NOTHING PERSISTS. That does not crash and
+// does not warn. It presents as "kits stopped loading". _mem_head/_mem_fits
+// (the FX view's headroom readout) are measured where the last of it is
+// allocated -- right after the undo slot, beside _udo_ready.
 
 // ─── Init per-pad defaults ────────────────────────────────────────────────
 i = 0; loop(NUM_PADS,
@@ -1484,7 +1519,7 @@ i = 0; loop(NUM_PADS,
   i += 1;
 );
 
-i = 0; loop(MAX_VOICES + 1, v_pos[i] = -1; v_slot[i] = 0; v_stage[i] = 0; v_layer[i] = 0; v_kind[i] = 0; v_quiet[i] = 0; i += 1;);
+i = 0; loop(V_SLOTS, v_pos[i] = -1; v_slot[i] = 0; v_stage[i] = 0; v_layer[i] = 0; v_kind[i] = 0; v_quiet[i] = 0; i += 1;);
 memset(pad_flash, 0, NUM_PADS);
 memset(p_peak, 0, NUM_PADS);
 memset(p_peak_hold, 0, NUM_PADS);
@@ -1517,6 +1552,17 @@ last_srate = srate;
 _prev_play_state = 0;  // transport state tracker for retrigger reset
 _transport_grace = 0;  // note-off suppression counter after transport start
 _xf_active = 0;           // anti-pop crossfade: not active until deserialize
+
+// ─── Master idle gate (Phase 4, A O-1, 2026-09-15; the gate is decided at the end
+//     of @block, the skip is in @sample) ────────────────────────────────────────
+_mst_idle = 0;        // 1 = @sample skips the master section (re-checked per sample with voices_alive)
+_mst_quiet_n = 0;     // samples since anything last reached the bus (capped at 4 s)
+_any_stretch = 0;     // per block: some pad is in Stretch mode (gates the ring drain)
+_mst_live = 0; _mst_idle_want = 0; _mst_pi = 0;
+_dly_inL = 0; _dly_inR = 0; _rvb_inL = 0; _rvb_inR = 0;
+// IDENT name publish (Phase 4, A O-3): the band is compared against the strings only on
+// heal blocks (every 64th, and on a slot change); otherwise one strcmp per pad
+_id_pub_slot = -1; _id_heal = 0; _id_sh = 0;
 _xf_pos = 0;
 _xf_len = 1;
 memset(_xf_prev, 0, 38);  // no previous output at init (38 = 16 buses + verb/delay/smash returns)
@@ -1669,6 +1715,108 @@ active_id    = -1;
 prev_LMB     = 0;
 prev_RMB     = 0;
 last_mouse_cap = 0;
+// ── Per-surface press latches (D-3, Audit D 2026-09-14) ─────────────────────
+// One prev_LMB used to serve every @gfx surface. REAPER 7.79 runs at most one
+// window-or-embed surface of an instance at a time (EON_Probe_Surface S1-S6),
+// with one exception: an instance embedded in BOTH the TCP and the MCP with its
+// window closed, whose two embeds alternate pass for pass (S5: 88 passes and 88
+// canvas-width flips in 2 s). REAPER hands an unhovered embed a mouse_cap of 0
+// (EON_Weld's measurement), so while a pad was held in one embed the other's
+// pass wrote prev_LMB = 0, and every following pass of the held embed saw a
+// fresh press edge: the pad retriggered at the pass rate (~21/s), the embed VOL
+// knob's drag ended and re-anchored every pass, and each phantom edge pushed an
+// undo entry.
+// So the latch is PER SURFACE -- EON_Weld's idiom (ebc_plmb_e / ebc_plmb_w),
+// extended to two embeds. Slot 0 is the window and the idle context: they never
+// run together, and the idle canvas IS the window's. Slots 1 and 2 are the two
+// embeds, told apart by canvas signature (gfx_w, gfx_h: 277 and 82 px wide in
+// the rig); a signature nobody holds takes the slot the last embed pass did not
+// use, so two alternating embeds settle into one slot each and a resized single
+// embed simply re-keys.
+// swing_srf_load (the @gfx head) puts this pass's latch into prev_LMB/prev_RMB,
+// so the release and commit code keep reading prev_LMB unchanged;
+// swing_srf_store (the frame tail) writes mouse_cap back into the same latch.
+// A press belongs to the surface that saw its edge, until that surface sees the
+// release. While the OTHER embed holds one, this embed's pass (no button, the
+// pointer over the other panel) presents the press as still held at the owner's
+// pointer and with the owner's modifiers, and no edge: the held pad is neither
+// released nor re-launched, and a knob drag keeps its anchor instead of ending
+// on every other pass (ssl_knob_interact ends a drag on any pass with LMB 0).
+// The modifiers matter as much as the button: the same knob reads CTRL as its
+// fine mode, so a Ctrl fine-drag handed a bare mouse_cap 0 computed every other
+// pass at ten times the step (second audit, 2026-09-15). Bounded: the owner
+// must have run within the last half second, or its press is over and its latch
+// is dropped -- a hold can never outlive its surface.
+// A window or idle pass is never frozen. It re-reads the physical button, and
+// it first adopts every embed latch, so a press that began in an embed ends
+// there as a release edge (undo commit, held-pad release), never as a new
+// press. An embed pass drops the window latch the same way: an embed only runs
+// while no window of the instance shows, so a press the window held is over.
+_srf = 0; _srf_last_emb = 0; _srf_foreign = 0; _srf_cap = 0;
+_srf_sig1 = 0; _srf_sig2 = 0; _srf_cap1 = 0; _srf_cap2 = 0;
+_srf_plmb0 = 0; _srf_prmb0 = 0;
+_srf_plmb1 = 0; _srf_prmb1 = 0; _srf_mx1 = 0; _srf_my1 = 0; _srf_t1 = 0;
+_srf_plmb2 = 0; _srf_prmb2 = 0; _srf_mx2 = 0; _srf_my2 = 0; _srf_t2 = 0;
+
+function swing_srf_load()
+  local(_sg, _oth_plmb, _oth_prmb, _oth_mx, _oth_my, _oth_t, _oth_cap)
+(
+  // This pass's effective mouse_cap for the modifiers (the head reads CTRL,
+  // SHIFT and ALT from it): the real one, unless a foreign press is handed over.
+  _srf_cap = mouse_cap;
+  is_embedded ? (
+    _sg = gfx_w * 65536 + gfx_h;
+    _srf = _sg == _srf_sig1 ? 1 : _sg == _srf_sig2 ? 2 : 0;
+    _srf == 0 ? (
+      _srf = _srf_last_emb == 1 ? 2 : 1;
+      _srf == 1 ? ( _srf_sig1 = _sg; _srf_plmb1 = 0; _srf_prmb1 = 0; _srf_t1 = 0; _srf_cap1 = 0; )
+                : ( _srf_sig2 = _sg; _srf_plmb2 = 0; _srf_prmb2 = 0; _srf_t2 = 0; _srf_cap2 = 0; );
+    );
+    _srf_last_emb = _srf;
+    _srf_plmb0 = 0; _srf_prmb0 = 0;
+    _srf == 1 ? (
+      prev_LMB = _srf_plmb1; prev_RMB = _srf_prmb1;
+      _oth_plmb = _srf_plmb2; _oth_prmb = _srf_prmb2;
+      _oth_mx = _srf_mx2; _oth_my = _srf_my2; _oth_t = _srf_t2; _oth_cap = _srf_cap2;
+    ) : (
+      prev_LMB = _srf_plmb2; prev_RMB = _srf_prmb2;
+      _oth_plmb = _srf_plmb1; _oth_prmb = _srf_prmb1;
+      _oth_mx = _srf_mx1; _oth_my = _srf_my1; _oth_t = _srf_t1; _oth_cap = _srf_cap1;
+    );
+    (_oth_plmb || _oth_prmb) && time_precise() - _oth_t > 0.5 ? (
+      // The owner has not run for half a second: its press is over.
+      _srf == 1 ? ( _srf_plmb2 = 0; _srf_prmb2 = 0; ) : ( _srf_plmb1 = 0; _srf_prmb1 = 0; );
+      _oth_plmb = 0; _oth_prmb = 0;
+    );
+    _srf_foreign = (_oth_plmb || _oth_prmb) && !(mouse_cap & 3);
+    _srf_foreign ? (
+      LMB = _oth_plmb; RMB = _oth_prmb;
+      prev_LMB = _oth_plmb; prev_RMB = _oth_prmb;   // held, and no edge either way
+      mx = _oth_mx; my = _oth_my;
+      _srf_cap = _oth_cap;                          // ...with its modifiers
+    );
+  ) : (
+    _srf = 0; _srf_foreign = 0;
+    prev_LMB = _srf_plmb0 || _srf_plmb1 || _srf_plmb2;
+    prev_RMB = _srf_prmb0 || _srf_prmb1 || _srf_prmb2;
+    _srf_plmb1 = 0; _srf_prmb1 = 0; _srf_plmb2 = 0; _srf_prmb2 = 0;
+  );
+);
+
+function swing_srf_store()
+(
+  _srf == 1 ? (
+    _srf_plmb1 = mouse_cap & 1; _srf_prmb1 = mouse_cap & 2;
+    _srf_foreign ? 0 : ( _srf_mx1 = mouse_x; _srf_my1 = mouse_y; _srf_t1 = time_precise(); _srf_cap1 = mouse_cap; );
+  ) : _srf == 2 ? (
+    _srf_plmb2 = mouse_cap & 1; _srf_prmb2 = mouse_cap & 2;
+    _srf_foreign ? 0 : ( _srf_mx2 = mouse_x; _srf_my2 = mouse_y; _srf_t2 = time_precise(); _srf_cap2 = mouse_cap; );
+  ) : (
+    _srf_plmb0 = mouse_cap & 1; _srf_prmb0 = mouse_cap & 2;
+  );
+  prev_LMB = mouse_cap & 1;
+  prev_RMB = mouse_cap & 2;
+);
 gfx_frame_count = 0;
 frame_last_timer = 0;
 any_solo     = 0;
@@ -1881,7 +2029,9 @@ GS_REB_SLOT_BASE   = 26342000;  // ..26342127
 // +6 cost_last s, +7 cost_max s, +8 cost_ema s (alpha 1/32), +9 ratio_max
 // (cost / block period), +10 reset_echo, +11 overrun_n (cost > period),
 // +12 blocks counted, +13 @block-pass EMA s, +14 sample-loop EMA s (split at a
-// first-@sample stamp). Cost = t(last @sample of the block) - t(@block entry)
+// first-@sample stamp), +15 the last CMD-87 path publish's own wall time s (0 =
+// none since reset; .dev_tests/EON_Live_P87Cost.lua reads it).
+// Cost = t(last @sample of the block) - t(@block entry)
 // = THIS FX's wall time per block. Gaps are a stall PROXY only: anticipative
 // FX processing delivers @block in bursts. Cost is the loader metric.
 EON_DIAG_BASE        = 26342400;  // header ..26342415
@@ -2535,11 +2685,16 @@ function swing_fx_setv(_fa_pad, _fa_pid, _fa_val) (
   _fa_pid == FX_PID_EQ_MID_Q     ? ( fx_eq_mid_q[_fa_pad]     = _fa_val; 1; ) :
   _fa_pid == FX_PID_EQ_MID2_Q    ? ( fx_eq_mid2_q[_fa_pad]    = _fa_val; 1; ) :
   _fa_pid == FX_PID_EQ_LO_Q      ? ( fx_eq_lo_q[_fa_pad]      = _fa_val; 1; ) :
-  _fa_pid == FX_PID_EQ_HI_Q      ? ( fx_eq_hi_q[_fa_pad]      = _fa_val; 1; );
-  0;   // nothing matched: no value changed, so no recalc is owed either.
-       // (The old code ran one regardless.) Each arm reports for ITSELF --
-       // a contiguous-pid-range test would silently drop a recalc the day
-       // someone inserts a pid out of order.
+  _fa_pid == FX_PID_EQ_HI_Q      ? ( fx_eq_hi_q[_fa_pad]      = _fa_val; 1; )
+  : 0;   // nothing matched: no value changed, so no recalc is owed either.
+         // ⚠ This `: 0` is the chain's ELSE arm, which makes the chain the
+         // function's value. Until 2026-09-14 it was a separate `0;` statement
+         // AFTER the chain's `;`, so the function returned 0 for EVERY pid and
+         // swing_fx_set never recalculated: kit macros, the Pad FX window and
+         // the strip mailbox changed the stored value but not the sound (audit
+         // A-1, shipped in 3.0.10; rig EON_Probe_FxSetv). Each arm reports for
+         // ITSELF -- a contiguous-pid-range test would silently drop a recalc
+         // the day someone inserts a pid out of order.
 );
 
 // Value + coefficients, the shape every existing caller expects.
@@ -2881,7 +3036,8 @@ cmp_recalc();
 // glides the INPUT to zero and lets the tail ring out, then stands the
 // engine down once the wet has been under BUS_TAIL_FLOOR for _bus_tail_hold
 // consecutive samples. Pulling the send is what "off" should sound like.
-// srate-fixed, like dly_sm_c above: ext_noinit = 1.0 makes @init one-shot.
+// srate-derived, like dly_sm_c: ext_noinit = 1.0 makes @init one-shot, so
+// swing_block_handle_srate_change re-derives both after a rate change (A-6).
 _bus_gate_c    = exp(-1 / (0.008 * srate));  // 8 ms TIME CONSTANT (~55 ms to
                                              // -60 dB) on the input mute
 _bus_tail_hold = (0.5 * srate) | 0;          // 500 ms of proven silence
@@ -2910,6 +3066,12 @@ _send_fx_mem += SWAP_CHUNK;
 udo_s2_audio = _send_fx_mem;
 _send_fx_mem += SLOT_SIZE;
 _udo_ready = (udo_s2_audio + SLOT_SIZE <= __memtop()) ? 1 : 0;
+// Headroom = what is left above the TOP of everything (see the budget note at
+// s_audio_start). It used to be taken there as pads + undo slot only, which
+// skipped the send FX and the swap chunk between them, so the readout showed
+// more room than there was (2026-09-13 audit). Same test as _udo_ready, as a count.
+_mem_head = __memtop() - _send_fx_mem;
+_mem_fits = _mem_head >= 0 ? 1 : 0;
 
 // ─── Pad colors: HSL hue system ──────────────────────────────────────────
 // p_color[i] = hue (0.0–1.0), rendered with fixed S=0.75, L=0.55
@@ -3080,6 +3242,10 @@ ldr_budget = min(LDR_BUDGET_MAX, max(LDR_BUDGET_MIN, samplesblock * LDR_CELLS_PE
 // device buffer change is followed immediately.
 _udo_cow_budget = min(UDO_COW_MAX, max(UDO_COW_MIN, samplesblock * UDO_COW_PER_SPL));
 
+// The UI thread's recalc requests, performed here before anything launches or
+// publishes this block (A-9a; the request counters are described at kmac_rcp).
+swing_block_rcp_settle();
+
 // ─── Master comp voice ─────────────────────────────────────────────────────
 // A change between ENGINES starts the incoming one clean (Weld's bypass path
 // proved the pattern: a stale capacitor charge is a thump). Black <-> Blue is
@@ -3093,6 +3259,14 @@ cmp_voice != _cmp_voice_seen ? (
   swing_comp_anvil_push();
 );
 cmp_voice > 0 ? anv_engine_block();   // srate follow, pot inertia, recalc requests
+
+// The registry latch is re-validated BEFORE the slot-keyed publishers below (the
+// master link, the stretch control, the patch ring, the strip band): an instance
+// waking from a background project tab otherwise wrote one block into the new
+// owner's bands and consumed the new owner's Drum Strip edit (C-3, audit C
+// 2026-09-14). swing_registry_claim() further down still runs it first and
+// re-acquires a slot the way it did.
+swing_registry_check_owner();
 
 // ── Master link: publish the output stage for EON Output (Multi-Out) ──
 // Every block, five cells, heartbeat last. Standalone-cheap; Output reads it
@@ -3311,7 +3485,7 @@ _prev_play_state != play_state && (play_state & 1) && !(_prev_play_state & 1) ? 
 _prev_play_state != play_state && !(play_state & 1) && (_prev_play_state & 1) ? (
   memset(p_held, 0, NUM_PADS);
   rpt_counter = 0;
-  i = 0; loop(MAX_VOICES + 1,
+  i = 0; loop(V_SLOTS,
     v_stage[i] > 0 && v_stage[i] < 4 ? v_stage[i] = 4;
     i += 1;
   );
@@ -3436,7 +3610,7 @@ while(midirecv(offset, msg1, msg2, msg3)) (
     //       from killing a voice just launched in the same block
     //   (b) transport just started (_transport_grace) — REAPER may send chase
     //       note-offs in the first 1-2 blocks after play starts
-    i = 0; loop(MAX_VOICES + 1,
+    i = 0; loop(V_SLOTS,
       v_note[i] == msg2 && v_stage[i] < 4 ? (
         _eos = p_oneshot[v_slot[i]];
         (_eos == 0 || (_eos < 0 && !oneshot_global)) && !_blk_trig[v_slot[i]] && _transport_grace == 0 ? (
@@ -3647,6 +3821,10 @@ _is_browser_target() ? (
   );
 );
 
+// Pad clicks from the UI thread, launched here beside the bridge's trigger (A-9b;
+// the rings are described at GT_RING in @init).
+swing_block_gt_consume();
+
 // ─── Deferred release: same-block note-on + note-off ────────────────────
 // If a pad got both note-on and note-off in the same block, the note-off
 // was blocked by _blk_trig (chase note-off guard). Apply it now — but ONLY
@@ -3663,7 +3841,7 @@ i = 0; loop(NUM_PADS,
     // In gate mode, release voices for this pad
     _eos = p_oneshot[i];
     (_eos == 0 || (_eos < 0 && !oneshot_global)) ? (
-      j = 0; loop(MAX_VOICES + 1,
+      j = 0; loop(V_SLOTS,
         v_slot[j] == i && v_stage[j] > 0 && v_stage[j] < 4 ? v_stage[j] = 4;
         j += 1;
       );
@@ -3768,8 +3946,10 @@ gmem[KIT_GMEM_CMD] == 69 && !kit_busy && !_bl_inflight && _bridge_state != 2 ? (
 
 // Face -> engine transport. @gfx must not own the read position, so it asks
 // here and @block sets the state that @sample reads.
-fb_prv_cmd == 1 ? ( _prv_len > 0 ? ( _prv_pos = 0; _prv_on = 1; ); fb_prv_cmd = 0; ) :
-fb_prv_cmd == 2 ? ( _prv_on = 0; fb_prv_cmd = 0; );
+// STOP latches _prv_stopped so a stream still landing cannot restart the audition;
+// PLAY and every new preview clear it (D-7).
+fb_prv_cmd == 1 ? ( _prv_stopped = 0; _prv_len > 0 ? ( _prv_pos = 0; _prv_on = 1; ); fb_prv_cmd = 0; ) :
+fb_prv_cmd == 2 ? ( _prv_on = 0; _prv_stopped = 1; fb_prv_cmd = 0; );
 gmem[KIT_GMEM_CMD] == 65 && _reg_my_slot == gmem[GS_PENDING_PITCH_INST] && !kit_busy && !_bl_inflight ? swing_pad_audio_swap();  // !kit_busy: defer Tuned bake while a kit-import restore is populating pad buffers (blank-pads race)
 gmem[KIT_GMEM_CMD] == 66 && _reg_my_slot == gmem[GS_PENDING_PITCH_INST] && !kit_busy && !_bl_inflight ? swing_pad_audio_export();  // !kit_busy (Phase 3): 66 writes KIT_GMEM_AUDIO offset 0, where VER-201 stages pad 0 path string
 gmem[KIT_GMEM_CMD] == 67 && _reg_my_slot == gmem[GS_PENDING_PITCH_INST] && !kit_busy && !_bl_inflight ? swing_pad_layer_audio_swap();  // !kit_busy (Phase 3): same shared-band defer as CMD 65
@@ -4062,6 +4242,11 @@ _reg_my_slot >= 0 ? (
   _id_ib = INST_IDENT_BASE   + _reg_my_slot * INST_IDENT_INST_STRIDE;
   _id_nb = INST_PADNAME_BASE + _reg_my_slot * INST_PADNAME_INST_STRIDE;
   _id_mb = INST_PADMIX_BASE  + _reg_my_slot * INST_PADMIX_INST_STRIDE;
+  // Heal block (A O-3): the band itself is compared, as it was every block until Phase 4,
+  // so a foreign write to the band (or a fresh slot's stale cells) is put right within a
+  // second; every other block trusts the per-pad shadow of what was last published.
+  _id_heal = _id_pub_slot != _reg_my_slot || (_bl_blkctr & 63) == 0;
+  _id_pub_slot = _reg_my_slot;
   _reg_pi = 0;
   loop(NUM_PADS,
     _id_pb = _id_ib + _reg_pi * INST_IDENT_PAD_FIELDS;
@@ -4093,18 +4278,23 @@ _reg_my_slot >= 0 ? (
     );
     _id_nbp = _id_nb + _reg_pi * INST_PADNAME_PAD_LEN;
     _id_cn  = get_cname_slot(_reg_pi);
-    _id_cl  = strlen(_id_cn);
-    _id_changed = 0; _id_cj = 0;
-    loop(INST_PADNAME_PAD_LEN,
-      (gmem[_id_nbp + _id_cj] != (_id_cj < _id_cl ? str_getchar(_id_cn, _id_cj) : 0)) ? _id_changed = 1;
-      _id_cj += 1;
+    _id_sh  = get_idname_slot(_reg_pi);
+    // One strcmp against the shadow (Phase 4, A O-3) in place of 32 gmem reads per pad
+    _id_changed = strcmp(_id_cn, _id_sh) != 0;
+    _id_heal && !_id_changed ? (
+      _id_cl = strlen(_id_cn); _id_cj = 0;
+      loop(INST_PADNAME_PAD_LEN,
+        (gmem[_id_nbp + _id_cj] != (_id_cj < _id_cl ? str_getchar(_id_cn, _id_cj) : 0)) ? _id_changed = 1;
+        _id_cj += 1;
+      );
     );
     _id_changed ? (
-      _id_cj = 0;
+      _id_cl = strlen(_id_cn); _id_cj = 0;
       loop(INST_PADNAME_PAD_LEN,
         gmem[_id_nbp + _id_cj] = _id_cj < _id_cl ? str_getchar(_id_cn, _id_cj) : 0;
         _id_cj += 1;
       );
+      strcpy(_id_sh, _id_cn);
       gmem[_id_pb + IDENT_OFF_VER] = gmem[_id_pb + IDENT_OFF_VER] + 1;
     );
     _reg_pi += 1;
@@ -4429,6 +4619,7 @@ gmem[KIT_GMEM_CMD] == 86 && !kit_busy &&
 //    explicit bridge request (rebase audit / health refresh / relink).
 gmem[KIT_GMEM_CMD] == 87 && !kit_busy &&
   gmem[GS_PENDING_LOAD_INST] == instance_id ? (
+  diag_armed ? diag_p87_t0 = time_precise();   // EON_DIAG +15 (armed only)
   _pr87_cnt = 0; _pr87_skip = 0;
   _pr87_ki = 0;
   loop(NUM_PADS,
@@ -4475,6 +4666,7 @@ gmem[KIT_GMEM_CMD] == 87 && !kit_busy &&
   gmem[GS_REB_PUB_ACK] = gmem[GS_REB_PUB_REQ];  // echo the request nonce (producer presets ACK=0)
   gmem[GS_PENDING_LOAD_INST] = 0;
   gmem[KIT_GMEM_CMD] = 0;              // ack LAST
+  diag_armed ? diag_p87_last = time_precise() - diag_p87_t0;
 );
 
 // ── P4 step 3: CMD-88 adopt + reload-blank (auto-rebase / relink repair).
@@ -4631,7 +4823,7 @@ diag_armed ? (
     diag_reset_seen = gmem[EON_DIAG_BASE + 1];
     diag_blocks = 0; diag_stall_n = 0; diag_pause_n = 0; diag_gap_max = 0;
     diag_cost_last = 0; diag_cost_max = 0; diag_cost_ema = 0; diag_ratio_max = 0;
-    diag_overrun_n = 0; diag_bema = 0; diag_sema = 0;
+    diag_overrun_n = 0; diag_bema = 0; diag_sema = 0; diag_p87_last = 0;
   );
   // A full previous block (armed at its entry, all its samples stamped).
   diag_t0_prev > 0 && diag_t1 > diag_t0_prev && diag_spl >= samplesblock ? (
@@ -4657,6 +4849,7 @@ diag_armed ? (
     gmem[_dg + 9]  = diag_ratio_max;  gmem[_dg + 10] = diag_reset_seen; gmem[_dg + 11] = diag_overrun_n;
     gmem[_dg + 12] = diag_blocks;
     gmem[_dg + 13] = diag_bema;       gmem[_dg + 14] = diag_sema;
+    gmem[_dg + 15] = diag_p87_last;
     gmem[_dg] = _bl_blkctr;   // SEQ, written LAST
   );
 );
@@ -4670,6 +4863,46 @@ diag_spl = 0;   // the coming block's @sample count
 //    ~1987) to avoid running it on both threads concurrently — state 3
 //    has incremental kit_copy_pad/layer/pos counters that would race.
 swing_ui_import_tick();
+
+// Gate-mode releases from the UI thread (A-9b), at the block's end: a press and
+// its release posted within one block still give the voice this block.
+swing_block_gt_release();
+
+// ── Master idle gate (Phase 4, A O-1): decided here, after every launch site of the
+//    block, read by @sample together with this sample's voices_alive. Idle means nothing
+//    can reach the bus: no voice slot in any stage, no preview, no Wired drain, no
+//    crossfade, no Stretch pad (its ring outlives the local voice), a second of proven
+//    quiet, both send engines stood down (their own counters, in @sample), the limiter
+//    and the master comp at rest. Measured before this gate: an idle instance cost
+//    ~2.8 us per sample (audit A, O-1), most of it the master SVFs, the comp and the
+//    two send engines running on silence.
+_any_stretch = 0; _mst_pi = 0;
+loop(NUM_PADS, sp_pitch_mode[_mst_pi] == SP_PITCH_MODE_STRETCH ? _any_stretch = 1; _mst_pi += 1;);
+_mst_live = _prv_on || patch_drain || _xf_active || _any_stretch;
+!_mst_live ? ( _mst_pi = 0; loop(V_SLOTS, v_stage[_mst_pi] > 0 ? _mst_live = 1; _mst_pi += 1;); );
+_mst_quiet_n = _mst_live ? 0 : min(_mst_quiet_n + samplesblock, 4 * srate);
+_mst_idle_want = !_mst_live && _mst_quiet_n >= srate
+  && _dly_tail_n >= dly_len_s + _bus_tail_hold && _rvb_tail_n >= rvb_pre_samps + _bus_tail_hold
+  && (!gfx_lim_on || gfx_lim_env >= 0.999)
+  && (cmp_bypass || (cmp_voice > 0 ? anv_gr_lin >= 0.999 : cmp_last_lin >= 0.999));
+_mst_idle_want && !_mst_idle ? (
+  // The idle edge: settle what the skipped section would have settled over the next
+  // few hundred milliseconds. The limiter's last 0.1 % of release, the master SVFs'
+  // integrators (a second of silence has decayed them past denormal), the crossfade's
+  // previous-output snapshot (nothing is sounding, so it is zero).
+  gfx_lim_env = 1.0;
+  memset(_xf_prev, 0, 38);
+  _mst_pi = 0; loop(SVF_MST_COUNT, svf_flush_state(svf_master + _mst_pi * SVF_STEREO_SIZE); _mst_pi += 1;);
+);
+!_mst_idle_want && _mst_idle ? (
+  // Wake: a coefficient glide or a bus gate that moved while idle would have completed
+  // on silence -- snap them, so the first sample after the rest is what a running
+  // section would have produced.
+  _mst_pi = 0; loop(SVF_MST_COUNT, svf_snap(svf_master + _mst_pi * SVF_STEREO_SIZE); _mst_pi += 1;);
+  _dly_gate = dly_on ? 1 : 0;
+  _rvb_gate = rvb_on ? 1 : 0;
+);
+_mst_idle = _mst_idle_want;
 
 // ─── Sample: full ADSR per-voice ──────────────────────────────────────────
 @sample
@@ -4697,7 +4930,7 @@ _xf_active ? (
 // pins when fx_returns is on. (Said 36 from before Smash had a return of its
 // own; the loop below has always cleared 38.)
 (multi_out || patch_live) ? (
-  i = 0; loop(38, spl(i) = 0; i += 1;);
+  _xs_i = 0; loop(38, spl(_xs_i) = 0; _xs_i += 1;);
 ) : (
   spl(0) = 0; spl(1) = 0;
 );
@@ -4708,7 +4941,7 @@ memset(pad_accR, 0, NUM_PADS);
 
 // ─── Voice loop: sum into per-pad accumulators ──────────────────────────
 voices_alive = 0;
-vi = 0; loop(MAX_VOICES + 1,
+vi = 0; loop(V_SLOTS,
   // Advance waiting voices (negative v_pos = delayed start from loose sum mode)
   v_pos[vi] < 0 && v_pos[vi] > -9999 && v_stage[vi] > 0 ? (
     v_pos[vi] += 1;
@@ -4757,7 +4990,7 @@ vi = 0; loop(MAX_VOICES + 1,
       env *= p_rel_c[si];
       v_decay_ct[vi] += 1;
     );
-    vi == MAX_VOICES && v_stage[vi] == 4 ? (
+    vi >= MAX_VOICES && v_stage[vi] == 4 ? (   // a steal-fade slot (A-2): ~5 ms on top of the release
       env *= steal_coeff;
     );
 
@@ -4856,7 +5089,7 @@ vi = 0; loop(MAX_VOICES + 1,
     v_kind[vi] ? (
       // SYN voice: no sample end — dies on release-envelope floor (or steal fade)
       ((v_stage[vi] == 4 && env < 0.005) ||
-       (vi == MAX_VOICES && env < 0.005)) ? (
+       (vi >= MAX_VOICES && env < 0.005)) ? (
         v_pos[vi] = -1; v_env[vi] = 0; v_stage[vi] = 0; v_kind[vi] = 0;
       );
     ) : (
@@ -4869,7 +5102,7 @@ vi = 0; loop(MAX_VOICES + 1,
     ((v_inc[vi] >= 0 && v_pos[vi] >= a_end) ||
      (v_inc[vi] < 0 && v_pos[vi] <= a_start) ||
      (v_stage[vi] == 4 && env < 0.005) ||
-     (vi == MAX_VOICES && env < 0.005)) ? (
+     (vi >= MAX_VOICES && env < 0.005)) ? (
       v_pos[vi] = -1; v_env[vi] = 0; v_stage[vi] = 0;
     );
     );
@@ -4890,7 +5123,7 @@ vi = 0; loop(MAX_VOICES + 1,
 // At cold start both pointers are 0 → reads silence until the
 // audio_hook starts writing.
 // ────────────────────────────────────────────────────────────────────
-_reg_my_slot >= 0 ? (
+_reg_my_slot >= 0 && _any_stretch ? (   // _any_stretch: decided per block in @block (Phase 4, A O-1)
 _pi = 0; loop(NUM_PADS,
   sp_pitch_mode[_pi] == SP_PITCH_MODE_STRETCH ? (
     _sr_base   = STRETCH_AUDIO_BASE + _reg_my_slot * STRETCH_INST_AUDIO_STRIDE + _pi * STRETCH_PAD_STRIDE;
@@ -4907,12 +5140,25 @@ _pi = 0; loop(NUM_PADS,
       // spacing between repeats comes out exact. The ring holds 16382 frames,
       // so parking a buffer's worth costs nothing.
       stretch_hold[_pi] > 0 ? stretch_hold[_pi] -= 1 : (
+      stretch_choked[_pi] >= 2 ? (
+        // choked and faded out (A-7): discard what the Extension still writes for this
+        // hit -- park the read cursor at the write cursor until the pad's next trigger
+        _sr_read = _sr_write;
+        stretch_read_pos[_pi] = _sr_read;
+        atomic_set(gmem[_sr_base + STRETCH_OFF_READ_POS], _sr_read);
+      ) : (
       _sr_data = _sr_base + STRETCH_HEADER_SLOTS + _sr_read * 2;
-      pad_accL[_pi] += gmem[_sr_data];
-      pad_accR[_pi] += gmem[_sr_data + 1];
+      pad_accL[_pi] += gmem[_sr_data] * stretch_gain[_pi];
+      pad_accR[_pi] += gmem[_sr_data + 1] * stretch_gain[_pi];
+      // a choked pad drains behind a short fade (steal_coeff, ~5 ms), then parks
+      stretch_choked[_pi] == 1 ? (
+        stretch_gain[_pi] *= steal_coeff;
+        stretch_gain[_pi] < 0.005 ? stretch_choked[_pi] = 2;
+      );
       _sr_read = (_sr_read + 1) % STRETCH_PAD_DATA_FRAMES;
       stretch_read_pos[_pi] = _sr_read;
       atomic_set(gmem[_sr_base + STRETCH_OFF_READ_POS], _sr_read);
+      );
       );
     );
   );
@@ -5008,8 +5254,10 @@ patch_drain ? (   // patch_live AND the cursor is aimed (see the re-aim in @bloc
 
 _pi = 0; loop(NUM_PADS,
   // process_pad_fx sets _pfxL/_pfxR (post-pan output)
-  // and _pfx_sendL/_pfx_sendR (post-FX, pre-pan for sends)
-  process_pad_fx(_pi);
+  // and _pfx_sendL/_pfx_sendR (post-FX, pre-pan for sends), and returns 0 for a silent
+  // pad (no signal, no filter residual: every output 0). A silent pad skips the routing,
+  // the sends and the meter compare below; its meters keep falling (Phase 4, A O-1).
+  process_pad_fx(_pi) ? (
 
   // Route to output bus (clamp to valid range).
   // In loopback the pair is shifted up by one bus: channels 0/1 are what the
@@ -5052,6 +5300,11 @@ _pi = 0; loop(NUM_PADS,
   _absL > pad_meterL[_pi] ? pad_meterL[_pi] = _absL : pad_meterL[_pi] *= _pad_meter_decay;
   _absR > pad_meterR[_pi] ? pad_meterR[_pi] = _absR : pad_meterR[_pi] *= _pad_meter_decay;
 
+  ) : (   // silent pad: only the meters move
+    pad_meterL[_pi] *= _pad_meter_decay;
+    pad_meterR[_pi] *= _pad_meter_decay;
+  );
+
   _pi += 1;
 );
 
@@ -5068,15 +5321,22 @@ _pi = 0; loop(NUM_PADS,
 // the repeats dead mid-tail. OFF now glides the input shut and rings out.
 _dly_gate += ((dly_on ? 1 : 0) - _dly_gate) * (1 - _bus_gate_c);
 _dly_gate < BUS_TAIL_FLOOR ? _dly_gate = 0;
-(dly_on || _dly_tail_n < _bus_tail_hold) ? (
-  dly_process(snd_dly_accL[0] * _dly_gate, snd_dly_accR[0] * _dly_gate);
+// The engine stands down while ON as well as OFF (Phase 4, A O-1): once its input has
+// been exactly zero and its output under the floor for one delay length plus
+// _bus_tail_hold, nothing audible is left in the line (a pending repeat would have
+// come out above the floor within a delay length and reset the counter). Any input
+// wakes it on that sample. Until Phase 4 an ON delay -- the kit default -- ran on every
+// sample of an idle instance.
+_dly_inL = snd_dly_accL[0] * _dly_gate; _dly_inR = snd_dly_accR[0] * _dly_gate;
+(_dly_inL != 0 || _dly_inR != 0) ? _dly_tail_n = 0;
+(_dly_tail_n < dly_len_s + _bus_tail_hold) ? (
+  dly_process(_dly_inL, _dly_inR);
   // Denormal protection on delay tail
   abs(dly_outL) < DENORM_THR ? dly_outL = 0;
   abs(dly_outR) < DENORM_THR ? dly_outR = 0;
-  // Ring-out bookkeeping: ON keeps the counter parked at 0; OFF counts only
-  // CONSECUTIVE sub-floor samples, so a still-audible repeat resets it.
-  dly_on ? _dly_tail_n = 0 :
-    (abs(dly_outL) + abs(dly_outR) < BUS_TAIL_FLOOR ? _dly_tail_n += 1 : _dly_tail_n = 0);
+  // Ring-out bookkeeping: counts only CONSECUTIVE sub-floor samples with a silent
+  // input, so a still-audible repeat resets it.
+  (abs(dly_outL) + abs(dly_outR) < BUS_TAIL_FLOOR) ? _dly_tail_n += 1 : _dly_tail_n = 0;
   _fx_ret_pins ? (
     spl(34) += dly_outL * dly_mix;
     spl(35) += dly_outR * dly_mix;
@@ -5100,13 +5360,16 @@ _dly_gate < BUS_TAIL_FLOOR ? _dly_gate = 0;
 // size 0 fine (scale floors at 0.35x), so the engine is happy to run there.
 _rvb_gate += ((rvb_on ? 1 : 0) - _rvb_gate) * (1 - _bus_gate_c);
 _rvb_gate < BUS_TAIL_FLOOR ? _rvb_gate = 0;
-(rvb_on || _rvb_tail_n < _bus_tail_hold) ? (
-  rvb_process(snd_rvb_accL[0] * _rvb_gate, snd_rvb_accR[0] * _rvb_gate);
+// Stands down while ON too (Phase 4, A O-1; the delay above has the reasoning): the
+// hold covers the pre-delay line, so nothing is still on its way into the tank.
+_rvb_inL = snd_rvb_accL[0] * _rvb_gate; _rvb_inR = snd_rvb_accR[0] * _rvb_gate;
+(_rvb_inL != 0 || _rvb_inR != 0) ? _rvb_tail_n = 0;
+(_rvb_tail_n < rvb_pre_samps + _bus_tail_hold) ? (
+  rvb_process(_rvb_inL, _rvb_inR);
   // Denormal protection on reverb tail
   abs(rvb_outL) < DENORM_THR ? rvb_outL = 0;
   abs(rvb_outR) < DENORM_THR ? rvb_outR = 0;
-  rvb_on ? _rvb_tail_n = 0 :
-    (abs(rvb_outL) + abs(rvb_outR) < BUS_TAIL_FLOOR ? _rvb_tail_n += 1 : _rvb_tail_n = 0);
+  (abs(rvb_outL) + abs(rvb_outR) < BUS_TAIL_FLOOR) ? _rvb_tail_n += 1 : _rvb_tail_n = 0;
   _fx_ret_pins ? (
     spl(32) += rvb_outL * rvb_mix;
     spl(33) += rvb_outR * rvb_mix;
@@ -5126,6 +5389,18 @@ _fx_ret_pins ? (
   spl(36) += snd_sms_accL[0];
   spl(37) += snd_sms_accR[0];
 );
+
+// ─── Master idle gate (Phase 4, A O-1) ───────────────────────────────────
+// _mst_idle is decided once per block at the end of @block (nothing reached the bus
+// for a second, both send engines stood down, the limiter and comp at rest, no preview,
+// no Wired drain, no crossfade, no Stretch pad). voices_alive is THIS sample's count,
+// so a pad clicked in @gfx mid-block wakes the section on the sample its voice first
+// sounds. spl(0)/spl(1) are already the zeros the clear at the top wrote; idle costs
+// two meter decays and the GR needle's fall to rest.
+_mst_idle && voices_alive == 0 ? (
+  (cmp_vu.pos > 0 || cmp_vu.hold > 0) ? cmp_vu.rk_vu_sample_gr(1);
+  master_meterL *= _mst_meter_decay; master_meterR *= _mst_meter_decay;
+) : (
 
 // ─── Global FX on main stereo bus (SVF filters) ─────────────────────────
 _gL = spl(0); _gR = spl(1);
@@ -5243,27 +5518,33 @@ gfx_lim_on ? (
 );
 
 // ─── Output guard (2026-09-08) ────────────────────────────────────────────
-// A NaN/inf (or an absurd > +18 dBFS) from any voice/FX path must never reach
-// the host or the meters: master_meter* never recovers from a NaN (every
-// compare is false). !(abs(x) <= 8) is the NaN-safe test -- true for NaN, inf
-// and the impossible alike -- two compares per sample on the master, and the
-// same sweep over the pad buses only in multi-out / patchbay mode.
+// An Inf (or an absurd > +18 dBFS) from any voice/FX path must never reach the
+// host or the meters: !(abs(x) <= 8) catches Inf and the impossible -- two
+// compares per sample on the master, and the same sweep over the pad buses only
+// in multi-out / patchbay mode. It does NOT catch a NaN: measured on REAPER 7.79
+// (EON_Probe_NanSem, A-11) EEL2 comparisons are NaN-blind in both forms. A NaN
+// needs no catching here -- EEL2 arithmetic flushes it to 0 on first use, and a
+// NaN written to spl renders as 0 at the host boundary (wiki 7.8).
 !(abs(_gL) <= 8) ? _gL = 0;
 !(abs(_gR) <= 8) ? _gR = 0;
 spl(0) = _gL; spl(1) = _gR;
 (multi_out || patch_live) ? (
-  i = 2; loop(36, !(abs(spl(i)) <= 8) ? spl(i) = 0; i += 1;);
+  _xs_i = 2; loop(36, !(abs(spl(_xs_i)) <= 8) ? spl(_xs_i) = 0; _xs_i += 1;);
 );
 
-// Anti-pop crossfade: blend from previous output to current output after deserialize
+// Anti-pop crossfade: blend from previous output to current output after deserialize.
+// All 38 channels whenever pads leave on them: multi-out, and Wired, where every
+// pad pair rides channels 2..33 to the inserts and back through the ring (A-5:
+// a pair blended on 0/1 only stepped to zero at the kill and the step came back
+// after the blend had ended). Same test as the clear loop in @block.
 _xf_active ? (
   _xf_t = _xf_pos / _xf_len;            // 0→1 over crossfade duration
   _xf_t = _xf_t * _xf_t * (3 - 2 * _xf_t);  // smoothstep for click-free curve
   _xf_w = 1.0 - _xf_t;                  // weight of old signal (1→0)
-  multi_out ? (
-    i = 0; loop(38,
-      spl(i) = spl(i) * _xf_t + _xf_prev[i] * _xf_w;
-      i += 1;
+  (multi_out || patch_live) ? (
+    _xs_i = 0; loop(38,
+      spl(_xs_i) = spl(_xs_i) * _xf_t + _xf_prev[_xs_i] * _xf_w;
+      _xs_i += 1;
     );
   ) : (
     spl(0) = spl(0) * _xf_t + _xf_prev[0] * _xf_w;
@@ -5271,8 +5552,8 @@ _xf_active ? (
   );
 ) : (
   // Only track output when crossfade is NOT active (freeze _xf_prev during crossfade)
-  multi_out ? (
-    i = 0; loop(38, _xf_prev[i] = spl(i); i += 1;);
+  (multi_out || patch_live) ? (
+    _xs_i = 0; loop(38, _xf_prev[_xs_i] = spl(_xs_i); _xs_i += 1;);
   ) : (
     _xf_prev[0] = spl(0); _xf_prev[1] = spl(1);
   );
@@ -5282,6 +5563,8 @@ _xf_active ? (
 _moL = abs(_gL); _moR = abs(_gR);
 _moL > master_meterL ? master_meterL = _moL : master_meterL *= _mst_meter_decay;
 _moR > master_meterR ? master_meterR = _moR : master_meterR *= _mst_meter_decay;
+
+);   // end of the master section (its idle branch is at the gate above)
 
 // EON_DIAG: stamp the LAST @sample of the block (armed only; one branch unarmed).
 diag_armed ? (
@@ -6282,7 +6565,7 @@ is_read ? (
 // ─── Anti-pop: kill all voices + reset FX state + fade-in after deserialize ──
 is_read ? (
   // Kill all voices immediately so @sample doesn't read half-written buffers
-  _srz_vi = 0; loop(MAX_VOICES + 1,
+  _srz_vi = 0; loop(V_SLOTS,
     v_pos[_srz_vi] = -1; v_env[_srz_vi] = 0; v_stage[_srz_vi] = 0;
     _srz_vi += 1;
   );
@@ -6341,7 +6624,7 @@ is_read ? (
   // short-circuit (-80 dB) can deactivate it. Threshold split is intentional.
   abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
     _xf_pos = 0;
-    _xf_len = max(1, (0.020 * srate)|0);  // 20ms crossfade
+    _xf_len = swing_xf_len(0.020);  // 20ms crossfade (+ a block under Wired, A-5)
     _xf_active = 1;
   );
 
@@ -6736,17 +7019,31 @@ _char = gfx_getchar();
 is_embedded = gfx_ext_flags & 1;
 mx = mouse_x; my = mouse_y;
 LMB = mouse_cap & 1;
-lmb_down = LMB && !prev_LMB;
 RMB = mouse_cap & 2;
+// Per-surface press latches (D-3): loads THIS pass's surface latch into
+// prev_LMB / prev_RMB, and freezes an unhovered embed's pass while the other
+// embed holds a press. Defined beside the latches in @init.
+swing_srf_load();
+lmb_down = LMB && !prev_LMB;
 rmb_down = RMB && !prev_RMB;
 // Internal PARAM undo: snapshot all pads' pre-edit state on the mouse-DOWN
 // edge (before any UI handler can mutate a pad this frame). Committed on the
 // mouse-UP edge below for whichever pads mark_dirty_pad() flagged.
+// A wheel or right-button bracket still open (D-9, below) commits first, so its
+// edits keep their own entry and the left press captures a fresh baseline.
+lmb_down && _udo_nl_t > 0 ? ( undo_commit_gesture(); _udo_nl_t = 0; );
 lmb_down ? undo_capture_baseline();
-CTRL  = mouse_cap & 4;
+// A finished kit or browser load re-bases the snapshot (D-8): the import tick and
+// swing_browser_load_pad_done raise the request from @block. A drag in flight
+// loses its pre-load entry, the accepted trade.
+_udo_rebase_req ? ( _udo_rebase_req = 0; undo_capture_baseline(); );
+// Modifiers from the same effective mouse state as LMB and mx/my: _srf_cap is
+// mouse_cap, except on an unhovered embed pass standing in for the other
+// embed's live press, where swing_srf_load hands over the owner's cap (D-3).
+CTRL  = _srf_cap & 4;
 
-SHIFT = mouse_cap & 8;
-ALT   = mouse_cap & 16;
+SHIFT = _srf_cap & 8;
+ALT   = _srf_cap & 16;
 // Global safety: release active_id when mouse button is up
 !LMB && active_id >= 0 ? active_id = -1;
 dt = min(time_precise() - frame_last_timer, 0.05);
@@ -6754,6 +7051,15 @@ frame_last_timer = time_precise();
 hv_speed = 11;
 frame_wheel = mouse_wheel / 120;
 mouse_wheel = 0;
+// Internal PARAM undo for a wheel notch or a right-button edit (D-9): with no left
+// press, the first one captures the baseline and opens a timed bracket, further
+// notches within 0.3 s extend it, and the tail commits it once 0.3 s pass without
+// activity (or a left press begins, above). Before this, only the left press
+// captured a baseline, so a scrolled knob had nothing to undo.
+!LMB && (frame_wheel != 0 || rmb_down) ? (
+  _udo_nl_t == 0 ? undo_capture_baseline();
+  _udo_nl_t = time_precise();
+);
 
 // ── Registry heartbeat (mirror of the @block writer at the @block top) ──
 // @block freezes when transport stops or REAPER idles the audio device,
@@ -6974,6 +7280,38 @@ _ccmd > 0 && !kit_busy && (_cctgt == 0 || _cctgt == (instance_id|0)) ? (
   gmem[GS_COMPANION_CMD] = 0;
 );
 
+// ── Idle context: a closed instance draws nothing (D O-1; decided 2026-09-15) ──
+// options:gfx_idle keeps @gfx ticking with no surface showing: 13 passes/s on
+// REAPER 7.79, gfx_ext_flags bit 2 set, a real canvas of the last window size,
+// mouse_cap 0 (EON_Probe_Surface S2). Everything a closed instance needs from
+// those passes sits ABOVE this point -- the registry heartbeat mirror, the
+// undo / name / swap / companion mailboxes, the PADCAT drain, EON_VIEW_REQ and
+// EON_POPUP_REQ, the export tick and misc commands, the browser sync, the pitch
+// tick and the engine-stall fallback -- and below it there is only drawing and
+// the input that drawing carries. So an idle pass skips both branches whole:
+// the closed-window cost of an instance is a few gmem writes per pass instead
+// of a full floating frame (background, header cluster, LCD page, sixteen pad
+// faces with waveforms, the strip and its browser-sync writes). The frame tail
+// after the branches still runs, so a pad held when the window closes is
+// released on the first idle pass, as before.
+// What an idle pass no longer does, each checked: bump the strip's FB_FACE_HB
+// (no reader anywhere) or re-post its grow request (the bridge acts on a
+// CHANGE of FB_REQ_GROW, and the last value stands); re-aim the FX picker at
+// sel_pad (swing_fxview_follow_pad re-publishes on the first window pass,
+// before the FX tab draws); reset gfx_lim_gr (one stale GR-meter frame on
+// reopen); refresh _dock_gfx_t (so the re-dock hello fires on reopen, which is
+// what its comment always assumed); consume _ins_want_wired (it waits for the
+// window, where it was raised). The gmem walk over both branches' call graphs
+// found no mailbox consume below this point (fix plan 2026-09-14, section 9).
+// The first idle pass after a shown one posts the audition's STOP (D-7, decision 7):
+// closing the window stops it, as closing the strip does. Idle passes alone never
+// post (an instance loaded with its window closed starts idle).
+_gfx_idle_now = (gfx_ext_flags & 2) ? 1 : 0;
+_gfx_idle_now && !_gfx_idle_prev && _gfx_pass_n > 0 ? fb_prv_cmd = 2;
+_gfx_idle_prev = _gfx_idle_now; _gfx_pass_n += 1;
+(gfx_ext_flags & 2) ? (
+  0;
+) :
 is_embedded ? (
   // ═══════════════════════════════════════════════════════════════════════
   // EMBEDDED — Maximized 4×4 coloured pad grid with waveforms + note info
@@ -7168,6 +7506,11 @@ is_embedded ? (
   ) : (
   // ═══ FULL UI ═══
 
+  // The FX picker follows the selected pad, every frame, so the FX tab, the
+  // rack and the big picker all open on it (swing_fxview_follow_pad). Before
+  // the LCD frame, which is where Shift+clicking the FX tab opens the picker.
+  swing_fxview_follow_pad();
+
   // ── Header + layout + LCD frame ──
   swing_ui_draw_header();
   swing_ui_calc_layout();
@@ -7226,12 +7569,23 @@ is_embedded ? (
   // rk_swing_ui_changemap.jsfx-inc on why it can't wait for this point.
   swing_chgmap_overlay_draw();
 
-  // ── Console "add insert" on a pad while stereo: switch Wired on ──
-  // Raised by swing_panels_ins_aim (an earlier import, which cannot call the
-  // raise function itself). CMD 41 to the bridge; harmless if already on.
-  _ins_want_wired ? (
+  // ── "Add insert" on a pad while stereo: switch Wired on ──
+  // Raised by swing_panels_ins_aim (the console) and swing_fxview_want_wired
+  // (the FX tab's picker) -- earlier imports, which cannot call the raise
+  // function themselves. CMD 41 to the bridge.
+  // ⚠️ CMD 41 is a TOGGLE (rk_ops.do_toggle_wired); !patch_on is the only thing
+  // that makes it an "on". patch_on changes only after the bridge has acted, so
+  // a second request inside that gap -- two adds in a row -- would switch Wired
+  // straight back OFF. One request per 3 s.
+  // ⚠️ ONLY ON AN IDLE BUS. raise_bridge_cmd writes CMD whenever LOCK is free or
+  // OURS, so an add during this instance's own load or save would overwrite the
+  // command in flight. The request waits, unconsumed, until CMD is back to 0.
+  _ins_want_wired && gmem[KIT_GMEM_CMD] == 0 ? (
     _ins_want_wired = 0;
-    !patch_on && !multi_out ? swing_panels_raise_bridge_cmd(41);
+    !patch_on && !multi_out && time_precise() - _ins_wired_t > 3 ? (
+      swing_panels_raise_bridge_cmd(41);
+      _ins_wired_t = time_precise();
+    );
   );
 
   // ── Modal panels (big view / right-click pad editor) ──
@@ -7367,15 +7721,18 @@ is_embedded ? (
   rkth_overlay_draw();   // EON theme dropdown (shared widget) — painted last, above everything
 );
 
-// Release GUI-held pad on mouse-up
-gui_held_pad >= 0 && !LMB ? (
+// Release GUI-held pad on mouse-up. The raw button (swing_ui_modal_gate keeps
+// _raw_LMB every frame), not the gated copy: under a modal the gate zeroes LMB, so
+// a pad held into a popup never released (D-5).
+gui_held_pad >= 0 && !_raw_LMB ? (
   // When effective one-shot is OFF (gate mode), release voices on mouse-up
   _eos = p_oneshot[gui_held_pad];
   (_eos == 0 || (_eos < 0 && !oneshot_global)) ? (
-    i = 0; loop(MAX_VOICES + 1,
-      v_slot[i] == gui_held_pad && v_stage[i] < 4 ? v_stage[i] = 4;
-      i += 1;
-    );
+    // Posted, not performed: @block ends the pad's voices at the block's end
+    // (swing_block_gt_release), so the UI thread writes no voice cell (A-9b).
+    // The loop this replaces once shared the bare `i` with @sample's channel
+    // loops and overran _xf_prev into udo_fs (A-8, Audit A 2026-09-14).
+    swing_gt_post_release(gui_held_pad);
   );
   p_held[gui_held_pad] = 0;
   gui_held_pad = -1;
@@ -7383,11 +7740,15 @@ gui_held_pad >= 0 && !LMB ? (
 
 frame_wheel = 0;
 // Internal PARAM undo: mouse-UP edge (prev_LMB still holds last frame here) —
-// push one undo entry per pad edited during the just-finished gesture.
-(prev_LMB && !LMB) ? undo_commit_gesture();
+// push one undo entry per pad edited during the just-finished gesture. The raw
+// button again (D-5): a gesture that ends under a modal committed nothing.
+(prev_LMB && !_raw_LMB) ? undo_commit_gesture();
+// The wheel / right-button bracket commits once 0.3 s pass without a notch (D-9).
+_udo_nl_t > 0 && !_raw_LMB && time_precise() - _udo_nl_t > 0.3 ? ( undo_commit_gesture(); _udo_nl_t = 0; );
 
-prev_LMB = mouse_cap & 1;
-prev_RMB = mouse_cap & 2;
+// Per-surface press latches (D-3): mouse_cap goes back into THIS pass's
+// surface latch, and into prev_LMB / prev_RMB as before.
+swing_srf_store();
 last_mouse_cap = mouse_cap;
 
 

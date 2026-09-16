@@ -10,6 +10,49 @@
 
 @init
 
+// ─── Recalc requests from the UI thread, performed here (A-9a) ────────────
+// One writer per counter: the UI bumps _rcp_req_* (swing_rcp_post_* in
+// rk_drumkit_dsp), this side owns _rcp_done_*. done is set BEFORE the recalc
+// runs, so a request that lands during it differs again next block. The macro
+// engine's kmac_rcp bits are consumed inside kmac_tick as before.
+function swing_block_rcp_settle() local(_rs_p) (
+  _rs_p = 0; loop(NUM_PADS,
+    _rcp_req_fx[_rs_p] != _rcp_done_fx[_rs_p] ? (
+      _rcp_done_fx[_rs_p] = _rcp_req_fx[_rs_p]; recalc_fx(_rs_p);
+    );
+    _rcp_req_pad[_rs_p] != _rcp_done_pad[_rs_p] ? (
+      _rcp_done_pad[_rs_p] = _rcp_req_pad[_rs_p]; recalc_pad(_rs_p);
+    );
+    _rs_p += 1;
+  );
+  _rcp_req_cmp != _rcp_done_cmp ? ( _rcp_done_cmp = _rcp_req_cmp; cmp_recalc(); );
+  _rcp_req_master != _rcp_done_master ? ( _rcp_done_master = _rcp_req_master; recalc_global_fx(); );
+);
+
+// ─── Pad clicks and gate-mode releases posted by the UI thread (A-9b) ─────
+// Rings and posts: swing_gt_post* in rk_drumkit_dsp. This side owns the read
+// indexes. The launch is the same call the MIDI loop and the bridge trigger
+// make; the release sends every SOUNDING voice of the pad to its release
+// stage (v_stage > 0, like the note-off and choke sites: a dead voice set to 4
+// would never be free again, which the @gfx loop this replaces did not guard).
+function swing_block_gt_consume() local(_gc_i) (
+  while (_gt_rd < _gt_wr) (
+    _gc_i = _gt_rd % GT_RING;
+    launch_voices_for_pad(_gt_pad[_gc_i] | 0, _gt_note[_gc_i], _gt_vel[_gc_i], _gt_flash[_gc_i]);
+    _gt_rd += 1;
+  );
+);
+function swing_block_gt_release() local(_gc_i, _gc_v) (
+  while (_gtr_rd < _gtr_wr) (
+    _gc_i = _gtr_rd % GT_RING;
+    _gc_v = 0; loop(V_SLOTS,
+      v_slot[_gc_v] == _gtr_pad[_gc_i] && v_stage[_gc_v] > 0 && v_stage[_gc_v] < 4 ? v_stage[_gc_v] = 4;
+      _gc_v += 1;
+    );
+    _gtr_rd += 1;
+  );
+);
+
 // ─── Audio-engine gap detector ──────────────────────────────────────────
 // Normal block gap ≈ samplesblock/srate (~1–6ms). Anything >50ms means the
 // engine paused (app switch, device reset). On resume, flush filter state
@@ -76,6 +119,15 @@ local(i)
     _sm_coeff = 1.0 - exp(-1.0 / max(1, 0.0045 * srate));
     recalc_global_fx();
     i = 0; loop(SVF_MST_COUNT, svf_snap(svf_master + i * SVF_STEREO_SIZE); i += 1;);
+    // Latched at load and missed here until 2026-09-15 (A-6): the synth engines'
+    // pitch and time factors, the SYN silence retire, the send buses' gate and
+    // stand-down, the delay's length glide and the tank's geometry.
+    rk_dd_srate_init();
+    syn_quiet_n = 0.06 * srate;
+    _bus_gate_c    = exp(-1 / (0.008 * srate));
+    _bus_tail_hold = (0.5 * srate) | 0;
+    dly_srate_init();
+    rvb_srate_recalc();
     dly_recalc();
     rvb_recalc();
     cmp_recalc();

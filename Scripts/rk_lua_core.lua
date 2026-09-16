@@ -218,23 +218,97 @@ end
 -- `writer` is either a body string or a function(f) that streams into f.
 -- Returns true on success, false (+ message) on any failure — a writer that
 -- throws is caught so the old file is not clobbered.
-function core.atomic_write(path, writer)
+-- Checked, atomic file writer (2026-09-14, audits B-1 and B-3). Writes
+-- <path>.tmp beside the destination and hands `writer` a handle whose write()
+-- RAISES on the first failure: a stdio write returns nil, err and never throws,
+-- so a pcall around plain f:write calls cannot see a full disk, a dropped share
+-- or a quota (write_kit_v4 reported "Kit saved!" over a truncated file that
+-- way). Then it checks close() -- the flush, the last chance to hear that
+-- buffered bytes never landed -- verifies the byte count on disk for binary
+-- modes, and publishes with copy_file's shuffle: old -> aside, tmp -> path,
+-- remove aside; the old file comes back if the final rename fails. On ANY
+-- failure the destination is left exactly as it was, the temp is removed and
+-- false, err is returned. Returns true, bytes on success.
+--   opts.keep_old = <backup path>: while that file does not exist, the old
+--   destination is moved THERE instead of aside and never removed -- the kit
+--   writers' ".bak" rule (the first re-save keeps the original forever).
+-- Text mode ("w") translates newlines on Windows, so the on-disk size check
+-- applies to binary modes only. Never route audio through "w".
+function core.write_file_checked(path, mode, writer, opts)
+  if not path or path == "" then return false, "bad path" end
+  opts = opts or {}
+  mode = mode or "wb"
   local tmp = path .. ".tmp"
-  local f = io.open(tmp, "w")
-  if not f then return false, "open failed: " .. tmp end
-  local ok, err = true, nil
+  os.remove(tmp)
+  local raw = io.open(tmp, mode)
+  if not raw then return false, "cannot create: " .. tmp end
+  local count, werr = 0, nil
+  local h = {}
+  function h:write(...)
+    for i = 1, select("#", ...) do
+      local s = select(i, ...)
+      if type(s) ~= "string" then s = tostring(s) end
+      local ok, e = raw:write(s)
+      if not ok then werr = "write failed: " .. tostring(e); error(werr, 0) end
+      count = count + #s
+    end
+    return h
+  end
+  function h:seek(...) return raw:seek(...) end
+  function h:flush() return raw:flush() end
+  local ok, err
   if type(writer) == "function" then
-    ok, err = pcall(writer, f)
+    ok, err = pcall(writer, h)
   else
-    f:write(tostring(writer))
+    ok, err = pcall(h.write, h, tostring(writer))
   end
-  f:close()
-  if not ok then
+  if ok and werr then ok, err = false, werr end   -- a writer that swallowed the raise
+  local cok, cerr = raw:close()
+  if ok and not cok then ok, err = false, "close failed: " .. tostring(cerr) end
+  if not ok then os.remove(tmp); return false, werr or tostring(err) end
+  if mode:find("b", 1, true) then
+    local vf = io.open(tmp, "rb")
+    local n = vf and vf:seek("end") or -1
+    if vf then vf:close() end
+    if n ~= count then
+      os.remove(tmp)
+      return false, ("short write: %s of %d bytes reached the disk"):format(tostring(n), count)
+    end
+  end
+  -- A read-only destination is refused, not replaced (copy_file's rule): Windows
+  -- lets a rename move a read-only file aside, which would defeat the attribute.
+  local ro = io.open(path, "rb")
+  if ro then
+    ro:close()
+    local ap = io.open(path, "ab")
+    if not ap then os.remove(tmp); return false, "destination is read-only: " .. path end
+    ap:close()
+  end
+  local aside, permanent = path .. ".prev", false
+  if opts.keep_old then
+    local kf = io.open(opts.keep_old, "rb")
+    if kf then kf:close() else aside, permanent = opts.keep_old, true end
+  end
+  if not permanent then os.remove(aside) end
+  local had_old = os.rename(path, aside)
+  local rok, rerr = os.rename(tmp, path)
+  if not rok then
+    if had_old then os.rename(aside, path) end
     os.remove(tmp)
-    return false, err
+    return false, "rename failed: " .. tostring(rerr)
   end
-  os.remove(path)
-  return os.rename(tmp, path)
+  if had_old and not permanent then os.remove(aside) end
+  return true, count
+end
+
+-- Text-mode atomic write for settings and caches: `writer` is a string or a
+-- function taking the handle. Routes through write_file_checked, so a failed
+-- write or close or a blocked rename leaves the live file intact. (It used to
+-- remove the live file BEFORE the rename and ignore every write error, so a
+-- full disk or an antivirus hold on the fresh .tmp cost the browser its
+-- settings and the analysis cache -- audit B-3.)
+function core.atomic_write(path, writer)
+  return core.write_file_checked(path, "w", writer)
 end
 
 -- Binary file copy that never lies about success. Streams in 1 MB chunks (a
@@ -608,8 +682,11 @@ core.GMEM = {
   PAD_ACTION_REVERSE   = 3,
   PAD_ACTION_SET_NOTE  = 4,
   PAD_ACTION_SET_OUT   = 5,
-  -- JSFX → bridge: pad-click → MCP/TCP track select. 1-indexed pad
-  -- (1..16), 0 = no request (bridge writes 0 back after consuming).
+  -- JSFX → bridge: pad-click → MCP/TCP track select. Value =
+  -- (pad + 1) + instance_id * 32 (C-4, 2026-09-15: the bridge decodes
+  -- inst = floor(v / 32), pad = v - inst * 32 - 1 and resolves the track
+  -- by id; a bare 1..16 from an older face = the first Swing), 0 = no
+  -- request (bridge writes 0 back after consuming).
   -- Gated on JSFX side by pad_click_selects_track preference (off
   -- by default; opt-in via Colors right-click menu).
   GS_PAD_TRACK_SELECT  = 2623,

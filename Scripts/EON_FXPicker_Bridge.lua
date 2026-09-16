@@ -657,14 +657,40 @@ local function ci_pad_name(slot, pad)
   return table.concat(t)
 end
 
+-- A pad AIM -> the target it means on THIS tick. The console's insert slots and
+-- Swing's FX tab (which follows the selected pad) name a PAD; which track holds
+-- that pad is ci_pads' answer, and the answer can change while the aim is still
+-- held: stereo <-> multi-out, a rebuilt pad track, another Swing taking over
+-- the registry slot. nil = not resolvable this tick. Declared here, above
+-- resolve_target, for the same compile-time reason as ci_tgt.
+-- -1 = the master/bus strip. A pad with NO track (stereo) is a VIEW of Swing's
+-- own track: its Wired slice, pinned to the pad's pair (fx.view) -- the
+-- publisher stashes that track as pads.swing_tr.
+local function pad_target(slot, pad)
+  local pads = ci_pads[slot]
+  if not pads then return nil end
+  if pad < 0 then
+    return pads.master and { tr = pads.master, pad = pads.master_pad, aim = pad } or nil
+  end
+  if pads[pad] then return { tr = pads[pad], aim = pad } end
+  if pads.swing_tr then return { tr = pads.swing_tr, pad = pad, aim = pad } end
+  return nil
+end
+
 -- ⭐ ONE resolver, so drawing and acting can never aim at different tracks.
--- ci_tgt still wins: aiming at a console slot is an EXPLICIT choice and a pin
--- must not out-rank the thing the user just clicked. The pin only displaces
--- the last-touched fallback, which is the drift it exists to stop.
+-- ci_tgt still wins: an aim is a choice -- the console's is a click the user just
+-- made, and Swing's FX tab stops aiming while PIN is on -- so a pin must not
+-- out-rank it. The pin only displaces the last-touched fallback, which is the
+-- drift it exists to stop.
 local function resolve_target(slot)
   -- A target is { tr = MediaTrack, pad = nil | 0..15 | -1 }: nil = the whole
   -- track; a pad = that pad's Wired slice of Swing's own track (fx.view);
   -- -1 = the master slice of it. The last-touched fallback is a whole track.
+  -- An AIMED target also carries aim = the pad it names and is re-resolved
+  -- here on every call, so it follows that pad to whatever track holds it
+  -- now. When this tick cannot resolve it, the last answer stands.
+  local a = ci_tgt[slot]
+  if a and a.aim ~= nil then ci_tgt[slot] = pad_target(slot, a.aim) or a end
   local t = ci_tgt[slot] or ci_pin[slot]
   local tr, pad
   if t then tr, pad = t.tr, t.pad else tr = reaper.GetLastTouchedTrack() end
@@ -802,14 +828,16 @@ local function do_action(slot, verb, a, bnum)
 end
 
 -- Console targeting. The face writes "pad P, slot S" and bumps TGT_SEQ when
--- you click an insert slot on a strip; until then the picker's target is
--- whatever REAPER last touched, which is right for "open the picker on the
--- thing I just clicked" and useless for "this pad, that slot".
+-- you click an insert slot on a strip, and Swing's FX tab does the same
+-- whenever the selected pad changes; until one of them has, the picker's
+-- target is whatever REAPER last touched, which is right for "open the picker
+-- on the thing I just clicked" and useless for "this pad, that slot".
 --
--- ci_tgt[slot] holds the resolved MediaTrack. It is re-resolved on every
--- console publish rather than cached forever: a pad's track can be deleted or
--- rebuilt underneath us, and a stale pointer would have the picker quietly
--- editing a track that no longer exists.
+-- ci_tgt[slot] holds the resolved target AND the pad it aims at. resolve_target
+-- re-resolves it from the latest console publish on every tick rather than
+-- trusting the track it found first: a pad's track can be deleted or rebuilt
+-- underneath us, and a stale pointer would have the picker quietly editing a
+-- track that no longer exists.
 local TGT_SEQ, TGT_PAD, TGT_SLOT = 142, 143, 144
 -- ⚠️ TGT_PIN and ci_pin USED TO BE DECLARED HERE. Re-declaring them below
 -- do_action did not just hide them from it -- a second `local` of the same
@@ -823,20 +851,13 @@ local function consume_target(slot)
   if seq == 0 or seq == ci_tgt_seq[slot] then return end
   ci_tgt_seq[slot] = seq
   local pad = math.floor(reaper.gmem_read(b + TGT_PAD) or -1)
-  local pads = ci_pads[slot]
-  -- -1 = the master/bus strip. Anything else indexes the pad tracks the
-  -- console publisher already resolved this tick, so the two sides cannot
-  -- disagree about which track a pad means. A pad with NO track (stereo) is
-  -- a VIEW of Swing's own track: its Wired slice, pinned to the pad's pair
-  -- (fx.view) -- the publisher stashed that track as pads.swing_tr.
-  if pad >= 0 then
-    if pads and pads[pad] then ci_tgt[slot] = { tr = pads[pad] }
-    elseif pads and pads.swing_tr then ci_tgt[slot] = { tr = pads.swing_tr, pad = pad }
-    else ci_tgt[slot] = nil end
-  else
-    ci_tgt[slot] = (pads and pads.master)
-      and { tr = pads.master, pad = pads.master_pad } or nil
-  end
+  -- pad_target indexes the pad tracks the console publisher resolved, so the
+  -- two sides cannot disagree about which track a pad means. ⚠️ An aim that
+  -- cannot resolve yet is KEPT, not dropped -- a Swing that registered a moment
+  -- ago is not in ci_pads until the next publish (<= 0.5 s). Dropping it left
+  -- REAPER's last-touched track on screen until something aimed again, and the
+  -- FX tab never re-aims at a pad it already asked for. resolve_target retries.
+  ci_tgt[slot] = pad_target(slot, pad) or { aim = pad }
   local sel = math.floor(reaper.gmem_read(b + TGT_SLOT) or -1)
   reaper.gmem_write(b + CH_SEL, sel)
   ch_fp[slot] = nil            -- force a republish for the new target
@@ -866,10 +887,16 @@ local function publish_chain(slot)
   local tr, pad = resolve_target(slot)
   -- A target that has since been deleted must not be handed to the API.
   if not tr then
-    tr = reaper.GetLastTouchedTrack()
-    ci_tgt[slot] = nil
     pad = nil
-    if tr and not reaper.ValidatePtr2(0, tr, "MediaTrack*") then tr = nil end
+    if not (ci_tgt[slot] and ci_tgt[slot].aim ~= nil) then
+      tr = reaper.GetLastTouchedTrack()
+      ci_tgt[slot] = nil
+      if tr and not reaper.ValidatePtr2(0, tr, "MediaTrack*") then tr = nil end
+    end
+    -- An AIMED pad that cannot resolve right now shows NO track, not whatever
+    -- REAPER touched last: do_action refuses every verb while resolve_target
+    -- returns nil, so a stranger's chain on screen would only invite clicks
+    -- that do nothing. The aim stays; resolve_target keeps retrying it.
   end
   local tname, tnum, tcol = "", 0, -1
   if tr then

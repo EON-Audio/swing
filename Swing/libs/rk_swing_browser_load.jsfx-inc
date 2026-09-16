@@ -131,13 +131,14 @@ local(_ci, _cn, _cnl)
     // load ever gets analysed. Four gmem writes; the bridge does the work and
     // throttles it to one file per tick.
     swing_lcd_rootnote_request(_bp_pad);
+    _udo_rebase_req = 1;   // the @gfx head re-bases the param-undo snapshot on the new sample (D-8)
 );
 // ─── CMD 63 — single-pad sample load ────────────────────────────────────
 // Fully resets the pad (clear_pad) before loading: leaving stale layers
 // would cause Sum-mode mixing with the previous sample, and stale per-pad
 // gain/pan/tune would leak the old kit's mix into the new sound.
 function swing_browser_load_pad()
-local(_bp_pad, _bp_len, _xf_vi, _ci)
+local(_bp_pad, _bp_len, _ci)
 (
   // In-flight latch (2026-07-27 double-dispatch fix): both dispatch sites
   // (@block + @gfx stall-fallback) check !_bl_inflight, so a handler that is
@@ -174,20 +175,11 @@ local(_bp_pad, _bp_len, _xf_vi, _ci)
     swing_ldr_bridge_notice(0);   // no bridge: the file read it always could do, said on the LCD
     // Tukan-style undo: REAPER's chunk diff captures the load via
     // mark_dirty_pad(_bp_pad) below. Audio is in @serialize.
-    // Kill any active voices on this pad + activate crossfade before overwriting buffer
-    _xf_vi = 0; loop(MAX_VOICES + 1,
-      v_slot[_xf_vi] == _bp_pad ? ( v_pos[_xf_vi] = -1; v_env[_xf_vi] = 0; v_stage[_xf_vi] = 0; );
-      _xf_vi += 1;
-    );
-    // Gate threshold -40 dB: only arm crossfade when residue is clearly
-    // audible. Below -40 dB, snap-cut is masked by noise floor — and arming
-    // for sub-audible residue means the ramp attenuates the next hit's
-    // transient before the @sample short-circuit (-80 dB) can deactivate.
-    !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
-      _xf_pos = 0;
-      _xf_len = max(1, (0.010 * srate)|0);  // 10ms crossfade for single pad
-      _xf_active = 1;
-    );
+    // Kill any active voices on this pad + activate crossfade before overwriting
+    // the buffer. The helper (rk_drumkit_dsp) carries the -40 dB arm gate: only
+    // arm when the residue is clearly audible, or the ramp attenuates the next
+    // hit's transient before the @sample short-circuit (-80 dB) can deactivate.
+    swing_voice_kill_pad_xf(_bp_pad);
     strcpy(#_browser_path, "");
     _ci = 0; loop(_bp_len,
       str_setchar(#_browser_path, _ci, gmem[GS_BROWSER_PATH + _ci]);
@@ -272,7 +264,7 @@ local(_ci, _cn, _cnl)
 // clear the pad: layer load is additive. Pad name is only refreshed when
 // layer 0 is targeted (layers 1..3 keep the existing display name).
 function swing_browser_load_layer()
-local(_bp_pad, _bp_layer, _bp_len, _xf_vi, _ci)
+local(_bp_pad, _bp_layer, _bp_len, _ci)
 (
   _bl_inflight = 1;   // double-dispatch latch (see swing_browser_load_pad)
   // Multi-instance gate (see swing_browser_load_pad)
@@ -298,17 +290,8 @@ local(_bp_pad, _bp_layer, _bp_len, _xf_vi, _ci)
     swing_ldr_bridge_notice(0);   // no bridge: the file read, said on the LCD
     // Tukan-style undo: REAPER's chunk diff captures the load via
     // mark_dirty_pad(_bp_pad) below. Audio is in @serialize.
-    // Kill active voices on this pad + crossfade
-    _xf_vi = 0; loop(MAX_VOICES + 1,
-      v_slot[_xf_vi] == _bp_pad ? ( v_pos[_xf_vi] = -1; v_env[_xf_vi] = 0; v_stage[_xf_vi] = 0; );
-      _xf_vi += 1;
-    );
-    // Gate threshold -40 dB (see CMD 63 above for rationale).
-    !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
-      _xf_pos = 0;
-      _xf_len = max(1, (0.010 * srate)|0);
-      _xf_active = 1;
-    );
+    // Kill active voices on this pad + crossfade (see CMD 63 above).
+    swing_voice_kill_pad_xf(_bp_pad);
     strcpy(#_browser_path, "");
     _ci = 0; loop(_bp_len,
       str_setchar(#_browser_path, _ci, gmem[GS_BROWSER_PATH + _ci]);

@@ -14,12 +14,16 @@ desc:EON Patchbay
 // is actually reading the ring. Embedded in the TCP/MCP it is a 4x4 grid of
 // the same lanes.
 //
-// link_slot: Swing's registry slot (session-volatile), pushed by the bridge
-// when Wired switches on; it selects the ring. Not a user control.
+// link_inst: the Swing's INSTANCE ID, pushed by the bridge when Wired switches
+// on and re-stamped by its identity walker; it selects the ring, resolved from
+// the registry every block (C-1). link_slot: Swing's registry slot at Wired-on
+// (session-volatile), the ring only while no id is set. Neither is a user
+// control.
 
 options:gmem=Swing_Media_Transfer no_meter
 
 slider1:link_slot=0<0,15,1>-Instance slot (internal; set by the bridge)
+slider2:link_inst=0<0,99999999,1>-Link Instance (internal; bridge-set)
 
 in_pin:Return L
 in_pin:Return R
@@ -99,8 +103,36 @@ gfx_ext_retina == 0 ? gfx_ext_retina = 1;
 // hover tooltip over the embed (7.79+; older ignores).
 gfx_ext_flags |= 0x100 | 0x400;
 
-_pb_base = swing_patch_base(link_slot | 0);
-_pb_wpos = 0;
+// The instance registry (canonical map: .refs/swing_gmem_bridge_protocol.md),
+// read-only here: the 16-cell scan EON_Output runs to find its Swing.
+PB_REG_BASE   = 2556;
+PB_REG_STRIDE = 4;
+PB_REG_MAX    = 16;
+
+// Point the producer at ring `slot`: the base, the write cursor and the header
+// stamp. Re-aiming never clears the ring: the bridge can re-stamp a link on a
+// rebuild while audio is running, and dropping the contents would be an audible
+// gap for no reason. NSEEL allocates gmem lazily on first write, so a consumer
+// reading ahead of the first producer write sees an unbacked page: the header
+// is stamped here (the EON_FXPICK prefault precedent). A fresh producer for
+// this band: the write cursor is back at 0 while Swing's read cursor is
+// wherever it stopped, so Swing must re-aim rather than carry on a random
+// distance behind (see PATCH_OFF_GEN). Read-modify-write so the count keeps
+// rising across incarnations -- Swing only ever compares it with the last value
+// it saw, never assumes a starting number.
+function pb_aim(slot) (
+  _pb_slot = slot | 0;
+  _pb_base = swing_patch_base(_pb_slot);
+  _pb_wpos = 0;
+  gmem[_pb_base + PATCH_OFF_WPOS]  = 0;
+  gmem[_pb_base + PATCH_OFF_OWNER] = _pb_slot;
+  gmem[_pb_base + PATCH_OFF_NCH]   = PATCH_CHANS;
+  gmem[_pb_base + PATCH_OFF_GEN]   = (gmem[_pb_base + PATCH_OFF_GEN] | 0) + 1;
+);
+
+_pb_slot = -1;
+pb_aim(link_slot | 0);
+gmem[_pb_base + PATCH_OFF_HB] = 0;
 _pb_hb   = 0;
 
 // Per-pad peaks. _pb_acc fills in @sample (audio thread), @block hands the
@@ -114,36 +146,37 @@ _pb_gpk = freemem; freemem += 16;   // gfx-side, decayed
 _pb_c = 0;
 loop(16, _pb_acc[_pb_c] = 0; _pb_pk[_pb_c] = 0; _pb_gpk[_pb_c] = 0; _pb_c += 1; );
 
-// NSEEL allocates gmem lazily on first write, so a consumer reading ahead of
-// the first producer write sees an unbacked page. Stamp the header now (the
-// EON_FXPICK prefault precedent).
-gmem[_pb_base + PATCH_OFF_WPOS]  = 0;
-gmem[_pb_base + PATCH_OFF_HB]    = 0;
-gmem[_pb_base + PATCH_OFF_OWNER] = link_slot | 0;
-gmem[_pb_base + PATCH_OFF_NCH]   = PATCH_CHANS;
-// A fresh producer for this band: the write cursor is back at 0 while Swing's
-// read cursor is wherever it stopped, so Swing must re-aim rather than carry on
-// a random distance behind (see PATCH_OFF_GEN). Read-modify-write so the count
-// keeps rising across incarnations -- Swing only ever compares it with the last
-// value it saw, never assumes a starting number.
-gmem[_pb_base + PATCH_OFF_GEN]   = (gmem[_pb_base + PATCH_OFF_GEN] | 0) + 1;
-
 @slider
 
-// Re-point without clearing the ring: the bridge can re-stamp link_slot on a
-// rebuild while audio is running, and dropping the contents would be an audible
-// gap for no reason.
-_pb_new = swing_patch_base(link_slot | 0);
-_pb_new != _pb_base ? (
-  _pb_base = _pb_new;
-  _pb_wpos = 0;
-  gmem[_pb_base + PATCH_OFF_WPOS]  = 0;
-  gmem[_pb_base + PATCH_OFF_OWNER] = link_slot | 0;
-  gmem[_pb_base + PATCH_OFF_NCH]   = PATCH_CHANS;
-  gmem[_pb_base + PATCH_OFF_GEN]   = (gmem[_pb_base + PATCH_OFF_GEN] | 0) + 1;  // fresh producer here too
-);
+// link_slot speaks only while no instance id is set (link_inst 0: a chunk saved
+// before C-1, or a Patchbay the bridge is still stamping). With an id, @block
+// resolves the slot from the registry every block. Re-pointing never clears
+// the ring (pb_aim).
+(link_inst | 0) == 0 && (link_slot | 0) != _pb_slot ? pb_aim(link_slot | 0);
 
 @block
+
+// ── The id decides the ring (C-1, Audit C 2026-09-14) ──────────────────────
+// link_slot is a registry slot: session-volatile, and saved in the chunk. A
+// saved Wired project reopened where its Swing lands on another slot -- a
+// second tab, another Swing project first in the session, a reopen within the
+// ghost window, a different track order -- kept writing the OLD ring: Swing
+// read its own, saw no heartbeat, and bypassed every pad insert while the
+// switch stayed on and the lamp said "Swing not reading". So the binding is
+// the Swing's INSTANCE ID (EON_Output's idiom), resolved here every block: the
+// 16-cell registry scan, and a re-aim only when the found slot differs. Not
+// found (a Swing still booting, an id re-minted by an undo) keeps the current
+// aim; the bridge's identity walker re-stamps link_inst from the track's Swing
+// within a second, which heals both, and heals every chunk saved before C-1
+// (link_inst 0: link_slot rules until then).
+(link_inst | 0) > 0 ? (
+  _pb_fs = -1; _pb_s = 0;
+  loop(PB_REG_MAX,
+    (_pb_fs < 0 && (gmem[PB_REG_BASE + _pb_s * PB_REG_STRIDE] | 0) == (link_inst | 0)) ? _pb_fs = _pb_s;
+    _pb_s += 1;
+  );
+  (_pb_fs >= 0 && _pb_fs != _pb_slot) ? pb_aim(_pb_fs);
+);
 
 // The heartbeat is a COUNTER, not a clock — this has no wall clock and Swing
 // only needs to know it moved.
@@ -297,7 +330,7 @@ micro ? (
   gfx_setfont(1, "Arial", max(8, floor(10 * sc)), 0);
   gfx_set(0.72, 0.75, 0.80, 0.95);
   gfx_x = 14 * sc; gfx_y = H - 33 * sc;
-  sprintf(#_pb_s, "Returning %d channels (16 stereo pads) to Swing, slot %d. Out 1 = 3/4 … Out 16 = 33/34.", PATCH_CHANS, link_slot | 0);
+  sprintf(#_pb_s, "Returning %d channels (16 stereo pads) to Swing, slot %d. Out 1 = 3/4 … Out 16 = 33/34.", PATCH_CHANS, _pb_slot);
   gfx_drawstr(#_pb_s);
   gfx_set(0.42, 0.46, 0.53, 0.9);
   gfx_x = 14 * sc; gfx_y = H - 18 * sc;

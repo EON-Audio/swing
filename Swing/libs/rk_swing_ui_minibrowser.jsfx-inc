@@ -197,6 +197,10 @@ _prv_rate = 1;
 fb_prv_loop = 0;
 fb_prv_gain = 0.7;
 fb_prv_cmd  = 0;  // @gfx -> @block: 1 = play from the top, 2 = stop
+_prv_stopped = 0; // @block owns this too: STOP was the last transport command, so a chunk
+                  // of a stream still landing must not restart the audition (D-7);
+                  // cleared by PLAY and by every new preview
+_fb_was_open = 0; // @gfx: the strip was open on the previous frame (its close posts STOP)
 fb_prv_name = -1; // row handle currently loaded, so the face can show it
 
 function swing_fb_prv_init(mem_start)
@@ -210,7 +214,7 @@ function swing_fb_prv_init(mem_start)
 // undo capture and no kit state touched -- that is the entire point.
 function swing_fb_prv_load(path_str) local(f, nch, fsr, n)
 (
-  _prv_on = 0; _prv_len = 0; _prv_pos = 0;
+  _prv_on = 0; _prv_len = 0; _prv_pos = 0; _prv_stopped = 0;   // a new preview is a new request to hear (D-7)
   f = file_open(path_str);
   f >= 0 ? (
     file_riff(f, nch, fsr);
@@ -559,8 +563,10 @@ function swing_fb_can_grow()
   : 1;
 );
 
-function swing_fb_gate()
-  local(_cap, _got, _cangrow)
+// Window and idle passes only: swing_fb_gate (below) is the entry point @gfx
+// calls, and it skips embed passes whole (D-1).
+function swing_fb_gate_window()
+  local(_cap, _got, _cangrow, _fb_yield)
 (
   // ══ HOW MUCH WIDTH THE STRIP MAY TAKE, THIS FRAME ═════════════════════════
   // ⭐⭐ THE RULE: it only ever occupies width the WINDOW HAS ALREADY BEEN GIVEN.
@@ -662,7 +668,25 @@ function swing_fb_gate()
   // while invisible, so the right ~316 px of EVERY big view was click-dead --
   // a whole column of picker cards, the right-most console strips. Found in the
   // 2026-08-29 growth audit; the strip has never referenced big_view_id.
-  _fb_over = big_view_id == VIEW_NONE
+  // ⚠️ ...and the strip YIELDS where something else owns the pixels (D-2, D-6,
+  // Audit D 2026-09-14): the open THEME list (rkth_input runs in the header,
+  // AFTER this gate, and the list paints last -- over the strip -- so with the
+  // folder rail on every row from y = 28 down was dead and the click went to
+  // the browser row beneath it: a folder change, or with AUTOLOAD a file load);
+  // the rack face's change-map panel (its kdd_px ignores the strip's column);
+  // and a gesture live on the pad grid -- a swap drag or a VOL/PAN mini-knob
+  // drag drifting into the column ended the moment it crossed, because the zero
+  // below is what the knob and the swap read as a release. The strip protects
+  // its own drags the same way (fb_drag_state, below); the grid gets the same
+  // courtesy. The list and panel rects are last frame's and the gesture flag is
+  // last frame's: fine, none of them moves inside one frame.
+  _fb_yield = (rkth_open && mouse_x >= rkth_ddx && mouse_x < rkth_ddx + rkth_ddw
+                         && mouse_y >= rkth_ddy && mouse_y < rkth_ddy + rkth_ddh)
+           || (dock_face && kdd_open != KDD_MODE_NONE
+               && mouse_x >= kdd_px && mouse_x < kdd_px + CHGMAP_PANEL_W
+               && mouse_y >= kdd_py && mouse_y < kdd_py + CHGMAP_PANEL_H)
+           || _grid_gesture_live;
+  _fb_over = big_view_id == VIEW_NONE && !_fb_yield
           && mouse_x >= _fb_gx0 && mouse_x < gfx_w
           && mouse_y >= _fb_top && mouse_y < gfx_h;
   _fb_over ? (
@@ -685,6 +709,27 @@ function swing_fb_gate()
   // Same insurance as above: the press already happened on the seam, so nothing
   // out there should act on the way past.
   fb_split_drag ? ( lmb_down = 0; LMB = 0; frame_wheel = 0; );
+);
+
+// ══ THE SURFACE TEST (D-1, Audit D 2026-09-14) ═══════════════════════════════
+// The strip never appears in an EMBEDDED pass (TCP / MCP: swing_grid_draw_embedded
+// is the whole frame there), but the gate above ran in every pass, and with
+// swing_fb_can_grow at 0 in the embed its squeeze made fb_w_cur = 24 + cap on the
+// embed's own canvas: the embed's right 24 px were click-dead (the rightmost
+// pads and their VOL knobs), and 174 px with the strip open in the window --
+// most of a TCP embed, the whole 82 px MCP embed. The embed reads none of the
+// width machine and nothing consumes the stash there, so an embed pass SKIPS the
+// gate whole -- the Drum Strip rule: embed passes must skip the panel, never
+// clear it. The `_fb_*` width cells are left untouched too: the one-shot
+// first-frame adopt and the re-baseline must measure a WINDOW canvas, not
+// whichever surface REAPER painted first after a project load. Only the five
+// stash cells are zeroed, so no late reader can act on the window's last click.
+function swing_fb_gate()
+(
+  is_embedded ? (
+    _fb_g_lmbdown = 0; _fb_g_rmbdown = 0;
+    _fb_g_lmbclick = 0; _fb_g_rmbclick = 0; _fb_g_wheel = 0;
+  ) : swing_fb_gate_window();
 );
 
 // Push the filter text over the wire. LEN is written LAST of the payload and
@@ -1304,7 +1349,13 @@ function swing_fb_draw(x, y, w, h)
 
   // Keys: the filter box owns them while it has focus, otherwise the LIST does.
   // ⚠️ An embedded instance gets no keyboard at all, so neither runs there.
-  !is_embedded ? ( fb_filt_focus ? swing_fb_filter_keys() : _fb_want_keys = 1; );
+  // ⚠️ And neither runs under a MODAL (decision 6, 2026-09-15): an overlay, a
+  // popup or the macro editor owns the keyboard while it is up. Without this
+  // the arrows walked the list behind a popup, Enter loaded the focused row
+  // onto the selected pad, and a focused filter box ate every keystroke a
+  // modal's own text field was waiting for. _ui_modal_up is the modal gate's
+  // own verdict (swing_ui_modal_gate), so the two can never disagree.
+  !is_embedded && !_ui_modal_up ? ( fb_filt_focus ? swing_fb_filter_keys() : _fb_want_keys = 1; );
 
   // The old pad-triggered audition is GONE. It loaded onto a pad and played the
   // pad, which is why it fought AUTOLOAD, overwrote the kit, and failed silently
@@ -2099,6 +2150,8 @@ function swing_fb_draw(x, y, w, h)
 
   );  // fb_open
 
-  // A drag must not survive the panel closing under it.
-  !fb_open ? ( fb_drag_state = 0; fb_drag_pad = -1; );
+  // A drag must not survive the panel closing under it -- nor the audition (D-7):
+  // the strip owns its player, so the frame it closes posts its STOP once.
+  !fb_open ? ( fb_drag_state = 0; fb_drag_pad = -1; _fb_was_open ? fb_prv_cmd = 2; );
+  _fb_was_open = fb_open;
 );

@@ -277,7 +277,7 @@ function swing_grid_draw_embedded() (
       // Click to trigger via full voice launch (same path as MIDI, supports Sum/RR/VelSplit)
       mx >= ex_ && mx <= ex_ + ew_ && my >= ey_ && my <= ey_ + eh_ && lmb_down && !_eout_clicked && !_e_knob_hover ? (
         pad_is_playable(gi) ? (
-          launch_voices_for_pad(gi, p_note[gi], 127, 8);
+          swing_gt_post(gi, p_note[gi], 127, 8);
           p_held[gi] = 1; p_held_vel[gi] = 127; p_held_note[gi] = p_note[gi]; gui_held_pad = gi;
         );
       );
@@ -305,8 +305,11 @@ function swing_grid_draw_embedded() (
             p_gain[drop_gi] = 1.0; p_pan[drop_gi] = 0; p_tune[drop_gi] = 0;
             p_panL[drop_gi] = 1.0; p_panR[drop_gi] = 1.0;
             s_start[drop_gi] = 0; s_end[drop_gi] = 1.0;
+            // A sounding pad fades instead of cutting at the loader's s_len = 0
+            // (A-3): the browser path's kill-and-crossfade, same helper.
+            swing_voice_kill_pad_xf(drop_gi);
             load_from_path(drop_gi, #df);
-            recalc_pad(drop_gi); s_dirty[drop_gi] = 1;
+            swing_rcp_post_pad(drop_gi); s_dirty[drop_gi] = 1;
             // The pad's JOB follows its new sample: a native drop never touches
             // the browser, so this is the only place that can classify it.
             swing_lcd_padcat_queue_drop(drop_gi);
@@ -1146,21 +1149,26 @@ function swing_grid_draw_pads() (
         swing_synthview_open(gi);
       );
 
-      // Left-click pad → select + trigger
-      in_pad && lmb_down && !SHIFT && !ALT && pad_input_allowed() && !_out_clicked && !_note_clicked && !_name_clicked && !_knob_hover && !_syn_clicked ? (
+      // Left-click pad → select + trigger. Not with Ctrl: that is the clear
+      // gesture below, and it used to trigger the pad it was clearing (D-4).
+      in_pad && lmb_down && !SHIFT && !ALT && !CTRL && pad_input_allowed() && !_out_clicked && !_note_clicked && !_name_clicked && !_knob_hover && !_syn_clicked ? (
         sel_pad = gi;
         lcd_right_tab = 1;  // auto-switch to PAD tab
         pad_is_playable(gi) ? (
-          launch_voices_for_pad(gi, p_note[gi], 127, 8);
+          swing_gt_post(gi, p_note[gi], 127, 8);
           p_held[gi] = 1; p_held_vel[gi] = 127; p_held_note[gi] = p_note[gi]; gui_held_pad = gi;
         );
         // Pad-click-selects-track (opt-in via Colors right-click menu):
         // signal the bridge to select the corresponding multi-out child
-        // track in REAPER's TCP/MCP. 1-indexed (0 = no request, bridge
-        // writes 0 back after consuming). Gated on bridge alive so the
-        // request doesn't stale-trigger when the bridge later starts.
+        // track in REAPER's TCP/MCP. (pad + 1) + instance_id * 32 (0 = no
+        // request, bridge writes 0 back after consuming): the click names
+        // ITS instance, so the bridge selects this Swing's child track and
+        // not the first Swing's (C-4, audit C 2026-09-14; a bare 1..16 from
+        // an older face still resolves to the first Swing). Gated on bridge
+        // alive so the request doesn't stale-trigger when the bridge later
+        // starts.
         pad_click_selects_track && gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
-          gmem[GS_PAD_TRACK_SELECT] = gi + 1;
+          gmem[GS_PAD_TRACK_SELECT] = (gi + 1) + instance_id * 32;
         );
       );
 
@@ -1207,8 +1215,9 @@ function swing_grid_draw_pads() (
             p_gain[drop_gi] = 1.0; p_pan[drop_gi] = 0; p_tune[drop_gi] = 0;
             p_panL[drop_gi] = 1.0; p_panR[drop_gi] = 1.0;
             s_start[drop_gi] = 0; s_end[drop_gi] = 1.0;
+            swing_voice_kill_pad_xf(drop_gi);   // A-3: fade, never cut (see the embedded grid)
             load_from_path(drop_gi, #df);
-            recalc_pad(drop_gi);
+            swing_rcp_post_pad(drop_gi);
             s_dirty[drop_gi] = 1;
             // The pad's JOB follows its new sample: a native drop never touches
             // the browser, so this is the only place that can classify it.
@@ -1388,6 +1397,21 @@ function swing_grid_draw_pads() (
       drag_src_pad = -1; drag_active = 0;
     );
   );
+
+  // ── A gesture live on this grid (D-6) ─────────────────────────────────────
+  // The mini browser's input gate (swing_fb_gate_window) yields to it, so a
+  // swap drag or a VOL/PAN mini-knob drag that drifts into the strip's column
+  // keeps its button instead of reading the gate's zero as a release. Any
+  // pad's knob memory: _knob_active above is per pad, so the 16 are walked
+  // here. Written at the end of the draw, read by the NEXT frame's gate -- a
+  // frame stale is fine, a gesture is older than that.
+  _ggl_i = 0; _ggl_knob = 0;
+  loop(NUM_PADS,
+    _ggl_b = km_pad_vol_pan + _ggl_i * KM_PAD_MINI * KS;
+    (_ggl_b[1] || _ggl_b[KS + 1]) ? _ggl_knob = 1;
+    _ggl_i += 1;
+  );
+  _grid_gesture_live = drag_src_pad >= 0 || _ggl_knob;
 );
 
 // ── External drag-over (browser → pad grid) ───────────────────────────────

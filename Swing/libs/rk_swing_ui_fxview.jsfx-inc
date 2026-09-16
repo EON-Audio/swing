@@ -365,11 +365,17 @@ function swing_fxview_fmt_name(f)
 function swing_fxview_request(off, n)
   local(b)
 (
-  b = EON_FXPICK_BASE + max(0, min(EON_FXPICK_SLOTS - 1, _reg_my_slot)) * EON_FXPICK_STRIDE;
-  gmem[b + FXP_REQ_OFF] = off;
-  gmem[b + FXP_REQ_N]   = n;
-  _fxv_req_seq += 1;
-  gmem[b + FXP_REQ_SEQ] = _fxv_req_seq;    // LAST
+  // C-5 (audit C 2026-09-14): with no registry slot the latch of -1 clamped to slot 0
+  // and this posted into slot 0's band, so the picker bridge answered it as slot 0's
+  // (and slot 0's FX tab showed the foreign page). Unslotted -- the registry full, or
+  // the 50 ms re-claim settle -- nothing is posted; the page draws the notice instead.
+  _reg_my_slot >= 0 ? (
+    b = EON_FXPICK_BASE + max(0, min(EON_FXPICK_SLOTS - 1, _reg_my_slot)) * EON_FXPICK_STRIDE;
+    gmem[b + FXP_REQ_OFF] = off;
+    gmem[b + FXP_REQ_N]   = n;
+    _fxv_req_seq += 1;
+    gmem[b + FXP_REQ_SEQ] = _fxv_req_seq;    // LAST
+  );
 );
 
 // ── the search box ─────────────────────────────────────────────────────────
@@ -412,7 +418,7 @@ function swing_fxview_q_clear()
 // Push the query into the request half and re-ask from the top. A query change
 // resets the scroll: the result set is a different list, so holding position
 // in it would be meaningless.
-function swing_fxview_q_send()
+function swing_fxview_q_send_do()
   local(b, i)
 (
   b = EON_FXPICK_BASE + max(0, min(EON_FXPICK_SLOTS - 1, _reg_my_slot)) * EON_FXPICK_STRIDE;
@@ -442,6 +448,11 @@ function swing_fxview_q_send()
   _fxv_reqoff = 0;
 );
 
+// C-5: the query cells are slot 0's payload when this instance has no slot, so the push
+// is dropped whole (a foreign query would ride slot 0's next request). The body above
+// is unchanged under its _do name.
+function swing_fxview_q_send() ( _reg_my_slot >= 0 ? swing_fxview_q_send_do(); );
+
 // Post one mutation. Refuses while an earlier action is unacknowledged --
 // that is the whole point of the second mailbox. The 60-frame escape stops a
 // lost ack from wedging the picker forever.
@@ -449,7 +460,8 @@ function swing_fxview_act(verb, a, bnum)
   local(b)
 (
   b = EON_FXPICK_BASE + max(0, min(EON_FXPICK_SLOTS - 1, _reg_my_slot)) * EON_FXPICK_STRIDE;
-  (gmem[b + FXP_ACT_ACK] == _fxv_aseq || _fxv_await > 60) ? (
+  // C-5: no slot, no action -- a verb posted into slot 0's band ran on slot 0's chain.
+  _reg_my_slot >= 0 && (gmem[b + FXP_ACT_ACK] == _fxv_aseq || _fxv_await > 60) ? (
     gmem[b + FXP_ACT_VERB] = verb;
     gmem[b + FXP_ACT_A]    = a;
     gmem[b + FXP_ACT_B]    = bnum;
@@ -458,6 +470,20 @@ function swing_fxview_act(verb, a, bnum)
     _fxv_await = 0;
     1;
   ) : 0;
+);
+
+// An ADD on a pad asks for Wired, the way the console's empty-slot click does
+// (swing_panels_ins_aim). USER, 2026-09-14: "make the fx tab turn wired on too".
+// In stereo a pad's inserts sit on Swing's own track pinned to the pad's pair,
+// and only Wired makes them audible -- so an add with Wired off was silent.
+// Pads only: the master's inserts are on the summed output and play either way.
+// Call it only after swing_fxview_act returned 1 (the add was really posted).
+// The consumer in Swing_ReaKit.jsfx sends the switch only while Wired is off
+// and the kit is not multi-out, so asking on every add is safe.
+function swing_fxview_want_wired() local(b, t) (
+  b = EON_FXPICK_BASE + max(0, min(EON_FXPICK_SLOTS - 1, _reg_my_slot)) * EON_FXPICK_STRIDE;
+  t = gmem[b + FXP_TGT_PAD];
+  _reg_my_slot >= 0 && gmem[b + FXP_TGT_SEQ] > 0 && t >= 0 && t < NUM_PADS ? _ins_want_wired = 1;
 );
 
 // ── Snapshot the published page ─────────────────────────────────────────────
@@ -545,8 +571,11 @@ function swing_fxview_pick(_rec) local(_p) (
     (_p[FXP_R_KIND] | 0) == FXK_FOLDER ? swing_fxview_crel_push(_rec)
                                        : _fxv_chsel = _p[FXP_R_RIDX] | 0;
   ) : (
+    // A SWAP replaces a plugin the pad already had, so like the console it
+    // leaves Wired alone; an INSERT is an add.
     swing_fxview_act(_fxv_csel >= 0 ? FXA_SWAP : FXA_INSERT,
-                     _fxv_csel, _p[FXP_R_RIDX] | 0);
+                     _fxv_csel, _p[FXP_R_RIDX] | 0) && _fxv_csel < 0 ?
+      swing_fxview_want_wired();
   );
 );
 
@@ -770,7 +799,9 @@ function swing_fxview_tnum_tag(_r, _g, _b) local(_x, _y, _w, _h) (
   gfx_drawstr(#fxv_s);
 );
 
-// PIN: hold the current target instead of following REAPER's selection.
+// PIN: hold the current chain. While it is on, the picker stops following the
+// selected pad (swing_fxview_follow_pad). The bridge also latches a target from
+// the flag, which only decides anything before a pad has aimed the picker.
 // ⚠️ Writes the flag EVERY frame it draws, not only on the click. The bridge
 // reads it from gmem, which outlives both sides -- so a face reload (flag back
 // to 0) against a bridge still holding a pin, or a bridge restart against a
@@ -778,7 +809,7 @@ function swing_fxview_tnum_tag(_r, _g, _b) local(_x, _y, _w, _h) (
 function swing_fxview_pin_btn(bx, by) local(_hov, _b) (
   _b = EON_FXPICK_BASE + max(0, min(EON_FXPICK_SLOTS - 1, _reg_my_slot))
        * EON_FXPICK_STRIDE;
-  gmem[_b + FXP_TGT_PIN] = fxv_pin_on ? 1 : 0;
+  _reg_my_slot >= 0 ? ( gmem[_b + FXP_TGT_PIN] = fxv_pin_on ? 1 : 0; );   // C-5: never slot 0's flag
   _hov = mx >= bx && mx <= bx + 24 && my >= by && my <= by + 13;
   fxv_pin_on ? gfx_set(0.85, 0.62, 0.25, _hov ? 0.95 : 0.8)
              : gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, _hov ? 0.22 : 0.10);
@@ -789,8 +820,8 @@ function swing_fxview_pin_btn(bx, by) local(_hov, _b) (
   gfx_x = bx + 3; gfx_y = by + 2;
   gfx_drawstr("PIN");
   _hov ? swing_tooltip_check(1056, fxv_pin_on
-    ? "PINNED — the picker holds this track. Click to follow the selection again."
-    : "Hold this track, so the picker stops following REAPER's selection.");
+    ? "PINNED — this chain stays put. Click to follow the selected pad again."
+    : "Hold this chain, so the FX tab stops following the selected pad.");
   _hov && lmb_down ? ( fxv_pin_on = !fxv_pin_on; );
   _hov;
 );
@@ -1215,10 +1246,61 @@ function swing_fxview_col(cx, cy, cw, ch)
   gfx_rect(cx, cy + ch - 1, cw, 1); gfx_rect(cx + cw - 1, cy, 1, ch);
 );
 
+// ── The FX picker follows the selected pad ──────────────────────────────────
+// USER, 2026-09-14: the FX tab "should follow the selected pad at all times".
+// It used to show whatever the picker was last aimed at, and the only thing
+// that aimed it at a pad was a console insert slot -- so one console click on
+// pad 1 kept pad 1 on the tab for good. Swing now aims the picker itself,
+// through the SAME mailbox the console uses (swing_panels_ins_aim, a later
+// import): payload first, SEQ LAST, slot -1 = no slot focused. Called once per
+// frame from the FULL UI in Swing_ReaKit.jsfx, not from the FX tab or the rack,
+// so every way into the picker -- Shift+clicking the FX tab included -- opens
+// on the selected pad, whether or not either view was on screen.
+//
+// It aims when the mailbox names another pad (a new selection, a console click
+// aimed elsewhere, PIN turned back off) or was never written (SEQ 0 = a fresh
+// REAPER). Nothing else is needed: the bridge re-resolves an aimed pad to the
+// track that holds it NOW on every tick (resolve_target), so a stereo <->
+// multi-out change or a bridge restart keeps the right chain without a re-aim.
+//
+// ⚠️ _fxv_csel IS RESET WITH THE AIM. A console click on a FILLED slot leaves
+// that slot focused (swing_panels_ins_aim), and a focused slot turns the next
+// pick into a SWAP -- carried onto another pad it would replace that pad's
+// plugin in the same position instead of adding one.
+//
+// ⚠️ QUIET while anything else owns the mailbox or an action is in flight:
+//   PIN on           -- that is what PIN means now.
+//   any big view     -- the console's slot menus post an AIM and an ACTION as a
+//                       pair; a re-aim landing between them before the bridge
+//                       ticks would run that action on the selected pad instead.
+//                       This also covers the console's compact picker, which
+//                       only exists inside the console view. ⛔ Do not add
+//                       con_pick_open here: closing the console with that picker
+//                       up leaves the flag at 1, and the follow died with it.
+//   an unacked action -- same ack test and 60-frame escape as swing_fxview_act,
+//                       plus _fxv_aseq == 0: this instance has posted nothing, so
+//                       nothing of ours can be in flight. Without it a project
+//                       REOPENED in the same REAPER met the ack cell's old value
+//                       (gmem outlives the instance, _fxv_aseq starts at 0) and
+//                       waited out 60 frames of an FX view before following.
+//   no registry slot -- max(0, ...) would aim slot 0, another Swing's picker.
+function swing_fxview_follow_pad() local(b) (
+  b = EON_FXPICK_BASE + max(0, min(EON_FXPICK_SLOTS - 1, _reg_my_slot)) * EON_FXPICK_STRIDE;
+  !fxv_pin_on && big_view_id == VIEW_NONE && _reg_my_slot >= 0 &&
+  sel_pad >= 0 && sel_pad < NUM_PADS &&
+  (gmem[b + FXP_TGT_SEQ] == 0 || gmem[b + FXP_TGT_PAD] != sel_pad) &&
+  (_fxv_aseq == 0 || gmem[b + FXP_ACT_ACK] == _fxv_aseq || _fxv_await > 60) ? (
+    _fxv_csel = -1;
+    gmem[b + FXP_TGT_PAD]  = sel_pad;
+    gmem[b + FXP_TGT_SLOT] = -1;
+    gmem[b + FXP_TGT_SEQ]  = gmem[b + FXP_TGT_SEQ] + 1;   // SEQ LAST
+  );
+);
+
 // ── The compact LCD page for the FX tab ─────────────────────────────────────
 // Deliberately NOT a catalogue. At ~288 px the useful question is "what is on
-// this track", so this is the chain, as cards, with a way into the big view.
-// Lives here rather than with the other panels because it needs the chain
+// the selected pad", so this is its chain, as cards, with a way into the big
+// view. Lives here rather than with the other panels because it needs the chain
 // buffer and the card renderer, both of which this file already owns.
 function swing_fxview_lcd()
   local(n, i, j, p, cw, ch, cx, cy, hov, cols)
@@ -1233,7 +1315,10 @@ function swing_fxview_lcd()
   // that picker's page on a metronome -- which is exactly what "blinking at
   // a very steady interval" was. The big view does its own asking; while it
   // owns the picker, this tab has nothing to register.
-  big_view_id != VIEW_FXPICK && !con_pick_open ? (
+  // The console's compact picker counts only while the console is open: it is
+  // drawn nowhere else, and closing the console with it up leaves con_pick_open
+  // at 1, which silently stopped this re-ask for good.
+  big_view_id != VIEW_FXPICK && !(con_pick_open && big_view_id == VIEW_CONSOLE) ? (
     _fxv_lcd_ask <= 0 ? (
       swing_fxview_request(0, 1); _fxv_lcd_ask = 30;
     ) : (
@@ -1424,7 +1509,7 @@ function swing_fxview_rack(rx, ry, rw, rh)
   local(i, j, p, n, rowh, y0, cw, ch, hov, bx, on, ofl, vis, hb, hx, hu, hd)
 (
   // See swing_fxview_lcd: posting under an open picker resets its page.
-  big_view_id != VIEW_FXPICK && !con_pick_open ? (
+  big_view_id != VIEW_FXPICK && !(con_pick_open && big_view_id == VIEW_CONSOLE) ? (
     _fxv_lcd_ask <= 0 ? ( swing_fxview_request(0, 1); _fxv_lcd_ask = 30; )
                       : ( _fxv_lcd_ask -= 1; );
   );
@@ -1778,7 +1863,10 @@ function swing_fxview_draw()
     gfx_x = fxv_sav_x + 9; gfx_y = fxv_up_y;
     gfx_drawstr("SAVE CURRENT");
 
-    lmb_down && _fxv_rephov ? swing_fxview_act(FXA_CHAIN_APPLY, _fxv_chsel, -1);
+    // A chain applied to a pad lands pinned to that pad (view_chain_apply): an add.
+    lmb_down && _fxv_rephov ? (
+      swing_fxview_act(FXA_CHAIN_APPLY, _fxv_chsel, -1) ? swing_fxview_want_wired();
+    );
     lmb_down && _fxv_savhov ? swing_fxview_act(FXA_CHAIN_SAVE, -1, -1);
   );
 
@@ -2184,9 +2272,11 @@ function swing_fxview_draw()
           ? "Add the selected plugin to the end of the chain."
           : "The end of the chain — the next pick lands here.");
       hv && lmb_down ? (
-        _fxv_sel >= _fxv_off && _fxv_sel < _fxv_off + _fxv_n ?
+        _fxv_sel >= _fxv_off && _fxv_sel < _fxv_off + _fxv_n ? (
           swing_fxview_act(FXA_INSERT, -1,
-            (_fxv_rows + (_fxv_sel - _fxv_off) * FXP_REC)[FXP_R_RIDX] | 0);
+            (_fxv_rows + (_fxv_sel - _fxv_off) * FXP_REC)[FXP_R_RIDX] | 0) ?
+            swing_fxview_want_wired();
+        );
         _fxv_csel = -1;
       );
     );
@@ -2228,7 +2318,8 @@ function swing_fxview_draw()
     gfx_drawstr(#fxv_s);
     hv && grows && lmb_down ? (
       swing_fxview_act(FXA_INSERT, _fxv_csel,
-        (_fxv_rows + (_fxv_sel - _fxv_off) * FXP_REC)[FXP_R_RIDX] | 0);
+        (_fxv_rows + (_fxv_sel - _fxv_off) * FXP_REC)[FXP_R_RIDX] | 0) ?
+        swing_fxview_want_wired();
     );
   );
 
@@ -2451,7 +2542,9 @@ function swing_fxview_draw()
   _fxv_live && !_fxv_live_last ? _fxv_asked = 0;
   _fxv_live_last = _fxv_live;
 
-  _fxv_n > 0 ? (
+  // C-5: the snapshot above is slot 0's page while this instance has no slot; the
+  // list is not drawn from it and the empty state names the cause.
+  _fxv_n > 0 && _reg_my_slot >= 0 ? (
     _fxv_mode ? (
       ri = 0;
       loop(min(rows_vis, cols * grows),
@@ -2510,7 +2603,8 @@ function swing_fxview_draw()
   ) : (
     gfx_setfont(1, "Arial", 12);
     gfx_set(0.32, 0.36, 0.42, 1);
-    strcpy(#fxv_s, _fxv_live ? "no plugins matched" : "waiting for the bridge…");
+    strcpy(#fxv_s, _reg_my_slot < 0 ? "registry full — this Swing has no slot, so its picker is off"
+                 : _fxv_live ? "no plugins matched" : "waiting for the bridge…");
     gfx_measurestr(#fxv_s, tw, th);
     gfx_x = fxv_x + (fxv_w - tw) / 2;
     gfx_y = fxv_body_y + (fxv_body_h / 2) | 0;

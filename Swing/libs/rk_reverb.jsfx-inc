@@ -125,21 +125,79 @@ local(c, guard)
   c;
 );
 
-// ─── Init ──────────────────────────────────────────────────────────────────
-
-function rvb_init(mem_start)
-local(i, sc, base)
-(
-  sc = srate / 44100;
-
-  // Base (unscaled) line lengths — geometric spread, ascending.
-  rvb_base_len = mem_start; mem_start += RVB_N;
-  base = RVB_SPREAD_A * sc;
+// ─── Rate-derived geometry (A-6) ───────────────────────────────────────────
+// One scale factor (1.0 = the 44.1 kHz design) fills the three length tables:
+// the tank's base line lengths (geometric spread, ascending), the tank allpass
+// lengths (fixed primes, ~3.6:1 spread, all distinct) and the input diffusers
+// (six per channel, descending primes: the first smears the transient, the
+// short ones pack in density). rvb_init calls it with srate / 44100 and sizes
+// every buffer from the result; rvb_srate_recalc calls it again after a rate
+// change with the factor capped at RVB_SC_INIT, so nothing ever outgrows the
+// buffers it was given: a rate BELOW the load-time rate gets the geometry it
+// should have (the tank used to keep its sample lengths and shrink by the rate
+// ratio), a rate above it keeps the load-time geometry as before. Sizing the
+// buffers for 192 kHz at load is the Phase 4 alternative.
+function _rvb_set_lengths(_rl_sc) local(i, base) (
+  base = RVB_SPREAD_A * _rl_sc;
   i = 0; loop(RVB_N,
     rvb_base_len[i] = base | 0;
     base *= RVB_SPREAD_K;
     i += 1;
   );
+  rvb_tap_len[0] = max(8, (149 * _rl_sc) | 0);  rvb_tap_len[1] = max(8, (211 * _rl_sc) | 0);
+  rvb_tap_len[2] = max(8, (263 * _rl_sc) | 0);  rvb_tap_len[3] = max(8, (313 * _rl_sc) | 0);
+  rvb_tap_len[4] = max(8, (373 * _rl_sc) | 0);  rvb_tap_len[5] = max(8, (431 * _rl_sc) | 0);
+  rvb_tap_len[6] = max(8, (479 * _rl_sc) | 0);  rvb_tap_len[7] = max(8, (541 * _rl_sc) | 0);
+  rvb_ap_len[0]  = max(4, (227 * _rl_sc) | 0);   // 5.1 ms
+  rvb_ap_len[1]  = max(4, (311 * _rl_sc) | 0);   // 7.1 ms
+  rvb_ap_len[2]  = max(4, (149 * _rl_sc) | 0);   // 3.4 ms
+  rvb_ap_len[3]  = max(4, (79  * _rl_sc) | 0);   // 1.8 ms
+  rvb_ap_len[4]  = max(4, (53  * _rl_sc) | 0);   // 1.2 ms
+  rvb_ap_len[5]  = max(4, (37  * _rl_sc) | 0);   // 0.8 ms
+  rvb_ap_len[6]  = max(4, (241 * _rl_sc) | 0);
+  rvb_ap_len[7]  = max(4, (337 * _rl_sc) | 0);
+  rvb_ap_len[8]  = max(4, (163 * _rl_sc) | 0);
+  rvb_ap_len[9]  = max(4, (89  * _rl_sc) | 0);
+  rvb_ap_len[10] = max(4, (59  * _rl_sc) | 0);
+  rvb_ap_len[11] = max(4, (41  * _rl_sc) | 0);
+);
+
+// After a sample-rate change (swing_block_handle_srate_change, right before its
+// rvb_recalc): re-derive the geometry inside the existing buffers and restart the
+// tank -- a write pointer may sit past a shorter length, and the rate change has
+// already interrupted the audio. rvb_recalc then re-snaps the loop lengths to
+// primes and re-derives the gains, the damping and the pre-delay (clamped to its
+// load-time ring) from these tables; rvb_tick re-derives the modulated lengths.
+function rvb_srate_recalc() local(i) (
+  _rvb_set_lengths(min(srate / 44100, RVB_SC_INIT));
+  i = 0; loop(RVB_N,
+    memset(rvb_dl_buf[i], 0, RVB_MAX_DL);   rvb_dl_wp[i] = 0;
+    memset(rvb_tap_buf[i], 0, RVB_MAX_TAP); rvb_tap_wp[i] = 0; rvb_tap_mod[i] = rvb_tap_len[i];
+    rvb_lp_state[i] = 0;
+    i += 1;
+  );
+  i = 0; loop(RVB_NDIFF * 2,
+    memset(rvb_ap_buf[i], 0, rvb_ap_cap[i]); rvb_ap_wp[i] = 0;
+    i += 1;
+  );
+  memset(rvb_pre_bufL, 0, RVB_MAX_PRE); memset(rvb_pre_bufR, 0, RVB_MAX_PRE); rvb_pre_wp = 0;
+  rvb_hpf_stateL = 0; rvb_hpf_stateR = 0;
+);
+
+// ─── Init ──────────────────────────────────────────────────────────────────
+
+function rvb_init(mem_start)
+local(i, sc)
+(
+  sc = srate / 44100;
+  RVB_SC_INIT = sc;   // the geometry every buffer below is sized for; rvb_srate_recalc never exceeds it
+
+  // The three length tables first, then every buffer sized from them (A-6).
+  rvb_base_len = mem_start; mem_start += RVB_N;
+  rvb_tap_len  = mem_start; mem_start += RVB_N;
+  rvb_ap_len   = mem_start; mem_start += RVB_NDIFF * 2;
+  rvb_ap_cap   = mem_start; mem_start += RVB_NDIFF * 2;
+  _rvb_set_lengths(sc);
   // Longest line + PRIME-SEARCH HEADROOM (3 %: snapping walks UP to the next
   // prime, so the buffer must hold more than the raw base length) + modulation
   // excursion + interpolation guard.
@@ -157,12 +215,7 @@ local(i, sc, base)
   );
 
   // ── Tank diffusion allpasses: one per line, inside the feedback path ──
-  // Fixed prime lengths, ~3.6:1 spread, all distinct from each other.
-  rvb_tap_len = mem_start; mem_start += RVB_N;
-  rvb_tap_len[0] = max(8, (149 * sc) | 0);  rvb_tap_len[1] = max(8, (211 * sc) | 0);
-  rvb_tap_len[2] = max(8, (263 * sc) | 0);  rvb_tap_len[3] = max(8, (313 * sc) | 0);
-  rvb_tap_len[4] = max(8, (373 * sc) | 0);  rvb_tap_len[5] = max(8, (431 * sc) | 0);
-  rvb_tap_len[6] = max(8, (479 * sc) | 0);  rvb_tap_len[7] = max(8, (541 * sc) | 0);
+  // (lengths from _rvb_set_lengths above)
   RVB_MAX_TAP = (rvb_tap_len[RVB_N - 1] | 0) + RVB_TAP_SWING + 8;
 
   rvb_tap_buf = mem_start; mem_start += RVB_N;
@@ -196,32 +249,18 @@ local(i, sc, base)
   rvb_lfo_rate[6] = 1.21; rvb_lfo_rate[7] = 1.31;
   i = 0; loop(RVB_N, rvb_lfo_ph[i] = i / RVB_N; i += 1; );
 
-  // ── Input diffusion allpasses (4 series, stereo = 8 buffers) ──
+  // ── Input diffusion allpasses (6 series, stereo = 12 buffers) ──
   // Six stages per channel, descending prime lengths: 0–5 = L chain, 6–11 = R.
   // Descending so the first stage smears the transient and the later short ones
   // pack in density.
   rvb_ap_buf = mem_start; mem_start += RVB_NDIFF * 2;
   rvb_ap_wp  = mem_start; mem_start += RVB_NDIFF * 2;
-  rvb_ap_len = mem_start; mem_start += RVB_NDIFF * 2;
-
-  rvb_ap_len[0]  = max(4, (227 * sc) | 0);   // 5.1 ms
-  rvb_ap_len[1]  = max(4, (311 * sc) | 0);   // 7.1 ms
-  rvb_ap_len[2]  = max(4, (149 * sc) | 0);   // 3.4 ms
-  rvb_ap_len[3]  = max(4, (79  * sc) | 0);   // 1.8 ms
-  rvb_ap_len[4]  = max(4, (53  * sc) | 0);   // 1.2 ms
-  rvb_ap_len[5]  = max(4, (37  * sc) | 0);   // 0.8 ms
-  rvb_ap_len[6]  = max(4, (241 * sc) | 0);
-  rvb_ap_len[7]  = max(4, (337 * sc) | 0);
-  rvb_ap_len[8]  = max(4, (163 * sc) | 0);
-  rvb_ap_len[9]  = max(4, (89  * sc) | 0);
-  rvb_ap_len[10] = max(4, (59  * sc) | 0);
-  rvb_ap_len[11] = max(4, (41  * sc) | 0);
-
   i = 0; loop(RVB_NDIFF * 2,
     rvb_ap_buf[i] = mem_start;
     memset(mem_start, 0, rvb_ap_len[i]);
     mem_start += rvb_ap_len[i];
     rvb_ap_wp[i] = 0;
+    rvb_ap_cap[i] = rvb_ap_len[i];   // this buffer's size: a later rate change never grows past it
     i += 1;
   );
 
@@ -446,7 +485,7 @@ local(pre_rp, diffL, diffR,
   inR = rvb_pre_bufR[pre_rp];
   rvb_pre_wp += 1; rvb_pre_wp >= RVB_MAX_PRE ? rvb_pre_wp = 0;
 
-  // ── Input diffusion — 4 series allpasses per channel ──
+  // ── Input diffusion — 6 series allpasses per channel ──
   // Descending gains: the first stage smears hard transients, later stages add
   // density without eating the drum attack.
   diffL = _rvb_ap_process(0, inL,   RVB_IN_G1);

@@ -123,19 +123,35 @@ function svf_set_onepole()      ( svf_ramp_mode = 0; );
 // ceiling in ~9 ms, from silence, heard as a full-scale distorted blast.
 //
 // EEL2 function locals are static per-function, NOT per-call, so `_g` is shared
-// by every concurrent invocation. svf_calc_a runs on the audio thread (via
-// svf_tick) and can also be reached from @gfx (via svf_snap) — a concurrent
-// call clobbers `_g` between the three stores and builds exactly that mixed
-// triple. See svf_tick's blow-up guard, which detects and repairs the result.
+// by every concurrent invocation. That is why ONLY svf_tick (the audio thread)
+// may call svf_calc_a. It used to be reached from @gfx too: a knob on a SILENT
+// pad runs recalc_fx -> svf_snap, and that call could clobber `_g` while the
+// audio thread was deriving a PLAYING pad's triple, handing the playing pad
+// exactly that mixed triple (2026-09-13 audit). svf_snap and svf_init now use
+// svf_calc_a_nolocal below. svf_tick's blow-up guard stays as the backstop.
 function svf_calc_a(p) local(_g, _a1, _a2) (
   _g  = p[SVF_G];
   _a1 = 1.0 / (1.0 + _g * (_g + p[SVF_K]));
   _a2 = _g * _a1;
-  // Publish only after all three are derived from the SAME _g, so a reader can
-  // never observe a1 from one generation next to a2/a3 from another.
+  // Publish only after all three are derived from the SAME _g. With the audio
+  // thread as the only caller, nothing else can move _g between these stores.
   p[SVF_A1] = _a1;
   p[SVF_A2] = _a2;
   p[SVF_A3] = _g * _a2;
+);
+
+// ─── The same math for callers OFF the per-sample path ──────────────────
+// svf_snap and svf_init run from @gfx, @serialize, @init and @block. This is a
+// separate function so they never share svf_calc_a's storage with the audio
+// thread, and ⛔ it has no local() on purpose: nothing to share at all. Same
+// operations in the same order as svf_calc_a, so the result is bit-identical.
+// If two of these callers ever collide with EACH OTHER, the damage lasts at
+// most one sample: svf_tick re-derives the triple of every filter it runs,
+// every sample. Not for svf_tick itself: re-reading p[] costs more per sample.
+function svf_calc_a_nolocal(p) (
+  p[SVF_A1] = 1.0 / (1.0 + p[SVF_G] * (p[SVF_G] + p[SVF_K]));
+  p[SVF_A2] = p[SVF_G] * p[SVF_A1];
+  p[SVF_A3] = p[SVF_G] * p[SVF_A2];
 );
 
 // Blow-up guard threshold. Musical peaks through these filters stay under ~10
@@ -183,7 +199,7 @@ function svf_snap(p) (
   p[SVF_SG] = p[SVF_TG];  p[SVF_SK] = p[SVF_TK];      // seed 2-pole intermediate = target
   p[SVF_SM0] = p[SVF_TM0]; p[SVF_SM1] = p[SVF_TM1]; p[SVF_SM2] = p[SVF_TM2];
   p[SVF_T]  = 1;
-  svf_calc_a(p);
+  svf_calc_a_nolocal(p);   // not svf_calc_a: this runs from @gfx and @serialize too
 );
 
 // ─── Init: unity passthrough, resting, cleared state ─────────────────────
@@ -202,7 +218,7 @@ function svf_init(p) (
   p[SVF_M0] = 1; p[SVF_TM0] = 1; p[SVF_SM0] = 1;
   p[SVF_K] = 1.41421356237; p[SVF_TK] = 1.41421356237; p[SVF_SK] = 1.41421356237;
   p[SVF_T] = 1;
-  svf_calc_a(p);
+  svf_calc_a_nolocal(p);   // not svf_calc_a: @serialize calls this
 );
 
 // ─── Flush integrator state only (engine-gap recovery) ──────────────────
@@ -299,11 +315,14 @@ function svf_tick(p) local(_c, _t) (
   // re-derive a consistent triple from the live g,k — the filter recovers
   // silently instead of screaming. Four compares per filter per sample, no
   // transcendentals (@sample-safe).
-  // ⚠️ Written as !(x <= MAX), NOT (x > MAX). abs(NaN) > 1000 is FALSE in IEEE
-  // 754, so the natural form is NaN-BLIND: a non-finite state would be invisible
-  // to the guard AND permanent (NaN is absorbing through the whole recursion,
-  // and the settle epsilon below is equally NaN-blind so SVF_T never returns to
-  // 1). The negated form is TRUE for NaN, so the repair catches it.
+  // Written as !(x <= MAX) for Inf and the runaway: that it does catch. What it
+  // does NOT catch is NaN -- measured on REAPER 7.79 (EON_Probe_NanSem, 2026-09-14,
+  // A-11): EEL2 comparisons are NaN-blind in BOTH forms (for a NaN x, !(abs(x) <= M)
+  // reads 0 just as abs(x) > M does), and abs() of a NaN is still NaN. It does not
+  // need to: EEL2 arithmetic flushes a NaN to 0 the first time it is used (x * y,
+  // x + y, x - x all give 0; the JIT never produces one itself), so a NaN cannot
+  // latch in this recursion, and the settle flush `abs(v) < tiny ? v = 0` below is
+  // a NaN flush as well as a denormal flush. Wiki 7.8 has the measured table.
   (!(abs(p[SVF_IC1L]) <= SVF_STATE_MAX) || !(abs(p[SVF_IC2L]) <= SVF_STATE_MAX) ||
    !(abs(p[SVF_IC1R]) <= SVF_STATE_MAX) || !(abs(p[SVF_IC2R]) <= SVF_STATE_MAX)) ? (
     p[SVF_IC1L] = 0; p[SVF_IC2L] = 0; p[SVF_IC1R] = 0; p[SVF_IC2R] = 0;

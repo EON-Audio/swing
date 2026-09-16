@@ -97,7 +97,7 @@ _pp_defer = 0;       // begin() declined because a kit import owns the pad bank
 _pp_deferring = 0;   // ... and the FIRST chunk is being left unlatched on purpose
 _pp_landed = 0;
 _pp_fail_until = 0;  // LCD notice "couldn't read that file" (rk_swing_ui_state rung 1e)
-_pp_pl = 0; _pp_ci = 0; _pp_vi = 0; _pp_fresh = 0;
+_pp_pl = 0; _pp_ci = 0; _pp_fresh = 0;
 // Bridge presence + capability for the load gates (2026-09-10, plan Phase B). Decided once
 // per block in swing_padpcm_tick and read by rk_swing_browser_load (CMD 63/64) and the
 // CMD-69 dispatch: 0 = no bridge, 1 = a bridge older than this JSFX, 2 = current. A global
@@ -161,7 +161,7 @@ function swing_padpcm_begin(job)
     _pp_job = job;
     // The mini browser's audition buffer: no pad, no undo, no kit state (that is the whole
     // point, as swing_fb_prv_load says). The payload is interleaved stereo whatever the file.
-    _prv_on = 0; _prv_len = 0; _prv_pos = 0;
+    _prv_on = 0; _prv_len = 0; _prv_pos = 0; _prv_stopped = 0;   // a new preview is a new request to hear (D-7)
     _prv_ch = 2;
     _prv_sr = gmem[EON_PADPCM_HDR + PP_SR] > 0 ? gmem[EON_PADPCM_HDR + PP_SR] : srate;
     _prv_rate = _prv_sr / srate;
@@ -181,16 +181,8 @@ function swing_padpcm_begin(job)
       _pp_pad >= 0 && _pp_pad < NUM_PADS && _pp_layer < MAX_LAYERS ? (
         swing_padpcm_read_path();
         // Kill the pad's voices + 10 ms crossfade -- the start half of
-        // swing_browser_load_pad, verbatim (rk_swing_browser_load has the rationale).
-        _pp_vi = 0; loop(MAX_VOICES + 1,
-          v_slot[_pp_vi] == _pp_pad ? ( v_pos[_pp_vi] = -1; v_env[_pp_vi] = 0; v_stage[_pp_vi] = 0; );
-          _pp_vi += 1;
-        );
-        !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
-          _xf_pos = 0;
-          _xf_len = max(1, (0.010 * srate)|0);
-          _xf_active = 1;
-        );
+        // swing_browser_load_pad (rk_drumkit_dsp has the rationale).
+        swing_voice_kill_pad_xf(_pp_pad);
         // ONE outer undo bracket around clear_pad + the load (browser_load's rationale:
         // undo_capture_pad overwrites on every depth-0 capture). It closes in the
         // completion half, possibly many blocks later.
@@ -231,7 +223,7 @@ function swing_padpcm_finish()
     _prv_len > _pp_cap / 2 ? _prv_len = (_pp_cap / 2) | 0;
     // audition means "let me hear it": a one-chunk file starts here; a longer one is
     // already playing progressively and just learns its final length
-    !_prv_on ? ( _prv_pos = 0; _prv_on = _prv_len > 0 ? 1 : 0; );
+    !_prv_on && !_prv_stopped ? ( _prv_pos = 0; _prv_on = _prv_len > 0 ? 1 : 0; );   // not after a STOP (D-7)
   );
   (_pp_kind == PP_KIND_DROP || _pp_kind == PP_KIND_LAYER) && _pp_dst >= 0 ? (
     // Hand the loader job to phase 2 with what landed. From here the resume half in
@@ -396,7 +388,7 @@ local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim)
       // _prv_len instead of waiting seconds for a long file. LAST stamps the final length.
       _pp_kind == PP_KIND_PREVIEW && !(_pp_flags & PP_F_LAST) ? (
         _prv_len = min((_pp_off + _pp_len) / 2, _pp_cap / 2) | 0;
-        !_prv_on && _prv_len > 0 ? ( _prv_pos = 0; _prv_on = 1; );
+        !_prv_on && !_prv_stopped && _prv_len > 0 ? ( _prv_pos = 0; _prv_on = 1; );   // not after a STOP (D-7)
       );
       (_pp_flags & PP_F_LAST) ? swing_padpcm_finish();   // finish BEFORE the echo
       _pp_gen_seen = _pp_gen_cur;
