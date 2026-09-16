@@ -212,6 +212,38 @@ _prv_stopped = 0; // @block owns this too: STOP was the last transport command, 
                   // of a stream still landing must not restart the audition (D-7);
                   // cleared by PLAY and by every new preview
 _fb_was_open = 0; // @gfx: the strip was open on the previous frame (its close posts STOP)
+
+// ── The audition transport, in ONE place ─────────────────────────────────────
+// ⚠️⚠️ 3.0.14 SHIPPED SILENT AUDITIONS because this did not exist. The release
+// envelope was added to the file-read completion and to PLAY, and the two
+// STREAMED arming sites in rk_swing_padpcm.jsfx-inc were left setting _prv_on
+// by hand -- so the voice switched on with _prv_env and _prv_tgt still at zero,
+// rendered silence, and turned itself back off on the next sample. And the
+// streamed path is the NORMAL one: a level-204 bridge consumes CMD 69 itself,
+// and only "no bridge at all" falls through to the file read
+// (Swing_ReaKit.jsfx, the CMD 69 block). The fallback worked; the path every
+// customer uses did not.
+// Five sites arm or release this voice -- file-read completion, streamed
+// progressive, streamed LAST, stream failure, and PLAY/STOP. They all call
+// these now, so the next field added to the transport cannot reach four of
+// five again.
+function swing_prv_kill()
+(
+  _prv_on = 0; _prv_env = 0; _prv_tgt = 0;
+);
+// len > 1, matching @sample's own gate: the 2-point interpolator addresses
+// frame _prv_len - 2, so a one-frame buffer has nothing to play -- and arming
+// it anyway latched _prv_on on with no renderer running to ever clear it.
+function swing_prv_arm()
+(
+  _prv_len > 1 ? ( _prv_pos = 0; _prv_tgt = 1; _prv_on = 1; ) : swing_prv_kill();
+);
+// STOP and end-of-buffer only ASK. @sample ends the voice when the envelope
+// reaches zero, which is the whole point of having one.
+function swing_prv_release()
+(
+  _prv_tgt = 0;
+);
 fb_prv_name = -1; // row handle currently loaded, so the face can show it
 
 function swing_fb_prv_init(mem_start)
@@ -253,7 +285,7 @@ function swing_fb_prv_begin(path_str) local(nch, fsr)
   // while a release is still in flight ramps back up from wherever the envelope
   // got to -- resetting it to 0 there would step it down, which is the click
   // again, just somewhere new.
-  _prv_on = 0; _prv_env = 0; _prv_tgt = 0;
+  swing_prv_kill();
   _prv_len = 0; _prv_pos = 0; _prv_stopped = 0;   // a new preview is a new request to hear (D-7)
   _prv_lf = file_open(path_str);
   _prv_lf >= 0 ? (

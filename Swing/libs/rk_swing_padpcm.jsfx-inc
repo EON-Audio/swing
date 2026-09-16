@@ -161,7 +161,16 @@ function swing_padpcm_begin(job)
     _pp_job = job;
     // The mini browser's audition buffer: no pad, no undo, no kit state (that is the whole
     // point, as swing_fb_prv_load says). The payload is interleaved stereo whatever the file.
-    _prv_on = 0; _prv_len = 0; _prv_pos = 0; _prv_stopped = 0;   // a new preview is a new request to hear (D-7)
+    swing_prv_kill();
+    _prv_len = 0; _prv_pos = 0;
+    // ⚠️ CLEARED AT FIRST, WHICH IS NOT THE REQUEST EDGE. A STOP or a browser
+    // close that lands between the click and the first chunk is forgotten here
+    // and the audition starts anyway. Known, NOT fixed in this hotfix: on the
+    // bridge path the JSFX never sees the click (the bridge consumes CMD 69),
+    // so moving this needs a request id the stream can be matched against --
+    // and getting it wrong leaves every preview after one STOP muted forever,
+    // which is worse than the race. Needs EON_Probe_Audition, not a guess.
+    _prv_stopped = 0;   // a new preview is a new request to hear (D-7)
     _prv_ch = 2;
     _prv_sr = gmem[EON_PADPCM_HDR + PP_SR] > 0 ? gmem[EON_PADPCM_HDR + PP_SR] : srate;
     _prv_rate = _prv_sr / srate;
@@ -223,7 +232,7 @@ function swing_padpcm_finish()
     _prv_len > _pp_cap / 2 ? _prv_len = (_pp_cap / 2) | 0;
     // audition means "let me hear it": a one-chunk file starts here; a longer one is
     // already playing progressively and just learns its final length
-    !_prv_on && !_prv_stopped ? ( _prv_pos = 0; _prv_on = _prv_len > 0 ? 1 : 0; );   // not after a STOP (D-7)
+    !_prv_on && !_prv_stopped ? swing_prv_arm();   // not after a STOP (D-7); arm() owns the envelope
   );
   (_pp_kind == PP_KIND_DROP || _pp_kind == PP_KIND_LAYER) && _pp_dst >= 0 ? (
     // Hand the loader job to phase 2 with what landed. From here the resume half in
@@ -248,7 +257,7 @@ function swing_padpcm_fail(job)
 local(_cmd)
 (
   _cmd = _pp_kind == PP_KIND_PREVIEW ? 69 : _pp_kind == PP_KIND_DROP ? 63 : _pp_kind == PP_KIND_LAYER ? 64 : 0;
-  _pp_kind == PP_KIND_PREVIEW ? ( _prv_on = 0; );
+  _pp_kind == PP_KIND_PREVIEW ? swing_prv_kill();
   (_pp_kind == PP_KIND_DROP || _pp_kind == PP_KIND_LAYER) ? (
     _pp_dst >= 0 && _pp_job == job ? (
       swing_ldr_abort(ldr_job0);
@@ -388,7 +397,7 @@ local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim)
       // _prv_len instead of waiting seconds for a long file. LAST stamps the final length.
       _pp_kind == PP_KIND_PREVIEW && !(_pp_flags & PP_F_LAST) ? (
         _prv_len = min((_pp_off + _pp_len) / 2, _pp_cap / 2) | 0;
-        !_prv_on && !_prv_stopped && _prv_len > 0 ? ( _prv_pos = 0; _prv_on = 1; );   // not after a STOP (D-7)
+        !_prv_on && !_prv_stopped ? swing_prv_arm();   // not after a STOP (D-7); arm() owns the envelope
       );
       (_pp_flags & PP_F_LAST) ? swing_padpcm_finish();   // finish BEFORE the echo
       _pp_gen_seen = _pp_gen_cur;
