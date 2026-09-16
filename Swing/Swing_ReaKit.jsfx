@@ -3,7 +3,7 @@
 desc: Swing
 tags: instrument, sampler, drums
 author: EON Studios
-version: 3.0.13
+version: 3.0.14
 
 slider1:root_note=36<0,127,1>-Base Note
 slider2:master_db=0<-48,12,0.1>-Master Volume (dB)
@@ -1508,6 +1508,27 @@ i = 0; loop(NUM_PADS,
   fx_bc_cnt[i] = 0; fx_bc_holdL[i] = 0; fx_bc_holdR[i] = 0; fx_bc_lvl[i] = 32768;
   fx_lpf_stL[i] = 0; fx_lpf_stR[i] = 0;
   fx_cmp_env[i] = 0; fx_cmp_last_gr[i] = 0; fx_cmp_last_lin[i] = 1.0;
+  // The 3.0.13 additions, explicitly zeroed for the same reason sp_pitch_mode
+  // is twenty lines up: freemem is not reliably zero on every reload, and each
+  // of these is READ before it is written on the first sample of a hit.
+  //   fx_sat_drv_sm  is _drv, the wet/dry coefficient in `_aL += (_doL-_aL)*_drv`
+  //                  -- garbage here is not a fast self-heal, it is one sample of
+  //                  arbitrary magnitude arriving at the output guard.
+  //   fx_res         is a COUNTDOWN. Garbage > 0 counts down one per sample, so a
+  //                  large value holds every pad's whole FX chain awake for the
+  //                  session -- the sleep gate silently off, which is the one
+  //                  thing it was added to do.
+  //   fx_dc_*        one stale offset through the 5 Hz blocker on the first
+  //                  TUBE sample.
+  // fx_sat_drv_sm starts at 0 and NOT at fx_sat_drv[i] only because the two are
+  // the same thing here -- fx_sat_drv[i] was set to 0 thirty lines up, in this
+  // same loop. Whatever @serialize restores after @init arrives later, and the
+  // idle snap in process_pad_fx (which runs for every pad on every sample,
+  // Swing_ReaKit.jsfx:5327) carries the smoother to it before the pad is struck.
+  fx_res[i] = 0;
+  fx_sat_drv_sm[i] = 0;
+  fx_dc_x1L[i] = 0; fx_dc_y1L[i] = 0;
+  fx_dc_x1R[i] = 0; fx_dc_y1R[i] = 0;
   i += 1;
 );
 
@@ -1570,6 +1591,11 @@ _pad_meter_decay = exp(-1.0 / max(1, 0.090 * srate));   // ~90ms pad meter fall
 _mst_meter_decay = exp(-1.0 / max(1, 0.450 * srate));   // ~450ms master meter fall
 _sm_coeff = 1.0 - exp(-1.0 / max(1, 0.0045 * srate));   // ~4.5ms (sat drive + master vol)
 _pad_sm_coeff = 1.0 - exp(-1.0 / max(1, 0.008 * srate));  // ~8ms (per-pad pan + drive)
+// Browser audition release. LINEAR, not the one-pole the smoothers above use:
+// this one has to actually REACH zero to end the voice, and a one-pole only
+// approaches it. ~4 ms -- long enough to kill the step, short enough that STOP
+// still feels instant.
+_prv_fade_step = 1.0 / max(1, 0.004 * srate);
 // Pad sleep-gate hold: how long a pad keeps processing after its chain last
 // showed energy. Only has to bridge a zero crossing, so 30 ms is generous --
 // and being derived from srate it is the same 30 ms at every rate.
@@ -3978,16 +4004,29 @@ gmem[KIT_GMEM_CMD] == 69 && !kit_busy && !_bl_inflight && _bridge_state != 2 ? (
 // so the two cost the same per block. Audition means "let me hear it" -- the
 // load landing IS the request to play, which is why the transport starts here
 // rather than at the CMD-69 site that began it.
+// ⚠️ ...unless a STOP arrived while it was still landing. This site is the THIRD
+// completion path for a preview and was the one that did not ask. The two
+// streamed ones both do (rk_swing_padpcm.jsfx-inc, `!_prv_on && !_prv_stopped`,
+// tagged D-7) -- the file-read path was simply missed, and the comment eight
+// lines below already promised the latch it was not honouring.
+// STOP is not only the STOP button: closing the browser sends cmd 2
+// (rk_swing_ui_minibrowser.jsfx-inc), and so does a @gfx idle transition down at
+// the bottom of this file -- and an open window stops the embed's @gfx, which is
+// routine. Symptom: audition something long, close the browser, and it starts
+// playing with no face left to stop it.
 _prv_loading ? (
-  swing_fb_prv_step(ldr_budget) ? ( _prv_len > 0 ? ( _prv_pos = 0; _prv_on = 1; ) );
+  swing_fb_prv_step(ldr_budget) ? ( _prv_len > 0 && !_prv_stopped ? ( _prv_pos = 0; _prv_tgt = 1; _prv_on = 1; ) );
 );
 
 // Face -> engine transport. @gfx must not own the read position, so it asks
 // here and @block sets the state that @sample reads.
 // STOP latches _prv_stopped so a stream still landing cannot restart the audition;
 // PLAY and every new preview clear it (D-7).
-fb_prv_cmd == 1 ? ( _prv_stopped = 0; _prv_len > 0 ? ( _prv_pos = 0; _prv_on = 1; ); fb_prv_cmd = 0; ) :
-fb_prv_cmd == 2 ? ( _prv_on = 0; _prv_stopped = 1; fb_prv_cmd = 0; );
+// STOP no longer clears _prv_on here -- it asks for the release and @sample
+// ends the voice when the envelope reaches zero. Clearing it outright is what
+// made the click.
+fb_prv_cmd == 1 ? ( _prv_stopped = 0; _prv_len > 0 ? ( _prv_pos = 0; _prv_tgt = 1; _prv_on = 1; ); fb_prv_cmd = 0; ) :
+fb_prv_cmd == 2 ? ( _prv_tgt = 0; _prv_stopped = 1; fb_prv_cmd = 0; );
 gmem[KIT_GMEM_CMD] == 65 && _reg_my_slot == gmem[GS_PENDING_PITCH_INST] && !kit_busy && !_bl_inflight ? swing_pad_audio_swap();  // !kit_busy: defer Tuned bake while a kit-import restore is populating pad buffers (blank-pads race)
 gmem[KIT_GMEM_CMD] == 66 && _reg_my_slot == gmem[GS_PENDING_PITCH_INST] && !kit_busy && !_bl_inflight ? swing_pad_audio_export();  // !kit_busy (Phase 3): 66 writes KIT_GMEM_AUDIO offset 0, where VER-201 stages pad 0 path string
 gmem[KIT_GMEM_CMD] == 67 && _reg_my_slot == gmem[GS_PENDING_PITCH_INST] && !kit_busy && !_bl_inflight ? swing_pad_layer_audio_swap();  // !kit_busy (Phase 3): same shared-band defer as CMD 65
@@ -5476,11 +5515,20 @@ _sat_drv_sm > 0.01 ? (
   // rk_drumkit_fx.jsfx-inc for why the "HPF downstream" its curve comment
   // promised does not exist. Same one-pole here so the MASTER curve cannot
   // push an offset into the limiter and the meters.
-  gfx_drv_mode == 1 ? (
+  (gfx_drv_mode | 0) == 1 ? (
     _mdc_yL = _gL - _mdc_x1L + _dc_r * _mdc_y1L;
     _mdc_x1L = _gL; _mdc_y1L = _mdc_yL; _gL = _mdc_yL;
     _mdc_yR = _gR - _mdc_x1R + _dc_r * _mdc_y1R;
     _mdc_x1R = _gR; _mdc_y1R = _mdc_yR; _gR = _mdc_yR;
+  ) : (
+    // Same park-on-mode-change as the per-pad blocker (rk_drumkit_fx.jsfx-inc):
+    // the branch below only fires when the whole saturator goes idle, so TUBE ->
+    // TAPE with the drive still up froze this state and returning to TUBE
+    // resumed off it. On the master that offset lands in the limiter and the
+    // meters.
+    _mdc_y1L != 0 || _mdc_y1R != 0 ? (
+      _mdc_x1L = 0; _mdc_y1L = 0; _mdc_x1R = 0; _mdc_y1R = 0;
+    );
   );
 ) : (
   _mdc_y1L != 0 || _mdc_y1R != 0 ? (
@@ -5526,27 +5574,46 @@ _gR *= _vol_sm;
 // of the instrument, so it skips the pad chain entirely, but it still gets peak
 // protection and a level of its own. Linear interpolation only -- @sample
 // forbids transcendentals and this needs none.
-_prv_on && _prv_len > 0 ? (
+// _prv_len > 1, not > 0: the release below holds the read head on frame
+// _prv_len - 2 (the last one the 2-point interpolator can address), so a
+// degenerate one-frame buffer has nowhere to hold and just ends.
+_prv_on && _prv_len > 1 ? (
   _prv_i = _prv_pos | 0;
   _prv_i >= _prv_len - 1 ? (
-    fb_prv_loop ? ( _prv_pos = 0; _prv_i = 0; ) : ( _prv_on = 0; );
+    // End of buffer. LOOP wraps as before. Otherwise RELEASE instead of cutting,
+    // and hold the read head on the last addressable frame so the fade has
+    // something to decay from -- reading past _prv_len is the one thing this
+    // reader has never done. This is the end that bites: anything longer than
+    // FB_PRV_MAX is truncated mid-waveform, so the cut was at full amplitude.
+    fb_prv_loop ? ( _prv_pos = 0; _prv_i = 0; )
+                : ( _prv_tgt = 0; _prv_i = _prv_len - 2; _prv_pos = _prv_i; );
   );
   _prv_on ? (
+    // Envelope advanced BEFORE the read, so the first sample of a new audition
+    // is already above zero and the last one of a release is already below the
+    // level that would step. Folded into the knob gain, so the reads below cost
+    // exactly what they did before.
+    _prv_tgt > _prv_env ? ( _prv_env = min(_prv_tgt, _prv_env + _prv_fade_step); )
+                        : ( _prv_env = max(_prv_tgt, _prv_env - _prv_fade_step); );
+    _prv_g = fb_prv_gain * _prv_env;
     _prv_f = _prv_pos - _prv_i;
     _prv_ch == 2 ? (
       _prv_a = _prv_buf[_prv_i * 2];
       _prv_b = _prv_buf[_prv_i * 2 + 2];
-      _gL += (_prv_a + (_prv_b - _prv_a) * _prv_f) * fb_prv_gain;
+      _gL += (_prv_a + (_prv_b - _prv_a) * _prv_f) * _prv_g;
       _prv_a = _prv_buf[_prv_i * 2 + 1];
       _prv_b = _prv_buf[_prv_i * 2 + 3];
-      _gR += (_prv_a + (_prv_b - _prv_a) * _prv_f) * fb_prv_gain;
+      _gR += (_prv_a + (_prv_b - _prv_a) * _prv_f) * _prv_g;
     ) : (
       _prv_a = _prv_buf[_prv_i];
       _prv_b = _prv_buf[_prv_i + 1];
-      _prv_s = (_prv_a + (_prv_b - _prv_a) * _prv_f) * fb_prv_gain;
+      _prv_s = (_prv_a + (_prv_b - _prv_a) * _prv_f) * _prv_g;
       _gL += _prv_s; _gR += _prv_s;
     );
-    _prv_pos += _prv_rate;
+    // The voice ends HERE, when the release has actually reached zero -- not at
+    // the STOP command and not at the end of the buffer. Both of those now only
+    // ask for it.
+    _prv_env <= 0 && _prv_tgt <= 0 ? ( _prv_on = 0; ) : ( _prv_pos = _prv_pos + _prv_rate; );
   );
 );
 

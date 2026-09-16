@@ -20,7 +20,7 @@ FX_CMP_DENORM = pow(10, -30);
 // and _pfx_sendL/_pfx_sendR (post-FX, pre-pan — for send buses).
 function process_pad_fx(i)
 local(_aL, _aR, _svf_base, _svf,
-      _bc_hold, _bc_levels, _sm,
+      _bc_hold, _bc_levels, _sm, _smR,
       _cmp_det, _cmp_lev, _cmp_gr, _cmp_lin, _cmp_wet_L, _cmp_wet_R,
       _dcx, _dcy, _drv)
 (
@@ -173,11 +173,29 @@ local(_aL, _aR, _svf_base, _svf,
       // FUZZ, sixteen lines below TUBE in the curve bank, subtracts its own
       // bias -- TUBE never did. One-pole blocker, gated on the mode so no
       // other curve pays for it.
-      fx_drv_mode[i] == 1 ? (
+      // ⚠️ `|0`, spelled the same way drive_process is dispatched two lines up.
+      // The two tests select the same curve and MUST agree: a kit import copies
+      // this field raw out of gmem (rk_swing_ui_state.jsfx-inc, a bulk block
+      // where nothing is coerced), so a blob carrying 1.5 would run TUBE by the
+      // truncating dispatch while a bare `== 1` left the blocker off -- the DC
+      // back, on exactly the pads a kit set to TUBE, with the fix still in the
+      // file. Gate on the value the curve bank actually sees.
+      (fx_drv_mode[i] | 0) == 1 ? (
         _dcx = fx_dc_x1L[i]; _dcy = _aL - _dcx + _dc_r * fx_dc_y1L[i];
         fx_dc_x1L[i] = _aL; fx_dc_y1L[i] = _dcy; _aL = _dcy;
         _dcx = fx_dc_x1R[i]; _dcy = _aR - _dcx + _dc_r * fx_dc_y1R[i];
         fx_dc_x1R[i] = _aR; fx_dc_y1R[i] = _dcy; _aR = _dcy;
+      ) : (
+        // Leaving TUBE parks it too, not just turning the knob down. The park
+        // used to live only in the drive-off branch below, so TUBE -> TAPE with
+        // the knob still up FROZE x1/y1, and coming back to TUBE resumed from
+        // signal history that could be minutes old: the first sample got
+        // -x1_stale + R*y1_stale as an offset, decaying over the blocker's own
+        // 32 ms (_dc_r is a 5 Hz pole). Not a click -- a low thump, which is
+        // harder to place.
+        fx_dc_y1L[i] != 0 || fx_dc_y1R[i] != 0 ? (
+          fx_dc_x1L[i] = 0; fx_dc_y1L[i] = 0; fx_dc_x1R[i] = 0; fx_dc_y1R[i] = 0;
+        );
       );
     ) : (
       // Drive off: park the blocker, or re-engaging steps off stale state.
@@ -235,10 +253,22 @@ local(_aL, _aR, _svf_base, _svf,
     // writing four cells unconditionally doubled the cost of the idle path.
     // On target -- which is the whole of a quiet session -- it now writes
     // nothing at all.
-    _sm = strip_tk[i] ? 1.0 : p_panL[i];
-    p_panL_sm[i] != _sm || fx_sat_drv_sm[i] != fx_sat_drv[i] ? (
+    // ⚠️⚠️ The guard has to ask about BOTH coefficients. It used to test only
+    // p_panL_sm, and the pan law is a linear balance, not constant power:
+    //   p_panL = 1.0 - max(0, p_pan)      p_panR = 1.0 + min(0, p_pan)
+    // (rk_drumkit_dsp.jsfx-inc). So for EVERY pan value left of centre, p_panL
+    // sits at exactly 1.0 and does not move at all -- 1.0 != 1.0 is false, the
+    // guard never fired, and p_panR_sm stayed stranded at its old value. The
+    // next hit then swept centre -> left across its first 8 ms: precisely the
+    // sweep this snap exists to prevent, on half the knob. Panning RIGHT always
+    // worked, because there it is L that moves, so it survives an ear test done
+    // in one direction.
+    _sm  = strip_tk[i] ? 1.0 : p_panL[i];
+    _smR = strip_tk[i] ? 1.0 : p_panR[i];
+    p_panL_sm[i] != _sm || p_panR_sm[i] != _smR ||
+    fx_sat_drv_sm[i] != fx_sat_drv[i] ? (
       p_panL_sm[i] = _sm;
-      p_panR_sm[i] = strip_tk[i] ? 1.0 : p_panR[i];
+      p_panR_sm[i] = _smR;
       fx_sat_drv_sm[i] = fx_sat_drv[i];
     );
     fx_res[i] > 0 ? fx_res[i] = 0;
