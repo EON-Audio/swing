@@ -17113,7 +17113,14 @@ function eon_fill_parse_kit_v4(filepath)
   end
   local chunk = load(content:sub(17, 16 + lua_len), "swing_v4_fill", "t", {})
   if not chunk then return nil, "invalid v4 Lua section" end
-  local ok, kit = pcall(chunk)
+  -- Bounded, not just sandboxed -- the same reason load_kit_v2 and load_kit_v4
+  -- are. The empty env above stops capability and the pcall stops errors, but
+  -- neither stops `while true do end`, and a FILL is run against a kit the user
+  -- may have been sent. This path was the one site the 3.0.13 hardening missed:
+  -- the two LOAD parsers got run_bounded and FILL kept a bare pcall, so the
+  -- cheapest way to hang REAPER with a shared kit was to offer it for FILL
+  -- rather than Load. The budget trip arrives here as an ordinary failure.
+  local ok, kit = core.run_bounded(chunk)
   if not ok or type(kit) ~= "table" then return nil, "invalid v4 kit data" end
   -- Binary walk (read-only): per pad [lc:8B] then ((lc==0) and 1 or lc)
   -- blobs of [len:8B][sr:8B][PCM len*2] — mirrors read_blob's truncation

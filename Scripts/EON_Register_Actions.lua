@@ -49,8 +49,16 @@ local BLOCK = {
 
 local function excluded(name)
   if BLOCK[name] then return true end
-  -- dev/test/diagnostic scripts
-  if name:find("TEST") or name:find("Test") or name:find("Diag") then return true end
+  -- dev/test/diagnostic scripts. Matched CASE-INSENSITIVELY against a small set
+  -- of stems rather than as literal spellings: the old form was
+  -- `find("TEST") or find("Test") or find("Diag")`, which is two spellings of
+  -- one word plus one spelling of another, and it let EON_Dock_Debug.lua into
+  -- customers' Action Lists because nobody had thought of "Debug". Spelling out
+  -- each capitalisation is a guard list that grows by one entry per mistake.
+  local lower = name:lower()
+  for _, stem in ipairs({ "test", "diag", "debug", "probe" }) do
+    if lower:find(stem, 1, true) then return true end
+  end
   return false
 end
 

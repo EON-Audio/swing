@@ -118,14 +118,44 @@ local function project_has_swing()
   return false
 end
 
--- Mini version of rk_lua_core's jsfx_addname (same candidate order, same
--- "JS:" + Effects-relative format). The core resolver stays the canonical one.
+-- rk_lua_core ships in THIS folder. Loaded lazily and under pcall so a missing
+-- or broken core degrades to the candidates below rather than taking the dock
+-- down with it.
+local _core_mod, _core_tried
+local function eon_core()
+  if not _core_tried then
+    _core_tried = true
+    local ok, m = pcall(dofile, here .. sep .. "rk_lua_core.lua")
+    if ok and type(m) == "table" and type(m.jsfx_addname) == "function" then _core_mod = m end
+  end
+  return _core_mod
+end
+
+-- ⚠️⚠️ THE THREE CANDIDATES BELOW CANNOT REACH A ReaPack INSTALL, which is the
+-- only channel Swing ships through. ReaPack puts the plugin under
+-- <resource>/Effects/<index name>/EON/Swing/, and the index name is remote
+-- metadata the user can rename -- so it has to be DISCOVERED by enumerating the
+-- Effects subfolders, which is core.jsfx_addname step 3, and it was never
+-- copied here. The old comment claimed "same candidate order as core", which was
+-- true and misleading: core has two MORE steps after these, and those two are
+-- the ones every customer needs. Symptom was "Swing_ReaKit.jsfx was not found
+-- under the Effects folder" on a clean install of the shipping build.
+-- Candidates first, core second, deliberately: this is strictly additive, so an
+-- install that resolves today resolves identically and only the case that was
+-- broken changes. (Which copy WINS on a machine carrying both an old .exe
+-- install and ReaPack is a separate question, and one core itself decides --
+-- not something to settle inside a dock script.)
 local function swing_addname()
   local eff = reaper.GetResourcePath() .. sep .. "Effects" .. sep
   for _, c in ipairs({ "EON/Swing/", "", "EON_ReaKit_Bundle/installer/src/Swing/" }) do
     local rel = c .. "Swing_ReaKit.jsfx"
     local f = io.open(eff .. rel:gsub("/", sep), "r")
     if f then f:close() return "JS:" .. rel end
+  end
+  local core = eon_core()
+  if core then
+    local addname = core.jsfx_addname("Swing_ReaKit.jsfx")
+    if addname then return addname end
   end
 end
 

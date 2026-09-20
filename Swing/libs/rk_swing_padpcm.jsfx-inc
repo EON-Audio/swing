@@ -63,6 +63,14 @@ PP_PRV_ON = 17;       // JSFX diagnostics, every block: the preview player's sta
 PP_PRV_LEN = 18;      //   (_prv_on, _prv_len frames, fb_prv_loop) -- probes read them
 PP_PRV_LOOP = 19;
 PP_BRIDGE_STATE = 20; // JSFX diagnostics, every block: _bridge_state (0 no bridge / 1 older / 2 current) -- probes read it
+PP_MEM_HEAD = 21;     // JSFX diagnostics, every block: _mem_head, the audit band's headroom
+                      // in CELLS (__memtop() - the top of everything addressed). Negative =
+                      // past the ceiling, where writes land in a phantom page and NOTHING
+                      // PERSISTS, with no crash and no warning. It was drawn in @gfx and
+                      // nowhere else, so the one number that says whether this build's
+                      // memory is safe could only be read by a human looking at the FX
+                      // view -- no probe, no script, no gate could ask. Published here so
+                      // every future freemem addition can be checked instead of estimated.
 PP_PATH = 64;      // len-prefixed path record (eon_write_gmem_path convention), +64..+323
 
 PP_KIND_DROP = 0; PP_KIND_LAYER = 1; PP_KIND_PREVIEW = 2; PP_KIND_KIT = 3; PP_KIND_REPAIR = 4;
@@ -163,14 +171,10 @@ function swing_padpcm_begin(job)
     // point, as swing_fb_prv_load says). The payload is interleaved stereo whatever the file.
     swing_prv_kill();
     _prv_len = 0; _prv_pos = 0;
-    // ⚠️ CLEARED AT FIRST, WHICH IS NOT THE REQUEST EDGE. A STOP or a browser
-    // close that lands between the click and the first chunk is forgotten here
-    // and the audition starts anyway. Known, NOT fixed in this hotfix: on the
-    // bridge path the JSFX never sees the click (the bridge consumes CMD 69),
-    // so moving this needs a request id the stream can be matched against --
-    // and getting it wrong leaves every preview after one STOP muted forever,
-    // which is worse than the race. Needs EON_Probe_Audition, not a guess.
-    _prv_stopped = 0;   // a new preview is a new request to hear (D-7)
+    // ⭐ _prv_stopped is NOT cleared here any more. FIRST is when the data
+    // arrives, not when the user asked, and clearing a cancellation on arrival
+    // is what made a STOP before the first chunk vanish. The clear now happens
+    // on the CMD-69 rising edge in swing_padpcm_tick, which is the request.
     _prv_ch = 2;
     _prv_sr = gmem[EON_PADPCM_HDR + PP_SR] > 0 ? gmem[EON_PADPCM_HDR + PP_SR] : srate;
     _prv_rate = _prv_sr / srate;
@@ -187,7 +191,19 @@ function swing_padpcm_begin(job)
       _pp_pad = gmem[EON_PADPCM_HDR + PP_PAD] | 0;
       _pp_layer = _pp_kind == PP_KIND_DROP ? -1 : (gmem[EON_PADPCM_HDR + PP_LAYER] | 0);
       _pp_base = _pp_layer < 0 ? 0 : _pp_layer * LAYER_SIZE;   // barrier coords are slot-relative
-      _pp_pad >= 0 && _pp_pad < NUM_PADS && _pp_layer < MAX_LAYERS ? (
+      // ⚠️ The layer bound needs BOTH ends. It was `_pp_layer < MAX_LAYERS`
+      // alone, and the line directly above turns ANY negative into the main pad
+      // (`_pp_layer < 0 ? 0`) -- not only the -1 that means "this is a pad
+      // drop". So a LAYER job carrying -2 in its header passed the guard and
+      // then rewrote the WHOLE PAD instead of one layer. Only the bridge writes
+      // that field in normal use, so this is hardening rather than a live bug,
+      // but it costs one comparison and what it prevents is a silent overwrite
+      // of a pad the user never touched. DROP is spelled out rather than left
+      // implicit: it is assigned -1 two lines up, and if that ever changes this
+      // guard should fail loudly instead of quietly widening.
+      _pp_pad >= 0 && _pp_pad < NUM_PADS &&
+      (_pp_kind == PP_KIND_DROP ? _pp_layer == -1
+                                : (_pp_layer >= 0 && _pp_layer < MAX_LAYERS)) ? (
         swing_padpcm_read_path();
         // Kill the pad's voices + 10 ms crossfade -- the start half of
         // swing_browser_load_pad (rk_drumkit_dsp has the rationale).
@@ -274,12 +290,13 @@ local(_cmd)
 
 // ── @block: advertise, latch a published chunk, copy a bounded slice, echo. ──
 function swing_padpcm_tick()
-local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim)
+local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim, _prv_cmd_now)
 (
   gmem[EON_PADPCM_HDR + PP_JSFX_LEVEL] = EON_PADPCM_LEVEL;
   gmem[EON_PADPCM_HDR + PP_PRV_ON] = _prv_on;
   gmem[EON_PADPCM_HDR + PP_PRV_LEN] = _prv_len;
   gmem[EON_PADPCM_HDR + PP_PRV_LOOP] = fb_prv_loop;
+  gmem[EON_PADPCM_HDR + PP_MEM_HEAD] = _mem_head;
   // Bridge-dead guard: a streamable CMD that a level-204 bridge should turn into a job but
   // never does (it died between posting and streaming) must not wedge the browser queue --
   // the bridge's own stale-CMD watchdog is dead with it. 3 s unadopted -> ack. Not while
@@ -299,6 +316,25 @@ local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim)
                   (gmem[EON_PADPCM_HDR + PP_BRIDGE_LEVEL] >= EON_PADPCM_LEVEL ? 2 : 1);
   gmem[EON_PADPCM_HDR + PP_BRIDGE_STATE] = _bridge_state;   // diagnostic: what the gates will see
   _c = gmem[KIT_GMEM_CMD] | 0;
+  // ── The audition request edge ────────────────────────────────────────────
+  // ⚠️⚠️ _prv_stopped used to be cleared in swing_padpcm_begin -- when the
+  // FIRST chunk lands, which is not when the user asked. A STOP, or a browser
+  // close (which posts one), landing in the gap between the click and that
+  // chunk was forgotten, and the audition then started with the browser
+  // already gone: sound arriving from a window that is no longer there.
+  // On the bridge path the JSFX never sees the click itself -- the bridge
+  // consumes CMD 69. But it DOES see the command sitting in gmem for the whole
+  // job, because nothing acks it until swing_padpcm_finish. So the RISING EDGE
+  // of "CMD 69 addressed to me" is the request, and it is the only event
+  // permitted to clear a cancellation. The level would not do: it stays 1 for
+  // the entire stream, which would re-clear a STOP pressed mid-flight and undo
+  // the D-7 latch this is built beside.
+  // ⭐ A fresh request after a cancelled one is a NEW edge, because the
+  // cancelled job still runs to LAST and acks the CMD on its way out. That is
+  // what stops this becoming the latch-it-off non-fix.
+  _prv_cmd_now = (_c == 69) && (gmem[KIT_GMEM_INSTANCE] | 0) == (instance_id | 0);
+  _prv_cmd_now && !_prv_cmd_seen ? _prv_stopped = 0;
+  _prv_cmd_seen = _prv_cmd_now;
   (_c == 69 || _c == 63 || _c == 64) && _pp_job < 0 && _pp_gen_cur == 0 && !_pp_deferring &&
   _bridge_state == 2 ? (
     _pp_idle_t == 0 ? _pp_idle_t = time_precise() :

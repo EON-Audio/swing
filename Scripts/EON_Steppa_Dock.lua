@@ -130,12 +130,47 @@ local auto_tried = {}           -- track GUID → true once we attempted an add
 -- mini resolver for Swing; the core resolver stays the canonical one. The
 -- flat Effects-root copy is StepSeq's canonical runtime location (existing
 -- projects reference it), so the "" candidate is the one that matches there.
+-- rk_lua_core ships in THIS folder. Lazy + pcall so a missing or broken core
+-- degrades to the candidates rather than taking the dock down.
+-- This script had no notion of its own directory, so it gets the same
+-- debug.getinfo idiom EON_Swing_Dock_View uses -- NOT a resource-path constant,
+-- which is the thing that used to name the author's own checkout and resolved
+-- nowhere on a customer machine.
+local function eon_script_dir()
+  local info = debug.getinfo(1, "S")
+  local path = info.source:match("@?(.*)") or ""
+  return path:match("^(.*)[/\\]") or ""
+end
+local _core_mod, _core_tried
+local function eon_core()
+  if not _core_tried then
+    _core_tried = true
+    local ok, m = pcall(dofile, eon_script_dir() .. sep .. "rk_lua_core.lua")
+    if ok and type(m) == "table" and type(m.jsfx_addname) == "function" then _core_mod = m end
+  end
+  return _core_mod
+end
+
+-- ⚠️⚠️ Same hole as EON_Swing_Dock_View: these three candidates cannot reach a
+-- ReaPack install (<resource>/Effects/<index name>/EON/Swing/), and the index
+-- name has to be discovered rather than typed. Here the symptom was SILENT --
+-- adding Steppa to a Swing track that had none simply did nothing, with no
+-- message at all, which is worse than the dock view's error box.
+-- Candidates stay FIRST on purpose: the flat Effects-root copy is StepSeq's
+-- canonical runtime location and existing projects reference it by that path,
+-- so resolving somewhere else first would hand REAPER a different plugin
+-- identity than the one those projects already carry.
 local function steppa_addname()
   local eff = reaper.GetResourcePath() .. sep .. "Effects" .. sep
   for _, c in ipairs({ "EON/Swing/", "", "EON_ReaKit_Bundle/installer/src/Swing/" }) do
     local rel = c .. "EON_StepSeq.jsfx"
     local f = io.open(eff .. rel:gsub("/", sep), "r")
     if f then f:close() return "JS:" .. rel end
+  end
+  local core = eon_core()
+  if core then
+    local addname = core.jsfx_addname("EON_StepSeq.jsfx")
+    if addname then return addname end
   end
 end
 

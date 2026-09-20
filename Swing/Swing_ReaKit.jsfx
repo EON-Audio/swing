@@ -3,7 +3,7 @@
 desc: Swing
 tags: instrument, sampler, drums
 author: EON Studios
-version: 3.0.15
+version: 3.0.16
 
 slider1:root_note=36<0,127,1>-Base Note
 slider2:master_db=0<-48,12,0.1>-Master Volume (dB)
@@ -535,6 +535,11 @@ ps_mac5 = freemem; freemem += NUM_PADS;
 ps_mac6 = freemem; freemem += NUM_PADS;
 ps_mac7 = freemem; freemem += NUM_PADS;
 v_kind      = freemem; freemem += V_SLOTS;                       // 0=sample, 1=synth
+// 1 = this voice is a STRETCH pad playing LOCALLY because the Extension could not
+// be reached (no registry slot). Per VOICE, not per pad, for the same reason
+// v_kind is: the pad can claim a slot while this note is still ringing, and the
+// note must not fall silent underneath the player when it does.
+v_stfb      = freemem; freemem += V_SLOTS;
 v_syn_state = freemem; freemem += V_SLOTS * RK_SYN_STATE_SIZE; // per-voice engine state
 _syn_mac_scratch = freemem; freemem += RK_SYN_MACROS;                   // trigger-time gather
 freemem = rk_syn_init(freemem);                                         // engine LUTs (once)
@@ -887,6 +892,12 @@ pc          = freemem; freemem += NUM_PADS;
 // to load fresh from the kit (a restored length could index past the loaded
 // buffer). Globals are preserved by gating the kit-import globals block.
 // (See swing_kit_preserve_snapshot / _restore in rk_swing_ui_state.jsfx-inc.)
+// Pad NAME strings, as char codes rather than string slots. memcpy cannot
+// shadow a string, which is why names were left out of the preserve snapshot
+// to begin with -- so this borrows the undo engine's proven shape
+// (udo_s2_name): 33 cells of cname then 33 of name, per pad -- 33, because
+// PNE_MAX_LEN is 32 and a full 32-char name still needs its terminator.
+sv_pad_names     = freemem; freemem += NUM_PADS * 66;
 sv_p_gain        = freemem; freemem += NUM_PADS;
 sv_p_pan         = freemem; freemem += NUM_PADS;
 sv_p_tune        = freemem; freemem += NUM_PADS;
@@ -1362,7 +1373,7 @@ _udo_uc = 0; _udo_rc = 0; _udo_applying = 0;
 // region (near _send_fx_mem). Scoped restore => no collateral on other pads.
 udo_st_meta = freemem; freemem += UDO_STRIDE;             // ONE pad's param/layer pack (undo_pack)
 udo_s2_aud  = freemem; freemem += 16;                     // one pad: s_len,s_sr,p_layer_cnt + l_len/l_sr/sp_baked_tune x4
-udo_s2_name = freemem; freemem += 1428;                   // one pad: cname(32)+name(32)+path(272)+4 layer paths(4*272) char codes (P3: LPATH undo fix)
+udo_s2_name = freemem; freemem += 1432;                   // one pad: cname(33)+name(33)+path(272)+4 layer paths(4*272) char codes (P3: LPATH undo fix; 33 per name so a full 32-char name keeps its terminator)
 _udo_st_valid = 0;       // 1 = a structural undo entry exists
 udo_s2_type = 0;         // 1 = per-pad, 2 = swap, 3 = kit (deferred)
 udo_s2_pad  = -1; udo_s2_pad2 = -1;
@@ -1562,7 +1573,7 @@ i = 0; loop(NUM_PADS,
   i += 1;
 );
 
-i = 0; loop(V_SLOTS, v_pos[i] = -1; v_slot[i] = 0; v_stage[i] = 0; v_layer[i] = 0; v_kind[i] = 0; v_quiet[i] = 0; i += 1;);
+i = 0; loop(V_SLOTS, v_pos[i] = -1; v_slot[i] = 0; v_stage[i] = 0; v_layer[i] = 0; v_kind[i] = 0; v_stfb[i] = 0; v_quiet[i] = 0; i += 1;);
 memset(pad_flash, 0, NUM_PADS);
 memset(p_peak, 0, NUM_PADS);
 memset(p_peak_hold, 0, NUM_PADS);
@@ -1596,6 +1607,9 @@ _pad_sm_coeff = 1.0 - exp(-1.0 / max(1, 0.008 * srate));  // ~8ms (per-pad pan +
 // approaches it. ~4 ms -- long enough to kill the step, short enough that STOP
 // still feels instant.
 _prv_fade_step = 1.0 / max(1, 0.004 * srate);
+// UI font scale, recomputed every @gfx frame. Seeded to 1 so the two frames
+// before gfx_w is trustworthy cannot produce a 0 and collapse every font.
+_ui_sc = 1.0;
 // Pad sleep-gate hold: how long a pad keeps processing after its chain last
 // showed energy. Only has to bridge a zero crossing, so 30 ms is generous --
 // and being derived from srate it is the same 30 ms at every rate.
@@ -1675,14 +1689,29 @@ syn_view_pad = 0;    // SYNTH view's edit target (session-transient)
 // Defaults are state "B" (the FX rack): inserts open at 8 slots, Swing's fixed
 // chain folded to its summary bar, everything else on.
 //
-// ⚠️ ONE-SHOT GUARD, not a plain assignment. These are serialized, and a
-// sample-rate change re-runs @init WITHOUT re-running @serialize — so a bare
-// `con_ins = 1` here would silently reset every one of the user's choices the
-// moment they changed the project SR. The guard is zero-init on genuine first
-// load and 1 forever after, so:
+// ⚠️ ONE-SHOT GUARD, not a plain assignment. These are serialized, so a bare
+// `con_ins = 1` here would reset the user's choices on any @init that runs
+// after a project load without @serialize running behind it.
 //   new instance   → defaults below stand
 //   project load   → defaults, then @serialize read overwrites them
-//   SR change      → skipped entirely, the loaded values survive
+//   re-init        → skipped entirely, the loaded values survive
+//
+// ⚠️⚠️ THE REASON THIS USED TO GIVE WAS WRONG, and it is worth not repeating:
+// it said "a sample-rate change re-runs @init WITHOUT re-running @serialize".
+// MEASURED 2026-08-03 (sandboxed 7.78, an @init-counter gmem cell, and
+// mutation-verified by forcing ext_noinit = 0 in a probe copy, which DID re-run
+// every time): with ext_noinit = 1 a samplerate flip does NOT re-run @init at
+// all. ext_noinit shields samplerate re-inits as well as play-start ones. See
+// wiki 3.2, which names that premise as wrong on stock 7.78.
+//
+// ⭐ THE GUARD STAYS ANYWAY, and the reason is better than the old one: that
+// shield is UNDOCUMENTED behaviour and can drift between REAPER versions. A
+// guard that costs one compare is the right price for not depending on it. Note
+// what the guard is protecting against is therefore hypothetical today -- but
+// the per-pad @init loop and swing_apply_defaults_* have no such guard, so if
+// the shield ever does drift, THEY are where it lands, not here.
+// ⚠️ The measurement is on 7.78 and the field is on 7.80, and the ss_srwipe
+// harness that produced it no longer exists. Re-measure before relying on it.
 // The backfill in the ser_ver 58 gate covers pre-58 projects separately; it
 // cannot cover a brand new instance, which is why both exist.
 _con_defaults_done ? 0 : (
@@ -5154,7 +5183,10 @@ vi = 0; loop(V_SLOTS,
     // SYN voices always sum (their audio never comes from the Extension ring;
     // launch excludes synth on Stretch pads, but a live voice must survive a
     // mid-note mode flip without muting).
-    (v_kind[vi] || sp_pitch_mode[si] != SP_PITCH_MODE_STRETCH) ? (
+    // v_stfb: a Stretch pad that had no registry slot at launch played LOCALLY, so
+    // there is no Extension audio to double against and this voice must be summed.
+    // Without it the fallback launched correctly and was silenced right here.
+    (v_kind[vi] || v_stfb[vi] || sp_pitch_mode[si] != SP_PITCH_MODE_STRETCH) ? (
       pad_accL[si] += sL * g;
       pad_accR[si] += sR * g;
     );
@@ -6903,6 +6935,23 @@ gfx_frame_count <= 2 ? (
   gfx_set(0, 0, 0, 1); gfx_rect(0, 0, gfx_w, gfx_h);
 ) : (
 
+// ── UI font scale (issue #1 point 3: "unusable" at 4K / 175%) ─────────────
+// REAPER hands this @gfx a surface sized by the display scale, so at 175% the
+// window is 1.75x the 780 declared above. Every box here is a fraction of
+// gfx_w/gfx_h and grew with it; the labels were literal pixels and did not.
+// ⭐ Deliberately NOT gfx_ext_retina. That changes the coordinate system the
+// entire UI is built on -- a rewrite, not a fix -- and the minibrowser's own
+// comments already depend on Swing staying off it. This leaves every
+// coordinate exactly as it is and only asks how much bigger the surface is
+// than the size the layout was drawn for.
+// min of the two ratios, not gfx_w alone: the window resizes to any aspect,
+// and text sized off the LONG side overflows boxes bound by the short one.
+// max(1, ...) never shrinks below the designed sizes -- a window smaller than
+// 780 keeps exactly today's behaviour instead of gaining unreadable text,
+// which is the floor the handful of already-scaled call sites use too.
+_ui_sc = max(1.0, min(gfx_w / 780, gfx_h / 780));
+
+
 // ── Deferred undo action processor ──
 swing_ui_process_undo();
 
@@ -7633,7 +7682,7 @@ is_embedded ? (
   // ── Header + layout + LCD frame ──
   swing_ui_draw_header();
   swing_ui_calc_layout();
-  swing_lcd_draw(right_x, 28, right_w, LCD_BAR_H);
+  swing_lcd_draw(right_x, 28, right_w, swing_px(LCD_BAR_H));
 
   // The FX rack page is drawn HERE, not inside rk_swing_lcd, because it calls
   // swing_bigview_open -- which is defined in rk_swing_ui_state, imported

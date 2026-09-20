@@ -1709,7 +1709,11 @@ RK_DDR_F9    = 125;  // bps3  (t2)      peak8
 RK_DDR_F10   = 132;  // lp    (t2)      peak9
 RK_DDR_SH1   = 139;  // t1 only: his ride.fshift,  110 Hz -> 139..184
 RK_DDR_SH2   = 185;  // t1 only: his fshift2,      0.4 Hz -> 185..230
-RK_DDR_CELLS = 231;
+// Pad TUNE, latched at launch. It has to be STORED because ride type 0
+// rebuilds dt5/dt6 every sample (see the tick) and so cannot use the
+// one-shot scaling every other oscillator gets at launch.
+RK_DDR_TUNEF = 231;  // 1 = no transposition
+RK_DDR_CELLS = 232;
 
 function rk_syn_dd_ride_reset(st, rtype, rattack, rdecay, rtone, rduty)
 local(af, df, idec, isr_dec, isr_dec2, isr_tone, tc, d7, t_s, isr_decay)
@@ -1717,12 +1721,17 @@ global(srate, RK_DDR_SEED, RK_DDR_TYPE, RK_DDR_T, RK_DDR_DUTY, RK_DDR_TONE,
        RK_DDR_DT, RK_DDR_E12, RK_DDR_E13, RK_DDR_E2, RK_DDR_E3,
        RK_DDR_B1, RK_DDR_B3, RK_DDR_B4, RK_DDR_B2S, RK_DDR_B2K, RK_DDR_B4FR,
        RK_DDR_F1, RK_DDR_F2, RK_DDR_F3, RK_DDR_F4, RK_DDR_F5, RK_DDR_F6,
-       RK_DDR_F7, RK_DDR_F8, RK_DDR_F9, RK_DDR_F10, RK_DDR_SH1, RK_DDR_SH2)
+       RK_DDR_F7, RK_DDR_F8, RK_DDR_F9, RK_DDR_F10, RK_DDR_SH1, RK_DDR_SH2,
+       RK_DDR_TUNEF)
 (
   st[RK_DDR_TYPE] = rtype;
   st[RK_DDR_T]    = 0;
   st[RK_DDR_DUTY] = rduty;
   st[RK_DDR_TONE] = rtone;
+  // Default the tune ratio to 1 HERE, not at the caller. The caller only writes
+  // it when tune != 0, so without this a voice slot reused from a tuned pad
+  // would keep that pad's ratio and detune an untuned one.
+  st[RK_DDR_TUNEF] = 1;
   st[RK_DDR_SEED] <= 0 ? st[RK_DDR_SEED] = 22222;
 
   af = pow(10, rattack - 0.5);
@@ -1871,7 +1880,8 @@ global(srate,
        RK_DDR_PH, RK_DDR_DT, RK_DDR_E12, RK_DDR_E13, RK_DDR_E2, RK_DDR_E3,
        RK_DDR_B1, RK_DDR_B3, RK_DDR_B4, RK_DDR_B2S, RK_DDR_B2K,
        RK_DDR_F1, RK_DDR_F2, RK_DDR_F3, RK_DDR_F4, RK_DDR_F5, RK_DDR_F6,
-       RK_DDR_F7, RK_DDR_F8, RK_DDR_F9, RK_DDR_F10, RK_DDR_SH1, RK_DDR_SH2)
+       RK_DDR_F7, RK_DDR_F8, RK_DDR_F9, RK_DDR_F10, RK_DDR_SH1, RK_DDR_SH2,
+       RK_DDR_TUNEF)
 (
   tt = st[RK_DDR_T];
 
@@ -1880,7 +1890,12 @@ global(srate,
     tn = st[RK_DDR_TONE];
     d5 = (tn < 0.5 ? 359.4 + 881.2 * tn : 450.09 + 699.8 * tn);
     d6 = (tn < 0.5 ? 254.3 + 571.4 * tn : 452.8 + 174.4 * tn);
-    d5 *= 1 / srate; d6 *= 1 / srate;
+    // ⚠️ dt5/dt6 are the ONLY two of the ride's six oscillators rebuilt here
+    // rather than at launch, so the one-shot `*= f` that transposes the other
+    // eleven rates was overwritten every sample and these two stayed put. Tune
+    // a type-0 ride an octave and two thirds of the cymbal moved while a third
+    // stayed anchored. The ratio is latched at launch for exactly this.
+    d5 *= st[RK_DDR_TUNEF] / srate; d6 *= st[RK_DDR_TUNEF] / srate;
     st[RK_DDR_DT + 4] = d5; st[RK_DDR_DT + 5] = d6;
 
     st[RK_DDR_PH + 0] += st[RK_DDR_DT + 0];
@@ -2573,7 +2588,7 @@ local(fam, typ, es, seed, f, kb, t2, i)
 global(srate,
        RK_DDK_SEED, RK_DDS_SEED, RK_DDH_SEED, RK_DDH_DT,
        RK_DDC_SEED, RK_DDR_SEED, RK_DDR_DT, RK_DDT_SEED,
-       RK_DDM_SEED, RK_DDW_SEED, RK_DDK2_SEED)
+       RK_DDM_SEED, RK_DDW_SEED, RK_DDK2_SEED, RK_DDR_TUNEF)
 (
   engine = max(0, engine|0);
   typ = (engine * 0.1)|0;
@@ -2616,7 +2631,10 @@ global(srate,
   fam == 4 ? (
     es[RK_DDR_SEED] = seed;
     rk_syn_dd_ride_reset(es, min(typ, 2), mac[0], mac[1], mac[2], mac[3]);
-    tune != 0 ? ( i = 0; loop(13, es[RK_DDR_DT + i] *= f; i += 1; ); );
+    // Latched for the tick's per-sample rebuild of dt5/dt6. The reset leaves
+    // it at 1, so an untuned pad is byte-for-byte what it was before.
+    tune != 0 ? ( i = 0; loop(13, es[RK_DDR_DT + i] *= f; i += 1; );
+                  es[RK_DDR_TUNEF] = f; );
   ) :
   fam == 5 ? (
     es[RK_DDT_SEED] = seed;

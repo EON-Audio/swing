@@ -158,37 +158,93 @@ function swing_do_pad_swap(a, b) local(li, sa, sb) (
 // The structural undo engine (rk_drumkit_dsp, imported EARLIER) can't call
 // get_*_slot, so the visible name/path strings are backed up / restored HERE
 // (in core, where those slot helpers exist) into the udo_s2_name char buffer:
-//   [0..31] cname (gamelayer label)  [32..63] name  [64..335] path
-//   [336 + li*272 .. +271] layer li path (P3: LPATH strings were NOT backed
+//   [0..32] cname (gamelayer label)  [33..65] name  [66..337] path
+//   [338 + li*272 .. +271] layer li path
+// ⚠ 33, not 32, for each NAME: the editor's cap is PNE_MAX_LEN = 32 and a
+//   32-char name needs a 33rd cell for its terminator. At 32 the last
+//   character was dropped on every restore. Same fix in the preserve-live
+//   shadow below -- the two are separate copies of one idea and the bug was
+//   in both, so a fix to one is half a fix. (P3: LPATH strings were NOT backed
 //   up before — a structural undo left stale layer paths behind, which then
 //   re-serialized via the ser_ver>=11 block. The swap path always swapped
 //   them correctly; only this non-swap path was affected.)
 function undo_pad_names_save(pad) local(h, i, n, d, li) (
   h = get_cname_slot(pad); d = udo_s2_name;
-  n = min(strlen(h), 31);  i = 0; loop(n, d[i] = str_getchar(h, i); i += 1;); d[n] = 0;
-  h = get_name_slot(pad);  d = udo_s2_name + 32;
-  n = min(strlen(h), 31);  i = 0; loop(n, d[i] = str_getchar(h, i); i += 1;); d[n] = 0;
-  h = get_path_slot(pad);  d = udo_s2_name + 64;
+  n = min(strlen(h), 32);  i = 0; loop(n, d[i] = str_getchar(h, i); i += 1;); d[n] = 0;
+  h = get_name_slot(pad);  d = udo_s2_name + 33;
+  n = min(strlen(h), 32);  i = 0; loop(n, d[i] = str_getchar(h, i); i += 1;); d[n] = 0;
+  h = get_path_slot(pad);  d = udo_s2_name + 66;
   n = min(strlen(h), 271); i = 0; loop(n, d[i] = str_getchar(h, i); i += 1;); d[n] = 0;
   li = 0; loop(MAX_LAYERS,
     h = LPATH_STR_BASE + pad * MAX_LAYERS + li;
-    d = udo_s2_name + 336 + li * 272;
+    d = udo_s2_name + 338 + li * 272;
     n = min(strlen(h), 271); i = 0; loop(n, d[i] = str_getchar(h, i); i += 1;); d[n] = 0;
     li += 1;
   );
 );
 function undo_pad_names_restore(pad) local(h, i, c, d, li) (
   h = get_cname_slot(pad); d = udo_s2_name;
-  strcpy(h, ""); i = 0; c = d[0]; while(c != 0 && i < 31)  ( str_setchar(h, i, c); i += 1; c = d[i]; );
-  h = get_name_slot(pad);  d = udo_s2_name + 32;
-  strcpy(h, ""); i = 0; c = d[0]; while(c != 0 && i < 31)  ( str_setchar(h, i, c); i += 1; c = d[i]; );
-  h = get_path_slot(pad);  d = udo_s2_name + 64;
+  strcpy(h, ""); i = 0; c = d[0]; while(c != 0 && i < 32)  ( str_setchar(h, i, c); i += 1; c = d[i]; );
+  h = get_name_slot(pad);  d = udo_s2_name + 33;
+  strcpy(h, ""); i = 0; c = d[0]; while(c != 0 && i < 32)  ( str_setchar(h, i, c); i += 1; c = d[i]; );
+  h = get_path_slot(pad);  d = udo_s2_name + 66;
   strcpy(h, ""); i = 0; c = d[0]; while(c != 0 && i < 271) ( str_setchar(h, i, c); i += 1; c = d[i]; );
   li = 0; loop(MAX_LAYERS,
     h = LPATH_STR_BASE + pad * MAX_LAYERS + li;
-    d = udo_s2_name + 336 + li * 272;
+    d = udo_s2_name + 338 + li * 272;
     strcpy(h, ""); i = 0; c = d[0]; while(c != 0 && i < 271) ( str_setchar(h, i, c); i += 1; c = d[i]; );
     li += 1;
+  );
+);
+
+// ── UI font scale ──────────────────────────────────────────────────────────
+// A font size in DESIGN pixels, returned at the current surface scale.
+// The geometry in this UI is proportional -- a pad cell is gfx_w/4, panels are
+// fractions of gfx_w/gfx_h -- but the font sizes were literal pixels, so the
+// bigger the surface got the SMALLER the text looked on it. _ui_sc (set at the
+// top of @gfx) is how much bigger the surface is than the 780 the layout was
+// drawn for; this turns a design size into a drawn one.
+// 6 px floor: below that Arial stops being legible at any DPI, so a caller
+// asking for something tiny gets tiny, not invisible.
+function swing_fs(px) ( max(6, floor(px * _ui_sc + 0.5)); );
+
+// A BOX size in design pixels, returned at the current surface scale.
+// The companion to swing_fs, and the reason it exists: scaling only the type
+// inside a box that keeps its pixel size makes things WORSE, not better --
+// measured 2026-09-17 at _ui_sc 1.75, where the FX picker's grown title ran
+// straight through its own tab row and the macro editor's CAPTURE label
+// overflowed its button. Type and the box around it have to move together.
+// No floor is needed: _ui_sc is itself max(1.0, ...), so a scaled box can
+// never come back smaller than the design size it was tuned at.
+function swing_px(px) ( floor(px * _ui_sc + 0.5); );
+
+// ── Preserve-on-reload name shadow ─────────────────────────────────────────
+// Same reason undo_pad_names_* live here rather than in the engine: only core
+// can see get_*_slot. A preserve-live reload (project-open sidecar, or the
+// undo/chunk audio repair) runs AFTER @serialize has restored the live state,
+// and the kit import would otherwise write the KIT FILE's names over the ones
+// the user typed -- so a pad you renamed, saved, and reopened through a repair
+// path came back with the kit's name. Filed as "a known minor limitation";
+// it is really project recall, which is a different thing.
+// PATH is deliberately NOT shadowed here, unlike in the undo engine: on this
+// route the audio is reloaded from the kit, so the path must come from the kit
+// with it. Names are the user's; the path belongs to the audio.
+function swing_preserve_names_save() local(p, h, i, n, d) (
+  p = 0; loop(NUM_PADS,
+    h = get_cname_slot(p); d = sv_pad_names + p * 66;
+    n = min(strlen(h), 32); i = 0; loop(n, d[i] = str_getchar(h, i); i += 1;); d[n] = 0;
+    h = get_name_slot(p);  d = sv_pad_names + p * 66 + 33;
+    n = min(strlen(h), 32); i = 0; loop(n, d[i] = str_getchar(h, i); i += 1;); d[n] = 0;
+    p += 1;
+  );
+);
+function swing_preserve_names_restore() local(p, h, i, c, d) (
+  p = 0; loop(NUM_PADS,
+    h = get_cname_slot(p); d = sv_pad_names + p * 66;
+    strcpy(h, ""); i = 0; c = d[0]; while(c != 0 && i < 32) ( str_setchar(h, i, c); i += 1; c = d[i]; );
+    h = get_name_slot(p);  d = sv_pad_names + p * 66 + 33;
+    strcpy(h, ""); i = 0; c = d[0]; while(c != 0 && i < 32) ( str_setchar(h, i, c); i += 1; c = d[i]; );
+    p += 1;
   );
 );
 
@@ -451,13 +507,29 @@ function clear_layer(pad_idx, layer_idx) local(_lidx, li, _zn) (
 );
 
 // ─── Clear entire pad (all layers + legacy + name/path) ─────────────────
-function clear_pad(i) local(li, _zs) (
+function clear_pad(i) local(li, _zs, _z0) (
   undo_begin_pad(i);  // Phase 2: back up this pad (audio+meta+names) for scoped structural undo
   // A LEGACY (non-layered) pad keeps its audio in the slot itself, sized by
   // s_len, with every l_len at 0 -- so the per-layer zeroing below would not
   // touch a cell of it. Capture the written span before s_len is reset and
   // zero exactly that, after the layers.
   _zs = min(max(s_len[i], 0), SLOT_SIZE);
+  // ...and capture how much of that span LAYER 0 is about to zero for us.
+  // ⚠️ swing_pad_promote copies s_len into l_len[0] and does NOT clear s_len,
+  // so a promoted pad carries BOTH -- and both describe the same cells, since
+  // layer 0 starts at the slot base. The memset below then re-zeroed ground
+  // clear_layer(i, 0) had just covered: up to LAYER_SIZE cells of duplicate
+  // work on the audio thread, in the function this release spent its time
+  // making cheaper. Captured HERE because p_layer_cnt is reset below, before
+  // the loop, and clear_layer zeroes l_len as it goes -- by then both facts
+  // are gone.
+  // ⚠️ Clamped to LAYER_SIZE as well as to _zs, because that is exactly what
+  // clear_layer clamps ITS span to (_zn). Claiming more than it actually zeroes
+  // would skip cells nothing ever cleared -- and _zs can reach SLOT_SIZE, four
+  // times LAYER_SIZE. This mirrors clear_layer's own arithmetic rather than
+  // assuming l_len is in range, so it stays correct even if that guard slips.
+  _z0 = p_layer_cnt[i] > 0
+        ? min(min(max(l_len[i * MAX_LAYERS], 0), LAYER_SIZE), _zs) : 0;
   s_len[i] = 0; s_start[i] = 0; s_end[i] = 1.0;
   // Eagerly clear the gmem blank signal too, so consumers (Kit Bridge
   // multi-out coloring, Drum Matrix lane sync) see the pad as blank on
@@ -473,9 +545,17 @@ function clear_pad(i) local(li, _zs) (
   p_layer_cnt[i] = 0;
   p_layer_mode[i] = 3;
   li = 0; loop(MAX_LAYERS, clear_layer(i, li); li += 1;);
-  // The legacy blob captured above. Layered pads leave _zs at 0 (their audio is
-  // per-layer and the loop just zeroed it), so this costs nothing there.
-  !_clr_skip_audio && _zs > 0 ? memset(s_audio_start + i * SLOT_SIZE, 0, _zs);
+  // The legacy blob captured above, MINUS whatever layer 0 already zeroed.
+  // The old comment said "layered pads leave _zs at 0, so this costs nothing
+  // there" -- true of a pad built from layers, false of a PROMOTED one, which
+  // is every pad that ever had a plain sample dropped on it and then gained a
+  // layer. Those paid for the same cells twice.
+  //   plain pad        _z0 = 0        -> unchanged, zeroes [0, _zs)
+  //   promoted, intact _z0 = _zs      -> nothing: layer 0 covered all of it
+  //   promoted, then a SHORTER sample loaded into layer 0: zeroes only the
+  //   tail [_z0, _zs) that layer 0 did not reach -- which the old form also
+  //   cleared, just after redundantly clearing the head as well.
+  !_clr_skip_audio && _zs > _z0 ? memset(s_audio_start + i * SLOT_SIZE + _z0, 0, _zs - _z0);
   // Reset FX to defaults
   fx_hpf_freq[i] = 20; fx_lpf_freq[i] = 20000;
   fx_eq_lo[i] = 0; fx_eq_mid[i] = 0; fx_eq_mid2[i] = 0; fx_eq_hi[i] = 0;
@@ -1345,6 +1425,7 @@ function swing_voice_steal_park(_stl_vi) local(_stl_k, _stl_sf, _stl_best, _stl_
   v_age[_stl_sf] = max(1, v_age[_stl_vi]);   // never 0: @sample zeroes a voice's envelope on its first sample
   // synth voices carry their engine state into the fade slot
   v_kind[_stl_sf] = v_kind[_stl_vi];
+  v_stfb[_stl_sf] = v_stfb[_stl_vi];   // or a stolen fallback mutes as it releases
   v_kind[_stl_vi] == 1 ? memcpy(v_syn_state + _stl_sf * RK_SYN_STATE_SIZE,
                                 v_syn_state + _stl_vi * RK_SYN_STATE_SIZE, RK_SYN_STATE_SIZE);
   v_stage[_stl_sf] = 4;   // LAST -- audio thread gate
@@ -1393,6 +1474,7 @@ function launch_syn_for_pad(_sy_pad, _sy_midi, _sy_vel, _sy_gaindiv, _sy_ofs)
     v_slot[vi] = _sy_pad;
     v_layer[vi] = 0;
     v_kind[vi] = 1;
+    v_stfb[vi] = 0;   // a SYN slot may be reused from a Stretch fallback voice; do not inherit its flag
     _syn_mac_scratch[0] = ps_mac0[_sy_pad]; _syn_mac_scratch[1] = ps_mac1[_sy_pad];
     _syn_mac_scratch[2] = ps_mac2[_sy_pad]; _syn_mac_scratch[3] = ps_mac3[_sy_pad];
     _syn_mac_scratch[4] = ps_mac4[_sy_pad]; _syn_mac_scratch[5] = ps_mac5[_sy_pad];
@@ -1483,7 +1565,20 @@ function launch_voices_for_pad_ofs(_lv_pad, _lv_midi, _lv_vel, _lv_flash, _lv_of
   // per-pad SPSC ring; JSFX @sample reads from the ring instead of running
   // the local voice loop. Pads in Mode=Repitch or Mode=Tuned fall through
   // to the existing local-voice path unchanged.
-  sp_pitch_mode[_lv_pad] == SP_PITCH_MODE_STRETCH ? (
+  // ⚠️⚠️ `&& _reg_my_slot >= 0`: WITHOUT A SLOT THIS PAD WAS SILENT. The branch
+  // published nothing (the inner guard below), never fell through to the local
+  // path, and still flashed the pad -- so the hit lit up and made no sound. Not a
+  // startup race either: `_regfull_since` and its LCD banner exist precisely
+  // because a full registry leaves an instance without a slot indefinitely, and
+  // swing_registry_check_owner drops us to -1 whenever our slot is reassigned. In
+  // that state the pad's Repitch and Tuned neighbours played normally and only its
+  // Stretch pads went quiet. Falling through to the resident-buffer resampler is
+  // exactly what the header promises when the Extension is not there; being
+  // unreachable is the same thing from the player's side.
+  // ⭐ Swing_ReaKit.jsfx:4096 records fixing this identical shape in the @block
+  // heartbeat -- gated `_reg_my_slot >= 0`, so a vacated instance stayed silent.
+  // Same gate, same silence, one function over, and it went unlooked-for.
+  sp_pitch_mode[_lv_pad] == SP_PITCH_MODE_STRETCH && _reg_my_slot >= 0 ? (
     // ── Trigger-edge ring reset (consumer-side jump) ────────────────────
     // The Extension audio_hook (producer) and JSFX @sample (consumer) run
     // on the same audio thread. REAPER's per-buffer order is:
@@ -1589,6 +1684,10 @@ function launch_voices_for_pad_ofs(_lv_pad, _lv_midi, _lv_vel, _lv_flash, _lv_of
       vi >= 0 ? (
         v_slot[vi] = _lv_pad;
         v_kind[vi] = 0;   // sample voice (slot may be reused from a synth voice)
+        // Reaching the local path on a STRETCH pad means the Extension was
+        // unreachable, so @sample must sum this voice rather than defer to a ring
+        // that will never fill. Every other mode stamps 0 and behaves as before.
+        v_stfb[vi] = sp_pitch_mode[_lv_pad] == SP_PITCH_MODE_STRETCH ? 1 : 0;
         _sel_layer >= 0 && p_layer_cnt[_lv_pad] > 0 ? (
           v_layer[vi] = _sel_layer;
           _lidx = _lv_pad * MAX_LAYERS + _sel_layer;

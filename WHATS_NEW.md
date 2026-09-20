@@ -308,7 +308,8 @@ kit. All thirteen factory kits carry a macro block.
 
 ## After the second beta
 
-Two small updates since, 3.0.1 and 3.0.2.
+Several updates since. This page is the 3.0 tour and does not track them one
+by one — each release's own notes are in ReaPack, under Swing's changelog.
 
 ### EON Floatter
 
@@ -372,7 +373,8 @@ These are the changes most likely to have you hunting for something.
 
 **Keep a copy of any project you might need to open in 2.1.x again.**
 
-The project format moves from `ser_ver` 44 to 57. Your 2.1.x projects and kits
+The project format moves up from `ser_ver` 44 (2.1.x); 3.0.x has carried it
+further with each release. Your 2.1.x projects and kits
 load into 3.0 cleanly — older fields fill in with sensible defaults. But 3.0
 writes per-pad data that 2.1.x has no reader for: synth voices, the new EQ
 bands, key ranges, pitch state. We haven't tested going backwards and we don't

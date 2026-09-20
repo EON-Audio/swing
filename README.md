@@ -135,6 +135,13 @@ anymore.
 
 3. **Synchronize packages**, install **EON Swing 3**, and **restart REAPER**.
 
+**REAPER 7.79 or newer recommended.** Everything loads and plays well below
+that; what changes is how the embedded faceplates look in the track and mixer
+panels. Embedding itself works from REAPER 6.30. On 7.45 the faceplates lose
+their surrounding decoration and gain click-through, and on 7.79 REAPER's own
+tooltip stops appearing over them. Below REAPER 7 the FX picker also drops its
+per-pad containers for a flat, pinned layout.
+
 Also via ReaPack, free and required: **SWS** (Drum Strip sync on multi-out
 tracks), **ReaImGui** (the sample browser, Pad FX, dock layouts) and
 **js_ReaScriptAPI** (the dock rig). Install them first; the Kit Bridge names
@@ -192,8 +199,9 @@ Plain answers, because you shouldn't have to read source to know:
   repository. (The Windows .exe channel ships an update checker that asks
   `api.github.com` for the latest release number when Swing loads; it sends
   nothing about you or your projects and stays silent offline. On a ReaPack
-  install it only runs if you launch **EON_UpdateCheck** from the Action List
-  yourself.)
+  install it does not run at all: EON_UpdateCheck is deliberately kept out of
+  the Action List, and ReaPack does not register it either, so ReaPack tells
+  you about updates instead. Use Synchronize.)
 - **Where your data lives.** Kits: `Data/Swing_Kits/`. Settings, caches and
   logs: `Data/EON_Swing/` and `Data/Swing_Cache/` — all inside your REAPER
   resource folder. The only thing written next to a project is that project's
