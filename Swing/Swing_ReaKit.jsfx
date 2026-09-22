@@ -3,7 +3,12 @@
 desc: Swing
 tags: instrument, sampler, drums
 author: EON Studios
-version: 3.0.16
+// version: STAYS "3.0" in source on purpose -- deploy.sh stamps the PUBLISHED
+// copy from index.xml (release_index.py --print-version), cross-checks
+// EON_UpdateCheck.lua's CURRENT_VERSION and aborts on a mismatch. index.xml is
+// the single source of truth; a hand-edit here is overwritten at deploy. Three
+// external auditors have read source-vs-index as version drift -- it is not.
+version: 3.0.17
 
 slider1:root_note=36<0,127,1>-Base Note
 slider2:master_db=0<-48,12,0.1>-Master Volume (dB)
@@ -860,9 +865,23 @@ km_master_vol = freemem; freemem += KS;
 KM_CON_PER_PAD = 11;
 km_console  = freemem; freemem += NUM_PADS * KM_CON_PER_PAD * KS;
 km_comp     = freemem; freemem += 12 * KS;   // master COMP card: 6 knobs x 2 surfaces (big view, LCD)
-// Master EQ page curve cache (Phase 4, D O-2): 80 sweep magnitudes, 3 node magnitudes,
-// 3 node log-frequencies; keyed on the eleven values in swing_panels_draw_eq. @gfx only.
-meq_cv      = freemem; freemem += 88;
+// Master EQ page curve cache (Phase 4, D O-2): MEQ_CV_N sweep magnitudes, 3 node
+// magnitudes, 3 node log-frequencies; keyed on the sixteen values in
+// swing_panels_draw_eq. @gfx only.
+// [0..79] the first 80 of the combined curve -- see MEQ_CV_SUM, [80..85] node
+// magnitudes and log-frequencies, [86..87] spare, then MEQ_CV_SUM: the combined
+// curve, MEQ_CV_N cells, then MEQ_CV_BANDS: each band's own curve, 5 rows x
+// MEQ_CV_N (HPF, LPF, LO, MID, HI), for the per-band fills.
+// ⭐ 512 points, not 80 (2026-09-21): at 80 a Q 4 bell was two or three points
+// wide, its peak fell between them, and the curve drew as a clipped triangle
+// beside ReEQ's smooth bell (the user put the two side by side). The cells sit
+// below s_audio_start, so they move the pad region and everything above it up
+// by ~3.2k cells (25 KB) against the ~72M HEADROOM BUDGET -- noted, not
+// ignored, and far below anything that budget has had to absorb.
+MEQ_CV_N     = 512;
+MEQ_CV_SUM   = 88;
+MEQ_CV_BANDS = MEQ_CV_SUM + MEQ_CV_N;
+meq_cv      = freemem; freemem += MEQ_CV_BANDS + 5 * MEQ_CV_N;
 meq_cv_valid = 0;
 
 // ─── Send bus accumulators (cleared each sample) ────────────────────────
@@ -1417,6 +1436,34 @@ _udo_cow_budget = UDO_COW_MIN;  // cells per barrier call; @block rescales from 
 // two-sighting guard (never duel on a single sighting).
 _coll_hb_prev = freemem; freemem += 16;
 
+// Comp link, two-way bookkeeping. Four cells per param id 1..9 (ids are
+// 1-based, so cell 0 of each goes unused; 16 apiece keeps the slabs aligned
+// with the one above and leaves room if the row ever carries more).
+// To know WHO moved a control you have to remember what BOTH sides held last
+// time you looked — that is the whole reason these exist. An echo that differs
+// from the last echo means the folder's face was touched; a live value that
+// differs from the last live value means this page was. Neither can be inferred
+// from the other, and guessing is how a two-way link starts fighting itself.
+_bcl_eprev = freemem; freemem += 16;   // echo as of the previous pass
+_bcl_lprev = freemem; freemem += 16;   // our value as of the previous pass
+_bcl_sent  = freemem; freemem += 16;   // value posted, while a post is in flight
+_bcl_wait  = freemem; freemem += 16;   // 1 = our post is out and unconfirmed
+
+// The same four again for the EON Tone link (EQ + drive). Thirteen params
+// rather than nine; 16 apiece keeps every slab here the same width.
+// Tone link: TNL_NPARAM params -- 13, plus the five master-EQ Q values of
+// ser_ver 75. These four arrays are indexed by PARAM NUMBER, 1..TNL_NPARAM,
+// so each needs TNL_NPARAM + 1 cells.
+// ⚠️⚠️ They were a literal 16 -- enough for 13, not for 18 -- and
+// _tnl_wait is the LAST allocation before s_audio_start: params 16..18 would
+// have written into the first samples of the first pad's audio, silently.
+// Sized from the constant now, so the two cannot drift apart again.
+TNL_NPARAM = 18;
+_tnl_eprev = freemem; freemem += TNL_NPARAM + 1;
+_tnl_lprev = freemem; freemem += TNL_NPARAM + 1;
+_tnl_sent  = freemem; freemem += TNL_NPARAM + 1;
+_tnl_wait  = freemem; freemem += TNL_NPARAM + 1;
+
 // Audio buffers
 s_audio_start = freemem;
 // freemem += NUM_PADS * SLOT_SIZE;  -- do not advance; REAPER manages rest
@@ -1811,7 +1858,7 @@ last_mouse_cap = 0;
 // fresh press edge: the pad retriggered at the pass rate (~21/s), the embed VOL
 // knob's drag ended and re-anchored every pass, and each phantom edge pushed an
 // undo entry.
-// So the latch is PER SURFACE -- EON_Weld's idiom (ebc_plmb_e / ebc_plmb_w),
+// So the latch is PER SURFACE -- EON_Weld's idiom (ebc_ck0 / ebc_ck1),
 // extended to two embeds. Slot 0 is the window and the idle context: they never
 // run together, and the idle canvas IS the window's. Slots 1 and 2 are the two
 // embeds, told apart by canvas signature (gfx_w, gfx_h: 277 and 82 px wide in
@@ -2162,6 +2209,157 @@ EON_VIEW_REQ           = 26004520;
 // drive the folder even though Swing's own main bus is empty there.
 EON_MASTER_LINK        = 26005248;
 EON_MASTER_LINK_STRIDE = 32;
+
+// GS_BC_LINK: the comp link band. EON Weld publishes its settings and its gain
+// reduction onto a row of this band every @block; which row is decided by the
+// Link Slot Lua pushes into it. ⚠️ THE ROW CARRIES THE ROLE — a Swing can own
+// two Welds (smash return, and the serial glue on its Audio folder) and the row
+// is keyed by slot alone, so the bus one is given registry slot + ROW_BUS and
+// the smash one keeps the low rows. Full layout and the reasoning live at the
+// band constants in EON_Weld.jsfx; read that before touching this.
+// TWO-WAY as of 3.0.17. We READ +0 the heartbeat and +9 gain reduction in dB,
+// and we WRITE the nine comp params round-robin, one per block, via the mailbox
+// below -- move the COMP page or move the folder Weld and the other follows.
+// (This said "we only read ... nothing here drives the folder yet" until the
+// link landed; an auditor read it as the contract.)
+GS_BC_LINK_BASE        = 26170000;
+GS_BC_LINK_STRIDE      = 24;
+GS_BC_LINK_ROW_BUS     = 32;   // audio-bus row = _reg_my_slot + this
+BCL_OFF_HB             = 0;
+BCL_OFF_ECHO           = 1;   // +1..+8: thresh ratio attack release knee makeup mix bypass
+BCL_OFF_GR             = 9;
+BCL_OFF_AUTO           = 10;  // auto-release echo — NOT part of the +1..+8 run
+BCL_OFF_GRMIN          = 13;  // deepest LINEAR gain in the block (1.0 = none)
+BCL_OFF_GRVER          = 14;  // 1 = that Weld publishes GRMIN; 0 = older, use +9
+BCL_OFF_SEQ            = 16;  // bumped LAST, after PARAM and VAL
+BCL_OFF_PARAM          = 17;  // 1..8 in echo order, 9 = auto-release
+BCL_OFF_VAL            = 18;
+_bcl_tx                = 0;   // round-robin cursor over the nine params
+_bcl_seq               = 0;   // our command counter for the row
+_bcl_primed            = 0;   // 0 = the rack has not been adopted yet this session
+// What the bridge says is actually on the Audio folder. MUST match
+// rk_lua_core.lua GS_STRIP_OFF_RACK_*. Lets this plugin tell "no rack at all"
+// from "a rack that cannot follow me" — both mean its own compressor is wrong
+// to run, but only one of them has anything to report on the COMP page.
+GS_STRIP_OFF_RACK_HB   = 640;
+GS_STRIP_OFF_RACK_ENG  = 641;
+_rck_hb_prev           = -1;    // -1 = unbaselined; see the @block rack read
+_rck_t                 = -1000; // wall clock of the last rack-scan movement
+RCK_STALE_S            = 3.0;   // no movement for this long = the rack is gone
+bcl_foreign            = 0;   // 1 = a rack is there and it is not one we drive
+
+// ── EON Tone link: the EQ + drive record ───────────────────────────────────
+// In the reserved tail of this instance's strip band. Same shape as the comp
+// link — heartbeat, echo run, command mailbox with the seq bumped LAST — and
+// for the same reasons, so read the comp block above for the reasoning; only
+// the param list differs. ONE Tone per Swing, so the registry slot alone keys
+// the record and there is no role offset like GS_BC_LINK needs.
+// The thirteen are Tone's own slider order, so the ids here and the ids there
+// are the same integers.
+TNL_OFF_HB             = 642;
+TNL_OFF_ECHO           = 643;  // 643..655, params 1..13, contiguous — no gap like the comp row's GR cell
+TNL_OFF_ECHO_Q         = 659;  // 659..663, params 14..18: master-EQ Q (ser_ver 75). NOT appended at
+                               // 656: SEQ/PARAM/VAL live there. The first 13 keep their exact cells,
+                               // so an older Tone still understands them. Use tnl_eoff(), never the
+                               // arithmetic -- there are two ranges now.
+TNL_OFF_SEQ            = 656;  // bumped LAST
+TNL_OFF_PARAM          = 657;  // 1..13
+TNL_OFF_VAL            = 658;
+_tnl_hb_prev           = -1;   // -1 = unbaselined; see the @block heartbeat read
+_tnl_stall             = 1000;
+_tnl_row_last          = -1;   // row this baseline belongs to; -1 = none yet
+_tnl_tx                = 0;
+_tnl_seq               = 0;
+_tnl_primed            = 0;
+tnl_live               = 0;    // 1 = an EON Tone is answering on our record
+
+function tnl_get(pi) (
+  pi ==  1 ? gfx_hpf_freq    : pi ==  2 ? gfx_lpf_freq    :
+  pi ==  3 ? gfx_eq_lo       : pi ==  4 ? gfx_eq_lo_freq  :
+  pi ==  5 ? meq_lo_bell     : pi ==  6 ? gfx_eq_mid      :
+  pi ==  7 ? gfx_eq_mid_freq : pi ==  8 ? gfx_eq_hi       :
+  pi ==  9 ? gfx_eq_hi_freq  : pi == 10 ? meq_hi_bell     :
+  pi == 11 ? gfx_sat_drv     : pi == 12 ? gfx_drv_mode    :
+  pi == 13 ? meq_bypass      : pi == 14 ? gfx_eq_lo_sq    :
+  pi == 15 ? gfx_eq_lo_bq    : pi == 16 ? gfx_eq_mid_q    :
+  pi == 17 ? gfx_eq_hi_sq    : gfx_eq_hi_bq;
+);
+// Clamped to Tone's own slider ranges on the way in — the echo is another
+// plugin's memory, and these are the ranges it will quantize to anyway.
+function tnl_set(pi, v) (
+  pi ==  1 ? gfx_hpf_freq    = max(20, min(8000, v))     :
+  pi ==  2 ? gfx_lpf_freq    = max(200, min(20000, v))   :
+  pi ==  3 ? gfx_eq_lo       = max(-12, min(12, v))      :
+  pi ==  4 ? gfx_eq_lo_freq  = max(40, min(500, v))      :
+  pi ==  5 ? meq_lo_bell     = v >= 0.5                  :
+  pi ==  6 ? gfx_eq_mid      = max(-12, min(12, v))      :
+  pi ==  7 ? gfx_eq_mid_freq = max(200, min(8000, v))    :
+  pi ==  8 ? gfx_eq_hi       = max(-12, min(12, v))      :
+  pi ==  9 ? gfx_eq_hi_freq  = max(2000, min(16000, v))  :
+  pi == 10 ? meq_hi_bell     = v >= 0.5                  :
+  pi == 11 ? gfx_sat_drv     = max(0, min(1, v))         :
+  pi == 12 ? gfx_drv_mode    = max(0, min(4, v | 0))     :
+  pi == 13 ? meq_bypass      = v >= 0.5                  :
+  pi == 14 ? gfx_eq_lo_sq    = max(0.3, min(6, v))       :
+  pi == 15 ? gfx_eq_lo_bq    = max(0.3, min(6, v))       :
+  pi == 16 ? gfx_eq_mid_q    = max(0.3, min(6, v))       :
+  pi == 17 ? gfx_eq_hi_sq    = max(0.3, min(6, v))       :
+                               gfx_eq_hi_bq = max(0.3, min(6, v));
+);
+// Half a step. The frequencies move in whole Hz, the gains in 0.1 dB, drive in
+// 0.01, and the three toggles plus the drive type are integers.
+function tnl_eps(pi) (
+  pi ==  1 || pi ==  2 || pi == 4 || pi == 7 || pi == 9 ? 0.5   :
+  pi == 11 ? 0.005 :
+  pi ==  5 || pi == 10 || pi == 12 || pi == 13 ? 0.4 :
+  // Q: 0.005. Tone's Q sliders step 0.0001, and its shelf default may round
+  // 1/sqrt(2) to 0.7071 -- 6.8e-6 off Swing's exact value. The tolerance must
+  // swallow that, or a DEFAULT would never settle and retry forever: the
+  // filter-range bug of c7409b1 had exactly that shape.
+  pi >= 14 ? 0.005 : 0.05;
+);
+// Param number -> its echo cell. Two ranges since ser_ver 75: 1..13 at
+// TNL_OFF_ECHO, 14..18 at TNL_OFF_ECHO_Q. Every echo read goes through here.
+function tnl_eoff(pi) (
+  pi <= 13 ? TNL_OFF_ECHO + pi - 1 : TNL_OFF_ECHO_Q + pi - 14;
+);
+
+// Per-param helpers. The ids are Weld's OWN dispatch ids (1..8 in echo order,
+// 9 = auto), deliberately, so these can be read straight against its source.
+function bcl_get(pi) (
+  pi == 1 ? cmp_thresh  : pi == 2 ? cmp_ratio  : pi == 3 ? cmp_attack :
+  pi == 4 ? cmp_release : pi == 5 ? cmp_knee   : pi == 6 ? cmp_makeup :
+  pi == 7 ? cmp_mix     : pi == 8 ? cmp_bypass : cmp_auto;
+);
+// Clamped to SWING's ranges coming in — the echo is another plugin's memory.
+// Weld clamps identically on its side, so a healthy value passes untouched and
+// the two never disagree about what a legal value is.
+function bcl_set(pi, v) (
+  pi == 1 ? cmp_thresh  = max(-40, min(0, v))    :
+  pi == 2 ? cmp_ratio   = max(1, min(20, v))     :
+  pi == 3 ? cmp_attack  = max(0.1, min(100, v))  :
+  pi == 4 ? cmp_release = max(100, min(1200, v)) :
+  pi == 5 ? cmp_knee    = max(0, min(12, v))     :
+  pi == 6 ? cmp_makeup  = max(-12, min(12, v))   :
+  pi == 7 ? cmp_mix     = max(0, min(1, v))      :
+  pi == 8 ? cmp_bypass  = v >= 0.5               :
+            cmp_auto    = v >= 0.5;
+);
+// ⚠ The echo run is NOT nine long: 1..8 sit at +1..+8, +9 is the GR cell, and
+// auto-release echoes at +10.
+function bcl_eoff(pi) ( pi == 9 ? BCL_OFF_AUTO : BCL_OFF_ECHO + pi - 1; );
+// Half a step, per control: mix moves in 0.01, release in 1 ms, knee in 0.5,
+// the toggles are 0/1, the rest in 0.1. Used for every comparison here, because
+// Weld quantizes what it is handed and an exact compare never settles.
+function bcl_eps(pi) (
+  pi == 7 ? 0.005 : pi == 4 ? 0.5 : pi == 5 ? 0.26 : pi >= 8 ? 0.5 : 0.05;
+);
+_bcl_hb_prev           = -1;   // -1 = unbaselined; see the @block heartbeat read
+_bcl_stall             = 1000; // starts stalled: nothing has proven itself live
+_bcl_row_last          = -1;   // row this baseline belongs to; -1 = none yet
+bcl_live               = 0;    // 1 = a bus Weld is answering on our row
+bcl_gr_lin             = 1;    // linear gain, 1.0 = no reduction (needle at rest)
+
 _view_req_last         = -1;   // seq echo; -1 = not yet baselined
 // Lua → JSFX modal-surface request: +0 = seq (written LAST), +1 = target
 // instance slot, +2 = kind, +3 = pad index. Companion to EON_VIEW_REQ and for
@@ -2435,7 +2633,7 @@ GS_COMPANION_TARGET = 2250;   // instance_id the companion cmd is FOR; 0 = broad
 GS_SWING_ALIVE      = 1711;     // heartbeat counter (Lua detects changes)
 GS_UPDATE_REQUEST   = 1712;     // JSFX → Lua: 1=check now, 2=open download URL
 GS_UPDATE_STATE     = 1713;     // Lua → JSFX: 0=idle, 1=checking, 3=update available
-GS_LATEST_VER_BASE  = 1714;     // 5 chars: 1714–1718
+// 1714-1718 free since 2026-09-20 (a 5-char version band, never read here).
 GS_MEDIA_EXPLORER_OPEN = 1719;  // bridge → JSFX: 1 if REAPER Media Explorer is open
 
 // Audio-only reload flag — bridge → JSFX. Set to 1 by the bridge for a
@@ -3372,6 +3570,345 @@ _reg_my_slot >= 0 ? (
   _ml_hb += 1;
   gmem[_ml_b + 0] = _ml_hb;   // LAST
 );
+
+// ── Comp link: watch the audio-bus Weld's row (the READ half) ───────────────
+// Liveness is the heartbeat MOVING, not the heartbeat being nonzero. gmem
+// persists across plugin reloads and project switches, so a row left behind by
+// a deleted Audio folder reads "alive" forever on a value test — the same trap
+// the strip takeover answers with a stall count, and the same shape here.
+// The GR cell is foreign memory. A NaN passes every comparison in EEL2, so both
+// guards are written in the POSITIVE form: require the good case, the way the
+// kit loader's lua_len guard does, instead of testing for the bad ones.
+_reg_my_slot >= 0 ? (
+  _bcl_b  = GS_BC_LINK_BASE + (_reg_my_slot + GS_BC_LINK_ROW_BUS) * GS_BC_LINK_STRIDE;
+  // The row moved under us -- a slot re-claim after an id collision. The
+  // baseline below belongs to the OLD row, and a new row measured against it
+  // reads as movement, which is the same false-life bug by another door. Go
+  // back to unbaselined. EON_Tone.jsfx clears _tn_cmd_inited on a slot change
+  // for this reason; this is that idiom on the reading side.
+  _bcl_b != _bcl_row_last ? ( _bcl_row_last = _bcl_b; _bcl_hb_prev = -1; _bcl_stall = 1000; );
+  _bcl_hb = gmem[_bcl_b + BCL_OFF_HB];
+  _bcl_hb != _bcl_hb ? _bcl_hb = _bcl_hb_prev;   // NaN reads as "changed" forever
+  // ⚠️⚠️ THE FIRST READING IS A BASELINE, NOT A SIGN OF LIFE. _bcl_hb_prev
+  // starts at -1, so the opening read of an UNTOUCHED row (0) differed from it
+  // and reset the stall -- declaring an empty row live for the ~100 blocks it
+  // takes to expire again. That is long enough for the adopt below to fire and
+  // pull nine zeroes into the master compressor: threshold 0, ratio 1, mix 0,
+  // voice reset -- and mark_dirty_kit() then lights SAVE over the wreckage, so
+  // the next save writes it to disk. Nor is it only the no-Weld case: on a cold
+  // start gmem is zeroed and this runs upstream of the Audio folder, so the
+  // INTENDED rig can read the row before Weld's first @block too.
+  // Take the reading, leave the stall where it is, and wait for the value to
+  // MOVE -- only a running Weld can do that. Weld writes its echo before its
+  // heartbeat, so one movement is enough: the values beside it are already real.
+  // -1 is a safe sentinel -- Weld bumps a counter up from 0 and never writes it.
+  _bcl_hb != _bcl_hb_prev ? (
+    _bcl_hb_prev == -1 ? _bcl_hb_prev = _bcl_hb                  // baseline only
+                       : ( _bcl_hb_prev = _bcl_hb; _bcl_stall = 0; );
+  ) : ( _bcl_stall < 1000 ? _bcl_stall += 1 );
+  // ⚠️⚠️ !patch_live IS LOad-BEARING, not defensive. Under Wired the pads are
+  // shifted up one bus and channels 0/1 carry the loopback SUM, so the master
+  // section there is processing the whole instrument and is exactly where it
+  // belongs. Gating only on multi_out would take the master compressor out of
+  // Wired entirely and hand the needle a folder's reading while Swing's own
+  // comp was the one working.
+  bcl_live = multi_out && !patch_live && _bcl_stall < 100 ? 1 : 0;
+  bcl_live ? (
+    // Prefer the DEEPEST reduction in the block over the snapshot beside it.
+    // +9 is written in @block, so it holds whatever the last sample happened to
+    // be doing: on a fast transient the real depth is over before Weld's @block
+    // looks, and this needle read shallower than Weld's own. +13 is the minimum
+    // tracked across the block, and it is already linear, so no conversion.
+    // ⚠ The dialect cell is what makes the fallback safe. A missing +13 reads as
+    // gmem's zero, and zero means TOTAL reduction — the needle would slam and
+    // stay there against an older Weld. Same lesson as the strip band's mask
+    // version: publish the dialect, never infer it from the value.
+    gmem[_bcl_b + BCL_OFF_GRVER] >= 1 ? (
+      _bcl_gl = gmem[_bcl_b + BCL_OFF_GRMIN];
+      !(_bcl_gl >= 0 && _bcl_gl <= 1) ? _bcl_gl = 1;
+      bcl_gr_lin = _bcl_gl;
+    ) : (
+      _bcl_db = gmem[_bcl_b + BCL_OFF_GR];
+      !(_bcl_db <= 0 && _bcl_db >= -60) ? _bcl_db = 0;
+      // dB -> linear ONCE per block. exp() is banned in @sample; the needle is
+      // fed this as a constant across the block, which is what it wants anyway
+      // (rk_vu_sample_gr keeps the deepest reading per decimation window).
+      bcl_gr_lin = exp(_bcl_db * 0.11512925465);
+    );
+  ) : ( bcl_gr_lin = 1; );
+
+  // What the bridge says is on the folder. Its scan has its own heartbeat, on
+  // the same moving-not-nonzero test as above, so a stale cell from a project
+  // that is no longer open cannot masquerade as a live report.
+  _rck_b  = GS_STRIP_BASE + _reg_my_slot * GS_STRIP_STRIDE;
+  _rck_hb  = gmem[_rck_b + GS_STRIP_OFF_RACK_HB];
+  _rck_now = time_precise();
+  _rck_hb != _rck_hb ? _rck_hb = _rck_hb_prev;
+  // ⚠️⚠️ WALL CLOCK, NOT A BLOCK COUNT. This expired after 300 @blocks, chosen
+  // as "about three of the bridge's ~1 s scans" -- but a block is not a fixed
+  // slice of time. At 44.1k/512 the guess holds (3.5 s); at 48k/64 there are
+  // 750 blocks in a second, so 300 was 0.4 s and the rack expired BETWEEN two
+  // perfectly healthy scans. bcl_foreign then flapped at about 1 Hz, and every
+  // time it fell Swing's own compressor switched back into circuit on OUT 1 --
+  // and since the bypass branch reseats both engines on the way out, each
+  // re-entry started from clean capacitors. The comment already reasoned in
+  // seconds; this makes the code do the same. time_precise() is legal here
+  // (@block -- it is @sample that is barred).
+  // The first reading is a BASELINE, the same rule as the link heartbeats
+  // above: stamp the clock only once the value has actually MOVED, or an
+  // untouched cell would read fresh for the whole first RCK_STALE_S.
+  // No row-change guard here, unlike the two links: the ENG cell beside this
+  // is re-read every block, so a slot re-claim costs at most one optimistic
+  // window and the next real scan corrects it.
+  _rck_hb != _rck_hb_prev ? (
+    _rck_hb_prev == -1 ? _rck_hb_prev = _rck_hb                  // baseline only
+                       : ( _rck_hb_prev = _rck_hb; _rck_t = _rck_now; );
+  );
+  // A rack is present, and it is not answering our link: a stock comp, an FX
+  // chain, an Anvil, or something dropped in by hand. Our own compressor is
+  // just as wrong here as it is with a Weld — in Multi-Out it only ever reaches
+  // the pad on OUT 1 — but there is no gain reduction to borrow, so the needle
+  // rests and the page says so instead of implying it is in charge.
+  // ⚠ Engine 0 means the folder has NO comp: that is the build where the bus
+  // compressor box was left unticked, and there Swing's own stage is the only
+  // one there is. It keeps running, exactly as it always has.
+  // ⚠ Seconds here, blocks for Weld above, and the difference is the point:
+  // Weld bumps its heartbeat every @block, so a hundred blocks of silence is
+  // a hundred of ITS missed turns however long they took -- same clock, so a
+  // count is the honest unit. The bridge scans on a wall-clock timer that
+  // knows nothing about the buffer, so measuring it in blocks compares two
+  // different clocks. That is what broke at small buffers.
+  bcl_foreign = multi_out && !patch_live && _rck_now - _rck_t < RCK_STALE_S &&
+                gmem[_rck_b + GS_STRIP_OFF_RACK_ENG] >= 1 && !bcl_live ? 1 : 0;
+) : ( bcl_live = 0; bcl_gr_lin = 1; bcl_foreign = 0; );
+
+// ── Comp link: the COMP page drives the audio-bus Weld ──────────────────────
+// One param per block, round-robin over the nine. Weld consumes exactly one
+// mailbox edit per block, so posting faster would only be dropped and posting
+// slower would lag a drag.
+//
+// ⭐ THE POST CONDITION IS "THE ECHO DOES NOT AGREE", not "the value changed".
+// That one choice removes a whole class of bugs and needs no bookkeeping at all:
+//   · Weld ADOPTS the first seq it ever sees WITHOUT acting on it — a stale
+//     mailbox must never fire — so a fire-and-forget first post is swallowed in
+//     silence. Here the echo simply stays wrong and the next pass asks again.
+//   · A command dropped for any other reason retries by itself.
+//   · A Weld arriving with its own settings (inserted by hand, or riding in on
+//     a track template) is pulled into line without anyone detecting "new".
+//   · Nothing is ever resent once it agrees, which matters because Weld calls
+//     slider_automate on every value it consumes: a needless resend writes an
+//     automation point and an undo step, per block, for as long as the link is up.
+// Agreement is judged within the param's OWN step, because Weld's sliders
+// quantize what they are handed and an exact compare would repost for ever.
+// Written in the positive form, so a NaN echo reads as "not agreed" and asks
+// again rather than passing as agreement.
+// ⛔ No give-up timeout. Strip_Sync's comment says why: a timeout that lets the
+// unconfirmed side win is how a control appears to "revert on its own" later.
+bcl_live ? (
+  // ⚠️ WHILE LINKED THE VOICE IS WELD. An INVARIANT asserted every block, not a
+  // one-shot: the forcing below runs only on first sight, and _bcl_primed is
+  // session-scoped ON PURPOSE (see its comment -- re-arming it on the heartbeat
+  // returning would let a rack that went quiet for a moment stomp the page).
+  // That left a trap. Link up, leave Multi-Out, pick BLACK or BLUE while the
+  // chips are live, come back: first sight has already happened, so the page
+  // keeps the Anvil voice, and the chips are gated on !bcl_live
+  // (rk_swing_ui_panels_lcd.jsfx-inc:939) so WELD cannot be picked back. A page
+  // of knobs writing cmp_anv_*, which this link does not carry and nothing on
+  // the bus reads, and the only escape was to leave Multi-Out -- which nothing
+  // said. Asserting it costs one compare a block and cannot stomp anything: the
+  // nine VALUES are untouched, and while linked the user has no way to have set
+  // this deliberately. Gated on _bcl_primed so first sight still does it once,
+  // in one dirty tag, instead of tagging twice in the same block.
+  // Delta audit 2026-09-20.
+  _bcl_primed && cmp_voice != 0 ? (
+    cmp_voice = 0;
+    swing_rcp_post_cmp();
+    _kd_site = 8; mark_dirty_kit();   // NOT a gesture, same as first sight
+  );
+  !_bcl_primed ? (
+    // ── FIRST SIGHT: the rack wins, once ──────────────────────────────────
+    // Somebody who dialled the Weld on their folder by hand — before this link
+    // existed, or through its mixer embed — must not have it overwritten the
+    // instant Swing notices it. So the first connection reads the folder and
+    // adopts it wholesale, and only then does the page take ownership.
+    // Scoped to the SESSION, deliberately NOT to the heartbeat returning: if a
+    // stall re-armed this, a rack that went quiet for a moment would stomp the
+    // page every time it came back. Weld writes its echo before its heartbeat,
+    // so seeing the heartbeat move means the echo beside it is already real.
+    _bcl_i = 1;
+    loop(9,
+      _bcl_ec = gmem[_bcl_b + bcl_eoff(_bcl_i)];
+      abs(_bcl_ec) <= 100000 ? bcl_set(_bcl_i, _bcl_ec);   // positive form: NaN skipped
+      _bcl_eprev[_bcl_i] = _bcl_ec;
+      _bcl_lprev[_bcl_i] = bcl_get(_bcl_i);
+      _bcl_wait[_bcl_i]  = 0;
+      _bcl_i += 1;
+    );
+    // The VOICE is adopted too, by the same rule and for a harder reason than
+    // the nine values: what is in circuit on the folder is a Weld, because Weld
+    // is the only comp that can follow this link at all. A page left showing an
+    // Anvil voice would draw the Anvil face and the Anvil knob set, and every
+    // knob turned on it would write cmp_anv_* — parameters this link does not
+    // carry and nothing on the bus reads. The chips are inert while linked for
+    // the same reason. ⭐ Both go away when Weld carries the three voices
+    // itself (decided 2026-09-20) and the voice becomes another posted value.
+    cmp_voice = 0;
+    _bcl_primed = 1;
+    swing_rcp_post_cmp();
+    _kd_site = 8; mark_dirty_kit();   // NOT a gesture -- tag it, or _kd_src reads 1000
+  ) : (
+    _bcl_p  = _bcl_tx + 1;
+    _bcl_ep = bcl_eps(_bcl_p);
+    _bcl_ec = gmem[_bcl_b + bcl_eoff(_bcl_p)];
+    _bcl_lv = bcl_get(_bcl_p);
+
+    _bcl_wait[_bcl_p] ? (
+      // ── A post of ours is out and unconfirmed ───────────────────────────
+      // While it is, the row is NEVER allowed to drive this page. Forward-
+      // pushing here is exactly what yanked a fader backwards mid-drag in the
+      // strip sync: during a drag we post a chain of values and the echo trails
+      // the newest one, so an echo read as an edit is our own past.
+      !(abs(_bcl_lv - _bcl_sent[_bcl_p]) <= _bcl_ep) ? (
+        // Still moving — refresh the payload rather than waiting on a stale one.
+        _bcl_sent[_bcl_p] = _bcl_lv;
+        _bcl_lprev[_bcl_p] = _bcl_lv;
+        gmem[_bcl_b + BCL_OFF_VAL]   = _bcl_lv;
+        gmem[_bcl_b + BCL_OFF_PARAM] = _bcl_p;
+        _bcl_seq += 1;
+        gmem[_bcl_b + BCL_OFF_SEQ]   = _bcl_seq;   // LAST
+      ) : abs(_bcl_ec - _bcl_sent[_bcl_p]) <= _bcl_ep ? (
+        _bcl_wait[_bcl_p]  = 0;                    // landed
+        _bcl_eprev[_bcl_p] = _bcl_ec;
+      ) : (
+        // Not landed. Ask again — Weld ADOPTS the first seq it ever sees
+        // without acting on it, so the opening post of a link is always
+        // swallowed, and any other drop deserves the same treatment.
+        // ⛔ No give-up timeout: one that lets the unconfirmed side win is how
+        // a control appears to "revert on its own" minutes later.
+        // ⚠️⚠️ REWRITE THE PAYLOAD, NOT JUST THE SEQ. PARAM and VAL are ONE
+        // mailbox shared by all nine, and the round-robin has visited up to
+        // eight other params since this one posted. A seq-only bump re-sends
+        // whoever wrote the mailbox LAST -- so the dropped edit never lands,
+        // its wait flag never clears, and because a pending wait also bars the
+        // row from driving this page, that control is locked one-way for good.
+        // With no give-up timeout there is nothing downstream to catch it.
+        gmem[_bcl_b + BCL_OFF_VAL]   = _bcl_sent[_bcl_p];
+        gmem[_bcl_b + BCL_OFF_PARAM] = _bcl_p;
+        _bcl_seq += 1;
+        gmem[_bcl_b + BCL_OFF_SEQ]   = _bcl_seq;   // LAST
+      );
+    ) : (
+      // ── Nothing outstanding: whoever moved since the last look wins ──────
+      _bcl_em = !(abs(_bcl_ec - _bcl_eprev[_bcl_p]) <= _bcl_ep);   // the folder moved
+      _bcl_lm = !(abs(_bcl_lv - _bcl_lprev[_bcl_p]) <= _bcl_ep);   // this page moved
+      _bcl_em ? (
+        // ADOPT. On a genuine tie — both moved inside the same window — the
+        // rack wins, deterministically, and the page converges next pass. The
+        // guarantee worth having is determinism, not a verdict on who was right.
+        bcl_set(_bcl_p, _bcl_ec);
+        _bcl_eprev[_bcl_p] = _bcl_ec;
+        _bcl_lprev[_bcl_p] = bcl_get(_bcl_p);
+        swing_rcp_post_cmp();
+        _kd_site = 8; mark_dirty_kit();   // a rack edit is a kit edit: undoable, lights SAVE
+      ) : _bcl_lm ? (
+        gmem[_bcl_b + BCL_OFF_VAL]   = _bcl_lv;
+        gmem[_bcl_b + BCL_OFF_PARAM] = _bcl_p;
+        _bcl_seq += 1;
+        gmem[_bcl_b + BCL_OFF_SEQ]   = _bcl_seq;   // LAST
+        _bcl_sent[_bcl_p]  = _bcl_lv;
+        _bcl_wait[_bcl_p]  = 1;
+        _bcl_lprev[_bcl_p] = _bcl_lv;
+      );
+    );
+    _bcl_tx += 1; _bcl_tx >= 9 ? _bcl_tx = 0;
+  );
+) : ( _bcl_tx = 0; );
+
+// ── EON Tone link: the EQ and drive pages drive the Audio folder ────────────
+// The same machinery as the comp link above — thirteen params instead of nine,
+// and a contiguous echo run with no GR cell interrupting it. Everything the
+// long comment up there explains about liveness being MOVEMENT, the echo being
+// the only confirm, never letting the row drive while a post is outstanding,
+// first sight belonging to the rack, and the absence of a give-up timeout
+// applies here word for word. The recalc request is the master one rather than
+// the comp one, because these thirteen feed the five-band SVF and the saturator.
+_reg_my_slot >= 0 ? (
+  _tnl_b  = GS_STRIP_BASE + _reg_my_slot * GS_STRIP_STRIDE;
+  _tnl_b != _tnl_row_last ? ( _tnl_row_last = _tnl_b; _tnl_hb_prev = -1; _tnl_stall = 1000; );
+  _tnl_hb = gmem[_tnl_b + TNL_OFF_HB];
+  _tnl_hb != _tnl_hb ? _tnl_hb = _tnl_hb_prev;
+  // ⚠️⚠️ Baseline, not life -- the comp link's copy of this carries the full
+  // reasoning. Worse here than there: thirteen zeroes through tnl_set() put the
+  // master LPF at its floor of 1 kHz with meq_bypass off, so an empty row does
+  // not quietly flatten the compressor, it drops a blanket over the instrument.
+  _tnl_hb != _tnl_hb_prev ? (
+    _tnl_hb_prev == -1 ? _tnl_hb_prev = _tnl_hb                  // baseline only
+                       : ( _tnl_hb_prev = _tnl_hb; _tnl_stall = 0; );
+  ) : ( _tnl_stall < 1000 ? _tnl_stall += 1 );
+  tnl_live = multi_out && !patch_live && _tnl_stall < 100 ? 1 : 0;
+  tnl_live ? (
+    !_tnl_primed ? (
+      _tnl_i = 1;
+      loop(TNL_NPARAM,
+        _tnl_ec = gmem[_tnl_b + tnl_eoff(_tnl_i)];
+        abs(_tnl_ec) <= 100000 ? tnl_set(_tnl_i, _tnl_ec);
+        _tnl_eprev[_tnl_i] = _tnl_ec;
+        _tnl_lprev[_tnl_i] = tnl_get(_tnl_i);
+        _tnl_wait[_tnl_i]  = 0;
+        _tnl_i += 1;
+      );
+      _tnl_primed = 1;
+      swing_rcp_post_master();
+      _kd_site = 9; mark_dirty_kit();   // NOT a gesture -- tag it, or _kd_src reads 1000
+    ) : (
+      _tnl_p  = _tnl_tx + 1;
+      _tnl_ep = tnl_eps(_tnl_p);
+      _tnl_ec = gmem[_tnl_b + tnl_eoff(_tnl_p)];
+      _tnl_lv = tnl_get(_tnl_p);
+      _tnl_wait[_tnl_p] ? (
+        !(abs(_tnl_lv - _tnl_sent[_tnl_p]) <= _tnl_ep) ? (
+          _tnl_sent[_tnl_p]  = _tnl_lv;
+          _tnl_lprev[_tnl_p] = _tnl_lv;
+          gmem[_tnl_b + TNL_OFF_VAL]   = _tnl_lv;
+          gmem[_tnl_b + TNL_OFF_PARAM] = _tnl_p;
+          _tnl_seq += 1;
+          gmem[_tnl_b + TNL_OFF_SEQ]   = _tnl_seq;
+        ) : abs(_tnl_ec - _tnl_sent[_tnl_p]) <= _tnl_ep ? (
+          _tnl_wait[_tnl_p]  = 0;
+          _tnl_eprev[_tnl_p] = _tnl_ec;
+        ) : (
+          // ⚠️⚠️ Rewrite the payload too -- the comp link's copy of this branch
+          // carries the reasoning. One mailbox, THIRTEEN params round-robining
+          // through it, so the window for a seq-only retry to re-send someone
+          // else's value is wider here than there.
+          gmem[_tnl_b + TNL_OFF_VAL]   = _tnl_sent[_tnl_p];
+          gmem[_tnl_b + TNL_OFF_PARAM] = _tnl_p;
+          _tnl_seq += 1;
+          gmem[_tnl_b + TNL_OFF_SEQ]   = _tnl_seq;   // LAST
+        );
+      ) : (
+        _tnl_em = !(abs(_tnl_ec - _tnl_eprev[_tnl_p]) <= _tnl_ep);
+        _tnl_lm = !(abs(_tnl_lv - _tnl_lprev[_tnl_p]) <= _tnl_ep);
+        _tnl_em ? (
+          tnl_set(_tnl_p, _tnl_ec);
+          _tnl_eprev[_tnl_p] = _tnl_ec;
+          _tnl_lprev[_tnl_p] = tnl_get(_tnl_p);
+          swing_rcp_post_master();
+          _kd_site = 9; mark_dirty_kit();   // a rack edit is a kit edit: undoable, lights SAVE
+        ) : _tnl_lm ? (
+          gmem[_tnl_b + TNL_OFF_VAL]   = _tnl_lv;
+          gmem[_tnl_b + TNL_OFF_PARAM] = _tnl_p;
+          _tnl_seq += 1;
+          gmem[_tnl_b + TNL_OFF_SEQ]   = _tnl_seq;
+          _tnl_sent[_tnl_p]  = _tnl_lv;
+          _tnl_wait[_tnl_p]  = 1;
+          _tnl_lprev[_tnl_p] = _tnl_lv;
+        );
+      );
+      _tnl_tx += 1; _tnl_tx >= TNL_NPARAM ? _tnl_tx = 0;
+    );
+  ) : ( _tnl_tx = 0; );
+) : ( tnl_live = 0; );
 
 // Master limiter release: the face writes gfx_lim_rel (ms); the one-pole
 // coefficient is derived HERE, once per change, never on the gfx thread.
@@ -5514,7 +6051,11 @@ _mst_idle && voices_alive == 0 ? (
 // ─── Global FX on main stereo bus (SVF filters) ─────────────────────────
 _gL = spl(0); _gR = spl(1);
 
-!meq_bypass ? (
+// ⭐ Stands down with the comp when EON Tone is driving the Audio folder:
+// same argument, same gate. In Multi-Out these five filters only ever reached
+// the pad on OUT 1, and Tone runs the identical chain on the folder from the
+// identical values, so leaving this in would EQ one drum twice.
+(!meq_bypass && !tnl_live) ? (
   // All 5 filters ALWAYS processed (no engage gates): a gate that bypassed
   // instantly when a drag crossed the HPF/LPF threshold would skip the SVF's
   // bypass glide — an audible click on the bus. Off filters carry unity-dry
@@ -5539,7 +6080,10 @@ _gL = spl(0); _gR = spl(1);
 // selected by gfx_drv_mode). drive_process writes _doL/_doR. Mirrors the
 // per-pad blend in rk_drumkit_fx.jsfx-inc (8x gain into the curve, then mix).
 _sat_drv_sm += (gfx_sat_drv - _sat_drv_sm) * _sm_coeff;
-_sat_drv_sm > 0.01 ? (
+// Drive follows the EQ, for the same reason — Tone carries the saturator too.
+// The smoother above keeps running, so a link dropping mid-drive glides back in
+// rather than stepping.
+(_sat_drv_sm > 0.01 && !tnl_live) ? (
   drive_process(_gL * 8.0, _gR * 8.0, gfx_drv_mode | 0);
   _gL += (_doL - _gL) * _sat_drv_sm;
   _gR += (_doR - _gR) * _sat_drv_sm;
@@ -5569,7 +6113,16 @@ _sat_drv_sm > 0.01 ? (
 );
 
 // ─── Master compressor (after EQ + saturation, before volume + limiter) ──
-!cmp_bypass ? (
+// ⭐ STANDS DOWN when the audio-bus Weld is answering (Multi-Out, not Wired).
+// It has to: in Multi-Out this stage only ever sees the pad routed to OUT 1 --
+// pads write to spl(p_output*2) and this chain reads spl(0)/spl(1) -- so it was
+// compressing the kick and nothing else, and once the COMP page drives the
+// folder that pad was being compressed TWICE, here and again on the bus.
+// The condition routes into the bypass branch below, which is exactly right and
+// not a coincidence: that branch already feeds the needle, and already reseats
+// both engines ONCE on the way out of circuit, so re-engaging when the link
+// drops starts from silence instead of a stale capacitor charge.
+(!cmp_bypass && !bcl_live && !bcl_foreign) ? (
   cmp_voice > 0 ? (
     // Anvil voice: the FET circuit from rk_anvil, Swing's controls pushed in
     // from @block. Only this branch or the one below runs, never both.
@@ -5582,10 +6135,22 @@ _sat_drv_sm > 0.01 ? (
     cmp_process(_gL, _gR);
     _gL = cmp_outL;
     _gR = cmp_outR;
-    cmp_vu.rk_vu_sample_gr(cmp_last_lin);    // GR needle: linear gain in, no transcendental
+    cmp_vu.rk_vu_sample_gr(cmp_last_lin);   // GR needle: linear gain in, no transcendental
   );
+  // ⛔ Do NOT reach for bcl_gr_lin in here. Both needle calls above used to
+  // read `bcl_live ? bcl_gr_lin : ...`, which this branch's own guard makes
+  // unreachable -- fcdb280 added them so the needle would follow the bus, then
+  // 5a3c1da put !bcl_live in the condition above and left two compares per
+  // sample that can never be true. The bus reading belongs in the ELSE branch,
+  // which is exactly where a live link now sends us, and it is there already.
 ) : (
-  (cmp_vu.pos > 0 || cmp_vu.hold > 0) ? cmp_vu.rk_vu_sample_gr(1);   // out of circuit: needle AND hold needle fall to rest, then the branch is inert
+  // The needle follows the compressor that is actually working on the signal.
+  // In Multi-Out with a bus Weld answering, that is the one on the Audio folder
+  // — including here, where OUR comp is bypassed and the old code let the
+  // needle fall to rest: resting would have said "nothing is compressing" while
+  // the folder was doing exactly that. bcl_gr_lin is a per-block constant.
+  bcl_live ? cmp_vu.rk_vu_sample_gr(bcl_gr_lin)
+           : ((cmp_vu.pos > 0 || cmp_vu.hold > 0) ? cmp_vu.rk_vu_sample_gr(1));   // out of circuit: needle AND hold needle fall to rest, then the branch is inert
   // Bypassed master comp costs nothing — but a re-engage must start from
   // CLEAN state, not a stale capacitor charge (audit 2026-08-24). One
   // compare per sample while bypassed; reset fires once, then both caps
@@ -5733,7 +6298,10 @@ diag_armed ? (
 // below as a harmless idempotent re-set).
 is_read = file_avail(0) >= 0;
 // Version tag for forward-compat
-ser_ver = 74;   // 74 = console: show/hide the house plugins in the pad insert rows (con_ins_house).
+ser_ver = 75;   // 75 = master EQ Q per mode (gfx_eq_lo_sq/_bq, _mid_q, _hi_sq/_bq), wheel over a node.
+                //      Took 75, which the pad-banks plan had reserved: banks now 76, the step
+                //      sequencer 77 (decided with the user 2026-09-21).
+                // 74 = console: show/hide the house plugins in the pad insert rows (con_ins_house).
                 // 71 = rpt_grid: note repeat locked to the project grid.
                 // 70 = cmp_auto: the master comp's AUTO release (Weld's card on the COMP page)
                 // 69 = dock_want: the wordmark's "dock me" intent, so a closed
@@ -6900,6 +7468,40 @@ is_read ? swing_comp_anvil_push();
 ser_ver >= 74 ? file_var(0, con_ins_house);
 is_read && ser_ver < 74 ? con_ins_house = 0;
 is_read ? con_ins_house = con_ins_house ? 1 : 0;
+
+// ser_ver 75: master EQ Q, one per MODE (LO shelf, LO bell, MID, HI shelf, HI
+// bell) -- wheel over a node. A NEW gate: the 74 gate above is never extended.
+// The backfill is not decoration: ext_noinit makes @init run once per
+// instance, so loading an older project into a running Swing would otherwise
+// keep the PREVIOUS project's Q. Per-mode Q needs no knowledge of the mode to
+// backfill -- every value simply returns to the pre-75 fixed shape.
+ser_ver >= 75 ? (
+  file_var(0, gfx_eq_lo_sq); file_var(0, gfx_eq_lo_bq); file_var(0, gfx_eq_mid_q);
+  file_var(0, gfx_eq_hi_sq); file_var(0, gfx_eq_hi_bq);
+);
+is_read && ser_ver < 75 ? (
+  gfx_eq_lo_sq = sqrt(0.5); gfx_eq_lo_bq = 0.8; gfx_eq_mid_q = 0.8;
+  gfx_eq_hi_sq = sqrt(0.5); gfx_eq_hi_bq = 0.8;
+);
+// A saved Q is another program's number: clamp it to the wheel's range, and
+// catch NaN in the positive form (a NaN fails every comparison).
+is_read ? (
+  gfx_eq_lo_sq = gfx_eq_lo_sq >= 0.3 ? min(6, gfx_eq_lo_sq) : sqrt(0.5);
+  gfx_eq_lo_bq = gfx_eq_lo_bq >= 0.3 ? min(6, gfx_eq_lo_bq) : 0.8;
+  gfx_eq_mid_q = gfx_eq_mid_q >= 0.3 ? min(6, gfx_eq_mid_q) : 0.8;
+  gfx_eq_hi_sq = gfx_eq_hi_sq >= 0.3 ? min(6, gfx_eq_hi_sq) : sqrt(0.5);
+  gfx_eq_hi_bq = gfx_eq_hi_bq >= 0.3 ? min(6, gfx_eq_hi_bq) : 0.8;
+);
+// The master filters were rebuilt and snapped far above, BEFORE Q was read,
+// so they still hold the previous Q -- the graph would show the restored Q
+// while the audio kept the old one (reopen, or undo of a Q-only edit). Rebuild
+// and snap again now that every master-EQ value is in: a restore must not
+// glide (the same rule as the pass above). The block drift watcher would
+// catch it too, but a block late and gliding.
+is_read ? (
+  recalc_global_fx();
+  _srz_i = 0; loop(SVF_MST_COUNT, svf_snap(svf_master + _srz_i * SVF_STEREO_SIZE); _srz_i += 1;);
+);
 
 // ─── Graphics ─────────────────────────────────────────────────────────────
 // Default height 720 -> 780: at 720 the master section overflowed the window.

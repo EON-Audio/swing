@@ -4,8 +4,119 @@
 // (c) EON Studios — All Rights Reserved
 
 @init
+// ── EQ band palette ── ONE definition, referenced by name everywhere a
+// band is drawn. The bands were hand-typed RGB triples in three files, and
+// three pairs had drifted into each other: HPF and LO both orange, HI and
+// LPF both blue, LO and MID both yellowish. With each band now filling its
+// own shape those pairs would smear together, so the colours run in
+// FREQUENCY ORDER, low to high like a spectrum, and neighbours never share
+// a hue. (Requested 2026-09-21.)
+// Defined HERE, at the top level of this file's @init, because the master
+// EQ (this file) and the per-pad EQ (rk_swing_ui_grid_overlay_fx) both read
+// it. Not in swing_ui_set_colors: that runs in @gfx, every frame.
+// ⚠️ EON_Tone.jsfx carries the same values for the master EQ -- keep in step.
+
+EQC_HPF_R = 0.92; EQC_HPF_G = 0.30; EQC_HPF_B = 0.30;   // red
+EQC_LO_R = 0.96; EQC_LO_G = 0.60; EQC_LO_B = 0.18;   // orange
+EQC_MID_R = 0.38; EQC_MID_G = 0.86; EQC_MID_B = 0.36;   // green
+EQC_MID2_R = 0.22; EQC_MID2_G = 0.82; EQC_MID2_B = 0.70;   // teal (per-pad EQ only)
+EQC_HI_R = 0.30; EQC_HI_G = 0.66; EQC_HI_B = 0.96;   // blue-cyan
+EQC_LPF_R = 0.68; EQC_LPF_G = 0.44; EQC_LPF_B = 0.96;   // violet
+
+// The cached dB the graph shows in pixel column `c` of `cw`, from the cache row
+// at `row`. The cache holds MEQ_CV_N log-spaced points whatever the width, so
+// this is the one place a point becomes a pixel: when the points outnumber the
+// columns each column takes the value FURTHEST from 0 dB among its points (a
+// narrow bell keeps its tip; a plain sample at the column's centre would shave
+// it), and when the columns outnumber the points it interpolates. Drawing per
+// column, not per point, is what keeps a narrow embed from stair-stepping --
+// segments a fraction of a pixel long give the antialiasing nothing to work
+// with (learned on Apex's mixer-strip embed, 2026-09-21).
+// ⚠️ Same as tn_cv_at in EON_Tone.jsfx -- keep in step.
+function swing_panels_meq_cv_at(row, c, cw)
+  local(t, j, j1, fr, v)
+(
+  MEQ_CV_N - 1 > cw ? (
+    j  = min(floor(c * (MEQ_CV_N - 1) / max(cw - 1, 1)), MEQ_CV_N - 1);
+    j1 = min(floor((c + 1) * (MEQ_CV_N - 1) / max(cw - 1, 1)), MEQ_CV_N - 1);
+    v  = meq_cv[row + j];
+    j += 1;
+    while (j <= j1) ( abs(meq_cv[row + j]) > abs(v) ? v = meq_cv[row + j]; j += 1; );
+    v;
+  ) : (
+    t  = c / max(cw - 1, 1) * (MEQ_CV_N - 1);
+    j  = floor(t);
+    fr = t - j;
+    j >= MEQ_CV_N - 1 ? ( j = MEQ_CV_N - 2; fr = 1; );
+    meq_cv[row + j] + (meq_cv[row + j + 1] - meq_cv[row + j]) * fr;
+  );
+);
+
+// One band's fill between two sweep points: every column once, (x0, x1], y
+// interpolated along the segment, from the 0 dB line to the band's own curve.
+// The column rule is the one that fixed the stripes -- within a band, a column
+// painted twice at this alpha would bring them back. Different bands DO share
+// columns; that overlap is the point. A band that is off has a flat row, so
+// its fill has no height and draws nothing.
+// ⚠️ Same rule as tn_band_fill in EON_Tone.jsfx -- keep in step.
+function swing_panels_meq_band_fill(x0, y0, x1, y1)
+  local(fx, fxe, fdx, fy, fy1, fy2)
+(
+  fx  = (x0 | 0) + 1;
+  fxe = x1 | 0;
+  fdx = max(1, x1 - x0);
+  loop(max(0, fxe - fx + 1),
+    fy  = y0 + (y1 - y0) * (fx - x0) / fdx;
+    fy1 = min(_lcd_mid_y, fy);
+    fy2 = max(_lcd_mid_y, fy);
+    fy2 - fy1 > 0 ? gfx_rect(fx, fy1, 1, fy2 - fy1);
+    fx += 1;
+  );
+);
+
+// A master-EQ node's label: its gain, plus its Q once the Q has been moved
+// off its mode's default -- the per-pad EQ's convention, so a Q you scrolled
+// is something you can read. Defaults: shelf 1/sqrt(2), bell 0.8.
+function swing_panels_meq_node_label(gain, q, qdef) (
+  abs(q - qdef) > 0.005 ? sprintf(#_lv, "%+.0f dB Q%.1f", gain, q)
+                        : sprintf(#_lv, "%+.0f dB", gain);
+);
 
 function swing_panels_draw_eq() (
+    // ⚠️ ONE dB SCALE for this graph: _lcd_dbr dB maps to _lcd_yr, the
+    // drawable half-height. The curve, its clamp, the node dots, the +/-6 lines
+    // AND the node drag all read it. They used to carry their own numbers --
+    // curve 14, drag 12, clamp 18 -- and every bug in this graph was two of
+    // them disagreeing: the curve ran 29% past the floor (18 vs 14), and a
+    // dragged node moved at 86% of the cursor (12 vs 14).
+    // 24 is derived, not picked: LO tops out at 500 Hz and HI starts at 2 kHz,
+    // so all three bands can never overlap -- at most TWO sum at any frequency,
+    // +/-12 each. So the bands' combined curve always fits and nothing audible
+    // changed (the band GAIN range is still +/-12). Only a filter's stopband
+    // goes deeper, and that flattens along the floor as on any EQ display.
+    _lcd_dbr = 24;
+    // ── Graph geometry: the knob strip comes OUT of the curve's height ──
+    // HPF and LPF used to sit INSIDE the bottom of the graph, so a filter
+    // stopband flattening along the floor ran behind them (user-reported
+    // 2026-09-21). They now live in a strip below it. The curve, its fill, the
+    // node dots, the +/-6 lines, the frequency labels AND the node drag all use
+    // _lcd_gh / _lcd_mid_y / _lcd_yr from HERE, computed once, so none of them
+    // can disagree about where the graph ends -- that disagreement is what
+    // every earlier bug in this graph was. _lcd_mid_y is re-derived over the
+    // curve area: every caller sets it fresh before calling, and the big-view
+    // callers save and restore it around the call.
+    _meq_kr    = 12;
+    // The strip must hold the HPF/LPF label as well as the knob, and a 9 px
+    // bold label MEASURES 11-12 px, so it is measured rather than guessed: a
+    // fixed margin put the label 1-4 px over the divider line below. Every
+    // piece of text drawn before the label sets its own font, so measuring
+    // here disturbs nothing.
+    gfx_setfont(1, "Arial", 9, 'b');
+    gfx_measurestr("HPF", _meq_lw, _meq_lh);
+    _lcd_ks    = 2 * _meq_kr + _meq_lh + 6;  // knob + label + 2 px under the line
+    _lcd_gh    = max(10, _lcd_ch - _lcd_ks);
+    _lcd_mid_y = _lcd_cy + _lcd_gh / 2;
+    _lcd_yr    = _lcd_gh / 2 - 4;
     // Shift+click the graph opens the full-size EQ over the pad grid (compact
     // page only; the node hit-test above is guarded !SHIFT so it won't drag).
     big_view_id != VIEW_EQ && lmb_down && SHIFT && mx >= _lcd_cx && mx <= _lcd_cx + _lcd_cw && my >= _lcd_cy && my <= _lcd_cy + _lcd_ch ? (
@@ -16,7 +127,15 @@ function swing_panels_draw_eq() (
     gfx_set(lcd_tx_r * 0.3, lcd_tx_g * 0.3, lcd_tx_b * 0.3, 0.5);
     gfx_line(_lcd_cx, _lcd_mid_y, _lcd_cx + _lcd_cw, _lcd_mid_y);
     // ±6dB reference lines
-    _lcd_6db = _lcd_ch * 0.25;
+    // The LABEL says 6 dB, so the line goes where 6 dB is on the curve's own
+    // scale. (0.25 * _lcd_ch, the original, drew it where 7 dB sits.)
+    _lcd_6db = (6 / _lcd_dbr) * _lcd_yr;
+    // The graph ends here and the knob strip begins: say so with a line, or the
+    // floor of the curve and the top of the knobs read as one space.
+    _lcd_ks > 0 ? (
+      gfx_set(lcd_tx_r * 0.3, lcd_tx_g * 0.3, lcd_tx_b * 0.3, 0.5);
+      gfx_line(_lcd_cx, _lcd_cy + _lcd_gh, _lcd_cx + _lcd_cw, _lcd_cy + _lcd_gh);
+    );
     gfx_set(lcd_tx_r * 0.15, lcd_tx_g * 0.15, lcd_tx_b * 0.15, 0.4);
     gfx_line(_lcd_cx, _lcd_mid_y - _lcd_6db, _lcd_cx + _lcd_cw, _lcd_mid_y - _lcd_6db);
     gfx_line(_lcd_cx, _lcd_mid_y + _lcd_6db, _lcd_cx + _lcd_cw, _lcd_mid_y + _lcd_6db);
@@ -27,9 +146,9 @@ function swing_panels_draw_eq() (
     _rf100 = _lcd_cx + (log10(100) - _lcd_log_lo) / _lcd_log_range * _lcd_cw;
     _rf1k  = _lcd_cx + (log10(1000) - _lcd_log_lo) / _lcd_log_range * _lcd_cw;
     _rf10k = _lcd_cx + (log10(10000) - _lcd_log_lo) / _lcd_log_range * _lcd_cw;
-    gfx_x = _rf100; gfx_y = _lcd_cy + _lcd_ch - 9; gfx_drawstr("100");
-    gfx_x = _rf1k;  gfx_y = _lcd_cy + _lcd_ch - 9; gfx_drawstr("1k");
-    gfx_x = _rf10k; gfx_y = _lcd_cy + _lcd_ch - 9; gfx_drawstr("10k");
+    gfx_x = _rf100; gfx_y = _lcd_cy + _lcd_gh - 9; gfx_drawstr("100");
+    gfx_x = _rf1k;  gfx_y = _lcd_cy + _lcd_gh - 9; gfx_drawstr("1k");
+    gfx_x = _rf10k; gfx_y = _lcd_cy + _lcd_gh - 9; gfx_drawstr("10k");
     // dB labels
     gfx_set(lcd_tx_r * 0.5, lcd_tx_g * 0.5, lcd_tx_b * 0.5, 0.6);
     gfx_x = _lcd_cx + 1; gfx_y = _lcd_mid_y - _lcd_6db - 4; gfx_drawstr("+6");
@@ -39,8 +158,8 @@ function swing_panels_draw_eq() (
     active_id == 230 ? ( LMB ? (
       // Clamp mouse to graph area
       _cmx = max(_lcd_cx, min(_lcd_cx + _lcd_cw, mx));
-      _cmy = max(_lcd_cy, min(_lcd_cy + _lcd_ch, my));
-      gfx_eq_lo = max(-12, min(12, meq_drag_val_lo - (_cmy - meq_drag_my) / (_lcd_ch / 2 - 4) * 12));
+      _cmy = max(_lcd_cy, min(_lcd_cy + _lcd_gh, my));
+      gfx_eq_lo = max(-12, min(12, meq_drag_val_lo - (_cmy - meq_drag_my) / _lcd_yr * _lcd_dbr));
       // Delta-based freq in log space
       _dx = _cmx - meq_drag_mx;
       _logf = log10(meq_drag_freq_lo) + (_dx / _lcd_cw) * _lcd_log_range;
@@ -49,8 +168,8 @@ function swing_panels_draw_eq() (
     ) : active_id = -1; );
     active_id == 231 ? ( LMB ? (
       _cmx = max(_lcd_cx, min(_lcd_cx + _lcd_cw, mx));
-      _cmy = max(_lcd_cy, min(_lcd_cy + _lcd_ch, my));
-      gfx_eq_mid = max(-12, min(12, meq_drag_val_md - (_cmy - meq_drag_my) / (_lcd_ch / 2 - 4) * 12));
+      _cmy = max(_lcd_cy, min(_lcd_cy + _lcd_gh, my));
+      gfx_eq_mid = max(-12, min(12, meq_drag_val_md - (_cmy - meq_drag_my) / _lcd_yr * _lcd_dbr));
       _dx = _cmx - meq_drag_mx;
       _logf = log10(meq_drag_freq_md) + (_dx / _lcd_cw) * _lcd_log_range;
       gfx_eq_mid_freq = max(200, min(8000, pow(10, _logf)));
@@ -58,8 +177,8 @@ function swing_panels_draw_eq() (
     ) : active_id = -1; );
     active_id == 232 ? ( LMB ? (
       _cmx = max(_lcd_cx, min(_lcd_cx + _lcd_cw, mx));
-      _cmy = max(_lcd_cy, min(_lcd_cy + _lcd_ch, my));
-      gfx_eq_hi = max(-12, min(12, meq_drag_val_hi - (_cmy - meq_drag_my) / (_lcd_ch / 2 - 4) * 12));
+      _cmy = max(_lcd_cy, min(_lcd_cy + _lcd_gh, my));
+      gfx_eq_hi = max(-12, min(12, meq_drag_val_hi - (_cmy - meq_drag_my) / _lcd_yr * _lcd_dbr));
       _dx = _cmx - meq_drag_mx;
       _logf = log10(meq_drag_freq_hi) + (_dx / _lcd_cw) * _lcd_log_range;
       gfx_eq_hi_freq = max(2000, min(16000, pow(10, _logf)));
@@ -67,118 +186,155 @@ function swing_panels_draw_eq() (
     ) : active_id = -1; );
 
     // Draw combined frequency response curve
-    // Phase 4 (D O-2, 2026-09-15): the 80-point sweep, the three node magnitudes and the
-    // three node abscissae are cached in meq_cv against the eleven values they depend on
-    // (the Drum Strip's EQ-graph cache is the model). A page left open costs eleven
-    // compares per frame; the ~90 transcendentals run only when a band, a bell flag or
-    // the rate moves. The sweep's frequencies are fixed (80 log points, 20 Hz - 20 kHz),
-    // so the cache is width-independent and the compact page and the big view share it.
+    // Phase 4 (D O-2, 2026-09-15): the MEQ_CV_N-point sweep, the three node magnitudes
+    // and the three node abscissae are cached in meq_cv against the sixteen values they
+    // depend on (the Drum Strip's EQ-graph cache is the model). A page left open costs
+    // sixteen compares per frame; the sweep's ~18k transcendentals run only when a band,
+    // a Q, a bell flag or the rate moves. The sweep's frequencies are fixed (log points,
+    // 20 Hz - 20 kHz), so the cache is width-independent and the compact page and the
+    // big view share it; swing_panels_meq_cv_at turns it into pixel columns.
     _lcd_prev_x = -1; _lcd_prev_y = -1;
-    _lcd_yr = _lcd_ch / 2 - 4;
     (!meq_cv_valid || meq_cv_p0 != gfx_hpf_freq || meq_cv_p1 != gfx_lpf_freq
      || meq_cv_p2 != gfx_eq_lo || meq_cv_p3 != gfx_eq_lo_freq || meq_cv_p4 != meq_lo_bell
      || meq_cv_p5 != gfx_eq_mid || meq_cv_p6 != gfx_eq_mid_freq
      || meq_cv_p7 != gfx_eq_hi || meq_cv_p8 != gfx_eq_hi_freq || meq_cv_p9 != meq_hi_bell
+     // Q (ser_ver 75) is part of the curve, so it is part of the KEY -- miss it
+     // here, or in the store below, and turning Q would never redraw the graph.
+     || meq_cv_pq0 != gfx_eq_lo_sq || meq_cv_pq1 != gfx_eq_lo_bq || meq_cv_pq2 != gfx_eq_mid_q
+     || meq_cv_pq3 != gfx_eq_hi_sq || meq_cv_pq4 != gfx_eq_hi_bq
      || meq_cv_sr != srate) ? (
-      // Pre-compute all biquad coefficients ONCE (not 80x per recompute)
-      // HPF coefficients
-      _cv_hpf_on = gfx_hpf_freq > 25;
-      _cv_hpf_on ? (
-        bq_calc_highpass(gfx_hpf_freq, 0.707);
-        _hpf_b0 = _tb0; _hpf_b1 = _tb1; _hpf_b2 = _tb2;
-        _hpf_a1 = _ta1; _hpf_a2 = _ta2;
-      );
-      // LPF coefficients
-      _cv_lpf_on = gfx_lpf_freq < 19500;
-      _cv_lpf_on ? (
-        bq_calc_lowpass(gfx_lpf_freq, 0.707);
-        _lpf_b0 = _tb0; _lpf_b1 = _tb1; _lpf_b2 = _tb2;
-        _lpf_a1 = _ta1; _lpf_a2 = _ta2;
-      );
-      // Lo band coefficients — NO ternary, fully flat if-blocks
-      _cv_lo_on = gfx_eq_lo != 0;
-      _lo_use_shelf = _cv_lo_on && (meq_lo_bell == 0);
-      _lo_use_bell  = _cv_lo_on && (meq_lo_bell != 0);
-      _lo_use_shelf ? (
-        bq_calc_lowshelf(gfx_eq_lo_freq, gfx_eq_lo, 1.0);
-        _lo_b0 = _tb0; _lo_b1 = _tb1; _lo_b2 = _tb2;
-        _lo_a1 = _ta1; _lo_a2 = _ta2;
-      );
-      _lo_use_bell ? (
-        bq_calc_peaking(gfx_eq_lo_freq, gfx_eq_lo, 0.8);
-        _lo_b0 = _tb0; _lo_b1 = _tb1; _lo_b2 = _tb2;
-        _lo_a1 = _ta1; _lo_a2 = _ta2;
-      );
-      // Mid band coefficients
-      _cv_md_on = gfx_eq_mid != 0;
-      _cv_md_on ? (
-        bq_calc_peaking(gfx_eq_mid_freq, gfx_eq_mid, 0.8);
-        _md_b0 = _tb0; _md_b1 = _tb1; _md_b2 = _tb2;
-        _md_a1 = _ta1; _md_a2 = _ta2;
-      );
-      // Hi band coefficients — NO ternary, fully flat if-blocks
-      _cv_hi_on = gfx_eq_hi != 0;
-      _hi_use_shelf = _cv_hi_on && (meq_hi_bell == 0);
-      _hi_use_bell  = _cv_hi_on && (meq_hi_bell != 0);
-      _hi_use_shelf ? (
-        bq_calc_highshelf(gfx_eq_hi_freq, gfx_eq_hi, 1.0);
-        _hi_b0 = _tb0; _hi_b1 = _tb1; _hi_b2 = _tb2;
-        _hi_a1 = _ta1; _hi_a2 = _ta2;
-      );
-      _hi_use_bell ? (
-        bq_calc_peaking(gfx_eq_hi_freq, gfx_eq_hi, 0.8);
-        _hi_b0 = _tb0; _hi_b1 = _tb1; _hi_b2 = _tb2;
-        _hi_a1 = _ta1; _hi_a2 = _ta2;
-      );
-
-      // Sweep 80 frequency points into the cache (magnitudes only)
-      _lcd_px = 0;
-      loop(80,
-        _lcd_f = pow(10, _lcd_log_lo + (_lcd_px / 79) * _lcd_log_range);
-        _lcd_f = min(20000, _lcd_f);
-        _lcd_db = 0;
-        _cv_hpf_on ? ( _lcd_db += bq_mag_db(_lcd_f, _hpf_b0, _hpf_b1, _hpf_b2, _hpf_a1, _hpf_a2); );
-        _cv_lpf_on ? ( _lcd_db += bq_mag_db(_lcd_f, _lpf_b0, _lpf_b1, _lpf_b2, _lpf_a1, _lpf_a2); );
-        _cv_lo_on  ? ( _lcd_db += bq_mag_db(_lcd_f, _lo_b0, _lo_b1, _lo_b2, _lo_a1, _lo_a2); );
-        _cv_md_on  ? ( _lcd_db += bq_mag_db(_lcd_f, _md_b0, _md_b1, _md_b2, _md_a1, _md_a2); );
-        _cv_hi_on  ? ( _lcd_db += bq_mag_db(_lcd_f, _hi_b0, _hi_b1, _hi_b2, _hi_a1, _hi_a2); );
-        meq_cv[_lcd_px] = max(-18, min(18, _lcd_db));
-        _lcd_px += 1;
-      );
-      // Node magnitudes at the band frequencies (0 dB when a band is off: the node sits on
-      // the centre line) and the node abscissae in log space (the layout scales them per frame)
-      meq_cv[80] = _cv_lo_on ? max(-18, min(18, bq_mag_db(gfx_eq_lo_freq, _lo_b0, _lo_b1, _lo_b2, _lo_a1, _lo_a2))) : 0;
-      meq_cv[81] = _cv_md_on ? max(-18, min(18, bq_mag_db(gfx_eq_mid_freq, _md_b0, _md_b1, _md_b2, _md_a1, _md_a2))) : 0;
-      meq_cv[82] = _cv_hi_on ? max(-18, min(18, bq_mag_db(gfx_eq_hi_freq, _hi_b0, _hi_b1, _hi_b2, _hi_a1, _hi_a2))) : 0;
-      meq_cv[83] = log10(gfx_eq_lo_freq); meq_cv[84] = log10(gfx_eq_mid_freq); meq_cv[85] = log10(gfx_eq_hi_freq);
+      // ⚠️ SNAPSHOT FIRST. The key is taken HERE, before any coefficient, and the
+      // whole rebuild below reads the snapshot, never the live values. Those
+      // live values are also written off this thread: the Tone link receiver
+      // runs in @block, and @serialize restores them. When the key was stored
+      // AFTER the sweep, a value that changed mid-sweep went into the key while
+      // the curve still held the old one, the key then matched, and the graph
+      // kept a stale curve until the next edit (Codex pack 7). Now the curve and
+      // its key are the same numbers by construction, and a change that lands
+      // mid-sweep fails the key compare next frame and rebuilds.
       meq_cv_p0 = gfx_hpf_freq; meq_cv_p1 = gfx_lpf_freq;
       meq_cv_p2 = gfx_eq_lo; meq_cv_p3 = gfx_eq_lo_freq; meq_cv_p4 = meq_lo_bell;
       meq_cv_p5 = gfx_eq_mid; meq_cv_p6 = gfx_eq_mid_freq;
       meq_cv_p7 = gfx_eq_hi; meq_cv_p8 = gfx_eq_hi_freq; meq_cv_p9 = meq_hi_bell;
-      meq_cv_sr = srate; meq_cv_valid = 1;
+      meq_cv_pq0 = gfx_eq_lo_sq; meq_cv_pq1 = gfx_eq_lo_bq; meq_cv_pq2 = gfx_eq_mid_q;
+      meq_cv_pq3 = gfx_eq_hi_sq; meq_cv_pq4 = gfx_eq_hi_bq;
+      meq_cv_sr = srate;
+
+      // Pre-compute all biquad coefficients ONCE (not once per point)
+      // HPF coefficients
+      _cv_hpf_on = meq_cv_p0 > 25;
+      _cv_hpf_on ? (
+        bq_calc_highpass(meq_cv_p0, 0.707);
+        _hpf_b0 = _tb0; _hpf_b1 = _tb1; _hpf_b2 = _tb2;
+        _hpf_a1 = _ta1; _hpf_a2 = _ta2;
+      );
+      // LPF coefficients
+      _cv_lpf_on = meq_cv_p1 < 19500;
+      _cv_lpf_on ? (
+        bq_calc_lowpass(meq_cv_p1, 0.707);
+        _lpf_b0 = _tb0; _lpf_b1 = _tb1; _lpf_b2 = _tb2;
+        _lpf_a1 = _ta1; _lpf_a2 = _ta2;
+      );
+      // Lo band coefficients — NO ternary, fully flat if-blocks
+      _cv_lo_on = meq_cv_p2 != 0;
+      _lo_use_shelf = _cv_lo_on && (meq_cv_p4 == 0);
+      _lo_use_bell  = _cv_lo_on && (meq_cv_p4 != 0);
+      _lo_use_shelf ? (
+        bq_calc_lowshelf_q(meq_cv_p3, meq_cv_p2, meq_cv_pq0);
+        _lo_b0 = _tb0; _lo_b1 = _tb1; _lo_b2 = _tb2;
+        _lo_a1 = _ta1; _lo_a2 = _ta2;
+      );
+      _lo_use_bell ? (
+        bq_calc_peaking(meq_cv_p3, meq_cv_p2, meq_cv_pq1);
+        _lo_b0 = _tb0; _lo_b1 = _tb1; _lo_b2 = _tb2;
+        _lo_a1 = _ta1; _lo_a2 = _ta2;
+      );
+      // Mid band coefficients
+      _cv_md_on = meq_cv_p5 != 0;
+      _cv_md_on ? (
+        bq_calc_peaking(meq_cv_p6, meq_cv_p5, meq_cv_pq2);
+        _md_b0 = _tb0; _md_b1 = _tb1; _md_b2 = _tb2;
+        _md_a1 = _ta1; _md_a2 = _ta2;
+      );
+      // Hi band coefficients — NO ternary, fully flat if-blocks
+      _cv_hi_on = meq_cv_p7 != 0;
+      _hi_use_shelf = _cv_hi_on && (meq_cv_p9 == 0);
+      _hi_use_bell  = _cv_hi_on && (meq_cv_p9 != 0);
+      _hi_use_shelf ? (
+        bq_calc_highshelf_q(meq_cv_p8, meq_cv_p7, meq_cv_pq3);
+        _hi_b0 = _tb0; _hi_b1 = _tb1; _hi_b2 = _tb2;
+        _hi_a1 = _ta1; _hi_a2 = _ta2;
+      );
+      _hi_use_bell ? (
+        bq_calc_peaking(meq_cv_p8, meq_cv_p7, meq_cv_pq4);
+        _hi_b0 = _tb0; _hi_b1 = _tb1; _hi_b2 = _tb2;
+        _hi_a1 = _ta1; _hi_a2 = _ta2;
+      );
+
+      // Sweep MEQ_CV_N frequency points into the cache (magnitudes only)
+      _lcd_px = 0;
+      loop(MEQ_CV_N,
+        _lcd_f = pow(10, _lcd_log_lo + (_lcd_px / (MEQ_CV_N - 1)) * _lcd_log_range);
+        _lcd_f = min(20000, _lcd_f);
+        // Each band's OWN response, kept apart so it can fill its own shape in
+        // its own colour. The combined curve is their sum, exactly as before.
+        _bd_hp = _cv_hpf_on ? bq_mag_db(_lcd_f, _hpf_b0, _hpf_b1, _hpf_b2, _hpf_a1, _hpf_a2) : 0;
+        _bd_lp = _cv_lpf_on ? bq_mag_db(_lcd_f, _lpf_b0, _lpf_b1, _lpf_b2, _lpf_a1, _lpf_a2) : 0;
+        _bd_lo = _cv_lo_on  ? bq_mag_db(_lcd_f, _lo_b0, _lo_b1, _lo_b2, _lo_a1, _lo_a2) : 0;
+        _bd_md = _cv_md_on  ? bq_mag_db(_lcd_f, _md_b0, _md_b1, _md_b2, _md_a1, _md_a2) : 0;
+        _bd_hi = _cv_hi_on  ? bq_mag_db(_lcd_f, _hi_b0, _hi_b1, _hi_b2, _hi_a1, _hi_a2) : 0;
+        meq_cv[MEQ_CV_SUM + _lcd_px] = max(-_lcd_dbr, min(_lcd_dbr, _bd_hp + _bd_lp + _bd_lo + _bd_md + _bd_hi));
+        // ...and each band's own curve, for its own fill: rows of MEQ_CV_N from
+        // MEQ_CV_BANDS. Same validity key as the combined curve above -- they
+        // depend on exactly the same settings.
+        meq_cv[MEQ_CV_BANDS +                _lcd_px] = max(-_lcd_dbr, min(_lcd_dbr, _bd_hp));
+        meq_cv[MEQ_CV_BANDS +     MEQ_CV_N + _lcd_px] = max(-_lcd_dbr, min(_lcd_dbr, _bd_lp));
+        meq_cv[MEQ_CV_BANDS + 2 * MEQ_CV_N + _lcd_px] = max(-_lcd_dbr, min(_lcd_dbr, _bd_lo));
+        meq_cv[MEQ_CV_BANDS + 3 * MEQ_CV_N + _lcd_px] = max(-_lcd_dbr, min(_lcd_dbr, _bd_md));
+        meq_cv[MEQ_CV_BANDS + 4 * MEQ_CV_N + _lcd_px] = max(-_lcd_dbr, min(_lcd_dbr, _bd_hi));
+        _lcd_px += 1;
+      );
+      // Node magnitudes at the band frequencies (0 dB when a band is off: the node sits on
+      // the centre line) and the node abscissae in log space (the layout scales them per frame)
+      meq_cv[80] = _cv_lo_on ? max(-_lcd_dbr, min(_lcd_dbr, bq_mag_db(meq_cv_p3, _lo_b0, _lo_b1, _lo_b2, _lo_a1, _lo_a2))) : 0;
+      meq_cv[81] = _cv_md_on ? max(-_lcd_dbr, min(_lcd_dbr, bq_mag_db(meq_cv_p6, _md_b0, _md_b1, _md_b2, _md_a1, _md_a2))) : 0;
+      meq_cv[82] = _cv_hi_on ? max(-_lcd_dbr, min(_lcd_dbr, bq_mag_db(meq_cv_p8, _hi_b0, _hi_b1, _hi_b2, _hi_a1, _hi_a2))) : 0;
+      meq_cv[83] = log10(meq_cv_p3); meq_cv[84] = log10(meq_cv_p6); meq_cv[85] = log10(meq_cv_p8);
+      meq_cv_valid = 1;
     );
 
-    // Draw the cached curve
+    // Draw the cached curve, one pixel column at a time (see swing_panels_meq_cv_at)
+    _lcd_ncol = max(2, floor(_lcd_cw));
     _lcd_px = 0;
-    loop(80,
-      _lcd_db = meq_cv[_lcd_px];
-      _lcd_cur_x = _lcd_cx + (_lcd_px / 79) * _lcd_cw;
-      _lcd_cur_y = _lcd_mid_y - (_lcd_db / 14) * _lcd_yr;
+    loop(_lcd_ncol,
+      _lcd_cur_x = _lcd_cx + _lcd_px;
+      _lcd_db    = swing_panels_meq_cv_at(MEQ_CV_SUM, _lcd_px, _lcd_ncol);
+      _lcd_cur_y = _lcd_mid_y - (_lcd_db / _lcd_dbr) * _lcd_yr;
+      _by_hp = _lcd_mid_y - (swing_panels_meq_cv_at(MEQ_CV_BANDS,                _lcd_px, _lcd_ncol) / _lcd_dbr) * _lcd_yr;
+      _by_lp = _lcd_mid_y - (swing_panels_meq_cv_at(MEQ_CV_BANDS +     MEQ_CV_N, _lcd_px, _lcd_ncol) / _lcd_dbr) * _lcd_yr;
+      _by_lo = _lcd_mid_y - (swing_panels_meq_cv_at(MEQ_CV_BANDS + 2 * MEQ_CV_N, _lcd_px, _lcd_ncol) / _lcd_dbr) * _lcd_yr;
+      _by_md = _lcd_mid_y - (swing_panels_meq_cv_at(MEQ_CV_BANDS + 3 * MEQ_CV_N, _lcd_px, _lcd_ncol) / _lcd_dbr) * _lcd_yr;
+      _by_hi = _lcd_mid_y - (swing_panels_meq_cv_at(MEQ_CV_BANDS + 4 * MEQ_CV_N, _lcd_px, _lcd_ncol) / _lcd_dbr) * _lcd_yr;
 
       _lcd_prev_x >= 0 ? (
-        // Fill
-        _lcd_fy1 = min(_lcd_mid_y, _lcd_cur_y);
-        _lcd_fy2 = max(_lcd_mid_y, _lcd_cur_y);
-        _lcd_fy2 - _lcd_fy1 > 0 ? (
-          gfx_set(lcd_tx_r * 0.2, lcd_tx_g * 0.2, lcd_tx_b * 0.2, 0.2);
-          gfx_rect(_lcd_cur_x, _lcd_fy1, 1, _lcd_fy2 - _lcd_fy1);
-        );
+        // Each band fills its own shape, from the 0 dB line to its own curve, in
+        // a shade of its own colour. They replace the single grey fill under the
+        // combined curve (requested 2026-09-21); where two bands overlap they
+        // layer translucently, the way Pro-Q draws them. The combined curve is
+        // still the white line drawn over them all. Dimmer when bypassed.
+        _meq_ba = meq_bypass ? 0.07 : 0.20;
+        gfx_set(EQC_HPF_R, EQC_HPF_G, EQC_HPF_B, _meq_ba); swing_panels_meq_band_fill(_lcd_prev_x, _pby_hp, _lcd_cur_x, _by_hp);
+        gfx_set(EQC_LPF_R, EQC_LPF_G, EQC_LPF_B, _meq_ba); swing_panels_meq_band_fill(_lcd_prev_x, _pby_lp, _lcd_cur_x, _by_lp);
+        gfx_set(EQC_LO_R,  EQC_LO_G,  EQC_LO_B,  _meq_ba); swing_panels_meq_band_fill(_lcd_prev_x, _pby_lo, _lcd_cur_x, _by_lo);
+        gfx_set(EQC_MID_R, EQC_MID_G, EQC_MID_B, _meq_ba); swing_panels_meq_band_fill(_lcd_prev_x, _pby_md, _lcd_cur_x, _by_md);
+        gfx_set(EQC_HI_R,  EQC_HI_G,  EQC_HI_B,  _meq_ba); swing_panels_meq_band_fill(_lcd_prev_x, _pby_hi, _lcd_cur_x, _by_hi);
         // Combined line
         gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 0.85);
         gfx_line(_lcd_prev_x, _lcd_prev_y, _lcd_cur_x, _lcd_cur_y);
       );
       _lcd_prev_x = _lcd_cur_x;
       _lcd_prev_y = _lcd_cur_y;
+      _pby_hp = _by_hp; _pby_lp = _by_lp; _pby_lo = _by_lo; _pby_md = _by_md; _pby_hi = _by_hi;
       _lcd_px += 1;
     );
 
@@ -189,16 +345,16 @@ function swing_panels_draw_eq() (
     _lcd_lo_nx = _lcd_cx + (meq_cv[83] - _lcd_log_lo) / _lcd_log_range * _lcd_cw;
     _lcd_md_nx = _lcd_cx + (meq_cv[84] - _lcd_log_lo) / _lcd_log_range * _lcd_cw;
     _lcd_hi_nx = _lcd_cx + (meq_cv[85] - _lcd_log_lo) / _lcd_log_range * _lcd_cw;
-    _lcd_lo_ny = _lcd_mid_y - (meq_cv[80] / 14.0) * _lcd_yr;
-    _lcd_md_ny = _lcd_mid_y - (meq_cv[81] / 14.0) * _lcd_yr;
-    _lcd_hi_ny = _lcd_mid_y - (meq_cv[82] / 14.0) * _lcd_yr;
+    _lcd_lo_ny = _lcd_mid_y - (meq_cv[80] / _lcd_dbr) * _lcd_yr;
+    _lcd_md_ny = _lcd_mid_y - (meq_cv[81] / _lcd_dbr) * _lcd_yr;
+    _lcd_hi_ny = _lcd_mid_y - (meq_cv[82] / _lcd_dbr) * _lcd_yr;
 
     // Node circles
-    gfx_set(0.85, 0.65, 0.20, 1); gfx_circle(_lcd_lo_nx, _lcd_lo_ny, _lcd_nr, 1);
+    gfx_set(EQC_LO_R, EQC_LO_G, EQC_LO_B, 1); gfx_circle(_lcd_lo_nx, _lcd_lo_ny, _lcd_nr, 1);
     gfx_set(0, 0, 0, 0.4); gfx_circle(_lcd_lo_nx, _lcd_lo_ny, _lcd_nr, 0);
-    gfx_set(0.70, 0.85, 0.30, 1); gfx_circle(_lcd_md_nx, _lcd_md_ny, _lcd_nr, 1);
+    gfx_set(EQC_MID_R, EQC_MID_G, EQC_MID_B, 1); gfx_circle(_lcd_md_nx, _lcd_md_ny, _lcd_nr, 1);
     gfx_set(0, 0, 0, 0.4); gfx_circle(_lcd_md_nx, _lcd_md_ny, _lcd_nr, 0);
-    gfx_set(0.30, 0.70, 0.85, 1); gfx_circle(_lcd_hi_nx, _lcd_hi_ny, _lcd_nr, 1);
+    gfx_set(EQC_HI_R, EQC_HI_G, EQC_HI_B, 1); gfx_circle(_lcd_hi_nx, _lcd_hi_ny, _lcd_nr, 1);
     gfx_set(0, 0, 0, 0.4); gfx_circle(_lcd_hi_nx, _lcd_hi_ny, _lcd_nr, 0);
 
     // Node hover tooltips — independent of click state
@@ -206,8 +362,39 @@ function swing_panels_draw_eq() (
     dist(mx, my, _lcd_md_nx, _lcd_md_ny) <= _lcd_nr + 5 ? swing_tooltip_check(1103, "Mid band EQ node — drag Y for gain (-12 to +12 dB), drag X for frequency (200-8000 Hz). Double-click to reset.");
     dist(mx, my, _lcd_hi_nx, _lcd_hi_ny) <= _lcd_nr + 5 ? swing_tooltip_check(1105, "High band EQ node — drag Y for gain (-12 to +12 dB), drag X for frequency (2-16 kHz). Double-click to reset.");
 
+    // ── Wheel over a node: that band's Q (ser_ver 75) ────────────────
+    // The per-pad EQ's rule VERBATIM (rk_swing_ui_grid_overlay_fx), so the
+    // wheel feels the same on every EQ in Swing: 12% a notch, 3% with SHIFT,
+    // clamped 0.3..6. LO and HI change the Q of whichever MODE they are in --
+    // shelf or bell each keep their own. Placed after the nodes are laid out
+    // and BEFORE the hit-test and the knobs, and the notch is consumed, so the
+    // same notch cannot also turn a knob. Not while a node is being dragged.
+    // !_srf_foreign: Swing has foreign passes too when embedded twice, and a
+    // second embed is handed the owner's pointer. 0 on any other surface.
+    frame_wheel != 0 && active_id == -1 && !_srf_foreign ? (
+      _meq_wq = dist(mx, my, _lcd_md_nx, _lcd_md_ny) <= _lcd_nr + 4 ? 2 :
+            dist(mx, my, _lcd_lo_nx, _lcd_lo_ny) <= _lcd_nr + 4 ? 1 :
+            dist(mx, my, _lcd_hi_nx, _lcd_hi_ny) <= _lcd_nr + 4 ? 3 : 0;
+      _meq_wq ? (
+        _meq_wf = 1 + frame_wheel * (SHIFT ? 0.03 : 0.12);
+        // Explicit branches, not `c ? a = x : b = y` -- JSFX parses that
+        // ambiguously (rk_drumkit_dsp's recalc says the same).
+        _meq_wq == 1 ? (
+          meq_lo_bell ? ( gfx_eq_lo_bq = max(0.3, min(6, gfx_eq_lo_bq * _meq_wf)); )
+                      : ( gfx_eq_lo_sq = max(0.3, min(6, gfx_eq_lo_sq * _meq_wf)); );
+        ) : _meq_wq == 2 ? (
+          gfx_eq_mid_q = max(0.3, min(6, gfx_eq_mid_q * _meq_wf));
+        ) : (
+          meq_hi_bell ? ( gfx_eq_hi_bq = max(0.3, min(6, gfx_eq_hi_bq * _meq_wf)); )
+                      : ( gfx_eq_hi_sq = max(0.3, min(6, gfx_eq_hi_sq * _meq_wf)); );
+        );
+        recalc_master_eq(); mark_dirty_kit();   // same commit as a node drag
+        frame_wheel = 0; mouse_wheel = 0;
+      );
+    );
+
     // Node hit detect (BEFORE knobs so EQ nodes get click priority over HPF/LPF knobs)
-    active_id == -1 && lmb_down && !SHIFT && mx >= _lcd_cx && mx <= _lcd_cx + _lcd_cw && my >= _lcd_cy && my <= _lcd_cy + _lcd_ch ? (
+    active_id == -1 && lmb_down && !SHIFT && mx >= _lcd_cx && mx <= _lcd_cx + _lcd_cw && my >= _lcd_cy && my <= _lcd_cy + _lcd_gh ? (
       meq_drag_my = my; meq_drag_mx = mx;
       _hit_node = -1;
       dist(mx, my, _lcd_lo_nx, _lcd_lo_ny) <= _lcd_nr + 5 ? ( _hit_node = 230; meq_drag_val_lo = gfx_eq_lo; meq_drag_freq_lo = gfx_eq_lo_freq; ) :
@@ -232,7 +419,6 @@ function swing_panels_draw_eq() (
     );
 
     // ── HPF / LPF knobs (bottom corners of EQ graph) ──
-    _meq_kr = 12;
     _meq_hpf_cx = _lcd_cx + _meq_kr + 4;
     _meq_hpf_cy = _lcd_cy + _lcd_ch - _meq_kr - 3;
     _meq_lpf_cx = _lcd_cx + _lcd_cw - _meq_kr - 4;
@@ -256,7 +442,7 @@ function swing_panels_draw_eq() (
     dist(mx, my, _meq_hpf_cx, _meq_hpf_cy) <= _meq_kr + 4 ? swing_tooltip_check(1108, "Master HPF (high-pass filter, 20-8000 Hz, log). Removes low-end rumble before EQ. OFF at minimum.");
     // HPF label + value
     gfx_setfont(1, "Arial", 9, 'b');
-    gfx_set(0.85, 0.35, 0.20, _lcd_hpf_active ? 0.9 : 0.5);
+    gfx_set(EQC_HPF_R, EQC_HPF_G, EQC_HPF_B, _lcd_hpf_active ? 0.9 : 0.5);
     gfx_measurestr("HPF",tw,th);
     gfx_x = _meq_hpf_cx - tw/2; gfx_y = _meq_hpf_cy - _meq_kr - th - 1; gfx_drawstr("HPF");
     _lcd_hpf_active ? (
@@ -284,7 +470,7 @@ function swing_panels_draw_eq() (
       0.08, 0.08, 0.10);
     dist(mx, my, _meq_lpf_cx, _meq_lpf_cy) <= _meq_kr + 4 ? swing_tooltip_check(1109, "Master LPF (low-pass filter, 200-20000 Hz, log). Tames high frequencies after EQ. OFF at maximum.");
     // LPF label + value
-    gfx_set(0.20, 0.55, 0.85, _lcd_lpf_active ? 0.9 : 0.5);
+    gfx_set(EQC_LPF_R, EQC_LPF_G, EQC_LPF_B, _lcd_lpf_active ? 0.9 : 0.5);
     gfx_measurestr("LPF",tw,th);
     gfx_x = _meq_lpf_cx - tw/2; gfx_y = _meq_lpf_cy - _meq_kr - th - 1; gfx_drawstr("LPF");
     _lcd_lpf_active ? (
@@ -298,19 +484,19 @@ function swing_panels_draw_eq() (
     // dB + Hz labels on nodes
     gfx_setfont(1, "Arial", 9, 'b');
     gfx_eq_lo != 0 ? (
-      gfx_set(0.85, 0.65, 0.20, 1); sprintf(#_lv,"%+.0f dB", gfx_eq_lo);
+      gfx_set(EQC_LO_R, EQC_LO_G, EQC_LO_B, 1); swing_panels_meq_node_label(gfx_eq_lo, meq_lo_bell ? gfx_eq_lo_bq : gfx_eq_lo_sq, meq_lo_bell ? 0.8 : sqrt(0.5));
       gfx_measurestr(#_lv,tw,th);
       gfx_x = _lcd_lo_nx - tw/2; gfx_y = _lcd_lo_ny < _lcd_mid_y ? _lcd_lo_ny - th - 2 : _lcd_lo_ny + _lcd_nr + 1;
       gfx_drawstr(#_lv);
     );
     gfx_eq_mid != 0 ? (
-      gfx_set(0.70, 0.85, 0.30, 1); sprintf(#_lv,"%+.0f dB", gfx_eq_mid);
+      gfx_set(EQC_MID_R, EQC_MID_G, EQC_MID_B, 1); swing_panels_meq_node_label(gfx_eq_mid, gfx_eq_mid_q, 0.8);
       gfx_measurestr(#_lv,tw,th);
       gfx_x = _lcd_md_nx - tw/2; gfx_y = _lcd_md_ny < _lcd_mid_y ? _lcd_md_ny - th - 2 : _lcd_md_ny + _lcd_nr + 1;
       gfx_drawstr(#_lv);
     );
     gfx_eq_hi != 0 ? (
-      gfx_set(0.30, 0.70, 0.85, 1); sprintf(#_lv,"%+.0f dB", gfx_eq_hi);
+      gfx_set(EQC_HI_R, EQC_HI_G, EQC_HI_B, 1); swing_panels_meq_node_label(gfx_eq_hi, meq_hi_bell ? gfx_eq_hi_bq : gfx_eq_hi_sq, meq_hi_bell ? 0.8 : sqrt(0.5));
       gfx_measurestr(#_lv,tw,th);
       gfx_x = _lcd_hi_nx - tw/2; gfx_y = _lcd_hi_ny < _lcd_mid_y ? _lcd_hi_ny - th - 2 : _lcd_hi_ny + _lcd_nr + 1;
       gfx_drawstr(#_lv);
@@ -349,7 +535,7 @@ function swing_panels_draw_eq() (
     _tgl_lo_x = _lcd_cx + _lcd_cw - _tgl_w * 2 - 8;
     _tgl_lo_y = _lcd_cy + 1;
     meq_lo_bell ? strcpy(#_tgl_lo, "BELL") : strcpy(#_tgl_lo, "SHELF");
-    gfx_set(0.85, 0.65, 0.20, meq_lo_bell ? 0.7 : 0.35);
+    gfx_set(EQC_LO_R, EQC_LO_G, EQC_LO_B, meq_lo_bell ? 0.7 : 0.35);
     gfx_rect(_tgl_lo_x, _tgl_lo_y, _tgl_w, _tgl_h);
     gfx_set(0, 0, 0, 0.9);
     gfx_measurestr(#_tgl_lo, tw, th);
@@ -364,7 +550,7 @@ function swing_panels_draw_eq() (
     _tgl_hi_x = _lcd_cx + _lcd_cw - _tgl_w - 4;
     _tgl_hi_y = _lcd_cy + 1;
     meq_hi_bell ? strcpy(#_tgl_hi, "BELL") : strcpy(#_tgl_hi, "SHELF");
-    gfx_set(0.30, 0.70, 0.85, meq_hi_bell ? 0.7 : 0.35);
+    gfx_set(EQC_HI_R, EQC_HI_G, EQC_HI_B, meq_hi_bell ? 0.7 : 0.35);
     gfx_rect(_tgl_hi_x, _tgl_hi_y, _tgl_w, _tgl_h);
     gfx_set(0, 0, 0, 0.9);
     gfx_measurestr(#_tgl_hi, tw, th);
@@ -817,7 +1003,11 @@ function swing_panels_comp_knob(ki, cx, cy, kr, km) local(_lv, _nv) (
   ) :
   ki == 1 ? (
     _lv = log(max(1, cmp_ratio));
+    // Right-click on RATIO cycles the knee (below), not a reset; see the note on
+    // the LCD PAN knob in rk_swing_lcd.
+    _rmb_keep = rmb_down; rmb_down = 0;
     _nv = ssl_knob_interact(km, cx, cy, kr, _lv, 0, 2.99573227355, 1.38629436112, 0);
+    rmb_down = _rmb_keep;
     _nv != _lv ? ( cmp_ratio = exp(_nv); swing_rcp_post_cmp(); mark_dirty_kit(); );
     _cpc_dv = _nv; _cpc_dmin = 0; _cpc_dmax = 2.99573227355; _cpc_dsym = 0;
     strcpy(#wface_lbl, "RATIO");
@@ -924,15 +1114,29 @@ function swing_panels_anvil_knob(ki, cx, cy, kr, km) local(_nv, _r) (
 // picked up by @block, which resets the incoming engine and pushes the
 // controls; nothing here touches the audio thread.
 function swing_panels_comp_voice_chips(x0, y0, cw, ch, gap) local(_hv) (
+  // ⚠ While the audio-bus Weld is driving, the voice is NOT this page's to pick.
+  // The compressor in circuit is the plugin the Drum Bus Options dialog put on
+  // the folder, and only Weld can follow this link at all -- Anvil declares no
+  // shared memory, so an Anvil on the bus could never be driven from here. A
+  // live BLACK/BLUE chip would therefore change the page's face and the knob
+  // set while the bus went on running Weld, and every knob the user then turned
+  // would write a parameter nothing reads. So the chips REPORT instead, and the
+  // link's first-sight adoption has already pulled the page to WELD to match.
+  // ⭐ Delete these gates the day Weld carries the three voices itself (decided
+  // 2026-09-20): the chips then become a voice post on the same mailbox.
   _hv = wface_btn_labeled(x0, y0, cw, ch, cmp_voice == 0, "WELD", "");
   _hv ? swing_tooltip_check(1416, "Master compressor voice: EON Weld, the console bus compressor.");
-  _hv && lmb_down && cmp_voice != 0 ? ( cmp_voice = 0; mark_dirty_kit(); );
+  _hv && lmb_down && !bcl_live && cmp_voice != 0 ? ( cmp_voice = 0; mark_dirty_kit(); );
   _hv = wface_btn_labeled(x0 + cw + gap, y0, cw, ch, cmp_voice == 1, "BLACK", "");
-  _hv ? swing_tooltip_check(1417, "Master compressor voice: EON Anvil, blackface (Rev D) FET limiting amp.");
-  _hv && lmb_down && cmp_voice != 1 ? ( cmp_voice = 1; mark_dirty_kit(); );
+  _hv ? swing_tooltip_check(1417, bcl_live ?
+        "The Audio bus is running EON Weld. Its rack is chosen when you build, in Drum Bus Options." :
+        "Master compressor voice: EON Anvil, blackface (Rev D) FET limiting amp.");
+  _hv && lmb_down && !bcl_live && cmp_voice != 1 ? ( cmp_voice = 1; mark_dirty_kit(); );
   _hv = wface_btn_labeled(x0 + 2 * (cw + gap), y0, cw, ch, cmp_voice == 2, "BLUE", "");
-  _hv ? swing_tooltip_check(1418, "Master compressor voice: EON Anvil, blue-stripe silverface (Rev A).");
-  _hv && lmb_down && cmp_voice != 2 ? ( cmp_voice = 2; mark_dirty_kit(); );
+  _hv ? swing_tooltip_check(1418, bcl_live ?
+        "The Audio bus is running EON Weld. Its rack is chosen when you build, in Drum Bus Options." :
+        "Master compressor voice: EON Anvil, blue-stripe silverface (Rev A).");
+  _hv && lmb_down && !bcl_live && cmp_voice != 2 ? ( cmp_voice = 2; mark_dirty_kit(); );
 );
 
 function swing_panels_draw_comp()
@@ -976,6 +1180,26 @@ local(x, y, w, h, s, land, top, vu_r, vu_cx, vu_cy, vu_bot, vg, sep1, sep2, ky1,
     gfx_setfont(4, "Arial", max(10, floor(13 * s)));
     gfx_set(wface_td_r, wface_td_g, wface_td_b, 0.9);
     gfx_drawstr(cmp_voice == 0 ? "  BUS COMPRESSOR" : cmp_voice == 1 ? "  FET LIMITING AMP  ·  BLACKFACE" : "  FET LIMITING AMP  ·  BLUE STRIPE");
+    // Where the needle's reading comes from. In Multi-Out the compressor doing
+    // the work is the Weld on the Audio folder, and the GR arc above is its
+    // reduction, not this page's -- say so, or the meter is an unattributed
+    // number. Same accent EON Output uses for "linked to Swing", so the suite
+    // states the relationship the same way wherever it appears. Reads
+    // "DRIVING" once this page can push values back (step 4); today it only
+    // listens, and the label says only that.
+    bcl_live ? (
+      gfx_set(0.35, 0.80, 0.84, 0.95);
+      gfx_drawstr("   ·  GR: AUDIO BUS");
+    ) : bcl_foreign ? (
+      // A compressor is on the folder that cannot follow this page — a stock
+      // one, an FX chain, an Anvil, or something dropped in by hand. This page
+      // is not driving it and has no reading to borrow from it, so say both.
+      // Swing's own compressor is out of circuit here too: in Multi-Out it only
+      // ever reached the pad on OUT 1, so leaving it in would be a second,
+      // hidden compressor on one drum.
+      gfx_set(0.85, 0.55, 0.15, 0.95);
+      gfx_drawstr("   ·  AUDIO BUS COMP: NOT LINKED");
+    );
     // voice chips on their own row under the wordmark -- WELD · BLACK · BLUE --
     // clear of the subtitle, which in the Anvil voices runs most of the width.
     // The header grows by the row; everything below reflows through vg.
@@ -1031,8 +1255,11 @@ local(x, y, w, h, s, land, top, vu_r, vu_cx, vu_cy, vu_bot, vg, sep1, sep2, ky1,
     gfx_measurestr(cmp_voice > 0 ? "EON ANVIL" : "EON WELD", tw, th);
     bx = lx + floor(14 * s) + tw + floor(12 * s); by = y + floor(2 * s); bw = floor(28 * s); bh = max(10, floor(12 * s));
     hv = wface_btn_labeled(bx, by, bw, bh, cmp_voice > 0, cmp_voice == 0 ? "W" : cmp_voice == 1 ? "BLK" : "BLU", "");
-    hv ? swing_tooltip_check(1420, "Master compressor voice. Click to cycle: Weld, Anvil Black, Anvil Blue.");
-    hv && lmb_down ? ( cmp_voice = (cmp_voice + 1) % 3; mark_dirty_kit(); );
+    hv ? swing_tooltip_check(1420, bcl_live ?
+         "The Audio bus is running EON Weld. Its rack is chosen when you build, in Drum Bus Options." :
+         "Master compressor voice. Click to cycle: Weld, Anvil Black, Anvil Blue.");
+    // Inert while the bus Weld is driving — same reason as the header chips.
+    hv && lmb_down && !bcl_live ? ( cmp_voice = (cmp_voice + 1) % 3; mark_dirty_kit(); );
     // LIM chip: the master limiter in / out. Ceiling and release are in the
     // big view (double-click the card); the card has no room for two knobs.
     bx += bw + floor(6 * s);

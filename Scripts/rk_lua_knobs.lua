@@ -887,13 +887,51 @@ function K.roland(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg,
   if hover_t > 0.01 then g:set(1, 1, 1, 0.20 * hover_t); g:circle(cx, cy, body_r + 1, 0) end
 end
 
+-- Rainbow Arc (style 9) — rainbow_knob_draw. EON's own knob: a 270-degree arc
+-- whose colour cross-fades through EON's six band colours (Tone's six), a dark
+-- body with a thin coloured rim, a pointer ending in a dot. Stateless: the colour
+-- follows the clock while the knob is up and rests on red at zero.
+K.RAINBOW_SIX = { {0.92, 0.30, 0.30}, {0.96, 0.60, 0.18}, {0.38, 0.86, 0.36},
+                  {0.22, 0.82, 0.70}, {0.30, 0.66, 0.96}, {0.68, 0.44, 0.96} }
+function K.rainbow(g, cx, cy, radius, value, vmin, vmax, hover_t)
+  local six = K.RAINBOW_SIX
+  local v = clamp((value - vmin) / math.max(1e-7, vmax - vmin), 0, 1)
+  local cr, cg, cb = six[1][1], six[1][2], six[1][3]
+  if v > 0 then
+    local p = (reaper.time_precise() / 0.6) % 6
+    local i = floor(p)
+    local f = p - i
+    f = f * f * (3 - 2 * f)
+    local a, b = six[i + 1], six[(i + 1) % 6 + 1]
+    cr, cg, cb = lerp(a[1], b[1], f), lerp(a[2], b[2], f), lerp(a[3], b[3], f)
+  end
+  local hov = hover_t or 0
+  local sweep, a0 = PI * 1.5, -PI * 0.75
+  local av = a0 + v * sweep
+  local ring_w = radius * (0.16 + 0.04 * hov)
+  local ring_mid = radius - ring_w * 0.5
+  g:set(0.06 + cr * 0.2, 0.06 + cg * 0.2, 0.07 + cb * 0.2, 1)
+  g:arc(cx, cy, ring_mid, a0, a0 + sweep, ring_w)
+  if v > 0 then
+    g:set(cr, cg, cb, 1)
+    g:arc(cx, cy, ring_mid, a0, av, ring_w)
+  end
+  local body_r = radius - ring_w - math.max(2, radius * 0.08)
+  g:set(0.10, 0.10, 0.12, 1); g:circle(cx, cy, body_r, 1)
+  g:set(cr, cg, cb, 0.55 + 0.35 * hov); g:circle(cx, cy, body_r, 0)
+  local s, c = sin(av), -cos(av)
+  g:set(cr, cg, cb, 1)
+  g:line(cx + s * body_r * 0.35, cy + c * body_r * 0.35, cx + s * body_r * 0.85, cy + c * body_r * 0.85, 1.5)
+  g:circle(cx + s * body_r * 0.85, cy + c * body_r * 0.85, math.max(1.5, radius * 0.05), 1)
+end
+
 -- ── Dispatcher ───────────────────────────────────────────────────────────────
 -- Style ids match knobs_kbsg.jsfx-inc rk_knob_draw (1 ssl · 2 varimu · 3 api ·
--- 4 ws · 5 neve · 6 jo · 7 mpc · 8 jog · 10 sp · 11 encoder · 12 pultec ·
+-- 4 ws · 5 neve · 6 jo · 7 mpc · 8 jog · 9 rainbow · 10 sp · 11 encoder · 12 pultec ·
 -- 13 ableton · 14 fl · 15 pt · 16 fabfilter · 17 serum · 18 roland).
--- PORTED: all 18 — ssl(1) varimu(2) api(3) ws(4) neve(5) jo(6) mpc(7) jog(8)
+-- PORTED: ssl(1) varimu(2) api(3) ws(4) neve(5) jo(6) mpc(7) jog(8) rainbow(9)
 -- sp(10) encoder(11) pultec(12) ableton(13) fl(14) pt(15) fabfilter(16) serum(17)
--- roland(18). (style 9 = bb, needs interaction memory — not used here; 0/unknown → ssl.)
+-- roland(18) pultec_cream(19) neve_alt(20). (0/unknown → ssl.)
 function K.draw(style, g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t,
                 cr, cg, cb, n_det, bgr, bgg, bgb)
   if style == 2  then return K.varimu(g, cx, cy, radius, value, vmin, vmax, hover_t, cr, cg, cb) end
@@ -903,6 +941,7 @@ function K.draw(style, g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t,
   if style == 6  then return K.jo(g, cx, cy, radius, (value - vmin) / math.max(1e-7, vmax - vmin), hover_t, cr, cg, cb) end
   if style == 7  then return K.mpc(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg, cb, bgr, bgg, bgb) end
   if style == 8  then return K.jog(g, cx, cy, radius, value, vmin, vmax, hover_t, cr, cg, cb) end
+  if style == 9  then return K.rainbow(g, cx, cy, radius, value, vmin, vmax, hover_t) end
   if style == 10 then return K.sp(g, cx, cy, radius, (value - vmin) / math.max(1e-7, vmax - vmin), hover_t) end
   if style == 11 then return K.encoder(g, cx, cy, radius, value, vmin, vmax, hover_t, cr, cg, cb) end
   if style == 12 then return K.pultec(g, cx, cy, radius, value, vmin, vmax, hover_t) end

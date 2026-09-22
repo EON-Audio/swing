@@ -293,7 +293,7 @@ T.FIXED = {
 
 -- ── Per-theme knob identity (EON console themes) ──────────────────────────
 -- Knob STYLE indices (match knobs_kbsg.jsfx-inc rk_knob_draw dispatch):
---   1 ssl · 2 varimu · 3 api · 4 ws · 5 neve · 6 jo · 7 mpc · 8 jog · 10 sp
+--   1 ssl · 2 varimu · 3 api · 4 ws · 5 neve · 6 jo · 7 mpc · 8 jog · 9 rainbow · 10 sp
 --   · 11 encoder · 12 pultec · 13 ableton · 14 fl · 15 protools · 16 fabfilter
 --   · 17 serum · 18 roland · 19 pultec_cream · 20 neve_alt.
 --   Each theme = { primary, secondary }. IDs persist in ExtState — append only.

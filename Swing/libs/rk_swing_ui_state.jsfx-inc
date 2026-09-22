@@ -305,6 +305,14 @@ kit_export_state == 11 ? (
   gmem[_gb + 41] = oneshot_global;
   gmem[_gb + 42] = rvb_on;
   gmem[_gb + 43] = dly_on;
+  // Master EQ Q per mode (ser_ver 75). Appended after dly_on, the same way the
+  // bus enables were -- see KIT_GLOBAL_KEYS in Swing_Kit_Bridge.lua, whose order
+  // this must match. Swing Lite never reaches past +41, so these are Swing's.
+  gmem[_gb + 44] = gfx_eq_lo_sq;
+  gmem[_gb + 45] = gfx_eq_lo_bq;
+  gmem[_gb + 46] = gfx_eq_mid_q;
+  gmem[_gb + 47] = gfx_eq_hi_sq;
+  gmem[_gb + 48] = gfx_eq_hi_bq;
   // Per-pad metadata
   _ki = 0; loop(NUM_PADS,
     _mb = KIT_GMEM_META + _ki * KIT_GMEM_META_PP;
@@ -942,6 +950,16 @@ kit_import_state == 2 ? (
     // existed arrives with both set to 1, not zero-init 0.
     rvb_on         = gmem[_gb + 42];
     dly_on         = gmem[_gb + 43];
+    // Master EQ Q (ser_ver 75), read BEFORE the recalc below. Same no-version-
+    // bump reasoning as the enables: the bridge fills every slot, from its
+    // defaults table when a kit predates the key. Clamped anyway, in the
+    // positive form: Lua's `or` only falls back on a MISSING key, so a kit that
+    // carried a 0 would load a 0 -- a needle-thin band -- and NaN fails every test.
+    gfx_eq_lo_sq   = gmem[_gb + 44]; gfx_eq_lo_sq = gfx_eq_lo_sq >= 0.3 ? min(6, gfx_eq_lo_sq) : sqrt(0.5);
+    gfx_eq_lo_bq   = gmem[_gb + 45]; gfx_eq_lo_bq = gfx_eq_lo_bq >= 0.3 ? min(6, gfx_eq_lo_bq) : 0.8;
+    gfx_eq_mid_q   = gmem[_gb + 46]; gfx_eq_mid_q = gfx_eq_mid_q >= 0.3 ? min(6, gfx_eq_mid_q) : 0.8;
+    gfx_eq_hi_sq   = gmem[_gb + 47]; gfx_eq_hi_sq = gfx_eq_hi_sq >= 0.3 ? min(6, gfx_eq_hi_sq) : sqrt(0.5);
+    gfx_eq_hi_bq   = gmem[_gb + 48]; gfx_eq_hi_bq = gfx_eq_hi_bq >= 0.3 ? min(6, gfx_eq_hi_bq) : 0.8;
     // Recalc derived values
     recalc_global_fx();
     gfx_lim_rel_c = exp(-1.0 / max(1, gfx_lim_rel * 0.001 * srate));
@@ -1855,6 +1873,7 @@ function swing_ui_knob_name(_id) (
   _id == 6  ? strcpy(#_knob_name, "Joanny")    :
   _id == 7  ? strcpy(#_knob_name, "MPC")       :
   _id == 8  ? strcpy(#_knob_name, "Jog")       :
+  _id == 9  ? strcpy(#_knob_name, "Rainbow")   :
   _id == 10 ? strcpy(#_knob_name, "Spice")     :
   _id == 11 ? strcpy(#_knob_name, "Encoder")   :
   _id == 12 ? strcpy(#_knob_name, "Pultec")    :
@@ -1866,14 +1885,16 @@ function swing_ui_knob_name(_id) (
   _id == 18 ? strcpy(#_knob_name, "Roland")    :
   _id == 19 ? strcpy(#_knob_name, "Pultec Cr") :
   _id == 20 ? strcpy(#_knob_name, "Neve Alt")  :
-  strcpy(#_knob_name, "Default");   // 0 / 9(bb) / unknown
+  strcpy(#_knob_name, "Default");   // 0 / unknown
 );
-// Cycle to the next / previous valid style id (numeric order, skip bb=9, wrap 20<->0).
+// Cycle to the next / previous style id (numeric order, wrap 20<->0). Style 9 is
+// the Rainbow Arc (EON's own, stateless) since 2026-09-22; it used to be the
+// mem-only BirdBird knob and was skipped here.
 function swing_ui_knob_next(_id) (
-  _id >= 20 ? 0 : (_id == 8 || _id == 9) ? 10 : _id + 1;
+  _id >= 20 ? 0 : _id + 1;
 );
 function swing_ui_knob_prev(_id) (
-  _id <= 0 ? 20 : (_id == 10 || _id == 9) ? 8 : _id - 1;
+  _id <= 0 ? 20 : _id - 1;
 );
 
 // ── Header caption for a value chip ────────────────────────────────────────
@@ -2202,19 +2223,19 @@ function swing_ui_draw_header() (
     // Click (either button) → style picker popup
     _knob_hover && (lmb_down || rmb_down) ? (
       swing_popup_open(mx, my,
-        "Default|SSL|Vari-Mu|API|Witti|Neve|Joanny|MPC|Jog|Spice|Encoder|Pultec|Ableton|FL|Pro Tools|FabFilter|Serum|Roland|Pultec Cr|Neve Alt",
+        "Default|SSL|Vari-Mu|API|Witti|Neve|Joanny|MPC|Jog|Rainbow|Spice|Encoder|Pultec|Ableton|FL|Pro Tools|FabFilter|Serum|Roland|Pultec Cr|Neve Alt",
         SP_POPUP_CALLER_KNOB_STYLE);
       lmb_down = 0;
     );
-    // Wheel → cycle (numeric style order, skips the mem-only bb=9)
+    // Wheel → cycle (numeric style order)
     _knob_hover && frame_wheel != 0 ? (
       gmem[GS_THEME_KNOB_REQ] = (frame_wheel > 0 ? swing_ui_knob_next(_knob_cur) : swing_ui_knob_prev(_knob_cur)) + 1;
       frame_wheel = 0;
     );
   ) : ( _knob_capw = 0; );
-  // Popup pick → style request. Positions 1..9 → id (r-1); 10..20 → id r.
+  // Popup pick → style request. Row = style id: positions 1..21 → id (r-1).
   swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_KNOB_STYLE ? (
-    _knob_pick = swing_popup_result <= 9 ? swing_popup_result - 1 : swing_popup_result;
+    _knob_pick = swing_popup_result - 1;
     swing_popup_result = 0;
     gmem[GS_THEME_KNOB_REQ] = _knob_pick + 1;
   );

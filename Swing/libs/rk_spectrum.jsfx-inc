@@ -1,0 +1,1041 @@
+desc: rk_spectrum - FFT spectrum analyzer (ReaKit suite)
+
+/*
+================================================================================
+  rk_spectrum.jsfx-inc
+================================================================================
+
+  FFT spectrum analyzer library for the EON Studios ReaKit suite.
+  Provides multi-buffer averaging, log-frequency axis mapping, dB-scaled
+  display with configurable floor, piano-keys overlay, peak hold, and
+  octave gridlines.
+
+  This file is a port of Justin Johnson's S2GFX spectrum.jsfx-inc as
+  bundled with the Tukan plugin suite. The instance namespace has been
+  renamed `spectrum.` -> `rk_spectrum.` for collision-free coexistence
+  with other ReaKit modules. DSP behavior unchanged.
+
+  References (public-domain DSP technique):
+    http://www.zytrax.com/tech/audio/calculator.html
+    https://lists.gnu.org/archive/html/help-octave/2015-07/msg00016.html
+    http://apmr.matelys.com/Standards/OctaveBands.html
+
+  Usage example:
+    @init
+    rk_spectrum.init_memory(__memtop__);
+    rk_spectrum.alloc_memory(...);
+    rk_spectrum.set_block_size(2048);
+    @sample
+    rk_spectrum.sample0(spl0 + spl1);
+    @gfx
+    rk_spectrum.draw_grid(0);
+    rk_spectrum.draw(0);
+
+================================================================================
+  ORIGINAL FILE LICENSE
+================================================================================
+
+  MIT License - Copyright (c) Justin Johnson (nitsuj / Tukan)
+
+  License declared in parent plugin "Orange EQ S2 (Tukan)" by Justin Johnson.
+  Permission to use, copy, modify, merge, publish, distribute, sublicense,
+  and/or sell, with the above copyright notice preserved in all copies.
+
+  Software provided "AS IS", without warranty.
+
+================================================================================
+  EON STUDIOS - ReaKit Suite Foundation
+  Copyright (c) 2026 EON Studios
+================================================================================
+*/
+
+/*
+  Spectrum Analyzer Library
+  
+  Reference:
+   http://www.zytrax.com/tech/audio/calculator.html
+   https://lists.gnu.org/archive/html/help-octave/2015-07/msg00016.html
+   http://apmr.matelys.com/Standards/OctaveBands.html
+ */
+
+@init
+
+/*
+ * Initialise spectrum memory allocater
+ * We pass in an existing memory index so that we can integrate with
+ * other allocaters
+ */
+function rk_spectrum.init_memory(i) instance(mem_index) ( 
+  mem_index = i;
+);
+
+/*
+ * Allocate memory for spectrum analyzer
+ */
+function rk_spectrum.alloc_memory(amount) instance(mem_index) local(i) ( 
+  i = mem_index;
+  mem_index += amount;
+  i;
+);
+
+/*
+ * Return the memory index so that we can integrate with other allocaters
+ */
+function rk_spectrum.get_memory_index() instance(mem_index) (
+  mem_index;
+);
+
+/*
+ * Round a number up or down
+ */
+function rk_spectrum.round(in) (
+  in = floor(in + 0.5 * sign(in));
+);
+
+/*
+ * Given frequency, return screen x position
+ */
+function rk_spectrum.freq_to_x(freq) (
+  rk_spectrum.left_margin + ((grf_w - rk_spectrum.left_margin - rk_spectrum.right_margin) * log(freq / rk_spectrum.min_freq) / rk_spectrum.freq_log_max);
+);
+
+/*
+ * Given screen x position, return frequency
+ */
+function rk_spectrum.x_to_freq(x) (
+  x = rk_spectrum.min_freq * exp(rk_spectrum.freq_log_max * (x - rk_spectrum.left_margin) / (grf_w - rk_spectrum.left_margin - rk_spectrum.right_margin));
+  max(min(x, rk_spectrum.max_freq), rk_spectrum.min_freq);
+);
+
+/*
+ * Given decibels, return screen y position
+ */
+function rk_spectrum.db_to_y(db) ( 
+  rk_spectrum.top_margin + (((db - rk_spectrum.ceiling) / (rk_spectrum.noise_floor - rk_spectrum.ceiling)) * (grf_h - rk_spectrum.top_margin - rk_spectrum.bottom_margin - gfx_texth));
+);
+
+/*
+ * Given screen y position, return decibels
+ */
+function rk_spectrum.y_to_db(y) (
+  y = (y - rk_spectrum.top_margin) / (grf_h - rk_spectrum.top_margin - rk_spectrum.bottom_margin - gfx_texth);
+  rk_spectrum.ceiling + (y * (rk_spectrum.noise_floor - rk_spectrum.ceiling) );
+);
+
+/*
+ * Given a magnitude (1.0 .... very small number), return y screen position
+ * No tilt
+ */
+function rk_spectrum.magnitude_to_y(m) local(db) (
+  db = 10 * log10(m);
+  rk_spectrum.top_margin + (((db - rk_spectrum.ceiling) / (rk_spectrum.noise_floor - rk_spectrum.ceiling)) * (grf_h - rk_spectrum.top_margin - rk_spectrum.bottom_margin - gfx_texth));
+);
+
+/*
+ * Given a magnitude, return y screen position as 0..1 with applied tilt
+ */
+function rk_spectrum.magnitude_to_01(m, freq) local(db) (
+  db = 10 * log10(m);
+
+  // Tilt around 1kHz
+  rk_spectrum.tilt != 0.0 ? db += rk_spectrum.tilt * ((log(freq) / log(2)) - (log(1024) / log(2)));
+
+  1.0 - ((db - rk_spectrum.ceiling) / (rk_spectrum.noise_floor - rk_spectrum.ceiling));
+);
+
+/*
+ * Given a 0..1 screen coordinate, return y screen coordinate
+ */
+function rk_spectrum.01_to_y(zo) (
+  rk_spectrum.top_margin + (1.0 - zo) * (grf_h - rk_spectrum.top_margin - rk_spectrum.bottom_margin - gfx_texth);
+);
+
+/*
+ * Put sample in spectrum buffer 0
+ */
+function rk_spectrum.sample0(s) (
+  rk_spectrum.pos0[] = s;
+  rk_spectrum.pos0 += 1;
+  rk_spectrum.pos0 >= rk_spectrum.end0 ? rk_spectrum.pos0 = rk_spectrum.samples0;
+);
+
+/*
+ * Put sample in spectrum buffer 1
+ */
+function rk_spectrum.sample1(s) (
+  rk_spectrum.pos1[] = s;
+  rk_spectrum.pos1 += 1;
+  rk_spectrum.pos1 >= rk_spectrum.end1 ? rk_spectrum.pos1 = rk_spectrum.samples1;
+);
+
+/*
+ * Put sample in spectrum buffer 2
+ */
+function rk_spectrum.sample2(s) (
+  rk_spectrum.pos2[] = s;
+  rk_spectrum.pos2 += 1;
+  rk_spectrum.pos2 >= rk_spectrum.end2 ? rk_spectrum.pos2 = rk_spectrum.samples2;
+);
+
+/*
+ * Put sample in spectrum buffer 3
+ */
+function rk_spectrum.sample3(s) (
+  rk_spectrum.pos3[] = s;
+  rk_spectrum.pos3 += 1;
+  rk_spectrum.pos3 >= rk_spectrum.end3 ? rk_spectrum.pos3 = rk_spectrum.samples3;
+);
+
+/*
+ * Put sample in spectrum buffer 4
+ */
+function rk_spectrum.sample4(s) (
+  rk_spectrum.pos4[] = s;
+  rk_spectrum.pos4 += 1;
+  rk_spectrum.pos4 >= rk_spectrum.end4 ? rk_spectrum.pos4 = rk_spectrum.samples4;
+);
+
+/*
+ * Put sample in spectrum buffer 5
+ */
+function rk_spectrum.sample5(s) (
+  rk_spectrum.pos5[] = s;
+  rk_spectrum.pos5 += 1;
+  rk_spectrum.pos5 >= rk_spectrum.end5 ? rk_spectrum.pos5 = rk_spectrum.samples5;
+);
+
+/*
+ * Reset all spectrum buffers
+ */
+function rk_spectrum.reset_buffers() ( 
+  // Clear sample buffers and force recalculate window
+  rk_spectrum.windowsize = 0;
+  memset(rk_spectrum.samples0, 0, rk_spectrum.histsize);
+  memset(rk_spectrum.samples1, 0, rk_spectrum.histsize);
+  memset(rk_spectrum.samples2, 0, rk_spectrum.histsize);
+  memset(rk_spectrum.samples3, 0, rk_spectrum.histsize);
+
+  // Spectrum 1
+  memset(rk_spectrum.bin_mag0, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_freq0, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_y0, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakmag0, rk_spectrum.small_mag, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakfreq0, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.samples0, 0, rk_spectrum.histsize);
+  rk_spectrum.pos0 = rk_spectrum.samples0;
+  rk_spectrum.end0 = rk_spectrum.samples0 + rk_spectrum.histsize;
+
+  // Spectrum 2
+  memset(rk_spectrum.bin_mag1, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_freq1, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_y1, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakmag1, rk_spectrum.small_mag, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakfreq1, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.samples1, 0, rk_spectrum.histsize);
+  rk_spectrum.pos1 = rk_spectrum.samples1;
+  rk_spectrum.end1 = rk_spectrum.samples1 + rk_spectrum.histsize;
+
+  // Spectrum 3
+  memset(rk_spectrum.bin_mag2, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_freq2, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_y2, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakmag2, rk_spectrum.small_mag, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakfreq2, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.samples2, 0, rk_spectrum.histsize);
+  rk_spectrum.pos2 = rk_spectrum.samples2;
+  rk_spectrum.end2 = rk_spectrum.samples2 + rk_spectrum.histsize;
+
+  // Spectrum 4
+  memset(rk_spectrum.bin_mag3, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_freq3, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_y3, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakmag3, rk_spectrum.small_mag, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakfreq3, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.samples3, 0, rk_spectrum.histsize);
+  rk_spectrum.pos3 = rk_spectrum.samples3;
+  rk_spectrum.end3 = rk_spectrum.samples3 + rk_spectrum.histsize;
+
+  // Spectrum 5
+  memset(rk_spectrum.bin_mag4, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_freq4, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_y4, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakmag4, rk_spectrum.small_mag, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakfreq4, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.samples4, 0, rk_spectrum.histsize);
+  rk_spectrum.pos4 = rk_spectrum.samples4;
+  rk_spectrum.end4 = rk_spectrum.samples4 + rk_spectrum.histsize;
+
+  // Spectrum 6
+  memset(rk_spectrum.bin_mag5, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_freq5, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_y5, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakmag5, rk_spectrum.small_mag, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakfreq5, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.samples5, 0, rk_spectrum.histsize);
+  rk_spectrum.pos5 = rk_spectrum.samples5;
+  rk_spectrum.end5 = rk_spectrum.samples5 + rk_spectrum.histsize;
+);
+
+/*
+ * Set the new fft block size for all buffers
+ */
+function rk_spectrum.set_block_size(size) ( 
+  rk_spectrum.fftsize = size;
+
+  rk_spectrum.reset_buffers();
+);
+
+/*
+ * Set the windowing type for all buffers
+ */
+function rk_spectrum.set_type(t) ( 
+  rk_spectrum.windowsize = 0;
+  rk_spectrum.windowtype = t;
+);
+
+/*
+ * Set a spectrum's color
+ */
+function rk_spectrum.set_color(buf_index, r, g, b, a) ( 
+  rk_spectrum.red[buf_index] = r;
+  rk_spectrum.green[buf_index] = g;
+  rk_spectrum.blue[buf_index] = b;
+  rk_spectrum.alpha[buf_index] = a;
+);
+
+/*
+ * Set whether spectrum peaks are shown
+ */
+function rk_spectrum.set_show_peaks(show) ( 
+  rk_spectrum.show_peaks = show;
+
+  // Clear out the peak data
+  memset(rk_spectrum.bin_peakmag0, rk_spectrum.small_mag, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakfreq0, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakmag1, rk_spectrum.small_mag, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakfreq1, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakmag2, rk_spectrum.small_mag, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakfreq2, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakmag3, rk_spectrum.small_mag, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakfreq3, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakmag4, rk_spectrum.small_mag, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakfreq4, 0, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakmag5, rk_spectrum.small_mag, rk_spectrum.max_buffer);
+  memset(rk_spectrum.bin_peakfreq5, 0, rk_spectrum.max_buffer);
+);
+
+/*
+ * Set whether a spectrum is line or filled
+ */
+function rk_spectrum.set_fill(buf_index, fill) ( 
+  rk_spectrum.fill[buf_index] = fill;
+);
+
+/*
+ * Initialise all variables and allocate buffers
+ */
+function rk_spectrum.init() (
+  // Main buffer size for all calcs
+  rk_spectrum.max_buffer = 16384;
+
+  // Range db
+  rk_spectrum.ceiling = 0;
+  rk_spectrum.noise_floor = -90;
+
+  // Visible frequency limit
+  rk_spectrum.max_freq = 44100 / 2.0;
+  rk_spectrum.min_freq = 10;
+  rk_spectrum.freq_log_max = log(rk_spectrum.max_freq / rk_spectrum.min_freq);
+
+  rk_spectrum.top_margin = 10;
+  rk_spectrum.bottom_margin = 0;
+  rk_spectrum.left_margin = 0;
+  rk_spectrum.right_margin = 0;
+
+  // Tilts around the 1kHz frequency
+  rk_spectrum.tilt = 4.5;
+
+  // Piano roll position
+  rk_spectrum.piano_y = 50;
+
+  // Smallest magnitude
+  rk_spectrum.small_mag = 0.00000000000000000000000001;
+
+  // FFT window
+  rk_spectrum.max_fft_size = 32768;
+  rk_spectrum.fftsize = 8192;
+  rk_spectrum.histsize = rk_spectrum.max_fft_size + (rk_spectrum.max_fft_size * 0.5 - 1);
+
+  rk_spectrum.windowsize = 0;
+
+  rk_spectrum.show_peaks = 0;
+
+  // Window types
+  // 1: hamming
+  // 2: blackman-harris
+  // 3: blackman
+  // 4: rectangular
+  rk_spectrum.windowtype = 2;  // blackman-harris default
+  rk_spectrum.window = rk_spectrum.alloc_memory(rk_spectrum.histsize);
+
+  rk_spectrum.fftworkspace = rk_spectrum.alloc_memory(rk_spectrum.max_fft_size * 0.5 + 1);
+
+  rk_spectrum.default_r = 46 / 255;
+  rk_spectrum.default_g = 71 / 255;
+  rk_spectrum.default_b = 83 / 255;
+  rk_spectrum.default_a = 1;
+
+  rk_spectrum.red = rk_spectrum.alloc_memory(6);
+  rk_spectrum.green = rk_spectrum.alloc_memory(6);
+  rk_spectrum.blue = rk_spectrum.alloc_memory(6);
+  rk_spectrum.alpha = rk_spectrum.alloc_memory(6);
+
+  rk_spectrum.fill = rk_spectrum.alloc_memory(6);
+
+  // Repurposed (2026-08): these were point_x/point_y, dead since the disabled
+  // block at the bottom of draw(). Now:
+  //   bin_ix   — precomputed FFT-index -> quantized-bin-run table (i-1 -> num_bins),
+  //              a pure function of (srate, fftsize); rebuilt only when either changes
+  //   bin_xpos — per-bin screen x cached by the fill loop, reused by the peaks loop
+  rk_spectrum.bin_ix = rk_spectrum.alloc_memory(16384);
+  rk_spectrum.bin_xpos = rk_spectrum.alloc_memory(16384);
+
+  // Buffer 0
+  rk_spectrum.samples0 = rk_spectrum.alloc_memory(rk_spectrum.histsize);
+  rk_spectrum.bin_mag0 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_freq0 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_y0 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_peakmag0 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_peakfreq0 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.pos0 = rk_spectrum.samples0;
+  rk_spectrum.end0 = rk_spectrum.samples0 + rk_spectrum.histsize;
+  rk_spectrum.set_color(0, rk_spectrum.default_r, rk_spectrum.default_g, rk_spectrum.default_b, rk_spectrum.default_a);
+  rk_spectrum.set_fill(0, 1);
+
+  // Buffer 1
+  rk_spectrum.samples1 = rk_spectrum.alloc_memory(rk_spectrum.histsize);
+  rk_spectrum.bin_mag1 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_freq1 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_y1 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_peakmag1 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_peakfreq1 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.pos1 = rk_spectrum.samples1;
+  rk_spectrum.end1 = rk_spectrum.samples1 + rk_spectrum.histsize;
+  rk_spectrum.set_color(1, rk_spectrum.default_r, rk_spectrum.default_g, rk_spectrum.default_b, rk_spectrum.default_a);
+  rk_spectrum.set_fill(1, 1);
+
+  // Buffer 2
+  rk_spectrum.samples2 = rk_spectrum.alloc_memory(rk_spectrum.histsize);
+  rk_spectrum.bin_mag2 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_freq2 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_y2 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_peakmag2 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_peakfreq2 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.pos2 = rk_spectrum.samples2;
+  rk_spectrum.end2 = rk_spectrum.samples2 + rk_spectrum.histsize;
+  rk_spectrum.set_color(2, rk_spectrum.default_r, rk_spectrum.default_g, rk_spectrum.default_b, rk_spectrum.default_a);
+  rk_spectrum.set_fill(2, 1);
+
+  // Buffer 3
+  rk_spectrum.samples3 = rk_spectrum.alloc_memory(rk_spectrum.histsize);
+  rk_spectrum.bin_mag3 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_freq3 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_y3 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_peakmag3 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_peakfreq3 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.pos3 = rk_spectrum.samples3;
+  rk_spectrum.end3 = rk_spectrum.samples3 + rk_spectrum.histsize;
+  rk_spectrum.set_color(3, rk_spectrum.default_r, rk_spectrum.default_g, rk_spectrum.default_b, rk_spectrum.default_a);
+  rk_spectrum.set_fill(3, 1);
+
+  // Buffer 4
+  rk_spectrum.samples4 = rk_spectrum.alloc_memory(rk_spectrum.histsize);
+  rk_spectrum.bin_mag4 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_freq4 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_y4 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_peakmag4 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_peakfreq4 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.pos4 = rk_spectrum.samples4;
+  rk_spectrum.end4 = rk_spectrum.samples4 + rk_spectrum.histsize;
+  rk_spectrum.set_color(4, rk_spectrum.default_r, rk_spectrum.default_g, rk_spectrum.default_b, rk_spectrum.default_a);
+  rk_spectrum.set_fill(4, 1);
+
+  // Buffer 5
+  rk_spectrum.samples5 = rk_spectrum.alloc_memory(rk_spectrum.histsize);
+  rk_spectrum.bin_mag5 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_freq5 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_y5 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_peakmag5 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.bin_peakfreq5 = rk_spectrum.alloc_memory(rk_spectrum.max_buffer);
+  rk_spectrum.pos5 = rk_spectrum.samples5;
+  rk_spectrum.end5 = rk_spectrum.samples5 + rk_spectrum.histsize;
+  rk_spectrum.set_color(5, rk_spectrum.default_r, rk_spectrum.default_g, rk_spectrum.default_b, rk_spectrum.default_a);
+  rk_spectrum.set_fill(5, 1);
+
+  rk_spectrum.last_time = rk_spectrum.alloc_memory(6);
+);
+
+/*
+ * Cubic hermite, given A,B,C,D and time (t) return cubic interpolation
+ * http://paulbourke.net/miscellaneous/interpolation/
+ */
+function rk_spectrum_cubic_hermite(A, B, C, D, t) local(a0, a1, a2, a3, t2)
+(
+   t2 = t * t;
+
+   a0 = D - C - A + B;
+   a1 = A - B - a0;
+   a2 = C - A;
+   a3 = B;
+
+   a0 * t * t2 + a1 * t2 + a2 * t + a3;
+);
+
+function rk_spectrum.draw_line(x1, y1, x2, y2)
+(
+  x1 = floor(x1);
+  x2 = floor(x2);
+  x2 = floor(x2);
+  y2 = floor(y2);
+  
+  gfx_line(x1, y1-1, x2, y2-1, 1);
+  gfx_line(x1, y1, x2-1,y2-1, 1); 
+);
+
+/*
+ * Draw the specified spectrum
+ */
+function rk_spectrum.draw(bufindex)
+  local(i, pwr, windowpos, dwindowpos, buf1, buf2, buf3, tx, ty, spectrum_fill, tpx, tpy, fill_slast, fill_slmin,
+        lx, ly, tx0, lx0, num_bins, last_bin, bin, ipnt, mag, freq, bottom, delta, time, rate_over_fftsize, nb, log2c)
+(
+  // Select buffer to draw
+  bufindex == 0 ? ( 
+    rk_spectrum.samples = rk_spectrum.samples0;
+    rk_spectrum.bin_mag = rk_spectrum.bin_mag0;
+    rk_spectrum.bin_freq = rk_spectrum.bin_freq0;
+    rk_spectrum.bin_y = rk_spectrum.bin_y0;
+    rk_spectrum.bin_peakmag = rk_spectrum.bin_peakmag0;
+    rk_spectrum.bin_peakfreq = rk_spectrum.bin_peakfreq0;
+    rk_spectrum.pos = rk_spectrum.pos0;
+    rk_spectrum.end = rk_spectrum.end0;
+  ) : bufindex == 1 ? ( 
+    rk_spectrum.samples = rk_spectrum.samples1;
+    rk_spectrum.bin_mag = rk_spectrum.bin_mag1;
+    rk_spectrum.bin_freq = rk_spectrum.bin_freq1;
+    rk_spectrum.bin_y = rk_spectrum.bin_y1;
+    rk_spectrum.bin_peakmag = rk_spectrum.bin_peakmag1;
+    rk_spectrum.bin_peakfreq = rk_spectrum.bin_peakfreq1;
+    rk_spectrum.pos = rk_spectrum.pos1;
+    rk_spectrum.end = rk_spectrum.end1;
+  ) : bufindex == 2 ? ( 
+    rk_spectrum.samples = rk_spectrum.samples2;
+    rk_spectrum.bin_mag = rk_spectrum.bin_mag2;
+    rk_spectrum.bin_freq = rk_spectrum.bin_freq2;
+    rk_spectrum.bin_y = rk_spectrum.bin_y2;
+    rk_spectrum.bin_peakmag = rk_spectrum.bin_peakmag2;
+    rk_spectrum.bin_peakfreq = rk_spectrum.bin_peakfreq2;
+    rk_spectrum.pos = rk_spectrum.pos2;
+    rk_spectrum.end = rk_spectrum.end2;
+  ) : bufindex == 3 ? ( 
+    rk_spectrum.samples = rk_spectrum.samples3;
+    rk_spectrum.bin_mag = rk_spectrum.bin_mag3;
+    rk_spectrum.bin_freq = rk_spectrum.bin_freq3;
+    rk_spectrum.bin_y = rk_spectrum.bin_y3;
+    rk_spectrum.bin_peakmag = rk_spectrum.bin_peakmag3;
+    rk_spectrum.bin_peakfreq = rk_spectrum.bin_peakfreq3;
+    rk_spectrum.pos = rk_spectrum.pos3;
+    rk_spectrum.end = rk_spectrum.end3;
+  ) : bufindex == 4 ? ( 
+    rk_spectrum.samples = rk_spectrum.samples4;
+    rk_spectrum.bin_mag = rk_spectrum.bin_mag4;
+    rk_spectrum.bin_freq = rk_spectrum.bin_freq4;
+    rk_spectrum.bin_y = rk_spectrum.bin_y4;
+    rk_spectrum.bin_peakmag = rk_spectrum.bin_peakmag4;
+    rk_spectrum.bin_peakfreq = rk_spectrum.bin_peakfreq4;
+    rk_spectrum.pos = rk_spectrum.pos4;
+    rk_spectrum.end = rk_spectrum.end4;
+  ) : bufindex == 5 ? ( 
+    rk_spectrum.samples = rk_spectrum.samples5;
+    rk_spectrum.bin_mag = rk_spectrum.bin_mag5;
+    rk_spectrum.bin_freq = rk_spectrum.bin_freq5;
+    rk_spectrum.bin_y = rk_spectrum.bin_y5;
+    rk_spectrum.bin_peakmag = rk_spectrum.bin_peakmag5;
+    rk_spectrum.bin_peakfreq = rk_spectrum.bin_peakfreq5;
+    rk_spectrum.pos = rk_spectrum.pos5;
+    rk_spectrum.end = rk_spectrum.end5;
+  );
+
+  // Create the smoothing rk_spectrum.window if necessary
+  rk_spectrum.windowsize != rk_spectrum.fftsize ? (
+      rk_spectrum.windowsize = rk_spectrum.fftsize;
+      dwindowpos = $pi * 2 / rk_spectrum.fftsize;
+      i = pwr = 0;
+      loop(rk_spectrum.fftsize*.5+1,
+         windowpos = i * dwindowpos;
+         pwr += (rk_spectrum.window[i] = (
+            // 1: hamming
+            rk_spectrum.windowtype==1 ? 0.53836 - cos(windowpos) * 0.46164 :
+            // 2: blackman-harris
+            rk_spectrum.windowtype==2 ? 0.35875 - 0.48829 * cos(windowpos) + 0.14128 * cos(2 * windowpos) - 0.01168 * cos(3 * windowpos) :
+            // 3: blackman
+            rk_spectrum.windowtype==3 ? 0.42 - 0.50 * cos(windowpos) + 0.08 * cos(2.0 * windowpos) :
+            // 4: rectangular
+            1.0));
+         i += 1;
+      );
+      pwr = 0.5 / (pwr * 2 - rk_spectrum.window[i - 1]);
+      loop(rk_spectrum.fftsize * 0.5 + 1,rk_spectrum.window[i -= 1] *= pwr);
+    );
+
+  // Apply the frequency smoothing spectrum window
+  buf1=rk_spectrum.pos - rk_spectrum.fftsize;
+  buf1<rk_spectrum.samples ? buf1+=rk_spectrum.histsize;
+  buf2=rk_spectrum.window;
+  buf3=rk_spectrum.fftworkspace;
+  loop(rk_spectrum.fftsize * 0.5 + 1,
+    buf3[] = buf1[] * buf2[];
+    buf3 += 1;
+
+    buf2 += 1;
+    (buf1 += 1) >= rk_spectrum.end ? buf1 = rk_spectrum.samples;
+  );
+  buf2 -= 1;
+  loop(rk_spectrum.fftsize * 0.5 - 1,
+    buf3[] = buf1[] * (buf2-=1)[];
+    buf3 += 1;
+
+    (buf1 += 1) >= rk_spectrum.end ? buf1 = rk_spectrum.samples;
+  );
+
+  fft_real(rk_spectrum.fftworkspace,rk_spectrum.fftsize);
+  fft_permute(rk_spectrum.fftworkspace,rk_spectrum.fftsize / 2);
+  rk_spectrum.fftworkspace[1] = 0;
+
+  buf3 = rk_spectrum.fftworkspace;
+
+  memset(rk_spectrum.bin_mag, rk_spectrum.small_mag, rk_spectrum.max_buffer);
+
+  rate_over_fftsize = srate / rk_spectrum.fftsize;
+
+  // The i -> quantized-bin-run mapping is a pure function of (srate, fftsize).
+  // Rebuild the bin_ix table only when either changes; the hot loop below then
+  // does zero log()/divisions per bin. Reproduces the original sequence exactly,
+  // including the historical off-by-one (num_bins pre-increments, so index 0 is
+  // never written) — do not "fix" that.
+  rk_spectrum.map_srate != srate || rk_spectrum.map_fftsize != rk_spectrum.fftsize ? (
+    log2c = log(2);
+    i = 1; nb = 0; last_bin = -1;
+    loop(rk_spectrum.fftsize * 0.5,
+      freq = i * rate_over_fftsize;
+      bin = floor(32 * log(freq) / log2c);
+      bin != last_bin ? (
+        nb += 1;
+        last_bin = bin;
+      );
+      rk_spectrum.bin_ix[i - 1] = nb;
+      i += 1;
+    );
+    rk_spectrum.map_numbins = nb;
+    rk_spectrum.map_srate = srate;
+    rk_spectrum.map_fftsize = rk_spectrum.fftsize;
+  );
+
+  num_bins = rk_spectrum.map_numbins;
+
+  i = 1;
+  ipnt = 0;
+
+  loop(rk_spectrum.fftsize * 0.5,
+    mag = sqr(buf3[i*2+0]) + sqr(buf3[i*2+1]);
+
+    freq = i * rate_over_fftsize;
+
+    nb = rk_spectrum.bin_ix[i - 1];
+
+    // Set the dominant frequency for the bin
+    rk_spectrum.bin_freq[nb] = freq;
+    rk_spectrum.bin_peakfreq[nb] = freq;
+
+    // Set the maximum magnitudes for the quantized bin
+    rk_spectrum.bin_mag[nb] = max(mag, rk_spectrum.bin_mag[nb]);
+    rk_spectrum.bin_peakmag[nb] = max(mag, rk_spectrum.bin_peakmag[nb]);
+
+    i+=1;
+    ipnt += 1;
+  );
+
+  gfx_r = rk_spectrum.red[bufindex];
+  gfx_g = rk_spectrum.green[bufindex];
+  gfx_b = rk_spectrum.blue[bufindex];
+  gfx_a = rk_spectrum.alpha[bufindex];
+
+  spectrum_fill = rk_spectrum.fill[bufindex];
+
+  bottom = grf_h - rk_spectrum.bottom_margin - gfx_texth;
+
+  time = time_precise();
+  delta = 0.99 ^ ((time - rk_spectrum.last_time[bufindex]) * 30);
+
+  rk_spectrum.last_time[bufindex] = time;
+
+  ly = 0;
+  lx = -1;
+  // Start at 1: index 0 is the historical never-written slot (freq 0), whose
+  // log-domain x/y are off-scale. Under an 8192 FFT the guard hid the phantom
+  // segment (first real bin sat left of left_margin); at smaller FFT sizes the
+  // first real bin is on-screen and the phantom drew a corner-to-floor line.
+  ipnt = 1;
+
+  loop(num_bins - 1, (
+      tx = rk_spectrum.freq_to_x(rk_spectrum.bin_freq[ipnt]);
+      // Cache x for the peaks loop below — bin_peakfreq is written the same
+      // value as bin_freq every frame, so freq_to_x would return the same x.
+      rk_spectrum.bin_xpos[ipnt] = tx;
+      ty = rk_spectrum.magnitude_to_01(rk_spectrum.bin_mag[ipnt], rk_spectrum.bin_freq[ipnt]);
+
+      // Decay
+      rk_spectrum.bin_y[ipnt] *= delta;
+
+      rk_spectrum.bin_y[ipnt] = max(ty, rk_spectrum.bin_y[ipnt]);
+
+      ty = rk_spectrum.01_to_y(rk_spectrum.bin_y[ipnt]);
+
+      lx != -1 && tx >= rk_spectrum.left_margin && (ly < bottom-1 || ty < bottom-1) ? 
+      (
+        spectrum_fill ? (
+          tx0=tx|0;
+          lx0=lx|0;
+          tx0>lx0? (
+            ly < bottom || ty < bottom ? gfx_triangle(lx0,bottom,lx0,ly,tx0-1,ty,tx0-1,bottom);
+          ) : (
+            tx0 > fill_slast ? (
+             fill_slast < bottom ? gfx_line(fill_slast,bottom,fill_slast,fill_slmin);
+             fill_slmin=bottom;
+           ) : (
+             fill_slmin=min(fill_slmin,ty);
+            );
+          );
+          fill_slast=tx0;
+
+          // Draw a capping line for antialiasing
+          rk_spectrum.draw_line(lx, ly, tx, ty);
+
+        ) : (
+          (ly < bottom || ty < bottom) && !(ly > bottom - 1 && ty > bottom - 1) ? (
+            //Line
+            rk_spectrum.draw_line(lx, ly, tx, ty);
+          );
+        );
+      );
+
+      lx=tx; ly=ty;
+      ipnt += 1;
+    );
+  );
+
+  rk_spectrum.show_peaks ? (
+    gfx_r = gfx_g = gfx_b = 0.8; gfx_a = 1;
+
+    lpx = -1; lpy = 0; tpy = 0; tpx = -1;
+    ipnt = 1;  // skip the never-written slot 0 (see fill loop note)
+
+    loop(num_bins - 1, (
+      // Calc max peaks (x reused from the fill loop's bin_xpos cache)
+      tpx = rk_spectrum.bin_xpos[ipnt];
+      tpy = rk_spectrum.magnitude_to_01(rk_spectrum.bin_peakmag[ipnt], rk_spectrum.bin_peakfreq[ipnt]);
+      tpy = rk_spectrum.01_to_y(tpy);
+
+      tpy = min(bottom, tpy);
+
+      // Draw max peaks
+      lpx != -1 && (lpy < bottom || tpy < bottom) ? (
+        //Line
+        rk_spectrum.draw_line(lpx, lpy, tpx, tpy);
+      );
+
+      lpx=tpx; lpy=tpy;    
+      ipnt += 1;
+    ));
+  );
+
+/*
+  // Keep this around for reference/debugging.
+  i = 0;
+  ipnt = 0;
+
+  buf3=rk_spectrum.fftworkspace;
+
+  gfx_r = 1; gfx_g = 1; gfx_b = 1; gfx_a = 1;
+
+  lx = -1;
+
+  loop(rk_spectrum.fftsize*0.5,
+    mag = sqr(buf3[i*2+0]) + sqr(buf3[i*2+1]);
+    freq = (i * srate) / rk_spectrum.fftsize;
+
+    freq = max(1, freq);
+
+    ty = rk_spectrum.magnitude_to_y(mag);
+    tx = rk_spectrum.freq_to_x(freq);
+
+    lx != -1 ? (
+      //Line
+      gfx_line(lx, ly, tx, ty, 1);
+      gfx_line(lx+1, ly+1, tx+1, ty+1,1);
+    );
+    lx=tx; ly=ty;
+    i+=1;
+    ipnt += 1;
+  );
+*/
+
+/*
+  // Keep this for reference - cubic curve fitting.
+  // NOTE (2026-08): point_x/point_y no longer exist — their allocations were
+  // repurposed as bin_ix/bin_xpos (see init()). Re-enabling this block would
+  // need fresh arrays.
+  percent = ipnt / (num_samples - 1);
+  x = (num_bins-1) * percent;
+
+  index = floor(x);
+        
+  t = x - floor(x);
+  
+  A = rk_spectrum.point_x[max(0,index-1)];
+  B = rk_spectrum.point_x[index+0];
+  C = rk_spectrum.point_x[min(num_bins-1, index+1)];
+  D = rk_spectrum.point_x[min(num_bins-1, index+2)];
+  tx = rk_spectrum_cubic_hermite(A, B, C, D, t);
+
+  A = rk_spectrum.point_y[max(0,index-1)];
+  B = rk_spectrum.point_y[index+0];
+  C = rk_spectrum.point_y[min(num_bins-1, index+1)];
+  D = rk_spectrum.point_y[min(num_bins-1, index+2)];
+  ty = rk_spectrum_cubic_hermite(A, B, C, D, t);
+*/
+
+);
+
+/*
+ * Draw the spectrum bode grid
+ */
+function rk_spectrum.draw_grid(skip_dblines) local(db, y, f, lx, tx, dotext, frq, width, height) (
+  // Draw magnitude axis
+  gfx_y = -100;
+  db = rk_spectrum.ceiling;
+  while(
+    y = rk_spectrum.db_to_y(db);
+
+    y > gfx_y ? (
+      !skip_dblines ? (
+        gfx_r=gfx_g=gfx_b=1; gfx_a=0.3;
+        gfx_line(gfx_texth*2,y,grf_w,y,0);
+      );
+      gfx_x=0;
+      gfx_r=gfx_g=gfx_b=0.4; gfx_a=1.0;
+      gfx_y = y - (gfx_texth * 0.5);
+      gfx_drawnumber(db,0);
+
+      gfx_y+=gfx_texth;
+    );
+
+    db -= 10;
+    db >= rk_spectrum.noise_floor;
+  );
+
+  // Draw frequency axis
+  f = 10;
+  gfx_x = 0;
+  lx = 0;
+  while(
+    tx = rk_spectrum.freq_to_x(f);
+
+    dotext = tx > gfx_x && (f==20 || f==50 || f==100 || f == 200 || f == 500 || f == 1000 || f == 2000 || f == 5000 || f == 10000);
+    gfx_a = dotext ? 0.8 : 0.6;
+    tx > lx ? ( lx=tx+4; gfx_line(tx,0,tx,grf_h - (dotext ? 12 : gfx_texth+2) - rk_spectrum.bottom_margin,0); );
+    dotext ? (
+      gfx_r=gfx_g=gfx_b=0.4; gfx_a=1.0;
+
+      frq = #;
+      sprintf(frq,"%.1f Hz", read_freq);
+      f>=1000 ? sprintf(frq,"%dk",f/1000) : sprintf(frq,"%d",f);
+
+      gfx_measurestr(frq, width, height);
+
+      gfx_x = tx - (width*0.5);
+
+      gfx_y = grf_h-(gfx_texth-2)-rk_spectrum.bottom_margin;
+      gfx_drawstr(frq);
+    );
+    f += (f<100?10:f<1000?100:f<10000?1000:10000);
+
+    f < rk_spectrum.max_freq;
+  );
+);
+
+/*
+ * Draw a piano octave
+ * Also returns note frequency if a note was selected with mouse
+ */
+function rk_spectrum_draw_octave(anote)
+  local(a,b,c,d,e,f,g,aSharp,gSharp,fSharp,dSharp,cSharp,aa,gw,hw,sw,w, bx,ax,gx,fx,ex,dx,cx,aax,
+        cc,csx,cxx, i, note_select)
+( 
+  b      = anote * pow(2, 2/12);   
+  aSharp = anote * pow(2, 1/12);
+  a = anote;
+  gSharp = anote * pow(2, -1/12); 
+  g      = anote * pow(2, -2/12); 
+  fSharp = anote * pow(2, -3/12); 
+  f      = anote * pow(2, -4/12); 
+  e      = anote * pow(2, -5/12); 
+  dSharp = anote * pow(2, -6/12); 
+  d      = anote * pow(2, -7/12); 
+  cSharp = anote * pow(2, -8/12);  
+  c      = anote * pow(2, -9/12); 
+
+  cc = c*2;
+
+  bx = rk_spectrum.freq_to_x(b);
+  asx = rk_spectrum.freq_to_x(aSharp);
+  ax = rk_spectrum.freq_to_x(a);
+  gsx = rk_spectrum.freq_to_x(gSharp);
+  gx = rk_spectrum.freq_to_x(g);
+  fsx = rk_spectrum.freq_to_x(fSharp);
+  fx = rk_spectrum.freq_to_x(f);
+  ex = rk_spectrum.freq_to_x(e);
+  dsx = rk_spectrum.freq_to_x(dSharp);
+  dx = rk_spectrum.freq_to_x(d);
+  csx = rk_spectrum.freq_to_x(cSharp);
+  cx = rk_spectrum.freq_to_x(c);
+
+  note_select = 0;
+
+  cxx = rk_spectrum.freq_to_x(cc);
+
+  hw = (bx - ax) * 0.5;
+  w = dx - cx - 2;
+
+  gfx_r = gfx_g = gfx_b = 1;
+  gfx_a = 1;
+
+  sw = (cxx - cx) / 7;
+
+  is_hover = 0;
+  hover_x = -1;
+  sharp_w = (sw * 0.50);
+  xp = cx + (sw * 0.75);
+
+  ffw = rk_spectrum.freq_to_x(cSharp) - cx;
+
+  i = 0;
+
+  while(
+    i != 2 ? (
+      mouse_x >= xp && mouse_x <= xp + sharp_w && mouse_y >= rk_spectrum.piano_y && mouse_y <= rk_spectrum.piano_y + 35 ? ( 
+        is_hover = 2; hover_sharp = i;
+        hover_x = xp; hover_w = sharp_w; hover_h = 35;
+      );
+    );
+    xp += sw;
+    i += 1;
+    i < 6;
+  );
+
+  i = 0;
+  xp = cx;
+  loop(7,
+    is_hover == 0 && mouse_x >= xp && mouse_x <= xp+sw && mouse_y >= rk_spectrum.piano_y && mouse_y <= rk_spectrum.piano_y + 60 ? ( 
+      is_hover = 1; hover_key = i;
+      hover_x = xp; hover_w = sw-1; hover_h = 60;
+    );
+
+    gfx_rect(xp, rk_spectrum.piano_y, sw-1, 60);
+
+    i += 1;
+    xp += sw;
+  );
+
+  is_hover == 1 ? ( 
+    gfx_r = 0.7; gfx_b = 0.7; gfx_g = 0.7; gfx_a = 1;
+    gfx_rect(hover_x, rk_spectrum.piano_y, hover_w, hover_h);
+  );
+
+  gfx_r = gfx_g = gfx_b = 0;
+
+  xp = cx + (sw * 0.75);
+
+  i = 0;
+
+  loop(6,
+    i != 2 ? (
+      gfx_rect(xp, rk_spectrum.piano_y, sw*0.50, 35);
+    );
+    i += 1;
+    xp += sw;
+  );
+
+  is_hover == 2 ? ( 
+    gfx_r = 0.7; gfx_b = 0.7; gfx_g = 0.7; gfx_a = 1;
+    gfx_rect(hover_x, rk_spectrum.piano_y, hover_w, hover_h);
+  );
+
+  is_hover ? ( 
+    is_hover == 1 ? ( 
+      hover_key == 0 ? (frq = c; sw = csx - cx;);
+      hover_key == 1 ? (frq = d; sw = dsx - dx;);
+      hover_key == 2 ? (frq = e; sw = fx - ex;);
+      hover_key == 3 ? (frq = f; sw = fsx - fx;);
+      hover_key == 4 ? (frq = g; sw = gsx - gx;);
+      hover_key == 5 ? (frq = a; sw = asx - ax;);
+      hover_key == 6 ? (frq = b; sw = cxx - bx;);
+  
+      xp = rk_spectrum.freq_to_x(frq);
+      note_select = frq;
+
+      gfx_r = 1; gfx_g = 0.8; gfx_b = 0.8; gfx_a = 0.3;
+      gfx_rect(xp, rk_spectrum.piano_y + 65, sw, grf_h - rk_spectrum.bottom_margin - (rk_spectrum.piano_y + 65));
+    ) : (
+      hover_sharp == 0 ? (frq = cSharp; sw = dx - csx;);
+      hover_sharp == 1 ? (frq = dSharp; sw = ex - dsx;);
+      hover_sharp == 3 ? (frq = fSharp; sw = gx - fsx;);
+      hover_sharp == 4 ? (frq = gSharp; sw = ax - gsx;);
+      hover_sharp == 5 ? (frq = aSharp; sw = bx - asx;);
+  
+      xp = rk_spectrum.freq_to_x(frq);
+      note_select = frq;
+
+      gfx_r = 1; gfx_g = 0.8; gfx_b = 0.8; gfx_a = 0.3;
+      gfx_rect(xp, rk_spectrum.piano_y + 65, sw, grf_h - rk_spectrum.bottom_margin - (rk_spectrum.piano_y + 65));
+    );
+  );
+
+  note_select;
+);
+
+/*
+ * Draw the piano keys (all octaves)
+ */
+function rk_spectrum.draw_piano() local(A4, note_select) ( 
+
+  gfx_r = gfx_g = gfx_b = 1; gfx_a = 1;
+
+  A4 = 440;
+
+  note_select = 0;
+  note_select = max(rk_spectrum_draw_octave(A4 * pow(2, -5)), note_select);
+  note_select = max(rk_spectrum_draw_octave(A4 * pow(2, -4)), note_select);
+  note_select = max(rk_spectrum_draw_octave(A4 * pow(2, -3)), note_select);
+  note_select = max(rk_spectrum_draw_octave(A4 * pow(2, -2)), note_select);
+  note_select = max(rk_spectrum_draw_octave(A4 * pow(2, -1)), note_select);
+  note_select = max(rk_spectrum_draw_octave(A4 * pow(2, 0)), note_select);
+  note_select = max(rk_spectrum_draw_octave(A4 * pow(2, 1)), note_select);
+  note_select = max(rk_spectrum_draw_octave(A4 * pow(2, 2)), note_select);
+  note_select = max(rk_spectrum_draw_octave(A4 * pow(2, 3)), note_select);
+  note_select = max(rk_spectrum_draw_octave(A4 * pow(2, 4)), note_select);
+  note_select = max(rk_spectrum_draw_octave(A4 * pow(2, 5)), note_select);
+  note_select = max(rk_spectrum_draw_octave(A4 * pow(2, 6)), note_select);
+
+  note_select;
+);

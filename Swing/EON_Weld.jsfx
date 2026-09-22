@@ -14,11 +14,13 @@ options:gfx_hz=60 gfx_idle no_meter gmem=Swing_Media_Transfer
 // survives as ebc_dark only so old saves still deserialize; it is parked
 // dead and nothing reads it. Weld also does NOT follow One Rack themes.
 //
-// Smash-return link: when the strip-sync companion pushes a registry slot into
-// slider9 (Link Slot), this instance publishes a param echo + GR onto its
-// GS_BC_LINK row and consumes knob edits from the return viewer's deck. The
-// drum-bus instance stays at slot -1 and never touches the band. All link I/O
-// runs in @block, so it works with this UI closed.
+// Comp link: when Lua pushes a row into slider9 (Link Slot), this instance
+// publishes a param echo + GR onto its GS_BC_LINK row and consumes knob edits
+// from whichever deck drives that row — the return viewer for the smash-return
+// instance, Swing's COMP page for the one on the Audio folder (see the ROLE
+// SPLIT note at the band constants; the row number is what tells them apart).
+// An UNLINKED instance stays at slot -1 and never touches the band. All link
+// I/O runs in @block, so it works with this UI closed.
 
 slider1:ebc_thresh=-12<-40,0,0.1>-Threshold (dB)
 slider2:ebc_ratio=4<1,20,0.1>-Ratio
@@ -58,18 +60,35 @@ gfx_ext_flags |= 0x100 | 0x400;
 M_LN10_20 = 8.68588963806503655302257837833210;  // 20/ln(10)
 ebc_eps = pow(10, -9);
 
-// ── Smash-return viewer link band ──────────────────────────────────────────
+// ── Comp link band ─────────────────────────────────────────────────────────
 // Row per registry slot. MUST match EON_FX_Return_View.jsfx. Declared in
 // .refs/swing_gmem_bridge_protocol.md (26170000-26171535, 64 slots x 24).
 //   +0 heartbeat (bumped per @block) · +1..8 param echo (thresh, ratio, attack,
 //   release, knee, makeup, mix, bypass) · +9 GR dB · +10 auto-release echo ·
 //   +16 cmd_seq · +17 cmd_param (1..8 echo order; 9 = auto) · +18 cmd_val.
 //   Seq bumped LAST by the writer.
+//
+// ⚠️⚠️ ROLE SPLIT — THE ROW IS KEYED BY SLOT ALONE, SO TWO WELDS ON ONE SWING
+// WOULD SHARE A ROW AND FIGHT OVER THE MAILBOX. A Swing instance can have two:
+// the one on its SMASH RETURN and the serial glue on its AUDIO folder, and
+// nothing in this file can tell them apart. So the LINK SLOT PUSHED BY LUA
+// carries the role, using the half of the band Swing's 16-slot registry never
+// reaches:
+//   rows  0..15  = the SMASH-RETURN Weld   (Link Slot = registry slot)
+//                  pushed by EON_Swing_Strip_Sync.lua, deck = EON_FX_Return_View
+//   rows 32..47  = the AUDIO-BUS Weld      (Link Slot = registry slot + 32)
+//                  pushed by the Multi-Out builder, deck = Swing's COMP page
+//   rows 16..31 and 48..63 are unused — keep them that way, they are the
+//                  headroom that makes this split possible.
+// This file needs no code for that: it clamps 0..63 and uses whatever row it
+// is handed. Read the offset in the pusher, never invent one here.
 GS_BC_LINK_BASE   = 26170000;
 GS_BC_LINK_STRIDE = 24;
 BC_OFF_HB    = 0;
 BC_OFF_ECHO  = 1;
 BC_OFF_GR    = 9;
+BC_OFF_GRMIN = 13;   // deepest LINEAR gain in the block (1.0 = none)
+BC_OFF_GRVER = 14;   // 1 = this build publishes GRMIN; 0 = older, use +9
 BC_OFF_SEQ   = 16;
 BC_OFF_PARAM = 17;
 BC_OFF_VAL   = 18;
@@ -82,6 +101,7 @@ KS = 16;                              // knobs_kbsg per-knob state stride
 ebc_km = freemem; freemem += 8 * KS;  // 6 face knobs + bypass + spare
 ebc_km_e = freemem; freemem += 8 * KS; // embed surface's own drag anchors
 
+_bc_grmin = 1;   // per-block deepest gain, reset after each publish
 gr_vu.rk_vu_init_gr();                // GR meter: fed linear gain, 1.0 = none
 
 // NaN canonicalization at the WRAPPER (external audit 2026-08-25): the
@@ -157,6 +177,86 @@ function ebc_gr_db() ( -gr_vu.pos; );
 // (EON_Anvil.jsfx:1548). ebc_rc_rq is the request flag consumed in @block.
 ebc_rc_rq = 0;
 ebc_recalc();
+
+// ── Per-surface press latches ────────────────────────────────────────
+// ⚠⚠ VERBATIM from Swing_ReaKit.jsfx (swing_srf_load / swing_srf_store, D-3,
+// Audit D 2026-09-14 + 2026-09-15). ONLY the two function names differ. Swing
+// carries the full rationale above its copy; read that, and keep these in step
+// -- `diff` them if either side is touched.
+//
+// Measured (REAPER 7.79): at most ONE window-or-embed surface of an instance
+// runs @gfx at a time, EXCEPT an instance embedded in BOTH the TCP and the MCP
+// with its window closed -- those two alternate pass for pass and BOTH report
+// gfx_ext_flags&1, which is why a `micro` split could never separate them.
+// Slot 0 is the window and the idle context (they never co-run, and the idle
+// canvas IS the window's); slots 1 and 2 are the two embeds, told apart by
+// canvas signature. An unhovered embed's pass is handed the OTHER embed's live
+// press -- still held, at its pointer, with its modifiers, and no edge either
+// way -- because ssl_knob_interact ends a drag on any pass that sees LMB 0 and
+// the knob mem is shared across surfaces. Bounded at half a second.
+//
+// CALLER CONTRACT: set is_embedded, mx/my, LMB and RMB from the real mouse,
+// then rk_srf_load(); take lmb_down/rmb_down off prev_LMB/prev_RMB and the
+// modifiers off _srf_cap (NOT mouse_cap); rk_srf_store() at the frame tail.
+function rk_srf_load()
+  local(_sg, _oth_plmb, _oth_prmb, _oth_mx, _oth_my, _oth_t, _oth_cap)
+(
+  // This pass's effective mouse_cap for the modifiers (the head reads CTRL,
+  // SHIFT and ALT from it): the real one, unless a foreign press is handed over.
+  _srf_cap = mouse_cap;
+  is_embedded ? (
+    _sg = gfx_w * 65536 + gfx_h;
+    _srf = _sg == _srf_sig1 ? 1 : _sg == _srf_sig2 ? 2 : 0;
+    _srf == 0 ? (
+      _srf = _srf_last_emb == 1 ? 2 : 1;
+      _srf == 1 ? ( _srf_sig1 = _sg; _srf_plmb1 = 0; _srf_prmb1 = 0; _srf_t1 = 0; _srf_cap1 = 0; )
+                : ( _srf_sig2 = _sg; _srf_plmb2 = 0; _srf_prmb2 = 0; _srf_t2 = 0; _srf_cap2 = 0; );
+    );
+    _srf_last_emb = _srf;
+    _srf_plmb0 = 0; _srf_prmb0 = 0;
+    _srf == 1 ? (
+      prev_LMB = _srf_plmb1; prev_RMB = _srf_prmb1;
+      _oth_plmb = _srf_plmb2; _oth_prmb = _srf_prmb2;
+      _oth_mx = _srf_mx2; _oth_my = _srf_my2; _oth_t = _srf_t2; _oth_cap = _srf_cap2;
+    ) : (
+      prev_LMB = _srf_plmb2; prev_RMB = _srf_prmb2;
+      _oth_plmb = _srf_plmb1; _oth_prmb = _srf_prmb1;
+      _oth_mx = _srf_mx1; _oth_my = _srf_my1; _oth_t = _srf_t1; _oth_cap = _srf_cap1;
+    );
+    (_oth_plmb || _oth_prmb) && time_precise() - _oth_t > 0.5 ? (
+      // The owner has not run for half a second: its press is over.
+      _srf == 1 ? ( _srf_plmb2 = 0; _srf_prmb2 = 0; ) : ( _srf_plmb1 = 0; _srf_prmb1 = 0; );
+      _oth_plmb = 0; _oth_prmb = 0;
+    );
+    _srf_foreign = (_oth_plmb || _oth_prmb) && !(mouse_cap & 3);
+    _srf_foreign ? (
+      LMB = _oth_plmb; RMB = _oth_prmb;
+      prev_LMB = _oth_plmb; prev_RMB = _oth_prmb;   // held, and no edge either way
+      mx = _oth_mx; my = _oth_my;
+      _srf_cap = _oth_cap;                          // ...with its modifiers
+    );
+  ) : (
+    _srf = 0; _srf_foreign = 0;
+    prev_LMB = _srf_plmb0 || _srf_plmb1 || _srf_plmb2;
+    prev_RMB = _srf_prmb0 || _srf_prmb1 || _srf_prmb2;
+    _srf_plmb1 = 0; _srf_prmb1 = 0; _srf_plmb2 = 0; _srf_prmb2 = 0;
+  );
+);
+
+function rk_srf_store()
+(
+  _srf == 1 ? (
+    _srf_plmb1 = mouse_cap & 1; _srf_prmb1 = mouse_cap & 2;
+    _srf_foreign ? 0 : ( _srf_mx1 = mouse_x; _srf_my1 = mouse_y; _srf_t1 = time_precise(); _srf_cap1 = mouse_cap; );
+  ) : _srf == 2 ? (
+    _srf_plmb2 = mouse_cap & 1; _srf_prmb2 = mouse_cap & 2;
+    _srf_foreign ? 0 : ( _srf_mx2 = mouse_x; _srf_my2 = mouse_y; _srf_t2 = time_precise(); _srf_cap2 = mouse_cap; );
+  ) : (
+    _srf_plmb0 = mouse_cap & 1; _srf_prmb0 = mouse_cap & 2;
+  );
+  prev_LMB = mouse_cap & 1;
+  prev_RMB = mouse_cap & 2;
+);
 
 @slider
 // Requests only. Host-side automation, preset recall and TrackFX_SetParam land
@@ -255,6 +355,9 @@ ebc_link_slot >= 0 ? (
   gmem[_bc_row + BC_OFF_ECHO + 6] = ebc_mix;
   gmem[_bc_row + BC_OFF_ECHO + 7] = ebc_bypass;
   gmem[_bc_row + BC_OFF_GR]       = cmp_gr_db;
+  gmem[_bc_row + BC_OFF_GRMIN]    = _bc_grmin;
+  gmem[_bc_row + BC_OFF_GRVER]    = 1;
+  _bc_grmin = 1;
   gmem[_bc_row + BC_OFF_ECHO + 9] = ebc_auto;
   ebc_hb += 1;
   gmem[_bc_row + BC_OFF_HB] = ebc_hb;
@@ -275,6 +378,13 @@ ebc_link_slot >= 0 ? (
 // needle relax through the real network — deliberate product decision,
 // not taken as of this note.
 cmp_process(spl0, spl1);
+// Deepest reduction anywhere in this block, for the link's meter. ONE compare
+// per sample. The +9 cell beside it is a SNAPSHOT taken in @block, so it holds
+// whatever the last sample happened to be doing -- on a fast transient the real
+// depth is over before @block looks, and a reader sees a shallower number than
+// this plugin's own needle. Linear, not dB, so nobody needs a log() to publish
+// it or an exp() to read it.
+_bc_grmin = min(_bc_grmin, cmp_last_lin);
 _bp_t = ebc_bypass ? 0 : 1;
 // Seat the blend on the first processing pass (same discipline as the
 // engine's makeup/mix smoothers): a fresh instance must start ON the
@@ -318,25 +428,21 @@ wface_sc = sc;                                          // the face lib draws at
 _vg = 1;
 mx = mouse_x; my = mouse_y;
 LMB = mouse_cap & 1;
-// ⭐⭐ PER-SURFACE PRESS LATCHES. The FX window and the MCP embed each run
-// @gfx, and prev_LMB was ONE shared variable. REAPER hands an unhovered embed
-// a mouse_cap of 0, so that pass wrote prev_LMB = 0 while the button was still
-// physically held -- and the next floating pass then saw LMB=1 with prev=0 and
-// manufactured a SECOND press edge out of one physical click. An even number of
-// toggles cancels (IN looks dead) and a re-fired edge re-anchors a knob drag
-// every time it lands (knobs look frozen). One cause, both symptoms.
+RMB = mouse_cap & 2;
+// ⭐⭐ PER-SURFACE PRESS LATCHES -- rk_srf_load() in @init owns them.
 // ⛔ Do NOT re-add a cross-surface "gesture owner" on top of this (64697de,
 // d4cf11f). Both arbitrated on a bounds test that the embed answers with a
 // PARKED pointer, so both ended up muting whichever surface lost the race --
 // which is how the buttons died. Per-surface state is the whole fix.
-lmb_down = LMB && !(micro ? ebc_plmb_e : ebc_plmb_w);
+is_embedded = micro;
+rk_srf_load();
+lmb_down = LMB && !prev_LMB;
 // Face sheet open (rk_vu_picker, called last): widgets drawn before it must
 // not see this click. Stash the press edge; the picker call restores it.
 _ebc_pk_lmb = lmb_down; !micro && gr_vu.pk_open ? lmb_down = 0;
-RMB = mouse_cap & 2;
-rmb_down = RMB && !(micro ? ebc_prmb_e : ebc_prmb_w);
-CTRL  = mouse_cap & 4;
-SHIFT = mouse_cap & 8;
+rmb_down = RMB && !prev_RMB;
+CTRL  = _srf_cap & 4;
+SHIFT = _srf_cap & 8;
 dt = min(time_precise() - ebc_lt, 0.05); ebc_lt = time_precise();
 hv_speed = 11;
 frame_wheel = mouse_wheel / 120;
@@ -628,8 +734,7 @@ show_chrome ? (
 
 // ── End of frame: embed click-through re-arm + input latches ────────────────
 micro && !ebc_hov ? gfx_ext_flags |= 0x200;
-micro ? ( ebc_plmb_e = LMB; ebc_prmb_e = RMB; )
-      : ( ebc_plmb_w = LMB; ebc_prmb_w = RMB; );
+rk_srf_store();
 // Consume-once wheel (2026-08-28): mouse_wheel is ONE per-instance
 // accumulator shared by BOTH @gfx passes, and the old unconditional zero
 // here let whichever pass painted first eat a wheel aimed at the other

@@ -33,6 +33,7 @@ out_pin:left output
 out_pin:right output
 
 import libs/knobs_kbsg.jsfx-inc
+import libs/rk_vu.jsfx-inc
 
 @init
 
@@ -54,10 +55,13 @@ freemem = 0;
 OU_KNOBS = 3;
 ou_kmem = freemem; freemem += OU_KNOBS * 16;
 
+// GR meter, fed the limiter's own envelope (linear, 1.0 = no reduction) --
+// the same wiring EON Weld uses for its compressor. rk_vu claims no memory.
+gr_vu.rk_vu_init_gr();
+
 _ou_sm      = 1.0 - exp(-1.0 / max(1, 0.0045 * srate));   // Swing's 4.5 ms
 ou_gain     = -1;   // seated from the target on the first @block, no fade-in on load
 ou_lim_env  = 1;
-ou_lim_gr   = 1;
 _ou_hb_prev = -1;
 _ou_stall   = OU_STALL_MAX;
 ou_linked   = 0;
@@ -68,6 +72,86 @@ function ou_recalc() (
   ou_rel_c   = exp(-1.0 / max(1, ou_lim_rel * 0.001 * srate));
 );
 ou_recalc();
+
+// ── Per-surface press latches ────────────────────────────────────────
+// ⚠⚠ VERBATIM from Swing_ReaKit.jsfx (swing_srf_load / swing_srf_store, D-3,
+// Audit D 2026-09-14 + 2026-09-15). ONLY the two function names differ. Swing
+// carries the full rationale above its copy; read that, and keep these in step
+// -- `diff` them if either side is touched.
+//
+// Measured (REAPER 7.79): at most ONE window-or-embed surface of an instance
+// runs @gfx at a time, EXCEPT an instance embedded in BOTH the TCP and the MCP
+// with its window closed -- those two alternate pass for pass and BOTH report
+// gfx_ext_flags&1, which is why a `micro` split could never separate them.
+// Slot 0 is the window and the idle context (they never co-run, and the idle
+// canvas IS the window's); slots 1 and 2 are the two embeds, told apart by
+// canvas signature. An unhovered embed's pass is handed the OTHER embed's live
+// press -- still held, at its pointer, with its modifiers, and no edge either
+// way -- because ssl_knob_interact ends a drag on any pass that sees LMB 0 and
+// the knob mem is shared across surfaces. Bounded at half a second.
+//
+// CALLER CONTRACT: set is_embedded, mx/my, LMB and RMB from the real mouse,
+// then rk_srf_load(); take lmb_down/rmb_down off prev_LMB/prev_RMB and the
+// modifiers off _srf_cap (NOT mouse_cap); rk_srf_store() at the frame tail.
+function rk_srf_load()
+  local(_sg, _oth_plmb, _oth_prmb, _oth_mx, _oth_my, _oth_t, _oth_cap)
+(
+  // This pass's effective mouse_cap for the modifiers (the head reads CTRL,
+  // SHIFT and ALT from it): the real one, unless a foreign press is handed over.
+  _srf_cap = mouse_cap;
+  is_embedded ? (
+    _sg = gfx_w * 65536 + gfx_h;
+    _srf = _sg == _srf_sig1 ? 1 : _sg == _srf_sig2 ? 2 : 0;
+    _srf == 0 ? (
+      _srf = _srf_last_emb == 1 ? 2 : 1;
+      _srf == 1 ? ( _srf_sig1 = _sg; _srf_plmb1 = 0; _srf_prmb1 = 0; _srf_t1 = 0; _srf_cap1 = 0; )
+                : ( _srf_sig2 = _sg; _srf_plmb2 = 0; _srf_prmb2 = 0; _srf_t2 = 0; _srf_cap2 = 0; );
+    );
+    _srf_last_emb = _srf;
+    _srf_plmb0 = 0; _srf_prmb0 = 0;
+    _srf == 1 ? (
+      prev_LMB = _srf_plmb1; prev_RMB = _srf_prmb1;
+      _oth_plmb = _srf_plmb2; _oth_prmb = _srf_prmb2;
+      _oth_mx = _srf_mx2; _oth_my = _srf_my2; _oth_t = _srf_t2; _oth_cap = _srf_cap2;
+    ) : (
+      prev_LMB = _srf_plmb2; prev_RMB = _srf_prmb2;
+      _oth_plmb = _srf_plmb1; _oth_prmb = _srf_prmb1;
+      _oth_mx = _srf_mx1; _oth_my = _srf_my1; _oth_t = _srf_t1; _oth_cap = _srf_cap1;
+    );
+    (_oth_plmb || _oth_prmb) && time_precise() - _oth_t > 0.5 ? (
+      // The owner has not run for half a second: its press is over.
+      _srf == 1 ? ( _srf_plmb2 = 0; _srf_prmb2 = 0; ) : ( _srf_plmb1 = 0; _srf_prmb1 = 0; );
+      _oth_plmb = 0; _oth_prmb = 0;
+    );
+    _srf_foreign = (_oth_plmb || _oth_prmb) && !(mouse_cap & 3);
+    _srf_foreign ? (
+      LMB = _oth_plmb; RMB = _oth_prmb;
+      prev_LMB = _oth_plmb; prev_RMB = _oth_prmb;   // held, and no edge either way
+      mx = _oth_mx; my = _oth_my;
+      _srf_cap = _oth_cap;                          // ...with its modifiers
+    );
+  ) : (
+    _srf = 0; _srf_foreign = 0;
+    prev_LMB = _srf_plmb0 || _srf_plmb1 || _srf_plmb2;
+    prev_RMB = _srf_prmb0 || _srf_prmb1 || _srf_prmb2;
+    _srf_plmb1 = 0; _srf_prmb1 = 0; _srf_plmb2 = 0; _srf_prmb2 = 0;
+  );
+);
+
+function rk_srf_store()
+(
+  _srf == 1 ? (
+    _srf_plmb1 = mouse_cap & 1; _srf_prmb1 = mouse_cap & 2;
+    _srf_foreign ? 0 : ( _srf_mx1 = mouse_x; _srf_my1 = mouse_y; _srf_t1 = time_precise(); _srf_cap1 = mouse_cap; );
+  ) : _srf == 2 ? (
+    _srf_plmb2 = mouse_cap & 1; _srf_prmb2 = mouse_cap & 2;
+    _srf_foreign ? 0 : ( _srf_mx2 = mouse_x; _srf_my2 = mouse_y; _srf_t2 = time_precise(); _srf_cap2 = mouse_cap; );
+  ) : (
+    _srf_plmb0 = mouse_cap & 1; _srf_prmb0 = mouse_cap & 2;
+  );
+  prev_LMB = mouse_cap & 1;
+  prev_RMB = mouse_cap & 2;
+);
 
 @slider
 ou_recalc();
@@ -112,6 +196,16 @@ ou_link_inst > 0 ? (
   );
 );
 
+// ─── The limiter's envelope must not survive a bypass ──────────────────
+// Swing flushes gfx_lim_env to unity whenever its master goes idle or flushes
+// (rk_swing_block.jsfx-inc, "prevents stale GR from popping"). Output has no
+// idle path, so it clears here instead -- every block while the limiter is
+// out, which is the same thing as clearing on the OFF edge and needs no latch.
+// Without it, LIM IN re-applies the reduction that was in force when the
+// limiter went out and ducks audio already under the ceiling for a release
+// time: 12 dB, still ~2.8 dB down a second later at rel = 1000 ms.
+!ou_lim_on ? ou_lim_env = 1.0;
+
 ou_gain < 0 ? ou_gain = ou_gain_t;   // first block: seat, do not fade in
 
 @sample
@@ -130,80 +224,270 @@ ou_lim_on ? (
   );
   _ou_l *= ou_lim_env;   // apply BEFORE releasing, or the peak leaves above the ceiling
   _ou_r *= ou_lim_env;
-  ou_lim_gr = min(ou_lim_gr, ou_lim_env);   // held for the readout
   ou_lim_env += (1.0 - ou_lim_env) * (1.0 - ou_rel_c);   // release for the next sample; stays <= 1
 );
 
+gr_vu.rk_vu_sample_gr(ou_lim_on ? ou_lim_env : 1);   // decimated inside the lib
+
 spl0 = _ou_l; spl1 = _ou_r;
 
-@gfx 420 170
+@gfx 300 700
+// ⚠️ @gfx sets the EMBED ASPECT (house rule: portrait, so the strip pairs with
+// Drum Strip / Weld / Anvil in the mixer). 300x700 is Drum Strip's ratio
+// exactly, so the two line up side by side on an Audio folder. The old
+// 420x170 was landscape: in an 82 px mixer strip that is 33 px tall, which is
+// why the embed showed a title and nothing else.
 
-// A working face; the final face is Swing's own master controls driving this
-// over the link. This one exists so Output is complete on its own.
-gfx_set(0.15, 0.16, 0.18, 1);
-gfx_rect(0, 0, gfx_w, gfx_h);
-gfx_setfont(1, "Arial", 13);
-gfx_set(0.88, 0.89, 0.92, 1);
-gfx_x = 14; gfx_y = 12; gfx_drawstr("EON OUTPUT");
-gfx_set(0.55, 0.58, 0.63, 1);
-gfx_x = 110; gfx_y = 12; gfx_drawstr("Swing's master volume + limiter, for the Audio bus");
-
-// link lamp
-ou_linked ? gfx_set(0.35, 0.80, 0.84, 1) : (ou_link_inst > 0 ? gfx_set(0.85, 0.55, 0.15, 1) : gfx_set(0.40, 0.42, 0.46, 1));
-gfx_circle(gfx_w - 118, 18, 4, 1, 1);
-gfx_set(0.70, 0.72, 0.76, 1);
-gfx_x = gfx_w - 108; gfx_y = 12;
-gfx_drawstr(ou_linked ? "linked to Swing" : (ou_link_inst > 0 ? "Swing not answering" : "standalone"));
-
-_kr = 24; _ky = 92;
-_ou_mdown = (mouse_cap & 1) ? 1 : 0;
-_ou_click = _ou_mdown && !_ou_mprev;
-_ou_mprev = _ou_mdown;
-
-// VOL
-_cx = 70;
-_nv = ssl_knob_interact(ou_kmem + 0 * 16, _cx, _ky, _kr, ou_vol, -48, 12, 0, 0);
-_nv != ou_vol && !ou_linked ? ( ou_vol = _nv; slider_automate(ou_vol); ou_recalc(); );
-rk_knob_draw(1, _cx, _ky, _kr, ou_vol, -48, 12, 0, (ou_kmem + 0 * 16)[0], 0.80, 0.82, 0.86, 0, 0.15, 0.16, 0.18);
-gfx_set(0.70, 0.72, 0.76, 1);
-gfx_x = _cx - 16; gfx_y = _ky + 34; gfx_drawstr("VOL");
-gfx_x = _cx - 28; gfx_y = _ky + 50; gfx_printf("%+.1f dB", ou_vol);
-
-// THRESHOLD
-_cx = 180;
-_nv = ssl_knob_interact(ou_kmem + 1 * 16, _cx, _ky, _kr, ou_lim_thr, -12, 0, 0, 0);
-_nv != ou_lim_thr && !ou_linked ? ( ou_lim_thr = _nv; slider_automate(ou_lim_thr); ou_recalc(); );
-rk_knob_draw(1, _cx, _ky, _kr, ou_lim_thr, -12, 0, 0, (ou_kmem + 1 * 16)[0], 0.93, 0.62, 0.30, 0, 0.15, 0.16, 0.18);
-gfx_set(0.70, 0.72, 0.76, 1);
-gfx_x = _cx - 20; gfx_y = _ky + 34; gfx_drawstr("CEILING");
-gfx_x = _cx - 28; gfx_y = _ky + 50; gfx_printf("%+.1f dB", ou_lim_thr);
-
-// RELEASE (log 10..1000)
-_cx = 290;
-_t = log(max(10, min(1000, ou_lim_rel)) / 10) / log(100);
-_nt = ssl_knob_interact(ou_kmem + 2 * 16, _cx, _ky, _kr, _t, 0, 1, 0.5, 0);
-_nt != _t && !ou_linked ? ( ou_lim_rel = floor(10 * pow(100, max(0, min(1, _nt))) + 0.5); slider_automate(ou_lim_rel); ou_recalc(); );
-rk_knob_draw(1, _cx, _ky, _kr, _nt, 0, 1, 0, (ou_kmem + 2 * 16)[0], 0.80, 0.82, 0.86, 0, 0.15, 0.16, 0.18);
-gfx_set(0.70, 0.72, 0.76, 1);
-gfx_x = _cx - 24; gfx_y = _ky + 34; gfx_drawstr("RELEASE");
-gfx_x = _cx - 22; gfx_y = _ky + 50; gfx_printf("%d ms", ou_lim_rel);
-
-// limiter in/out + GR readout
-_bx = 350; _by = 76; _bw = 56; _bh = 22;
-_ou_click && !ou_linked && mouse_x >= _bx && mouse_x <= _bx + _bw && mouse_y >= _by && mouse_y <= _by + _bh ? (
-  ou_lim_on = ou_lim_on ? 0 : 1; slider_automate(ou_lim_on);
+// ── Frame globals (knobs_kbsg caller contract) ─────────────────────────
+// ssl_knob_interact reads mx/my/LMB/lmb_down/CTRL/dt/hv_speed/frame_wheel as
+// globals -- the caller supplies them. Without this block every knob below
+// hit-tests against (0,0), never hovers, and returns its value unchanged.
+micro = gfx_ext_flags & 1;
+W = gfx_w; H = gfx_h;
+ret = max(1, gfx_ext_retina);
+mx = mouse_x; my = mouse_y;
+LMB = mouse_cap & 1;
+RMB = mouse_cap & 2;
+// ⭐⭐ PER-SURFACE PRESS LATCHES -- rk_srf_load() in @init owns them.
+is_embedded = micro;
+rk_srf_load();
+lmb_down = LMB && !prev_LMB;
+rmb_down = RMB && !prev_RMB;
+CTRL  = _srf_cap & 4;   // the lib's FINE-drag modifier (0.25x)
+SHIFT = _srf_cap & 8;   // ...and its FINER one (0.1x). ssl_knob_interact reads both
+                        // as caller-supplied GLOBALS; an unset SHIFT is 0 in EEL2, so
+                        // this face took the coarse branch on every Shift-drag. The
+                        // preamble was ported from Tone (262ef5f) before the library
+                        // grew the SHIFT tier. Delta audit 2026-09-20.
+dt = min(time_precise() - _ou_lt, 0.05); _ou_lt = time_precise();
+hv_speed = 11;
+frame_wheel = mouse_wheel / 120;
+// Embedded wheel events arrive with a STALE mouse position; remember the
+// cursor on normal frames, reuse it on wheel frames.
+micro ? (
+  frame_wheel == 0 ? ( _ou_hmx = mx; _ou_hmy = my; ) : ( mx = _ou_hmx; my = _ou_hmy; );
 );
-ou_lim_on ? gfx_set(0.26, 0.55, 0.36, 1) : gfx_set(0.26, 0.28, 0.32, 1);
-gfx_rect(_bx, _by, _bw, _bh);
-gfx_set(0.92, 0.93, 0.95, 1);
-gfx_x = _bx + 10; gfx_y = _by + 4; gfx_drawstr(ou_lim_on ? "LIM IN" : "LIM OUT");
-gfx_set(0.70, 0.72, 0.76, 1);
-gfx_x = _bx - 2; gfx_y = _by + 34;
-ou_lim_gr < 0.999 ? gfx_printf("%.1f dB GR", 20 * log(ou_lim_gr) / 2.30258509299) : gfx_drawstr("0.0 dB GR");
-ou_lim_gr = 1;   // held since the last frame; release it
 
-ou_linked ? (
-  gfx_set(0.42, 0.46, 0.53, 1);
-  gfx_x = 14; gfx_y = gfx_h - 20;
-  gfx_drawstr("Linked: set VOL on Swing, and the limiter in Swing's COMP view (LIMITER section).");
+// ── Layout choice ──────────────────────────────────────────────────────
+// Two LAYOUTS, not one layout scaled: an 82 px mixer strip cannot show a
+// 300 px face legibly at any scale, and knobs that small cannot be hit. Above
+// the threshold the full face scales; below it, a meter column takes over.
+// (Drum Strip's idiom -- it switches layout by emb_mode rather than shrinking.)
+// ⚠️ HEIGHT COUNTS TOO, not just width. This face went from 420x170 landscape
+// to 300x700 portrait, so EVERY project saved before that reopens it at the old
+// SHORT size -- and the full layout is fixed multiples of sc with sc floored at
+// 0.5, so at 420x170 the VOL, CEILING and RELEASE knobs and the LIM button all
+// sat below the bottom edge: a face showing the meter and nothing you can
+// touch. The compact column derives from H and fits at any height, so a window
+// too short for the full layout goes there instead of drawing off-canvas.
+// ⚠️ THE THRESHOLD IS THE LAST CONTROL, NOT THE LAST PIXEL. 596 = the LIM
+// button's bottom (566 + 30). It was 626 for one commit -- 596 plus the 30 px
+// footer -- and that band cost every control on the face: at 300x300 sc floors
+// at 0.5, so the controls end at 298 and fit, but 626 * 0.5 = 313 sent the
+// window to the compact column, which draws meters and has NO input handling,
+// and all five sliders are hidden (`-` labels) so there is no native fallback
+// either. A window that can show every control must show them; the footer is
+// one line of prose and drops out below instead (delta audit 2026-09-20).
+sc = max(0.5, min(W / 300, H / 700));
+_ou_full = W >= 150 && H >= 596 * sc;
+// Decoration only, and it would draw over the LIM button in the 596..626 band.
+_ou_foot = H >= 626 * sc;
+
+// Locked-knob look: while the link is live these follow Swing and cannot be
+// turned here. They used to look identical to live ones -- which read as
+// broken rather than locked, even to the person who wrote the plugin.
+_ou_lk = ou_linked ? 0.42 : 1.0;
+
+gfx_set(0.13, 0.14, 0.16, 1);
+gfx_rect(0, 0, W, H);
+
+_ou_full ? (
+
+  // ── Header ──────────────────────────────────────────────────────────
+  gfx_setfont(1, "Arial", max(9, floor(15 * sc)), 'b');
+  gfx_set(0.88, 0.89, 0.92, 1);
+  gfx_x = floor(14 * sc); gfx_y = floor(14 * sc); gfx_drawstr("EON OUTPUT");
+  ou_linked ? gfx_set(0.35, 0.80, 0.84, 1) : (ou_link_inst > 0 ? gfx_set(0.85, 0.55, 0.15, 1) : gfx_set(0.40, 0.42, 0.46, 1));
+  gfx_circle(floor(19 * sc), floor(42 * sc), max(3, 4 * sc), 1, 1);
+  gfx_setfont(2, "Arial", max(8, floor(11 * sc)));
+  gfx_set(0.62, 0.65, 0.70, 1);
+  gfx_x = floor(30 * sc); gfx_y = floor(35 * sc);
+  gfx_drawstr(ou_linked ? "linked to Swing" : (ou_link_inst > 0 ? "Swing not answering" : "standalone"));
+  gfx_set(1, 1, 1, 0.06);
+  gfx_rect(floor(12 * sc), floor(58 * sc), W - floor(24 * sc), 1);
+
+  // ── GR meter: the thing you watch on a master bus ────────────────────
+  // ⚠ rk_vu_theme() FIRST or the plate draws unlit -- Weld does the same before
+  // its GR call. 0 = Cream, the library default.
+  rk_vu_theme(0);
+  _vr = floor(96 * sc); _vcy = floor(58 * sc) + _vr * 1.4;
+  gr_vu.rk_vu_draw_at(W * 0.5, _vcy, _vr, 1, -1, "GR");
+  gfx_setfont(2, "Arial", max(8, floor(11 * sc)));
+  gfx_set(0.72, 0.75, 0.80, 1);
+  gfx_x = W * 0.5 - floor(28 * sc); gfx_y = _vcy + _vr * 0.34;
+  gfx_printf("%.1f dB GR", max(0, gr_vu.pos));
+
+  // ── VOL ──────────────────────────────────────────────────────────────
+  _cx = W * 0.5; _ky = floor(312 * sc); _kr = floor(48 * sc);
+  _nv = ssl_knob_interact(ou_kmem + 0 * 16, _cx, _ky, _kr, ou_vol, -48, 12, 0, 0);
+  _nv != ou_vol && !ou_linked ? ( ou_vol = _nv; slider_automate(ou_vol); ou_recalc(); );
+  rk_knob_draw(1, _cx, _ky, _kr, ou_vol, -48, 12, 0, (ou_kmem + 0 * 16)[0] * _ou_lk,
+               0.80 * _ou_lk, 0.82 * _ou_lk, 0.86 * _ou_lk, 0, 0.13, 0.14, 0.16);
+  gfx_setfont(2, "Arial", max(8, floor(11 * sc)));
+  gfx_set(0.60, 0.63, 0.68, 1);
+  gfx_x = _cx - floor(12 * sc); gfx_y = _ky + _kr + floor(8 * sc); gfx_drawstr("VOL");
+  gfx_setfont(3, "Arial", max(9, floor(15 * sc)), 'b');
+  gfx_set(0.86, 0.88, 0.92, 1);
+  gfx_x = _cx - floor(30 * sc); gfx_y = _ky + _kr + floor(24 * sc);
+  gfx_printf("%+.1f dB", ou_vol);
+
+  // ── CEILING / RELEASE ────────────────────────────────────────────────
+  _kr = floor(34 * sc); _ky = floor(464 * sc);
+  _cx = W * 0.30;
+  _nv = ssl_knob_interact(ou_kmem + 1 * 16, _cx, _ky, _kr, ou_lim_thr, -12, 0, 0, 0);
+  _nv != ou_lim_thr && !ou_linked ? ( ou_lim_thr = _nv; slider_automate(ou_lim_thr); ou_recalc(); );
+  rk_knob_draw(1, _cx, _ky, _kr, ou_lim_thr, -12, 0, 0, (ou_kmem + 1 * 16)[0] * _ou_lk,
+               0.93 * _ou_lk, 0.62 * _ou_lk, 0.30 * _ou_lk, 0, 0.13, 0.14, 0.16);
+  gfx_setfont(2, "Arial", max(8, floor(11 * sc)));
+  gfx_set(0.60, 0.63, 0.68, 1);
+  gfx_x = _cx - floor(20 * sc); gfx_y = _ky + _kr + floor(8 * sc); gfx_drawstr("CEILING");
+  gfx_set(0.86, 0.88, 0.92, 1);
+  gfx_x = _cx - floor(20 * sc); gfx_y = _ky + _kr + floor(22 * sc);
+  gfx_printf("%+.1f dB", ou_lim_thr);
+
+  _cx = W * 0.70;
+  _t = log(max(10, min(1000, ou_lim_rel)) / 10) / log(100);
+  _nt = ssl_knob_interact(ou_kmem + 2 * 16, _cx, _ky, _kr, _t, 0, 1, 0.5, 0);
+  _nt != _t && !ou_linked ? ( ou_lim_rel = floor(10 * pow(100, max(0, min(1, _nt))) + 0.5); slider_automate(ou_lim_rel); ou_recalc(); );
+  // Draw the value in force, not the raw return: a LOCKED knob must not follow a
+  // drag Output threw away, and ou_lim_rel is floored to whole ms.
+  _t = log(max(10, min(1000, ou_lim_rel)) / 10) / log(100);
+  rk_knob_draw(1, _cx, _ky, _kr, _t, 0, 1, 0, (ou_kmem + 2 * 16)[0] * _ou_lk,
+               0.80 * _ou_lk, 0.82 * _ou_lk, 0.86 * _ou_lk, 0, 0.13, 0.14, 0.16);
+  gfx_setfont(2, "Arial", max(8, floor(11 * sc)));
+  gfx_set(0.60, 0.63, 0.68, 1);
+  gfx_x = _cx - floor(20 * sc); gfx_y = _ky + _kr + floor(8 * sc); gfx_drawstr("RELEASE");
+  gfx_set(0.86, 0.88, 0.92, 1);
+  gfx_x = _cx - floor(16 * sc); gfx_y = _ky + _kr + floor(22 * sc);
+  gfx_printf("%d ms", ou_lim_rel);
+
+  // ── LIM in/out ───────────────────────────────────────────────────────
+  _bw = floor(120 * sc); _bh = floor(30 * sc);
+  _bx = (W - _bw) * 0.5; _by = floor(566 * sc);
+  lmb_down && !ou_linked && mx >= _bx && mx <= _bx + _bw && my >= _by && my <= _by + _bh ? (
+    ou_lim_on = ou_lim_on ? 0 : 1; slider_automate(ou_lim_on);
+  );
+  ou_lim_on ? gfx_set(0.26 * _ou_lk, 0.55 * _ou_lk, 0.36 * _ou_lk, 1) : gfx_set(0.24, 0.26, 0.30, 1);
+  gfx_rect(_bx, _by, _bw, _bh);
+  gfx_set(1, 1, 1, 0.08);
+  gfx_rect(_bx, _by, _bw, 1);
+  gfx_setfont(3, "Arial", max(9, floor(13 * sc)), 'b');
+  gfx_set(0.92, 0.93, 0.95, ou_linked ? 0.6 : 1);
+  gfx_x = _bx + _bw * 0.5 - floor(24 * sc); gfx_y = _by + floor(7 * sc);
+  gfx_drawstr(ou_lim_on ? "LIM IN" : "LIM OUT");
+
+  // ── Footer ───────────────────────────────────────────────────────────
+  _ou_foot ? (
+    gfx_set(1, 1, 1, 0.05);
+    gfx_rect(0, H - floor(30 * sc), W, 1);
+    gfx_setfont(2, "Arial", max(8, floor(10 * sc)));
+    ou_linked ? (
+      gfx_set(0.42, 0.62, 0.68, 0.95);
+      gfx_x = floor(12 * sc); gfx_y = H - floor(22 * sc);
+      gfx_drawstr("Locked: VOL on Swing, limiter in its COMP view.");
+    ) : (
+      gfx_set(0.42, 0.46, 0.53, 0.8);
+      gfx_x = floor(12 * sc); gfx_y = H - floor(22 * sc);
+      gfx_drawstr("Master volume, then the limiter.");
+    );
+    gfx_setfont(4, "Arial", max(8, floor(10 * sc)), 'b');
+    gfx_set(0.52, 0.56, 0.62, 0.6);
+    gfx_x = W - floor(34 * sc); gfx_y = H - floor(22 * sc);
+    gfx_drawstr("EON");
+  );
+
+) : (
+
+  // ── Compact column (narrow mixer strip) ──────────────────────────────
+  // No knobs: below ~150 px they cannot be hit or read. What a master strip
+  // is actually FOR at this size is the reduction, the level and whether the
+  // limiter is in -- so it shows those three and nothing else.
+  // The lamp SAID as well as lit: a colour alone makes you remember which one
+  // means what. "linked to Swing" cannot fit an 82 px strip, so it is the short
+  // form sized to the strip -- measure it, and if it overhangs, shrink the font
+  // by exactly the overhang and measure once more. One retry always lands it.
+  // (Same idiom as EON_Patchbay's strip; kept local rather than pushed into
+  //  knobs_kbsg, which is the RELEASED ReaKit library.)
+  // ⚠️⚠️ TYPE IS SIZED FROM THE SMALLER OF WHAT THE WIDTH AND THE HEIGHT CAN
+  // CARRY. W alone was right for an 82 px mixer strip, where width is the tight
+  // dimension -- but a window saved at the OLD size is WIDE AND SHORT, and
+  // W * 0.15 there is a 63 px font inside 170 px of height: readouts off the
+  // bottom, overlapping each other, and the meter's height arithmetic going
+  // NEGATIVE so it never filled at any amount of reduction. H * 0.30 is the
+  // binding constraint. Horizontal POSITIONS stay on W -- only sizes are
+  // capped.
+  _ou_u = min(W, H * 0.30);
+  _ou_ty = max(2, H * 0.012);
+  _ou_fs = max(6, floor(_ou_u * 0.15));
+  gfx_setfont(2, "Arial", _ou_fs, 'b');
+  sprintf(#_ou_s, "%s", ou_linked ? "LINKED" : (ou_link_inst > 0 ? "NO SWING" : "STANDALONE"));
+  gfx_measurestr(#_ou_s, tw, th);
+  tw > W - 4 ? (
+    _ou_fs = max(5, floor(_ou_fs * (W - 4) / max(1, tw)));
+    gfx_setfont(2, "Arial", _ou_fs, 'b');
+    gfx_measurestr(#_ou_s, tw, th);
+  );
+  ou_linked ? gfx_set(0.35, 0.80, 0.84, 1) : (ou_link_inst > 0 ? gfx_set(0.85, 0.55, 0.15, 1) : gfx_set(0.40, 0.42, 0.46, 1));
+  gfx_circle(W * 0.5, _ou_ty + max(2, _ou_u * 0.04), max(2, _ou_u * 0.04), 1, 1);
+  gfx_x = (W - tw) * 0.5; gfx_y = _ou_ty + max(5, _ou_u * 0.10);
+  gfx_drawstr(#_ou_s);
+
+  // vertical GR bar, filling DOWNWARD as reduction deepens. Its top is derived
+  // from where the text actually ended, so a wider strip with a bigger font
+  // cannot run the words into the meter.
+  _mx0 = W * 0.30; _mw = W * 0.40;
+  _my0 = gfx_y + th + max(2, H * 0.012); _mh = H * 0.55 - (_my0 - H * 0.09);
+  gfx_set(0.08, 0.09, 0.10, 1);
+  gfx_rect(_mx0, _my0, _mw, _mh);
+  gfx_set(1, 1, 1, 0.07);
+  gfx_rect(_mx0, _my0, _mw, 1);
+  // gr_vu.pos is dB of reduction, 0 at rest. 18 dB fills the bar.
+  _grd = max(0, min(18, gr_vu.pos));
+  _grh = _mh * (_grd / 18);
+  _grh > 0.5 ? (
+    gfx_set(0.93, 0.62, 0.30, 0.92);
+    gfx_rect(_mx0, _my0, _mw, _grh);
+  );
+  // The figure is a convenience -- the BAR already carries the reduction. Its
+  // font floors at 7 px while the gap between the bar's bottom (H * 0.64) and
+  // the level readout (H * 0.70) keeps shrinking with H, so in a very short
+  // strip it would sit on top of the level. Drop it rather than overlap.
+  _ou_gf = max(7, floor(_ou_u * 0.16));
+  _ou_gy = _my0 + _mh + max(2, H * 0.012);
+  _ou_gy + _ou_gf <= H * 0.70 ? (
+    gfx_setfont(2, "Arial", _ou_gf);
+    gfx_set(0.72, 0.75, 0.80, 1);
+    gfx_x = _mx0; gfx_y = _ou_gy;
+    gfx_printf("%.1f", _grd);
+  );
+
+  // level
+  gfx_setfont(3, "Arial", max(8, floor(_ou_u * 0.20)), 'b');
+  gfx_set(0.86, 0.88, 0.92, 1);
+  gfx_x = W * 0.10; gfx_y = H * 0.70;
+  gfx_printf("%+.0f", ou_vol);
+
+  // limiter state
+  _bh2 = max(8, H * 0.07);
+  _by2 = H * 0.86;
+  ou_lim_on ? gfx_set(0.26, 0.55, 0.36, 1) : gfx_set(0.24, 0.26, 0.30, 1);
+  gfx_rect(W * 0.14, _by2, W * 0.72, _bh2);
+  gfx_setfont(2, "Arial", max(7, floor(_ou_u * 0.15)), 'b');
+  gfx_set(0.92, 0.93, 0.95, 1);
+  gfx_x = W * 0.24; gfx_y = _by2 + max(1, _bh2 * 0.18);
+  gfx_drawstr(ou_lim_on ? "LIM" : "OUT");
 );
+
+// ── End of frame: input latches ────────────────────────────────────
+rk_srf_store();
+mouse_wheel = 0;

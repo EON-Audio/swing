@@ -6179,6 +6179,10 @@ local KIT_GLOBAL_KEYS = {
   "meq_bypass", "cmp_thresh", "cmp_ratio", "cmp_attack", "cmp_release",
   "cmp_knee", "cmp_makeup", "cmp_mix", "cmp_bypass", "rvb_predelay",
   "rvb_hpf", "oneshot_global", "rvb_on", "dly_on",
+  -- Master EQ Q per mode (Swing ser_ver 75). APPENDED, never inserted: the
+  -- gmem slot is KIT_GMEM_GLOBALS + position, so every existing key keeps its
+  -- cell. 49 keys now -> gmem 40..88, inside the declared 40..89 band.
+  "eq_lo_sq", "eq_lo_bq", "eq_mid_q", "eq_hi_sq", "eq_hi_bq",
 }
 -- Globals whose "absent from the file" value is NOT zero. Every key not listed
 -- defaults to 0. The bus enables MUST live here: kits saved before they existed
@@ -6188,6 +6192,15 @@ local KIT_GLOBAL_DEFAULTS = {
   oneshot_global = 1,
   rvb_on         = 1,
   dly_on         = 1,
+  -- Q MUST be here: a Q of 0 is a needle-thin band. A kit saved before these
+  -- existed has no such keys, and the "or 0" fallback would load exactly that.
+  -- These are the pre-ser_ver-75 fixed shapes: shelf 1/sqrt(2) (== the old
+  -- slope S = 1.0), bell 0.8 -- so an old kit sounds the way it always did.
+  eq_lo_sq       = math.sqrt(0.5),
+  eq_lo_bq       = 0.8,
+  eq_mid_q       = 0.8,
+  eq_hi_sq       = math.sqrt(0.5),
+  eq_hi_bq       = 0.8,
 }
 local KIT_GMEM_GLOBALS = 40  -- gmem base for global settings
 
@@ -16098,6 +16111,98 @@ function refresh_multiout_identity_per_instance()
               local p_li = eon_param_by_name(tr, pb, "Link Instance")
               if p_li >= 0 and math.floor(reaper.TrackFX_GetParam(tr, pb, p_li) or 0) ~= inst_id then
                 reaper.TrackFX_SetParam(tr, pb, p_li, inst_id)
+              end
+            end
+            -- The AUDIO-BUS Weld follows this Swing on the UPPER half of the
+            -- comp link band (slot + GS_BC_LINK_ROW_BUS). Rows 0..15 belong to
+            -- the smash-return Weld that Strip_Sync links; linking this one the
+            -- obvious way would put two Welds on one row, trading knob values
+            -- forever with no symptom naming the cause. See the band comment in
+            -- EON_Weld.jsfx.
+            -- Done here rather than at build, on the same ~1 Hz sub-tick and
+            -- with the same value guard as the Patchbay heal above: one code
+            -- path instead of two, one param write for the life of a linked
+            -- project, and a track template, a duplicated folder or a
+            -- re-inserted plugin heals itself inside a second instead of
+            -- sitting on a stale row. find_audio_subfolder returns nil outside
+            -- Multi-Out, so this is self-gating.
+            local asub = find_audio_subfolder(tr)
+            if asub then
+              local bw, bo, ba, bx = -1, -1, -1, -1
+              for i = 0, reaper.TrackFX_GetCount(asub) - 1 do
+                local _, fxn = reaper.TrackFX_GetFXName(asub, i, "")
+                if fxn then
+                  if bw < 0 and fxn:find("EON Weld", 1, true) then bw = i end
+                  if bo < 0 and fxn:find("EON Output", 1, true) then bo = i end
+                  if ba < 0 and fxn:find("EON Anvil", 1, true) then ba = i end
+                  -- Anything on this folder that is not Swing's own three is
+                  -- the rack somebody chose: a stock comp, an FX chain, or a
+                  -- plugin dropped in by hand after the build. Identified by
+                  -- what is ACTUALLY on the track, not by the P_EXT mark the
+                  -- builder leaves -- that mark is only written for the stock
+                  -- and chain branches, and it goes stale the moment the user
+                  -- swaps the plugin themselves.
+                  if bx < 0 and not fxn:find("EON Tone", 1, true)
+                     and not fxn:find("EON Output", 1, true)
+                     and not fxn:find("EON Weld", 1, true)
+                     and not fxn:find("EON Anvil", 1, true) then bx = i end
+                end
+              end
+              -- Tell Swing what is on its bus, so it can stop compressing into
+              -- a folder that already has a compressor -- in Multi-Out its own
+              -- stage only ever reaches the pad on OUT 1 anyway -- and so the
+              -- COMP page can say plainly when the rack is one it cannot drive.
+              local band = G.GS_STRIP_BASE + slot * G.GS_STRIP_STRIDE
+              reaper.gmem_write(band + G.GS_STRIP_OFF_RACK_ENG,
+                (bw >= 0) and 1 or ((ba >= 0) and 2 or ((bx >= 0) and 3 or 0)))
+              reaper.gmem_write(band + G.GS_STRIP_OFF_RACK_HB,
+                (reaper.gmem_read(band + G.GS_STRIP_OFF_RACK_HB) or 0) + 1)
+              -- EON Output's link is BAKED ONCE at build (ensure_output) and
+              -- nothing has ever re-asserted it, so when Swing's instance id
+              -- changes underneath it -- recompile, collision reclaim, a
+              -- duplicated track carrying the original's id -- the folder
+              -- silently stops following and its face reads "Swing not
+              -- answering". FOUND LIVE 2026-09-20: Swing on instance 1, its
+              -- Output still pointed at 16, so MASTER VOL and the limiter were
+              -- driving nothing. Same failure the Patchbay heal above exists
+              -- for, and the same one-line fix; the pad tracks' EON Macros are
+              -- already re-asserted elsewhere, which is why only this one drifted.
+              if bo >= 0 then
+                local p_oi = eon_param_by_name(asub, bo, "Link Instance")
+                if p_oi >= 0 and math.floor(reaper.TrackFX_GetParam(asub, bo, p_oi) or 0) ~= inst_id then
+                  reaper.TrackFX_SetParam(asub, bo, p_oi, inst_id)
+                end
+              end
+              -- EON Tone follows its Swing by registry slot. Its Link Slot has
+              -- existed since the plugin was written and has never been pushed
+              -- by anything -- the label reads "Lua-pushed" and no Lua pushed
+              -- it -- so until now the EQ on the Audio bus was an island.
+              -- One Tone per Swing, so the slot alone identifies the record; no
+              -- role offset is needed here, unlike the comp band where two
+              -- Welds can belong to one instance.
+              local bt = -1
+              for i = 0, reaper.TrackFX_GetCount(asub) - 1 do
+                local _, fxn = reaper.TrackFX_GetFXName(asub, i, "")
+                if fxn and fxn:find("EON Tone", 1, true) then bt = i break end
+              end
+              if bt >= 0 then
+                local p_ts = eon_param_by_name(asub, bt, "Link Slot")
+                if p_ts >= 0 and math.floor(reaper.TrackFX_GetParam(asub, bt, p_ts) or -1) ~= slot then
+                  reaper.TrackFX_SetParam(asub, bt, p_ts, slot)
+                end
+              end
+              if bw >= 0 then
+                local want = slot + G.GS_BC_LINK_ROW_BUS
+                local p_ls = eon_param_by_name(asub, bw, "Link Slot")
+                if p_ls >= 0 and math.floor(reaper.TrackFX_GetParam(asub, bw, p_ls) or -1) ~= want then
+                  reaper.TrackFX_SetParam(asub, bw, p_ls, want)
+                end
+                -- Stamp the claim. Weld writes neither cell, so they outlive
+                -- its publish and a later pass can tell "my row" from "a row
+                -- somebody else also thinks is theirs".
+                local brow = G.GS_BC_LINK_BASE + want * G.GS_BC_LINK_STRIDE
+                reaper.gmem_write(brow + G.GS_BC_LINK_OFF_ENGINE, 1)
+                reaper.gmem_write(brow + G.GS_BC_LINK_OFF_OWNER, 2)
               end
             end
           end

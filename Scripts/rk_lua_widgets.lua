@@ -656,6 +656,110 @@ function w.draw_pad_grid(ctx, opts)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════════
+-- ANIMATION
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Measured 2026-09-20 (.dev_tests/EON_Probe_ImGuiFps_probe.lua): REAPER calls a
+-- deferred script ~31 times a second, and ImGui adds nothing to that — a loop
+-- drawing nothing at all gets the same 31. So a frame is ~32 ms, a 150 ms
+-- transition is five frames, and anything under ~100 ms reads as a snap whatever
+-- curve is on it. 180–250 ms is the useful band; hover feedback wants less.
+--
+-- Drawing is cheap at our scale: 1200 DrawList primitives measured 1.0 ms of that
+-- 32 ms frame, 200 measured 0.245 ms — about a microsecond each, scaling linearly.
+-- So what animation costs is bookkeeping, not paint.
+--
+-- Every animated value is stored with the TIME IT STARTED, never as a per-frame
+-- accumulator, and its current value is recomputed from the clock each frame.
+-- That is the whole trick: a dropped frame lands further along the curve instead
+-- of falling behind, and the same code looks identical on a machine whose defer
+-- rate differs from this one.
+
+-- Penner's curves, written from the published equations. t is normalised 0..1.
+local function ease_linear(t)    return t end
+local function ease_out_quad(t)  local u = 1 - t; return 1 - u * u end
+local function ease_out_cubic(t) local u = 1 - t; return 1 - u * u * u end
+local function ease_in_out_cubic(t)
+  if t < 0.5 then return 4 * t * t * t end
+  local u = -2 * t + 2
+  return 1 - (u * u * u) * 0.5
+end
+
+w.EASE = {
+  linear       = ease_linear,
+  out_quad     = ease_out_quad,
+  out_cubic    = ease_out_cubic,
+  in_out_cubic = ease_in_out_cubic,
+}
+
+-- id -> { from, to, t0, dur, curve, seen }
+w._anim = w._anim or {}
+
+local function anim_at(a, now)
+  if a.dur <= 0 then return a.to end
+  local t = (now - a.t0) / a.dur
+  if t <= 0 then return a.from end
+  if t >= 1 then return a.to end
+  return a.from + (a.to - a.from) * a.curve(t)
+end
+
+--- Current value of a named animation, retargeting whenever `target` changes.
+--- Call it every frame with the value you WANT; it returns where the animation
+--- has actually got to. A reversal mid-flight restarts from where it is rather
+--- than from the old endpoint, so hover-out-hover-in never jumps.
+--- @param id     string   stable per widget (the widget's ImGui id is the natural one)
+--- @param target number
+--- @param dur    number   seconds (default 0.20)
+--- @param curve  function one of w.EASE (default out_cubic)
+function w.ease(id, target, dur, curve)
+  local now = reaper.time_precise()
+  local a   = w._anim[id]
+  if not a then
+    a = { from = target, to = target, t0 = now,
+          dur = dur or 0.20, curve = curve or ease_out_cubic }
+    w._anim[id] = a
+  elseif a.to ~= target then
+    a.from  = anim_at(a, now)
+    a.to    = target
+    a.t0    = now
+    a.dur   = dur or 0.20
+    a.curve = curve or ease_out_cubic
+  end
+  a.seen = now
+  return anim_at(a, now)
+end
+
+--- Drop animations nothing has asked for in `max_age` seconds. An immediate-mode
+--- panel mints and abandons ids as the user navigates; without this the table
+--- grows for the life of the script. Cheap enough to call once a frame.
+function w.anim_gc(max_age)
+  local cutoff = reaper.time_precise() - (max_age or 5)
+  for id, a in pairs(w._anim) do
+    if (a.seen or 0) < cutoff then w._anim[id] = nil end
+  end
+end
+
+--- Scale a colour's alpha. ReaImGui colours are 0xRRGGBBAA, so the alpha is the
+--- low byte — this is how a whole widget fades without touching its palette.
+function w.fade(col, mul)
+  local a = math.floor((col & 0xFF) * mul + 0.5)
+  if a < 0 then a = 0 elseif a > 255 then a = 255 end
+  return (col & 0xFFFFFF00) | a
+end
+
+--- Blend two colours channel-wise. t = 0 is c1, t = 1 is c2.
+function w.lerp_color(c1, c2, t)
+  if t <= 0 then return c1 end
+  if t >= 1 then return c2 end
+  local out = 0
+  for shift = 24, 0, -8 do
+    local a = (c1 >> shift) & 0xFF
+    local b = (c2 >> shift) & 0xFF
+    out = out | (math.floor(a + (b - a) * t + 0.5) << shift)
+  end
+  return out
+end
+
+-- ═══════════════════════════════════════════════════════════════════════════════
 -- ROTARY KNOB + MODE PILL  (Pad FX panel; reusable)
 -- ═══════════════════════════════════════════════════════════════════════════════
 
@@ -691,9 +795,6 @@ function w.resolve_knob_style(theme)
   end
   return 1
 end
-
--- Per-id eased hover (0..1) feeding the JSFX knob skins' hover_t brightness.
-w._knob_hov = w._knob_hov or {}
 
 --- Rotary knob. Vertical drag changes value (Shift = fine); double-click resets
 --- to opts.default. When a JSFX knob-skin port is loaded, the dial is drawn by
@@ -744,10 +845,11 @@ function w.knob(ctx, id, value, vmin, vmax, opts)
   local radius = r - 3
 
   -- Ease the hover_t the JSFX skins use for their brightness/cap response.
-  local hov_target = (hovered or active) and 1 or 0
-  local hov = w._knob_hov[id] or 0
-  hov = hov + (hov_target - hov) * 0.25
-  w._knob_hov[id] = hov
+  -- This was a per-FRAME chase (`hov + (target - hov) * 0.25`), which tied the
+  -- fade's speed to whatever frame rate the machine happened to give us. 120 ms
+  -- is about four frames at the measured 31 fps — the old constant's speed, now
+  -- stated in time instead of arrived at by luck.
+  local hov = w.ease("knob_hov_" .. id, (hovered or active) and 1 or 0, 0.12)
 
   local style = opts.style or w.resolve_knob_style(w._cur_theme)
   if rkknobs and style then

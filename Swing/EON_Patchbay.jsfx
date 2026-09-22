@@ -237,16 +237,31 @@ _pb_wpos += 1;
 _pb_wpos >= PATCH_FRAMES ? _pb_wpos = 0;
 atomic_set(gmem[_pb_base + PATCH_OFF_WPOS], _pb_wpos);
 
-@gfx 420 300
-// Portrait-ish embed aspect (house rule), landscape enough to seat 16 lanes.
+@gfx 300 700
+// ⚠️ @gfx sets the EMBED ASPECT (house rule: portrait, so the strip pairs with
+// Drum Strip / Output / Macros in the mixer). The old 420x300 was landscape:
+// 59 px tall in an 82 px mixer strip, which is not enough for sixteen meters.
+// 300x700 is Drum Strip's ratio, and the sixteen lanes become a 4x4 GRID --
+// which is the shape Swing's pads are in anyway, so lane 6 sits where pad 6 is.
 
 micro = gfx_ext_flags & 1;
 ret = max(1, gfx_ext_retina);
 W = gfx_w; H = gfx_h;
-sc = micro ? ret : max(0.6, min(W / 420, H / 300));
 // Nothing here takes a click: the embed always passes the mouse through.
 gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
 micro ? gfx_ext_flags |= 0x200;
+
+// Two LAYOUTS, not one scaled: below ~150 px the labels and the status line
+// cannot be read at any scale, so the compact grid drops to meters alone.
+// ⚠️ HEIGHT COUNTS TOO, not just width -- same trap as EON_Output. This face
+// went from 420x300 to 300x700, so a project saved before that reopens it at
+// 420x300, where the fourth row of lanes runs into the footer text.
+// 610 * sc = the last lane number's TOP (558) plus the 52 footer. The label's
+// own height is added separately because its font FLOORS at 8 px -- it does not
+// keep shrinking with sc, so a purely proportional 620 * sc was 3 px short at
+// the sc = 0.5 floor and the numbers still crossed the footer rule at H = 310.
+sc = max(0.5, min(W / 300, H / 700));
+_pb_full = W >= 150 && H >= 610 * sc + max(8, 10 * sc);
 
 // ── Is Swing reading the ring? Its consumer counter moves every live block. ─
 _pb_chb = gmem[_pb_base + PATCH_OFF_CONS_HB];
@@ -269,79 +284,120 @@ function pb_lane(x, y, w, h, i) local(lv, fh, r, g, b) (
   lv = _pb_gpk[i];
   // dB-ish taper: 0.001 -> bottom, 1.0 -> top
   fh = lv <= 0.001 ? 0 : max(0, min(1, 1 + log10(lv) / 3));
-  gfx_set(0.09, 0.10, 0.12, 1);
+  // The track carries an edge so a silent lane still reads as a LANE -- sixteen
+  // unlit meters on a dark plate are otherwise invisible, and silent is the
+  // normal resting state here.
+  gfx_set(0.19, 0.20, 0.23, 1);
   gfx_rect(x, y, w, h);
+  gfx_set(0.09, 0.10, 0.12, 1);
+  gfx_rect(x + 1, y + 1, w - 2, h - 2);
   fh > 0 ? (
     lv >= 0.99 ? ( r = 0.93; g = 0.35; b = 0.28; ) :
     lv >= 0.5  ? ( r = 0.93; g = 0.68; b = 0.22; ) :
                  ( r = 0.35; g = 0.80; b = 0.84; );
     gfx_set(r, g, b, 0.95);
-    gfx_rect(x, y + h - fh * h, w, fh * h);
+    gfx_rect(x + 1, y + 1 + (h - 2) * (1 - fh), w - 2, (h - 2) * fh);
   );
 );
 
 gfx_set(0.13, 0.14, 0.16, 1);
 gfx_rect(0, 0, W, H);
 
-micro ? (
-  // ── EMBED: a 4x4 grid of lanes, no text ──
-  _pb_gap = 2 * ret;
-  _pb_cw = (W - _pb_gap * 5) / 4;
-  _pb_chh = (H - _pb_gap * 5) / 4;
-  _pbg_i = 0;
-  loop(16,
-    pb_lane(_pb_gap + (_pbg_i % 4) * (_pb_cw + _pb_gap), _pb_gap + ((_pbg_i / 4) | 0) * (_pb_chh + _pb_gap), _pb_cw, _pb_chh, _pbg_i);
-    _pbg_i += 1;
-  );
-  // lamp: a 3 px dot, teal when Swing reads, amber when not
-  _pb_listening ? gfx_set(0.35, 0.80, 0.84, 1) : gfx_set(0.85, 0.55, 0.15, 1);
-  gfx_circle(W - 5 * ret, 5 * ret, 2 * ret, 1, 1);
-) : (
-  // ── FLOATING ──
-  gfx_setfont(1, "Arial", max(10, floor(14 * sc)), 'b');
+_pb_full ? (
+
+  gfx_setfont(1, "Arial", max(9, floor(15 * sc)), 'b');
   gfx_set(0.90, 0.91, 0.94, 1);
-  gfx_x = 14 * sc; gfx_y = 10 * sc; gfx_drawstr("EON PATCHBAY");
-  gfx_setfont(1, "Arial", max(8, floor(10 * sc)), 0);
-  gfx_set(0.52, 0.56, 0.62, 1);
-  gfx_x = 132 * sc; gfx_y = 13 * sc; gfx_drawstr("the return half of Wired");
-
-  // lamp + status, right
+  gfx_x = floor(14 * sc); gfx_y = floor(14 * sc); gfx_drawstr("EON PATCHBAY");
   _pb_listening ? gfx_set(0.35, 0.80, 0.84, 1) : gfx_set(0.85, 0.55, 0.15, 1);
-  gfx_circle(W - 150 * sc, 16 * sc, 4 * sc, 1, 1);
-  gfx_set(0.72, 0.75, 0.80, 1);
-  gfx_x = W - 140 * sc; gfx_y = 10 * sc;
-  gfx_drawstr(_pb_listening ? "Swing is reading the ring" : "Swing not reading — Wired off?");
+  gfx_circle(floor(19 * sc), floor(42 * sc), max(3, 4 * sc), 1, 1);
+  gfx_setfont(2, "Arial", max(8, floor(11 * sc)));
+  gfx_set(0.62, 0.65, 0.70, 1);
+  gfx_x = floor(30 * sc); gfx_y = floor(35 * sc);
+  gfx_drawstr(_pb_listening ? "Swing is reading the ring" : "not reading -- Wired off?");
+  gfx_set(1, 1, 1, 0.06);
+  gfx_rect(floor(12 * sc), floor(58 * sc), W - floor(24 * sc), 1);
 
-  // lanes: 2 rows of 8
-  _pb_lx = 14 * sc; _pb_ly = 44 * sc;
-  _pb_lw = (W - 28 * sc) / 8; _pb_lh = 92 * sc;
-  gfx_setfont(1, "Arial", max(8, floor(9 * sc)), 'b');
+  // 4x4, laid out like Swing's pads: lane 6 sits where pad 6 is.
+  _pb_gx = floor(16 * sc); _pb_gy = floor(78 * sc);
+  _pb_cw = (W - floor(32 * sc)) / 4;
+  _pb_rh = floor(124 * sc);
+  _pb_lh = _pb_rh - floor(20 * sc);
+  gfx_setfont(3, "Arial", max(8, floor(10 * sc)), 'b');
   _pbg_i = 0;
   loop(16,
-    _pb_x = _pb_lx + (_pbg_i % 8) * _pb_lw;
-    _pb_y = _pb_ly + ((_pbg_i / 8) | 0) * (_pb_lh + 22 * sc);
-    pb_lane(_pb_x + 3 * sc, _pb_y, _pb_lw - 6 * sc, _pb_lh, _pbg_i);
+    _pb_x = _pb_gx + (_pbg_i % 4) * _pb_cw;
+    _pb_y = _pb_gy + ((_pbg_i / 4) | 0) * _pb_rh;
+    pb_lane(_pb_x + floor(5 * sc), _pb_y, _pb_cw - floor(10 * sc), _pb_lh, _pbg_i);
     gfx_set(0.62, 0.66, 0.72, 0.9);
     sprintf(#_pb_s, "%d", _pbg_i + 1);
     gfx_measurestr(#_pb_s, tw, th);
-    gfx_x = _pb_x + (_pb_lw - tw) / 2; gfx_y = _pb_y + _pb_lh + 4 * sc;
+    gfx_x = _pb_x + (_pb_cw - tw) / 2; gfx_y = _pb_y + _pb_lh + floor(4 * sc);
     gfx_drawstr(#_pb_s);
     _pbg_i += 1;
   );
 
-  // footer
   gfx_set(1, 1, 1, 0.05);
-  gfx_rect(0, H - 40 * sc, W, 1);
-  gfx_setfont(1, "Arial", max(8, floor(10 * sc)), 0);
+  gfx_rect(0, H - floor(52 * sc), W, 1);
+  gfx_setfont(2, "Arial", max(8, floor(10 * sc)));
   gfx_set(0.72, 0.75, 0.80, 0.95);
-  gfx_x = 14 * sc; gfx_y = H - 33 * sc;
-  sprintf(#_pb_s, "Returning %d channels (16 stereo pads) to Swing, slot %d. Out 1 = 3/4 … Out 16 = 33/34.", PATCH_CHANS, _pb_slot);
+  gfx_x = floor(14 * sc); gfx_y = H - floor(44 * sc);
+  sprintf(#_pb_s, "%d channels back to Swing, slot %d.", PATCH_CHANS, _pb_slot);
   gfx_drawstr(#_pb_s);
+  gfx_set(0.52, 0.56, 0.62, 0.9);
+  gfx_x = floor(14 * sc); gfx_y = H - floor(31 * sc);
+  gfx_drawstr("Out 1 = 3/4 ... Out 16 = 33/34.");
   gfx_set(0.42, 0.46, 0.53, 0.9);
-  gfx_x = 14 * sc; gfx_y = H - 18 * sc;
-  gfx_drawstr("Keep this last in the chain. Pad inserts go above it — the console's INS strips put them there.");
-  gfx_setfont(4, "Arial", max(8, floor(9 * sc)), 'b');
+  gfx_x = floor(14 * sc); gfx_y = H - floor(18 * sc);
+  gfx_drawstr("Keep this last; pad inserts go above it.");
+  gfx_setfont(4, "Arial", max(8, floor(10 * sc)), 'b');
   gfx_set(0.52, 0.56, 0.62, 0.6);
-  gfx_x = W - 34 * sc; gfx_y = H - 18 * sc;
+  gfx_x = W - floor(34 * sc); gfx_y = H - floor(18 * sc);
   gfx_drawstr("EON");
+
+) : (
+
+  // ── Compact: the same 4x4, with the lamp SAID as well as lit. ──
+  // A colour alone makes you remember which one means what; the word does not.
+  // "Swing is reading the ring" cannot fit an 82 px strip, so it is the short
+  // form, sized to the strip: measure it, and if it overhangs, shrink the font
+  // by exactly the overhang and measure again. One retry always lands it.
+  // ⛔⛔ NOT _pb_fs -- that is @block's RESOLVED REGISTRY SLOT (line 178), and
+  // @gfx runs on the other thread. At an 82 px strip this expression is exactly
+  // 12, so a write landing between the registry scan and pb_aim() aimed this
+  // Patchbay's ring at slot 12: audio redirected into another instance's ring.
+  // ⚠️⚠️ TYPE IS SIZED FROM THE SMALLER OF WHAT THE WIDTH AND THE HEIGHT CAN
+  // CARRY. W alone was right for an 82 px mixer strip, where width is the tight
+  // dimension -- but a window saved at the OLD size is WIDE AND SHORT, and
+  // W * 0.15 there is a 63 px font inside 170 px of height: readouts off the
+  // bottom, overlapping each other, and the meter's height arithmetic going
+  // NEGATIVE so it never filled at any amount of reduction. H * 0.30 is the
+  // binding constraint. Horizontal POSITIONS stay on W -- only sizes are
+  // capped.
+  _pb_u = min(W, H * 0.30);
+  _pb_txt_y = max(2, H * 0.012);
+  _pb_gfs = max(6, floor(_pb_u * 0.15));
+  gfx_setfont(2, "Arial", _pb_gfs, 'b');
+  sprintf(#_pb_s, "%s", _pb_listening ? "READING" : "NOT READING");
+  gfx_measurestr(#_pb_s, tw, th);
+  tw > W - 4 ? (
+    _pb_gfs = max(5, floor(_pb_gfs * (W - 4) / max(1, tw)));
+    gfx_setfont(2, "Arial", _pb_gfs, 'b');
+    gfx_measurestr(#_pb_s, tw, th);
+  );
+  _pb_listening ? gfx_set(0.35, 0.80, 0.84, 1) : gfx_set(0.85, 0.55, 0.15, 1);
+  gfx_circle(W * 0.5, _pb_txt_y + max(2, _pb_u * 0.04), max(2, _pb_u * 0.04), 1, 1);
+  gfx_x = (W - tw) * 0.5; gfx_y = _pb_txt_y + max(5, _pb_u * 0.10);
+  gfx_drawstr(#_pb_s);
+
+  _pb_gap = max(1, _pb_u * 0.03);
+  _pb_cw = (W - _pb_gap * 5) / 4;
+  _pb_top = gfx_y + th + max(2, H * 0.012);
+  _pb_chh = (H - _pb_top - _pb_gap * 5) / 4;
+  _pbg_i = 0;
+  loop(16,
+    pb_lane(_pb_gap + (_pbg_i % 4) * (_pb_cw + _pb_gap),
+            _pb_top + ((_pbg_i / 4) | 0) * (_pb_chh + _pb_gap),
+            _pb_cw, _pb_chh, _pbg_i);
+    _pbg_i += 1;
+  );
 );

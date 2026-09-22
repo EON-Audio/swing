@@ -2912,6 +2912,86 @@ function initialize48(pm)
   update_has_notes();
   refresh_tb=1;
 );
+// ── Per-surface press latches ────────────────────────────────────────
+// ⚠⚠ VERBATIM from Swing_ReaKit.jsfx (swing_srf_load / swing_srf_store, D-3,
+// Audit D 2026-09-14 + 2026-09-15). ONLY the two function names differ. Swing
+// carries the full rationale above its copy; read that, and keep these in step
+// -- `diff` them if either side is touched.
+//
+// Measured (REAPER 7.79): at most ONE window-or-embed surface of an instance
+// runs @gfx at a time, EXCEPT an instance embedded in BOTH the TCP and the MCP
+// with its window closed -- those two alternate pass for pass and BOTH report
+// gfx_ext_flags&1, which is why a `micro` split could never separate them.
+// Slot 0 is the window and the idle context (they never co-run, and the idle
+// canvas IS the window's); slots 1 and 2 are the two embeds, told apart by
+// canvas signature. An unhovered embed's pass is handed the OTHER embed's live
+// press -- still held, at its pointer, with its modifiers, and no edge either
+// way -- because ssl_knob_interact ends a drag on any pass that sees LMB 0 and
+// the knob mem is shared across surfaces. Bounded at half a second.
+//
+// CALLER CONTRACT: set is_embedded, mx/my, LMB and RMB from the real mouse,
+// then rk_srf_load(); take lmb_down/rmb_down off prev_LMB/prev_RMB and the
+// modifiers off _srf_cap (NOT mouse_cap); rk_srf_store() at the frame tail.
+function rk_srf_load()
+  local(_sg, _oth_plmb, _oth_prmb, _oth_mx, _oth_my, _oth_t, _oth_cap)
+(
+  // This pass's effective mouse_cap for the modifiers (the head reads CTRL,
+  // SHIFT and ALT from it): the real one, unless a foreign press is handed over.
+  _srf_cap = mouse_cap;
+  is_embedded ? (
+    _sg = gfx_w * 65536 + gfx_h;
+    _srf = _sg == _srf_sig1 ? 1 : _sg == _srf_sig2 ? 2 : 0;
+    _srf == 0 ? (
+      _srf = _srf_last_emb == 1 ? 2 : 1;
+      _srf == 1 ? ( _srf_sig1 = _sg; _srf_plmb1 = 0; _srf_prmb1 = 0; _srf_t1 = 0; _srf_cap1 = 0; )
+                : ( _srf_sig2 = _sg; _srf_plmb2 = 0; _srf_prmb2 = 0; _srf_t2 = 0; _srf_cap2 = 0; );
+    );
+    _srf_last_emb = _srf;
+    _srf_plmb0 = 0; _srf_prmb0 = 0;
+    _srf == 1 ? (
+      prev_LMB = _srf_plmb1; prev_RMB = _srf_prmb1;
+      _oth_plmb = _srf_plmb2; _oth_prmb = _srf_prmb2;
+      _oth_mx = _srf_mx2; _oth_my = _srf_my2; _oth_t = _srf_t2; _oth_cap = _srf_cap2;
+    ) : (
+      prev_LMB = _srf_plmb2; prev_RMB = _srf_prmb2;
+      _oth_plmb = _srf_plmb1; _oth_prmb = _srf_prmb1;
+      _oth_mx = _srf_mx1; _oth_my = _srf_my1; _oth_t = _srf_t1; _oth_cap = _srf_cap1;
+    );
+    (_oth_plmb || _oth_prmb) && time_precise() - _oth_t > 0.5 ? (
+      // The owner has not run for half a second: its press is over.
+      _srf == 1 ? ( _srf_plmb2 = 0; _srf_prmb2 = 0; ) : ( _srf_plmb1 = 0; _srf_prmb1 = 0; );
+      _oth_plmb = 0; _oth_prmb = 0;
+    );
+    _srf_foreign = (_oth_plmb || _oth_prmb) && !(mouse_cap & 3);
+    _srf_foreign ? (
+      LMB = _oth_plmb; RMB = _oth_prmb;
+      prev_LMB = _oth_plmb; prev_RMB = _oth_prmb;   // held, and no edge either way
+      mx = _oth_mx; my = _oth_my;
+      _srf_cap = _oth_cap;                          // ...with its modifiers
+    );
+  ) : (
+    _srf = 0; _srf_foreign = 0;
+    prev_LMB = _srf_plmb0 || _srf_plmb1 || _srf_plmb2;
+    prev_RMB = _srf_prmb0 || _srf_prmb1 || _srf_prmb2;
+    _srf_plmb1 = 0; _srf_prmb1 = 0; _srf_plmb2 = 0; _srf_prmb2 = 0;
+  );
+);
+
+function rk_srf_store()
+(
+  _srf == 1 ? (
+    _srf_plmb1 = mouse_cap & 1; _srf_prmb1 = mouse_cap & 2;
+    _srf_foreign ? 0 : ( _srf_mx1 = mouse_x; _srf_my1 = mouse_y; _srf_t1 = time_precise(); _srf_cap1 = mouse_cap; );
+  ) : _srf == 2 ? (
+    _srf_plmb2 = mouse_cap & 1; _srf_prmb2 = mouse_cap & 2;
+    _srf_foreign ? 0 : ( _srf_mx2 = mouse_x; _srf_my2 = mouse_y; _srf_t2 = time_precise(); _srf_cap2 = mouse_cap; );
+  ) : (
+    _srf_plmb0 = mouse_cap & 1; _srf_prmb0 = mouse_cap & 2;
+  );
+  prev_LMB = mouse_cap & 1;
+  prev_RMB = mouse_cap & 2;
+);
+
 @slider
 
 new_p=slider1|0;
@@ -4346,13 +4426,36 @@ _gfx_release = ((_uip_prev & 1) && !(mouse_cap & 1)) ? 1 : 0;
 // knobs would silently never see the wheel.
 mx = mouse_x; my = mouse_y;
 LMB = mouse_cap & 1;
-lmb_down = LMB && !ss_prev_lmb;
-ss_prev_lmb = LMB;
-CTRL = mouse_cap & 4;            // the lib's FINE-drag modifier (0.1x), not SHIFT
+RMB = mouse_cap & 2;
+// ⭐⭐ PER-SURFACE PRESS LATCHES -- rk_srf_load() in @init owns them.
+// Scope, checked before wiring: LMB, lmb_down and mx/my exist in THIS file only
+// to feed the knob library -- nothing else reads them (the grid, toolbar and
+// embed branch all run off raw mouse_x / mouse_y / mouse_cap, 578 sites). So the
+// handover lands exactly on the lane VOL/PAN knobs, which are the ones that share
+// knob mem across surfaces, and no other handler's behaviour changes.
+is_embedded = gfx_ext_flags & 1;
+rk_srf_load();
+lmb_down = LMB && !prev_LMB;
+rmb_down = RMB && !prev_RMB;
+CTRL  = _srf_cap & 4;            // the lib's FINE-drag modifier (0.25x)
+SHIFT = _srf_cap & 8;            // ...and its FINER one (0.1x). Both are read by
+                                 // ssl_knob_interact, which reads them as GLOBALS the
+                                 // caller supplies -- an unset SHIFT is 0 in EEL2, so
+                                 // leaving it out silently took the coarse branch and
+                                 // a Shift-drag did nothing. Delta audit 2026-09-20.
 dt = min(time_precise() - ss_last_t, 0.05);   // capped: a stalled GUI must not
 ss_last_t = time_precise();                   // jump hover_t a whole second
 hv_speed = 11;                                // house hover speed (Drum Strip parity)
 frame_wheel = mouse_wheel / 120;
+// Embedded wheel events arrive with a STALE mouse position, so every hover test
+// on the wheel frame misses and the lane knobs never see the scroll. Remember the
+// cursor on normal frames, reuse it on wheel frames -- Drum Strip's user-verified
+// fix (EON_Drum_Strip.jsfx:1039), which the port of the block above left behind.
+// Only mx/my are remapped: the embed grid does its own hit-testing off mouse_x /
+// mouse_y / ss_mx, so nothing below this line changes behaviour.
+(gfx_ext_flags & 1) ? (
+  frame_wheel == 0 ? ( ss_hmx = mx; ss_hmy = my; ) : ( mx = ss_hmx; my = ss_hmy; );
+);
 
 // Lane-knob appearance, resolved to match the PAIRED Swing exactly. Style 0 means
 // "follow the theme", same as Swing, so sk_kp is only the fallback -- if the user
@@ -11484,3 +11587,4 @@ atomic_set(eon_gfx_hold_t, (mouse_cap & 1) ? time_precise() : 0);
 // forces a repaint every frame, the knob re-applied the same notch each time, and
 // the pad's gain/pan ramped to the rail and pinned there. EON_Drum_Strip.jsfx:1739.
 mouse_wheel = 0;
+rk_srf_store();

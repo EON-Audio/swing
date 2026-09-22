@@ -635,7 +635,7 @@ local function frame()
     -- theme's built-in knob). The bridge picks it up and republishes GS_THEME_KNOB_P
     -- live, so the themed knobs (Drum Strip / FX) update at once.
     local KNOB_OPTS = { {0,"Default"}, {1,"SSL"}, {2,"Vari-Mu"}, {3,"API"}, {4,"Witti"}, {5,"Neve"},
-                        {6,"Joanny"}, {7,"MPC"}, {8,"Jog"}, {10,"Spice"}, {11,"Encoder"}, {12,"Pultec"},
+                        {6,"Joanny"}, {7,"MPC"}, {8,"Jog"}, {9,"Rainbow"}, {10,"Spice"}, {11,"Encoder"}, {12,"Pultec"},
                         {13,"Ableton"}, {14,"FL"}, {15,"Pro Tools"}, {16,"FabFilter"}, {17,"Serum"}, {18,"Roland"},
                         {19,"Pultec Cream"}, {20,"Neve Alt"} }
     local _kov  = reaper.GetExtState("Swing", "eon_knob_" .. settings.theme)

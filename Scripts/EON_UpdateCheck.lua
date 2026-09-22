@@ -9,7 +9,7 @@
 --   1711  GS_SWING_ALIVE       counter incremented every @block (0 = no Swing)
 --   1712  GS_UPDATE_REQUEST    0=none, 1=check, 2=open URL
 --   1713  GS_UPDATE_STATE      0=idle, 1=checking, 2=up-to-date, 3=available
---   1714–1718  GS_LATEST_VER   5-char version string (e.g. "2.1.1")
+--   1714–1718  free -- a 5-char version band lived here until 2026-09-20
 
 ---------------------------------------------------------------------------
 -- CONFIG
@@ -43,7 +43,7 @@ local UPDATE_URL        = "https://api.github.com/repos/EON-Audio/swing/releases
 -- never fired only because no GitHub release exists yet. deploy.sh now refuses
 -- to publish when this does not match the version being released, so the drift
 -- cannot come back silently.
-local CURRENT_VERSION   = "3.0.16"
+local CURRENT_VERSION   = "3.0.17"
 local POLL_INTERVAL     = 5.0        -- seconds between heartbeat polls
 local HEARTBEAT_TIMEOUT = 2.0        -- seconds of stale counter = Swing gone
 
@@ -51,7 +51,6 @@ local HEARTBEAT_TIMEOUT = 2.0        -- seconds of stale counter = Swing gone
 local GS_SWING_ALIVE       = 1711
 local GS_UPDATE_REQUEST    = 1712
 local GS_UPDATE_STATE      = 1713
-local GS_LATEST_VER_BASE   = 1714  -- 5 slots: 1714–1718
 
 ---------------------------------------------------------------------------
 -- SELF-REGISTER AS STARTUP ACTION (one-time).
@@ -266,24 +265,14 @@ local function gmem_write(slot, val)
   reaper.gmem_write(slot, val)
 end
 
--- ⚠ FIVE CELLS, AND THEY CANNOT GROW: 1719 is GS_MEDIA_EXPLORER_OPEN and 1720
--- starts the 512-cell pad-name block, so the band is boxed in on both sides and
--- widening it means relocating it. Nothing reads it today -- the JSFX declares
--- the constant and never touches it; the face shows an UPDATE button off
--- GS_UPDATE_STATE and never draws a number -- so this is write-only.
--- A version that does not fit is written as EMPTY rather than truncated: "3.0.10"
--- cut to five characters reads "3.0.1", which is not a shorter version, it is a
--- DIFFERENT and older one, and the first thing to ever draw this band would show
--- it as fact. Empty means "unknown", which any future reader can handle honestly.
--- ⛔ Relocate the band (gmem auditor) before drawing it anywhere.
-local function write_version_string(str)
-  local fits = #str <= 5
-  for i = 0, 4 do
-    local ch = (fits and i < #str) and string.byte(str, i + 1) or 0
-    gmem_write(GS_LATEST_VER_BASE + i, ch)
-  end
-  return fits
-end
+-- REMOVED 2026-09-20: the five-cell version band at 1714-1718 and the writer
+-- that filled it. Five cells hold five characters; every version since 3.0.10
+-- is six, so it wrote itself EMPTY on every release for six releases, and
+-- nothing ever read it -- the face lights its UPDATE button off GS_UPDATE_STATE
+-- and never draws a number. It could not simply grow either: 1719 is
+-- GS_MEDIA_EXPLORER_OPEN and 1720 starts the 512-cell pad-name block, so it was
+-- boxed in on both sides. If the face should ever show the version itself, size
+-- a band for the whole string and put it somewhere it can grow.
 
 -- Hand the URL to the OS opener WITHOUT building a shell command line.
 -- CF_ShellExecute (SWS -- a required dependency) takes the string verbatim,
@@ -394,11 +383,6 @@ local function finish_update_check(retval)
     end
 
     if ver then
-      -- Empty rather than truncated when it does not fit (see the function).
-      if not write_version_string(ver) then
-        update_dbg("[EON] Update check: '" .. ver ..
-          "' does not fit the 5-char version band -- left empty.\n")
-      end
       -- Compare with current version. Numeric semver compare so we don't
       -- false-fire "available" when the user is AHEAD of GitHub (e.g. a
       -- dev build with a higher version than the latest release).

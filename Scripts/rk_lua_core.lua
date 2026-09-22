@@ -536,7 +536,9 @@ core.GMEM = {
   GS_SWING_ALIVE       = 1711,   -- monotonic heartbeat; nonzero + changing = alive
   GS_UPDATE_REQUEST    = 1712,
   GS_UPDATE_STATE      = 1713,
-  GS_LATEST_VER_BASE   = 1714,
+  -- 1714..1718 FREE since 2026-09-20. A 5-char version band lived there and
+  -- could not hold "3.0.10", so it only ever wrote empty. Boxed in by 1719 and
+  -- the 1720 pad-name block: anything that must grow belongs elsewhere.
   GS_MEDIA_EXPLORER_OPEN = 1719, -- bridge → JSFX: 1 if REAPER Media Explorer is open
   -- Audio-only reload flag — bridge → JSFX. Set to 1 for a project-open
   -- sidecar auto-load or an Undo/chunk-restore audio-repair reload (both run
@@ -781,6 +783,52 @@ core.GMEM = {
   -- them unprocessed until the heartbeat went stale. Written BEFORE the mask so
   -- Swing never pairs a new mask with an old dialect.
   GS_STRIP_OFF_MASK_VER = 603,
+
+  -- Bus-rack status, Lua → Swing. The pad region ends at 519; 600..603 and
+  -- 610..623 are taken; 624+ is free.
+  -- ⚠ RACK_HB must NOT be folded into GS_STRIP_OFF_LUA_HB. That one is only
+  -- written when the instance has live per-pad Drum Strips, so a Multi-Out
+  -- build with a full rack and no strips — exactly the case this serves —
+  -- would read dead.
+  -- RACK_ENG lets Swing tell "no rack at all" from "a rack that cannot follow
+  -- me". Both mean its own compressor is wrong to run, but only one of them
+  -- has something to report on the COMP page.
+  GS_STRIP_OFF_RACK_HB  = 640,  -- bumped every rack scan (~1 Hz)
+  GS_STRIP_OFF_RACK_ENG = 641,  -- 0 none · 1 EON Weld · 2 EON Anvil · 3 other
+  -- EON Tone link: the EQ + drive record, same shape as the comp link band
+  -- (heartbeat, echo run, command mailbox with the seq bumped LAST). One Tone
+  -- per Swing, so this is keyed by the registry slot alone and needs no role
+  -- offset like GS_BC_LINK does. MUST match EON_Tone.jsfx TNL_* and
+  -- Swing_ReaKit.jsfx TNL_*.
+  -- The thirteen, in Tone's own slider order: hpf, lpf, lo, lo freq, lo bell,
+  -- mid, mid freq, hi, hi freq, hi bell, drive, drive type, eq bypass.
+  GS_STRIP_OFF_TNL_HB    = 642,
+  GS_STRIP_OFF_TNL_ECHO  = 643,  -- 643..655, params 1..13
+  GS_STRIP_OFF_TNL_ECHO_Q = 659, -- 659..663, params 14..18: master-EQ Q (Swing ser_ver 75)
+  GS_STRIP_OFF_TNL_SEQ   = 656,  -- bumped LAST, after PARAM and VAL
+  GS_STRIP_OFF_TNL_PARAM = 657,  -- 1..18 since ser_ver 75
+  GS_STRIP_OFF_TNL_VAL   = 658,
+  -- 659..671 still free.
+
+  -- ─── Comp link band (a Weld and the deck that drives it) ─────────────────
+  -- MUST match EON_Weld.jsfx GS_BC_LINK_*. Row = BASE + row * STRIDE, 64 rows,
+  -- declared whole in .refs/swing_gmem_bridge_protocol.md (26170000-26171535).
+  -- ⚠️⚠️ THE ROW CARRIES THE ROLE, because a Swing can own TWO Welds — the one
+  -- on its smash return and the serial glue on its Audio folder — and the row
+  -- is keyed by slot alone, so both would land on one row and fight over the
+  -- command mailbox. Swing's registry hands out 16 slots and Weld accepts 64,
+  -- so the spare range separates them:
+  --   rows  0..15  smash return (Link Slot = slot)      — EON_Swing_Strip_Sync
+  --   rows 32..47  audio bus    (Link Slot = slot + 32) — the Multi-Out upkeep
+  -- ENGINE and OWNER are stamped by Lua and never touched by Weld, so they
+  -- persist as the claim a later pass checks a second arrival against.
+  GS_BC_LINK_BASE       = 26170000,
+  GS_BC_LINK_STRIDE     = 24,
+  GS_BC_LINK_ROW_BUS    = 32,  -- audio-bus row = registry slot + this
+  GS_BC_LINK_OFF_HB     = 0,   -- Weld→: bumped per @block; liveness
+  GS_BC_LINK_OFF_GR     = 9,   -- Weld→: gain reduction, dB (negative)
+  GS_BC_LINK_OFF_ENGINE = 11,  -- Lua→: 1 = Weld, 2 = Anvil
+  GS_BC_LINK_OFF_OWNER  = 12,  -- Lua→: 1 = smash return, 2 = audio bus
 
   -- ─── Unified theme bus (one selector → all four EON tools) ───────────────
   -- The Lua theme publisher resolves a palette (EON/Dark/Light/REAPER) and
@@ -1623,6 +1671,7 @@ core.THEME_FX_SEGMENTS = {
   "ReaKit1175", "ReaKit3BEQ", "ReaKit4BEQ", "ReaKitDeEsser", "ReaKitDelay",
   "ReaKitExpressBus", "ReaKitGate", "ReaKitLimiter", "ReaKitReverb",
   "ReaKitSaturation", "ReaKitStereoWidth", "FrostReaKitNetwork",
+  "ReaKitNoteRepeat",   -- EON: Note Repeat (MIDI), 2026-09-22
   -- Added with the appearance cluster (THEME/KNOB chips).
   -- (Prism Comp was briefly listed; it is a character plugin and no longer
   -- imports rk_theme, so it is off the list.)

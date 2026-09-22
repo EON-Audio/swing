@@ -14,14 +14,14 @@ options:gfx_hz=30 gfx_idle no_meter gmem=Swing_Media_Transfer
 //
 // No audio processing: samples pass straight through (no @sample).
 
-slider1:mc1=0<0,1,0.001>Macro 1
-slider2:mc2=0<0,1,0.001>Macro 2
-slider3:mc3=0<0,1,0.001>Macro 3
-slider4:mc4=0<0,1,0.001>Macro 4
-slider5:mc5=0<0,1,0.001>Macro 5
-slider6:mc6=0<0,1,0.001>Macro 6
-slider7:mc7=0<0,1,0.001>Macro 7
-slider8:mc8=0<0,1,0.001>Macro 8
+slider1:mc1=0<0,1,0.001>-Macro 1
+slider2:mc2=0<0,1,0.001>-Macro 2
+slider3:mc3=0<0,1,0.001>-Macro 3
+slider4:mc4=0<0,1,0.001>-Macro 4
+slider5:mc5=0<0,1,0.001>-Macro 5
+slider6:mc6=0<0,1,0.001>-Macro 6
+slider7:mc7=0<0,1,0.001>-Macro 7
+slider8:mc8=0<0,1,0.001>-Macro 8
 slider9:mc_link_inst=0<0,99999999,1>-Link Instance (internal; the Swing instance id to follow, bridge-set; 0 = free knobs)
 
 in_pin:left input
@@ -49,6 +49,75 @@ _mc_hb_prev = -1;
 _mc_stall   = MC_STALL_MAX;
 mc_linked   = 0;
 
+
+// ── Per-surface press latches ────────────────────────────────────
+// ⚠⚠ VERBATIM from Swing_ReaKit.jsfx (swing_srf_load / swing_srf_store). ONLY
+// the two names differ -- `diff` them if either side is touched. Needed here now
+// that the bars take a drag: TCP and MCP embeds alternate pass for pass and both
+// report gfx_ext_flags&1, so a shared prev-LMB re-fires the press edge.
+// CALLER CONTRACT: set is_embedded, mx/my, LMB, RMB; rk_srf_load(); take lmb_down
+// off prev_LMB and the modifiers off _srf_cap; rk_srf_store() at the frame tail.
+function rk_srf_load()
+  local(_sg, _oth_plmb, _oth_prmb, _oth_mx, _oth_my, _oth_t, _oth_cap)
+(
+  // This pass's effective mouse_cap for the modifiers (the head reads CTRL,
+  // SHIFT and ALT from it): the real one, unless a foreign press is handed over.
+  _srf_cap = mouse_cap;
+  is_embedded ? (
+    _sg = gfx_w * 65536 + gfx_h;
+    _srf = _sg == _srf_sig1 ? 1 : _sg == _srf_sig2 ? 2 : 0;
+    _srf == 0 ? (
+      _srf = _srf_last_emb == 1 ? 2 : 1;
+      _srf == 1 ? ( _srf_sig1 = _sg; _srf_plmb1 = 0; _srf_prmb1 = 0; _srf_t1 = 0; _srf_cap1 = 0; )
+                : ( _srf_sig2 = _sg; _srf_plmb2 = 0; _srf_prmb2 = 0; _srf_t2 = 0; _srf_cap2 = 0; );
+    );
+    _srf_last_emb = _srf;
+    _srf_plmb0 = 0; _srf_prmb0 = 0;
+    _srf == 1 ? (
+      prev_LMB = _srf_plmb1; prev_RMB = _srf_prmb1;
+      _oth_plmb = _srf_plmb2; _oth_prmb = _srf_prmb2;
+      _oth_mx = _srf_mx2; _oth_my = _srf_my2; _oth_t = _srf_t2; _oth_cap = _srf_cap2;
+    ) : (
+      prev_LMB = _srf_plmb2; prev_RMB = _srf_prmb2;
+      _oth_plmb = _srf_plmb1; _oth_prmb = _srf_prmb1;
+      _oth_mx = _srf_mx1; _oth_my = _srf_my1; _oth_t = _srf_t1; _oth_cap = _srf_cap1;
+    );
+    (_oth_plmb || _oth_prmb) && time_precise() - _oth_t > 0.5 ? (
+      // The owner has not run for half a second: its press is over.
+      _srf == 1 ? ( _srf_plmb2 = 0; _srf_prmb2 = 0; ) : ( _srf_plmb1 = 0; _srf_prmb1 = 0; );
+      _oth_plmb = 0; _oth_prmb = 0;
+    );
+    _srf_foreign = (_oth_plmb || _oth_prmb) && !(mouse_cap & 3);
+    _srf_foreign ? (
+      LMB = _oth_plmb; RMB = _oth_prmb;
+      prev_LMB = _oth_plmb; prev_RMB = _oth_prmb;   // held, and no edge either way
+      mx = _oth_mx; my = _oth_my;
+      _srf_cap = _oth_cap;                          // ...with its modifiers
+    );
+  ) : (
+    _srf = 0; _srf_foreign = 0;
+    prev_LMB = _srf_plmb0 || _srf_plmb1 || _srf_plmb2;
+    prev_RMB = _srf_prmb0 || _srf_prmb1 || _srf_prmb2;
+    _srf_plmb1 = 0; _srf_prmb1 = 0; _srf_plmb2 = 0; _srf_prmb2 = 0;
+  );
+);
+
+function rk_srf_store()
+(
+  _srf == 1 ? (
+    _srf_plmb1 = mouse_cap & 1; _srf_prmb1 = mouse_cap & 2;
+    _srf_foreign ? 0 : ( _srf_mx1 = mouse_x; _srf_my1 = mouse_y; _srf_t1 = time_precise(); _srf_cap1 = mouse_cap; );
+  ) : _srf == 2 ? (
+    _srf_plmb2 = mouse_cap & 1; _srf_prmb2 = mouse_cap & 2;
+    _srf_foreign ? 0 : ( _srf_mx2 = mouse_x; _srf_my2 = mouse_y; _srf_t2 = time_precise(); _srf_cap2 = mouse_cap; );
+  ) : (
+    _srf_plmb0 = mouse_cap & 1; _srf_prmb0 = mouse_cap & 2;
+  );
+  prev_LMB = mouse_cap & 1;
+  prev_RMB = mouse_cap & 2;
+);
+
+mc_drag = -1; mc_dc_i = -1; mc_dc_t = 0;   // bar drag state
 @block
 
 mc_linked = 0;
@@ -81,72 +150,192 @@ mc_link_inst > 0 ? (
   );
 );
 
-@gfx 300 150
+@gfx 300 700
+// ⚠️ @gfx sets the EMBED ASPECT (house rule: portrait, so the strip pairs with
+// Drum Strip / Output / Weld in the mixer). The old 300x150 was 2:1 landscape --
+// the worst ratio in the suite -- which in an 82 px mixer strip is 41 px tall:
+// eight bars 8 px wide and 41 px high, unreadable. 300x700 is Drum Strip's
+// ratio, and the bank turned on its side: eight bars stacked, not eight bars
+// side by side. A tall strip is the shape a macro bank actually wants.
 
 micro = gfx_ext_flags & 1;
 ret = max(1, gfx_ext_retina);
 W = gfx_w; H = gfx_h;
-sc = micro ? ret : max(0.6, min(W / 300, H / 150));
-// No control here takes a click: linked knobs are Swing's, free knobs are
-// the host's sliders. The embed always passes the mouse through.
+mx = mouse_x; my = mouse_y;
+LMB = mouse_cap & 1;
+RMB = mouse_cap & 2;
+// ⭐⭐ PER-SURFACE PRESS LATCHES -- rk_srf_load() in @init owns them. Needed now
+// that the bars take a drag: a shared latch re-fires the press edge every pass
+// when the same instance is in both the TCP and the MCP.
+is_embedded = micro;
+rk_srf_load();
+lmb_down = LMB && !prev_LMB;
+CTRL = _srf_cap & 4;
+frame_wheel = mouse_wheel / 120;
+// Embedded wheel events arrive with a STALE mouse position; remember the cursor
+// on normal frames, reuse it on wheel frames.
+micro ? (
+  frame_wheel == 0 ? ( _mc_hmx = mx; _mc_hmy = my; ) : ( mx = _mc_hmx; my = _mc_hmy; );
+);
+!LMB ? mc_drag = -1;          // a release anywhere ends the drag
+_mc_hov = 0;                  // set by any bar the pointer is over, for 0x200
+
+// Clear the embed click-through bit unconditionally (house pattern:
+// gfx_ext_flags is ONE variable shared by every @gfx pass of the instance), and
+// re-arm it at the END only over dead space -- over a bar the drag is handled
+// here instead of the click falling through to the track.
 gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
-micro ? gfx_ext_flags |= 0x200;
+
+// Two LAYOUTS, not one scaled: below ~150 px the labels and values cannot be
+// read at any scale, so the compact column drops to bars alone.
+// ⚠️ HEIGHT COUNTS TOO, not just width. The full layout is fixed multiples of
+// sc and sc FLOORS at 0.5, so a short window -- a project saved at the old
+// 300x150 -- put M5..M8 below the canvas at y=174..276, unreachable, and the
+// host's own sliders are hidden now so there is no other way to them. The
+// compact column divides H into eight rows and so fits at ANY height: a window
+// too short for the full layout goes there instead.
+// 606 = 76 top + 7*68 rows + 20 last bar + 34 footer, all scaled by sc.
+sc = max(0.5, min(W / 300, H / 700));
+_mc_full = W >= 150 && H >= 606 * sc;
 
 gfx_set(0.13, 0.14, 0.16, 1);
 gfx_rect(0, 0, W, H);
 
 function mc_val(i) ( i == 0 ? mc1 : i == 1 ? mc2 : i == 2 ? mc3 : i == 3 ? mc4 : i == 4 ? mc5 : i == 5 ? mc6 : i == 6 ? mc7 : mc8; );
 
-function mc_bar(x, y, w, h, i) local(v) (
-  v = mc_val(i);
-  gfx_set(0.09, 0.10, 0.12, 1);
-  gfx_rect(x, y, w, h);
-  mc_linked ? gfx_set(0.35, 0.80, 0.84, 0.95) : gfx_set(0.62, 0.66, 0.72, 0.9);
-  gfx_rect(x, y + h - v * h, w, v * h);
+// Write one macro and tell the host. The MASK form of slider_automate, because
+// the index is computed: 2^i, never 1<<i -- EEL2 shifts are 32-bit with the
+// count masked mod 32 (wiki: shift_32bit).
+function mc_set(i, v) (
+  v = max(0, min(1, v));
+  i == 0 ? ( mc1 = v; ) : i == 1 ? ( mc2 = v; ) : i == 2 ? ( mc3 = v; ) :
+  i == 3 ? ( mc4 = v; ) : i == 4 ? ( mc5 = v; ) : i == 5 ? ( mc6 = v; ) :
+  i == 6 ? ( mc7 = v; ) : ( mc8 = v; );
+  slider_automate(2 ^ i);
 );
 
-micro ? (
-  _mc_gap = 2 * ret;
-  _mc_bw = (W - _mc_gap * 9) / 8;
-  _mc_i = 0;
-  loop(8,
-    mc_bar(_mc_gap + _mc_i * (_mc_bw + _mc_gap), _mc_gap, _mc_bw, H - 2 * _mc_gap, _mc_i);
-    _mc_i += 1;
+// One macro as a horizontal bar: track, then fill from the left.
+function mc_bar(x, y, w, h, i, hot) local(v) (
+  v = max(0, min(1, mc_val(i)));
+  // The track has to read as a SLOT even at zero: eight empty bars on a dark
+  // plate are invisible, which is what a fresh macro bank looks like.
+  hot ? gfx_set(0.34, 0.36, 0.40, 1) : gfx_set(0.19, 0.20, 0.23, 1);
+  gfx_rect(x, y, w, h);
+  gfx_set(0.09, 0.10, 0.12, 1);
+  gfx_rect(x + 1, y + 1, w - 2, h - 2);
+  v > 0 ? (
+    mc_linked ? gfx_set(0.35, 0.80, 0.84, 0.95) : gfx_set(0.62, 0.66, 0.72, 0.9);
+    gfx_rect(x + 1, y + 1, (w - 2) * v, h - 2);
   );
-) : (
-  gfx_setfont(1, "Arial", max(10, floor(14 * sc)), 'b');
-  gfx_set(0.90, 0.91, 0.94, 1);
-  gfx_x = 14 * sc; gfx_y = 10 * sc; gfx_drawstr("EON MACROS");
-  gfx_setfont(1, "Arial", max(8, floor(10 * sc)), 0);
-  gfx_set(0.52, 0.56, 0.62, 1);
-  gfx_x = 118 * sc; gfx_y = 13 * sc; gfx_drawstr("Swing's macros on this track, for parameter links");
-  mc_linked ? gfx_set(0.35, 0.80, 0.84, 1) : (mc_link_inst > 0 ? gfx_set(0.85, 0.55, 0.15, 1) : gfx_set(0.40, 0.42, 0.46, 1));
-  gfx_circle(W - 14 * sc, 16 * sc, 4 * sc, 1, 1);
+);
 
-  _mc_lx = 14 * sc; _mc_ly = 40 * sc;
-  _mc_lw = (W - 28 * sc) / 8; _mc_lh = 64 * sc;
-  gfx_setfont(1, "Arial", max(8, floor(9 * sc)), 'b');
+// Drag / wheel / double-click on one bar. Absolute: the value follows the
+// pointer along the groove, the way a fader does. Returns 1 while hovered, so
+// the caller can keep the click-through bit down over it.
+// LOCKED while linked -- those values are Swing's, and a drag here would fight
+// the next block's adopt.
+function mc_input(x, y, w, h, i) local(hov) (
+  hov = mx >= x && mx < x + w && my >= y && my < y + h;
+  (hov && !mc_linked) ? (
+    lmb_down ? (
+      (mc_dc_i == i && time_precise() - mc_dc_t < 0.3) ? (
+        mc_set(i, 0); mc_drag = -1; mc_dc_t = 0;      // double-click resets
+      ) : (
+        mc_dc_t = time_precise(); mc_dc_i = i; mc_drag = i;
+      );
+    );
+    // ⛔ Same foreign-pass rule as the drag below: this writes a macro and
+    // automates it, so it must not run on a pass that does not own the pointer.
+    (frame_wheel != 0 && !_srf_foreign) ? mc_set(i, mc_val(i) + frame_wheel * (CTRL ? 0.005 : 0.02));
+  );
+  // ⛔ NOT on a FOREIGN pass. The handover hands us the OWNER's pointer, but
+  // x/w here are THIS surface's geometry, and the two embeds are different
+  // widths -- applying one to the other writes a different value on every
+  // alternating pass, and slider_automate records each one. The foreign pass
+  // still keeps mc_drag alive (LMB is the owner's held press), which is all it
+  // is for; only the owner's pass may move the value.
+  (mc_drag == i && LMB && !mc_linked && !_srf_foreign) ? mc_set(i, (mx - x) / max(1, w));
+  hov;
+);
+
+_mc_full ? (
+
+  gfx_setfont(1, "Arial", max(9, floor(15 * sc)), 'b');
+  gfx_set(0.90, 0.91, 0.94, 1);
+  gfx_x = floor(14 * sc); gfx_y = floor(14 * sc); gfx_drawstr("EON MACROS");
+  mc_linked ? gfx_set(0.35, 0.80, 0.84, 1) : (mc_link_inst > 0 ? gfx_set(0.85, 0.55, 0.15, 1) : gfx_set(0.40, 0.42, 0.46, 1));
+  gfx_circle(floor(19 * sc), floor(42 * sc), max(3, 4 * sc), 1, 1);
+  gfx_setfont(2, "Arial", max(8, floor(11 * sc)));
+  gfx_set(0.62, 0.65, 0.70, 1);
+  gfx_x = floor(30 * sc); gfx_y = floor(35 * sc);
+  gfx_drawstr(mc_linked ? "following Swing -- locked" : (mc_link_inst > 0 ? "Swing not answering" : "free knobs -- drag them"));
+  gfx_set(1, 1, 1, 0.06);
+  gfx_rect(floor(12 * sc), floor(58 * sc), W - floor(24 * sc), 1);
+
+  // Eight rows: label, bar, value.
+  _mc_top = floor(76 * sc);
+  _mc_rh  = floor(68 * sc);
+  _mc_bh  = floor(20 * sc);
+  _mc_bx  = floor(52 * sc);
+  _mc_bw  = W - _mc_bx - floor(56 * sc);
   _mc_i = 0;
   loop(8,
-    _mc_x = _mc_lx + _mc_i * _mc_lw;
-    mc_bar(_mc_x + 4 * sc, _mc_ly, _mc_lw - 8 * sc, _mc_lh, _mc_i);
-    gfx_set(0.62, 0.66, 0.72, 0.9);
+    _mc_y = _mc_top + _mc_i * _mc_rh;
+    _mc_h = mc_input(_mc_bx, _mc_y, _mc_bw, _mc_bh, _mc_i);
+    _mc_hov = _mc_hov || _mc_h;
+    gfx_setfont(3, "Arial", max(8, floor(12 * sc)), 'b');
+    gfx_set(0.62, 0.66, 0.72, 0.95);
     sprintf(#_mc_s, "M%d", _mc_i + 1);
-    gfx_measurestr(#_mc_s, tw, th);
-    gfx_x = _mc_x + (_mc_lw - tw) / 2; gfx_y = _mc_ly + _mc_lh + 4 * sc;
+    gfx_x = floor(14 * sc); gfx_y = _mc_y + floor(3 * sc);
     gfx_drawstr(#_mc_s);
+    mc_bar(_mc_bx, _mc_y, _mc_bw, _mc_bh, _mc_i, _mc_h && !mc_linked);
+    gfx_setfont(2, "Arial", max(8, floor(12 * sc)));
+    gfx_set(0.78, 0.81, 0.86, 0.9);
     sprintf(#_mc_s, "%d", floor(mc_val(_mc_i) * 100 + 0.5));
     gfx_measurestr(#_mc_s, tw, th);
-    gfx_set(0.72, 0.75, 0.80, 0.8);
-    gfx_x = _mc_x + (_mc_lw - tw) / 2; gfx_y = _mc_ly + _mc_lh + 16 * sc;
+    gfx_x = W - floor(14 * sc) - tw; gfx_y = _mc_y + floor(3 * sc);
     gfx_drawstr(#_mc_s);
     _mc_i += 1;
   );
 
-  gfx_setfont(1, "Arial", max(8, floor(9 * sc)), 0);
+  gfx_set(1, 1, 1, 0.05);
+  gfx_rect(0, H - floor(34 * sc), W, 1);
+  gfx_setfont(2, "Arial", max(8, floor(10 * sc)));
   gfx_set(0.42, 0.46, 0.53, 0.9);
-  gfx_x = 14 * sc; gfx_y = H - 16 * sc;
-  gfx_drawstr(mc_linked ? "Following Swing. Link a plugin's parameter to one of these (Swing's macro editor: LEARN)."
-            : (mc_link_inst > 0 ? "Swing not answering -- is it loaded and running?"
-                                : "Not linked to a Swing: the sliders are free knobs."));
+  gfx_x = floor(12 * sc); gfx_y = H - floor(25 * sc);
+  gfx_drawstr(mc_linked ? "Following Swing. Link a parameter to one of these"
+            : (mc_link_inst > 0 ? "Swing not answering -- is it loaded?"
+                                : "Drag a bar. Double-click resets it."));
+  gfx_x = floor(12 * sc); gfx_y = H - floor(14 * sc);
+  mc_linked ? gfx_drawstr("(Swing's macro editor: LEARN).");
+  gfx_setfont(4, "Arial", max(8, floor(10 * sc)), 'b');
+  gfx_set(0.52, 0.56, 0.62, 0.6);
+  gfx_x = W - floor(34 * sc); gfx_y = H - floor(20 * sc);
+  gfx_drawstr("EON");
+
+) : (
+
+  // Compact column: the link dot, then eight stacked bars. No labels -- at this
+  // width they cannot be read, and the order M1..M8 top to bottom is the label.
+  // Still draggable: a mixer strip is exactly where a quick macro nudge happens.
+  mc_linked ? gfx_set(0.35, 0.80, 0.84, 1) : (mc_link_inst > 0 ? gfx_set(0.85, 0.55, 0.15, 1) : gfx_set(0.40, 0.42, 0.46, 1));
+  gfx_circle(W * 0.5, max(5, H * 0.03), max(2, W * 0.045), 1, 1);
+  _mc_top = H * 0.08;
+  _mc_gap = max(1, H * 0.008);
+  _mc_rh  = (H - _mc_top - H * 0.02 - _mc_gap * 7) / 8;
+  _mc_i = 0;
+  loop(8,
+    _mc_y = _mc_top + _mc_i * (_mc_rh + _mc_gap);
+    _mc_h = mc_input(W * 0.08, _mc_y, W * 0.84, _mc_rh, _mc_i);
+    _mc_hov = _mc_hov || _mc_h;
+    mc_bar(W * 0.08, _mc_y, W * 0.84, _mc_rh, _mc_i, _mc_h && !mc_linked);
+    _mc_i += 1;
+  );
 );
+
+// ── End of frame ───────────────────────────────────────────────────────
+// Re-arm click-through only over dead space: over a bar the drag is ours.
+// While LINKED nothing here is interactive, so the whole face passes through.
+micro && (mc_linked || !_mc_hov) ? gfx_ext_flags |= 0x200;
+rk_srf_store();
+mouse_wheel = 0;
