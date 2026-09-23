@@ -25,6 +25,7 @@ slider1:ou_vol=0<-48,12,0.1>-Volume (dB)
 slider2:ou_lim_on=1<0,1,1>-Limiter
 slider3:ou_lim_thr=0<-12,0,0.1>-Limiter Threshold (dB)
 slider4:ou_lim_rel=100<10,1000,1>-Limiter Release (ms)
+slider6:ou_name_bar=0<0,1,1>-Name bar (internal; the THEME menu's NAME BAR row; 0 = borderless embed, house rule 1; persists via FX chunk, no @serialize touch)
 slider5:ou_link_inst=0<0,99999999,1>-Link Instance (internal; the Swing instance id to follow, bridge-set at build; 0 = standalone)
 
 in_pin:left input
@@ -34,8 +35,28 @@ out_pin:right output
 
 import libs/knobs_kbsg.jsfx-inc
 import libs/rk_vu.jsfx-inc
+// THEME menu. ⚠ ORDER IS LOAD-BEARING (rk_thememenu_core.jsfx-inc:8-15): the
+// shim gives rk_swing_popup the two helpers it calls but does not define, and
+// the ROWS must be compiled before the core that calls them. EEL2 has no
+// function pointers and a forward reference kills the whole file silently.
+import libs/rk_theme.jsfx-inc
+import libs/rk_thememenu_shim.jsfx-inc
+import libs/rk_swing_popup.jsfx-inc
+import libs/rk_ou_thememenu.jsfx-inc
+import libs/rk_thememenu_core.jsfx-inc
 
 @init
+
+// Embed support -- 0x100 MUST be set in @init (REAPER 7.45+); 0x400 = no MCP
+// hover tooltip over the embed (7.79+; older ignores). Without 0x100 REAPER
+// frames the embed and draws its own "EON Output" name bar over the strip --
+// the only face of the set that had one, until this line.
+// 0x400 always; 0x100 follows the THEME menu's NAME BAR row (slider6), default
+// 0 = borderless. REAPER documents 0x100 as an @init decision, so it is applied
+// here from the restored value; the re-apply in the @gfx tail is what makes the
+// row take effect without a reload (measured both ways on 7.79 and 7.80).
+gfx_ext_flags |= 0x400;
+ou_name_bar ? ( gfx_ext_flags = (gfx_ext_flags | 0x100) - 0x100; ) : ( gfx_ext_flags |= 0x100; );
 
 // The instance registry and the master-link band. Canonical map:
 // .refs/swing_gmem_bridge_protocol.md and .refs/gmem_regions_supplement.tsv.
@@ -54,6 +75,7 @@ OU_STALL_MAX    = 8;   // blocks without a heartbeat before the link is dead
 freemem = 0;
 OU_KNOBS = 3;
 ou_kmem = freemem; freemem += OU_KNOBS * 16;
+freemem = swing_popup_init(freemem);   // the THEME menu's row lists (194 cells)
 
 // GR meter, fed the limiter's own envelope (linear, 1.0 = no reduction) --
 // the same wiring EON Weld uses for its compressor. rk_vu claims no memory.
@@ -268,6 +290,31 @@ micro ? (
   frame_wheel == 0 ? ( _ou_hmx = mx; _ou_hmy = my; ) : ( mx = _ou_hmx; my = _ou_hmy; );
 );
 
+// ── THEME menu plumbing ──────────────────────────────────────────────────
+// swing_popup_tick reads the RAW buttons (rk_swing_popup:634, :651), which is
+// how a list stays clickable while the gate below silences the face. Swing sets
+// these in its modal gate; this face has none, so it mirrors them itself.
+_raw_lmb_down = lmb_down; _raw_LMB = LMB; _raw_wheel = frame_wheel;
+// ⚠ MODAL GATE. Without it the click that PICKS a list item also reaches
+// whatever the list was covering — a knob, the LIM button (rk_swing_popup:134-142
+// documents this exact bug). LMB matters as much as the edge, because a knob
+// drag continues on the held button, not on the press.
+swing_popup_active ? ( lmb_down = 0; rmb_down = 0; LMB = 0; frame_wheel = 0; );
+// The knob style follows the suite's, the way Swing's pad knobs do — this is
+// what the KNOB row drives. 0/unset means the library default (1 = SSL), which
+// is the literal every rk_knob_draw here used to carry.
+_ou_kp = gmem[GS_THEME_KNOB_P] >= 1 ? (gmem[GS_THEME_KNOB_P] | 0) : 1;
+
+// ── Click-through (0x200) -- HOUSE RULE for every face ─────────────────
+// A click on EMPTY embed space opens the floating window; while the window is
+// open, a click anywhere on the embed closes it, the way every stock JSFX
+// behaves. gfx_ext_flags is ONE variable shared by every @gfx pass of the
+// instance, so it is cleared here and re-armed at the frame tail -- except in
+// an IDLE pass (window closed, options:gfx_idle), which leaves whatever the
+// embed decided. _ou_hov = the pointer is over, or dragging, a live control.
+!(gfx_ext_flags & 2) ? gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
+_ou_hov = 0;
+
 // ── Layout choice ──────────────────────────────────────────────────────
 // Two LAYOUTS, not one layout scaled: an 82 px mixer strip cannot show a
 // 300 px face legibly at any scale, and knobs that small cannot be hit. Above
@@ -298,23 +345,51 @@ _ou_foot = H >= 626 * sc;
 // broken rather than locked, even to the person who wrote the plugin.
 _ou_lk = ou_linked ? 0.42 : 1.0;
 
-gfx_set(0.13, 0.14, 0.16, 1);
+rkth_setcol(0, 0.13, 0.14, 0.16, 1);
 gfx_rect(0, 0, W, H);
 
 _ou_full ? (
 
   // ── Header ──────────────────────────────────────────────────────────
   gfx_setfont(1, "Arial", max(9, floor(15 * sc)), 'b');
-  gfx_set(0.88, 0.89, 0.92, 1);
+  rkth_setcol(2, 0.88, 0.89, 0.92, 1);
   gfx_x = floor(14 * sc); gfx_y = floor(14 * sc); gfx_drawstr("EON OUTPUT");
   ou_linked ? gfx_set(0.35, 0.80, 0.84, 1) : (ou_link_inst > 0 ? gfx_set(0.85, 0.55, 0.15, 1) : gfx_set(0.40, 0.42, 0.46, 1));
   gfx_circle(floor(19 * sc), floor(42 * sc), max(3, 4 * sc), 1, 1);
   gfx_setfont(2, "Arial", max(8, floor(11 * sc)));
-  gfx_set(0.62, 0.65, 0.70, 1);
+  rkth_setcol(3, 0.62, 0.65, 0.70, 1);
   gfx_x = floor(30 * sc); gfx_y = floor(35 * sc);
   gfx_drawstr(ou_linked ? "linked to Swing" : (ou_link_inst > 0 ? "Swing not answering" : "standalone"));
   gfx_set(1, 1, 1, 0.06);
   gfx_rect(floor(12 * sc), floor(58 * sc), W - floor(24 * sc), 1);
+
+  // ── THEME chip + menu ────────────────────────────────────────────────
+  // ⭐ House rule: ONE menu with every appearance option this face has. A LEFT
+  // click opens it; a RIGHT click opens the theme list directly, and the wheel
+  // still cycles — the same gestures Swing's chip carries.
+  // ⚠ GUARDED ON !micro, NOT on _ou_full alone: _ou_full is a SIZE test (:308)
+  // and a tall enough TCP embed passes it, so the chip would draw in a strip.
+  // The panel itself is safe either way — the core early-outs on the embed bit.
+  !micro ? (
+    gfx_setfont(1, "Arial", max(9, floor(11 * sc)), 'b');
+    gfx_measurestr("REAPER Pnl", _ou_tw, _ou_th);   // reserve the widest name
+    _ou_cw = _ou_tw + floor(16 * sc);
+    _ou_ch = floor(18 * sc);
+    _ou_cx2 = W - floor(12 * sc) - _ou_cw;
+    _ou_cy2 = floor(12 * sc);
+    thm_anchor_x = _ou_cx2; thm_anchor_y = _ou_cy2;
+    thm_anchor_w = _ou_cw;  thm_anchor_h = _ou_ch;
+    _ou_chit = mx >= _ou_cx2 && mx < _ou_cx2 + _ou_cw && my >= _ou_cy2 && my < _ou_cy2 + _ou_ch;
+    // lmb is withheld from rkth_input so a LEFT click opens the PANEL instead of
+    // the widget's own list; the widget still stores its geometry for the draw.
+    rkth_input(_ou_cx2, _ou_cy2, _ou_cw, _ou_ch, mx, my, 0, rmb_down, frame_wheel, _ou_ch) ?
+      ( lmb_down = 0; frame_wheel = 0; );
+    _ou_chit && lmb_down ? ( thm_open = 1 - thm_open; rkth_open = 0; lmb_down = 0; );
+    rkth_draw_chip(max(9, floor(11 * sc)));
+    // The panel's rows must claim their click before the knobs and the LIM
+    // button below see it, so the input half runs here, in the header.
+    thm_input();
+  );
 
   // ── GR meter: the thing you watch on a master bus ────────────────────
   // ⚠ rk_vu_theme() FIRST or the plate draws unlit -- Weld does the same before
@@ -323,21 +398,22 @@ _ou_full ? (
   _vr = floor(96 * sc); _vcy = floor(58 * sc) + _vr * 1.4;
   gr_vu.rk_vu_draw_at(W * 0.5, _vcy, _vr, 1, -1, "GR");
   gfx_setfont(2, "Arial", max(8, floor(11 * sc)));
-  gfx_set(0.72, 0.75, 0.80, 1);
+  rkth_setcol(3, 0.72, 0.75, 0.80, 1);
   gfx_x = W * 0.5 - floor(28 * sc); gfx_y = _vcy + _vr * 0.34;
   gfx_printf("%.1f dB GR", max(0, gr_vu.pos));
 
   // ── VOL ──────────────────────────────────────────────────────────────
   _cx = W * 0.5; _ky = floor(312 * sc); _kr = floor(48 * sc);
   _nv = ssl_knob_interact(ou_kmem + 0 * 16, _cx, _ky, _kr, ou_vol, -48, 12, 0, 0);
+  _ou_hov |= (ou_kmem + 0 * 16)[6];   // slot 6 = hovered or dragging
   _nv != ou_vol && !ou_linked ? ( ou_vol = _nv; slider_automate(ou_vol); ou_recalc(); );
-  rk_knob_draw(1, _cx, _ky, _kr, ou_vol, -48, 12, 0, (ou_kmem + 0 * 16)[0] * _ou_lk,
+  rk_knob_draw(_ou_kp, _cx, _ky, _kr, ou_vol, -48, 12, 0, (ou_kmem + 0 * 16)[0] * _ou_lk,
                0.80 * _ou_lk, 0.82 * _ou_lk, 0.86 * _ou_lk, 0, 0.13, 0.14, 0.16);
   gfx_setfont(2, "Arial", max(8, floor(11 * sc)));
-  gfx_set(0.60, 0.63, 0.68, 1);
+  rkth_setcol(3, 0.60, 0.63, 0.68, 1);
   gfx_x = _cx - floor(12 * sc); gfx_y = _ky + _kr + floor(8 * sc); gfx_drawstr("VOL");
   gfx_setfont(3, "Arial", max(9, floor(15 * sc)), 'b');
-  gfx_set(0.86, 0.88, 0.92, 1);
+  rkth_setcol(2, 0.86, 0.88, 0.92, 1);
   gfx_x = _cx - floor(30 * sc); gfx_y = _ky + _kr + floor(24 * sc);
   gfx_printf("%+.1f dB", ou_vol);
 
@@ -345,44 +421,47 @@ _ou_full ? (
   _kr = floor(34 * sc); _ky = floor(464 * sc);
   _cx = W * 0.30;
   _nv = ssl_knob_interact(ou_kmem + 1 * 16, _cx, _ky, _kr, ou_lim_thr, -12, 0, 0, 0);
+  _ou_hov |= (ou_kmem + 1 * 16)[6];
   _nv != ou_lim_thr && !ou_linked ? ( ou_lim_thr = _nv; slider_automate(ou_lim_thr); ou_recalc(); );
-  rk_knob_draw(1, _cx, _ky, _kr, ou_lim_thr, -12, 0, 0, (ou_kmem + 1 * 16)[0] * _ou_lk,
+  rk_knob_draw(_ou_kp, _cx, _ky, _kr, ou_lim_thr, -12, 0, 0, (ou_kmem + 1 * 16)[0] * _ou_lk,
                0.93 * _ou_lk, 0.62 * _ou_lk, 0.30 * _ou_lk, 0, 0.13, 0.14, 0.16);
   gfx_setfont(2, "Arial", max(8, floor(11 * sc)));
-  gfx_set(0.60, 0.63, 0.68, 1);
+  rkth_setcol(3, 0.60, 0.63, 0.68, 1);
   gfx_x = _cx - floor(20 * sc); gfx_y = _ky + _kr + floor(8 * sc); gfx_drawstr("CEILING");
-  gfx_set(0.86, 0.88, 0.92, 1);
+  rkth_setcol(2, 0.86, 0.88, 0.92, 1);
   gfx_x = _cx - floor(20 * sc); gfx_y = _ky + _kr + floor(22 * sc);
   gfx_printf("%+.1f dB", ou_lim_thr);
 
   _cx = W * 0.70;
   _t = log(max(10, min(1000, ou_lim_rel)) / 10) / log(100);
   _nt = ssl_knob_interact(ou_kmem + 2 * 16, _cx, _ky, _kr, _t, 0, 1, 0.5, 0);
+  _ou_hov |= (ou_kmem + 2 * 16)[6];
   _nt != _t && !ou_linked ? ( ou_lim_rel = floor(10 * pow(100, max(0, min(1, _nt))) + 0.5); slider_automate(ou_lim_rel); ou_recalc(); );
   // Draw the value in force, not the raw return: a LOCKED knob must not follow a
   // drag Output threw away, and ou_lim_rel is floored to whole ms.
   _t = log(max(10, min(1000, ou_lim_rel)) / 10) / log(100);
-  rk_knob_draw(1, _cx, _ky, _kr, _t, 0, 1, 0, (ou_kmem + 2 * 16)[0] * _ou_lk,
+  rk_knob_draw(_ou_kp, _cx, _ky, _kr, _t, 0, 1, 0, (ou_kmem + 2 * 16)[0] * _ou_lk,
                0.80 * _ou_lk, 0.82 * _ou_lk, 0.86 * _ou_lk, 0, 0.13, 0.14, 0.16);
   gfx_setfont(2, "Arial", max(8, floor(11 * sc)));
-  gfx_set(0.60, 0.63, 0.68, 1);
+  rkth_setcol(3, 0.60, 0.63, 0.68, 1);
   gfx_x = _cx - floor(20 * sc); gfx_y = _ky + _kr + floor(8 * sc); gfx_drawstr("RELEASE");
-  gfx_set(0.86, 0.88, 0.92, 1);
+  rkth_setcol(2, 0.86, 0.88, 0.92, 1);
   gfx_x = _cx - floor(16 * sc); gfx_y = _ky + _kr + floor(22 * sc);
   gfx_printf("%d ms", ou_lim_rel);
 
   // ── LIM in/out ───────────────────────────────────────────────────────
   _bw = floor(120 * sc); _bh = floor(30 * sc);
   _bx = (W - _bw) * 0.5; _by = floor(566 * sc);
+  mx >= _bx && mx <= _bx + _bw && my >= _by && my <= _by + _bh ? _ou_hov = 1;
   lmb_down && !ou_linked && mx >= _bx && mx <= _bx + _bw && my >= _by && my <= _by + _bh ? (
     ou_lim_on = ou_lim_on ? 0 : 1; slider_automate(ou_lim_on);
   );
-  ou_lim_on ? gfx_set(0.26 * _ou_lk, 0.55 * _ou_lk, 0.36 * _ou_lk, 1) : gfx_set(0.24, 0.26, 0.30, 1);
+  ou_lim_on ? gfx_set(0.26 * _ou_lk, 0.55 * _ou_lk, 0.36 * _ou_lk, 1) : rkth_setcol(1, 0.24, 0.26, 0.30, 1);
   gfx_rect(_bx, _by, _bw, _bh);
   gfx_set(1, 1, 1, 0.08);
   gfx_rect(_bx, _by, _bw, 1);
   gfx_setfont(3, "Arial", max(9, floor(13 * sc)), 'b');
-  gfx_set(0.92, 0.93, 0.95, ou_linked ? 0.6 : 1);
+  rkth_setcol(2, 0.92, 0.93, 0.95, ou_linked ? 0.6 : 1);
   gfx_x = _bx + _bw * 0.5 - floor(24 * sc); gfx_y = _by + floor(7 * sc);
   gfx_drawstr(ou_lim_on ? "LIM IN" : "LIM OUT");
 
@@ -447,7 +526,7 @@ _ou_full ? (
   // cannot run the words into the meter.
   _mx0 = W * 0.30; _mw = W * 0.40;
   _my0 = gfx_y + th + max(2, H * 0.012); _mh = H * 0.55 - (_my0 - H * 0.09);
-  gfx_set(0.08, 0.09, 0.10, 1);
+  rkth_setcol(0, 0.08, 0.09, 0.10, 1);
   gfx_rect(_mx0, _my0, _mw, _mh);
   gfx_set(1, 1, 1, 0.07);
   gfx_rect(_mx0, _my0, _mw, 1);
@@ -466,26 +545,59 @@ _ou_full ? (
   _ou_gy = _my0 + _mh + max(2, H * 0.012);
   _ou_gy + _ou_gf <= H * 0.70 ? (
     gfx_setfont(2, "Arial", _ou_gf);
-    gfx_set(0.72, 0.75, 0.80, 1);
+    rkth_setcol(3, 0.72, 0.75, 0.80, 1);
     gfx_x = _mx0; gfx_y = _ou_gy;
     gfx_printf("%.1f", _grd);
   );
 
   // level
   gfx_setfont(3, "Arial", max(8, floor(_ou_u * 0.20)), 'b');
-  gfx_set(0.86, 0.88, 0.92, 1);
+  rkth_setcol(2, 0.86, 0.88, 0.92, 1);
   gfx_x = W * 0.10; gfx_y = H * 0.70;
   gfx_printf("%+.0f", ou_vol);
 
   // limiter state
   _bh2 = max(8, H * 0.07);
   _by2 = H * 0.86;
-  ou_lim_on ? gfx_set(0.26, 0.55, 0.36, 1) : gfx_set(0.24, 0.26, 0.30, 1);
+  ou_lim_on ? gfx_set(0.26, 0.55, 0.36, 1) : rkth_setcol(1, 0.24, 0.26, 0.30, 1);
   gfx_rect(W * 0.14, _by2, W * 0.72, _bh2);
   gfx_setfont(2, "Arial", max(7, floor(_ou_u * 0.15)), 'b');
-  gfx_set(0.92, 0.93, 0.95, 1);
+  rkth_setcol(2, 0.92, 0.93, 0.95, 1);
   gfx_x = W * 0.24; gfx_y = _by2 + max(1, _bh2 * 0.18);
   gfx_drawstr(ou_lim_on ? "LIM" : "OUT");
+);
+
+// ── Click-through re-arm ───────────────────────────────────────────
+// Embedded: over dead space only. The compact column takes no input at all,
+// and while LINKED every control here is locked, so then the whole face passes.
+// Floating window up: always -- the flag only routes clicks on the EMBED, and
+// the embed does not run @gfx while the window does, so a click on the strip
+// has nothing else to reach; with the flag armed it closes the window.
+micro ? (
+  (ou_linked || !_ou_full || !_ou_hov) ? gfx_ext_flags |= 0x200;
+) : !(gfx_ext_flags & 2) ? (
+  gfx_ext_flags |= 0x200;
+);
+
+// ⚠ _ou_full is a SIZE test (:351), and the chip + thm_input() live inside that
+// branch while the paint below does not. Shrink the window under the threshold
+// with the menu open and it would keep painting with nothing left to take its
+// clicks or dismiss it -- controls underneath would get them instead. Closing it
+// here is the same discipline as Swing's folded-header branch.
+!_ou_full ? thm_open = 0;
+
+// ── THEME menu paint, LAST ─────────────────────────────────────────
+// After every layout so the panel hangs over the face, and before the latch
+// store, which rewrites prev_LMB for the next frame. The open row list paints
+// after the panel, so it lands on top; the theme list is the widget's own.
+thm_draw();
+swing_popup_tick();
+!micro ? rkth_overlay_draw();
+
+// NAME BAR re-applied every visible pass — what makes the row live without a
+// reload. Note the INVERTED sense: the row ON means 0x100 CLEARED.
+!(gfx_ext_flags & 2) ? (
+  ou_name_bar ? ( gfx_ext_flags = (gfx_ext_flags | 0x100) - 0x100; ) : ( gfx_ext_flags |= 0x100; );
 );
 
 // ── End of frame: input latches ────────────────────────────────────

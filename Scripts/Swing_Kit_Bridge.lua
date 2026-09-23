@@ -3090,7 +3090,7 @@ function eon_fb_default_dir()
   if f then
     local body = f:read("a"); f:close()
     local chunk = load("return " .. (body:match("return%s*(%b{})") or "{}"), "fb", "t", {})
-    local ok, t = pcall(chunk)
+    local ok, t = core.run_bounded(chunk)   -- empty env AND a budget: a table literal can still call a looping function
     if ok and type(t) == "table" then
       local cand = (t.recent_folders and t.recent_folders[1])
                 or (t.favorites and t.favorites[1] and t.favorites[1].path)
@@ -3268,7 +3268,7 @@ function eon_fb_places(st)
   if f then
     local body = f:read("a"); f:close()
     local chunk = load("return " .. (body:match("return%s*(%b{})") or "{}"), "fb", "t", {})
-    local ok, t = pcall(chunk)
+    local ok, t = core.run_bounded(chunk)   -- empty env AND a budget: a table literal can still call a looping function
     if ok and type(t) == "table" then
       for _, fav in ipairs(t.favorites or {}) do
         local pth = eon_fb_norm(fav.path)
@@ -3341,7 +3341,7 @@ function eon_fb_settings_read()
   local body = f:read("a"); f:close()
   local chunk = load("return " .. (body:match("return%s*(%b{})") or "{}"), "fb", "t", {})
   if not chunk then return {} end
-  local ok, t = pcall(chunk)
+  local ok, t = core.run_bounded(chunk)   -- empty env AND a budget: a table literal can still call a looping function
   return (ok and type(t) == "table") and t or {}
 end
 

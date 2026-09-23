@@ -470,7 +470,7 @@ local function create_kit_database(kit_name)
   f:write("-- Swing Kit v2 — EON Studios — proprietary\n")
   f:write("return {\n")
   f:write('  version  = 2,\n')
-  f:write('  kit_name = "' .. kit_name:gsub('"', '\\"') .. '",\n')
+  f:write('  kit_name = "' .. kit_name:gsub('\\', '\\\\'):gsub('"', '\\"') .. '",\n')
   f:write('  author   = "",\n')
   f:write('  created  = "' .. os.date("%Y-%m-%d") .. '",\n')
   f:write('  modified = "' .. os.date("%Y-%m-%d") .. '",\n')
@@ -505,16 +505,18 @@ local function save_kit_database()
   -- Update cache from working state
   data.cache = kit_db.cache
 
-  local f = io.open(kit_db.filepath, "w")
-  if not f then
-    reaper.ShowConsoleMsg("[EON] Warning: could not save kit database to " .. kit_db.filepath .. "\n")
-    return
-  end
+  -- Built in memory and published through core.atomic_write: this REPLACES the
+  -- user's kit file, and an in-place io.open(path, "w") truncated it before the
+  -- first byte landed. Every f:write below takes one string.
+  local body = {}
+  local f = { write = function(_, s) body[#body + 1] = s end }
   f:write("-- Swing Kit v2 — EON Studios — proprietary\n")
   f:write("return {\n")
   f:write('  version  = ' .. (data.version or 2) .. ',\n')
-  f:write('  kit_name = "' .. (data.kit_name or ""):gsub('"', '\\"') .. '",\n')
-  f:write('  author   = "' .. (data.author or ""):gsub('"', '\\"') .. '",\n')
+  -- Backslash first, as the pad strings below do: a name ending in "\" escaped
+  -- its own closing quote and the kit stopped loading.
+  f:write('  kit_name = "' .. (data.kit_name or ""):gsub('\\', '\\\\'):gsub('"', '\\"') .. '",\n')
+  f:write('  author   = "' .. (data.author or ""):gsub('\\', '\\\\'):gsub('"', '\\"') .. '",\n')
   f:write('  created  = "' .. (data.created or os.date("%Y-%m-%d")) .. '",\n')
   f:write('  modified = "' .. data.modified .. '",\n')
 
@@ -578,7 +580,11 @@ local function save_kit_database()
   end
 
   f:write('}\n')
-  f:close()
+  local ok = core.atomic_write(kit_db.filepath, table.concat(body))
+  if not ok then
+    reaper.ShowConsoleMsg("[EON] Warning: could not save kit database to " .. kit_db.filepath .. "\n")
+    return
+  end
   kit_db.dirty = false
 end
 
@@ -773,7 +779,9 @@ local function load_settings()
 
   local chunk, err = loadfile(SETTINGS_FILE, "t", {})
   local ok, loaded = false, nil
-  if chunk then ok, loaded = pcall(chunk) end
+  -- Bounded like a kit (load_kit_database): the empty env keeps it away from
+  -- io/os, but only the instruction budget stops a `while true do end`.
+  if chunk then ok, loaded = core.run_bounded(chunk) end
   if ok and type(loaded) == "table" then
     -- Merge missing keys from defaults (§11.2)
     for k, v in pairs(settings) do
@@ -840,7 +848,10 @@ local function load_persistent_cache()
   -- Sandboxed env (defense in depth — never exec arbitrary code from disk)
   local chunk = (loadstring or load)(content, "analysis_cache", "t", {})
   if not chunk then return {} end
-  local ok, data = pcall(chunk)
+  -- Bounded too. A data literal runs under one VM instruction per source byte,
+  -- so 2x the file size can never cut a real cache short (20k entries is
+  -- megabytes), while a loop still dies instead of hanging the browser.
+  local ok, data = core.run_bounded(chunk, math.max(5000000, #content * 2))
   if not ok or type(data) ~= "table" or data.version ~= 1 then return {} end
   local entries = data.entries or {}
   -- `m` is the packed measurement string (see rk_lua_sample_analysis.pack).

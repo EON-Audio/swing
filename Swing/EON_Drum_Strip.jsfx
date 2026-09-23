@@ -70,6 +70,7 @@ slider28:strip_vu_set=0<0,21,1>-VU Set
 slider29:strip_snd_dly=0<0,1,0.01>-Delay Send
 slider30:strip_snd_rvb=0<0,1,0.01>-Reverb Send
 slider31:strip_snd_smash=0<0,1,0.01>-Smash Send
+slider32:name_bar=0<0,1,1>-Name bar (internal; the gear panel's NAME BAR row; 0 = borderless embed, house rule 1; persists via FX chunk, no @serialize touch)
 
 in_pin:left input
 in_pin:right input
@@ -88,7 +89,9 @@ out_pin:right output
 // embed (0x100 MUST be set in @init — no effect later; REAPER 7.45+). 0x400 =
 // suppress REAPER's hover tooltip over the MCP embed (7.79+; older ignores).
 gfx_ext_retina == 0 ? gfx_ext_retina = 1;
-gfx_ext_flags |= 0x100 | 0x400;
+// 0x400 always; 0x100 follows the NAME BAR row (gear panel), default 0 = borderless.
+gfx_ext_flags |= 0x400;
+name_bar ? ( gfx_ext_flags = (gfx_ext_flags | 0x100) - 0x100; ) : ( gfx_ext_flags |= 0x100; );
 
 // ─── Re-instantiation pulse (strip→sync) ──────────────────────────────────
 // REAPER re-runs @init whenever it RE-INSTANTIATES this FX — notably when the
@@ -1075,7 +1078,7 @@ gear_x = gfx_w - gear_s - floor(5 * sc); gear_y = floor((hdr_h - gear_s) * 0.5);
 // Gear panel (the set-and-forget selectors): THEME · KNOB · VU FACE · EMBED VIEW ·
 // SYNC ALL, one row each, hanging under the gear. Geometry each frame so a resize
 // can't strand it; state gp_open persists across frames only.
-gp_n = 5; gp_rh = floor(18 * max(1, sc)); gp_w = floor(200 * sc);
+gp_n = 6; gp_rh = floor(18 * max(1, sc)); gp_w = floor(200 * sc);
 gp_x = max(2, gfx_w - gp_w - floor(4 * sc)); gp_y = hdr_h + 2; gp_h = gp_n * gp_rh + 2;
 
 // ── House dropdown interaction (VIEW / VU / KNOB): FIRST, so an open panel
@@ -1150,7 +1153,8 @@ micro_view ? ( frame_wheel == 0 ? ( _hov_mx = mx; _hov_my = my; ) : ( mx = _hov_
       strip_view_mode = ((strip_view_mode | 0) + (frame_wheel > 0 ? 1 : -1) + 4) % 4;
       strip_view_touch += 1; slider_automate(2^22);
       strip_view_lock > 0.5 ? ( strip_view_bcast = (strip_view_mode | 0) + 1; slider_automate(2^24); );
-    ) : 0;
+    ) :
+    gp_row == 5 ? ( name_bar = name_bar > 0.5 ? 0 : 1; slider_automate(slider32); ) : 0;
     frame_wheel = 0; mouse_wheel = 0;
   );
   lmb_down && gp_row >= 0 ? (
@@ -1159,6 +1163,13 @@ micro_view ? ( frame_wheel == 0 ? ( _hov_mx = mx; _hov_my = my; ) : ( mx = _hov_
     gp_row == 1 ? ( ds_dd_openat(3, 19, gp_x, _gry + gp_rh + 1, gp_rh); ) :
     gp_row == 2 ? ( ds_dd_openat(2, 21, gp_x, _gry + gp_rh + 1, gp_rh); ) :
     gp_row == 3 ? ( ds_dd_openat(1, 4, gp_x, _gry + gp_rh + 1, gp_rh); ) :
+    gp_row == 5 ? (
+      // NAME BAR (house rule 1 is now a per-instance OPTION): 0 = borderless,
+      // 1 = REAPER's own name bar over the embed. Applied in @init from the
+      // restored value and re-applied every visible @gfx pass, which is what
+      // makes the pick live (measured both ways on 7.79 and 7.80).
+      name_bar = name_bar > 0.5 ? 0 : 1; slider_automate(slider32);
+    ) :
     (
       // SYNC ALL: latching. While ON every view change here is pushed to all Drum
       // Strips on the SAME Swing instance (EON_Swing_Strip_Sync relays it);
@@ -1699,7 +1710,14 @@ sk_node_active ? (
 // dragging a node clears the flag so the interaction stays inline. Only
 // bits 0x100/0x200 are ever written — bits 0/1 belong to REAPER.
 // (EEL2 has no unary bitwise-NOT — '~' is XOR — so clear via |= then -=.)
-gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
+// Not in an idle pass (& 2): idle leaves 0x200 as the last visible pass set it (house rule 4).
+!(gfx_ext_flags & 2) ? gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
+// NAME BAR re-applied every visible pass, which is what makes the gear-panel row
+// live: REAPER picks 0x100 up on the next frame, both ways. On an older host the
+// change simply waits for a reload.
+!(gfx_ext_flags & 2) ? (
+  name_bar ? ( gfx_ext_flags = (gfx_ext_flags | 0x100) - 0x100; ) : ( gfx_ext_flags |= 0x100; );
+);
 // Per-knob passthrough (mirrors 1175): the knob draws below OR their hover flag
 // (KS slot 6) into _kn_hov; the flag is re-armed at END of @gfx only when the
 // cursor is over NO knob and NO node — so clicks/WHEEL reach the knobs inline,
@@ -1865,14 +1883,15 @@ fullcol ? (   // embedded portrait only (the floating window runs the deck)
       gfx_rect(gp_x + 1, _gry, gp_w - 2, gp_rh);
     );
     _gpr == 0 ? strcpy(#gpl, "THEME") : _gpr == 1 ? strcpy(#gpl, "KNOB") : _gpr == 2 ? strcpy(#gpl, "VU FACE") :
-    _gpr == 3 ? strcpy(#gpl, "EMBED VIEW") : strcpy(#gpl, "SYNC ALL");
+    _gpr == 3 ? strcpy(#gpl, "EMBED VIEW") : _gpr == 4 ? strcpy(#gpl, "SYNC ALL") : strcpy(#gpl, "NAME BAR");
     _gpr == 0 ? strcpy(#gpv, rkth_name(rkth_cur() - 1)) :
     _gpr == 1 ? ( strip_kn_name(gmem[GS_THEME_KNOB_P] | 0); strcpy(#gpv, #sk_knname); ) :
     _gpr == 2 ? ( strip_vu_name(max(-1, min(19, strip_vu_style | 0))); strcpy(#gpv, #sk_vuname); ) :
     _gpr == 3 ? (
       _vm = max(0, min(3, strip_view_mode | 0));
       _vm == 0 ? strcpy(#gpv, "GRAPH") : _vm == 1 ? strcpy(#gpv, "STRIP") : _vm == 2 ? strcpy(#gpv, "STRIP+VU") : strcpy(#gpv, "FULL");
-    ) : strcpy(#gpv, strip_view_lock > 0.5 ? "ON" : "OFF");
+    ) : _gpr == 4 ? strcpy(#gpv, strip_view_lock > 0.5 ? "ON" : "OFF")
+      : strcpy(#gpv, name_bar > 0.5 ? "Shown" : "Hidden");
     _ghv ? gfx_set(0.10, 0.10, 0.12, 1) : (_th_live ? setcolor_band(3, 255, 1.0) : gfx_set(0.55, 0.57, 0.62, 1));
     gfx_x = gp_x + floor(8 * sc); gfx_y = _gry + floor((gp_rh - _uf8) * 0.5); gfx_drawstr(#gpl);
     gfx_measurestr(#gpv, _gvw, _gvh);
@@ -1929,6 +1948,11 @@ fullcol ? (   // embedded portrait only (the floating window runs the deck)
 // cursor is over NO knob and NO EQ node. Over a knob/node 0x200 stays cleared,
 // so drag + scroll-wheel reach the widget inline (1175 pattern). ──
 micro_view && !_kn_hov && !_pill_hov && _nhov == 0 && sk_node_active == 0 ? gfx_ext_flags |= 0x200;
+// House rule 3 (wiki 4.5): window up -> arm 0x200 always. The flag only routes
+// clicks on the EMBED, which runs no @gfx pass while a window is open, so this
+// is the only pass that can set it; a click on the strip then closes the window.
+// An idle pass (& 2) leaves the flag alone.
+!micro_view && !(gfx_ext_flags & 2) ? gfx_ext_flags |= 0x200;
 
 // ── Face picker on the dial's coil cover: a sheet of live miniatures. LAST,
 // floating only, and only when the dial was drawn this frame. A pick is the

@@ -90,6 +90,13 @@ import libs/rk_widgets.jsfx-inc
 import libs/knobs_kbsg.jsfx-inc
 import libs/rk_theme.jsfx-inc
 import libs/rk_cat_glyphs.jsfx-inc
+// THEME menu. ⚠ ORDER IS LOAD-BEARING (rk_thememenu_core.jsfx-inc:8-15): the
+// shim gives rk_swing_popup the two helpers it calls but does not define, and
+// the ROWS must compile before the core that calls them.
+import libs/rk_thememenu_shim.jsfx-inc
+import libs/rk_swing_popup.jsfx-inc
+import libs/rk_ss_thememenu.jsfx-inc
+import libs/rk_thememenu_core.jsfx-inc
 // ============================================================================
 // EON Step Sequencer  --  EON Studios fork of jnif's "megababy" sequencer.
 //   Base engine: "megababy" v3 by jnif.  Community mods referenced: NandyC
@@ -144,6 +151,7 @@ slider52:0<0,2,1{Auto,Full UI,Dock face}>--EON Dock View (0=aspect-triggered, 1=
 slider53:0<0,1,1{Free,Docked}>--EON Rig Docked (set by the dock rig script, not by hand; only honoured while GS_RIG_ALIVE is fresh)
 slider54:0<0,1,1{No,Yes}>--EON Dock Wanted (the wordmark's dock INTENT; set by "dock me", cleared only by "pop out"; outlives a closed pane, unlike slider53)
 slider55:1<0,1,1{Off,On}>--EON Song Strip (the ruler-gutter SONG pill; view-only, persists via FX chunk; ON by default since 2026-09-03)
+slider56:0<0,1,1{Hidden,Shown}>--EON Name Bar (the THEME menu's NAME BAR row; 0 = borderless embed, house rule 1; view-only, persists via FX chunk)
 in_pin:none
 out_pin:none
 
@@ -171,7 +179,12 @@ octave_offset=-1; // Set this value as you prefer.
 // (0x200) live in @gfx; detection is gfx_ext_flags & 1 there. (Mirrors EON_Drum_Strip.)
 // 0x400 = suppress REAPER's hover tooltip over the MCP embed (7.79+; older ignores).
 gfx_ext_retina == 0 ? gfx_ext_retina = 1;
-gfx_ext_flags |= 0x100 | 0x400;
+// 0x400 always; 0x100 follows the THEME menu's NAME BAR row (slider56),
+// default 0 = borderless. REAPER documents 0x100 as an @init decision, so the
+// restored value is applied here; the re-apply in the @gfx tail is what makes
+// the row take effect without a reload.
+gfx_ext_flags |= 0x400;
+ss_name_bar ? ( gfx_ext_flags = (gfx_ext_flags | 0x100) - 0x100; ) : ( gfx_ext_flags |= 0x100; );
 
 // It works the same way as "MIDI octave name display offset" in Reaper's preferences
 //  1 : MIDI note 60 = C5
@@ -735,6 +748,7 @@ nextslot1           = eon_adapt_scratch   + 001536;   // 0..1407 (128 steps x 11
 KS = 16;
 ss_knob_mem         = nextslot1;            // max_numnotes * 2 knobs * KS
 nextslot1           = ss_knob_mem         + 001568;   // 49 * 2 * 16
+nextslot1           = swing_popup_init(nextslot1);    // THEME menu row lists (194)
 memset(ss_knob_mem, 0, 1568);
 // Lane-header column spans, recorded by eon_ms_geo for the column-header strip.
 // 7 columns: 0 icon, 1 name, 2 mute, 3 solo, 4 vol, 5 pan, 6 swing.
@@ -3052,6 +3066,12 @@ npatterns=slider47;
 // without it); flipping it off restores the previous plain look exactly.
 eon_gridlines=slider50;
 eon_song_on=slider55;      // strip polish: the SONG strip row, ON by default, persisted like slider50
+// ⚠ Every view slider in this file is DECLARED WITHOUT A VARIABLE NAME and copied
+// into its global HERE -- that copy is the restore path. Without this line
+// slider56 came back from the project correctly and ss_name_bar stayed 0, so the
+// NAME BAR row read "Hidden" and the embed drew borderless however it was saved.
+// Caught by the 2026-09-22 Codex delta audit; it was the only real defect of four.
+ss_name_bar=slider56;
 // Column mask. Read BEFORE the pkw derivation below, which consumes it. Also
 // view-only -- hiding a column changes nothing about what the lane plays, which
 // is why none of this touches groove_dirty or the pattern data.
@@ -4447,6 +4467,13 @@ dt = min(time_precise() - ss_last_t, 0.05);   // capped: a stalled GUI must not
 ss_last_t = time_precise();                   // jump hover_t a whole second
 hv_speed = 11;                                // house hover speed (Drum Strip parity)
 frame_wheel = mouse_wheel / 120;
+
+// ── THEME menu plumbing ──────────────────────────────────────────────────
+// swing_popup_tick reads the RAW buttons, which is how an open list stays
+// clickable while the face is gated. Swing sets these in its modal gate;
+// Steppa has no such gate, so it mirrors them itself.
+_raw_lmb_down = lmb_down; _raw_LMB = LMB; _raw_wheel = frame_wheel;
+
 // Embedded wheel events arrive with a STALE mouse position, so every hover test
 // on the wheel frame misses and the lane knobs never see the scroll. Remember the
 // cursor on normal frames, reuse it on wheel frames -- Drum Strip's user-verified
@@ -7273,6 +7300,11 @@ ss_emb ? (
   !ss_over_widget ? gfx_ext_flags |= 0x200;            // dead-space click -> open floating window
   mouse_wheel = 0;
 ) : (
+  // House rule 3 (wiki 4.5): window up -> arm 0x200 always. The flag only routes
+  // clicks on the EMBED, which runs no @gfx pass while a window is open, so this
+  // is the only pass that can set it; a click on the strip then closes the window.
+  // An idle pass (& 2) leaves the flag alone.
+  !(gfx_ext_flags & 2) ? gfx_ext_flags |= 0x200;
 
 // DOCK FACE: geometry then input, before anything else in this branch can look
 // at the click. ss_dock_input() latches mstate on every gesture it claims, which
@@ -7415,13 +7447,52 @@ eon_vdd_open && mstate==0 && mouse_cap==1 ? (
 // dropdown region so the grid / control-row handlers below still gate correctly.
 colorscheme==10 ? (
   eon_thx = eon_thx2; eon_thy = eon_r2+1; eon_thw = busp*3-3; eon_thh = tbrh-2;
+  // The THEME MENU hangs from this chip; the core right-aligns itself to it.
+  thm_anchor_x = eon_thx; thm_anchor_y = eon_thy;
+  thm_anchor_w = eon_thw; thm_anchor_h = eon_thh;
+  // ⭐ HOUSE RULE: a LEFT click opens the menu — the one panel with every
+  // appearance option. The theme list stays one RIGHT click away and is also
+  // the menu's first row, so nothing is lost. lmb is withheld from rkth_input
+  // so the widget still stores its geometry without toggling its own list.
+  _ss_thit = mstate==0 && mouse_cap==1
+          && mouse_x>=eon_thx && mouse_x<eon_thx+eon_thw
+          && mouse_y>=eon_thy && mouse_y<eon_thy+eon_thh;
   rkth_input(eon_thx, eon_thy, eon_thw, eon_thh, mouse_x, mouse_y,
-             (mstate==0 && mouse_cap==1) ? 1 : 0, (mstate==0 && mouse_cap==2) ? 1 : 0,
+             0, (mstate==0 && mouse_cap==2) ? 1 : 0,
              mouse_wheel, 19) ? (
     mstate=ms_tb_button_noundo; refresh_tb=1; eon_pdraw=4; mouse_wheel=0;
   );
-  eon_thdd_in_panel = rkth_open && mouse_x>=rkth_ddx && mouse_x<rkth_ddx+rkth_ddw && mouse_y>=rkth_ddy && mouse_y<rkth_ddy+rkth_ddh;
-) : (eon_thdd_in_panel=0);
+  _ss_thit ? (
+    thm_open = 1 - thm_open; rkth_open = 0;
+    mstate=ms_tb_button_noundo; refresh_tb=1; eon_pdraw=4;
+    // ⚠⚠ SPEND THE EDGE HERE. thm_input() runs in this same frame, and the chip
+    // sits ABOVE the panel it just opened -- so an un-spent lmb_down lands
+    // outside the panel rect and the close-on-outside-click branch shuts it on
+    // the opening frame. Measured: _ss_thit fired once, geometry computed,
+    // thm_open still 0. Steppa's own chip never had to do this because it zeroes
+    // mouse_wheel and latches mstate, neither of which the core reads.
+    lmb_down = 0;
+  );
+  // Input EARLY: the rows must claim their click before the grid and control-row
+  // handlers further down.
+  thm_input();
+  // ⚠⚠ THIS IS THE LOAD-BEARING LINE ON THIS FACE. Steppa's grid, toolbar and
+  // control-row handlers run off RAW mouse_x/mouse_y/mouse_cap -- 578 sites --
+  // not off lmb_down, so the core's `lmb_down = 0` swallow means NOTHING to
+  // them. What stops them is this flag, which three separate gates already
+  // consult (:971 the knob modal check, :8026 the grid, :9540 the control row).
+  // Widening the EXISTING flag rather than adding a new one is what guarantees
+  // no call site is missed.
+  // swing_popup_active is tested WITHOUT geometry on purpose: an open list owns
+  // the screen, and :950-960 says a modal check is the right kind for that.
+  eon_thdd_in_panel =
+       (rkth_open && mouse_x>=rkth_ddx && mouse_x<rkth_ddx+rkth_ddw && mouse_y>=rkth_ddy && mouse_y<rkth_ddy+rkth_ddh)
+    || (thm_open && mouse_x>=thm_px && mouse_x<thm_px+thm_pw && mouse_y>=thm_py && mouse_y<thm_py+thm_ph)
+    || swing_popup_active;
+  // ...and latch the state machine too, so a press inside the panel or under an
+  // open list cannot START a drag that the gates above only block per-frame.
+  eon_thdd_in_panel && mstate==0 && mouse_cap ? mstate = ms_tb_button_noundo;
+) : (eon_thdd_in_panel=0; thm_open=0;);
 
 // EON: ZOOM cells (control row, under the settings cog) — SONG (op 10) frames
 // the arrange on all pattern regions, PAT (op 11, A1 = the selected pattern's
@@ -11586,5 +11657,17 @@ atomic_set(eon_gfx_hold_t, (mouse_cap & 1) ? time_precise() : 0);
 // Without this, a single notch over a lane knob stayed set forever -- eon_kn_hov>=0
 // forces a repaint every frame, the knob re-applied the same notch each time, and
 // the pad's gain/pan ramped to the rail and pinned there. EON_Drum_Strip.jsfx:1739.
+// ── THEME menu paint, LAST ────────────────────────────────────────────────
+// After both faces, before the latch store. The open row list is a swing_popup
+// and paints after the panel, so it lands on top.
+thm_draw();
+swing_popup_tick();
+
+// NAME BAR re-applied every visible pass -- what makes the row live without a
+// reload. INVERTED sense: the row ON means 0x100 CLEARED.
+!(gfx_ext_flags & 2) ? (
+  ss_name_bar ? ( gfx_ext_flags = (gfx_ext_flags | 0x100) - 0x100; ) : ( gfx_ext_flags |= 0x100; );
+);
+
 mouse_wheel = 0;
 rk_srf_store();

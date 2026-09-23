@@ -1,0 +1,153 @@
+// rk_thememenu_core.jsfx-inc — the dropped THEME-menu panel, host-agnostic
+//
+// ⭐⭐ HOUSE RULE (the user, 2026-09-22): every JSFX with a GUI has ONE theme menu
+// holding ALL of that plugin's appearance options. Not every plugin has the same
+// options; each shows only the ones it actually has. This file is the panel —
+// geometry, paint, hit-testing, open/close. It knows nothing about any row.
+//
+// ⚠️⚠️ IMPORT ORDER IS THE WHOLE CONTRACT. EEL2 has no function pointers, and a
+// forward reference to a not-yet-defined function silently kills the entire file,
+// so the host's row functions MUST be defined BEFORE this file is imported:
+//
+//     import libs/rk_theme.jsfx-inc          // rkth_setcol, for the panel's colours
+//     import libs/rk_swing_popup.jsfx-inc    // the row lists
+//     import libs/<host>_thememenu.jsfx-inc  // the ROWS  ← before the core
+//     import libs/rk_thememenu_core.jsfx-inc // ← this file
+//
+// The host must define, in that rows file:
+//     function thm_cap(r)               writes the row's caption into #_thm_lbl
+//     function thm_val(r)               writes the row's CURRENT value into #_thm_lbl
+//     function thm_openlist(r, px, py)  opens that row's list at px,py
+//     function thm_poll()               applies a finished pick (called every frame)
+// and must set, in its own @init:
+//     THM_N_ROWS                        how many rows it has
+// and each frame, BEFORE thm_input():
+//     thm_anchor_x / _y / _w / _h       the chip the panel hangs from
+//
+// The host also owes the usual UI globals — mx, my, lmb_down, rmb_down,
+// frame_wheel — plus swing_popup_init(freemem) and a swing_popup_tick() in its
+// @gfx tail, and _raw_lmb_down / _raw_LMB (Swing's modal gate sets these; a host
+// without one just mirrors lmb_down / LMB into them).
+//
+// CALL SITES, both of them:
+//     @gfx, right after the header draw:   thm_input();
+//     @gfx, in the tail before swing_popup_tick():  thm_draw();
+//
+// ⚠️ INPUT-EARLY / PAINT-LATE. The panel hangs over content the host draws after
+// its header, so the paint must be deferred; but the input must run before the
+// host's main surface or a click on a row falls through to whatever is under it.
+// Both halves early-out in an EMBEDDED pass — an embed must never show the panel.
+
+@init
+
+THM_ROW_H    = 18;
+THM_GAP      = 3;
+THM_PAD      = 6;
+THM_CAP_GAP  = 8;
+THM_CHIP_MIN = 92;
+
+thm_open     = 0;
+thm_pick_row = 0;
+
+// ── Geometry ─────────────────────────────────────────────────────────────────
+// ⚠️ FONT ORDER IS LOAD-BEARING: gfx_measurestr returns garbage under a stale
+// font, so captions are measured with the 9px face set and values with the 11px
+// face set, never interleaved. Same trap the shared appearance cluster documents.
+// The panel is RIGHT-aligned to its anchor chip and clamped to the canvas: the
+// chip lives at the right end of a header, and a left-aligned panel would hang
+// off the edge.
+function thm_geom() local(_j, _tw, _th) (
+  gfx_setfont(1, "Arial", 9, 'b');
+  thm_capw = 0; _j = 0;
+  loop(THM_N_ROWS,
+    thm_cap(_j); gfx_measurestr(#_thm_lbl, _tw, _th);
+    thm_capw = max(thm_capw, _tw); _j += 1;
+  );
+  gfx_setfont(1, "Arial", 11, 'b');
+  thm_chipw = THM_CHIP_MIN; _j = 0;
+  loop(THM_N_ROWS,
+    thm_val(_j); gfx_measurestr(#_thm_lbl, _tw, _th);
+    thm_chipw = max(thm_chipw, _tw + 14); _j += 1;
+  );
+  thm_pw = THM_PAD * 2 + thm_capw + THM_CAP_GAP + thm_chipw;
+  thm_ph = THM_PAD * 2 + THM_N_ROWS * THM_ROW_H + (THM_N_ROWS - 1) * THM_GAP;
+  thm_px = max(4, min(thm_anchor_x + thm_anchor_w - thm_pw, gfx_w - thm_pw - 4));
+  // ⚠ Clamp VERTICALLY too, not just horizontally: a panel hanging off a short
+  // window put its bottom rows past the canvas edge and those settings became
+  // unreachable. When the panel is taller than the whole canvas this lands at 4
+  // and still clips -- that case wants scrolling, which is not built.
+  thm_py = max(4, min(thm_anchor_y + thm_anchor_h + 3, gfx_h - thm_ph - 4));
+  thm_cx = thm_px + THM_PAD + thm_capw + THM_CAP_GAP;
+  thm_r0 = thm_py + THM_PAD;
+);
+
+// ── Input: EARLY ─────────────────────────────────────────────────────────────
+// The deferred list result is the HOST's to poll, in its rows file, because only
+// the host knows which caller ids are its own.
+function thm_input() local(_j, _ry, _in) (
+  // The pick is polled FIRST and unconditionally, because a list outlives the
+  // panel: the click that picks an item can also be the click that closes the
+  // panel. thm_poll is the host's — only it knows its own caller ids.
+  !(gfx_ext_flags & 1) ? thm_poll();
+  // ⚠ While a row's list is up it owns the mouse: swing_popup_tick reads the RAW
+  // buttons the host preserved, so it is immune to the swallow below — but
+  // without this guard a click on a list item that falls outside the panel rect
+  // would also run the close-on-outside-click branch and shut the panel under
+  // its own list.
+  !(gfx_ext_flags & 1) && thm_open && !swing_popup_active ? (
+    thm_geom();
+    // Stash the pointer for the deferred paint: by the time thm_draw runs in the
+    // tail, mx/my may have been zeroed by a gate (the theme dropdown keeps
+    // rkth_mx/rkth_my for exactly this reason).
+    thm_mx = mx; thm_my = my;
+    _in = mx >= thm_px && mx < thm_px + thm_pw && my >= thm_py && my < thm_py + thm_ph;
+    _in ? (
+      // The row hit test MUST run before the panel-wide swallow below, or it
+      // never fires.
+      lmb_down ? (
+        _j = 0;
+        loop(THM_N_ROWS,
+          _ry = thm_r0 + _j * (THM_ROW_H + THM_GAP);
+          (mx >= thm_cx && mx < thm_cx + thm_chipw && my >= _ry && my < _ry + THM_ROW_H) ? (
+            thm_pick_row = _j;
+            thm_openlist(_j, mx, my);
+          );
+          _j += 1;
+        );
+      );
+      lmb_down = 0; rmb_down = 0; frame_wheel = 0;   // the panel owns its rect
+    ) : ( lmb_down ? ( thm_open = 0; lmb_down = 0; ); );   // outside click closes, and is spent closing
+  );
+);
+
+// ── Paint: LATE ──────────────────────────────────────────────────────────────
+// An open row list is a swing_popup and paints after this, so it lands on top.
+function thm_draw() local(_j, _ry, _tw, _th, _hov) (
+  !(gfx_ext_flags & 1) && thm_open ? (
+    thm_geom();
+    gfx_set(0, 0, 0, 0.35); gfx_rect(thm_px + 2, thm_py + 3, thm_pw, thm_ph);
+    rkth_setcol(1, 0.14, 0.16, 0.20, 1); gfx_rect(thm_px, thm_py, thm_pw, thm_ph);
+    rkth_setcol(7, 0.34, 0.37, 0.44, 1); gfx_rect(thm_px, thm_py, thm_pw, thm_ph, 0);
+    _j = 0;
+    loop(THM_N_ROWS,
+      _ry = thm_r0 + _j * (THM_ROW_H + THM_GAP);
+      _hov = thm_mx >= thm_cx && thm_mx < thm_cx + thm_chipw && thm_my >= _ry && thm_my < _ry + THM_ROW_H;
+      gfx_setfont(1, "Arial", 9, 'b');
+      rkth_setcol(3, 0.62, 0.65, 0.70, 1);
+      thm_cap(_j); gfx_measurestr(#_thm_lbl, _tw, _th);
+      gfx_x = thm_px + THM_PAD; gfx_y = _ry + (THM_ROW_H - _th) * 0.5;
+      gfx_drawstr(#_thm_lbl);
+      gfx_set(0.35, 0.35, 0.38, _hov ? 0.95 : 0.68);
+      gfx_rect(thm_cx, _ry, thm_chipw, THM_ROW_H);
+      gfx_setfont(1, "Arial", 11, 'b');
+      gfx_set(1, 1, 1, _hov ? 1.0 : 0.92);
+      thm_val(_j); gfx_measurestr(#_thm_lbl, _tw, _th);
+      gfx_x = thm_cx + (thm_chipw - _tw) * 0.5; gfx_y = _ry + (THM_ROW_H - _th) * 0.5;
+      gfx_drawstr(#_thm_lbl);
+      _j += 1;
+    );
+    // Leave Arial 11 bold set: hosts draw header chrome relying on the font the
+    // header left standing (the hazard rkth_draw_chip documents).
+    gfx_setfont(1, "Arial", 11, 'b');
+  );
+);

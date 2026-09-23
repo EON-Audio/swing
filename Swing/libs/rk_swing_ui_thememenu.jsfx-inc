@@ -1,0 +1,284 @@
+// rk_swing_ui_thememenu.jsfx-inc — Swing's THEME menu (house rule, 2026-09-22)
+//
+// ⭐⭐ THE HOUSE RULE (the user): every JSFX with a GUI has ONE theme menu holding
+// ALL of that plugin's appearance options. Not every plugin has the same options;
+// each shows only the ones it actually has. Swing's are gathered here.
+//
+// ⚠️⚠️ WHY THIS IS SWING'S OWN CODE AND NOT THE SHARED CLUSTER. There are TWO
+// forks of rk_theme.jsfx-inc in this repo and they have drifted hard:
+//   EON/ReaKit/rk_theme.jsfx-inc        955 lines — HAS rkth_cluster* (the dropped
+//                                       appearance panel), LOCK, NATIVE, VU sync.
+//                                       Byte-identical to the RELEASED copy in
+//                                       .ReaKit-Repo/FX/ReaKit/ and used by 13 EON faces.
+//   installer/src/Swing/libs/rk_theme…  181 lines — an OLDER fork with NONE of that:
+//                                       no cluster, no LOCK, no NATIVE. Swing,
+//                                       EON_Drum_Strip and EON_StepSeq import THIS one.
+// Porting the 955-line cluster into Swing's fork would re-skin three shipping faces
+// and touch a file that also ships in the public ReaKit library. Building Swing's menu
+// on Swing's OWN popup system instead leaves both forks untouched, so the 13 EON faces
+// and the released library cannot regress. The rows below therefore delegate every
+// list to swing_popup_open() — the same widget the pad-knob right-click menu uses,
+// which is what guarantees the two paths write identical values.
+//
+// ⛔ LOCK and NATIVE are deliberately NOT rows here. They are features of the OTHER
+// fork, not options Swing has today, so adding them is new behaviour rather than
+// gathering what exists. Both need rkth_band()/rkth_lock_mem() ported into Swing's
+// fork (every raw gmem[GS_THEME_BASE+i] read in the Swing tree would have to move
+// behind the accessor) and LOCK additionally needs somewhere to persist: the EON
+// copy's rkth_lock_serialize() calls file_avail(0) mid-stream, which Swing_ReaKit
+// bans outright at :6447, :6987 and :7005. Left for a later pass, with the user.
+//
+// HOST CONTRACT (Swing_ReaKit.jsfx):
+//   import AFTER rk_swing_popup, rk_theme and rk_swing_ui_state — this file calls
+//     swing_popup_open(), rkth_name()/rkth_cur()/rkth_setcol() and swing_ui_knob_name().
+//   @gfx, right after swing_ui_draw_header():   swing_thm_input();
+//   @gfx, in the tail just before swing_popup_tick():  swing_thm_draw();
+//   The header chip sets thm_open; nothing else may.
+//
+// ⚠️ The panel is INPUT-EARLY / PAINT-LATE, the same split the theme dropdown uses:
+// it hangs over content Swing draws after the header, so the paint must be deferred,
+// but the input must run before the pad grid or a click on a row falls through to a
+// pad. Both halves early-out in an EMBEDDED pass — an embed must never show it.
+
+@init
+
+THM_N_ROWS   = 10;
+
+// Row ids, in draw order. Adding a row later (SCROLL GROUP) is: bump THM_N_ROWS,
+// add one branch to each of the five row functions below. Nothing else changes —
+// the panel size, both column widths and every hit test derive from THM_N_ROWS.
+// ⭐ These ids are DRAW ORDER, nothing more: they are never written to disk and
+// nothing outside this file reads them (Output, Tone and Steppa each declare
+// their own set in their own rows file, which never shares a compile with this
+// one). So HOVER could be slotted in beside KNOB rather than appended, which is
+// where it belongs — it is how a knob answers the mouse, and Elements puts its
+// HOVER bar in the Knobs tab for the same reason.
+THM_ROW_THEME   = 0;
+THM_ROW_KNOB    = 1;
+THM_ROW_HOVER   = 2;
+THM_ROW_VOL_K   = 3;
+THM_ROW_VOL_C   = 4;
+THM_ROW_PAN_K   = 5;
+THM_ROW_PAN_C   = 6;
+THM_ROW_FACE    = 7;
+THM_ROW_NAMEBAR = 8;
+// ⭐ EMBED (the user, 2026-09-22): the header chip moved in here. This row is the
+// odd one out — it does NOT own a value list of its own. It opens the EXISTING
+// embed menu through the EXISTING builder, swing_state_embedmenu_open(), whose
+// four items (two face toggles + two "show it in the TCP/MCP" actions) are still
+// handled by the ONE consumer in rk_swing_ui_state. Duplicating that menu here
+// would be two places to keep in step, which is the bug this whole menu exists to
+// avoid. Its chip therefore summarises the embedded FACE rather than a setting.
+THM_ROW_EMBED   = 9;
+
+
+// ── Value-name helpers ───────────────────────────────────────────────────────
+// ⚠️⚠️ The pad-knob styles are spelled DIFFERENTLY here than in the header's KNOB
+// chip: the pad right-click menu says "Wave" for style 4 and "JO" for style 6
+// (rk_swing_ui_grid_pads.jsfx-inc:1063) where swing_ui_knob_name says "Witti" and
+// "Joanny". A chip must read the same as the list it opens, and the list must stay
+// byte-identical to the right-click menu it mirrors, so the pad rows get their own
+// name helper. Do not "fix" this by calling swing_ui_knob_name here.
+// ⛔ Stops at 18/Roland. The dispatcher knows styles 19 and 20, but slider27/29 are
+// declared <0,18,1> and REAPER would silently clamp them to Roland.
+function swing_thm_padknob_name(v) (
+  v == 1  ? strcpy(#_thm_lbl, "SSL") :
+  v == 2  ? strcpy(#_thm_lbl, "Vari-Mu") :
+  v == 3  ? strcpy(#_thm_lbl, "API") :
+  v == 4  ? strcpy(#_thm_lbl, "Wave") :
+  v == 5  ? strcpy(#_thm_lbl, "Neve") :
+  v == 6  ? strcpy(#_thm_lbl, "JO") :
+  v == 7  ? strcpy(#_thm_lbl, "MPC") :
+  v == 8  ? strcpy(#_thm_lbl, "Jog") :
+  v == 9  ? strcpy(#_thm_lbl, "Rainbow") :
+  v == 10 ? strcpy(#_thm_lbl, "Spice") :
+  v == 11 ? strcpy(#_thm_lbl, "Encoder") :
+  v == 12 ? strcpy(#_thm_lbl, "Pultec") :
+  v == 13 ? strcpy(#_thm_lbl, "Ableton") :
+  v == 14 ? strcpy(#_thm_lbl, "FL") :
+  v == 15 ? strcpy(#_thm_lbl, "Pro Tools") :
+  v == 16 ? strcpy(#_thm_lbl, "FabFilter") :
+  v == 17 ? strcpy(#_thm_lbl, "Serum") :
+  v == 18 ? strcpy(#_thm_lbl, "Roland") :
+  strcpy(#_thm_lbl, "Follow Theme");   // 0 and anything unexpected
+);
+
+function swing_thm_padcol_name(v) (
+  v == 1 ? strcpy(#_thm_lbl, "Red") :
+  v == 2 ? strcpy(#_thm_lbl, "Orange") :
+  v == 3 ? strcpy(#_thm_lbl, "Green") :
+  v == 4 ? strcpy(#_thm_lbl, "Cyan") :
+  v == 5 ? strcpy(#_thm_lbl, "Blue") :
+  v == 6 ? strcpy(#_thm_lbl, "Purple") :
+  v == 7 ? strcpy(#_thm_lbl, "Follow Pad") :
+  v == 8 ? strcpy(#_thm_lbl, "Black") :
+  v == 9 ? strcpy(#_thm_lbl, "White") :
+  strcpy(#_thm_lbl, "Theme");          // 0 and anything unexpected
+);
+
+// ⚠️⚠️ THE COLOUR MENU'S ORDER IS NOT ITS VALUE ORDER. The right-click menu reads
+// Theme, Follow Pad, Red..Purple, Black, White — i.e. menu slot 1 holds value 7.
+// rk_swing_ui_grid_pads.jsfx-inc:1327-1331 proves it. These two functions are each
+// other's inverse and an off-by-one here writes Orange where the user picked Red,
+// silently. k = menu slot (0-based), v = the value the slider stores.
+function swing_thm_col_k2v(k) (
+  k == 0 ? 0 : k == 1 ? 7 : (k >= 2 && k <= 7) ? k - 1 : k;
+);
+function swing_thm_col_v2k(v) (
+  v == 0 ? 0 : v == 7 ? 1 : (v >= 1 && v <= 6) ? v + 1 : v;
+);
+
+// ⚠️⚠️ THE HOVER ROW'S MENU ORDER IS NOT ITS VALUE ORDER, the same trap the pad
+// colour rows carry. The LIBRARY's encoding is 0 = Normal, 1 = None, 2 = Moderate,
+// 3 = Dramatic, and ⛔ it must never be renumbered: an EEL2 global that nobody
+// sets reads 0, so 0 HAS to be the do-nothing level or every plugin that ignores
+// rk_hover_mode would change behaviour. The MENU reads in the order you would
+// choose — None · Moderate · Normal · Dramatic — which is Elements' order, so the
+// two surfaces name the levels identically. These two are each other's inverse.
+// k = menu slot (0-based), v = the value slider46 stores and rk_knob_draw reads.
+function swing_thm_hover_k2v(k) (
+  k == 0 ? 1 : k == 1 ? 2 : k == 2 ? 0 : 3;
+);
+function swing_thm_hover_v2k(v) (
+  v == 1 ? 0 : v == 2 ? 1 : v == 0 ? 2 : 3;
+);
+function swing_thm_hover_name(v) (
+  v == 1 ? strcpy(#_thm_lbl, "None") :
+  v == 2 ? strcpy(#_thm_lbl, "Moderate") :
+  v == 3 ? strcpy(#_thm_lbl, "Dramatic") :
+  strcpy(#_thm_lbl, "Normal");         // 0 and anything unexpected
+);
+
+// ── Row model: five functions, one branch per row each ───────────────────────
+function thm_cap(r) (
+  r == THM_ROW_KNOB    ? strcpy(#_thm_lbl, "KNOB") :
+  r == THM_ROW_HOVER   ? strcpy(#_thm_lbl, "HOVER") :
+  r == THM_ROW_VOL_K   ? strcpy(#_thm_lbl, "PAD VOL KNOB") :
+  r == THM_ROW_VOL_C   ? strcpy(#_thm_lbl, "PAD VOL COLOUR") :
+  r == THM_ROW_PAN_K   ? strcpy(#_thm_lbl, "PAD PAN KNOB") :
+  r == THM_ROW_PAN_C   ? strcpy(#_thm_lbl, "PAD PAN COLOUR") :
+  r == THM_ROW_FACE    ? strcpy(#_thm_lbl, "PAD FACE") :
+  r == THM_ROW_NAMEBAR ? strcpy(#_thm_lbl, "NAME BAR") :
+  r == THM_ROW_EMBED   ? strcpy(#_thm_lbl, "EMBED") :
+  strcpy(#_thm_lbl, "THEME");
+);
+
+function swing_thm_count(r) (
+  r == THM_ROW_THEME ? RKTH_N :
+  r == THM_ROW_KNOB  ? 21 :
+  r == THM_ROW_HOVER ? 4 :
+  (r == THM_ROW_VOL_K || r == THM_ROW_PAN_K) ? 19 :
+  (r == THM_ROW_VOL_C || r == THM_ROW_PAN_C) ? 10 : 2;
+);
+
+// The current value as a MENU SLOT, so the list can tick it.
+function swing_thm_curidx(r) (
+  r == THM_ROW_THEME   ? rkth_cur() - 1 :
+  r == THM_ROW_KNOB    ? (gmem[GS_THEME_KNOB_P] | 0) :
+  r == THM_ROW_HOVER   ? swing_thm_hover_v2k(hover_mode) :
+  r == THM_ROW_VOL_K   ? pad_vol_style :
+  r == THM_ROW_VOL_C   ? swing_thm_col_v2k(pad_vol_appear) :
+  r == THM_ROW_PAN_K   ? pad_pan_style :
+  r == THM_ROW_PAN_C   ? swing_thm_col_v2k(pad_pan_appear) :
+  r == THM_ROW_FACE    ? pad_icon_mode :
+  name_bar;
+);
+
+// One option's label, by menu slot. Writes #_thm_lbl.
+function swing_thm_optname(r, k) (
+  r == THM_ROW_THEME ? strcpy(#_thm_lbl, rkth_name(k)) :
+  r == THM_ROW_KNOB  ? ( swing_ui_knob_name(k); strcpy(#_thm_lbl, #_knob_name); ) :
+  r == THM_ROW_HOVER ? swing_thm_hover_name(swing_thm_hover_k2v(k)) :
+  (r == THM_ROW_VOL_K || r == THM_ROW_PAN_K) ? swing_thm_padknob_name(k) :
+  (r == THM_ROW_VOL_C || r == THM_ROW_PAN_C) ? swing_thm_padcol_name(swing_thm_col_k2v(k)) :
+  r == THM_ROW_FACE ? ( k ? strcpy(#_thm_lbl, "Icon") : strcpy(#_thm_lbl, "Waveform"); ) :
+  ( k ? strcpy(#_thm_lbl, "Shown") : strcpy(#_thm_lbl, "Hidden"); );
+);
+
+// The chip face: the CURRENT value's label. Same helpers, so chip and list agree.
+function thm_val(r) (
+  r == THM_ROW_THEME ? strcpy(#_thm_lbl, rkth_name(rkth_cur() - 1)) :
+  r == THM_ROW_KNOB  ? ( swing_ui_knob_name(gmem[GS_THEME_KNOB_P] | 0); strcpy(#_thm_lbl, #_knob_name); ) :
+  r == THM_ROW_HOVER ? swing_thm_hover_name(hover_mode) :
+  r == THM_ROW_VOL_K ? swing_thm_padknob_name(pad_vol_style) :
+  r == THM_ROW_VOL_C ? swing_thm_padcol_name(pad_vol_appear) :
+  r == THM_ROW_PAN_K ? swing_thm_padknob_name(pad_pan_style) :
+  r == THM_ROW_PAN_C ? swing_thm_padcol_name(pad_pan_appear) :
+  r == THM_ROW_FACE  ? ( pad_icon_mode ? strcpy(#_thm_lbl, "Icon") : strcpy(#_thm_lbl, "Waveform"); ) :
+  r == THM_ROW_NAMEBAR ? ( name_bar ? strcpy(#_thm_lbl, "Shown") : strcpy(#_thm_lbl, "Hidden"); ) :
+  // EMBED: what the embedded pad face shows right now.
+  (embed_show_knobs && embed_show_icons) ? strcpy(#_thm_lbl, "Knobs + Icons") :
+  embed_show_knobs ? strcpy(#_thm_lbl, "Knobs") :
+  embed_show_icons ? strcpy(#_thm_lbl, "Icons") :
+  strcpy(#_thm_lbl, "Plain");
+);
+
+// Build a row's list. '!' ticks the live value (swing_popup's per-item marker).
+function swing_thm_menu(r) local(_k, _n, _cur) (
+  _n = swing_thm_count(r); _cur = swing_thm_curidx(r);
+  strcpy(#_thm_items, "");
+  _k = 0;
+  loop(_n,
+    _k > 0 ? strcat(#_thm_items, "|");
+    _k == _cur ? strcat(#_thm_items, "!");
+    swing_thm_optname(r, _k);
+    strcat(#_thm_items, #_thm_lbl);
+    _k += 1;
+  );
+);
+
+// ⭐ A pick writes EXACTLY what the existing surface writes, so the two paths can
+// never disagree. Theme + knob go to the bridge as requests (it persists and
+// republishes); the five pad/name sliders persist in the FX chunk, untouched by
+// @serialize. Equivalence with rk_swing_ui_grid_pads.jsfx-inc:1318-1341: its
+// combined menu decodes style at results 2..20 as r-2; the standalone style list
+// here sits at 1..19, so r-1 — the identical value set 0..18. Its colour decode
+// (22->0, 23->7, 24..29->r-23, 30->8, 31->9) minus the 21-item offset is exactly
+// swing_thm_col_k2v.
+function swing_thm_apply(r, res) local(_k) (
+  _k = res - 1;   // swing_popup returns 1-based
+  r == THM_ROW_THEME   ? ( gmem[GS_THEME_REQ] = _k + 1; ) :
+  r == THM_ROW_KNOB    ? ( gmem[GS_THEME_KNOB_REQ] = _k + 1; ) :
+  // ⛔ PER-INSTANCE, not a bridge request. THEME and KNOB above are suite-wide
+  // because the bridge republishes them; rk_hover_mode is a plain EEL2 global,
+  // which is per-instance by definition, so there is nothing to broadcast to.
+  // Making it suite-wide means a new cell in the published theme band and a
+  // bridge change — a protocol decision, not part of adding the row.
+  r == THM_ROW_HOVER   ? ( hover_mode = swing_thm_hover_k2v(_k); rk_hover_mode = hover_mode;
+                           slider_automate(slider46); mark_dirty(); ) :
+  r == THM_ROW_VOL_K   ? ( pad_vol_style  = _k; slider_automate(slider27); mark_dirty(); ) :
+  r == THM_ROW_VOL_C   ? ( pad_vol_appear = swing_thm_col_k2v(_k); slider_automate(slider28); mark_dirty(); ) :
+  r == THM_ROW_PAN_K   ? ( pad_pan_style  = _k; slider_automate(slider29); mark_dirty(); ) :
+  r == THM_ROW_PAN_C   ? ( pad_pan_appear = swing_thm_col_k2v(_k); slider_automate(slider30); mark_dirty(); ) :
+  r == THM_ROW_FACE    ? ( pad_icon_mode  = _k; slider_automate(slider25); mark_dirty(); ) :
+  ( name_bar = _k; slider_automate(slider45); mark_dirty(); );
+);
+
+// Poll the deferred pick. Called by the core EVERY frame, open or shut, because
+// a list outlives the panel: a click on an item that lands outside the panel rect
+// closes the panel in the same frame the pick is still pending. Only Swing knows
+// which caller ids are its own, which is why this lives here and not in the core.
+// ⛔ The EMBED row's menu is NOT polled here — it uses SP_POPUP_CALLER_EMBED_MENU
+// and rk_swing_ui_state is still its one and only consumer.
+function thm_poll() (
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_THEME ? (
+    swing_thm_apply(thm_pick_row, swing_popup_result);
+    swing_popup_result = 0;
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_THEME ? (
+    swing_popup_result = 0;
+  );
+);
+
+// One opener for every row. The EMBED row is the exception: it hands off to the
+// shared embed-menu builder, so that menu keeps ONE definition and ONE consumer.
+function thm_openlist(r, px, py) (
+  r == THM_ROW_EMBED ? (
+    swing_state_embedmenu_open(px, py);
+  ) : (
+    thm_pick_row = r;
+    swing_thm_menu(r);
+    swing_popup_open(px, py, #_thm_items, SP_POPUP_CALLER_THEME);
+  );
+);
+

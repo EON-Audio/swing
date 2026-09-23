@@ -2118,19 +2118,18 @@ function swing_ui_draw_header() (
   _redo_bw = _redo_tw + _btn_pad * 2;
   gfx_measurestr("↶ UNDO", _undo_tw, _btn_th);
   _undo_bw = _undo_tw + _btn_pad * 2;
-  gfx_measurestr("EMBED", _emb_tw, _emb_th);
-  _emb_bw  = _emb_tw + _btn_pad * 2;
   gfx_measurestr("⚙", _thru_tw, _btn_th);   // gear glyph drives the slot width
   _thru_bw = _thru_tw + _btn_pad * 2 + 6;        // extra padding so the icon button isn't cramped
   // Anchor: REDO ends 90 px from the right edge — leaves room for the
   // BRIDGE indicator + label, with a small visual gap from the cluster.
-  // Cluster reads left-to-right: THRU → EMBED → UNDO → REDO.
+  // Cluster reads left-to-right: THRU → UNDO → REDO.
+  // ⭐ EMBED left the header 2026-09-22 (the user): it is a look-of-the-embed
+  // control, so it is a row in the THEME menu now. Its MENU and its result
+  // handler are untouched and still live in this file — only the chip is gone,
+  // so the cluster anchors straight from UNDO.
   _redo_bx = gfx_w - 90 - _redo_bw;
   _undo_bx = _redo_bx - _undo_bw - _btn_gap;
-  _emb_bx  = _undo_bx - _emb_bw  - _btn_gap;
-  _thru_bx = _emb_bx  - _thru_bw - _btn_gap;
-  _emb_by  = _btn_y;
-  _emb_bh  = _btn_h;
+  _thru_bx = _undo_bx - _thru_bw - _btn_gap;
 
   // ── THEME selector ──
   // JSFX can't SetExtState, so a pick writes the chosen theme index to
@@ -2159,17 +2158,39 @@ function swing_ui_draw_header() (
   // longest. Same HDR_CAP_MIN_X the caption system already respects; anchor
   // math and popup-result consumers stay unconditional.
   _thm_bx >= HDR_CAP_MIN_X ? (
-    rkth_input(_thm_bx, _btn_y, _thm_bw, _btn_h, mx, my, lmb_down, rmb_down, frame_wheel, _btn_h) ? ( lmb_down = 0; frame_wheel = 0; );
+    // ⭐⭐ HOUSE RULE (2026-09-22): a LEFT click opens Swing's THEME MENU — the one
+    // panel holding every appearance option this plugin has. Nothing is lost: the
+    // theme list is still one RIGHT click away, and it is also the panel's first
+    // row. lmb is passed to rkth_input as 0 so the widget still stores its geometry
+    // for rkth_draw_chip and rkth_overlay_draw, without toggling its own list on a
+    // left click. Wheel still cycles the theme.
+    // The panel hangs from this chip; the core right-aligns itself to it.
+    thm_anchor_x = _thm_bx; thm_anchor_y = _btn_y;
+    thm_anchor_w = _thm_bw; thm_anchor_h = _btn_h;
+    _thm_lclick = lmb_down && mx >= _thm_bx && mx <= _thm_bx + _thm_bw && my >= _btn_y && my <= _btn_y + _btn_h;
+    rkth_input(_thm_bx, _btn_y, _thm_bw, _btn_h, mx, my, 0, rmb_down, frame_wheel, _btn_h) ? ( lmb_down = 0; frame_wheel = 0; );
+    // Spend the click HERE, so swing_thm_input's click-outside-closes test (which
+    // runs later this frame) cannot immediately undo the open.
+    _thm_lclick ? ( thm_open = 1 - thm_open; rkth_open = 0; lmb_down = 0; );
     rkth_draw_chip(11);
     _thm_hover = mx >= _thm_bx && mx <= _thm_bx + _thm_bw && my >= _btn_y && my <= _btn_y + _btn_h;
     _thm_hover ? (
-      #tooltip = "Theme — click / right-click for the list · hover+wheel cycles. Syncs all EON tools.";
+      #tooltip = "Theme menu — click for every appearance option · right-click for the theme list · hover+wheel cycles. Syncs all EON tools.";
     );
     // Caption drawn on Swing's side, NOT inside rkth_draw_chip: that widget is
     // shared with Drum Strip and ships in the ReaKit library, and this is a
     // Swing-layout decision. Consumed width shifts the TOOLBAR anchor below.
     _thm_capw = swing_ui_hdr_cap("THEME", _thm_bx, _btn_y, _btn_h, _thm_hover);
-  ) : ( _thm_capw = 0; rkth_open = 0; );   // folded chip closes its list, or it paints on with nothing to close it
+  ) : (
+    // Folded chip: close its list AND its menu, or they paint on with nothing
+    // left to close them. ⚠ thm_open = 0 is NOT enough -- a row's list is a
+    // swing_popup with its own lifetime, and swing_popup_tick is called
+    // unconditionally in the tail, so it would outlive the panel that opened it.
+    _thm_capw = 0; rkth_open = 0; thm_open = 0;
+    swing_popup_active &&
+      (swing_popup_caller_id == SP_POPUP_CALLER_THEME || swing_popup_caller_id == SP_POPUP_CALLER_EMBED_MENU)
+      ? swing_popup_close(-1);
+  );
 
   // ── TOOLBAR button — open/close the EON toolbar (bridge CMD 78). Sits just left
   //    of THEME. The bridge finds the [Floating toolbar N] titled EON and toggles
@@ -2197,51 +2218,12 @@ function swing_ui_draw_header() (
     );
   );
 
-  // ── KNOB style selector — pad-knob style, sits just left of THEME (both are
-  //    appearance controls). Writes (style+1) to GS_THEME_KNOB_REQ; the bridge
-  //    persists it per-theme + republishes GS_THEME_KNOB_P (pad knobs morph;
-  //    master knobs stay native). Reserve "FabFilter" so the chip width is
-  //    stable as the style name changes. ──
-  gfx_setfont(1, "Arial", 11, 'b');
-  gfx_measurestr("FabFilter", _knob_maxw, _knob_th2);
-  _knob_bw = _knob_maxw + _btn_pad * 2;
-  _knob_bx = _thm_bx - _thm_capw - _knob_bw - _btn_gap;   // clears the THEME caption (swap: THEME is left of TOOLBAR now)
-  _knob_cur = gmem[GS_THEME_KNOB_P] | 0;
-  _knob_bx >= HDR_CAP_MIN_X ? (
-    _knob_hover = mx >= _knob_bx && mx <= _knob_bx + _knob_bw && my >= _btn_y && my <= _btn_y + _btn_h;
-    gfx_set(0.35, 0.35, 0.38, _knob_hover ? 0.95 : 0.68);
-    gfx_rect(_knob_bx, _btn_y, _knob_bw, _btn_h);
-    gfx_set(1, 1, 1, _knob_hover ? 1.0 : 0.92);
-    swing_ui_knob_name(_knob_cur);
-    gfx_measurestr(#_knob_name, _knob_lw, _knob_lh);
-    gfx_x = _knob_bx + (_knob_bw - _knob_lw) * 0.5; gfx_y = _btn_y + (_btn_h - _knob_lh) * 0.5;
-    gfx_drawstr(#_knob_name);
-    _knob_hover ? (
-      #tooltip = "Pad knob style — click / right-click for the list · hover+wheel cycles. Saved per theme; master knobs unaffected.";
-    );
-    _knob_capw = swing_ui_hdr_cap("KNOB", _knob_bx, _btn_y, _btn_h, _knob_hover);
-    // Click (either button) → style picker popup
-    _knob_hover && (lmb_down || rmb_down) ? (
-      swing_popup_open(mx, my,
-        "Default|SSL|Vari-Mu|API|Witti|Neve|Joanny|MPC|Jog|Rainbow|Spice|Encoder|Pultec|Ableton|FL|Pro Tools|FabFilter|Serum|Roland|Pultec Cr|Neve Alt",
-        SP_POPUP_CALLER_KNOB_STYLE);
-      lmb_down = 0;
-    );
-    // Wheel → cycle (numeric style order)
-    _knob_hover && frame_wheel != 0 ? (
-      gmem[GS_THEME_KNOB_REQ] = (frame_wheel > 0 ? swing_ui_knob_next(_knob_cur) : swing_ui_knob_prev(_knob_cur)) + 1;
-      frame_wheel = 0;
-    );
-  ) : ( _knob_capw = 0; );
-  // Popup pick → style request. Row = style id: positions 1..21 → id (r-1).
-  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_KNOB_STYLE ? (
-    _knob_pick = swing_popup_result - 1;
-    swing_popup_result = 0;
-    gmem[GS_THEME_KNOB_REQ] = _knob_pick + 1;
-  );
-  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_KNOB_STYLE ? (
-    swing_popup_result = 0;
-  );
+  // ── KNOB style selector: REMOVED from the header (the user, 2026-09-22) ──
+  // "take knob out the main view now since its in the menu". The pad-knob style
+  // is the THEME menu's KNOB row, which writes the same GS_THEME_KNOB_REQ this
+  // chip did. swing_ui_knob_name / _next / _prev stay — the menu row uses them.
+  // SP_POPUP_CALLER_KNOB_STYLE now has no opener and no consumer anywhere.
+  _knob_capw = 0;   // STRIPS anchored off this; it now anchors off THEME directly
 
   // ── STRIPS view selector — remote-controls the embedded VIEW of every EON Drum
   //    Strip on THIS Swing instance (multi-out only). Click / hover-wheel cycle
@@ -2256,7 +2238,7 @@ function swing_ui_draw_header() (
     gfx_setfont(1, "Arial", 11, 'b');
     gfx_measurestr("S+VU", _strv_mw, _strv_th);
     _strv_bw = _strv_mw + _btn_pad * 2;
-    _strv_bx = _knob_bx - _knob_capw - _strv_bw - _btn_gap;   // clears the KNOB caption
+    _strv_bx = _thm_bx - _thm_capw - _strv_bw - _btn_gap;   // clears the THEME caption (KNOB chip removed 2026-09-22)
     _strv_bx >= HDR_CAP_MIN_X ? (
       _strv_hover = mx >= _strv_bx && mx <= _strv_bx + _strv_bw && my >= _btn_y && my <= _btn_y + _btn_h;
       gfx_set(0.35, 0.35, 0.38, _strv_hover ? 0.95 : 0.68);
@@ -2427,35 +2409,11 @@ function swing_ui_draw_header() (
     swing_popup_wheel = 0;
   );
 
-  // ── EMBED button ──
-  _emb_hover = _emb_bx >= HDR_CAP_MIN_X
-            && mx >= _emb_bx && mx <= _emb_bx + _emb_bw &&
-               my >= _emb_by && my <= _emb_by + _emb_bh;
-  _emb_bx >= HDR_CAP_MIN_X ? (
-    embed_show_knobs ? (
-      gfx_set(0.35, 0.65, 0.85, _emb_hover ? 0.95 : 0.75);  // active blue
-    ) : (
-      gfx_set(0.35, 0.35, 0.38, _emb_hover ? 0.85 : 0.65);  // neutral gray
-    );
-    gfx_rect(_emb_bx, _emb_by, _emb_bw, _emb_bh);
-    gfx_set(1, 1, 1, _emb_hover ? 1.0 : 0.95);
-    gfx_x = _emb_bx + _btn_pad; gfx_y = _emb_by + (_emb_bh - _emb_th) * 0.5;
-    gfx_drawstr("EMBED");
-  );
-  lmb_down && _emb_hover ? (
-    // Migrated to Swing-styled popup. Labels flip with state so the user
-    // sees what the click will DO (Show vs Hide) instead of relying on
-    // gfx_showmenu's checkmark indicator (which our popup doesn't render).
-    // Items 1-2 style the embedded FACE; items 3-4 turn embedding ON.
-    // There is no API to set embedding — the full TrackFX named-config-parm
-    // list has no key for it — so the bridge focuses this FX and fires
-    // REAPER's own "Show last focused FX embedded UI in TCP/MCP" action.
-    // ⚠️SHOW only: REAPER's matching hide is "hide ALL embedded FX on the
-    // selected tracks" (and has no MCP twin), which would silently do more
-    // than a menu item here claims. Turning it back off stays where it
-    // already is — right-click the FX in the chain.
-    swing_state_embedmenu_open(mx, my);
-  );
+  // ── EMBED: no header chip any more (the user, 2026-09-22) ──────────────
+  // The button moved into the THEME menu's EMBED row, which opens the SAME
+  // menu through the SAME builder (swing_state_embedmenu_open). The result
+  // handler below stays here and is still the only consumer, so nothing about
+  // what the menu DOES changed — only where it is opened from.
   swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_EMBED_MENU ? (
     swing_popup_result == 1 ? ( embed_show_knobs = !embed_show_knobs; );
     swing_popup_result == 2 ? ( embed_show_icons = !embed_show_icons; slider_automate(slider26); );

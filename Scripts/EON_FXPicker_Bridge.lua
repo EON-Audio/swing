@@ -114,6 +114,16 @@ if not ok then
   return
 end
 
+-- Styled dialog module (ReaImGui), the Kit Bridge's contract: pcall'd, gated on
+-- available(), and every call site keeps its native GetUserInputs /
+-- ShowMessageBox fallback. ⚠️ its prompts are ASYNC -- the work goes INSIDE
+-- on_ok, never after the call.
+local eon_dlg
+do
+  local okd, m = pcall(dofile, dir .. "/EON/eon_imgui_dialog.lua")
+  if okd and type(m) == "table" then eon_dlg = m end
+end
+
 -- Toggle: a second run stops the first.
 local _, _, secId, cmdId = reaper.get_action_context()
 if reaper.GetExtState("EON_FXPICK", "running") == "1" then
@@ -308,6 +318,9 @@ local CHMODE, CHREL_LEN, CHREL, CHREL_MAX = 145, 146, 147, 40
 local K_CHAIN, K_FOLDER = 4, 5
 local ch_rel = {}          -- per slot, the folder currently being listed
 
+-- ⚠️ This string comes out of SHARED gmem, so it is untrusted. The engine
+-- refuses anything that leaves FXChains (fx.chain_rel, called by every chain_*
+-- function), which is where the check has to live: that is what opens files.
 local function read_rel(b)
   local n = math.floor(reaper.gmem_read(b + CHREL_LEN) or 0)
   n = math.max(0, math.min(CHREL_MAX, n))
@@ -713,6 +726,112 @@ local function track_frozen(tr)
   return (ok and chunk and chunk:find('<FREEZE', 1, true)) and true or false
 end
 
+-- ── SAVE CHAIN: ask for a name ──────────────────────────────────────────────
+-- ⚠️ This used to pass the BROWSED FOLDER as the chain's name. At the root that
+-- is "" -- the engine refused it ("no name given") and the result was dropped,
+-- so the button did nothing at all -- and inside "Drums" it wrote
+-- FXChains/Drums.RfxChain BESIDE the folder and silently overwrote it on every
+-- save. Found by the 2026-09-22 safety-audit follow-up. Now: a name prompt,
+-- written into the folder you are looking at, and an overwrite is confirmed.
+
+-- What a chain file may be called. Strips the characters Windows forbids (the
+-- separators among them, so a name can never reach out of the folder), the
+-- trailing dots and spaces Win32 trims off by itself, and a typed .RfxChain so
+-- the extension is added exactly once. '?' goes too: pad names arrive from gmem
+-- with every non-ASCII byte already folded to '?', which is not a legal
+-- filename character.
+local function chain_name_clean(s)
+  s = tostring(s or "")
+  s = s:gsub("%.[rR][fF][xX][cC][hH][aA][iI][nN]$", "")
+  s = s:gsub('[<>:"/\\|%?%*%c]', " ")
+  s = s:gsub("%s+", " "):gsub("^[%s%.]+", ""):gsub("[%s%.]+$", "")
+  if #s > 64 then s = s:sub(1, 64):gsub("[%s%.]+$", "") end
+  -- ⚠️ Windows DEVICE NAMES are not filenames, and an extension does not rescue
+  -- them: CON, NUL, PRN, AUX, COM1..9, LPT1..9 -- and CON.anything too. Every
+  -- character in them is legal, so the cleaner above passes them through and the
+  -- save then fails with no useful message. Rejecting returns "" , which the
+  -- caller already treats as "nothing usable typed".
+  local stem = s:match("^([^%.]*)") or s
+  if stem:upper():match("^CON$") or stem:upper():match("^PRN$") or stem:upper():match("^AUX$")
+     or stem:upper():match("^NUL$") or stem:upper():match("^COM[1-9]$")
+     or stem:upper():match("^LPT[1-9]$") then
+    return ""
+  end
+  return s
+end
+
+-- ⚠️⚠️ `folder` IS AN ARGUMENT, NOT RE-READ FROM ch_rel. The overwrite prompt is
+-- asynchronous: the user can browse to another folder while it is up. Reading
+-- ch_rel[slot] again here meant the path we CHECKED and the path we WROTE could
+-- differ -- confirm "replace" for Drums/Kick, land on Bass/Kick, and overwrite a
+-- chain that was never mentioned. Reproduced by the 2026-09-22 Codex audit with
+-- mocked callbacks. Whatever the destination was when we asked is what we write.
+local function chain_save_write(tr, pad, v, slot, name, folder)
+  -- The answer arrives a dialog later, so the track is re-checked here.
+  if not (tr and reaper.ValidatePtr2(0, tr, "MediaTrack*")) then return end
+  folder = folder or ch_rel[slot] or ""
+  local rel = (folder == "" and name or (folder .. "/" .. name)) .. ".RfxChain"
+  local okw, err
+  if v then okw, err = fx.view_chain_save(tr, pad, rel)
+  else okw, err = fx.chain_save(tr, rel) end
+  if not okw then
+    reaper.ShowConsoleMsg("[EON] " .. tostring(err or "chain save failed") .. NL)
+    return
+  end
+  -- The listing is now stale -- the new chain would not appear until the folder
+  -- changed. Dropping the cache key rebuilds it on the next query.
+  view_q = nil
+end
+
+local function chain_save_named(tr, pad, v, slot, name)
+  name = chain_name_clean(name)
+  if name == "" then return end          -- cancelled, or nothing usable typed
+  local folder = ch_rel[slot] or ""
+  local path = fx.chain_dir() .. "/" .. (folder == "" and name or (folder .. "/" .. name))
+             .. ".RfxChain"
+  local f = io.open(path, "r")
+  -- `folder` is captured ABOVE and threaded through every branch: the one we
+  -- tested for existence is the one we write, even if the browser moved while
+  -- the prompt was up.
+  if not f then return chain_save_write(tr, pad, v, slot, name, folder) end
+  f:close()
+  local msg = '"' .. name .. '" already exists. Replace it?'
+  local shown = eon_dlg and eon_dlg.available() and eon_dlg.confirm and eon_dlg.confirm({
+    title = "Save FX chain", message = msg, ok_label = "Replace",
+    on_ok = function() chain_save_write(tr, pad, v, slot, name, folder) end,
+  })
+  if not shown then
+    -- MB type 4 is Yes/No, and its answers are 6 = Yes, 7 = No.
+    if reaper.ShowMessageBox(msg, "Save FX chain", 4) == 6 then
+      chain_save_write(tr, pad, v, slot, name, folder)
+    end
+  end
+end
+
+local function chain_save_prompt(tr, pad, v, slot)
+  if eon_dlg and eon_dlg.busy and eon_dlg.busy() then return end
+  local folder = ch_rel[slot] or ""
+  -- A default worth keeping: the pad's own name in a pad view, else the track's.
+  local def = (pad ~= nil and pad >= 0) and ci_pad_name(slot, pad) or ""
+  if def == "" and reaper.GetTrackName then
+    local _, tn = reaper.GetTrackName(tr)
+    def = tn or ""
+  end
+  def = chain_name_clean(def)
+  if def == "" then def = "My Chain" end
+  local where = (folder == "") and "saved in FXChains" or ("saved in FXChains/" .. folder)
+  local shown = eon_dlg and eon_dlg.available() and eon_dlg.open({
+    title = "Save FX chain", ok_label = "Save",
+    fields = { { key = "name", label = "Name", value = def, sub = where } },
+    on_ok = function(vals) chain_save_named(tr, pad, v, slot, vals.name) end,
+  })
+  if not shown then
+    local okd, nm = reaper.GetUserInputs("Save FX chain", 1,
+                                         "Name:,extrawidth=220", def)
+    if okd then chain_save_named(tr, pad, v, slot, nm) end
+  end
+end
+
 local function do_action(slot, verb, a, bnum)
   -- ⚠️ THE SAME RESOLVER THE PUBLISH USES. Acting on a different track than
   -- the one on screen is not a wrong result, it is an invisible one.
@@ -766,11 +885,10 @@ local function do_action(slot, verb, a, bnum)
         ch_fp[slot] = nil          -- the chain definitely moved
       end
     else
-      -- SAVE writes the target's CURRENT chain into the folder being
-      -- browsed, so "save here" means the folder you are looking at. A pad
-      -- view saves just that pad's slice, with the pad pins stripped.
-      if v then fx.view_chain_save(tr, pad, ch_rel[slot] or "")
-      else fx.chain_save(tr, ch_rel[slot] or "") end
+      -- SAVE asks for a name and writes the target's CURRENT chain into the
+      -- folder being browsed, so "save here" means the folder you are looking
+      -- at. A pad view saves just that pad's slice, with the pad pins stripped.
+      chain_save_prompt(tr, pad, v, slot)
     end
     return
   elseif verb == A_OFFLINE then

@@ -43,7 +43,7 @@ local UPDATE_URL        = "https://api.github.com/repos/EON-Audio/swing/releases
 -- never fired only because no GitHub release exists yet. deploy.sh now refuses
 -- to publish when this does not match the version being released, so the drift
 -- cannot come back silently.
-local CURRENT_VERSION   = "3.0.17"
+local CURRENT_VERSION   = "3.0.18"
 local POLL_INTERVAL     = 5.0        -- seconds between heartbeat polls
 local HEARTBEAT_TIMEOUT = 2.0        -- seconds of stale counter = Swing gone
 
@@ -344,8 +344,13 @@ local function start_update_check()
   -- Both paths go into a shell line. A quote in the resource path would break
   -- out of it, so refuse rather than build something unpredictable -- the check
   -- is a nicety, a mangled command line is not worth it.
-  if final:find('"', 1, true) or final:find("'", 1, true) then
-    update_dbg("[EON] Update check skipped: resource path contains a quote.\n")
+  -- ⚠️ Quotes are not the only way out. Inside the double quotes sh still
+  -- expands $( ), backticks and $VAR, and cmd expands %VAR% (and !VAR! when
+  -- delayed expansion is on in the registry), so a crafted folder name ran a
+  -- command with no quote in it at all. Refuse every character either shell
+  -- still acts on inside a quoted string, plus control characters.
+  if final:find("[\"'$`%%!%c]") then
+    update_dbg("[EON] Update check skipped: resource path has a character the shell would expand.\n")
     gmem_write(GS_UPDATE_STATE, 0)
     return
   end

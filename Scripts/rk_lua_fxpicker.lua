@@ -35,6 +35,7 @@
 --   M.chain_list(rel)            -> { dirs = {...}, files = {...} }
 --   M.chain_apply(tr, rel, mode) -> true | nil, err   mode "append" | "replace"
 --   M.chain_save(tr, rel)        -> true | nil, err
+--   M.chain_rel(rel)             -> rel normalised | nil, err (refuses escapes)
 --
 -- Indices are 0-based throughout, matching the ReaScript FX API. Lua arrays
 -- returned by chain()/registry() are 1-based; each row carries its own `.idx`.
@@ -52,6 +53,11 @@ local r = reaper
 
 local recipes = nil
 do local ok, m = pcall(require, "rk_lua_fx_recipes"); if ok then recipes = m end end
+
+-- The checked writer (core.write_file_checked: temp -> verified -> publish, old
+-- file restored on failure). Both loaders put this folder on package.path first.
+local core = nil
+do local ok, m = pcall(require, "rk_lua_core"); if ok then core = m end end
 
 M.BUCKETS = recipes and recipes.BUCKETS or {
   "comp", "eq", "sat", "verb", "delay", "limit", "strip", "pitch", "amp",
@@ -757,6 +763,38 @@ end
 
 local SEP = package.config and package.config:sub(1, 1) or "/"
 
+-- A user file we REPLACE (a chain saved under an existing name, the banks file)
+-- goes through the checked writer: a plain io.open(path, "w") truncates the old
+-- file before the first byte lands, so a full disk or a dropped share mid-write
+-- loses it. `body` is a string or a function(h) that calls h:write(...).
+local function write_checked(path, mode, body)
+  if not core then return nil, "rk_lua_core is missing" end
+  local ok, err = core.write_file_checked(path, mode, body)
+  if not ok then return nil, err end
+  return true
+end
+
+-- ⚠️ `rel` crosses a trust boundary. EON_FXPicker_Bridge reads it out of shared
+-- gmem, which any JSFX or script in the process can write. The face only ever
+-- builds it from folders it listed, but the ENGINE does the file I/O, so the
+-- engine enforces the root: a plain relative path under FXChains and nothing
+-- else. Refused: a leading separator (absolute or UNC), ':' (a drive, or an NTFS
+-- stream), control characters, and any component made only of dots and spaces
+-- -- '..' itself, and the '.. ' Windows would trim back into it. Doubled
+-- separators collapse. Returns the path rebuilt with this platform's separator
+-- ("" for the root), or nil + why.
+function M.chain_rel(rel)
+  rel = rel or ""
+  if rel == "" then return "" end
+  if rel:find("[%c:]") or rel:find("^[/\\]") then return nil, "chain: path refused" end
+  local parts = {}
+  for p in rel:gmatch("[^/\\]+") do
+    if p:find("^[%. ]*$") then return nil, "chain: path refused" end
+    parts[#parts + 1] = p
+  end
+  return table.concat(parts, SEP)
+end
+
 -- ── FX folders (the "banks" rail) ───────────────────────────────────────────
 -- reaper-fxfolders.ini: [FolderN] holds ItemK=<path or ident> and Nb=<count>;
 -- [Folders] holds NameN=<display name>. The two are joined BY INDEX -- that is
@@ -920,15 +958,6 @@ end
 local function mybank_write(list, hid)
   local path = mybank_path()
   r.RecursiveCreateDirectory(MYBANK_DIR, 0)
-  local tmp = path .. ".tmp"
-  local f = io.open(tmp, "w")
-  if not f then return nil, "cannot write " .. tmp end
-  f:write("# EON Swing FX banks. One [Bank Name] per bank, one plug-in per\n")
-  f:write("# line, written as REAPER names it. Safe to edit by hand.\n")
-  for _, b in ipairs(list) do
-    f:write("[", b.name, "]\n")
-    for _, id in ipairs(b.idents or {}) do f:write(id, "\n") end
-  end
   -- ⚠️⚠️ THE HIDDEN LIST IS REWRITTEN TOO, ALWAYS. This function writes the
   -- WHOLE file, so a caller that only meant to add a plug-in to a bank would
   -- otherwise drop every hidden name on the floor. `hid` defaults to what is
@@ -937,15 +966,20 @@ local function mybank_write(list, hid)
   local hn = {}
   for k in pairs(hid) do hn[#hn + 1] = k end
   table.sort(hn)                      -- a stable file diffs and reads sanely
-  if #hn > 0 then
-    f:write("[hidden]\n")
-    for _, k in ipairs(hn) do f:write(k, "\n") end
-  end
-  f:close()
-  os.remove(path)
-  local ok = os.rename(tmp, path)
-  if not ok then return nil, "cannot replace " .. path end
-  return true
+  -- Checked publish. This used to remove the live file and THEN rename the
+  -- temp over it, unchecked: a blocked rename lost every bank.
+  return write_checked(path, "w", function(f)
+    f:write("# EON Swing FX banks. One [Bank Name] per bank, one plug-in per\n")
+    f:write("# line, written as REAPER names it. Safe to edit by hand.\n")
+    for _, b in ipairs(list) do
+      f:write("[", b.name, "]\n")
+      for _, id in ipairs(b.idents or {}) do f:write(id, "\n") end
+    end
+    if #hn > 0 then
+      f:write("[hidden]\n")
+      for _, k in ipairs(hn) do f:write(k, "\n") end
+    end
+  end)
 end
 
 local function mybank_find(list, name)
@@ -1075,10 +1109,11 @@ end
 --- recursive walk: the spec's CHAINS rail is "top-level + breadcrumb; no
 --- expand-triangle tree widget", so one level is all a frontend ever needs.
 function M.chain_list(rel)
-  rel = rel or ""
+  local out = { dirs = {}, files = {} }
+  rel = M.chain_rel(rel)
+  if not rel then return out end
   local dir = M.chain_dir()
   if rel ~= "" then dir = dir .. SEP .. rel end
-  local out = { dirs = {}, files = {} }
   if not r.EnumerateSubdirectories or not r.EnumerateFiles then return out end
   local i = 0
   while true do
@@ -1113,6 +1148,9 @@ end
 function M.chain_apply(tr, rel, mode)
   if not tr then return nil, "chain: no track" end
   if not rel or rel == "" then return nil, "chain: no chain given" end
+  local rerr
+  rel, rerr = M.chain_rel(rel)
+  if not rel then return nil, rerr end
   local abs = M.chain_dir() .. SEP .. rel
   undo_begin()
   if mode == "replace" then
@@ -1172,6 +1210,9 @@ end
 function M.chain_save(tr, rel, guids)
   if not tr then return nil, "chain save: no track" end
   if not rel or rel == "" then return nil, "chain save: no name given" end
+  local rerr
+  rel, rerr = M.chain_rel(rel)
+  if not rel then return nil, rerr end
   if not rel:lower():find("%.rfxchain$") then rel = rel .. ".RfxChain" end
   local blocks, err = fxchain_blocks(tr)
   if not blocks then return nil, "chain save: " .. err end
@@ -1183,10 +1224,8 @@ function M.chain_save(tr, rel, guids)
   end
   if #keep == 0 then return nil, "chain save: nothing to save" end
   local path = M.chain_dir() .. SEP .. rel
-  local f = io.open(path, "wb")
-  if not f then return nil, "chain save: could not write " .. path end
-  f:write(table.concat(keep, "\n"), "\n")
-  f:close()
+  local ok, werr = write_checked(path, "wb", table.concat(keep, "\n") .. "\n")
+  if not ok then return nil, "chain save: " .. tostring(werr) end
   return true
 end
 
@@ -1624,6 +1663,9 @@ function M.view_chain_apply(tr, pad, rel, mode, name)
   local v = M.view(tr, pad)
   if not v then return M.chain_apply(tr, rel, mode) end
   if not rel or rel == "" then return nil, "chain: no chain given" end
+  local rerr
+  rel, rerr = M.chain_rel(rel)
+  if not rel then return nil, rerr end
   local abs = M.chain_dir() .. SEP .. rel
   undo_begin()
   if mode == "replace" then
@@ -1703,6 +1745,9 @@ function M.view_chain_save(tr, pad, rel)
   if not v then return M.chain_save(tr, rel) end
   if #v.idx == 0 then return nil, "chain save: this pad has no inserts" end
   if not rel or rel == "" then return nil, "chain save: no name given" end
+  local rerr
+  rel, rerr = M.chain_rel(rel)
+  if not rel then return nil, rerr end
   if not rel:lower():find("%.rfxchain$") then rel = rel .. ".RfxChain" end
   local keep = {}
   if v.container >= 0 then
@@ -1743,10 +1788,8 @@ function M.view_chain_save(tr, pad, rel)
   end
   if #keep == 0 then return nil, "chain save: nothing to save" end
   local path = M.chain_dir() .. SEP .. rel
-  local f = io.open(path, "wb")
-  if not f then return nil, "chain save: could not write " .. path end
-  f:write(table.concat(keep, "\n"), "\n")
-  f:close()
+  local ok, werr = write_checked(path, "wb", table.concat(keep, "\n") .. "\n")
+  if not ok then return nil, "chain save: " .. tostring(werr) end
   return true
 end
 

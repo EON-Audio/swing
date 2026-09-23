@@ -50,6 +50,7 @@ slider16:tn_lo_bq=0.8<0.3,6,0.0001>-Low Bell Q
 slider17:tn_mid_q=0.8<0.3,6,0.0001>-Mid Q
 slider18:tn_hi_sq=0.70710678<0.3,6,0.0001>-High Shelf Q
 slider19:tn_hi_bq=0.8<0.3,6,0.0001>-High Bell Q
+slider20:tn_name_bar=0<0,1,1>-Name bar (internal; the THEME menu's NAME BAR row; 0 = borderless embed, house rule 1; persists via FX chunk, no @serialize touch)
 
 in_pin:left input
 in_pin:right input
@@ -61,6 +62,14 @@ import libs/rk_svf.jsfx-inc
 import libs/rk_drumkit_dsp.jsfx-inc
 import libs/knobs_kbsg.jsfx-inc
 import libs/rk_spectrum.jsfx-inc
+// THEME menu. ⚠ ORDER IS LOAD-BEARING (rk_thememenu_core.jsfx-inc:8-15): the
+// ROWS must compile before the core that calls them, and the shim gives
+// rk_swing_popup the two helpers it calls but does not define.
+import libs/rk_theme.jsfx-inc
+import libs/rk_thememenu_shim.jsfx-inc
+import libs/rk_swing_popup.jsfx-inc
+import libs/rk_tn_thememenu.jsfx-inc
+import libs/rk_thememenu_core.jsfx-inc
 
 @init
 
@@ -72,7 +81,10 @@ gfx_ext_retina == 0 ? gfx_ext_retina = 1;
 //   to tell users below 7.45 that nothing could embed at all.
 // Embed support -- 0x100 MUST be set in @init (REAPER 7.45+); 0x400 = no MCP
 // hover tooltip over the embed (7.79+; older ignores).
-gfx_ext_flags |= 0x100 | 0x400;
+// 0x400 always; 0x100 follows the THEME menu's NAME BAR row (slider20), default
+// 0 = borderless. The re-apply in the tail is what makes the row live.
+gfx_ext_flags |= 0x400;
+tn_name_bar ? ( gfx_ext_flags = (gfx_ext_flags | 0x100) - 0x100; ) : ( gfx_ext_flags |= 0x100; );
 
 // Same block Swing carves for its master filters: five stereo SVFs. The
 // SVF_MST_* indices are Swing's (Swing_ReaKit.jsfx @init) and must match --
@@ -115,6 +127,7 @@ meq_cv_valid = 0;
 rk_spectrum.init_memory(freemem);
 rk_spectrum.init();
 freemem = rk_spectrum.get_memory_index();
+freemem = swing_popup_init(freemem);   // the THEME menu's row lists (194 cells)
 // The SAME x-axis as the curve. _lcd_log_lo 1.301 / _lcd_log_range 3.0 is
 // 20 Hz - 20 kHz, and with these the two maps reduce to the identical
 // log(f/20)/log(1000) -- so a peak sits exactly on its gridline. Set after
@@ -614,16 +627,16 @@ function tn_draw_eq(chrome) (
       _lcd_hpf_active = gfx_hpf_freq > 25;
       active_id < 230 || active_id > 232 ? (
         _hpf_log = log10(max(20, gfx_hpf_freq));
-        _hpf_log_nv = mpc_knob_interact(km_gfx_hpf, _meq_hpf_cx, _meq_hpf_cy, _meq_kr, _hpf_log, log10(20), log10(8000), log10(20), 0);
+        _hpf_log_nv = rk_knob_interact(_tn_kp, km_gfx_hpf, _meq_hpf_cx, _meq_hpf_cy, _meq_kr, _hpf_log, log10(20), log10(8000), log10(20), 0);
         _hpf_log_nv != _hpf_log ? (
           gfx_hpf_freq = pow(10, _hpf_log_nv);
           gfx_hpf_freq <= 25 ? gfx_hpf_freq = 20;
           tn_apply();
         );
       );
-      mpc_knob_draw(_meq_hpf_cx, _meq_hpf_cy, _meq_kr, log10(max(20, gfx_hpf_freq)), log10(20), log10(8000), 0, km_gfx_hpf[0],
+      rk_knob_draw(_tn_kp, _meq_hpf_cx, _meq_hpf_cy, _meq_kr, log10(max(20, gfx_hpf_freq)), log10(20), log10(8000), 0, km_gfx_hpf[0],
         _lcd_hpf_active ? 0.85 : 0.40, _lcd_hpf_active ? 0.35 : 0.38, _lcd_hpf_active ? 0.20 : 0.40,
-        0.08, 0.08, 0.10);
+        0, 0.08, 0.08, 0.10);
       dist(mx, my, _meq_hpf_cx, _meq_hpf_cy) <= _meq_kr + 4 ? ( _tn_hov = 1; tn_hint("HPF — high-pass, 20 Hz to 8 kHz (log). Removes low-end rumble before the EQ. OFF at minimum."); );
       gfx_setfont(1, "Arial", max(8, floor(9 * sc)), 'b');
       gfx_set(EQC_HPF_R, EQC_HPF_G, EQC_HPF_B, _lcd_hpf_active ? 0.9 : 0.5);
@@ -639,16 +652,16 @@ function tn_draw_eq(chrome) (
       _lcd_lpf_active = gfx_lpf_freq < 19500;
       active_id < 230 || active_id > 232 ? (
         _lpf_log = log10(max(200, gfx_lpf_freq));
-        _lpf_log_nv = mpc_knob_interact(km_gfx_lpf, _meq_lpf_cx, _meq_lpf_cy, _meq_kr, _lpf_log, log10(200), log10(20000), log10(20000), 0);
+        _lpf_log_nv = rk_knob_interact(_tn_kp, km_gfx_lpf, _meq_lpf_cx, _meq_lpf_cy, _meq_kr, _lpf_log, log10(200), log10(20000), log10(20000), 0);
         _lpf_log_nv != _lpf_log ? (
           gfx_lpf_freq = pow(10, _lpf_log_nv);
           gfx_lpf_freq >= 19500 ? gfx_lpf_freq = 20000;
           tn_apply();
         );
       );
-      mpc_knob_draw(_meq_lpf_cx, _meq_lpf_cy, _meq_kr, log10(max(200, gfx_lpf_freq)), log10(200), log10(20000), 0, km_gfx_lpf[0],
+      rk_knob_draw(_tn_kp, _meq_lpf_cx, _meq_lpf_cy, _meq_kr, log10(max(200, gfx_lpf_freq)), log10(200), log10(20000), 0, km_gfx_lpf[0],
         _lcd_lpf_active ? 0.20 : 0.40, _lcd_lpf_active ? 0.55 : 0.38, _lcd_lpf_active ? 0.85 : 0.40,
-        0.08, 0.08, 0.10);
+        0, 0.08, 0.08, 0.10);
       dist(mx, my, _meq_lpf_cx, _meq_lpf_cy) <= _meq_kr + 4 ? ( _tn_hov = 1; tn_hint("LPF — low-pass, 200 Hz to 20 kHz (log). Tames the top after the EQ. OFF at maximum."); );
       gfx_set(EQC_LPF_R, EQC_LPF_G, EQC_LPF_B, _lcd_lpf_active ? 0.9 : 0.5);
       gfx_measurestr("LPF", tw, th);
@@ -1050,11 +1063,23 @@ SHIFT = _srf_cap & 8;
 dt = min(time_precise() - _tn_lt, 0.05); _tn_lt = time_precise();
 hv_speed = 11;
 frame_wheel = mouse_wheel / 120;
+
+// ── THEME menu plumbing ──────────────────────────────────────────────────
+// swing_popup_tick reads the RAW buttons; the gate below silences the FACE
+// while a list is open, which the raws step around.
+_raw_lmb_down = lmb_down; _raw_LMB = LMB; _raw_wheel = frame_wheel;
+// ⚠ Tone's whole face is live under an open list — node drags, the BYP and
+// SHELF/BELL pills, the drive chips, both DRIVE knobs and both filter knobs.
+// LMB matters as much as the edge: a node drag continues on the held button.
+swing_popup_active ? ( lmb_down = 0; rmb_down = 0; LMB = 0; frame_wheel = 0; );
+// The knob style follows the suite's — what the KNOB row drives.
+_tn_kp = gmem[GS_THEME_KNOB_P] >= 1 ? (gmem[GS_THEME_KNOB_P] | 0) : 1;
 tau = 2 * $pi;
 // Clear 0x200 UNCONDITIONALLY (house pattern): gfx_ext_flags is ONE variable
 // shared by every @gfx pass of the instance (TCP + MCP embeds alternate; a window and
 // an embed never run together, wiki 4.5); the re-arm at the end stays micro-gated.
-gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
+// Not in an idle pass (& 2): idle leaves 0x200 as the last visible pass set it (house rule 4).
+!(gfx_ext_flags & 2) ? gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
 // Embedded wheel events arrive with a STALE mouse position; remember the
 // cursor on normal frames, reuse it on wheel frames.
 micro ? (
@@ -1077,7 +1102,7 @@ _tdm == 3 ? ( _tdrv_r=0.90; _tdrv_g=0.20; _tdrv_b=0.55; ) :  // FUZZ
             ( _tdrv_r=0.50; _tdrv_g=0.75; _tdrv_b=0.90; );   // CLIP
 
 // ── Plate ───────────────────────────────────────────────────────────────────
-gfx_set(0.13, 0.14, 0.16, 1);
+rkth_setcol(0, 0.13, 0.14, 0.16, 1);
 gfx_rect(0, 0, W, H);
 
 micro ? (
@@ -1107,7 +1132,7 @@ micro ? (
     _nv = ssl_knob_interact(tn_kmem_e, _tn_kcx, _tn_kcy, _tn_kr, gfx_sat_drv, 0, 1, 0, 0);
     _nv != gfx_sat_drv ? ( gfx_sat_drv = _nv; tn_apply(); );
   );
-  rk_knob_draw(1, _tn_kcx, _tn_kcy, _tn_kr, gfx_sat_drv, 0, 1, 0, tn_kmem_e[0],
+  rk_knob_draw(_tn_kp, _tn_kcx, _tn_kcy, _tn_kr, gfx_sat_drv, 0, 1, 0, tn_kmem_e[0],
                _tdrv_r, _tdrv_g, _tdrv_b, 0, 0.13, 0.14, 0.16);
   dist(mx, my, _tn_kcx, _tn_kcy) <= _tn_kr + 4 * ret ? _tn_hov = 1;
   // the amount, only when the band is tall enough to seat it under the knob
@@ -1122,13 +1147,50 @@ micro ? (
   );
 ) : (
   // ── FLOATING ────────────────────────────────────────────────────────────
+  // ── THEME chip + menu ──────────────────────────────────────────────────
+  // ⭐ House rule: ONE menu with every appearance option this face has.
+  // ⚠⚠ GATED ON THE IDLE BIT TOO. Tone has NO idle arm — an idle pass has the
+  // embed bit clear, so it falls into THIS branch and draws the whole face with
+  // whatever mouse state idle reports. The core self-gates on the embed bit
+  // only, so the idle guard has to live here.
+  // Geometry first: the subtitle below measures against _tn_cx2 to decide
+  // whether it still fits.
+  _tn_cw = 0;
+  !(gfx_ext_flags & 2) ? (
+    gfx_setfont(1, "Arial", max(9, floor(11 * sc)), 'b');
+    gfx_measurestr("REAPER Pnl", _tn_tw, _tn_th);
+    _tn_cw  = _tn_tw + floor(16 * sc);
+    _tn_ch  = floor(18 * sc);
+    _tn_cx2 = W - 12 * sc - _tn_cw;
+    _tn_cy2 = floor(9 * sc);
+    thm_anchor_x = _tn_cx2; thm_anchor_y = _tn_cy2;
+    thm_anchor_w = _tn_cw;  thm_anchor_h = _tn_ch;
+    _tn_chit = mx >= _tn_cx2 && mx < _tn_cx2 + _tn_cw && my >= _tn_cy2 && my < _tn_cy2 + _tn_ch;
+    // lmb withheld from rkth_input so a LEFT click opens the PANEL, not the
+    // widget's own list; RIGHT click and wheel keep their usual meaning.
+    rkth_input(_tn_cx2, _tn_cy2, _tn_cw, _tn_ch, mx, my, 0, rmb_down, frame_wheel, _tn_ch) ?
+      ( lmb_down = 0; frame_wheel = 0; mouse_wheel = 0; );
+    _tn_chit && lmb_down ? ( thm_open = 1 - thm_open; rkth_open = 0; lmb_down = 0; );
+    rkth_draw_chip(max(9, floor(11 * sc)));
+    // Input EARLY: the rows must claim their click before the EQ nodes and the
+    // pills below, all of which read lmb_down unconditionally.
+    thm_input();
+  );
+
   // Header
   gfx_setfont(1, "Arial", max(10, floor(14 * sc)), 'b');
-  gfx_set(0.90, 0.91, 0.94, 1);
+  rkth_setcol(2, 0.90, 0.91, 0.94, 1);
   gfx_x = 14 * sc; gfx_y = 10 * sc; gfx_drawstr("EON TONE");
   gfx_setfont(1, "Arial", max(8, floor(10 * sc)), 0);
-  gfx_set(0.52, 0.56, 0.62, 1);
-  gfx_x = 100 * sc; gfx_y = 13 * sc; gfx_drawstr("Swing's master EQ + drive, for the Audio bus");
+  // ⚠ The subtitle and the THEME chip share this band. Measure rather than
+  // assume: at the default 420 px the 43-character line very nearly reaches the
+  // chip, and any narrower it would run under it. Drop it instead of overlapping.
+  rkth_setcol(3, 0.52, 0.56, 0.62, 1);
+  gfx_measurestr("Swing's master EQ + drive, for the Audio bus", _tn_sw, _tn_sh);
+  100 * sc + _tn_sw < _tn_cx2 - 8 * sc ? (
+    gfx_x = 100 * sc; gfx_y = 13 * sc;
+    gfx_drawstr("Swing's master EQ + drive, for the Audio bus");
+  );
 
   // Graph
   _lcd_cx = 12 * sc; _lcd_cy = 36 * sc;
@@ -1160,7 +1222,7 @@ micro ? (
     _nv = ssl_knob_interact(tn_kmem, _kcx, _kcy, _kr, gfx_sat_drv, 0, 1, 0, 0);
     _nv != gfx_sat_drv ? ( gfx_sat_drv = _nv; tn_apply(); );
   );
-  rk_knob_draw(1, _kcx, _kcy, _kr, gfx_sat_drv, 0, 1, 0, tn_kmem[0], _tdrv_r, _tdrv_g, _tdrv_b, 0, 0.13, 0.14, 0.16);
+  rk_knob_draw(_tn_kp, _kcx, _kcy, _kr, gfx_sat_drv, 0, 1, 0, tn_kmem[0], _tdrv_r, _tdrv_g, _tdrv_b, 0, 0.13, 0.14, 0.16);
   dist(mx, my, _kcx, _kcy) <= _kr + 6 ? ( _tn_hov = 1; tn_hint("DRIVE — 0 is clean. 8x into the selected curve, blended back in by this amount. Double-click resets."); );
   gfx_setfont(1, "Arial", max(9, floor(12 * sc)), 'b');
   gfx_set(0.93, 0.62, 0.30, 1);
@@ -1187,21 +1249,38 @@ micro ? (
   gfx_rect(0, H - 26 * sc, W, 1);
   gfx_setfont(1, "Arial", max(8, floor(10 * sc)), 0);
   strlen(#tn_hint) > 0 ? (
-    gfx_set(0.72, 0.75, 0.80, 0.95);
+    rkth_setcol(3, 0.72, 0.75, 0.80, 0.95);
     gfx_x = 12 * sc; gfx_y = H - 19 * sc;
     gfx_drawstr(#tn_hint, 0, W - 40 * sc, H);
   ) : (
-    gfx_set(0.42, 0.46, 0.53, 0.8);
+    rkth_setcol(3, 0.42, 0.46, 0.53, 0.8);
     gfx_x = 12 * sc; gfx_y = H - 19 * sc;
     gfx_drawstr("Drag the nodes. Corner knobs are the filters. Double-click a node to reset it.");
   );
   gfx_setfont(4, "Arial", max(8, floor(9 * sc)), 'b');
-  gfx_set(0.52, 0.56, 0.62, 0.6);
+  rkth_setcol(3, 0.52, 0.56, 0.62, 0.6);
   gfx_x = W - 34 * sc; gfx_y = H - 19 * sc;
   gfx_drawstr("EON");
 );
 
+// ── THEME menu paint, LAST ────────────────────────────────────────────────
+// After both layouts, before the latch store. Idle-gated for the same reason
+// the chip is: this face has no idle arm.
+!(gfx_ext_flags & 2) ? (
+  thm_draw();
+  swing_popup_tick();
+  !micro ? rkth_overlay_draw();
+  // NAME BAR re-applied every visible pass — what makes the row live without a
+  // reload. INVERTED sense: the row ON means 0x100 CLEARED.
+  tn_name_bar ? ( gfx_ext_flags = (gfx_ext_flags | 0x100) - 0x100; ) : ( gfx_ext_flags |= 0x100; );
+);
+
 // ── End of frame: embed click-through re-arm + input latches ────────────────
 micro && !_tn_hov ? gfx_ext_flags |= 0x200;
+// House rule 3 (wiki 4.5): window up -> arm 0x200 always. The flag only routes
+// clicks on the EMBED, which runs no @gfx pass while a window is open, so this
+// is the only pass that can set it; a click on the strip then closes the window.
+// An idle pass (& 2) leaves the flag alone.
+!micro && !(gfx_ext_flags & 2) ? gfx_ext_flags |= 0x200;
 rk_srf_store();
 mouse_wheel = 0;

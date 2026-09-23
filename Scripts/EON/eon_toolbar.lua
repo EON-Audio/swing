@@ -124,22 +124,47 @@ function M.build(dir)
     return false, "No EON action scripts found in:\n" .. dir
   end
 
-  -- Back up before touching a file that holds the user's own toolbars.
+  -- Back up before touching a file that holds the user's own toolbars. The
+  -- backup must be WHOLE before the real file is touched, so every write and
+  -- the close are checked, and a failed backup stops the build.
   local p = menu_path()
   local cur = ""
   local f = io.open(p, "r")
-  if f then cur = f:read("*a"); f:close()
+  if f then
+    -- ⚠️⚠️ NIL IS NOT "". `f:read("*a") or ""` turned a READ FAILURE into an
+    -- empty string, and the next lines then wrote a ZERO-BYTE backup over the
+    -- user's previous one and reported it as a success -- the exact opposite of
+    -- the promise two lines above. The file itself survived (the append below is
+    -- "a", never "w"), but the recovery copy it claims to have made was gone.
+    -- Found by the 2026-09-22 Codex audit, which reproduced it with an injected
+    -- read error. An empty file reads as "" and is not an error; nil is.
+    local data = f:read("*a")
+    f:close()
+    if data == nil then
+      return false, "Could not read (nothing was changed):\n" .. p
+    end
+    cur = data
     local bak = io.open(p .. ".eon-backup", "w")
-    if bak then bak:write(cur); bak:close() end
+    local bok = bak and bak:write(cur) and true
+    if bak then bok = bak:close() and bok end
+    if not bok then return false, "Could not back up (nothing was changed):\n" .. p end
   end
 
   -- APPEND ONLY. Existing sections are never parsed, rewritten or reordered —
   -- a formatting quirk in someone's hand-edited file must not become our bug.
-  if #cur > 0 and cur:sub(-1) ~= "\n" then cur = cur .. "\n" end
-  local out = io.open(p, "w")
+  -- ⚠️ And opened in APPEND mode, not "w": "w" truncated the file and wrote it
+  -- all back, so a full disk or a dropped share after the open lost every
+  -- toolbar the user had. "a" never touches the bytes already there.
+  local out = io.open(p, "a")
   if not out then return false, "Could not write:\n" .. p end
-  out:write(cur .. table.concat(lines, "\n") .. "\n")
-  out:close()
+  local sect = table.concat(lines, "\n") .. "\n"
+  if #cur > 0 and cur:sub(-1) ~= "\n" then sect = "\n" .. sect end
+  local wok = out:write(sect) and true
+  wok = out:close() and wok
+  if not wok then
+    return false, "Could not finish writing:\n" .. p ..
+      "\n\nYour previous file is in:\n" .. p .. ".eon-backup"
+  end
 
   local msg = "EON toolbar created (Floating toolbar " .. target .. ")"
     .. " with " .. idx .. " buttons.\n\n"

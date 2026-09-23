@@ -8,7 +8,7 @@ author: EON Studios
 // EON_UpdateCheck.lua's CURRENT_VERSION and aborts on a mismatch. index.xml is
 // the single source of truth; a hand-edit here is overwritten at deploy. Three
 // external auditors have read source-vs-index as version drift -- it is not.
-version: 3.0.17
+version: 3.0.18
 
 slider1:root_note=36<0,127,1>-Base Note
 slider2:master_db=0<-48,12,0.1>-Master Volume (dB)
@@ -76,6 +76,8 @@ slider41:macro_sel=0<0,7,1>-Macro Select (internal; strip/editor focus; persists
 slider43:patch_on=0<0,1,1>-Wired (internal; the Patchbay loopback mode, set by the bridge; persists via FX chunk, no @serialize touch)
 slider44:patch_tap=0<0,1,1>-Wired tap point (internal; 0 = on the channel: pad leaves pre-pan, pan and pre-pan sends applied on return; 1 = on the bus: pad leaves post-pan, exactly what a child track hears; persists via FX chunk, no @serialize touch)
 slider42:0<0,1,1{Free,Docked}>--EON Rig Docked (set by the dock rig script, not by hand; only honoured while GS_RIG_ALIVE is fresh)
+slider45:name_bar=0<0,1,1>-Name bar (internal; the THEME menu's NAME BAR row; 0 = borderless embed, house rule 1; persists via FX chunk, no @serialize touch)
+slider46:hover_mode=0<0,3,1>-Knob hover (internal; the THEME menu's HOVER row; the LIBRARY's encoding, not the menu's -- 0 = Normal, 1 = None, 2 = Moderate, 3 = Dramatic; persists via FX chunk, no @serialize touch)
 
 // options:gmem=Swing_Media_Transfer is REQUIRED — the Lua bridge plus
 // a dozen Drum Matrix / Sample Browser scripts all call
@@ -139,6 +141,12 @@ import libs/rk_theme.jsfx-inc
 import libs/rk_swing_ui_minibrowser.jsfx-inc
 import libs/rk_swing_padpcm.jsfx-inc
 import libs/rk_swing_ui_state.jsfx-inc
+// AFTER ui_state: the THEME menu's rows call swing_ui_knob_name() and
+// swing_state_embedmenu_open(), and a forward reference to a not-yet-defined
+// function is a whole-file compile kill. The ROWS come first, then the panel
+// engine that calls them — same reason.
+import libs/rk_swing_ui_thememenu.jsfx-inc
+import libs/rk_thememenu_core.jsfx-inc
 // AFTER state (uses swing_bigview_open/close), BEFORE panels_controls (its
 // LOAD button calls swing_kitsview_open) — EEL resolves fn refs at def-time.
 // ⚠️ ORDER MATTERS, twice over.
@@ -232,7 +240,14 @@ ext_tail_size = -1;
 //    in those files stays off in Swing (named nowhere here on purpose, so the
 //    standing "is it absent?" grep keeps returning clean).
 // 0x400 = suppress REAPER's hover tooltip over the MCP embed (7.79+; older ignores).
-gfx_ext_flags |= 0x100 | 0x400;
+// House rule 1 (wiki 4.5): 0x100 = no REAPER frame and no grey name bar over the
+// embed, 0x400 = no MCP hover tooltip. The bar is now a per-instance OPTION — the
+// THEME menu's NAME BAR row, slider45, default 0 = borderless. REAPER's doc calls
+// 0x100 an @init decision, so it is applied here from the restored slider; the
+// per-pass re-apply in @gfx is what makes the row take effect without a reload
+// (measured both ways on 7.79 and 7.80, .dev_tests/EON_Probe_EmbedBar_*).
+gfx_ext_flags |= 0x400;
+name_bar ? ( gfx_ext_flags = (gfx_ext_flags | 0x100) - 0x100; ) : ( gfx_ext_flags |= 0x100; );
 
 // Generate unique instance ID (persists via slider4 + ext_noinit).
 //
@@ -2324,6 +2339,25 @@ function tnl_eoff(pi) (
   pi <= 13 ? TNL_OFF_ECHO + pi - 1 : TNL_OFF_ECHO_Q + pi - 14;
 );
 
+// ⚠️⚠️ IS THIS ECHO A VALUE AT ALL? Every adopt goes through here.
+// The range test alone is not enough for the Q params. ser_ver 75 added cells
+// 659..663; a Tone OLDER than that publishes a live heartbeat and the first
+// thirteen echoes and never touches those five, so they read 0 — and 0 is not
+// out of range, it sails through abs() and tnl_set() clamps it to the Q FLOOR
+// of 0.3. Swing then carries 0.3 into its own master EQ the moment multi-out
+// goes off (shelves want 1/sqrt(2), bells 0.8), and the prime marks the kit
+// dirty, so the wrong value is saved. Silent, and it survives the session.
+// ⭐A legitimate Q is 0.3..6 and can NEVER be 0, so a non-positive Q cell means
+// "this peer does not speak Q", not "set Q to zero". Params 1..13 keep the old
+// rule unchanged: zero is a legal gain, pan or bypass.
+// ⛔ This is the ADOPT side only. The PUSH side still round-robins params 14..18
+// at a peer that cannot echo them, so _tnl_wait never clears and those five
+// retry forever — busy, not corrupting. The real answer to both halves is
+// capability negotiation on the link; see the handoff.
+function tnl_echo_ok(pi, v) (
+  abs(v) <= 100000 && (pi <= 13 || v > 0);
+);
+
 // Per-param helpers. The ids are Weld's OWN dispatch ids (1..8 in echo order,
 // 9 = auto), deliberately, so these can be read straight against its source.
 function bcl_get(pi) (
@@ -3851,8 +3885,10 @@ _reg_my_slot >= 0 ? (
       _tnl_i = 1;
       loop(TNL_NPARAM,
         _tnl_ec = gmem[_tnl_b + tnl_eoff(_tnl_i)];
-        abs(_tnl_ec) <= 100000 ? tnl_set(_tnl_i, _tnl_ec);
-        _tnl_eprev[_tnl_i] = _tnl_ec;
+        tnl_echo_ok(_tnl_i, _tnl_ec) ? tnl_set(_tnl_i, _tnl_ec);
+        _tnl_eprev[_tnl_i] = _tnl_ec;   // baselined even when refused, so a peer
+                                        // that STARTS publishing Q later still
+                                        // reads as a move and gets adopted
         _tnl_lprev[_tnl_i] = tnl_get(_tnl_i);
         _tnl_wait[_tnl_i]  = 0;
         _tnl_i += 1;
@@ -3890,11 +3926,15 @@ _reg_my_slot >= 0 ? (
         _tnl_em = !(abs(_tnl_ec - _tnl_eprev[_tnl_p]) <= _tnl_ep);
         _tnl_lm = !(abs(_tnl_lv - _tnl_lprev[_tnl_p]) <= _tnl_ep);
         _tnl_em ? (
-          tnl_set(_tnl_p, _tnl_ec);
+          // ⚠️ _tnl_eprev is updated OUTSIDE the adopt, or a refused echo leaves
+          // _tnl_em true and this param spins on a value we will never take.
+          tnl_echo_ok(_tnl_p, _tnl_ec) ? (
+            tnl_set(_tnl_p, _tnl_ec);
+            _tnl_lprev[_tnl_p] = tnl_get(_tnl_p);
+            swing_rcp_post_master();
+            _kd_site = 9; mark_dirty_kit();   // a rack edit is a kit edit: undoable, lights SAVE
+          );
           _tnl_eprev[_tnl_p] = _tnl_ec;
-          _tnl_lprev[_tnl_p] = tnl_get(_tnl_p);
-          swing_rcp_post_master();
-          _kd_site = 9; mark_dirty_kit();   // a rack edit is a kit edit: undoable, lights SAVE
         ) : _tnl_lm ? (
           gmem[_tnl_b + TNL_OFF_VAL]   = _tnl_lv;
           gmem[_tnl_b + TNL_OFF_PARAM] = _tnl_p;
@@ -7529,7 +7569,23 @@ gfx_clear = bg_r > 0 ? ((bg_r * 255 + 0.5) | 0) + ((bg_g * 255 + 0.5) | 0) * 256
 // triggers + VOL knobs), so default to CAPTURE — clear 0x200 — or every click passes
 // through and the embedded knobs freeze (they can't grab the drag). Was |= 0x200
 // unconditionally. (EEL2 has no unary bitwise-NOT; clear a bit via |= then -=.)
-gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
+// Not in an idle pass (& 2): idle leaves 0x200 as the last visible pass set it (house rule 4).
+!(gfx_ext_flags & 2) ? gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
+// NAME BAR (the THEME menu's row, slider45) re-applied every visible pass, which is
+// what makes the pick live: REAPER picks 0x100 up on the next frame, both ways
+// (measured 7.79 + 7.80). On an older host the change simply waits for a reload.
+!(gfx_ext_flags & 2) ? (
+  name_bar ? ( gfx_ext_flags = (gfx_ext_flags | 0x100) - 0x100; ) : ( gfx_ext_flags |= 0x100; );
+);
+
+// HOVER (the THEME menu's row, slider46) -> the knob library's rk_hover_mode,
+// which rk_knob_draw reads for every style. Set HERE, at the top of the pass and
+// on EVERY pass including the embed, because the pad knobs draw in the embedded
+// view too and a knob drawn before this line would use last frame's level.
+// ⛔ The slider stores the LIBRARY's encoding (0 = Normal), NOT the menu's row
+// order -- so a project saved before this row existed reads 0 and draws exactly
+// as it always did. The menu does the reordering; see swing_thm_hover_k2v.
+rk_hover_mode = hover_mode;
 
 // Skip first 2 frames — gfx_w/gfx_h may not be valid yet on project load
 gfx_frame_count += 1;
@@ -8156,6 +8212,11 @@ is_embedded ? (
   // Position-only, and independent of the fade: the click band never moves.
   _eb_hot ? gfx_ext_flags |= 0x200;
 ) : (
+  // House rule 3 (wiki 4.5): window up -> arm 0x200 always. The flag only routes
+  // clicks on the EMBED, which runs no @gfx pass while a window is open, so this
+  // is the only pass that can set it; a click on the strip then closes the window.
+  // An idle pass (& 2) leaves the flag alone.
+  !(gfx_ext_flags & 2) ? gfx_ext_flags |= 0x200;
   // ═══════════════════════════════════════════════════════════════════════
   // FLOATING WINDOW
   // ═══════════════════════════════════════════════════════════════════════
@@ -8283,6 +8344,10 @@ is_embedded ? (
 
   // ── Header + layout + LCD frame ──
   swing_ui_draw_header();
+  // THEME menu input, EARLY: the panel hangs over the pad grid, so its rows must
+  // claim their clicks before the grid sees them. The paint is deferred to the
+  // tail (swing_thm_draw) because everything below is drawn after the header.
+  thm_input();
   swing_ui_calc_layout();
   swing_lcd_draw(right_x, 28, right_w, swing_px(LCD_BAR_H));
 
@@ -8487,6 +8552,7 @@ is_embedded ? (
   // ── Custom popup menu (rk_swing_popup.jsfx-inc) ──
   // Drawn LAST so it sits above everything else, including the tooltip.
   // Reads _raw_lmb_down / _raw_LMB preserved by swing_ui_modal_gate.
+  thm_draw();      // THEME menu panel — under its own open row list, over the content
   swing_popup_tick();
   rkth_overlay_draw();   // EON theme dropdown (shared widget) — painted last, above everything
 );
