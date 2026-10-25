@@ -430,6 +430,13 @@ local function resolve_kit_name()
 end
 
 local function do_build(slot)
+  -- Pad Banks step 5a: Drum Matrix lanes are bank A's (v1); the bands carry the bank on screen.
+  -- With no slot, one Swing's pads come from the legacy shared block: the bank its publisher shows (audit S13).
+  if (slot ~= nil and swing_state.SlotBankCur(slot) ~= 0)
+     or (slot == nil and #swing_hits == 1 and swing_state.SharedBankCur() ~= 0) then
+    r.ShowMessageBox("Drum Matrix lanes follow pad bank A.\nShow bank A in Swing (click tab A, or run 'EON: Swing bank A') and build again.", "EON DM Build", 0)
+    return
+  end
   -- Pad source priority: the chosen instance's per-slot band; the legacy
   -- shared block ONLY when it's unambiguous (single Swing); else defaults —
   -- swing_sync adopts the real names/pitches the moment the instance

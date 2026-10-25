@@ -10,7 +10,7 @@
 // and load_*_from_path touch shared sample buffers, so both sides observe the
 // same CMD handshake rather than free-running. They share the same protocol:
 //
-//   GS_BROWSE_PAD          — target pad index
+//   GS_BROWSE_PAD          — target pad: the ABSOLUTE slot 0..63 since step 4a (the bank rides in it)
 //   GS_BROWSER_PATH        — UTF-8 path chars (max GS_BROWSER_PATH_MAX)
 //   GS_BROWSER_PATH_LEN    — path length
 //   GS_BROWSE_LAYER        — (CMD 64 only) layer index 0..MAX_LAYERS-1
@@ -49,7 +49,7 @@
 // import tick's capture-depth leak guard.
 // ─── CMD 63 — single-pad sample load: completion half ───────────────────────
 function swing_browser_load_pad_done(_bp_pad)
-local(_ci, _cn, _cnl)
+local(_ci, _cn, _cnl, _bt)
 (
     // ④ FILL naming (consume-once): a requester that staged a DISPLAY name
     // (the kit pad's name) into KIT_GMEM_PADNAMES sets GS_BROWSE_NAME_ADOPT=1
@@ -59,11 +59,13 @@ local(_ci, _cn, _cnl)
     // between the requester's name write and its CMD write (the mirror only
     // yields once CMD==63): failure mode is "pad keeps its previous name" —
     // rare and benign. Empty staged name -> keep the auto name.
+    // Pad Banks step 5c: the name band is sixteen wide -- a requester stages the name at the pad's TILE.
+    _bt = swing_pad_tile(_bp_pad);
     gmem[GS_BROWSE_NAME_ADOPT] > 0.5 ? (
       gmem[GS_BROWSE_NAME_ADOPT] = 0;
       _cnl = 0;
       while (_cnl < KIT_GMEM_PADNAME_LEN &&
-             (gmem[KIT_GMEM_PADNAMES + _bp_pad * KIT_GMEM_PADNAME_LEN + _cnl]|0) > 0) (
+             (gmem[KIT_GMEM_PADNAMES + _bt * KIT_GMEM_PADNAME_LEN + _cnl]|0) > 0) (
         _cnl += 1;
       );
       _cnl > 0 ? (
@@ -71,7 +73,7 @@ local(_ci, _cn, _cnl)
         str_setlen(_cn, _cnl);
         _ci = 0; loop(_cnl,
           str_setchar(_cn, _ci,
-            gmem[KIT_GMEM_PADNAMES + _bp_pad * KIT_GMEM_PADNAME_LEN + _ci]|0);
+            gmem[KIT_GMEM_PADNAMES + _bt * KIT_GMEM_PADNAME_LEN + _ci]|0);
           _ci += 1;
         );
       );
@@ -90,18 +92,24 @@ local(_ci, _cn, _cnl)
     //       value back into cname on the next @gfx frame.
     // sync_note_names does the same for ALL pads but its gate can
     // fail (BRIDGE_ALIVE=0). This per-pad write is unconditional.
-    _cn = get_cname_slot(_bp_pad);
-    _cnl = strlen(_cn);
-    _ci = 0; loop(KIT_GMEM_PADNAME_LEN,
-      gmem[KIT_GMEM_PADNAMES + _bp_pad * KIT_GMEM_PADNAME_LEN + _ci] =
-        _ci < _cnl ? str_getchar(_cn, _ci) : 0;
-      _ci += 1;
+    // Pad Banks step 5c: the name, length and colour bands are sixteen wide -- the bank ON SCREEN by tile. A
+    // pad in another bank is left to the @block publisher (it shows the pad when its bank is shown). Indexing
+    // them with the absolute _bp_pad (step 4a) wrote a bank B..D pad's name past the band, over the sample
+    // offsets, the undo text, the pending-load cell and the instance registry.
+    swing_pad_bank(_bp_pad) == bank_cur ? (
+      _cn = get_cname_slot(_bp_pad);
+      _cnl = strlen(_cn);
+      _ci = 0; loop(KIT_GMEM_PADNAME_LEN,
+        gmem[KIT_GMEM_PADNAMES + _bt * KIT_GMEM_PADNAME_LEN + _ci] =
+          _ci < _cnl ? str_getchar(_cn, _ci) : 0;
+        _ci += 1;
+      );
+      // Write actual audio length (non-layered) or sentinel 1 (layered) so the
+      // bridge can read pad audio out of gmem without racing the @gfx mirror.
+      gmem[KIT_GMEM_AUDIOLEN + _bt] =
+        s_len[_bp_pad] > 0 ? s_len[_bp_pad] :
+        (pad_has_audio(_bp_pad) ? 1 : 0);
     );
-    // Write actual audio length (non-layered) or sentinel 1 (layered) so the
-    // bridge can read pad audio out of gmem without racing the @gfx mirror.
-    gmem[KIT_GMEM_AUDIOLEN + _bp_pad] =
-      s_len[_bp_pad] > 0 ? s_len[_bp_pad] :
-      (pad_has_audio(_bp_pad) ? 1 : 0);
     mark_dirty_pad(_bp_pad);
     col_dirty = 1;  // Re-derive auto-color hue from new filename (CMD 63)
     // Immediate auto-color derive + gmem write so browser pads update on
@@ -109,21 +117,27 @@ local(_ci, _cn, _cnl)
     // color on the NEXT frame (col_dirty → rebuild → sync runs before
     // CMD 63 in the @gfx order, so the per-frame sync writes stale hues
     // for the frame CMD 63 fires).
-    col_auto_mode_id == COL_AUTO_DRUMTYPE ? (
-      col_auto_hue[_bp_pad] = swing_color_drumtype_hue(_bp_pad);
-    ) : col_auto_mode_id == COL_AUTO_OUTPUT ? (
-      col_auto_hue[_bp_pad] = p_output[_bp_pad] / 16.0;
-    ) : col_auto_mode_id == COL_AUTO_RAINBOW ? (
-      col_auto_hue[_bp_pad] = _bp_pad / 16.0;
+    swing_pad_bank(_bp_pad) == bank_cur ? (   // col_auto_hue[] and the META band are the bank on screen's (step 5c)
+      col_auto_mode_id == COL_AUTO_DRUMTYPE ? (
+        col_auto_hue[_bt] = swing_color_drumtype_hue(_bp_pad);
+      ) : col_auto_mode_id == COL_AUTO_OUTPUT ? (
+        col_auto_hue[_bt] = swing_out_hue(_bp_pad);
+      ) : col_auto_mode_id == COL_AUTO_RAINBOW ? (
+        col_auto_hue[_bt] = _bt / 16.0;
+      );
+      gmem[KIT_GMEM_META + _bt * KIT_GMEM_META_PP + 12] =
+        col_auto_mode_id > 0 ? col_auto_hue[_bt] : p_color[_bp_pad];
     );
-    gmem[KIT_GMEM_META + _bp_pad * KIT_GMEM_META_PP + 12] =
-      col_auto_mode_id > 0 ? col_auto_hue[_bp_pad] : p_color[_bp_pad];
     // Visual feedback: trigger the existing pad_flash fade (8-frame white
     // overlay → ~250ms confirmation that the drop landed and the category
     // color got assigned). Reuses rk_swing_ui_grid_pads.jsfx-inc:85-89.
     pad_flash[_bp_pad] = 12;
     // Consume CMD before sync_note_names: its gate requires CMD==0.
     gmem[KIT_GMEM_CMD] = 0;
+    // ...then say WHICH stream job that ack was (PP_ACKED, rk_swing_padpcm): the bridge releases the job on it, so
+    // a CMD 63 posted the moment this reads 0 is the NEXT load, not this one still waiting (2026-10-10). After a
+    // file read (no bridge) DONE names an old job, which nobody is waiting for.
+    gmem[EON_PADPCM_HDR + PP_ACKED] = gmem[EON_PADPCM_HDR + PP_DONE];
     sync_note_names();
     // Ask the bridge to detect this pad's root note (EON_ROOTNOTE band).
     // A CMD-63 load is handled entirely JSFX-side — it never enters the
@@ -138,7 +152,7 @@ local(_ci, _cn, _cnl)
 // would cause Sum-mode mixing with the previous sample, and stale per-pad
 // gain/pan/tune would leak the old kit's mix into the new sound.
 function swing_browser_load_pad()
-local(_bp_pad, _bp_len, _ci)
+local(_bp_pad, _bp_len, _ci, _bp_need)
 (
   // In-flight latch (2026-07-27 double-dispatch fix): both dispatch sites
   // (@block + @gfx stall-fallback) check !_bl_inflight, so a handler that is
@@ -171,7 +185,26 @@ local(_bp_pad, _bp_len, _ci)
   ) : (
   _bp_pad = gmem[GS_BROWSE_PAD]|0;
   _bp_len = gmem[GS_BROWSER_PATH_LEN]|0;
-  _bp_pad >= 0 && _bp_pad < NUM_PADS && _bp_len > 0 && _bp_len < GS_BROWSER_PATH_MAX ? (
+  _bp_pad >= 0 && _bp_pad < NUM_SLOTS && _bp_len > 0 && _bp_len < GS_BROWSER_PATH_MAX ? (   // an absolute pad (step 4a)
+    strcpy(#_browser_path, "");
+    _ci = 0; loop(_bp_len,
+      str_setchar(#_browser_path, _ci, gmem[GS_BROWSER_PATH + _ci]);
+      _ci += 1;
+    );
+    str_setlen(#_browser_path, _bp_len);
+    // Step 2a (Spec_Swing_Pad_Banks §5.4): would it fit? The file is opened once for its size
+    // BEFORE the pad is touched, so a refusal leaves the pad exactly as it was (-1 = it did
+    // not open: the loader records that as it always has). The LCD says "instrument full".
+    _bp_need = swing_ldr_file_cells(#_browser_path);
+    (_bp_need > 0 && !swing_pad_can_fit(_bp_pad, -1, _bp_need)) ? (
+      // Room after packing (the check filed the request): leave the CMD unconsumed and come
+      // back next block -- the compaction tick runs meanwhile. No room at all: refuse.
+      !alc_wait ? (
+        swing_alloc_refuse_note(_bp_pad);
+        gmem[GS_BROWSE_NAME_ADOPT] = 0;   // a staged name must not rename a later load
+        gmem[KIT_GMEM_CMD] = 0;           // consume it, or the browser waits for ever
+      );
+    ) : (
     swing_ldr_bridge_notice(0);   // no bridge: the file read it always could do, said on the LCD
     // Tukan-style undo: REAPER's chunk diff captures the load via
     // mark_dirty_pad(_bp_pad) below. Audio is in @serialize.
@@ -180,12 +213,6 @@ local(_bp_pad, _bp_len, _ci)
     // arm when the residue is clearly audible, or the ramp attenuates the next
     // hit's transient before the @sample short-circuit (-80 dB) can deactivate.
     swing_voice_kill_pad_xf(_bp_pad);
-    strcpy(#_browser_path, "");
-    _ci = 0; loop(_bp_len,
-      str_setchar(#_browser_path, _ci, gmem[GS_BROWSER_PATH + _ci]);
-      _ci += 1;
-    );
-    str_setlen(#_browser_path, _bp_len);
     // Single-sample drop semantics: fully reset the pad before loading.
     // (Leaving stale layers causes Sum-mode mixing with the old kit sound;
     //  leaving stale per-pad gain/pan/tune leaks kit mix into the new sample.)
@@ -207,6 +234,7 @@ local(_bp_pad, _bp_len, _ci)
       _bl_job_pending = 0;
       swing_browser_load_pad_done(_bp_pad);
     );
+    );   // fits
   ) : (
     // Validation failed (bad pad index or path length) — still consume CMD
     // so the bridge isn't stuck waiting on an in-flight command. Also drop
@@ -220,39 +248,45 @@ local(_bp_pad, _bp_len, _ci)
 );
 // ─── CMD 64 — per-layer sample load: completion half ────────────────────
 function swing_browser_load_layer_done(_bp_pad, _bp_layer)
-local(_ci, _cn, _cnl)
+local(_ci, _cn, _cnl, _bt)
 (
     recalc_pad(_bp_pad);
     s_dirty[_bp_pad] = 1;
-    // Pad name → gmem PADNAME (same as CMD 63 — see comment there).
-    _cn = get_cname_slot(_bp_pad);
-    _cnl = strlen(_cn);
-    _ci = 0; loop(KIT_GMEM_PADNAME_LEN,
-      gmem[KIT_GMEM_PADNAMES + _bp_pad * KIT_GMEM_PADNAME_LEN + _ci] =
-        _ci < _cnl ? str_getchar(_cn, _ci) : 0;
-      _ci += 1;
+    // Pad name → gmem PADNAME (same as CMD 63 — see comment there; the bank on screen's tiles only, step 5c).
+    _bt = swing_pad_tile(_bp_pad);
+    swing_pad_bank(_bp_pad) == bank_cur ? (
+      _cn = get_cname_slot(_bp_pad);
+      _cnl = strlen(_cn);
+      _ci = 0; loop(KIT_GMEM_PADNAME_LEN,
+        gmem[KIT_GMEM_PADNAMES + _bt * KIT_GMEM_PADNAME_LEN + _ci] =
+          _ci < _cnl ? str_getchar(_cn, _ci) : 0;
+        _ci += 1;
+      );
+      gmem[KIT_GMEM_AUDIOLEN + _bt] =
+        s_len[_bp_pad] > 0 ? s_len[_bp_pad] :
+        (pad_has_audio(_bp_pad) ? 1 : 0);
     );
-    gmem[KIT_GMEM_AUDIOLEN + _bp_pad] =
-      s_len[_bp_pad] > 0 ? s_len[_bp_pad] :
-      (pad_has_audio(_bp_pad) ? 1 : 0);
     mark_dirty_pad(_bp_pad);
     col_dirty = 1;  // Re-derive auto-color hue from new filename (CMD 64)
     // Immediate auto-color derive + gmem write (same rationale as CMD 63)
-    col_auto_mode_id == COL_AUTO_DRUMTYPE ? (
-      col_auto_hue[_bp_pad] = swing_color_drumtype_hue(_bp_pad);
-    ) : col_auto_mode_id == COL_AUTO_OUTPUT ? (
-      col_auto_hue[_bp_pad] = p_output[_bp_pad] / 16.0;
-    ) : col_auto_mode_id == COL_AUTO_RAINBOW ? (
-      col_auto_hue[_bp_pad] = _bp_pad / 16.0;
+    swing_pad_bank(_bp_pad) == bank_cur ? (   // col_auto_hue[] and the META band are the bank on screen's (step 5c)
+      col_auto_mode_id == COL_AUTO_DRUMTYPE ? (
+        col_auto_hue[_bt] = swing_color_drumtype_hue(_bp_pad);
+      ) : col_auto_mode_id == COL_AUTO_OUTPUT ? (
+        col_auto_hue[_bt] = swing_out_hue(_bp_pad);
+      ) : col_auto_mode_id == COL_AUTO_RAINBOW ? (
+        col_auto_hue[_bt] = _bt / 16.0;
+      );
+      gmem[KIT_GMEM_META + _bt * KIT_GMEM_META_PP + 12] =
+        col_auto_mode_id > 0 ? col_auto_hue[_bt] : p_color[_bp_pad];
     );
-    gmem[KIT_GMEM_META + _bp_pad * KIT_GMEM_META_PP + 12] =
-      col_auto_mode_id > 0 ? col_auto_hue[_bp_pad] : p_color[_bp_pad];
     // Visual feedback: trigger the existing pad_flash fade (8-frame white
     // overlay → ~250ms confirmation that the drop landed and the category
     // color got assigned). Reuses rk_swing_ui_grid_pads.jsfx-inc:85-89.
     pad_flash[_bp_pad] = 12;
-    // Consume CMD before sync_note_names (see CMD 63 comment).
+    // Consume CMD before sync_note_names (see CMD 63 comment), then name the stream job it acked (see CMD 63).
     gmem[KIT_GMEM_CMD] = 0;
+    gmem[EON_PADPCM_HDR + PP_ACKED] = gmem[EON_PADPCM_HDR + PP_DONE];
     sync_note_names();
     // Root-note re-detect (see CMD 63). Layer 0 IS the pad's voice, so it
     // decides the root note; layers 1..n are velocity/RR variants of the same
@@ -286,7 +320,7 @@ local(_bp_pad, _bp_layer, _bp_len, _ci)
   _bp_pad = gmem[GS_BROWSE_PAD]|0;
   _bp_layer = gmem[GS_BROWSE_LAYER]|0;
   _bp_len = gmem[GS_BROWSER_PATH_LEN]|0;
-  _bp_pad >= 0 && _bp_pad < NUM_PADS && _bp_layer >= 0 && _bp_layer < MAX_LAYERS && _bp_len > 0 && _bp_len < GS_BROWSER_PATH_MAX ? (
+  _bp_pad >= 0 && _bp_pad < NUM_SLOTS && _bp_layer >= 0 && _bp_layer < MAX_LAYERS && _bp_len > 0 && _bp_len < GS_BROWSER_PATH_MAX ? (   // an absolute pad (step 4a)
     swing_ldr_bridge_notice(0);   // no bridge: the file read, said on the LCD
     // Tukan-style undo: REAPER's chunk diff captures the load via
     // mark_dirty_pad(_bp_pad) below. Audio is in @serialize.

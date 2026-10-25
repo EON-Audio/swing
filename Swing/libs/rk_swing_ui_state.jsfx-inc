@@ -5,7 +5,7 @@
 @init
 
 function swing_ui_process_undo()
-local(_ki, _cj, _cn, _cnl, gi, _sw_a, _sw_b, _swli)  // localized 2026-07-09: @gfx writes to these globals raced the @block kit-import loop (its _ki=16 exit value wrote PHANTOM PAD 16 = pad 0 via array adjacency). _undo_* stay global (cross-section mailbox).
+local(_ki, _cj, _cn, _cnl, gi, _sw_a, _sw_b, _swli, gi_s, _ki_s)  // localized 2026-07-09: @gfx writes to these globals raced the @block kit-import loop (its _ki=16 exit value wrote PHANTOM PAD 16 = pad 0 via array adjacency). _undo_* stay global (cross-section mailbox).
 (
 _undo_pending > 0 && gmem[KIT_GMEM_UNDO_ACK] == 1 ? (
   // Phase 2: record the right structural entry for this deferred op.
@@ -18,14 +18,20 @@ _undo_pending > 0 && gmem[KIT_GMEM_UNDO_ACK] == 1 ? (
   _undo_pending == 1 ? (
     // CLEAR ALL — pads only. Kit name + FX chain preserved (vs. NEW which
     // wipes everything via _undo_pending == 6 → swing_new_kit_full_reset).
-    gi = 0; loop(NUM_PADS, clear_pad(gi); clear_pad_syn(gi); swing_rcp_post_pad(gi); s_dirty[gi] = 1; gi += 1;);
+    _undo_clear_banks ? (
+      // step 4c: the tab menu's "clear all four banks" -- every slot
+      gi = 0; loop(NUM_SLOTS, clear_pad(gi); clear_pad_syn(gi); swing_rcp_post_pad(gi); s_dirty[gi] = 1; gi += 1;);
+      _undo_clear_banks = 0;
+    ) : (
+      gi = 0; loop(NUM_PADS, gi_s = swing_bp(gi); clear_pad(gi_s); clear_pad_syn(gi_s); swing_rcp_post_pad(gi_s); s_dirty[gi_s] = 1; gi += 1;);
+    );
   ) : _undo_pending == 2 ? (
-    _undo_pad >= 0 && _undo_pad < NUM_PADS ? ( clear_pad(_undo_pad); clear_pad_syn(_undo_pad); );
+    _undo_pad >= 0 && _undo_pad < NUM_SLOTS ? ( clear_pad(_undo_pad); clear_pad_syn(_undo_pad); );   // a slot (step 4a)
   ) : _undo_pending == 6 ? (
     // NEW KIT — full reset (pads + name + FX). See rk_swing_defaults.jsfx-inc.
     swing_new_kit_full_reset();
   ) : _undo_pending == 3 ? (
-    _undo_pad >= 0 && _undo_pad < NUM_PADS && _undo_layer >= 0 && _undo_layer < MAX_LAYERS ? (
+    _undo_pad >= 0 && _undo_pad < NUM_SLOTS && _undo_layer >= 0 && _undo_layer < MAX_LAYERS ? (   // a slot (step 4a)
       clear_layer(_undo_pad, _undo_layer);
       // Clearing a layer changes the effective RR sequence; reset cursor
       // so the next hit starts at position 1. Mirrors the synchronous
@@ -36,22 +42,7 @@ _undo_pending > 0 && gmem[KIT_GMEM_UNDO_ACK] == 1 ? (
   ) : _undo_pending == 5 ? (
     _undo_pad >= 0 && _undo_pad2 >= 0 && _undo_pad != _undo_pad2 ? (
       swap_pads(_undo_pad, _undo_pad2);
-      // Swap pad string metadata
-      strcpy(#_swap_nm, get_cname_slot(_undo_pad));
-      strcpy(get_cname_slot(_undo_pad), get_cname_slot(_undo_pad2));
-      strcpy(get_cname_slot(_undo_pad2), #_swap_nm);
-      strcpy(#_swap_nm, get_name_slot(_undo_pad));
-      strcpy(get_name_slot(_undo_pad), get_name_slot(_undo_pad2));
-      strcpy(get_name_slot(_undo_pad2), #_swap_nm);
-      strcpy(#_swap_nm, get_path_slot(_undo_pad));
-      strcpy(get_path_slot(_undo_pad), get_path_slot(_undo_pad2));
-      strcpy(get_path_slot(_undo_pad2), #_swap_nm);
-      _swli = 0; loop(MAX_LAYERS,
-        _sw_a = LPATH_STR_BASE + _undo_pad * MAX_LAYERS + _swli;
-        _sw_b = LPATH_STR_BASE + _undo_pad2 * MAX_LAYERS + _swli;
-        strcpy(#_swap_nm, _sw_a); strcpy(_sw_a, _sw_b); strcpy(_sw_b, #_swap_nm);
-        _swli += 1;
-      );
+      swing_pad_swap_strings(_undo_pad, _undo_pad2);   // cname, name, path + the layer paths (one copy, rk_swing_core)
     );
   );
   mark_dirty_pad(_undo_pad);
@@ -60,7 +51,8 @@ _undo_pending > 0 && gmem[KIT_GMEM_UNDO_ACK] == 1 ? (
   // sync_note_names() can't be used here — it sets CMD 52 which gets
   // immediately clobbered by CMD 48 below.
   _ki = 0; loop(NUM_PADS,
-    _cn = get_cname_slot(_ki);
+    _ki_s = swing_bp(_ki);
+    _cn = get_cname_slot(_ki_s);
     _cnl = strlen(_cn);
     _cj = 0; loop(KIT_GMEM_PADNAME_LEN,
       gmem[KIT_GMEM_PADNAMES + _ki * KIT_GMEM_PADNAME_LEN + _cj] =
@@ -95,11 +87,19 @@ function swing_bigview_close() ( big_view_id = VIEW_NONE; );
 // SYNTH view opener (rk_swing_ui_synthview.jsfx-inc). Lives HERE so the
 // earlier-imported grid_pads chip/Alt-click sites resolve it at def-time.
 // Closes any open pad editor: only one modal class at a time.
+// 2026-10-22 (the user: "I want it all" / the overlays "for just the compact mode"): in the FULL window both openers land in
+// the pad PANEL -- its SYNTH page here, its SOUND page below -- at the side or under the pads (fx_place); the big view and
+// the overlay stay for the faces that have no slot to hold a panel: the embeds, and the rack face when the editor is
+// placed below (it has no bottom slot). pfx_req is applied by the side slot's draw, after the width request has gone out.
+// The USER's face (the small-things round): the rack face the compact switch draws while a panel under the pads leaves
+// too little room keeps the full face's bottom slot, so the editor placed below still lands there.
+function swing_panel_can_host() ( !is_embedded && (!dock_face_user || fx_place != 3); );
 function swing_synthview_open(pad) (
   syn_view_pad = pad;
-  sel_pad = pad;
+  swing_select_pad(pad);   // an absolute pad (step 4a)
   overlay_pad = -1;
-  swing_bigview_open(VIEW_SYNTH);
+  swing_panel_can_host() ? ( swing_bigview_close(); pfx_req = 1; pfx_page = 1; )
+                         : swing_bigview_open(VIEW_SYNTH);
 );
 
 // Pad editor opener — the other half of the pair above, and for the same
@@ -116,9 +116,11 @@ function swing_synthview_open(pad) (
 // The SYNTH view now carries a PAD FX button that lands here.
 function swing_padfx_open(pad) (
   swing_bigview_close();          // no-op from the grid; the exit door from a view
-  overlay_pad = pad;
-  overlay_layer = _ov_last_tab >= MAX_LAYERS ? 0 : _ov_last_tab;
-  wf_zoom = 1.0; wf_scroll = 0.0;   // reset zoom on new pad
+  swing_panel_can_host() ? ( swing_select_pad(pad); overlay_pad = -1; pfx_req = 1; pfx_page = 0; ) : (
+    overlay_pad = pad;
+    overlay_layer = _ov_last_tab >= MAX_LAYERS ? 0 : _ov_last_tab;
+    wf_zoom = 1.0; wf_scroll = 0.0;   // reset zoom on new pad
+  );
 );
 
 // Pad input policy: true when the pad grid should receive live input. Today:
@@ -144,9 +146,13 @@ _raw_wheel = frame_wheel;  // preserve for popup wheel navigation (gate zeroes f
 // that knows a modal is up, so no second list of modals exists to drift.
 _ui_modal_up = overlay_pad >= 0 || big_view_id != VIEW_NONE || rng_ov_pad >= 0 || cat_ov_pad >= 0 || pk_ov_pad >= 0 || kmac_ed_open || swing_popup_active;
 _ui_modal_up ? (
-  _ov_pw = swing_px(420); _ov_ph = swing_px(560);
+  // The pad editor paints its panel UNSCALED, 420 x 560 (rk_swing_ui_grid_overlay op_w / op_h), so the gate's rect
+  // is that one (2026-10-16): scaled by _ui_sc it was larger than the panel in a big window, and a click in the ring
+  // between the two counted as inside the overlay while the overlay saw it outside its panel (triage 2026-10-14
+  // item 14). If the panel ever scales, scale both in one place.
+  _ov_pw = 420; _ov_ph = 560;
   _ov_px = (gfx_w - _ov_pw) / 2;
-  _ov_py = 28 + ((gfx_h - 28 - _ov_ph) / 2);
+  _ov_py = 28 + ((ui_bot - 28 - _ov_ph) / 2);   // centred over the face, not over the sequencer's panel under it
   _in_ov = mx >= _ov_px && mx <= _ov_px + _ov_pw && my >= _ov_py && my <= _ov_py + _ov_ph;
   // Suppress ALL mouse state so underlying controls never fire while overlay is open.
   // The overlay code (drawn last) restores what it needs from _ov_* saved copies.
@@ -183,7 +189,7 @@ swing_popup_active ? (
 function swing_ui_export_tick()
 local(_ki, _mb, _li_base, _lidx, _lj, _lo, _lpb, _pbase, _plen, _ci, _cj, _cn, _cnl,
       _knl, _gb, _j, _dump_off, _l_alen, _l_src, _lp, _lpl, _s_alen, _s_src, _tpath,
-      _syb, _n, _dump_over)
+      _syb, _n, _dump_over, _ex_bank, _ka, _km, _kb, _kd, _ks, _kn, _kpass, _kold)
 // local() list added 2026-07-09 — same @gfx/@block scratch-global race class as
 // swing_ui_import_tick (this one runs @gfx; its _ki loops clobbered the @block
 // import's index). _ex_undo_busy_prev deliberately global (cross-invocation).
@@ -237,21 +243,35 @@ kit_export_state == 10 ? (
     // Name ready — read it back from gmem
     _knl = gmem[KIT_GMEM_NAMELEN] | 0;
     _knl = min(_knl, 32);
-    str_setlen(#kit_name, 0);
-    _ki = 0; loop(_knl,
-      str_setchar(#kit_name, _ki, gmem[KIT_GMEM_NAME + _ki] | 0);
-      _ki += 1;
+    kit_export_only > 0 ? (
+      // Pad Banks audit S7: "save bank X as a kit" names BANK X -- its tab -- and the instrument keeps its own
+      // name. It took the instrument's, so a one-bank file renamed the whole kit everywhere it is shown.
+      _n = BKNAME_STR_BASE + kit_export_only - 1;
+      str_setlen(_n, 0);
+      _ki = 0; loop(_knl, str_setchar(_n, _ki, gmem[KIT_GMEM_NAME + _ki] | 0); _ki += 1; );
+      str_setlen(_n, _knl);
+      mark_dirty();   // the bank names are saved with the project (ser_ver 77)
+    ) : (
+      str_setlen(#kit_name, 0);
+      _ki = 0; loop(_knl,
+        str_setchar(#kit_name, _ki, gmem[KIT_GMEM_NAME + _ki] | 0);
+        _ki += 1;
+      );
+      str_setlen(#kit_name, _knl); kit_name_gmem_dirty = 1;
     );
-    str_setlen(#kit_name, _knl); kit_name_gmem_dirty = 1;
     kit_export_state = 11;  // proceed to metadata copy
   );
-  gmem[KIT_GMEM_CMD] == 98 ? ( kit_export_state = 0; kit_busy = 0; _ex_is_dump = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0; );
+  gmem[KIT_GMEM_CMD] == 98 ? ( kit_export_state = 0; kit_busy = 0; _ex_is_dump = 0; kit_export_only = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0; );
 );
 
 kit_export_state == 11 ? (
   // Phase 2: Write metadata to gmem (instant, one frame)
   gmem[KIT_GMEM_VER] = 24;
   gmem[KIT_GMEM_NPADS] = NUM_PADS;
+  // Step 3b (2026-09-23): the bank this dump publishes. The sixteen-wide bands cannot grow, so the
+  // bridge asks for one bank at a time (GS_KIT_EXPORT_BANK, 0 = bank A = what every save did before)
+  // and writes banks 1..3 as BANK tail records. _ki stays the band index, _ka is the engine slot.
+  _ex_bank = max(0, min(NUM_BANKS - 1, gmem[GS_KIT_EXPORT_BANK] | 0));
   // Kit name
   _knl = strlen(#kit_name);
   gmem[KIT_GMEM_NAMELEN] = _knl;
@@ -314,52 +334,53 @@ kit_export_state == 11 ? (
   gmem[_gb + 47] = gfx_eq_hi_sq;
   gmem[_gb + 48] = gfx_eq_hi_bq;
   // Per-pad metadata
-  _ki = 0; loop(NUM_PADS,
+  _ki = 0; loop(NUM_PADS,   // this bank (step 3b): band index _ki, engine slot _ka
+    _ka = _ex_bank * NUM_PADS + _ki;
     _mb = KIT_GMEM_META + _ki * KIT_GMEM_META_PP;
-    _li_base = _ki * MAX_LAYERS;
-    gmem[_mb + 0]  = p_gain[_ki];
-    gmem[_mb + 1]  = p_pan[_ki];
-    gmem[_mb + 2]  = p_tune[_ki];
-    gmem[_mb + 3]  = p_attack[_ki];
-    gmem[_mb + 4]  = p_decay[_ki];
-    gmem[_mb + 5]  = p_sustain[_ki];
-    gmem[_mb + 6]  = p_release[_ki];
-    gmem[_mb + 7]  = p_mute[_ki];
-    gmem[_mb + 8]  = p_solo[_ki];
-    gmem[_mb + 9]  = p_output[_ki];
-    gmem[_mb + 10] = p_note[_ki];
-    gmem[_mb + 11] = p_note_lock[_ki];
-    gmem[_mb + 12] = col_auto_mode_id > 0 ? col_auto_hue[_ki] : p_color[_ki];
-    gmem[_mb + 13] = p_choke[_ki];
-    gmem[_mb + 14] = p_oneshot[_ki];
-    gmem[_mb + 15] = p_reverse[_ki];
-    gmem[_mb + 16] = fx_hpf_freq[_ki];
-    gmem[_mb + 17] = fx_lpf_freq[_ki];
-    gmem[_mb + 18] = fx_eq_lo[_ki];
-    gmem[_mb + 19] = fx_eq_mid[_ki];
-    gmem[_mb + 20] = fx_eq_hi[_ki];
-    gmem[_mb + 21] = fx_sat_drv[_ki];
-    gmem[_mb + 22] = fx_drv_mode[_ki];
-    gmem[_mb + 23] = fx_bc_rate[_ki];
-    gmem[_mb + 24] = fx_bc_bits[_ki];
-    gmem[_mb + 25] = fx_snd_dly[_ki];
-    gmem[_mb + 26] = fx_snd_rvb[_ki];
+    _li_base = _ka * MAX_LAYERS;
+    gmem[_mb + 0]  = p_gain[_ka];
+    gmem[_mb + 1]  = p_pan[_ka];
+    gmem[_mb + 2]  = p_tune[_ka];
+    gmem[_mb + 3]  = p_attack[_ka];
+    gmem[_mb + 4]  = p_decay[_ka];
+    gmem[_mb + 5]  = p_sustain[_ka];
+    gmem[_mb + 6]  = p_release[_ka];
+    gmem[_mb + 7]  = p_mute[_ka];
+    gmem[_mb + 8]  = p_solo[_ka];
+    gmem[_mb + 9]  = p_output[_ka];
+    gmem[_mb + 10] = p_note[_ka] - _ex_bank * NUM_PADS;   // step 3b: a kit stores notes RELATIVE to the bank's block (bank A: identity)
+    gmem[_mb + 11] = p_note_lock[_ka];
+    gmem[_mb + 12] = (col_auto_mode_id > 0 && _ex_bank == 0) ? col_auto_hue[_ki] : p_color[_ka];   // the auto hues are the visible bank's
+    gmem[_mb + 13] = p_choke[_ka];
+    gmem[_mb + 14] = p_oneshot[_ka];
+    gmem[_mb + 15] = p_reverse[_ka];
+    gmem[_mb + 16] = fx_hpf_freq[_ka];
+    gmem[_mb + 17] = fx_lpf_freq[_ka];
+    gmem[_mb + 18] = fx_eq_lo[_ka];
+    gmem[_mb + 19] = fx_eq_mid[_ka];
+    gmem[_mb + 20] = fx_eq_hi[_ka];
+    gmem[_mb + 21] = fx_sat_drv[_ka];
+    gmem[_mb + 22] = fx_drv_mode[_ka];
+    gmem[_mb + 23] = fx_bc_rate[_ka];
+    gmem[_mb + 24] = fx_bc_bits[_ka];
+    gmem[_mb + 25] = fx_snd_dly[_ka];
+    gmem[_mb + 26] = fx_snd_rvb[_ka];
     // Smash send rides its own overflow band — META's 80-float stride is full
     // (see the GS_PAD_OFFSET_BASE note below).
-    gmem[GS_PAD_SMASH_BASE + _ki] = fx_snd_smash[_ki];
-    gmem[_mb + 27] = fx_eq_lo_freq[_ki];
-    gmem[_mb + 28] = fx_eq_mid_freq[_ki];
-    gmem[_mb + 29] = fx_eq_hi_freq[_ki];
-    gmem[_mb + 30] = p_sum_tight[_ki];
-    gmem[_mb + 31] = p_rpt_div[_ki];
-    gmem[_mb + 32] = p_layer_cnt[_ki];
-    gmem[_mb + 33] = p_layer_mode[_ki];
-    gmem[_mb + 34] = s_len[_ki];
-    gmem[_mb + 35] = s_start[_ki];
-    gmem[_mb + 36] = s_end[_ki];
-    gmem[_mb + 37] = s_sr[_ki];
-    gmem[_mb + 38] = s_norm[_ki];
-    gmem[_mb + 39] = s_norm_gain[_ki];
+    gmem[GS_PAD_SMASH_BASE + _ki] = fx_snd_smash[_ka];
+    gmem[_mb + 27] = fx_eq_lo_freq[_ka];
+    gmem[_mb + 28] = fx_eq_mid_freq[_ka];
+    gmem[_mb + 29] = fx_eq_hi_freq[_ka];
+    gmem[_mb + 30] = p_sum_tight[_ka];
+    gmem[_mb + 31] = p_rpt_div[_ka];
+    gmem[_mb + 32] = p_layer_cnt[_ka];
+    gmem[_mb + 33] = p_layer_mode[_ka];
+    gmem[_mb + 34] = s_len[_ka];
+    gmem[_mb + 35] = s_start[_ka];
+    gmem[_mb + 36] = s_end[_ka];
+    gmem[_mb + 37] = s_sr[_ka];
+    gmem[_mb + 38] = s_norm[_ka];
+    gmem[_mb + 39] = s_norm_gain[_ka];
     // Per-layer data (4 layers × 10 values = 40 floats)
     _lj = 0; loop(MAX_LAYERS,
       _lo = _mb + 40 + _lj * 10;
@@ -374,30 +395,32 @@ kit_export_state == 11 ? (
       gmem[_lo + 7] = l_vel_hi[_lidx];
       gmem[_lo + 8] = l_rr_order[_lidx];
       gmem[_lo + 9] = l_gain[_lidx];
+      // the layer's bake anchor (a plain pad's is layer 0's): the bridge stores the original, not a bake (2026-10-10)
+      gmem[GS_KIT_EXPORT_ANCHOR + _ki * MAX_LAYERS + _lj] = sp_baked_tune[_lidx];
       _lj += 1;
     );
     // Sample offset (separate gmem region — META is full)
-    gmem[GS_PAD_OFFSET_BASE + _ki] = p_sample_offset[_ki];
+    gmem[GS_PAD_OFFSET_BASE + _ki] = p_sample_offset[_ka];
     // SYN slot (own band — META's 80-float stride is full)
     _syb = GS_SYN_META_BASE + _ki * GS_SYN_META_PP;
-    gmem[_syb + 0]  = ps_enable[_ki];
-    gmem[_syb + 1]  = ps_engine[_ki];
-    gmem[_syb + 2]  = ps_level[_ki];
-    gmem[_syb + 3]  = ps_vel_lo[_ki];
-    gmem[_syb + 4]  = ps_vel_hi[_ki];
-    gmem[_syb + 5]  = ps_rr_order[_ki];
-    gmem[_syb + 6]  = ps_mac0[_ki];
-    gmem[_syb + 7]  = ps_mac1[_ki];
-    gmem[_syb + 8]  = ps_mac2[_ki];
-    gmem[_syb + 9]  = ps_mac3[_ki];
-    gmem[_syb + 10] = ps_mac4[_ki];
-    gmem[_syb + 11] = ps_mac5[_ki];
-    gmem[_syb + 12] = ps_mac6[_ki];
-    gmem[_syb + 13] = ps_mac7[_ki];
+    gmem[_syb + 0]  = ps_enable[_ka];
+    gmem[_syb + 1]  = ps_engine[_ka];
+    gmem[_syb + 2]  = ps_level[_ka];
+    gmem[_syb + 3]  = ps_vel_lo[_ka];
+    gmem[_syb + 4]  = ps_vel_hi[_ka];
+    gmem[_syb + 5]  = ps_rr_order[_ka];
+    gmem[_syb + 6]  = ps_mac0[_ka];
+    gmem[_syb + 7]  = ps_mac1[_ka];
+    gmem[_syb + 8]  = ps_mac2[_ka];
+    gmem[_syb + 9]  = ps_mac3[_ka];
+    gmem[_syb + 10] = ps_mac4[_ka];
+    gmem[_syb + 11] = ps_mac5[_ka];
+    gmem[_syb + 12] = ps_mac6[_ka];
+    gmem[_syb + 13] = ps_mac7[_ka];
     // Chromatic key-range, PACKED lo*128+hi (separate region; META full)
-    gmem[GS_PAD_RANGE_BASE + _ki] = (p_rng_lo[_ki]|0) * 128 + (p_rng_hi[_ki]|0);
+    gmem[GS_PAD_RANGE_BASE + _ki] = (p_rng_lo[_ka]|0) * 128 + (p_rng_hi[_ka]|0);
     // Pad name (up to 16 chars)
-    _cn = get_cname_slot(_ki);
+    _cn = get_cname_slot(_ka);
     _cnl = strlen(_cn);
     _cj = 0; loop(KIT_GMEM_PADNAME_LEN,
       gmem[KIT_GMEM_PADNAMES + _ki * KIT_GMEM_PADNAME_LEN + _cj] =
@@ -406,30 +429,61 @@ kit_export_state == 11 ? (
     );
     _ki += 1;
   );
+  gmem[GS_KIT_EXPORT_ANCHOR_ID] = instance_id;       // after every anchor: they speak for this instance's dump
+  gmem[GS_KIT_EXPORT_ANCHOR_STAMP] = _ex_bank + 1;   //   of this bank
   // ─── Kit-macro model → transfer band (KMAC_KIT_BASE; kit-LEVEL, once) ──
   // +0 is the bridge→JSFX staged flag and is NEVER written here. Export-
   // gated like everything in this phase, so a bridge-staged model can never
   // be stomped by a publish. The bridge's write_kit_v4 reads +1..+390 right
   // after this frame and packs them as tail tag 2. Layout MUST match
   // eon_kmac_pack/stage in Swing_Kit_Bridge.lua.
-  gmem[KMAC_KIT_BASE + 1] = 2;   // model version (v2 = +custom names)
+  gmem[KMAC_KIT_BASE + 1] = 3;   // model version (v2 = +custom names; v3 = bank B..D mappings last + full counts)
   gmem[KMAC_KIT_BASE + 2] = macro1; gmem[KMAC_KIT_BASE + 3] = macro2;
   gmem[KMAC_KIT_BASE + 4] = macro3; gmem[KMAC_KIT_BASE + 5] = macro4;
   gmem[KMAC_KIT_BASE + 6] = macro5; gmem[KMAC_KIT_BASE + 7] = macro6;
   gmem[KMAC_KIT_BASE + 8] = macro7; gmem[KMAC_KIT_BASE + 9] = macro8;
   _ki = 0; loop(KMAC_N,
-    gmem[KMAC_KIT_BASE + 10 + _ki] = kmac_nmap[_ki];
     gmem[KMAC_KIT_BASE + 18 + _ki] = kmac_scope[_ki];
     gmem[KMAC_KIT_BASE + 26 + _ki] = kmac_color[_ki];
     _ki += 1;
   );
-  _ki = 0; loop(KMAC_N * KMAC_MAX_MAP,
-    gmem[KMAC_KIT_BASE + 34 + _ki]  = kmac_pad[_ki];
-    gmem[KMAC_KIT_BASE + 98 + _ki]  = kmac_pid[_ki];
-    gmem[KMAC_KIT_BASE + 162 + _ki] = kmac_lo[_ki];
-    gmem[KMAC_KIT_BASE + 226 + _ki] = kmac_hi[_ki];
-    gmem[KMAC_KIT_BASE + 290 + _ki] = kmac_curve[_ki];
-    _ki += 1;
+  // ⭐ Model v3 (Pad Banks, 2026-09-24): kit macros reach all four banks, but a pre-banks reader (Swing 3.0.18
+  // and older) clamps any pad above 15 onto pad 16 -- and applies it at once (kmac_force), so a bank B mapping
+  // would change pad 16's sound there. So per macro the file carries the OLD-SAFE mappings first (ALL, SEL, a
+  // bank A pad: anything an old reader can apply), then the bank B..D ones; +10+m (the count every reader has
+  // always read) counts only the old-safe ones, and the new +487+m counts them all. An old reader stops at its
+  // count and never sees the rest. The reorder is the FILE's: the live arrays keep the user's order (after a
+  // reload the editor lists a macro's bank A rows first). Slots past a macro's count go out verbatim, as before.
+  _km = 0; loop(KMAC_N,
+    _kb = _km * KMAC_MAX_MAP;
+    _kn = min(kmac_nmap[_km], KMAC_MAX_MAP);
+    _kd = _kb;
+    _kpass = 0; loop(2,
+      _ks = _kb; loop(_kn,
+        _kold = kmac_pad[_ks] < NUM_PADS;   // -2 / -1 / a bank A pad = what a sixteen-pad reader can apply
+        (_kpass == 0 ? _kold : !_kold) ? (
+          gmem[KMAC_KIT_BASE + 34 + _kd]  = kmac_pad[_ks];
+          gmem[KMAC_KIT_BASE + 98 + _kd]  = kmac_pid[_ks];
+          gmem[KMAC_KIT_BASE + 162 + _kd] = kmac_lo[_ks];
+          gmem[KMAC_KIT_BASE + 226 + _kd] = kmac_hi[_ks];
+          gmem[KMAC_KIT_BASE + 290 + _kd] = kmac_curve[_ks];
+          _kd += 1;
+        );
+        _ks += 1;
+      );
+      _kpass == 0 ? ( gmem[KMAC_KIT_BASE + 10 + _km] = _kd - _kb; );   // the legacy count: old-safe rows only
+      _kpass += 1;
+    );
+    gmem[KMAC_KIT_BASE + 487 + _km] = _kn;                                // v3: the full count
+    _ks = _kb + _kn; loop(KMAC_MAX_MAP - _kn,
+      gmem[KMAC_KIT_BASE + 34 + _ks]  = kmac_pad[_ks];
+      gmem[KMAC_KIT_BASE + 98 + _ks]  = kmac_pid[_ks];
+      gmem[KMAC_KIT_BASE + 162 + _ks] = kmac_lo[_ks];
+      gmem[KMAC_KIT_BASE + 226 + _ks] = kmac_hi[_ks];
+      gmem[KMAC_KIT_BASE + 290 + _ks] = kmac_curve[_ks];
+      _ks += 1;
+    );
+    _km += 1;
   );
   _ki = 0; loop(KMAC_NSNAP * KMAC_N,
     gmem[KMAC_KIT_BASE + 354 + _ki] = kmac_snap[_ki]; _ki += 1;
@@ -450,8 +504,8 @@ kit_export_state == 11 ? (
     _ki += 1;
   );
   // ─── V2/v3 format: write per-pad file paths to gmem audio area ──
-  _ki = 0; loop(NUM_PADS,
-    _tpath = get_path_slot(_ki);
+  _ki = 0; loop(NUM_PADS,   // this bank (step 3b)
+    _tpath = get_path_slot(_ex_bank * NUM_PADS + _ki);
     _plen = strlen(_tpath);
     _pbase = KIT_GMEM_AUDIO + _ki * 260;
     gmem[_pbase] = _plen;
@@ -468,7 +522,7 @@ kit_export_state == 11 ? (
   // The Lua bridge reads these to locate per-layer source files for v4 save.
   _ki = 0; loop(NUM_PADS,
     _lj = 0; loop(MAX_LAYERS,
-      _lp = LPATH_STR_BASE + _ki * MAX_LAYERS + _lj;
+      _lp = LPATH_STR_BASE + (_ex_bank * NUM_PADS + _ki) * MAX_LAYERS + _lj;   // this bank (step 3b)
       _lpl = strlen(_lp);
       _lpb = KIT_GMEM_AUDIO + NUM_PADS * 260 + (_ki * MAX_LAYERS + _lj) * 260;
       gmem[_lpb] = _lpl;
@@ -503,17 +557,18 @@ kit_export_state == 11 ? (
   // Loop cap: every copy walks in KIT_DUMP_CHUNK pieces, so a plain pad's
   // full slot (up to SLOT_SIZE cells) never meets EEL2's 2^20 iteration cap.
   _dump_over = 0;
-  _ki = 0; loop(NUM_PADS,
-    p_layer_cnt[_ki] > 0 ? (
+  _ki = 0; loop(NUM_PADS,   // this bank (step 3b): _ka = the engine slot
+    _ka = _ex_bank * NUM_PADS + _ki;
+    p_layer_cnt[_ka] > 0 ? (
       // Layered: dump each active layer in order
-      _lj = 0; loop(p_layer_cnt[_ki],
-        _lidx = _ki * MAX_LAYERS + _lj;
+      _lj = 0; loop(p_layer_cnt[_ka],
+        _lidx = _ka * MAX_LAYERS + _lj;
         _l_alen = l_len[_lidx];
         _l_alen > 0 && !_dump_over ? (
           KIT_GMEM_AUDIO_DUMP + _dump_off + _l_alen > KIT_GMEM_AUDIO_DUMP_END ? (
             _dump_over = 1;
           ) : (
-            _l_src = s_audio_start + _ki * SLOT_SIZE + _lj * LAYER_SIZE;
+            _l_src = p_lptr[_ka * MAX_LAYERS + _lj];
             _j = 0;
             while(_j < _l_alen) (
               _n = min(_l_alen - _j, KIT_DUMP_CHUNK);
@@ -529,12 +584,12 @@ kit_export_state == 11 ? (
       );
     ) : (
       // Plain pad: dump the pad-main audio — the whole slot is its sample
-      _s_alen = s_len[_ki];
+      _s_alen = s_len[_ka];
       _s_alen > 0 && !_dump_over ? (
         KIT_GMEM_AUDIO_DUMP + _dump_off + _s_alen > KIT_GMEM_AUDIO_DUMP_END ? (
           _dump_over = 1;
         ) : (
-          _s_src = s_audio_start + _ki * SLOT_SIZE;
+          _s_src = p_aptr[_ka];
           _j = 0;
           while(_j < _s_alen) (
             _n = min(_s_alen - _j, KIT_DUMP_CHUNK);
@@ -555,9 +610,26 @@ kit_export_state == 11 ? (
   // Distinct completion signal (2026-07-09): 84 = silent undo-dump ready (bridge
   // acks 85, LOCK-preserving), 1 = user-save ready (bridge acks 99). Both land in
   // the state-3 waiter below; the split just removes the CMD-1 ambiguity.
-  gmem[KIT_GMEM_CMD] = _ex_is_dump ? 84 : 1;
-  kit_export_state = 3;        // wait for bridge acknowledgment
+  // ─── S3c: the step sequencer's patterns -> the EON_SEQ_KIT band, the kit's tail record 7 -- published in @block
+  // (the walk's thread owns the patterns; seq_kit_publish, right before the walk) the block after this frame asks,
+  // and state 12 below hands the bus to the bridge once it is in. A bank-only save, or a bank B..D pass of the
+  // whole-kit walk, carries none (2); the walk's final pass is bank A's and carries them (1). The count cell is
+  // lowered first, so a stale record is never packed should no @block answer (the audio device closed).
+  gmem[EON_SEQ_KIT_BASE + 2] = 0;
+  seq_kit_pub_only = (kit_export_only > 0 || _ex_bank > 0) ? 1 : 0;
+  seq_kit_pub_req += 1;   // the request counter: this thread's; @block answers in seq_kit_pub_ack, its own
+  _ex_t12 = time_precise();
+  kit_export_state = 12;
   kit_busy = 1;
+);
+
+kit_export_state == 12 ? (
+  // Phase 2b (S3c): the sequencer's record is in (the @block publish's ack met the request), or a second passed with
+  // no @block to answer: the bus goes to the bridge either way (the count cell says 0 then: no record).
+  seq_kit_pub_ack == seq_kit_pub_req || time_precise() - _ex_t12 > 1 ? (
+    gmem[KIT_GMEM_CMD] = _ex_is_dump ? 84 : 1;
+    kit_export_state = 3;        // wait for bridge acknowledgment
+  );
 );
 
 kit_export_state == 3 ? (
@@ -570,11 +642,23 @@ kit_export_state == 3 ? (
   // kit_saved_at feeds the SAVE button's transient "SAVED" flash. Stamped ONLY
   // here — the OTHER CMD 99 (import ack, ~:645) means "load landed" and runs on
   // @block; stamping that one would flash SAVED after every kit load.
-  gmem[KIT_GMEM_CMD] == 99 ? ( kit_export_state = 0; kit_busy = 0; _ex_is_dump = 0; kit_dirty = 0; kit_saved_at = time_precise(); gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0; );
-  gmem[KIT_GMEM_CMD] == 98 ? ( kit_export_state = 0; kit_busy = 0; _ex_is_dump = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0; );
+  // A bank-only save (kit_export_only, audit S7) wrote one bank to its own file: the instrument is not saved, so
+  // its dot stays and the SAVE button does not flash.
+  gmem[KIT_GMEM_CMD] == 99 ? (
+    kit_export_state = 0; kit_busy = 0; _ex_is_dump = 0;
+    kit_export_only == 0 ? ( kit_dirty = 0; kit_saved_at = time_precise(); );
+    kit_export_only = 0;
+    gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0;
+  );
+  gmem[KIT_GMEM_CMD] == 98 ? ( kit_export_state = 0; kit_busy = 0; _ex_is_dump = 0; kit_export_only = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0; );
   // 85 = silent undo-dump ack: exit the export WITHOUT touching LOCK (a
   // pending kit-load may own it); restore kit_busy to its pre-dump value.
-  gmem[KIT_GMEM_CMD] == 85 ? ( kit_export_state = 0; kit_busy = _ex_undo_busy_prev; _ex_is_dump = 0; gmem[KIT_GMEM_CMD] = 0; );
+  gmem[KIT_GMEM_CMD] == 85 ? ( kit_export_state = 0; kit_busy = _ex_undo_busy_prev; _ex_is_dump = 0; kit_export_only = 0; gmem[KIT_GMEM_CMD] = 0; );
+  // 93 = dump another bank (Pad Banks step 3b, 2026-09-23): the bridge has read what the state-11 dump
+  // just published and set GS_KIT_EXPORT_BANK to the next bank; re-enter state 11 inside the SAME save
+  // transaction (LOCK held, kit_busy up, _ex_is_dump kept), so the completion code stays 1 or 84 and the
+  // final 99 / 85 still closes it. An older bridge never sends 93.
+  gmem[KIT_GMEM_CMD] == 93 ? ( gmem[KIT_GMEM_CMD] = 0; kit_export_state = 11; );
 );
 );
 
@@ -593,14 +677,29 @@ kit_export_state == 3 ? (
 // spelled it. The sample PATH is still not shadowed: the audio reloads from
 // the kit on this route, so its path must come from the kit with it.
 // Globals are preserved by gating the kit-import globals block on
-// !kit_preserve_live.
+// !kit_preserve_live, and so are the sequencer's patterns and (2026-10-23,
+// H24) the kit macros: their adopt is gated the same way.
 // Blank-casualty test for the preserve-live reload: the pad's metadata claims
 // audio but the buffer reads zero at three points (the same probe the
 // audio-repair detector in @serialize uses). Layered pads probe every authored
 // layer region; a plain pad probes its slot. Returns 1 only when EVERY
 // audio-bearing region is zero -- i.e. the chunk truncated, or a marker save
-// whose disk source is gone. A pad with no audio metadata is NOT a casualty:
-// the user emptied it and the kit file must not refill it.
+// whose disk source is gone. A pad with no audio metadata AND no path is NOT a
+// casualty: the user emptied it and the kit file must not refill it.
+// A region with a PATH and no length is a casualty too, WHEN the path is a kit
+// extraction in the project's sample store (step 3c, found by the BanksKit
+// sidecar leg): the marker reload of a dead path fails at file_open, and
+// swing_ldr_begin resets the target's length to zero before finish records the
+// failure -- so by the time the sidecar reload reaches state 2, the pad reads
+// "path, no audio", not "audio, zero buffer". Without this rule every pad whose
+// store WAV was gone was KEPT as user-emptied and never refilled. The store test
+// is the user's decision (2026-09-23): only a pad whose audio the kit copy
+// (the sidecar) is KNOWN to hold -- one the bridge extracted from a kit file,
+// <store>/kits/kit_<base>_<hash>/[b<bank>_]pad<nn>_lay<l>.wav -- is refilled.
+// A pad the user replaced with their own file, or a Choppa slice
+// (<store>/chops/...), keeps the old behaviour: it stays empty with its path,
+// and the missing-samples banner / relink flow point at the file.
+function swing_pad_store_path(h) ( match("*kits?kit_*pad??_lay?.wav", h); );
 function swing_pad_audio_blank(p)
 local(_b, _n, _lj, _lidx, _len, _any, _blank)
 (
@@ -611,9 +710,11 @@ local(_b, _n, _lj, _lidx, _len, _any, _blank)
       _len = l_len[_lidx];
       _len > 100 ? (
         _any = 1;
-        _b = s_audio_start + p * SLOT_SIZE + _lj * LAYER_SIZE;
+        _b = p_lptr[p * MAX_LAYERS + _lj];
         _n = min(_len, LAYER_SIZE);
         (_b[0] != 0 || _b[1] != 0 || _b[2] != 0 || _b[(_n / 2) | 0] != 0 || _b[_n - 1] != 0) ? _blank = 0;
+      ) : (
+        swing_pad_store_path(LPATH_STR_BASE + _lidx) ? _any = 1;   // a store layer whose load failed: its extraction is gone
       );
       _lj += 1;
     );
@@ -621,27 +722,33 @@ local(_b, _n, _lj, _lidx, _len, _any, _blank)
     _len = s_len[p];
     _len > 100 ? (
       _any = 1;
-      _b = s_audio_start + p * SLOT_SIZE;
+      _b = p_aptr[p];
       _n = min(_len, SLOT_SIZE);
       (_b[0] != 0 || _b[1] != 0 || _b[2] != 0 || _b[(_n / 2) | 0] != 0 || _b[_n - 1] != 0) ? _blank = 0;
+    ) : (
+      swing_pad_store_path(get_path_slot(p)) ? _any = 1;   // a store pad whose load failed: its extraction is gone
     );
   );
   _any && _blank;
 );
 
-function swing_kit_preserve_snapshot() (
-  swing_preserve_names_save();   // strings, so not a memcpy -- see core
-  memcpy(sv_p_gain,        p_gain,        NUM_PADS);
-  memcpy(sv_p_pan,         p_pan,         NUM_PADS);
-  memcpy(sv_p_tune,        p_tune,        NUM_PADS);
-  memcpy(sv_p_attack,      p_attack,      NUM_PADS);
-  memcpy(sv_p_decay,       p_decay,       NUM_PADS);
-  memcpy(sv_p_sustain,     p_sustain,     NUM_PADS);
-  memcpy(sv_p_release,     p_release,     NUM_PADS);
-  memcpy(sv_p_adsr_user,   p_adsr_user,   NUM_PADS);
-  memcpy(sv_p_mute,        p_mute,        NUM_PADS);
-  memcpy(sv_p_solo,        p_solo,        NUM_PADS);
-  memcpy(sv_p_output,      p_output,      NUM_PADS);
+// Pad Banks (step 3c): a preserve reload (sidecar / repair) is one pass per bank, so the snapshot and the
+// restore cover the sixteen slots of the pass's bank -- kit_load_bank is latched at the state-1 arm, before
+// state 2 snapshots, and reset after state 4's ack, after the restore. The sv_* arrays are NUM_SLOTS wide.
+function swing_kit_preserve_snapshot() local(_o, _ol) (
+  _o = kit_load_bank * NUM_PADS; _ol = _o * MAX_LAYERS;   // the pass's bank (step 3c)
+  swing_preserve_names_save(_o);   // strings, so not a memcpy -- see core
+  memcpy(sv_p_gain + _o, p_gain + _o, NUM_PADS);
+  memcpy(sv_p_pan + _o, p_pan + _o, NUM_PADS);
+  memcpy(sv_p_tune + _o, p_tune + _o, NUM_PADS);
+  memcpy(sv_p_attack + _o, p_attack + _o, NUM_PADS);
+  memcpy(sv_p_decay + _o, p_decay + _o, NUM_PADS);
+  memcpy(sv_p_sustain + _o, p_sustain + _o, NUM_PADS);
+  memcpy(sv_p_release + _o, p_release + _o, NUM_PADS);
+  memcpy(sv_p_adsr_user + _o, p_adsr_user + _o, NUM_PADS);
+  memcpy(sv_p_mute + _o, p_mute + _o, NUM_PADS);
+  memcpy(sv_p_solo + _o, p_solo + _o, NUM_PADS);
+  memcpy(sv_p_output + _o, p_output + _o, NUM_PADS);
   // NOTE: p_note / p_note_lock are deliberately NOT preserved. The MIDI
   // trigger note is a kit-layout/routing property (the loader assigns
   // p.note or 36+pad), not a session tuning. Preserving a stale serialized
@@ -649,139 +756,169 @@ function swing_kit_preserve_snapshot() (
   // reopen) would leave a non-blank pad at note 0 and collide with another —
   // the Drum Matrix "maps pads X and Y to the same note 0" warning. Let the
   // kit-load assign notes exactly as a normal load does.
-  memcpy(sv_p_color,       p_color,       NUM_PADS);
-  memcpy(sv_p_choke,       p_choke,       NUM_PADS);
-  memcpy(sv_p_oneshot,     p_oneshot,     NUM_PADS);
-  memcpy(sv_p_reverse,     p_reverse,     NUM_PADS);
-  memcpy(sv_fx_hpf_freq,   fx_hpf_freq,   NUM_PADS);
-  memcpy(sv_fx_lpf_freq,   fx_lpf_freq,   NUM_PADS);
-  memcpy(sv_fx_eq_lo,      fx_eq_lo,      NUM_PADS);
-  memcpy(sv_fx_eq_mid,     fx_eq_mid,     NUM_PADS);
-  memcpy(sv_fx_eq_mid2,    fx_eq_mid2,    NUM_PADS);
-  memcpy(sv_fx_eq_mid_q,   fx_eq_mid_q,   NUM_PADS);
-  memcpy(sv_fx_eq_mid2_q,  fx_eq_mid2_q,  NUM_PADS);
-  memcpy(sv_fx_eq_lo_q,    fx_eq_lo_q,    NUM_PADS);
-  memcpy(sv_fx_eq_hi_q,    fx_eq_hi_q,    NUM_PADS);
-  memcpy(sv_fx_eq_hi,      fx_eq_hi,      NUM_PADS);
-  memcpy(sv_fx_sat_drv,    fx_sat_drv,    NUM_PADS);
-  memcpy(sv_fx_drv_mode,   fx_drv_mode,   NUM_PADS);
-  memcpy(sv_fx_bc_rate,    fx_bc_rate,    NUM_PADS);
-  memcpy(sv_fx_bc_bits,    fx_bc_bits,    NUM_PADS);
-  memcpy(sv_fx_snd_dly,    fx_snd_dly,    NUM_PADS);
-  memcpy(sv_fx_snd_rvb,    fx_snd_rvb,    NUM_PADS);
-  memcpy(sv_fx_snd_smash,  fx_snd_smash,  NUM_PADS);
-  memcpy(sv_fx_eq_lo_freq, fx_eq_lo_freq, NUM_PADS);
-  memcpy(sv_fx_eq_mid_freq,fx_eq_mid_freq,NUM_PADS);
-  memcpy(sv_fx_eq_mid2_freq,fx_eq_mid2_freq,NUM_PADS);
-  memcpy(sv_fx_eq_hi_freq, fx_eq_hi_freq, NUM_PADS);
-  memcpy(sv_p_sum_tight,   p_sum_tight,   NUM_PADS);
-  memcpy(sv_p_rpt_div,     p_rpt_div,     NUM_PADS);
-  memcpy(sv_p_layer_mode,  p_layer_mode,  NUM_PADS);
-  memcpy(sv_s_start,       s_start,       NUM_PADS);
-  memcpy(sv_s_end,         s_end,         NUM_PADS);
-  memcpy(sv_s_norm,        s_norm,        NUM_PADS);
-  memcpy(sv_s_norm_gain,   s_norm_gain,   NUM_PADS);
-  memcpy(sv_p_sample_offset, p_sample_offset, NUM_PADS);
-  memcpy(sv_p_rng_lo,      p_rng_lo,      NUM_PADS);
-  memcpy(sv_p_rng_hi,      p_rng_hi,      NUM_PADS);
-  memcpy(sv_l_start,       l_start,       NUM_PADS * MAX_LAYERS);
-  memcpy(sv_l_end,         l_end,         NUM_PADS * MAX_LAYERS);
-  memcpy(sv_l_norm,        l_norm,        NUM_PADS * MAX_LAYERS);
-  memcpy(sv_l_norm_gain,   l_norm_gain,   NUM_PADS * MAX_LAYERS);
-  memcpy(sv_l_vel_lo,      l_vel_lo,      NUM_PADS * MAX_LAYERS);
-  memcpy(sv_l_vel_hi,      l_vel_hi,      NUM_PADS * MAX_LAYERS);
-  memcpy(sv_l_rr_order,    l_rr_order,    NUM_PADS * MAX_LAYERS);
-  memcpy(sv_l_gain,        l_gain,        NUM_PADS * MAX_LAYERS);
+  memcpy(sv_p_color + _o, p_color + _o, NUM_PADS);
+  memcpy(sv_p_choke + _o, p_choke + _o, NUM_PADS);
+  memcpy(sv_p_oneshot + _o, p_oneshot + _o, NUM_PADS);
+  memcpy(sv_p_reverse + _o, p_reverse + _o, NUM_PADS);
+  memcpy(sv_fx_hpf_freq + _o, fx_hpf_freq + _o, NUM_PADS);
+  memcpy(sv_fx_lpf_freq + _o, fx_lpf_freq + _o, NUM_PADS);
+  memcpy(sv_fx_eq_lo + _o, fx_eq_lo + _o, NUM_PADS);
+  memcpy(sv_fx_eq_mid + _o, fx_eq_mid + _o, NUM_PADS);
+  memcpy(sv_fx_eq_mid2 + _o, fx_eq_mid2 + _o, NUM_PADS);
+  memcpy(sv_fx_eq_mid_q + _o, fx_eq_mid_q + _o, NUM_PADS);
+  memcpy(sv_fx_eq_mid2_q + _o, fx_eq_mid2_q + _o, NUM_PADS);
+  memcpy(sv_fx_eq_lo_q + _o, fx_eq_lo_q + _o, NUM_PADS);
+  memcpy(sv_fx_eq_hi_q + _o, fx_eq_hi_q + _o, NUM_PADS);
+  memcpy(sv_fx_eq_hi + _o, fx_eq_hi + _o, NUM_PADS);
+  memcpy(sv_fx_sat_drv + _o, fx_sat_drv + _o, NUM_PADS);
+  memcpy(sv_fx_drv_mode + _o, fx_drv_mode + _o, NUM_PADS);
+  memcpy(sv_fx_bc_rate + _o, fx_bc_rate + _o, NUM_PADS);
+  memcpy(sv_fx_bc_bits + _o, fx_bc_bits + _o, NUM_PADS);
+  memcpy(sv_fx_snd_dly + _o, fx_snd_dly + _o, NUM_PADS);
+  memcpy(sv_fx_snd_rvb + _o, fx_snd_rvb + _o, NUM_PADS);
+  memcpy(sv_fx_snd_smash + _o, fx_snd_smash + _o, NUM_PADS);
+  memcpy(sv_fx_eq_lo_freq + _o, fx_eq_lo_freq + _o, NUM_PADS);
+  memcpy(sv_fx_eq_mid_freq + _o, fx_eq_mid_freq + _o, NUM_PADS);
+  memcpy(sv_fx_eq_mid2_freq + _o, fx_eq_mid2_freq + _o, NUM_PADS);
+  memcpy(sv_fx_eq_hi_freq + _o, fx_eq_hi_freq + _o, NUM_PADS);
+  memcpy(sv_p_sum_tight + _o, p_sum_tight + _o, NUM_PADS);
+  memcpy(sv_p_rpt_div + _o, p_rpt_div + _o, NUM_PADS);
+  memcpy(sv_p_layer_mode + _o, p_layer_mode + _o, NUM_PADS);
+  memcpy(sv_s_start + _o, s_start + _o, NUM_PADS);
+  memcpy(sv_s_end + _o, s_end + _o, NUM_PADS);
+  memcpy(sv_s_norm + _o, s_norm + _o, NUM_PADS);
+  memcpy(sv_s_norm_gain + _o, s_norm_gain + _o, NUM_PADS);
+  memcpy(sv_p_sample_offset + _o, p_sample_offset + _o, NUM_PADS);
+  memcpy(sv_p_rng_lo + _o, p_rng_lo + _o, NUM_PADS);
+  memcpy(sv_p_rng_hi + _o, p_rng_hi + _o, NUM_PADS);
+  memcpy(sv_l_start + _ol, l_start + _ol, NUM_PADS * MAX_LAYERS);
+  memcpy(sv_l_end + _ol, l_end + _ol, NUM_PADS * MAX_LAYERS);
+  memcpy(sv_l_norm + _ol, l_norm + _ol, NUM_PADS * MAX_LAYERS);
+  memcpy(sv_l_norm_gain + _ol, l_norm_gain + _ol, NUM_PADS * MAX_LAYERS);
+  memcpy(sv_l_vel_lo + _ol, l_vel_lo + _ol, NUM_PADS * MAX_LAYERS);
+  memcpy(sv_l_vel_hi + _ol, l_vel_hi + _ol, NUM_PADS * MAX_LAYERS);
+  memcpy(sv_l_rr_order + _ol, l_rr_order + _ol, NUM_PADS * MAX_LAYERS);
+  memcpy(sv_l_gain + _ol, l_gain + _ol, NUM_PADS * MAX_LAYERS);
   // SYN slot: chunk state wins over kit file (sweep finding — without these,
   // the sidecar/repair reload's clear_pad on kit-empty pads destroyed
   // chunk-restored synth-only pads)
-  memcpy(sv_ps_enable,   ps_enable,   NUM_PADS);
-  memcpy(sv_ps_engine,   ps_engine,   NUM_PADS);
-  memcpy(sv_ps_level,    ps_level,    NUM_PADS);
-  memcpy(sv_ps_vel_lo,   ps_vel_lo,   NUM_PADS);
-  memcpy(sv_ps_vel_hi,   ps_vel_hi,   NUM_PADS);
-  memcpy(sv_ps_rr_order, ps_rr_order, NUM_PADS);
-  memcpy(sv_ps_mac0, ps_mac0, NUM_PADS); memcpy(sv_ps_mac1, ps_mac1, NUM_PADS);
-  memcpy(sv_ps_mac2, ps_mac2, NUM_PADS); memcpy(sv_ps_mac3, ps_mac3, NUM_PADS);
-  memcpy(sv_ps_mac4, ps_mac4, NUM_PADS); memcpy(sv_ps_mac5, ps_mac5, NUM_PADS);
-  memcpy(sv_ps_mac6, ps_mac6, NUM_PADS); memcpy(sv_ps_mac7, ps_mac7, NUM_PADS);
+  memcpy(sv_ps_enable + _o, ps_enable + _o, NUM_PADS);
+  memcpy(sv_ps_engine + _o, ps_engine + _o, NUM_PADS);
+  memcpy(sv_ps_level + _o, ps_level + _o, NUM_PADS);
+  memcpy(sv_ps_vel_lo + _o, ps_vel_lo + _o, NUM_PADS);
+  memcpy(sv_ps_vel_hi + _o, ps_vel_hi + _o, NUM_PADS);
+  memcpy(sv_ps_rr_order + _o, ps_rr_order + _o, NUM_PADS);
+  memcpy(sv_ps_mac0 + _o, ps_mac0 + _o, NUM_PADS); memcpy(sv_ps_mac1 + _o, ps_mac1 + _o, NUM_PADS);
+  memcpy(sv_ps_mac2 + _o, ps_mac2 + _o, NUM_PADS); memcpy(sv_ps_mac3 + _o, ps_mac3 + _o, NUM_PADS);
+  memcpy(sv_ps_mac4 + _o, ps_mac4 + _o, NUM_PADS); memcpy(sv_ps_mac5 + _o, ps_mac5 + _o, NUM_PADS);
+  memcpy(sv_ps_mac6 + _o, ps_mac6 + _o, NUM_PADS); memcpy(sv_ps_mac7 + _o, ps_mac7 + _o, NUM_PADS);
 );
 
-function swing_kit_preserve_restore() (
-  swing_preserve_names_restore();
-  memcpy(p_gain,        sv_p_gain,        NUM_PADS);
-  memcpy(p_pan,         sv_p_pan,         NUM_PADS);
-  memcpy(p_tune,        sv_p_tune,        NUM_PADS);
-  memcpy(p_attack,      sv_p_attack,      NUM_PADS);
-  memcpy(p_decay,       sv_p_decay,       NUM_PADS);
-  memcpy(p_sustain,     sv_p_sustain,     NUM_PADS);
-  memcpy(p_release,     sv_p_release,     NUM_PADS);
-  memcpy(p_adsr_user,   sv_p_adsr_user,   NUM_PADS);
-  memcpy(p_mute,        sv_p_mute,        NUM_PADS);
-  memcpy(p_solo,        sv_p_solo,        NUM_PADS);
-  memcpy(p_output,      sv_p_output,      NUM_PADS);
+function swing_kit_preserve_restore() local(_o, _ol) (
+  _o = kit_load_bank * NUM_PADS; _ol = _o * MAX_LAYERS;   // the pass's bank (step 3c)
+  swing_preserve_names_restore(_o);
+  memcpy(p_gain + _o, sv_p_gain + _o, NUM_PADS);
+  memcpy(p_pan + _o, sv_p_pan + _o, NUM_PADS);
+  memcpy(p_tune + _o, sv_p_tune + _o, NUM_PADS);
+  memcpy(p_attack + _o, sv_p_attack + _o, NUM_PADS);
+  memcpy(p_decay + _o, sv_p_decay + _o, NUM_PADS);
+  memcpy(p_sustain + _o, sv_p_sustain + _o, NUM_PADS);
+  memcpy(p_release + _o, sv_p_release + _o, NUM_PADS);
+  memcpy(p_adsr_user + _o, sv_p_adsr_user + _o, NUM_PADS);
+  memcpy(p_mute + _o, sv_p_mute + _o, NUM_PADS);
+  memcpy(p_solo + _o, sv_p_solo + _o, NUM_PADS);
+  memcpy(p_output + _o, sv_p_output + _o, NUM_PADS);
   // p_note / p_note_lock intentionally not restored — see snapshot note.
-  memcpy(p_color,       sv_p_color,       NUM_PADS);
-  memcpy(p_choke,       sv_p_choke,       NUM_PADS);
-  memcpy(p_oneshot,     sv_p_oneshot,     NUM_PADS);
-  memcpy(p_reverse,     sv_p_reverse,     NUM_PADS);
-  memcpy(fx_hpf_freq,   sv_fx_hpf_freq,   NUM_PADS);
-  memcpy(fx_lpf_freq,   sv_fx_lpf_freq,   NUM_PADS);
-  memcpy(fx_eq_lo,      sv_fx_eq_lo,      NUM_PADS);
-  memcpy(fx_eq_mid,     sv_fx_eq_mid,     NUM_PADS);
-  memcpy(fx_eq_mid2,    sv_fx_eq_mid2,    NUM_PADS);
-  memcpy(fx_eq_mid_q,   sv_fx_eq_mid_q,   NUM_PADS);
-  memcpy(fx_eq_mid2_q,  sv_fx_eq_mid2_q,  NUM_PADS);
-  memcpy(fx_eq_lo_q,    sv_fx_eq_lo_q,    NUM_PADS);
-  memcpy(fx_eq_hi_q,    sv_fx_eq_hi_q,    NUM_PADS);
-  memcpy(fx_eq_hi,      sv_fx_eq_hi,      NUM_PADS);
-  memcpy(fx_sat_drv,    sv_fx_sat_drv,    NUM_PADS);
-  memcpy(fx_drv_mode,   sv_fx_drv_mode,   NUM_PADS);
-  memcpy(fx_bc_rate,    sv_fx_bc_rate,    NUM_PADS);
-  memcpy(fx_bc_bits,    sv_fx_bc_bits,    NUM_PADS);
-  memcpy(fx_snd_dly,    sv_fx_snd_dly,    NUM_PADS);
-  memcpy(fx_snd_rvb,    sv_fx_snd_rvb,    NUM_PADS);
-  memcpy(fx_snd_smash,  sv_fx_snd_smash,  NUM_PADS);
-  memcpy(fx_eq_lo_freq, sv_fx_eq_lo_freq, NUM_PADS);
-  memcpy(fx_eq_mid_freq,sv_fx_eq_mid_freq,NUM_PADS);
-  memcpy(fx_eq_mid2_freq,sv_fx_eq_mid2_freq,NUM_PADS);
-  memcpy(fx_eq_hi_freq, sv_fx_eq_hi_freq, NUM_PADS);
-  memcpy(p_sum_tight,   sv_p_sum_tight,   NUM_PADS);
-  memcpy(p_rpt_div,     sv_p_rpt_div,     NUM_PADS);
-  memcpy(p_layer_mode,  sv_p_layer_mode,  NUM_PADS);
-  memcpy(s_start,       sv_s_start,       NUM_PADS);
-  memcpy(s_end,         sv_s_end,         NUM_PADS);
-  memcpy(s_norm,        sv_s_norm,        NUM_PADS);
-  memcpy(s_norm_gain,   sv_s_norm_gain,   NUM_PADS);
-  memcpy(p_sample_offset, sv_p_sample_offset, NUM_PADS);
-  memcpy(p_rng_lo,      sv_p_rng_lo,      NUM_PADS);
-  memcpy(p_rng_hi,      sv_p_rng_hi,      NUM_PADS);
-  memcpy(l_start,       sv_l_start,       NUM_PADS * MAX_LAYERS);
-  memcpy(l_end,         sv_l_end,         NUM_PADS * MAX_LAYERS);
-  memcpy(l_norm,        sv_l_norm,        NUM_PADS * MAX_LAYERS);
-  memcpy(l_norm_gain,   sv_l_norm_gain,   NUM_PADS * MAX_LAYERS);
-  memcpy(l_vel_lo,      sv_l_vel_lo,      NUM_PADS * MAX_LAYERS);
-  memcpy(l_vel_hi,      sv_l_vel_hi,      NUM_PADS * MAX_LAYERS);
-  memcpy(l_rr_order,    sv_l_rr_order,    NUM_PADS * MAX_LAYERS);
-  memcpy(l_gain,        sv_l_gain,        NUM_PADS * MAX_LAYERS);
+  memcpy(p_color + _o, sv_p_color + _o, NUM_PADS);
+  memcpy(p_choke + _o, sv_p_choke + _o, NUM_PADS);
+  memcpy(p_oneshot + _o, sv_p_oneshot + _o, NUM_PADS);
+  memcpy(p_reverse + _o, sv_p_reverse + _o, NUM_PADS);
+  memcpy(fx_hpf_freq + _o, sv_fx_hpf_freq + _o, NUM_PADS);
+  memcpy(fx_lpf_freq + _o, sv_fx_lpf_freq + _o, NUM_PADS);
+  memcpy(fx_eq_lo + _o, sv_fx_eq_lo + _o, NUM_PADS);
+  memcpy(fx_eq_mid + _o, sv_fx_eq_mid + _o, NUM_PADS);
+  memcpy(fx_eq_mid2 + _o, sv_fx_eq_mid2 + _o, NUM_PADS);
+  memcpy(fx_eq_mid_q + _o, sv_fx_eq_mid_q + _o, NUM_PADS);
+  memcpy(fx_eq_mid2_q + _o, sv_fx_eq_mid2_q + _o, NUM_PADS);
+  memcpy(fx_eq_lo_q + _o, sv_fx_eq_lo_q + _o, NUM_PADS);
+  memcpy(fx_eq_hi_q + _o, sv_fx_eq_hi_q + _o, NUM_PADS);
+  memcpy(fx_eq_hi + _o, sv_fx_eq_hi + _o, NUM_PADS);
+  memcpy(fx_sat_drv + _o, sv_fx_sat_drv + _o, NUM_PADS);
+  memcpy(fx_drv_mode + _o, sv_fx_drv_mode + _o, NUM_PADS);
+  memcpy(fx_bc_rate + _o, sv_fx_bc_rate + _o, NUM_PADS);
+  memcpy(fx_bc_bits + _o, sv_fx_bc_bits + _o, NUM_PADS);
+  memcpy(fx_snd_dly + _o, sv_fx_snd_dly + _o, NUM_PADS);
+  memcpy(fx_snd_rvb + _o, sv_fx_snd_rvb + _o, NUM_PADS);
+  memcpy(fx_snd_smash + _o, sv_fx_snd_smash + _o, NUM_PADS);
+  memcpy(fx_eq_lo_freq + _o, sv_fx_eq_lo_freq + _o, NUM_PADS);
+  memcpy(fx_eq_mid_freq + _o, sv_fx_eq_mid_freq + _o, NUM_PADS);
+  memcpy(fx_eq_mid2_freq + _o, sv_fx_eq_mid2_freq + _o, NUM_PADS);
+  memcpy(fx_eq_hi_freq + _o, sv_fx_eq_hi_freq + _o, NUM_PADS);
+  memcpy(p_sum_tight + _o, sv_p_sum_tight + _o, NUM_PADS);
+  memcpy(p_rpt_div + _o, sv_p_rpt_div + _o, NUM_PADS);
+  memcpy(p_layer_mode + _o, sv_p_layer_mode + _o, NUM_PADS);
+  memcpy(s_start + _o, sv_s_start + _o, NUM_PADS);
+  memcpy(s_end + _o, sv_s_end + _o, NUM_PADS);
+  memcpy(s_norm + _o, sv_s_norm + _o, NUM_PADS);
+  memcpy(s_norm_gain + _o, sv_s_norm_gain + _o, NUM_PADS);
+  memcpy(p_sample_offset + _o, sv_p_sample_offset + _o, NUM_PADS);
+  memcpy(p_rng_lo + _o, sv_p_rng_lo + _o, NUM_PADS);
+  memcpy(p_rng_hi + _o, sv_p_rng_hi + _o, NUM_PADS);
+  memcpy(l_start + _ol, sv_l_start + _ol, NUM_PADS * MAX_LAYERS);
+  memcpy(l_end + _ol, sv_l_end + _ol, NUM_PADS * MAX_LAYERS);
+  memcpy(l_norm + _ol, sv_l_norm + _ol, NUM_PADS * MAX_LAYERS);
+  memcpy(l_norm_gain + _ol, sv_l_norm_gain + _ol, NUM_PADS * MAX_LAYERS);
+  memcpy(l_vel_lo + _ol, sv_l_vel_lo + _ol, NUM_PADS * MAX_LAYERS);
+  memcpy(l_vel_hi + _ol, sv_l_vel_hi + _ol, NUM_PADS * MAX_LAYERS);
+  memcpy(l_rr_order + _ol, sv_l_rr_order + _ol, NUM_PADS * MAX_LAYERS);
+  memcpy(l_gain + _ol, sv_l_gain + _ol, NUM_PADS * MAX_LAYERS);
   // SYN slot restore — see snapshot note
-  memcpy(ps_enable,   sv_ps_enable,   NUM_PADS);
-  memcpy(ps_engine,   sv_ps_engine,   NUM_PADS);
-  memcpy(ps_level,    sv_ps_level,    NUM_PADS);
-  memcpy(ps_vel_lo,   sv_ps_vel_lo,   NUM_PADS);
-  memcpy(ps_vel_hi,   sv_ps_vel_hi,   NUM_PADS);
-  memcpy(ps_rr_order, sv_ps_rr_order, NUM_PADS);
-  memcpy(ps_mac0, sv_ps_mac0, NUM_PADS); memcpy(ps_mac1, sv_ps_mac1, NUM_PADS);
-  memcpy(ps_mac2, sv_ps_mac2, NUM_PADS); memcpy(ps_mac3, sv_ps_mac3, NUM_PADS);
-  memcpy(ps_mac4, sv_ps_mac4, NUM_PADS); memcpy(ps_mac5, sv_ps_mac5, NUM_PADS);
-  memcpy(ps_mac6, sv_ps_mac6, NUM_PADS); memcpy(ps_mac7, sv_ps_mac7, NUM_PADS);
+  memcpy(ps_enable + _o, sv_ps_enable + _o, NUM_PADS);
+  memcpy(ps_engine + _o, sv_ps_engine + _o, NUM_PADS);
+  memcpy(ps_level + _o, sv_ps_level + _o, NUM_PADS);
+  memcpy(ps_vel_lo + _o, sv_ps_vel_lo + _o, NUM_PADS);
+  memcpy(ps_vel_hi + _o, sv_ps_vel_hi + _o, NUM_PADS);
+  memcpy(ps_rr_order + _o, sv_ps_rr_order + _o, NUM_PADS);
+  memcpy(ps_mac0 + _o, sv_ps_mac0 + _o, NUM_PADS); memcpy(ps_mac1 + _o, sv_ps_mac1 + _o, NUM_PADS);
+  memcpy(ps_mac2 + _o, sv_ps_mac2 + _o, NUM_PADS); memcpy(ps_mac3 + _o, sv_ps_mac3 + _o, NUM_PADS);
+  memcpy(ps_mac4 + _o, sv_ps_mac4 + _o, NUM_PADS); memcpy(ps_mac5 + _o, sv_ps_mac5 + _o, NUM_PADS);
+  memcpy(ps_mac6 + _o, sv_ps_mac6 + _o, NUM_PADS); memcpy(ps_mac7 + _o, sv_ps_mac7 + _o, NUM_PADS);
+);
+
+// The packed copy's way past a LOCKED pad (V1 binary / VER-24 packed; 2026-10-23, H25). The bridge packs EVERY pad's
+// audio back to back at the KIT's lengths, and the copy below walks that stream with each pad's s_len / l_len, which
+// state 2 set from the kit's META -- except on a locked pad, whose META the sweep kept. So at a pad boundary a pad
+// latched locked (kit_lockskip_bits) moves the stream on by what the kit packed for it, read from the staged META
+// with the sweep's own clamps (the copy's own accounting, so every later pad's offset holds), and is not touched:
+// its regions, lengths and audio stay. NOT the AUDIOLEN band: the loading instance republishes that from its OWN
+// s_len every block, which for a locked pad is the OLD length.
+// A tile of the pass's bank (0..15) that was LOCKED when this load began (the state-2 latch, kit_lockskip_bits):
+// the one lock test every route of the load uses, so a lock pressed mid-load cannot split a pad's metadata from
+// its audio (see the latch in state 2).
+function swing_kit_lock_latched(t) ( (kit_lockskip_bits & (2 ^ t)) > 0; );
+
+function swing_kit_packed_skip_locked() local(mb, lc, st, lj, n) (
+  while (kit_copy_pad < NUM_PADS && kit_copy_layer == 0 && kit_copy_pos == 0 && swing_kit_lock_latched(kit_copy_pad)) (
+    mb = KIT_GMEM_META + kit_copy_pad * KIT_GMEM_META_PP;
+    lc = max(0, min(MAX_LAYERS, gmem[mb + 32]|0));
+    n = 0;
+    lc > 0 ? (
+      st = gmem[KIT_GMEM_VER] >= 24 ? 10 : 9;   // the sweep's layer stride
+      lj = 0; loop(lc, n += max(0, min(LAYER_SIZE, gmem[mb + 40 + lj * st])); lj += 1;);
+    ) : (
+      n = max(0, min(SLOT_SIZE, gmem[mb + 34]));
+    );
+    kit_audio_off += n;
+    kit_copied_audio += n;
+    kit_copy_pad += 1;
+  );
 );
 
 function swing_ui_import_tick()
 local(_ki, _mb, _li_base, _lidx, _lj, _lo, _lpb, _pbase, _plen, _ci, _cj, _cc, _cn, _cnl,
       _knl, _gb, _v201_lc, _v201_any, _v2_count, _xf_vi, _alen, _batch, _bj, _copied,
       _dgi, _dgp, _doff, _dst, _hbatch, _hdst, _hg, _hj, _hsrc, _layer_stride,
-      _remaining, _src_off, _was_preserve, _syb)
+      _remaining, _src_off, _was_preserve, _syb, _ka, _wb, _akb, _aki, _kv3, _hs_keep)
 // local() list added 2026-07-09: this @block state machine shared its scratch
 // globals (_ki etc.) with @gfx draw/undo/misc handlers running CONCURRENTLY on
 // the UI thread. A @gfx loop exiting with _ki=16 mid-pad made the import body
@@ -824,9 +961,22 @@ kit_import_state == 1 ? (
     // sidecar BEFORE staging this load (CMD 83 handshake, bridge-side). Just
     // arm the kit-type undo entry — except for preserve-live reloads
     // (bridge-initiated sidecar/audio-repair, not a user action).
-    ((gmem[GS_KIT_PRESERVE_LIVE] | 0) && _has_deserialized) ? 0 : udo_struct_begin_kit();
-    _udo_cap_depth = 1;        // suppress per-pad captures during import
-    kit_import_state = 2;      // data ready, read metadata
+    // Step 3b (2026-09-23): the pass's bank and the banks it empties first, from GS_KIT_LOAD_BANK
+    // (bank + 16 * mask), latched here and consumed with the delivery. A pass for bank >= 1 rides only
+    // the v26 stream or the VER-201 path route: the packed routes (VER 200 / 24) address bank A's
+    // slots directly, so such a pass is refused with a -epoch ack rather than landing in the wrong bank.
+    kit_load_bank = max(0, min(NUM_BANKS - 1, (gmem[GS_KIT_LOAD_BANK] | 0) % 16));
+    kit_load_wipe = ((gmem[GS_KIT_LOAD_BANK] | 0) / 16) | 0;
+    gmem[GS_KIT_LOAD_BANK] = 0;
+    (kit_load_bank > 0 && gmem[KIT_GMEM_VER] != 26 && gmem[KIT_GMEM_VER] != 201) ? (
+      kit_load_bank = 0; kit_load_wipe = 0;
+      kit_import_state = 0; kit_busy = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0;
+      gmem[GS_LOAD_ACK_INST] = instance_id; gmem[GS_LOAD_ACK_FAILBITS] = 0; gmem[GS_LOAD_ACK] = -gmem[GS_LOAD_EPOCH];
+    ) : (
+      ((gmem[GS_KIT_PRESERVE_LIVE] | 0) && _has_deserialized) ? 0 : udo_struct_begin_kit();
+      _udo_cap_depth = 1;        // suppress per-pad captures during import
+      kit_import_state = 2;      // data ready, read metadata
+    );
   );
   // CMD=99 means Lua finished a non-import op (multi-out, auto-color)
   // Both consumes abort an ARMED load (the gate captured kit_load_epoch) —
@@ -866,11 +1016,24 @@ kit_import_state == 2 ? (
   // skipped pad would desync the stream -- they keep the old all-pads reload.
   // Found live 2026-09-08 (probe 7): a pad replaced with the user's own sample
   // and saved embedded came back as the kit's original on the next real open.
-  _ki = 0; loop(NUM_PADS,
-    kit_keep_pad[_ki] = kit_preserve_live &&
+  _ki = 0; loop(NUM_PADS,   // this bank (step 3b)
+    _ka = kit_load_bank * NUM_PADS + _ki;
+    kit_keep_pad[_ka] = kit_preserve_live &&
                         (gmem[KIT_GMEM_VER] == 26 || gmem[KIT_GMEM_VER] == 201) &&
-                        !swing_pad_audio_blank(_ki);
+                        !swing_pad_audio_blank(_ka);
     _ki += 1;
+  );
+  // Step 3b: the banks this pass empties first -- a plain LOAD of a kit that holds fewer banks than the
+  // instrument (the bridge sets the mask on the kit's first pass; never on a sidecar / preserve reload).
+  kit_load_wipe > 0 ? (
+    _wb = 0; loop(NUM_BANKS,
+      (kit_load_wipe & (2 ^ _wb)) && _wb != kit_load_bank ? (
+        _ki = 0; loop(NUM_PADS, swing_slot_wipe(_wb * NUM_PADS + _ki); _ki += 1;);
+        strcpy(BKNAME_STR_BASE + _wb, "");   // step 4b: a wiped bank loses its name
+      );
+      _wb += 1;
+    );
+    kit_load_wipe = 0;
   );
   // Kit name — staged into #kit_name_pending, COMMITTED in state 4 (Phase 2
   // 2026-07-17). Writing #kit_name here (staging time, before ANY audio has
@@ -880,7 +1043,7 @@ kit_import_state == 2 ? (
   // old #kit_name was simply never touched. Preserve-live reloads skip the
   // stage entirely (audio-only restore — the name is unchanged by
   // definition; state 4 skips the commit for them too).
-  !kit_preserve_live ? (
+  !kit_preserve_live && kit_load_bank == 0 ? (   // kit-level: bank A's pass only (step 3b)
     _knl = gmem[KIT_GMEM_NAMELEN] | 0;
     _knl = min(_knl, 32);
     str_setlen(#kit_name_pending, 0);
@@ -890,10 +1053,18 @@ kit_import_state == 2 ? (
     );
     str_setlen(#kit_name_pending, _knl);
   );
+  // Step 4b: the BANK's name -- the same band, for ANY bank's pass (bank A's pass names the kit AND its bank;
+  // a follow-up pass names its bank only). Staged here, committed in state 4 with the pass, the same rule.
+  !kit_preserve_live ? (
+    _knl = min(gmem[KIT_GMEM_NAMELEN] | 0, 32);
+    str_setlen(#bkname_pending, 0);
+    _ki = 0; loop(_knl, str_setchar(#bkname_pending, _ki, gmem[KIT_GMEM_NAME + _ki] | 0); _ki += 1; );
+    str_setlen(#bkname_pending, _knl);
+  );
   // Global settings (kit format v22+; skip for older kits).
   // Under an audio-only reload, keep the @serialize-restored globals (they
   // were already recalc'd in @serialize); state 4 re-runs the global recalcs.
-  gmem[KIT_GMEM_VER] >= 22 && !kit_preserve_live ? (
+  gmem[KIT_GMEM_VER] >= 22 && !kit_preserve_live && kit_load_bank == 0 ? (   // kit-level: bank A's pass only (step 3b)
     _gb = KIT_GMEM_GLOBALS;
     repeat_div     = gmem[_gb + 0];
     vel_curve      = gmem[_gb + 1];
@@ -965,10 +1136,22 @@ kit_import_state == 2 ? (
     gfx_lim_rel_c = exp(-1.0 / max(1, gfx_lim_rel * 0.001 * srate));
     dly_recalc(); rvb_recalc(); cmp_recalc();
   );
+  // The tiles this pass leaves alone because they are LOCKED, latched ONCE, here, before anything is adopted
+  // (2026-10-23, H25). ⚠️⚠️ EVERY lock test of this load reads this latch (swing_kit_lock_latched), never the live
+  // lock: the META sweep below, the synth adopt, the old-kit migrations, the wipes, the VER-26 stream, VER-201's and
+  // VER-200's per-pad bodies and the V1 / VER-24 packed copy. The UI and the bridge let the user press LOCK PAD while
+  // a load streams, and a live test in state 3 then disagreed with what state 2 had done: a pad that took the kit's
+  // lengths and layer layout here had its arriving audio skipped (old buffers under new metadata: wrong, cut short
+  // or silent), and a pad unlocked mid-load took the kit's audio under its KEPT metadata (the Codex review of the
+  // fix pass, 2026-10-23; VER-201 and VER-200 had the same split before H25). A lock pressed mid-load counts from
+  // the next load. The packed routes are bank A only (the bridge's one-bank rule for old formats).
+  kit_lockskip_bits = 0;
+  _ki = 0; loop(NUM_PADS, swing_lcd_slot_locked(kit_load_bank * NUM_PADS + _ki) ? kit_lockskip_bits |= 2 ^ _ki; _ki += 1;);
   // Per-pad metadata
-  _ki = 0; loop(NUM_PADS,
+  _ki = 0; loop(NUM_PADS,   // this bank (step 3b): band index _ki, engine slot _ka
+    _ka = kit_load_bank * NUM_PADS + _ki;
     // ② LOCK gate (2026-08-04). This sweep was UNGATED while the two audio
-    // adopts below (:1021 VER-201, :1172 v26) were gated — so a locked pad kept
+    // adopts below (VER-201's, and VER-200's legacy path route) were gated — so a locked pad kept
     // its sample and took the incoming kit's everything-else. The visible
     // symptom was "my locked pad got renamed"; the dangerous part is s_len /
     // s_sr / p_layer_cnt / l_* below, which describe the audio buffer the adopt
@@ -980,60 +1163,60 @@ kit_import_state == 2 ? (
     // the pad's KEPT state rather than the kit's staging.
     // A kept pad (preserve-live reload, kit_keep_pad) is skipped the same way:
     // its lengths describe the audio the adopt below will refuse to replace.
-    gmem[EON_PADCAT_BASE + _reg_my_slot*EON_PADCAT_STRIDE + _ki*4 + 3] <= 0.5 && !kit_keep_pad[_ki] ? (
+    !swing_kit_lock_latched(_ki) && !kit_keep_pad[_ka] ? (   // this slot's lock as the load BEGAN (the latch above; was the live per-bank mask, audit S10's remainder, 2026-10-16)
     _mb = KIT_GMEM_META + _ki * KIT_GMEM_META_PP;
-    _li_base = _ki * MAX_LAYERS;
-    p_gain[_ki]      = gmem[_mb + 0];
-    p_pan[_ki]       = gmem[_mb + 1];
-    p_tune[_ki]      = gmem[_mb + 2];
-    p_attack[_ki]    = gmem[_mb + 3];
-    p_decay[_ki]     = gmem[_mb + 4];
-    p_sustain[_ki]   = gmem[_mb + 5];
-    p_release[_ki]   = gmem[_mb + 6];
+    _li_base = _ka * MAX_LAYERS;
+    p_gain[_ka]      = gmem[_mb + 0];
+    p_pan[_ka]       = gmem[_mb + 1];
+    p_tune[_ka]      = gmem[_mb + 2];
+    p_attack[_ka]    = gmem[_mb + 3];
+    p_decay[_ka]     = gmem[_mb + 4];
+    p_sustain[_ka]   = gmem[_mb + 5];
+    p_release[_ka]   = gmem[_mb + 6];
     // Kit-import: treat saved ADSR as user-tuned so a later drag-in won't auto-overwrite it.
     // (The kit author's stored values are what the user chose to ship in the kit.)
-    p_adsr_user[_ki] = 1;
-    p_mute[_ki]      = gmem[_mb + 7];
-    p_solo[_ki]      = gmem[_mb + 8];
-    p_output[_ki]    = gmem[_mb + 9];
-    p_note[_ki]      = gmem[_mb + 10];
-    p_note_lock[_ki] = gmem[_mb + 11];
-    p_color[_ki]     = gmem[_mb + 12]; col_dirty = 1;
-    p_choke[_ki]     = gmem[_mb + 13];
-    p_oneshot[_ki]   = gmem[_mb + 14];
-    p_reverse[_ki]   = gmem[_mb + 15];
-    fx_hpf_freq[_ki] = gmem[_mb + 16];
-    fx_lpf_freq[_ki] = gmem[_mb + 17];
-    fx_eq_lo[_ki]    = gmem[_mb + 18];
-    fx_eq_mid[_ki]   = gmem[_mb + 19];
-    fx_eq_hi[_ki]    = gmem[_mb + 20];
-    fx_sat_drv[_ki]  = gmem[_mb + 21];
-    fx_drv_mode[_ki] = gmem[_mb + 22];
-    fx_bc_rate[_ki]  = gmem[_mb + 23];
-    fx_bc_bits[_ki]  = gmem[_mb + 24];
-    fx_snd_dly[_ki]  = gmem[_mb + 25];
-    fx_snd_rvb[_ki]  = gmem[_mb + 26];
-    fx_snd_smash[_ki] = gmem[GS_PAD_SMASH_BASE + _ki];
-    fx_eq_lo_freq[_ki]  = gmem[_mb + 27];
-    fx_eq_mid_freq[_ki] = gmem[_mb + 28];
-    fx_eq_hi_freq[_ki]  = gmem[_mb + 29];
+    p_adsr_user[_ka] = 1;
+    p_mute[_ka]      = gmem[_mb + 7];
+    p_solo[_ka]      = gmem[_mb + 8];
+    p_output[_ka]    = gmem[_mb + 9];
+    p_note[_ka]      = max(0, min(127, gmem[_mb + 10] + kit_load_bank * NUM_PADS));   // step 3b: the file's note is bank-relative; bank B lands on 52.. (spec 13.7)
+    p_note_lock[_ka] = gmem[_mb + 11];
+    p_color[_ka]     = gmem[_mb + 12]; col_dirty = 1;
+    p_choke[_ka]     = gmem[_mb + 13];
+    p_oneshot[_ka]   = gmem[_mb + 14];
+    p_reverse[_ka]   = gmem[_mb + 15];
+    fx_hpf_freq[_ka] = gmem[_mb + 16];
+    fx_lpf_freq[_ka] = gmem[_mb + 17];
+    fx_eq_lo[_ka]    = gmem[_mb + 18];
+    fx_eq_mid[_ka]   = gmem[_mb + 19];
+    fx_eq_hi[_ka]    = gmem[_mb + 20];
+    fx_sat_drv[_ka]  = gmem[_mb + 21];
+    fx_drv_mode[_ka] = gmem[_mb + 22];
+    fx_bc_rate[_ka]  = gmem[_mb + 23];
+    fx_bc_bits[_ka]  = gmem[_mb + 24];
+    fx_snd_dly[_ka]  = gmem[_mb + 25];
+    fx_snd_rvb[_ka]  = gmem[_mb + 26];
+    fx_snd_smash[_ka] = gmem[GS_PAD_SMASH_BASE + _ki];
+    fx_eq_lo_freq[_ka]  = gmem[_mb + 27];
+    fx_eq_mid_freq[_ka] = gmem[_mb + 28];
+    fx_eq_hi_freq[_ka]  = gmem[_mb + 29];
     // v46: kit files don't carry the 4th EQ band or per-bell Qs yet (META
     // stride is full — see the GS_PAD_OFFSET_BASE overflow note above).
     // Reset them on kit load so an imported kit sounds exactly like its
     // 3-band fixed-Q author intended.
-    fx_eq_mid2[_ki] = 0; fx_eq_mid2_freq[_ki] = 3000;
-    fx_eq_mid_q[_ki] = 0.8; fx_eq_mid2_q[_ki] = 0.8;
-    fx_eq_lo_q[_ki] = 0.7071; fx_eq_hi_q[_ki] = 0.7071;
-    p_sum_tight[_ki] = gmem[_mb + 30];
-    p_rpt_div[_ki]   = gmem[_mb + 31];
-    p_layer_cnt[_ki] = max(0, min(MAX_LAYERS, gmem[_mb + 32]|0));
-    p_layer_mode[_ki] = max(0, min(3, gmem[_mb + 33]|0));
-    s_len[_ki]       = max(0, min(SLOT_SIZE, gmem[_mb + 34]));    // cells; a length past the slot copied into the next pad (B-4)
-    s_start[_ki]     = gmem[_mb + 35];
-    s_end[_ki]       = gmem[_mb + 36];
-    s_sr[_ki]        = gmem[_mb + 37];
-    s_norm[_ki]      = gmem[_mb + 38];
-    s_norm_gain[_ki] = max(0.01, min(100.0, gmem[_mb + 39]));
+    fx_eq_mid2[_ka] = 0; fx_eq_mid2_freq[_ka] = 3000;
+    fx_eq_mid_q[_ka] = 0.8; fx_eq_mid2_q[_ka] = 0.8;
+    fx_eq_lo_q[_ka] = 0.7071; fx_eq_hi_q[_ka] = 0.7071;
+    p_sum_tight[_ka] = gmem[_mb + 30];
+    p_rpt_div[_ka]   = gmem[_mb + 31];
+    p_layer_cnt[_ka] = max(0, min(MAX_LAYERS, gmem[_mb + 32]|0));
+    p_layer_mode[_ka] = max(0, min(3, gmem[_mb + 33]|0));
+    s_len[_ka]       = max(0, min(SLOT_SIZE, gmem[_mb + 34]));    // cells; a length past the slot copied into the next pad (B-4)
+    s_start[_ka]     = gmem[_mb + 35];
+    s_end[_ka]       = gmem[_mb + 36];
+    s_sr[_ka]        = gmem[_mb + 37];
+    s_norm[_ka]      = gmem[_mb + 38];
+    s_norm_gain[_ka] = max(0.01, min(100.0, gmem[_mb + 39]));
     // Per-layer data (stride 10 for v24+, stride 9 for older kits).
     // Read ONLY the layers the kit authors (_lj < p_layer_cnt); reset the
     // rest to empty defaults. Loaders that don't stage the full layer region
@@ -1047,7 +1230,7 @@ kit_import_state == 2 ? (
     _lj = 0; loop(MAX_LAYERS,
       _lo = _mb + 40 + _lj * _layer_stride;
       _lidx = _li_base + _lj;
-      _lj < p_layer_cnt[_ki] ? (
+      _lj < p_layer_cnt[_ka] ? (
         l_len[_lidx]       = max(0, min(LAYER_SIZE, gmem[_lo + 0]));   // cells; capped like s_len (B-4)
         l_start[_lidx]     = gmem[_lo + 1];
         l_end[_lidx]       = gmem[_lo + 2];
@@ -1076,7 +1259,7 @@ kit_import_state == 2 ? (
       _lj += 1;
     );
     // Pad name
-    _cn = get_cname_slot(_ki);
+    _cn = get_cname_slot(_ka);
     str_setlen(_cn, 0);
     _cj = 0; _cnl = 0;
     loop(KIT_GMEM_PADNAME_LEN,
@@ -1086,16 +1269,17 @@ kit_import_state == 2 ? (
     );
     str_setlen(_cn, _cnl);
     // Sample offset (from dedicated gmem region)
-    p_sample_offset[_ki] = gmem[GS_PAD_OFFSET_BASE + _ki];
+    p_sample_offset[_ka] = gmem[GS_PAD_OFFSET_BASE + _ki];
     // Chromatic key-range — unpack lo*128+hi. Old kits wrote 0 here (bridge
     // `or 0`) so both come out 0 = single-note pad (today's behavior).
-    p_rng_lo[_ki] = (gmem[GS_PAD_RANGE_BASE + _ki] / 128) | 0;
-    p_rng_hi[_ki] = gmem[GS_PAD_RANGE_BASE + _ki] - p_rng_lo[_ki] * 128;
-    p_rng_lo[_ki] = max(0, min(127, p_rng_lo[_ki]));  // guard hand-edited kits
-    p_rng_hi[_ki] = max(0, min(127, p_rng_hi[_ki]));
+    p_rng_lo[_ka] = (gmem[GS_PAD_RANGE_BASE + _ki] / 128) | 0;
+    p_rng_hi[_ka] = gmem[GS_PAD_RANGE_BASE + _ki] - p_rng_lo[_ka] * 128;
+    p_rng_lo[_ka] = max(0, min(127, p_rng_lo[_ka]));  // guard hand-edited kits
+    p_rng_hi[_ka] = max(0, min(127, p_rng_hi[_ka]));
     );  // end ② LOCK gate — locked pad keeps name, mix, envelope, note, FX, layers
     _ki += 1;
   );
+  swing_out_loaded(kit_load_bank);   // an own output another pad holds here takes a free one (Outputs step 3)
   // ── SYN slot adopt — ONLY when the (new) bridge staged the band for this
   // import (flag at +GS_SYN_STAGED_OFF, consumed here). Old kits / old bridge
   // stage nothing → live synth state survives the load (the ratified table:
@@ -1103,29 +1287,37 @@ kit_import_state == 2 ? (
   // wholesale, including disables — the kit's synth truth wins.
   gmem[GS_SYN_META_BASE + GS_SYN_STAGED_OFF] > 0.5 ? (
     gmem[GS_SYN_META_BASE + GS_SYN_STAGED_OFF] = 0;
-    _ki = 0; loop(NUM_PADS,
+    _ki = 0; loop(NUM_PADS,   // this bank (step 3b)
+      _ka = kit_load_bank * NUM_PADS + _ki;
       // ② LOCK: same rule as the sample side — a locked pad is not part of this
       // load, so the kit's synth truth does not win here either.
-      !swing_lcd_padcat_locked(_ki) ? (
+      !swing_kit_lock_latched(_ki) ? (   // this slot's lock as the load began (the state-2 latch; 2026-10-16 it was the live one, before that the shown bank's band)
       _syb = GS_SYN_META_BASE + _ki * GS_SYN_META_PP;
-      ps_enable[_ki]   = gmem[_syb + 0] > 0.5 ? 1 : 0;
-      ps_engine[_ki]   = max(0, min(38, gmem[_syb + 1]|0));  // family + 10*type, Spec_Synthdrums_Parity §5.1
-      ps_level[_ki]    = max(0, min(2, gmem[_syb + 2]));
-      ps_vel_lo[_ki]   = max(0, min(1, gmem[_syb + 3]));
-      ps_vel_hi[_ki]   = max(0, min(1, gmem[_syb + 4]));
-      ps_rr_order[_ki] = max(0, min(MAX_LAYERS, gmem[_syb + 5]|0));
-      ps_mac0[_ki] = max(0, min(1, gmem[_syb + 6]));
-      ps_mac1[_ki] = max(0, min(1, gmem[_syb + 7]));
-      ps_mac2[_ki] = max(0, min(1, gmem[_syb + 8]));
-      ps_mac3[_ki] = max(0, min(1, gmem[_syb + 9]));
-      ps_mac4[_ki] = max(0, min(1, gmem[_syb + 10]));
-      ps_mac5[_ki] = max(0, min(1, gmem[_syb + 11]));
-      ps_mac6[_ki] = max(0, min(1, gmem[_syb + 12]));
-      ps_mac7[_ki] = max(0, min(1, gmem[_syb + 13]));
+      ps_enable[_ka]   = gmem[_syb + 0] > 0.5 ? 1 : 0;
+      ps_engine[_ka]   = max(0, min(38, gmem[_syb + 1]|0));  // family + 10*type, Spec_Synthdrums_Parity §5.1
+      ps_level[_ka]    = max(0, min(2, gmem[_syb + 2]));
+      ps_vel_lo[_ka]   = max(0, min(1, gmem[_syb + 3]));
+      ps_vel_hi[_ka]   = max(0, min(1, gmem[_syb + 4]));
+      ps_rr_order[_ka] = max(0, min(MAX_LAYERS, gmem[_syb + 5]|0));
+      ps_mac0[_ka] = max(0, min(1, gmem[_syb + 6]));
+      ps_mac1[_ka] = max(0, min(1, gmem[_syb + 7]));
+      ps_mac2[_ka] = max(0, min(1, gmem[_syb + 8]));
+      ps_mac3[_ka] = max(0, min(1, gmem[_syb + 9]));
+      ps_mac4[_ka] = max(0, min(1, gmem[_syb + 10]));
+      ps_mac5[_ka] = max(0, min(1, gmem[_syb + 11]));
+      ps_mac6[_ka] = max(0, min(1, gmem[_syb + 12]));
+      ps_mac7[_ka] = max(0, min(1, gmem[_syb + 13]));
       );  // end ② LOCK gate
       _ki += 1;
     );
   );
+  // ── S3c: the step sequencer's patterns -- the bridge staged the kit's record (the flag at EON_SEQ_KIT_BASE; a
+  // kit without one stages nothing and clears it). A whole-kit load's bank A pass asks the host's @block to adopt it
+  // (seq_kit_adopt, right before the walk; rk_seq_core is imported after this file). A preserve reload keeps the
+  // project's own patterns (the truth) and drops the staged record; a pass into bank B..D (a load INTO a bank, a
+  // chop, a batch import there) drops it too -- the bridge absorbs a kit's tail on its first pass, whichever bank
+  // that pass fills (the rig: a kit with a record loaded INTO bank B left the flag up).
+  kit_load_bank == 0 && !kit_preserve_live ? seq_kit_adopt_req = 1 : gmem[EON_SEQ_KIT_BASE] = 0;
   // ── Kit-macro adopt — same contract as the SYN block above: ONLY when
   // the bridge staged a model (flag at KMAC_KIT_BASE+0, consumed here).
   // A kit WITHOUT a macro block stages nothing → the live macro rig
@@ -1136,7 +1328,12 @@ kit_import_state == 2 ? (
   // authored: knobs move cosmetically, force re-applies the mappings.
   // Floats take positive-form guards (a NaN from a foreign file must fall
   // to a sane default, never reach the engine).
-  gmem[KMAC_KIT_BASE] > 0.5 ? (
+  // ⚠️ NOT on a preserve-live reload (2026-10-23, H24), the same rule as the sequencer line above: the project
+  // holds its own macro rig (@serialize ver 54/55, the knob values on sliders 32-39) and it is the truth. The
+  // on-open sidecar reload (default on) adopted the KIT FILE's macros instead -- every shipped kit's knobs at 0,
+  // its names, mappings and snapshots -- so each reopen undid the user's macro edits, and the next save made it
+  // stick. A preserve pass drops the staged block (the branch below) so no other bank-A pass adopts it later.
+  kit_load_bank == 0 && !kit_preserve_live && gmem[KMAC_KIT_BASE] > 0.5 ? (   // kit-level: bank A's pass only (step 3b)
     gmem[KMAC_KIT_BASE] = 0;
     _kmv = gmem[KMAC_KIT_BASE + 2]; macro1 = _kmv >= 0 && _kmv <= 1 ? _kmv : 0;
     _kmv = gmem[KMAC_KIT_BASE + 3]; macro2 = _kmv >= 0 && _kmv <= 1 ? _kmv : 0;
@@ -1147,14 +1344,18 @@ kit_import_state == 2 ? (
     _kmv = gmem[KMAC_KIT_BASE + 8]; macro7 = _kmv >= 0 && _kmv <= 1 ? _kmv : 0;
     _kmv = gmem[KMAC_KIT_BASE + 9]; macro8 = _kmv >= 0 && _kmv <= 1 ? _kmv : 0;
     sliderchange(KMAC_SLMASK);
+    // Model v3 (Pad Banks): +10+m counts only a macro's OLD-SAFE rows (they come first) and +487+m counts them
+    // all, bank B..D rows included; a v1/v2 block's +10 IS the full count (the bridge zero-fills +487.. for it,
+    // but the version decides, never a zero).
+    _kv3 = gmem[KMAC_KIT_BASE + 1] >= 3;
     _ki = 0; loop(KMAC_N,
-      kmac_nmap[_ki]  = max(0, min(KMAC_MAX_MAP, gmem[KMAC_KIT_BASE + 10 + _ki] | 0));
+      kmac_nmap[_ki]  = max(0, min(KMAC_MAX_MAP, (_kv3 ? gmem[KMAC_KIT_BASE + 487 + _ki] : gmem[KMAC_KIT_BASE + 10 + _ki]) | 0));
       kmac_scope[_ki] = gmem[KMAC_KIT_BASE + 18 + _ki] | 0;
       kmac_color[_ki] = max(0, min(7, gmem[KMAC_KIT_BASE + 26 + _ki] | 0));
       _ki += 1;
     );
     _ki = 0; loop(KMAC_N * KMAC_MAX_MAP,
-      kmac_pad[_ki] = max(-2, min(NUM_PADS - 1, gmem[KMAC_KIT_BASE + 34 + _ki] | 0));
+      kmac_pad[_ki] = max(-2, min(NUM_SLOTS - 1, gmem[KMAC_KIT_BASE + 34 + _ki] | 0));   // any of the four banks
       // Guarded like every field around it. A junk pid is harmless TODAY --
       // nothing indexes an array by pid, so an unknown one writes nothing --
       // but that is luck, not design: the day a pid-indexed lookup appears,
@@ -1206,6 +1407,13 @@ kit_import_state == 2 ? (
       );
     );
     kmac_force = 1;   // apply the authored mappings at the authored values
+  ) : gmem[KMAC_KIT_BASE] > 0.5 ? (
+    // A preserve-live reload keeps the project's macros (above), and drops the staged block here.
+    // A pass into bank B..D staged a macro block too: a "load into bank X" is the file's bank A body, so the
+    // bridge absorbs that kit's tail. Kit macros are kit-level and not adopted here -- but the block must not
+    // stay STAGED either: the band is one flat window for every instance, and the next bank-A pass anywhere (a
+    // kit without a macro block, a chop into bank A) would adopt this kit's macros over the user's rig.
+    gmem[KMAC_KIT_BASE] = 0;   // consumed, never adopted
   );
   // Format migrations for old kits. ② LOCK: these normalise values the sweep
   // above just ADOPTED, so they must skip the pads that adopted nothing —
@@ -1213,16 +1421,18 @@ kit_import_state == 2 ? (
   // repeat and layer gains to the incoming kit's era.
   // Kit v23: force one-shot + zero per-pad repeat on old kits
   gmem[KIT_GMEM_VER] < 23 ? (
-    _ki = 0; loop(NUM_PADS,
-      !swing_lcd_padcat_locked(_ki) ? ( p_oneshot[_ki] = -1; p_rpt_div[_ki] = 0; );
+    _ki = 0; loop(NUM_PADS,   // this bank (step 3b)
+      _ka = kit_load_bank * NUM_PADS + _ki;
+      !swing_kit_lock_latched(_ki) ? ( p_oneshot[_ka] = -1; p_rpt_div[_ka] = 0; );
       _ki += 1;
     );
     oneshot_global = 1;
   );
   // Kit v25+: migrate binary one-shot (1) to tri-state (-1 = follow global)
   gmem[KIT_GMEM_VER] >= 23 && gmem[KIT_GMEM_VER] < 25 ? (
-    _ki = 0; loop(NUM_PADS,
-      !swing_lcd_padcat_locked(_ki) && p_oneshot[_ki] == 1 ? p_oneshot[_ki] = -1;
+    _ki = 0; loop(NUM_PADS,   // this bank (step 3b)
+      _ka = kit_load_bank * NUM_PADS + _ki;
+      !swing_kit_lock_latched(_ki) && p_oneshot[_ka] == 1 ? p_oneshot[_ka] = -1;
       _ki += 1;
     );
     oneshot_global = 1;
@@ -1231,7 +1441,7 @@ kit_import_state == 2 ? (
   // so the lock test takes the pad this layer belongs to.
   gmem[KIT_GMEM_VER] < 24 ? (
     _ki = 0; loop(NUM_PADS * MAX_LAYERS,
-      !swing_lcd_padcat_locked((_ki / MAX_LAYERS) | 0) ? l_gain[_ki] = 1.0;
+      !swing_kit_lock_latched((_ki / MAX_LAYERS) | 0) ? l_gain[kit_load_bank * NUM_PADS * MAX_LAYERS + _ki] = 1.0;   // this bank (step 3b)
       _ki += 1;
     );
   );
@@ -1255,11 +1465,12 @@ kit_import_state == 2 ? (
   // successful-open branch / explicit clear_pad), so an interrupted load can
   // never leave untouched pads blank (non-destructive by construction).
   gmem[KIT_GMEM_VER] != 26 && gmem[KIT_GMEM_VER] != 201 ? (
-    _ki = 0; loop(NUM_PADS,
-      memset(s_audio_start + _ki * SLOT_SIZE, 0, SLOT_SIZE);
+    _ki = 0; loop(NUM_PADS,   // bank A: only the v1 packed route reaches this wipe, and it addresses bank A only (Pad Banks audit S5; the bridge refuses an old format into another bank)
+      !swing_kit_lock_latched(_ki) ? swing_pad_free_all(_ki);   // step 2a: the wipe frees the regions; each pad's copy takes its own. A LOCKED pad keeps its own (H25)
       _ki += 1;
     );
   );
+  alloc_refused_bits = 0;   // step 2a: per import, ORed into the completion ack (state 4)
   // Calculate total audio for import progress
   kit_total_audio = 0;
   _ki = 0; loop(NUM_PADS,
@@ -1292,31 +1503,61 @@ kit_import_state == 3 ? (
       _hg != hs_cur_gen ? (
         // New message: latch meta. The payload was written BEFORE the even
         // GEN flip (x86 store order) and stays stable until we echo.
-        hs_cur_gen  = _hg;
-        hs_copy_pos = 0;
-        hs_pad   = max(0, min(NUM_PADS - 1,   gmem[KIT_HS_PAD]   | 0));
+        // (Step 2a: the meta is read first -- idempotently -- and the message is LATCHED only
+        // once the blob has a region. A blob that must wait for the compaction job stays
+        // unlatched and is looked at again next block.)
+        hs_pad   = kit_load_bank * NUM_PADS + max(0, min(NUM_PADS - 1, gmem[KIT_HS_PAD] | 0));   // the pass's bank (step 3b)
         hs_layer = max(0, min(MAX_LAYERS - 1, gmem[KIT_HS_LAYER] | 0));
         hs_flags = gmem[KIT_HS_FLAGS] | 0;
         // Clamp so a corrupt length can never overrun the resident slot.
-        hs_len   = max(0, min(gmem[KIT_HS_LEN] | 0, SLOT_SIZE - hs_layer * LAYER_SIZE));
+        hs_len   = max(0, min(gmem[KIT_HS_LEN] | 0, SLOT_SIZE));   // a region's cap; the layer clamp is applied below (the old `SLOT_SIZE - hs_layer * LAYER_SIZE` reached 0 once a layer grew to a pad)
         hs_flags & 2 ? (
           // Kit-done sentinel → finalize.
+          hs_cur_gen = _hg; hs_copy_pos = 0;
           gmem[KIT_HS_ECHO] = _hg;
           kit_import_state = 4;
         ) : (
           // First blob for this pad: zero ONLY this pad's slot. Every other
           // pad keeps its old audio until its own blobs arrive.
-          // ...unless the pad is kept (preserve-live reload): its audio stays.
-          hs_flags & 1 && !kit_keep_pad[hs_pad] ? memset(s_audio_start + hs_pad * SLOT_SIZE, 0, SLOT_SIZE);
+          // ...unless the pad is kept (preserve-live reload) or LOCKED: its audio stays. The lock was
+          // missing here (2026-10-23, H25: bf094b64 gated VER-201 and VER-200 and took the VER-200 branch
+          // for this one): the bridge streams every pad's blob, a locked one too, so the stream freed the
+          // locked pad, fitted the kit's blob at the pad's OLD layer count and copied it in, while the
+          // META sweep kept the old lengths -- a cut-short sound or a read past its region. A locked pad
+          // now consumes its blobs untouched, like a kept one (hs_r stays -1; the echo still advances).
+          _hs_keep = kit_keep_pad[hs_pad] || swing_kit_lock_latched(hs_pad - kit_load_bank * NUM_PADS);   // the lock as the load BEGAN: its META was kept then
+          hs_flags & 1 && !_hs_keep ? swing_pad_free_all(hs_pad);   // idempotent across a wait
+          // Step 2a: the blob's region, taken at the latch -- state 2 already applied the
+          // kit's META, so a plain pad's layer-0 blob is its PLAIN region and a layered pad's
+          // blob is one layer (LAYER_SIZE at most). hs_r = the region it lands in (0 plain,
+          // layer + 1), -1 = nothing to copy. Room after packing: the blob stays unlatched and
+          // is retried next block while the compaction job runs. No room: the blob is consumed
+          // and echoed but not copied, the pad reads empty there, the ack carries the bit.
+          hs_r = -1; _hs_latch = 1;
+          !_hs_keep ? (
+            p_layer_cnt[hs_pad] > 0 ? hs_len = min(hs_len, LAYER_SIZE);
+            (p_layer_cnt[hs_pad] > 0 ? swing_pad_fit_layer(hs_pad, hs_layer, hs_len, _al_dl_blk)
+                                     : swing_pad_fit_main(hs_pad, hs_len, _al_dl_blk)) ? (
+              hs_r = p_layer_cnt[hs_pad] > 0 ? hs_layer + 1 : 0;
+            ) : alc_wait ? (
+              _hs_latch = 0;
+            ) : (
+              swing_alloc_refuse_note(hs_pad);
+              p_layer_cnt[hs_pad] > 0 ? ( l_len[hs_pad * MAX_LAYERS + hs_layer] = 0; ) : ( s_len[hs_pad] = 0; );
+            );
+            swing_disp_free(_al_dl_blk);
+          );
+          _hs_latch ? ( hs_cur_gen = _hg; hs_copy_pos = 0; );
         );
       );
-      kit_import_state == 3 && !(hs_flags & 2) ? (
+      kit_import_state == 3 && _hg == hs_cur_gen && !(hs_flags & 2) ? (
         _hbatch = min(KIT_COPY_CHUNK, hs_len - hs_copy_pos);
-        _hdst = s_audio_start + hs_pad * SLOT_SIZE + hs_layer * LAYER_SIZE + hs_copy_pos;
+        // re-derived every block from the table: the compaction job may have moved the region
+        _hdst = hs_r >= 0 ? swing_region_ptr(hs_pad, hs_r) + hs_copy_pos : -1;
         _hsrc = KIT_GMEM_AUDIO + hs_copy_pos;
-        // A kept pad consumes the blob without writing it (the echo still
-        // advances the bridge); everything else copies as before.
-        !kit_keep_pad[hs_pad] ? (
+        // A kept or locked pad consumes the blob without writing it (the echo still
+        // advances the bridge; its hs_r stays -1 from the latch); so does a refused one (hs_r < 0); everything else copies.
+        !kit_keep_pad[hs_pad] && hs_r >= 0 ? (
           _hj = 0; loop(_hbatch,
             _hdst[_hj] = gmem[_hsrc + _hj];
             _hj += 1;
@@ -1368,13 +1609,14 @@ kit_import_state == 3 ? (
     );
     kit_copy_pad < NUM_PADS ? (
       _ki = kit_copy_pad;
+      _ka = kit_load_bank * NUM_PADS + _ki;   // engine slot (step 3b); _ki stays the 16-wide band index
       // ② LOCK (kit-categories): a locked pad is UNTOUCHED by kit loads — skip
       // its whole adopt (paths, clears, meta). Internal p_* state is kept and
       // the META republish sweep (:236) restores the truth cells, so a later
       // SAVE writes the pad's real (kept) data, not the skipped kit's staging.
       // A kept pad (preserve-live reload, kit_keep_pad) takes the same exit:
       // no path adopt, no clear, no load -- its audio is the user's truth.
-      gmem[EON_PADCAT_BASE + _reg_my_slot*EON_PADCAT_STRIDE + _ki*4 + 3] > 0.5 || kit_keep_pad[_ki] ? (
+      swing_kit_lock_latched(_ki) || kit_keep_pad[_ka] ? (   // this slot's lock as the load BEGAN (the state-2 latch: the sweep kept its META by it; a live test here split them)
         kit_copy_retry = 0;
         kit_copy_pad += 1;
       ) : (
@@ -1406,7 +1648,7 @@ kit_import_state == 3 ? (
                 _ci += 1;
               );
               str_setlen(#_kit_tmp_path, _plen);
-              swing_ldr_step_layer(_ki, _lj, #_kit_tmp_path) ?
+              swing_ldr_step_layer(_ka, _lj, #_kit_tmp_path) ?
                 ( kit_ldr_done |= 2^_lj; ) : ( kit_ldr_yield = 1; );
             );
           ) : (
@@ -1426,8 +1668,8 @@ kit_import_state == 3 ? (
               // retry backstop re-dispatches instead of the pad going silently
               // blank-but-"clean" (the failbits=0x0 blank-pad class).
               gmem[_mb + 40 + _lj * 10] > 0 ? kit_stage_gap_bits |= 2 ^ _ki;
-              (l_len[_ki * MAX_LAYERS + _lj] > 0 ||
-               strlen(LPATH_STR_BASE + _ki * MAX_LAYERS + _lj) > 0) ? clear_layer(_ki, _lj);
+              (l_len[_ka * MAX_LAYERS + _lj] > 0 ||
+               strlen(LPATH_STR_BASE + _ka * MAX_LAYERS + _lj) > 0) ? clear_layer(_ka, _lj);
               kit_ldr_done |= 2^_lj;
             );
           );
@@ -1436,7 +1678,7 @@ kit_import_state == 3 ? (
         // kit says layered but staged no paths: a sliced clear (Phase 4, A O-2), held
         // like a load until the slot is clean
         !kit_ldr_yield && !_v201_any && !(kit_ldr_done & 256) ? (
-          swing_ldr_zero_pad(_ki) ? ( kit_ldr_done |= 256; ) : ( kit_ldr_yield = 1; );
+          swing_ldr_zero_pad(_ka) ? ( kit_ldr_done |= 256; ) : ( kit_ldr_yield = 1; );
         );
       ) : (
         !(kit_ldr_done & 256) ? (
@@ -1450,7 +1692,7 @@ kit_import_state == 3 ? (
               _ci += 1;
             );
             str_setlen(#_kit_tmp_path, _plen);
-            swing_ldr_step_pad(_ki, #_kit_tmp_path) ?
+            swing_ldr_step_pad(_ka, #_kit_tmp_path) ?
               ( kit_ldr_done |= 256; ) : ( kit_ldr_yield = 1; );
           ) : (
             // STAGE-GAP CONTRADICTION (see the layered branch above): kit meta
@@ -1459,7 +1701,7 @@ kit_import_state == 3 ? (
             // pad is empty in the new kit: a sliced clear (Phase 4, A O-2), held like a
             // load until the slot is clean -- the four synchronous 8 MB memsets were one
             // audio-thread overrun per empty pad
-            swing_ldr_zero_pad(_ki) ?
+            swing_ldr_zero_pad(_ka) ?
               ( kit_ldr_done |= 256; ) : ( kit_ldr_yield = 1; );
           );
         );
@@ -1468,7 +1710,7 @@ kit_import_state == 3 ? (
       // ── Re-apply kit metadata over what the loaders clobbered (auto-name,
       // auto-ADSR, layer defaults). The gmem META region persists through
       // state 3, so read it back directly (same pattern as VER-200).
-      _cn = get_cname_slot(_ki);
+      _cn = get_cname_slot(_ka);
       str_setlen(_cn, 0);
       _cj = 0; _cnl = 0;
       loop(KIT_GMEM_PADNAME_LEN,
@@ -1477,19 +1719,19 @@ kit_import_state == 3 ? (
         _cj += 1;
       );
       str_setlen(_cn, _cnl);
-      s_start[_ki]     = gmem[_mb + 35];
-      s_end[_ki]       = gmem[_mb + 36];
-      p_attack[_ki]    = gmem[_mb + 3];
-      p_decay[_ki]     = gmem[_mb + 4];
-      p_sustain[_ki]   = gmem[_mb + 5];
-      p_release[_ki]   = gmem[_mb + 6];
-      p_adsr_user[_ki] = 1;  // kit ADSR overrides analyze_adsr — keep it sticky
+      s_start[_ka]     = gmem[_mb + 35];
+      s_end[_ka]       = gmem[_mb + 36];
+      p_attack[_ka]    = gmem[_mb + 3];
+      p_decay[_ka]     = gmem[_mb + 4];
+      p_sustain[_ka]   = gmem[_mb + 5];
+      p_release[_ka]   = gmem[_mb + 6];
+      p_adsr_user[_ka] = 1;  // kit ADSR overrides analyze_adsr — keep it sticky
       _v201_lc > 0 ? (
-        p_layer_cnt[_ki]  = _v201_lc;
-        p_layer_mode[_ki] = gmem[_mb + 33];
+        p_layer_cnt[_ka]  = _v201_lc;
+        p_layer_mode[_ka] = gmem[_mb + 33];
         _lj = 0; loop(MAX_LAYERS,
           _lo = _mb + 40 + _lj * 10;   // VER 201 implies the v24+ stride-10 layout
-          _lidx = _ki * MAX_LAYERS + _lj;
+          _lidx = _ka * MAX_LAYERS + _lj;
           l_start[_lidx]    = gmem[_lo + 1];
           l_end[_lidx]      = gmem[_lo + 2];
           l_norm[_lidx]     = gmem[_lo + 4];
@@ -1501,8 +1743,8 @@ kit_import_state == 3 ? (
           _lj += 1;
         );
       );
-      recalc_pad(_ki);
-      s_dirty[_ki] = 1;
+      recalc_pad(_ka);
+      s_dirty[_ka] = 1;
       // File-open retry (2026-07-19): a transient AV/indexer read-lock makes
       // file_open miss a VALID store WAV, leaving this pad blank. Rather than
       // advance, re-run THIS pad on the next @block — attempts spread across
@@ -1538,8 +1780,8 @@ kit_import_state == 3 ? (
         _xf_len = swing_xf_len(0.020);   // + a block under Wired (A-5)
         _xf_active = 1;
       );
-      _ki = 0; loop(NUM_PADS,
-        memset(s_audio_start + _ki * SLOT_SIZE, 0, SLOT_SIZE);
+      _ki = 0; loop(NUM_PADS,   // bank A: the v2 loader addresses bank A only (Pad Banks audit S5; the bridge refuses an old format into another bank)
+        !swing_kit_lock_latched(_ki) ? swing_pad_free_all(_ki);   // step 2a: the wipe frees the regions; each pad's load takes its own. A LOCKED pad keeps its own: its body below is skipped, so a freed one was left with no region and its old lengths (H25)
         _ki += 1;
       );
     );
@@ -1547,10 +1789,11 @@ kit_import_state == 3 ? (
     _v2_count = 0;
     while(_v2_count < 2 && kit_copy_pad < NUM_PADS) (
       _ki = kit_copy_pad;
-      // ② LOCK gate, legacy v26 path: skip the WHOLE pad body — its else-branch
+      // ② LOCK gate, VER-200 (the v2 path-only kit; this said "legacy v26 path", which is how the real VER-26 stream
+      // above went ungated until 2026-10-23): skip the WHOLE pad body — its else-branch
       // is clear_pad and the tail re-applies name/META, all of which must not
       // touch a locked pad. A kept pad (preserve-live reload) exits the same way.
-      gmem[EON_PADCAT_BASE + _reg_my_slot*EON_PADCAT_STRIDE + _ki*4 + 3] > 0.5 || kit_keep_pad[_ki] ? (
+      swing_kit_lock_latched(_ki) || kit_keep_pad[_ki] ? (   // VER 200 is bank A's pass: slot _ki's lock as the load began (the state-2 latch)
         kit_copy_pad += 1;
       ) : (
       _pbase = KIT_GMEM_AUDIO + _ki * 260;
@@ -1592,24 +1835,45 @@ kit_import_state == 3 ? (
       s_dirty[_ki] = 1;
       kit_copy_pad += 1;
       _v2_count += 1;
-      );  // close the ② lock-gate else-branch (v26 unlocked-pad body)
+      );  // close the ② lock-gate else-branch (VER-200 unlocked-pad body)
     );
     kit_copy_pad >= NUM_PADS ? (
       kit_import_state = 4;
     );
   ) : (
     // ─── V1 binary audio copy (existing code) ─────────────────────────
-    _copied = 0;
-    while(_copied < KIT_COPY_CHUNK && kit_copy_pad < NUM_PADS) (
+    _copied = 0; _v1_wait = 0;
+    swing_kit_packed_skip_locked();   // a LOCKED pad at the cursor: past it by the kit's size, untouched (H25)
+    while(_copied < KIT_COPY_CHUNK && kit_copy_pad < NUM_PADS && !_v1_wait) (
+      // Step 2a: each region is taken at its first cell (the legacy V1 route). Refused = no
+      // room: the region reads empty, its packed bytes are skipped so the later pads' offsets
+      // hold, and the ack carries the bit.
       p_layer_cnt[kit_copy_pad] > 0 ? (
         _lidx = kit_copy_pad * MAX_LAYERS + kit_copy_layer;
-        _dst = s_audio_start + kit_copy_pad * SLOT_SIZE + kit_copy_layer * LAYER_SIZE;
         _alen = l_len[_lidx];
+        (kit_copy_pos == 0 && _alen > 0) ? (
+          !swing_pad_fit_layer(kit_copy_pad, kit_copy_layer, _alen, _al_dl_blk) ? (
+            alc_wait ? ( _v1_wait = 1; ) : (   // room after packing: hold this block, retry next
+              swing_alloc_refuse_note(kit_copy_pad); l_len[_lidx] = 0; kit_audio_off += _alen; _alen = 0;
+            );
+          );
+          swing_disp_free(_al_dl_blk);
+        );
+        _dst = p_lptr[kit_copy_pad * MAX_LAYERS + kit_copy_layer];
       ) : (
-        _dst = s_audio_start + kit_copy_pad * SLOT_SIZE;
         _alen = s_len[kit_copy_pad];
+        (kit_copy_pos == 0 && _alen > 0) ? (
+          !swing_pad_fit_main(kit_copy_pad, _alen, _al_dl_blk) ? (
+            alc_wait ? ( _v1_wait = 1; ) : (
+              swing_alloc_refuse_note(kit_copy_pad); s_len[kit_copy_pad] = 0; kit_audio_off += _alen; _alen = 0;
+            );
+          );
+          swing_disp_free(_al_dl_blk);
+        );
+        _dst = p_aptr[kit_copy_pad];
       );
       _remaining = _alen - kit_copy_pos;
+      _v1_wait ? ( 0; ) :   // waiting for room: touch nothing this block
       _remaining <= 0 ? (
         p_layer_cnt[kit_copy_pad] > 0 ? (
           kit_copy_layer += 1;
@@ -1648,6 +1912,7 @@ kit_import_state == 3 ? (
           );
         );
       );
+      swing_kit_packed_skip_locked();   // the next pad, when locked (at a pad boundary only; the loop test re-checks the count)
     );
     kit_copy_pad >= NUM_PADS ? (
       kit_import_state = 4;
@@ -1667,18 +1932,20 @@ kit_import_state == 4 ? (
     gfx_lim_rel_c = exp(-1.0 / max(1, gfx_lim_rel * 0.001 * srate));
     dly_recalc(); rvb_recalc(); cmp_recalc();
   );
-  _ki = 0; loop(NUM_PADS,
-    s_dirty[_ki] = 1;
-    recalc_pad(_ki);
-    recalc_fx(_ki);
+  _ki = 0; loop(NUM_PADS,   // this bank (step 3b)
+    _ka = kit_load_bank * NUM_PADS + _ki;
+    s_dirty[_ka] = 1;
+    recalc_pad(_ka);
+    recalc_fx(_ka);
     // P4 fail bits: recompute for EVERY import route. The VER-201/200 loaders
     // recompute per pad themselves, but the direct-copy routes (VER-26 blob
     // stream, V1 binary) deliver audio without touching the loaders — a bit
     // set before the load survived a perfectly good import ("pad plays fine
     // but still flagged", observed live 2026-07-16 pad 2).
-    swing_pad_fail_recompute(_ki);
+    swing_pad_fail_recompute(_ka);
     _ki += 1;
   );
+  !kit_preserve_live ? strcpy(BKNAME_STR_BASE + kit_load_bank, #bkname_pending);   // step 4b: the pass's bank takes the kit's name
   // Mark colors dirty so the @block rebuild picks up the new kit's
   // drum-type / output / blank state and refreshes col_auto_hue[] for
   // every pad. Without this, loading a kit while the Swing window is
@@ -1691,7 +1958,11 @@ kit_import_state == 4 ? (
   // does the user-visible name flip. A load that stalled or aborted never
   // reaches this line, so the old name survives untouched (no rollback
   // machinery needed). Preserve-live reloads staged no pending name.
-  !kit_preserve_live ? (
+  // Bank A's pass only, the pass that staged it (state 2, step 3b): a pass into
+  // B..D -- a load INTO a bank, a chop or a batch import there -- committed a
+  // stale pending name, or an empty one on an instance that had not loaded a kit
+  // this session (Pad Banks audit S4). That bank's own name is BKNAME, above.
+  !kit_preserve_live && kit_load_bank == 0 ? (   // the instrument's name: bank A's pass commits it
     strcpy(#kit_name, #kit_name_pending);
     kit_name_gmem_dirty = 1;
   );
@@ -1707,7 +1978,18 @@ kit_import_state == 4 ? (
   // how blank pads acked failbits=0x0 for a week. Folding the contradiction
   // into the ack lets the bridge's existing failed-pads retry re-dispatch —
   // a full re-stage — instead of trusting a "clean" blank.
-  gmem[GS_LOAD_ACK_FAILBITS] = pad_fail_bits | kit_stage_gap_bits;
+  // A KEPT pad (preserve reload, kit_keep_pad) is not this pass's business: a pad the user replaced
+  // whose own file is gone keeps its fail bit for the banner, but that bit must not read as THIS
+  // pass failing -- the bridge would retry the body twice and drop the bank passes (step 3c).
+  _akb = swing_fail_mask(kit_load_bank);
+  kit_preserve_live ? ( _aki = 0; loop(NUM_PADS,   // this bank (step 3c)
+    kit_keep_pad[kit_load_bank * NUM_PADS + _aki] ? _akb = (_akb | (2 ^ _aki)) - 2 ^ _aki;
+    _aki += 1;
+  ); );
+  gmem[GS_LOAD_ACK_FAILBITS] = _akb | kit_stage_gap_bits | alloc_refused_bits;   // the LOADED bank's mask (step 3b) + the pads refused for room (step 2a)
+  // The pass is over (step 3b); the next arm latches its own. AFTER the ack: reset above it, the mask and the
+  // kept-pad walk read bank A's, so a failed B..D pad acked clean and was never retried (Pad Banks audit S2).
+  kit_load_bank = 0; kit_load_wipe = 0;
   // Echo the LIVE epoch, not the one captured at arm time (2026-07-19). The
   // in-plugin LOAD button arms this instance DIRECTLY (kit_import_state=1 on
   // click) instead of through the delivery gate, so kit_load_epoch was stale
@@ -1746,7 +2028,7 @@ kit_import_state == 4 ? (
 );
 
 function swing_ui_misc_cmds()
-local(_ki, _cj, _cn, _cnl, _cc)  // localized 2026-07-09: raced the @block kit-import loop (see swing_ui_process_undo note)
+local(_ki, _cj, _cn, _cnl, _cc, _ki_s)  // localized 2026-07-09: raced the @block kit-import loop (see swing_ui_process_undo note)
 (
 // Instance gate (audit B-6, 2026-09-14). A user save's 99 arrives with LOCK =
 // the saver -- the bridge no longer auto-releases LOCK on that ack -- so only
@@ -1759,7 +2041,8 @@ local(_ki, _cj, _cn, _cnl, _cc)  // localized 2026-07-09: raced the @block kit-i
   && (gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id) ? (
   // Re-read pad names from gmem
   _ki = 0; loop(NUM_PADS,
-    _cn = get_cname_slot(_ki);
+    _ki_s = swing_bp(_ki);
+    _cn = get_cname_slot(_ki_s);
     str_setlen(_cn, 0);
     _cj = 0; _cnl = 0;
     loop(KIT_GMEM_PADNAME_LEN,
@@ -1769,7 +2052,7 @@ local(_ki, _cj, _cn, _cnl, _cc)  // localized 2026-07-09: raced the @block kit-i
     );
     str_setlen(_cn, _cnl);
     // Re-read color from metadata slot 12
-    p_color[_ki] = gmem[KIT_GMEM_META + _ki * KIT_GMEM_META_PP + 12]; col_dirty = 1;
+    p_color[_ki_s] = gmem[KIT_GMEM_META + _ki * KIT_GMEM_META_PP + 12]; col_dirty = 1;
     _ki += 1;
   );
   gmem[KIT_GMEM_CMD] = 0;
@@ -1798,7 +2081,7 @@ gmem[KIT_GMEM_CMD] == 51 && gmem[KIT_GMEM_LOCK] == instance_id ? (
   gmem[KIT_GMEM_LOCK] = 0;
   gmem[KIT_GMEM_CMD] = 0;
   _rp >= 0 && _rp < NUM_PADS ? (
-    _cn = get_cname_slot(_rp);
+    _cn = get_cname_slot(swing_bp(_rp));
     str_setlen(_cn, 0);
     _cj = 0; _cnl = 0;
     loop(KIT_GMEM_PADNAME_LEN,
@@ -1807,7 +2090,7 @@ gmem[KIT_GMEM_CMD] == 51 && gmem[KIT_GMEM_LOCK] == instance_id ? (
       _cj += 1;
     );
     str_setlen(_cn, _cnl);
-    mark_dirty_pad(_rp);
+    mark_dirty_pad(swing_bp(_rp));
     sync_note_names();
     col_dirty = 1; // re-derive auto-color from new cname
   );
@@ -1815,13 +2098,14 @@ gmem[KIT_GMEM_CMD] == 51 && gmem[KIT_GMEM_LOCK] == instance_id ? (
 
 // Peak meter decay — use pad_meterL/R (smoothed in @sample)
 gi = 0; loop(NUM_PADS,
-  _pk = max(pad_meterL[gi], pad_meterR[gi]);
-  p_peak_hold[gi] = max(_pk, p_peak_hold[gi] * 0.92);
+  gi_s = swing_bp(gi);
+  _pk = max(pad_meterL[gi_s], pad_meterR[gi_s]);
+  p_peak_hold[gi_s] = max(_pk, p_peak_hold[gi_s] * 0.92);
   gi += 1;
 );
 
 // Build dirty caches
-gi = 0; loop(NUM_PADS, s_dirty[gi] ? build_wv_cache(gi); gi += 1;);
+gi = 0; loop(NUM_PADS, gi_s = swing_bp(gi); s_dirty[gi_s] ? build_wv_cache(gi_s); gi += 1;);
 );
 
 function swing_ui_set_colors() (
@@ -1928,11 +2212,11 @@ local(_w, _h, _used, _fs)
   // (user 2026-08-05). A smaller label beats a missing one; below 8px we
   // still drop it rather than draw the unreadable.
   _fs = 10;
-  gfx_setfont(1, "Arial", _fs, 'b');
+  rk_font(1, _fs, 'b');
   gfx_measurestr(_lbl, _w, _h);
   while(_chip_x - _w - HDR_CAP_GAP < HDR_CAP_MIN_X && _fs > 8) (
     _fs -= 1;
-    gfx_setfont(1, "Arial", _fs, 'b');
+    rk_font(1, _fs, 'b');
     gfx_measurestr(_lbl, _w, _h);
   );
   _used = 0;
@@ -1950,7 +2234,7 @@ local(_w, _h, _used, _fs)
   // inherit whatever the last chip left, and their widths were measured up top
   // at Arial 11 bold. This is the exact hazard rkth_draw_chip documents when it
   // refuses to call gfx_setfont(0).
-  gfx_setfont(1, "Arial", 11, 'b');
+  rk_font(1, 11, 'b');
   _used;
 );
 
@@ -2063,6 +2347,40 @@ local(_hov, _rig_docked)
   );
 );
 
+// Pad Banks Outputs step 4 (Plan_Swing_Pad_Banks_Outputs.md 6): Swing's panel in the mixer. The bridge says whether
+// this theme narrows the panel once the track passes 38 channels and what the user chose (the strip band's MIX_STATE:
+// 0 = not that theme / no bridge -- no menu entry; 1 = not asked yet; 2 = full width, Swing's strip on Layout B; 3 =
+// leave the theme alone); a click asks it to switch (MIX_REQ: 1 = use Layout B, 2 = leave it).
+function swing_mix_state() (
+  _reg_my_slot >= 0 ? gmem[GS_STRIP_BASE + _reg_my_slot * GS_STRIP_STRIDE + GS_STRIP_OFF_MIX_STATE] | 0 : 0;
+);
+function swing_mix_request(v) (
+  _reg_my_slot >= 0 ? gmem[GS_STRIP_BASE + _reg_my_slot * GS_STRIP_STRIDE + GS_STRIP_OFF_MIX_REQ] = v;
+);
+// The gear menu, built in one place (it is rebuilt in place while the wheel turns an item).
+function swing_prefs_menu() local(m) (
+  sprintf(#_prefs_menu, "%s|%s|%s|%s|%s",
+    midi_thru               ? "^G MIDI Thru: ON"                  : "MIDI Thru: OFF",
+    tooltips_enabled        ? "^G Tooltips: ON"                   : "Tooltips: OFF",
+    pad_click_selects_track ? "^G Select track on pad-click: ON"  : "Select track on pad-click: OFF",
+    embed_mode == EMBED_MODE_ALWAYS ? "Embed audio: Always (self-contained)" :
+    embed_mode == EMBED_MODE_NEVER  ? "Embed audio: Never (disk only)"       :
+                                      "Embed audio: Auto",
+    adsr_3node ? "ADSR nodes: 3 (drum — D carries sustain)" : "ADSR nodes: 4 (studio)");
+  m = swing_mix_state();
+  m >= 1 ? strcat(#_prefs_menu, m == 2 ? "|^G Mixer panel full width (Layout B): ON" : "|Mixer panel full width (Layout B): OFF");
+);
+
+// The THEME chip's things closed: its dropdown (rkth_open), its menu panel (thm_open) and a row's option list (a
+// swing_popup with its own lifetime: swing_popup_tick runs in the shared tail, so it would outlive the panel that opened
+// it). Their input lives in the full header; their draw in the tail. Called when the header folds the chip away and
+// when the face turns to the rack face (Swing_ReaKit.jsfx; the small-things round's compact switch adds ways in).
+function swing_theme_fold() (
+  rkth_open = 0; thm_open = 0;
+  swing_popup_active &&
+    (swing_popup_caller_id == SP_POPUP_CALLER_THEME || swing_popup_caller_id == SP_POPUP_CALLER_EMBED_MENU)
+    ? swing_popup_close(-1);
+);
 function swing_ui_draw_header() (
   gfx_set(bg_r, bg_g, bg_b, 1); gfx_rect(0, 0, gfx_w, gfx_h);
 
@@ -2083,7 +2401,7 @@ function swing_ui_draw_header() (
   gfx_set(0.18, 0.18, 0.20, 1); gfx_rect(0, 27, gfx_w, 1);
   gfx_set(0.42, 0.42, 0.44, 0.4); gfx_rect(0, 28, gfx_w, 1); // subtle shadow line at body
   // "SWING" title with spaced letters
-  gfx_setfont(1, "Arial", 16, 'b');
+  rk_font(1, 16, 'b');
   // SWING wordmark stays the signature AKAI red in every theme — it's the brand
   // mark, so it does NOT follow the theme accent (which would turn it orange under
   // EON, green under SSL, etc.). Other accent elements still follow the theme.
@@ -2099,7 +2417,7 @@ function swing_ui_draw_header() (
   // this line has always had (fixed 0.55/0.53/0.50 at a=0.5 over hd 0.30 composites
   // to ~0.42 grey; so does a near-white ink pulled 80% back toward hd) while
   // staying legible when the strip goes pale. Same helper the captions above use.
-  gfx_setfont(1, "Arial", 9, 0);
+  rk_font(1, 9, 0);
   rk_auto_ink_dim(hd_r, hd_g, hd_b, 0.80); gfx_a = 1;
   gfx_x = 78; gfx_y = 17; gfx_drawstr("by EON Studios");
 
@@ -2113,7 +2431,7 @@ function swing_ui_draw_header() (
   _btn_y   = 6;
   _btn_pad = 5;
   _btn_gap = 4;
-  gfx_setfont(1, "Arial", 11, 'b');
+  rk_font(1, 11, 'b');
   gfx_measurestr("↷ REDO", _redo_tw, _btn_th);
   _redo_bw = _redo_tw + _btn_pad * 2;
   gfx_measurestr("↶ UNDO", _undo_tw, _btn_th);
@@ -2144,7 +2462,7 @@ function swing_ui_draw_header() (
   // TOOLBAR sits at the far right of the cluster now, THEME just left of it
   // (user 2026-08-05: swap). Geometry computed HERE because THEME's anchor
   // depends on it; TOOLBAR's draw + input stay in their own block below.
-  gfx_setfont(1, "Arial", 11, 'b');
+  rk_font(1, 11, 'b');
   gfx_measurestr("TOOLBAR", _tb_maxw, _tb_th2);
   _tb_bw = _tb_maxw + _btn_pad * 2;
   _tb_bx = _thru_bx - _tb_bw - _btn_gap;
@@ -2162,13 +2480,22 @@ function swing_ui_draw_header() (
     // panel holding every appearance option this plugin has. Nothing is lost: the
     // theme list is still one RIGHT click away, and it is also the panel's first
     // row. lmb is passed to rkth_input as 0 so the widget still stores its geometry
-    // for rkth_draw_chip and rkth_overlay_draw, without toggling its own list on a
-    // left click. Wheel still cycles the theme.
+    // for rkth_draw_chip and rkth_overlay_draw. Wheel still cycles the theme.
+    // ⚠️⚠️ lmb reaches rkth_input ONLY while its list is
+    // already OPEN. Shut, it is withheld so a left click on the chip opens the
+    // THEME MENU rather than the widget's own list. Open, the click is the LIST'S:
+    // rk_theme.jsfx-inc:118 picks the hovered row under `lmb ?`, so withholding it
+    // unconditionally left the list openable by right-click and impossible to
+    // choose from -- which is how it shipped in 3.0.18.
+    // ⭐ _thm_lclick is gated the same way, and it must be: it is computed BEFORE the
+    // call, so rkth_input zeroing lmb_down on a consumed click cannot unset it. Without
+    // the gate, clicking the chip while the list is up would close the list AND open
+    // the panel in one gesture.
     // The panel hangs from this chip; the core right-aligns itself to it.
     thm_anchor_x = _thm_bx; thm_anchor_y = _btn_y;
     thm_anchor_w = _thm_bw; thm_anchor_h = _btn_h;
-    _thm_lclick = lmb_down && mx >= _thm_bx && mx <= _thm_bx + _thm_bw && my >= _btn_y && my <= _btn_y + _btn_h;
-    rkth_input(_thm_bx, _btn_y, _thm_bw, _btn_h, mx, my, 0, rmb_down, frame_wheel, _btn_h) ? ( lmb_down = 0; frame_wheel = 0; );
+    _thm_lclick = !rkth_open && lmb_down && mx >= _thm_bx && mx <= _thm_bx + _thm_bw && my >= _btn_y && my <= _btn_y + _btn_h;
+    rkth_input(_thm_bx, _btn_y, _thm_bw, _btn_h, mx, my, rkth_open ? lmb_down : 0, rmb_down, frame_wheel, _btn_h) ? ( lmb_down = 0; frame_wheel = 0; );
     // Spend the click HERE, so swing_thm_input's click-outside-closes test (which
     // runs later this frame) cannot immediately undo the open.
     _thm_lclick ? ( thm_open = 1 - thm_open; rkth_open = 0; lmb_down = 0; );
@@ -2186,10 +2513,7 @@ function swing_ui_draw_header() (
     // left to close them. ⚠ thm_open = 0 is NOT enough -- a row's list is a
     // swing_popup with its own lifetime, and swing_popup_tick is called
     // unconditionally in the tail, so it would outlive the panel that opened it.
-    _thm_capw = 0; rkth_open = 0; thm_open = 0;
-    swing_popup_active &&
-      (swing_popup_caller_id == SP_POPUP_CALLER_THEME || swing_popup_caller_id == SP_POPUP_CALLER_EMBED_MENU)
-      ? swing_popup_close(-1);
+    _thm_capw = 0; swing_theme_fold();
   );
 
   // ── TOOLBAR button — open/close the EON toolbar (bridge CMD 78). Sits just left
@@ -2199,7 +2523,7 @@ function swing_ui_draw_header() (
   // _tb_bw/_tb_bx precomputed above the THEME block (swap: TOOLBAR is the
   // rightmost chip, THEME anchors off it).
   _tb_bx >= HDR_CAP_MIN_X ? (
-    gfx_setfont(1, "Arial", 11, 'b');
+    rk_font(1, 11, 'b');
     _tb_hover = mx >= _tb_bx && mx <= _tb_bx + _tb_bw && my >= _btn_y && my <= _btn_y + _btn_h;
     _tb_lit = gmem[GS_TOOLBAR_OPEN] > 0.5;   // bridge publishes toolbar open-state
     _tb_lit ? gfx_set(1.0, 0.66, 0.20, _tb_hover ? 1.0 : 0.95)     // open  = vivid orange
@@ -2235,7 +2559,7 @@ function swing_ui_draw_header() (
     swing_strv_seen == 0 ? ( swing_strip_view = 3; swing_strv_seen = 1; );   // default FULL
     _strv = max(0, min(3, swing_strip_view | 0));
     _strv == 0 ? strcpy(#_strv_l, "EQ") : _strv == 1 ? strcpy(#_strv_l, "STRP") : _strv == 2 ? strcpy(#_strv_l, "S+VU") : strcpy(#_strv_l, "FULL");
-    gfx_setfont(1, "Arial", 11, 'b');
+    rk_font(1, 11, 'b');
     gfx_measurestr("S+VU", _strv_mw, _strv_th);
     _strv_bw = _strv_mw + _btn_pad * 2;
     _strv_bx = _thm_bx - _thm_capw - _strv_bw - _btn_gap;   // clears the THEME caption (KNOB chip removed 2026-09-22)
@@ -2282,7 +2606,7 @@ function swing_ui_draw_header() (
     _svu == 15 ? strcpy(#_svu_l, "Red")          : _svu == 16 ? strcpy(#_svu_l, "Yellow")       :
     _svu == 17 ? strcpy(#_svu_l, "Orange")       : _svu == 18 ? strcpy(#_svu_l, "Emerald")      :
                  strcpy(#_svu_l, "Cobalt");
-    gfx_setfont(1, "Arial", 11, 'b');
+    rk_font(1, 11, 'b');
     gfx_measurestr("Vintage Amber", _svu_mw, _svu_th);   // the widest face name
     // Caption-or-in-chip: mirror hdr_cap's LAST-RESORT fit test (8px) at the x
     // this chip is about to take. When even that caption would drop (crowded
@@ -2290,11 +2614,11 @@ function swing_ui_draw_header() (
     // moves INSIDE the chip: a dim "VU · " prefix ahead of the face name, so
     // the picker is never unlabeled. The chip widens by the prefix and grows
     // LEFT — only caption TEXT is bound by the HDR_CAP_MIN_X wordmark guard.
-    gfx_setfont(1, "Arial", 8, 'b');
+    rk_font(1, 8, 'b');
     gfx_measurestr("VU", _svu_w8, _svu_th8);
     _svu_incap = _strv_bx - _strv_capw - (_svu_mw + _btn_pad * 2) - _btn_gap
                  - _svu_w8 - HDR_CAP_GAP < HDR_CAP_MIN_X;
-    gfx_setfont(1, "Arial", 9, 'b');
+    rk_font(1, 9, 'b');
     gfx_measurestr("VU · ", _svu_pw, _svu_pth);
     _svu_bw = _svu_mw + (_svu_incap ? _svu_pw : 0) + _btn_pad * 2;
     _svu_bx = _strv_bx - _strv_capw - _svu_bw - _btn_gap;   // clears the STRIPS caption
@@ -2308,7 +2632,7 @@ function swing_ui_draw_header() (
         gfx_x = _svu_bx + _btn_pad; gfx_y = _btn_y + (_btn_h - _svu_pth) * 0.5;
         gfx_drawstr("VU · ");
       );
-      gfx_setfont(1, "Arial", 11, 'b');
+      rk_font(1, 11, 'b');
       gfx_set(1, 1, 1, _svu_hover ? 1.0 : 0.92);
       gfx_measurestr(#_svu_l, _svu_lw, _svu_lh);
       // value centred in its own zone (right of the prefix); with no prefix this
@@ -2355,14 +2679,7 @@ function swing_ui_draw_header() (
     _gear_hover ? ( #tooltip = "Settings — MIDI Thru · Tooltips · Select track on pad-click · Embed audio · ADSR nodes"; );
   );
   lmb_down && _gear_hover ? (
-    sprintf(#_prefs_menu, "%s|%s|%s|%s|%s",
-      midi_thru               ? "^G MIDI Thru: ON"                  : "MIDI Thru: OFF",
-      tooltips_enabled        ? "^G Tooltips: ON"                   : "Tooltips: OFF",
-      pad_click_selects_track ? "^G Select track on pad-click: ON"  : "Select track on pad-click: OFF",
-      embed_mode == EMBED_MODE_ALWAYS ? "Embed audio: Always (self-contained)" :
-      embed_mode == EMBED_MODE_NEVER  ? "Embed audio: Never (disk only)"       :
-                                        "Embed audio: Auto",
-      adsr_3node ? "ADSR nodes: 3 (drum — D carries sustain)" : "ADSR nodes: 4 (studio)");
+    swing_prefs_menu();
     swing_popup_open(mx, my, #_prefs_menu, SP_POPUP_CALLER_PREFS);
   );
   // Popup dispatch — pick toggles the underlying var (menu then closes).
@@ -2377,6 +2694,9 @@ function swing_ui_draw_header() (
     _prefs_resp == 4 ? ( embed_mode = embed_mode >= EMBED_MODE_NEVER ? EMBED_MODE_AUTO : embed_mode + 1; mark_dirty(); );
     // Display-only: the engine keeps all four params either way, so no recalc.
     _prefs_resp == 5 ? ( adsr_3node = !adsr_3node; sliderchange(slider31); mark_dirty(); );
+    // Item 6 (only on the theme that narrows the panel): ask the bridge to switch it (the answer is the user's, in
+    // REAPER's settings, not the project's -- no mark_dirty).
+    _prefs_resp == 6 && swing_mix_state() >= 1 ? swing_mix_request(swing_mix_state() == 2 ? 2 : 1);
   );
   swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_PREFS ? (
     swing_popup_result = 0;
@@ -2397,14 +2717,9 @@ function swing_ui_draw_header() (
     );
     // Item 5 (ADSR node count): wheel up = 3-node, down = 4-node.
     swing_popup_wheel_result == 5 && adsr_3node != _pw_on ? ( adsr_3node = _pw_on; sliderchange(slider31); mark_dirty(); );
-    sprintf(#_prefs_menu, "%s|%s|%s|%s|%s",
-      midi_thru               ? "^G MIDI Thru: ON"                  : "MIDI Thru: OFF",
-      tooltips_enabled        ? "^G Tooltips: ON"                   : "Tooltips: OFF",
-      pad_click_selects_track ? "^G Select track on pad-click: ON"  : "Select track on pad-click: OFF",
-      embed_mode == EMBED_MODE_ALWAYS ? "Embed audio: Always (self-contained)" :
-      embed_mode == EMBED_MODE_NEVER  ? "Embed audio: Never (disk only)"       :
-                                        "Embed audio: Auto",
-      adsr_3node ? "ADSR nodes: 3 (drum — D carries sustain)" : "ADSR nodes: 4 (studio)");
+    // Item 6: wheel up = full width (Layout B), down = leave the theme alone.
+    swing_popup_wheel_result == 6 && swing_mix_state() >= 1 && (swing_mix_state() == 2) != _pw_on ? swing_mix_request(_pw_on ? 1 : 2);
+    swing_prefs_menu();
     swing_popup_refresh_items(#_prefs_menu);
     swing_popup_wheel = 0;
   );
@@ -2496,7 +2811,7 @@ function swing_ui_draw_header() (
     gfx_circle(_ind_x, _ind_y, _ind_r, 1);
   );
   // Label next to dot
-  gfx_setfont(1, "Arial", 10, 'b');
+  rk_font(1, 10, 'b');
   _bridge_alive ? (
     gfx_set(0.30, 0.78, 0.45, 0.95);
     gfx_measurestr("BRIDGE", _tw_b, _th_b);
@@ -2518,7 +2833,7 @@ function swing_ui_draw_header() (
     update_dot_alpha <= 0.5 ? ( update_dot_alpha = 0.5; update_dot_dir =  1; );
 
     // Measure button text
-    gfx_setfont(1, "Arial", 9, 'b');
+    rk_font(1, 9, 'b');
     gfx_measurestr("UPDATE", _upd_tw, _upd_th);
     _upd_pad = 6;
     _upd_bw = _upd_tw + _upd_pad * 2;
@@ -2564,7 +2879,7 @@ function swing_ui_draw_header() (
 // (browser is the consumer; flags are raised by the operations that mutate
 // the underlying state — kit load, color rebuild, pad rename, etc.).
 function swing_browser_sync_gmem_writes()
-local(_pad_req, _knl, _ki, _cn, _cnl, _cj)
+local(_pad_req, _knl, _ki, _cn, _cnl, _cj, _ki_s)
 (
   // Multi-instance gate: only the browser-bound instance writes shared
   // state, otherwise two instances' window sizes/colors/names race for
@@ -2585,7 +2900,7 @@ local(_pad_req, _knl, _ki, _cn, _cnl, _cj)
   // Check if browser requested a pad change
   _pad_req = gmem[GS_PAD_SELECT_REQ] | 0;
   _pad_req >= 0 && _pad_req < NUM_PADS ? (
-    sel_pad = _pad_req;
+    swing_select_pad(swing_bp(_pad_req));   // bank-relative by protocol (step 4a)
     gmem[GS_PAD_SELECT_REQ] = -1;  // consume the request
   );
   // Kit name — written every frame (no inner dirty gate)
@@ -2603,9 +2918,10 @@ local(_pad_req, _knl, _ki, _cn, _cnl, _cj)
   // pad_has_audio() (binary 0/1) every frame, which raced the bridge's
   // own writes and silently corrupted Choppa kit saves to ~1 sample/pad.
   _ki = 0; loop(NUM_PADS,
+    _ki_s = swing_bp(_ki);
     gmem[KIT_GMEM_AUDIOLEN + _ki] =
-      s_len[_ki] > 0 ? s_len[_ki] :
-      (pad_has_audio(_ki) ? 1 : 0);
+      s_len[_ki_s] > 0 ? s_len[_ki_s] :
+      (pad_has_audio(_ki_s) ? 1 : 0);
     _ki += 1;
   );
   // Broadcast the effective saturation × intensity and lightness so the
@@ -2649,10 +2965,11 @@ local(_pad_req, _knl, _ki, _cn, _cnl, _cj)
     // ordering and neither reads half-staged kit data mid-import.
     col_auto_mode_id == 0 ? (
       _ki = 0; loop(NUM_PADS,
+        _ki_s = swing_bp(_ki);
         _gh = gmem[KIT_GMEM_META + _ki * KIT_GMEM_META_PP + 12];
         // Tolerance 0.005 (~1.8° hue) — below visible threshold
-        abs(_gh - p_color[_ki]) > 0.005 ? (
-          p_color[_ki] = _gh;
+        abs(_gh - p_color[_ki_s]) > 0.005 ? (
+          p_color[_ki_s] = _gh;
           col_dirty = 1;
         );
         _ki += 1;
@@ -2665,8 +2982,9 @@ local(_pad_req, _knl, _ki, _cn, _cnl, _cj)
     // multi-out tracks would show the underlying manual p_color values
     // instead of the auto-color the user is actually seeing on the pad grid.
     _ki = 0; loop(NUM_PADS,
+      _ki_s = swing_bp(_ki);
       gmem[KIT_GMEM_META + _ki * KIT_GMEM_META_PP + 12] =
-        col_auto_mode_id > 0 ? col_auto_hue[_ki] : p_color[_ki];
+        col_auto_mode_id > 0 ? col_auto_hue[_ki] : p_color[_ki_s];
       _ki += 1;
     );
     // ── REVERSE-DIRECTION NAME SYNC (TCP rename → JSFX cname) ──
@@ -2679,9 +2997,13 @@ local(_pad_req, _knl, _ki, _cn, _cnl, _cj)
     // their per-instance INCMD mailbox in @block instead — this shared-blob
     // path is the FALLBACK for unslotted instances only (otherwise the two
     // adopts double-fire on the active instance).
-    _reg_my_slot < 0 ?
+    // Bank A only (Pad Banks audit M1): a TCP rename is an output-lane leg, and those are bank A's (step 5a);
+    // with B..D shown the band can hold bank A's names (sync_note_names writes slots 0..15, after every
+    // rename), which this adopt would copy into the bank on screen: its pads renamed after bank A's.
+    _reg_my_slot < 0 && bank_cur == 0 ?
     ( _ki = 0; loop(NUM_PADS,
-      _cn = get_cname_slot(_ki);
+      _ki_s = swing_bp(_ki);
+      _cn = get_cname_slot(_ki_s);
       _cnl = strlen(_cn);
       // Compare first 16 bytes of gmem vs local
       _diff = 0;
@@ -2701,7 +3023,7 @@ local(_pad_req, _knl, _ki, _cn, _cnl, _cj)
           _cj += 1;
         );
         str_setlen(_cn, _cnl);
-        mark_dirty_pad(_ki);
+        mark_dirty_pad(_ki_s);
         col_dirty = 1; // re-derive auto-color from TCP rename
       );
       _ki += 1;
@@ -2712,7 +3034,8 @@ local(_pad_req, _knl, _ki, _cn, _cnl, _cj)
     // mirror it to gmem so the browser sees the latest names (its
     // per-frame read_pad_name() picks them up immediately).
     _ki = 0; loop(NUM_PADS,
-      _cn = get_cname_slot(_ki);
+      _ki_s = swing_bp(_ki);
+      _cn = get_cname_slot(_ki_s);
       _cnl = strlen(_cn);
       _cj = 0; loop(KIT_GMEM_PADNAME_LEN,
         gmem[KIT_GMEM_PADNAMES + _ki * KIT_GMEM_PADNAME_LEN + _cj] =
@@ -2747,7 +3070,8 @@ local(_pad_req, _knl, _ki, _cn, _cnl, _cj)
     // (bridge retries re-post CMD/REQ without re-staging META). Layered
     // kits stayed healthy because they WANT layer_cnt>0.
     _ki = 0; loop(NUM_PADS,
-      gmem[KIT_GMEM_META + _ki * KIT_GMEM_META_PP + 32] = p_layer_cnt[_ki];
+      _ki_s = swing_bp(_ki);
+      gmem[KIT_GMEM_META + _ki * KIT_GMEM_META_PP + 32] = p_layer_cnt[_ki_s];
       _ki += 1;
     );
   );
@@ -2768,8 +3092,43 @@ function swing_ui_calc_layout() local(_ui_w) (
   right_w = _ui_w - left_w;
   left_x = 0;
   left_y = 28;
-  left_h = gfx_h - 28;
-  grid_top = 28 + swing_px(LCD_BAR_H);   // pad well starts under the header + LCD bar
+  // ui_bot, not gfx_h: the step sequencer's gutter and panel take the bottom of the window (rk_seq_ui
+  // swing_seq_gate). When the window grows by the panel's height, ui_bot equals the old gfx_h and nothing
+  // above moves -- the browser's width rule, for height.
+  left_h = ui_bot - 28;
+  grid_top = 28 + swing_px(LCD_BAR_H) + swing_px(BANK_STRIP_H);   // pad well starts under the header + LCD bar + the bank strip (step 4b)
+);
+
+// ── The compact switch (the small-things round, 2026-10-23) ─────────────────────────────────────────────────────────
+// The user: "switch to the existing compact mode up top whenever the sequencer leaves too little room, and back when it
+// closes" (the rack face: "Yes, the Rack face"). Squeezed under a panel, the full face put TOOLS and the master under it
+// ("really goofy"): swing_seq_gate floors only the right column (424 px at scale 1), the left one needs more.
+// The full face's height need: its LEFT column, the binding one -- the header, the LCD, the KIT / SOUND / PLAY / SAMPLES
+// / TOOLS sections and the master block with VOL at its floor radius: 623 px at scale 1 (721 for a full-size VOL).
+// Built from the numbers swing_panels_draw_controls and swing_panels_draw_master lay the column out with: KEEP IN STEP
+// with them. The COLORS panel's rows are left out on purpose: they exist only while the full face draws them, so
+// counting them would let the face it picks change the need it was picked by.
+FACE_ROOM_MARGIN_B = 24;   // design px: the room must come back by this much more before the full face does (a handle dragged across the line does not flicker)
+function swing_face_full_need_h() (
+  28 + swing_px(4) + swing_px(130) + 4           // _btn_area_y: the header, lcd_y's offset, the LCD (lcd_h), the gap under it
+  + 5 * swing_px(15)                             // the five section labels (_hdr_h)
+  + 9 * swing_px(28)                             // the button rows (_btn_h): KIT 2, SOUND 2, PLAY 1, SAMPLES 1, TOOLS 3
+  + 4 * swing_px(4) + 4 * swing_px(8)            // the gaps between rows (_btn_gap: KIT, SOUND, TOOLS twice) and after sections (_sec_gap)
+  + 8 + 6 + 2 * swing_px(26) + swing_px(16);     // the master: its top gap and bottom margin, and VOL at its floor (_mvol_r's swing_px(26), plus 16)
+);
+// face_room_compact, once per window pass (Swing_ReaKit.jsfx, after the user's face is chosen): ON while a panel is open
+// under the pads (_fr_bot: swing_seq_gate's _bot_on) and the room above it (_fr_room: ui_bot) is under the full face's
+// need; OFF when the panel closes, when the user's own face is the rack face (no bottom slot there), or when the room is
+// back by FACE_ROOM_MARGIN_B more than the need. The room does not depend on the face drawn (the gate reads
+// dock_face_user), so the switch cannot feed itself. Returns the flag.
+function swing_face_room(_fr_user, _fr_bot, _fr_room) local(_fr_need) (
+  _fr_need = swing_face_full_need_h();
+  face_room_compact ? (
+    (_fr_user || !_fr_bot || _fr_room >= _fr_need + swing_px(FACE_ROOM_MARGIN_B)) ? face_room_compact = 0;
+  ) : (
+    (!_fr_user && _fr_bot && _fr_room < _fr_need) ? face_room_compact = 1;
+  );
+  face_room_compact;
 );
 
 // ── One rack-header ACTION chip ──────────────────────────────────────────
@@ -2818,6 +3177,7 @@ function swing_rack_macro() (
 function swing_rack_kitsview() (
   gmem[EON_KITLIST_BASE + 5] += 1;   // ask the bridge for a fresh scan
   kv_scroll = 0; kv_hover = -1;
+  kv_into = 0; kv_press = -1; kv_dragging = 0; kv_menu_i = -1;   // step 4c (the inline copy of swing_kitsview_open)
   swing_bigview_open(VIEW_KITS);
 );
 
@@ -2848,7 +3208,7 @@ function swing_rack_kitmenu() (
 function swing_rack_act_chip(_lbl, _rx, _by, _bh, _ena)
 local(_tw, _th, _bw, _ax, _hov)
 (
-  gfx_setfont(1, "Arial", 9, 'b');
+  rk_font(1, 9, 'b');
   gfx_measurestr(_lbl, _tw, _th);
   _bw = _tw + 14;
   _ax = _rx - _bw;
@@ -2895,7 +3255,7 @@ local(_fs, _tw, _th, _bh, _by, _bx, _cx, _cy, _ch, _cw, _cw_full, _cw_name,
   // Same rule as the full UI: the browser strip comes off the right and the pad
   // grid divides what is left.
   right_x = 0; right_w = gfx_w - swing_fb_width();
-  grid_top = rack_hdr_h;
+  grid_top = rack_hdr_h + swing_px(BANK_STRIP_H);   // the bank strip sits under the rack header (2026-10-15: docked, the bank was invisible and unswitchable)
 
   // Body fill — the pad well repaints most of it; this covers the margins.
   gfx_set(bg_r, bg_g, bg_b, 1); gfx_rect(0, 0, gfx_w, gfx_h);
@@ -2908,7 +3268,7 @@ local(_fs, _tw, _th, _bh, _by, _bx, _cx, _cy, _ch, _cw, _cw_full, _cw_name,
 
   // SWING wordmark — brand red in every theme (same rule as the full header).
   _fs = max(11, min(16, (rack_hdr_h * 0.42)|0));
-  gfx_setfont(1, "Arial", _fs, 'b');
+  rk_font(1, _fs, 'b');
   gfx_set(0.85, 0.20, 0.12, 1);
   gfx_measurestr("S W I N G", _tw, _th);
   gfx_x = 10; gfx_y = (rack_hdr_h - 1 - _th) * 0.5;
@@ -2929,7 +3289,7 @@ local(_fs, _tw, _th, _bh, _by, _bx, _cx, _cy, _ch, _cw, _cw_full, _cw_name,
 
   // Kit card measures — drawn further down, once the action cluster has
   // fixed its right limit.
-  gfx_setfont(1, "Arial", 11, 'b');
+  rk_font(1, 11, 'b');
   gfx_measurestr(strlen(#kit_name) > 0 ? #kit_name : "Untitled Kit", _nw, _nh);
   sprintf(#_rack_bpm, "%.4g BPM", tempo);
   gfx_measurestr(#_rack_bpm, _bpw, _bph);
@@ -2962,7 +3322,7 @@ local(_fs, _tw, _th, _bh, _by, _bx, _cx, _cy, _ch, _cw, _cw_full, _cw_name,
   // right-click opens the extended save menu. ⚠️ The SAVE_KIT and DM_BUILD popup
   // RESULTS are consumed in Swing_ReaKit's @gfx tail, NOT here — so picks work in
   // both faces and multiout_prep (defined in a later-imported inc) resolves.
-  gfx_setfont(1, "Arial", 9, 'b');
+  rk_font(1, 9, 'b');
   gfx_measurestr("SAVE", _ws, _th2);     _ws  += 14;
   gfx_measurestr("BROWSE", _wbr, _th2);  _wbr += 14;
   gfx_measurestr("COLORS", _wco, _th2);  _wco += 14;
@@ -3075,7 +3435,7 @@ local(_fs, _tw, _th, _bh, _by, _bx, _cx, _cy, _ch, _cw, _cw_full, _cw_name,
         _sv_a = _sv_el < 1.2 ? 1 : (1.8 - _sv_el) / 0.6;
         gfx_set(0.22, 0.72, 0.35, 0.92 * _sv_a);
         gfx_rect(_abx + 1, _by + 1, rack_act_w - 2, _bh - 2);
-        gfx_setfont(1, "Arial", 9, 'b');
+        rk_font(1, 9, 'b');
         gfx_set(1, 1, 1, _sv_a);
         gfx_measurestr("SAVED", _tw2, _th2);
         gfx_x = _abx + (rack_act_w - _tw2) * 0.5; gfx_y = _by + (_bh - _th2) * 0.5;
@@ -3155,7 +3515,7 @@ local(_fs, _tw, _th, _bh, _by, _bx, _cx, _cy, _ch, _cw, _cw_full, _cw_name,
     // Name (bright; dim placeholder when unnamed), then BPM (dim).
     _nx = _cx + 3 + _ts + 7;
     _ny = _cy + (_ch - _nh) * 0.5;
-    gfx_setfont(1, "Arial", 11, 'b');
+    rk_font(1, 11, 'b');
     strlen(#kit_name) > 0 ? gfx_set(0.93, 0.93, 0.90, 1)
                           : gfx_set(0.93, 0.93, 0.90, 0.5);
     gfx_x = _nx; gfx_y = _ny;
@@ -3183,7 +3543,7 @@ local(_fs, _tw, _th, _bh, _by, _bx, _cx, _cy, _ch, _cw, _cw_full, _cw_name,
     _arx       = _cx + _cw - 12;
     _over_arw  = mx >= _arx;
     _over_name = mx >= _nx && mx < _nx + _nw + 6;
-    gfx_setfont(1, "Arial", 8, 'b');
+    rk_font(1, 8, 'b');
     gfx_set(0.72, 0.72, 0.70, (_card_hov && _over_arw) ? 1 : 0.55);
     gfx_x = _arx + 2; gfx_y = _cy + (_ch - 8) * 0.5;
     gfx_drawstr("▾");
@@ -3202,7 +3562,7 @@ local(_fs, _tw, _th, _bh, _by, _bx, _cx, _cy, _ch, _cw, _cw_full, _cw_name,
     // Overflow: everything folded — "⋯" carries the kit + BPM as a tooltip.
     // Skipped entirely when even the dots would land on the action cluster
     // (_abx = its left edge; = _bx - 10 when no chips drew).
-    gfx_setfont(1, "Arial", 12, 'b');
+    rk_font(1, 12, 'b');
     gfx_measurestr("⋯", _dw, _dh);
     _cx + _dw + 8 <= _abx - 4 ? (
       _dots_hov = mx >= _cx && mx < _cx + _dw + 8 && my >= 0 && my < rack_hdr_h;
@@ -3313,7 +3673,7 @@ function swing_ui_draw_lcd_frame() (
       gfx_rect(_tx + 1, _tab_y + 1, _tab_w - 2, _tab_h - 2, 0);  // inset glow ring
     );
 
-    gfx_setfont(1, "Arial", 8, 'b');
+    rk_font(1, 8, 'b');
     _tab_active ? (
       gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 1);
     ) : (
@@ -3350,7 +3710,7 @@ function swing_ui_draw_lcd_frame() (
   kit_busy ? (
     gfx_set(0, 0, 0, 0.65);
     gfx_rect(lcd_x, lcd_y + 18, lcd_w, lcd_h - 18);
-    gfx_setfont(1, "Arial", 12, 'b');
+    rk_font(1, 12, 'b');
     gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 1);
     kit_export_state == 10 ? strcpy(#_kit_msg, "Enter Kit Name...") :
     kit_export_state > 0   ? strcpy(#_kit_msg, "Saving Kit...") :
@@ -3456,13 +3816,50 @@ function swing_ui_draw_lcd_frame() (
   //      this; the cut is undoable while the undo slot is backed. Session-
   //      volatile and self-expiring; a click dismisses it.
   (pad_cut_warn_pad >= 0 && time_precise() < pad_cut_warn_until) ? (
-    sprintf(#_cut_title, "Pad %d cut to %.1f s", pad_cut_warn_pad + 1, pad_cut_warn_after);
+    swing_pad_lbl(pad_cut_warn_pad, #_cut_pl);   // step 4d: "C4" when the pad is not in the bank on screen
+    sprintf(#_cut_title, "Pad %s cut to %.1f s", #_cut_pl, pad_cut_warn_after);
     _udo_ready ?
       sprintf(#_cut_sub, "%.1f s sample - a layer holds %.1f s. Undo restores it.",
               pad_cut_warn_before, pad_cut_warn_after) :
       sprintf(#_cut_sub, "%.1f s sample - a layer holds %.1f s. Undo cannot restore it here.",
               pad_cut_warn_before, pad_cut_warn_after);
     swing_warning_overlay(#_cut_title, #_cut_sub, 0.95, 0.65, 0.30) ? pad_cut_warn_pad = -1;
+  ) :
+  //   1c. A file longer than the pad (or the layer) holds was trimmed at the cap
+  //      (swing_ldr_finish, rk_swing_core; Spec_Swing_Pad_Banks §5.4 / §8.1). The pad face
+  //      keeps the mark for as long as the sample sits at the cap; this says it once.
+  //      Session-volatile, self-expiring; a click dismisses it.
+  (pad_trim_warn_pad >= 0 && time_precise() < pad_trim_warn_until) ? (
+    swing_pad_lbl(pad_trim_warn_pad, #_trim_pl);
+    sprintf(#_trim_title, "Pad %s trimmed to %.0f s", #_trim_pl, pad_trim_warn_secs);
+    pad_trim_warn_layer >= 0 ?
+      sprintf(#_trim_sub, "Layer %d holds %.0f s at %d Hz - the rest of the file was not loaded.",
+              pad_trim_warn_layer + 1, pad_trim_warn_secs, pad_trim_warn_sr) :
+      sprintf(#_trim_sub, "A pad holds %.0f s at %d Hz - the rest of the file was not loaded.",
+              pad_trim_warn_secs, pad_trim_warn_sr);
+    swing_warning_overlay(#_trim_title, #_trim_sub, 0.95, 0.65, 0.30) ? pad_trim_warn_pad = -1;
+  ) :
+  //   1d. A load was refused for room (Spec_Swing_Pad_Banks §5.4, step 2a): nothing was
+  //      trimmed, the pad is exactly as it was, and the figure is what is left of the
+  //      instrument (the bank that holds it arrives with step 2b). Armed by
+  //      swing_alloc_refuse_note (rk_swing_alloc) from any thread; a click dismisses it.
+  (alloc_refuse_pad >= 0 && time_precise() < alloc_refuse_until) ? (
+    _al_secs = swing_alloc_free_secs();
+    swing_pad_lbl(alloc_refuse_pad, #_al_pl);
+    sprintf(#_al_title, "Instrument full - pad %s not loaded", #_al_pl);
+    sprintf(#_al_sub, "%d:%02d of audio free. Clear a pad to make room; nothing was trimmed.",
+            (_al_secs / 60) | 0, (_al_secs - 60 * ((_al_secs / 60) | 0)) | 0);
+    swing_warning_overlay(#_al_title, #_al_sub, 0.95, 0.45, 0.30) ? alloc_refuse_pad = -1;
+  ) :
+  //   1e. The startup self-check found memory REAPER granted but could not back (rk_swing_alloc,
+  //      2026-09-23): the pool's top was lowered to the last good page, so the free figure is
+  //      honest and nothing plays silence -- but the machine is short, and the user should
+  //      know. Session-volatile; a click dismisses it for the session.
+  (!alloc_backed && !alloc_short_dismissed) ? (
+    _al_secs = swing_alloc_free_secs();
+    sprintf(#_al_sub, "REAPER granted more memory than this machine could back. Pool trimmed to %d:%02d of audio; undo may be off.",
+            (_al_secs / 60) | 0, (_al_secs - 60 * ((_al_secs / 60) | 0)) | 0);
+    swing_warning_overlay("Memory short on this machine", #_al_sub, 0.95, 0.45, 0.30) ? alloc_short_dismissed = 1;
   ) :
   gmem[GS_REAIMGUI_MISSING] == 1 ? (
     swing_warning_overlay("ReaImGui not installed",
@@ -3510,7 +3907,8 @@ function swing_ui_draw_lcd_frame() (
   !_welcome_dismissed ? (
     _wel_empty = 1;
     _wel_i = 0; loop(NUM_PADS,
-      pad_is_playable(_wel_i) ? _wel_empty = 0;
+      _wel_i_s = swing_bp(_wel_i);
+      pad_is_playable(_wel_i_s) ? _wel_empty = 0;
       _wel_i += 1;
     );
     _wel_empty ? (

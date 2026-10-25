@@ -25,10 +25,12 @@ EON_SWBROWSE_BASE   = 26607616;   // 406 * 65536, block-aligned
 EON_SWBROWSE_STRIDE = 4096;
 EON_SWBROWSE_SLOTS  = 16;
 // Waveform peaks for the SELECTED row live in their OWN band: a row record is
-// 60 cells and these are 256, so they could never ride along.
+// 60 cells and these could never ride along. 2026-10-15 (the user: "can we draw
+// the wave forms any better?"): 512 columns, folded to one per pixel when drawn,
+// plus a loudness BODY per column; 16 slots * 4096 fill block 407 exactly.
 EON_SWBPK_BASE      = 26673152;   // 407 * 65536
-EON_SWBPK_STRIDE    = 512;   // L max, L min, R max, R min -- 4 * FB_PK_N
-FB_PK_N             = 128;        // columns, sized to the strip not to the file
+EON_SWBPK_STRIDE    = 4096;  // per slot: L max, L min, R max, R min, L body, R body -- 6 * FB_PK_N (3072 used)
+FB_PK_N             = 512;        // columns; the strip draws one per pixel and folds the rest
 
 // ── folder tree band (26738688..26804223, 408 * 65536) ──────────────────────
 // Its own band because the tree and the file list are on screen TOGETHER and
@@ -109,6 +111,9 @@ FB_REQ_RECURSE  = 42;    // 1 = walk subfolders, 0 = this folder only
 FB_REQ_GFXW     = 44;    // face->bridge: our current gfx_w, so the bridge can
                          // measure canvas-px per window-px instead of assuming
                          // 1:1 (true only while Swing stays off gfx_ext_retina)
+FB_TR_RPT       = 11;    // bridge->face (P0a, the sequencer's transport row): REAPER's repeat state, 0 / 1
+FB_TR_MEAS      = 12;    // bridge->face: the bar under the play (or edit) cursor, 1-based (TimeMap2_timeToBeats)
+FB_TR_BEAT      = 13;    // bridge->face: the beat inside that bar x 1000 (0-based: 0 = the bar's first beat)
 FB_REQ_GROW     = 43;    // face->bridge: px of extra CANVAS width wanted, so the
                          // window WIDENS instead of the strip taking the pads'
                          // room. JSFX cannot resize its own window -- the @gfx
@@ -117,6 +122,23 @@ FB_REQ_GROW     = 43;    // face->bridge: px of extra CANVAS width wanted, so th
                          // (.dev_tests/fbwin_probe.lua): +200 asked -> canvas
                          // +200, gfx_w +200, height untouched, restore exact.
 FB_REQ_AUD      = 46;    // 1 = also load the PREVIEW voice on this click
+FB_REQ_GROWH    = 58;    // face->bridge: px of extra CANVAS height wanted, so the window grows TALLER for the
+                         // step sequencer's panel under the pads (rk_seq_ui swing_seq_gate; 2026-10-19).
+                         // The same bridge resize as FB_REQ_GROW, the same adopt-on-first-sight and rate
+                         // limit; the width probe measured height the same way (+120 asked -> +120 given).
+// THE DOCKED KEYBOARD (2026-10-15; the user: "when swing is docked and the mini browser is open the keyboard
+// dont work in the mini browser"). A plugin gets its keys through its FX window, and the dock rig
+// (EON_Swing_Dock.lua) moves the canvas out of it, so docked Swing saw no keys at all. Now the dock catches
+// them in its own window and queues them here, and the browser takes them one per frame as `_char`.
+// FB_DOCK_KEYS (face -> dock, every frame): 2 = this Swing is the docked one and its browser holds the
+// keyboard (the last click landed in the browser), 3 = the same with the filter box typing, 0 = no.
+// FB_DOCK_KW (dock writes: keys queued so far), FB_DOCK_KR (face writes: keys taken so far), the ring
+// FB_DOCK_KRING + (n % 8). The dock never writes past 8 unread keys.
+FB_DOCK_KEYS    = 47;
+FB_DOCK_KW      = 48;
+FB_DOCK_KR      = 49;
+FB_DOCK_KRING   = 50;    // ..57
+FB_DOCK_KRING_N = 8;
 FB_REQ_FILT_LEN = 192;   // verb 9: filter text length...
 FB_REQ_FILT     = 193;   // ...and its chars, +193..240
 FB_REQ_FILT_MAX = 48;
@@ -160,6 +182,13 @@ FB_GUTTER_W = 24;   // was 16. A 16 px strip flush against the window's right
                     // control. 24 px with a visible seam and an arrow is
                     // unmistakably a button.
 FB_PANEL_W  = 292;   // Poise's width: a name plus TWO narrow columns, not four
+PFX_PANEL_W = 420;   // the pad editor's panel in the side slot (rk_swing_ui_padfx_side, round two J, 2026-10-22): the editor's
+                     // own width (op_w), so its sections draw as they do in the overlay
+SEQ_SIDE_W  = 600;   // the step sequencer's column when it is placed at the side (seq_place 1; the sideways render): its
+                     // toolbar, chips and footer fold for the width on their own (rk_seq_ui swing_seq_panel_draw)
+SIDE_W_MIN_B = 300;  // the side slot's narrowest DRAGGED width (its panels' part), design px (the width handle, 2026-10-22)
+FB_SEAM_W   = 8;     // the SEAM between the pads and the side panel: the slot's width handle (the user: "in between the pads
+                     // and where the pad FX is"), part of the slot's width while it is open
 FB_ROW_H    = 22;   // + fb_fsz at use sites, so bigger type still fits
 FB_HDR_H    = 27;    // breadcrumb: up-arrow + the folder you are in
 FB_TOOL_H   = 23;    // button row under the breadcrumb
@@ -184,8 +213,11 @@ FB_FONT_N   = 5;
 //
 // ⭐ SIZE: ~11 s of stereo at 44.1 k. A seventeenth full pad slot would have cost
 // SLOT_SIZE (4,000,000 floats, ~32 MB) for something that only ever holds one
-// sample at a time; this is an eighth of that. Longer files load their first
-// 11 s, which is what an audition needs.
+// sample at a time; this is an eighth of that. Since 2026-10-14 it is a RING
+// (Spec_Swing_Preview_Ring): the bridge keeps it topped up as the player
+// consumes, so a longer file plays whole (up to the bridge's 120 s decode); the
+// size is how far ahead the stream runs, not how long a file may be. ⛔ It still
+// must not grow: it sits below the 64 M pad region in the same gmem grant.
 FB_PRV_MAX = 1000000;
 
 _prv_len  = 0;    // frames actually loaded (0 = nothing)
@@ -197,6 +229,18 @@ _prv_rate = 1;
 _prv_lf      = -1; // open handle while a sliced preview read is in flight
 _prv_rd      = 0;  // cells read into _prv_buf so far by that job
 _prv_loading = 0;  // 1 = a read is in flight; @block pumps it, @sample ignores it
+// The RING (Spec_Swing_Preview_Ring, 2026-10-14): the buffer above is a ring the bridge
+// keeps topped up as the player consumes, so a file is no longer cut at ~11 s. The
+// player's positions are ABSOLUTE frames in the job's stream; its ring index is
+// (_prv_ring_base + frame * 2) mod FB_PRV_MAX. These are the PLAYER's side; the incoming
+// job's side (_pp_prv_*) lives in rk_swing_padpcm, so a new preview can land while the
+// old voice still fades.
+_prv_ring_base = 0;   // ring index of the player's stream offset 0 (0 on the old file-read path)
+_prv_job = -1;        // the stream job the player plays (-1: the old file-read path, or nothing)
+_prv_eos = 0;         // 1 = the stream's end (LAST) landed: reaching _prv_len is the END, not an underrun
+_prv_long = 0;        // 1 = the file does not fit the ring: frame 0 is gone once played, PLAY after the end re-requests
+_prv_total_frames = 0;// one pass of the file, frames (information)
+_prv_hold_n = 0;      // @sample: samples held on an underrun (published as PP_PRV_HOLD; probes expect 0)
 // Release envelope for the audition voice. The transport used to be a boolean:
 // _prv_on went to 0 mid-waveform and the contribution to the master vanished in
 // one sample, which is a step, which is a click -- at STOP, and again at the
@@ -291,6 +335,8 @@ function swing_fb_prv_begin(path_str) local(nch, fsr)
   // again, just somewhere new.
   swing_prv_kill();
   _prv_len = 0; _prv_pos = 0; _prv_stopped = 0;   // a new preview is a new request to hear (D-7)
+  // the old (no-bridge) path fills the buffer linearly from 0: no ring, no wrap, the end is the end
+  _prv_ring_base = 0; _prv_job = -1; _prv_eos = 0; _prv_long = 0;
   _prv_lf = file_open(path_str);
   _prv_lf >= 0 ? (
     file_riff(_prv_lf, nch, fsr);
@@ -320,6 +366,7 @@ function swing_fb_prv_step(budget) local(m, n)
       file_close(_prv_lf); _prv_lf = -1; _prv_loading = 0;
       // file_mem returns INTERLEAVED samples; frames is what the reader wants
       _prv_len = (_prv_rd / _prv_ch) | 0;
+      _prv_total_frames = _prv_len; _prv_eos = 1;   // complete: the player's end is the end
       1;
     ) : ( 0; );
   );
@@ -361,8 +408,10 @@ fb_preview = 1;
 // AUTOLOAD: does a plain CLICK put the file on the focused pad, or only select
 // it? Dragging always loads -- that gesture is explicit and says where. This
 // only governs the click, so the list can be walked and read without touching
-// the kit.
-fb_autoload = 1;
+// the kit. OFF by default since 2026-10-15 (the user: "the autoload should not
+// be on by default"): a click auditions, and with AUTOLOAD on the audition had
+// to wait behind the pad load it queued first. Session-only, like fb_preview.
+fb_autoload = 0;
 // LCD: paint the strip in the theme's SCREEN colours instead of the pad tray,
 // for the retro-hardware look. Off = it reads as part of the chassis.
 // SUBFOLDERS: list the whole tree under here, not just this folder.
@@ -376,12 +425,13 @@ fb_autoload = 1;
 // fb_font: 0 Arial - 1 Verdana - 2 Tahoma - 3 Segoe UI - 4 Consolas.
 // SERIALIZED (ver 66), default 0 ⇒ zero-init, not assigned here.
 fb_fsz  = 2;      // -2..+8 on top of the base sizes
-// ⚠️ fb_fsz, fb_preview and fb_autoload are NOT persisted: their defaults are
-// non-zero (2, 1, 1), and this codebase's serialize pattern requires the
+// ⚠️ fb_fsz, fb_preview and fb_autoload are NOT persisted: the first two's
+// defaults are non-zero (2, 1), and this codebase's serialize pattern requires the
 // default to BE the zero value, because @init can run after @serialize and
 // would stamp the restored value back. Persisting them needs an offset form
 // (store value-minus-default) — worth doing, but it is a refactor of every use
-// site, not a one-line gate.
+// site, not a one-line gate. fb_autoload's default became 0 on 2026-10-15, so it
+// COULD now be saved under a new serialize gate; it is not yet (session-only).
 fb_settings_open = 0;
 
 _fb_tc = 0.9; _fb_tw = 0; _fb_th = 0;   // shared by swing_fb_btn
@@ -415,8 +465,9 @@ fb_sel_b = -1;
 // ⚠️ MEASURED CONTRACT (rk_swing_padname_edit's header, kbprobe 2026-08-04):
 // gfx_getchar() delivers letters/digits/backspace/enter when floating or in a
 // chain; SEVERAL chars can land in ONE frame so the queue must be DRAINED; ESC
-// never arrives at all; and an EMBEDDED instance gets NO keyboard whatsoever --
-// so the box refuses focus there rather than looking editable and eating keys.
+// arrives too (a physical press -- injected ESC is silently lost, wiki 7.4);
+// and an EMBEDDED instance gets NO keyboard whatsoever -- so the box refuses
+// focus there rather than looking editable and eating keys.
 fb_filt_focus = 0;
 fb_filt_len   = 0;
 
@@ -502,9 +553,30 @@ function swing_fb_tree_w()
 // Capped at 45% of the window: the rack/dock face is often only a few hundred
 // px wide, where a fixed panel would leave the pads a sliver -- and the pads
 // staying usable is the whole premise of dropping onto them.
+// ── The side slot (round two J, 2026-10-22): the browser (unless placed below: fb_place 3), the pad editor (pfx_open)
+// and the step sequencer when placed at the side (seq_place 1) share this column -- side by side when it has the room,
+// tabs until it does (rk_swing_ui_padfx_side, imported after this lib and after rk_seq_ui). The gate below opens the
+// slot, asks for width and squeezes on ANY of them, with the SUM of the open ones' widths. fb_open stays the browser's own.
+function swing_side_open() ( (fb_open && fb_place != 3) || (pfx_open && fx_place != 3) || (seq_shown && seq_place == 1); );
+// The panels' OWN want (plus the seam): what the bridge is asked to grow the window for.
+function swing_side_auto_w() (
+  ((fb_open && fb_place != 3) ? FB_PANEL_W + (fb_tree ? swing_fb_tree_w() : 0) : 0) + ((pfx_open && fx_place != 3) ? PFX_PANEL_W : 0) + ((seq_shown && seq_place == 1) ? SEQ_SIDE_W : 0) + swing_px(FB_SEAM_W);
+);
+// ... or the width the user DRAGGED the slot to (side_w, canvas px, gate 83; 0 = the panels' own widths), which the
+// seam's handle sets (swing_side_handle): the slot's CAP. A dragged width never reaches the bridge (the user, 2026-10-22:
+// "when i move the handle it resizes the window"): the window stays as it is and the pads give the difference, or take
+// it back -- the gate's squeeze, immediate while a dragged width stands.
+function swing_side_want_w() (
+  side_w > 0 ? max(swing_px(SIDE_W_MIN_B), side_w | 0) + swing_px(FB_SEAM_W) : swing_side_auto_w();
+);
+
 function swing_fb_cap_w()
 (
-  min(FB_PANEL_W + (fb_tree ? swing_fb_tree_w() : 0), max(150, (gfx_w * 0.45) | 0));
+  _fb_capw_sw = swing_side_open() ? swing_side_want_w() : FB_PANEL_W + (fb_tree ? swing_fb_tree_w() : 0);
+  // the 45 % cap guards the pads where the slot takes its room FROM them; a window that grew for the slot kept the pads'
+  // width, so the cap is the want itself there (_fb_growp: the gate's can-grow latch; two panels, 736, would never fit
+  // under 45 % of the window they grew; round two J, 2026-10-22)
+  _fb_growp ? _fb_capw_sw : min(_fb_capw_sw, max(150, (gfx_w * 0.45) | 0));
 );
 
 // What the strip occupies RIGHT NOW. Computed once per frame in swing_fb_gate;
@@ -518,6 +590,20 @@ function swing_fb_band()
 (
   EON_SWBROWSE_BASE
     + max(0, min(EON_SWBROWSE_SLOTS - 1, _reg_my_slot)) * EON_SWBROWSE_STRIDE;
+);
+
+// The next key the dock rig queued for this browser (FB_DOCK_KEYS above), or 0. One per call; a backlog past
+// the ring's eight is cut to the newest eight (the dock never writes past them, this is the belt to it).
+function swing_fb_dock_key() local(b, kw, kr, k) (
+  b = swing_fb_band();
+  kw = gmem[b + FB_DOCK_KW] | 0; kr = gmem[b + FB_DOCK_KR] | 0;
+  kw - kr > FB_DOCK_KRING_N ? kr = kw - FB_DOCK_KRING_N;
+  k = 0;
+  kr < kw ? (
+    k = gmem[b + FB_DOCK_KRING + (kr % FB_DOCK_KRING_N)] | 0;
+    gmem[b + FB_DOCK_KR] = kr + 1;
+  );
+  k;
 );
 
 // ── snapshot ────────────────────────────────────────────────────────────────
@@ -552,7 +638,18 @@ function swing_fb_snapshot()
   // governs what the strip DRAWS (swing_fb_cap_w, used in the gate), so a small
   // window is still never swallowed -- it just hands the surplus back to the
   // panes instead of feeding it into a loop.
-  gmem[b + FB_REQ_GROW] = fb_open ? (FB_PANEL_W + (fb_tree ? swing_fb_tree_w() : 0)) : 0;
+  // ⚠️ _fb_on -- the GATE's view of the slot this frame -- and not swing_side_open() live: a panel flag raised after the
+  // gate ran but before this line (the PAD FX button once; a rig hook; any future caller) posted the request in the
+  // same frame, the bridge widened the window within the tick, and the gate's first-frame baseline then took the GROWN
+  // width as the bare one -- the slot sat 24 px wide for twenty frames and opened by the squeeze (the swap's audit,
+  // 2026-10-22). Read from the gate, a flag raised late is posted a frame later, after the gate has baselined the
+  // window it will grow. The want itself may move the same frame (a second panel beside an open one): the base stands.
+  gmem[b + FB_REQ_GROW] = _fb_on ? swing_side_auto_w() : 0;   // the SUM of the side slot's open panels (round two J) -- never a dragged width (the seam splits the window that is there)
+  // The docked keyboard (FB_DOCK_KEYS above): only the instance the dock rig captured (slider42, under its live
+  // heartbeat -- the rack face's own test), only while its browser is open and holds the keyboard.
+  !fb_open ? fb_kbd = 0;
+  gmem[b + FB_DOCK_KEYS] = (fb_open && fb_kbd && slider42 > 0.5 && (time_precise() - gmem[GS_RIG_ALIVE_SWING]) < 2)
+                           ? (fb_filt_focus ? 3 : 2) : 0;
   // The bridge has to know WHOSE window to widen, and growth must work before
   // the first request has ever been posted.
   gmem[b + FB_REQ_INST] = instance_id;
@@ -675,6 +772,7 @@ function swing_fb_gate_window()
   // meant to smooth. There is no animation here now and none is wanted: the
   // whole open costs one bridge tick.
   _cap     = swing_fb_cap_w();
+  _fb_on   = swing_side_open();   // the slot: the browser OR the pad FX panel (round two J, 2026-10-22)
   _cangrow = swing_fb_can_grow();
 
   // First frame of this instance. A project that LOADS with the strip open gets
@@ -682,7 +780,7 @@ function swing_fb_gate_window()
   // as ALREADY PRESENT rather than asked for again -- the bridge's first-sight
   // adopt makes the same assumption from the other side.
   _fb_w_init ? 0 : (
-    _fb_base_w   = fb_open ? (gfx_w - _cap) : gfx_w;
+    _fb_base_w   = _fb_on ? (gfx_w - _cap) : gfx_w;
     _fb_base_set = 1;
     _fb_w_init   = 1;
     _fb_growp    = _cangrow;      // seeded here so frame 1 is never a transition
@@ -709,13 +807,13 @@ function swing_fb_gate_window()
     // subtracting the cap there would claim 292 px the pads still need. That is
     // what `_fb_carry` is for -- it is the last answer measured while the window
     // was ours to grow, and it is deliberately frozen across the dock.
-    _fb_base_w   = (fb_open && _fb_carry) ? (gfx_w - _cap) : gfx_w;
+    _fb_base_w   = (_fb_on && _fb_carry) ? (gfx_w - _cap) : gfx_w;
     _fb_base_set = 1;
     _fb_squeeze  = 0;
     _fb_wait     = 0;
   );
 
-  fb_open && !_fb_base_set ? ( _fb_base_w = gfx_w; _fb_base_set = 1; _fb_wait = 0; );
+  _fb_on && !_fb_base_set ? ( _fb_base_w = gfx_w; _fb_base_set = 1; _fb_wait = 0; );
 
   // Width the window has actually gained since the strip was opened.
   _got = _fb_base_set ? max(0, gfx_w - _fb_base_w) : 0;
@@ -725,7 +823,7 @@ function swing_fb_gate_window()
   // we dock -- which is what the transition above needs to read on the way back
   // out. -2 of slack because the grow is measured in window px and read back in
   // canvas px, and those need not divide evenly.
-  _cangrow && !_fb_squeeze ? _fb_carry = (fb_open && _got >= _cap - 2) ? 1 : 0;
+  _cangrow && !_fb_squeeze ? _fb_carry = (_fb_on && _got >= _cap - 2) ? 1 : 0;
 
   // Fall back to taking the room off the pads when the window will not grow.
   // ⭐ TWO ROUTES IN, and the fast one matters. When we can SEE that growth is
@@ -736,20 +834,24 @@ function swing_fb_gate_window()
   // Swing living somewhere the bridge's track-FX walk does not reach (a v7
   // container, take FX, input FX). There the request is posted, nothing answers,
   // and 20 frames later we stop waiting.
-  fb_open ? (
+  _fb_on ? (
     _fb_wait += 1;
-    (!_cangrow || (_fb_wait > 20 && _got < 1)) ? _fb_squeeze = 1;
+    (!_cangrow || side_w > 0 || (_fb_wait > 20 && _got < _cap - 2)) ? _fb_squeeze = 1;   // no growth, or PART of it (the screen's edge): the pads give the rest (round two J); a dragged width (the seam): at once
   ) : ( _fb_wait = 0; );
 
   // ⚠️ The cap is applied whether OPEN or CLOSED, deliberately. On a close the
   // request drops to 0 but the window is still wide for one tick; sizing the
   // panel from `fb_open` would blank it instantly and let the panes lunge into
   // space that is about to disappear -- the same reshape, in reverse.
-  fb_w_cur = FB_GUTTER_W + (_fb_squeeze ? (fb_open ? _cap : 0) : min(_cap, _got));
+  // the squeeze takes from the pads only what the window did not give, and never past 45 % of the window the slot
+  // started from (the pads' floor, the old cap's meaning): a screen that allows part of the growth gets the rest from the
+  // pads instead of a panel cut short at the right (the user, 2026-10-22: "the vol is cut off"; round two J)
+  _fb_room = _got + max(0, ((_fb_base_w * 0.45) | 0) - FB_GUTTER_W);
+  fb_w_cur = FB_GUTTER_W + (_fb_squeeze ? (_fb_on ? min(_cap, _fb_room) : 0) : min(_cap, _got));
 
   // Window back where it started: forget the baseline so the next open measures
   // afresh (the user may have resized it in between).
-  (!fb_open && _got < 1) ? ( _fb_base_set = 0; _fb_squeeze = 0; );
+  (!_fb_on && _got < 1) ? ( _fb_base_set = 0; _fb_squeeze = 0; );
 
   _fb_gx0 = gfx_w - swing_fb_width();      // the strip owns this column outright
   // The rack face has no 28 px header -- it has rack_hdr_h. Using 28 there would
@@ -785,9 +887,9 @@ function swing_fb_gate_window()
                && mouse_x >= kdd_px && mouse_x < kdd_px + CHGMAP_PANEL_W
                && mouse_y >= kdd_py && mouse_y < kdd_py + CHGMAP_PANEL_H)
            || _grid_gesture_live;
-  _fb_over = big_view_id == VIEW_NONE && !_fb_yield
-          && mouse_x >= _fb_gx0 && mouse_x < gfx_w
-          && mouse_y >= _fb_top && mouse_y < gfx_h;
+  _fb_over = (big_view_id == VIEW_NONE && !_fb_yield
+          && mx >= _fb_gx0 && mx < gfx_w
+          && my >= _fb_top && my < ui_bot) || side_gdrag;   // a width drag in flight keeps the claim (and the stash) wherever the cursor is   // the frame's copies of mouse_x / mouse_y (the rig's fake mouse sets them; round two J)   // ui_bot: the sequencer's gutter and panel own what is under it (swing_seq_gate)
   _fb_over ? (
     // ⚠️ EEL2 identifiers are CASE-INSENSITIVE: _fb_g_lmb and _fb_g_LMB would be
     // ONE variable, and the second assignment would quietly eat the first.
@@ -808,6 +910,8 @@ function swing_fb_gate_window()
   // Same insurance as above: the press already happened on the seam, so nothing
   // out there should act on the way past.
   fb_split_drag ? ( lmb_down = 0; LMB = 0; frame_wheel = 0; );
+  // The gutter's width drag likewise (swing_side_handle): the cursor is out over the pads while the slot follows it.
+  side_gdrag ? ( lmb_down = 0; LMB = 0; frame_wheel = 0; );
 );
 
 // ══ THE SURFACE TEST (D-1, Audit D 2026-09-14) ═══════════════════════════════
@@ -837,14 +941,17 @@ function swing_fb_gate()
 // Walk the list without the mouse. This is the natural partner to the preview
 // voice: arrow down, hear it, arrow down, hear the next one.
 //
-// ⚠️ Swing drains ONE char per frame into `_char` at the top of @gfx
-// (Swing_ReaKit.jsfx, "Frame globals"). A handler that only calls gfx_getchar()
-// therefore misses the first key of every frame -- which is exactly what
-// swing_fb_filter_keys does, and why the filter box drops characters. This one
-// takes `_char` first and then drains the rest.
+// ⚠️ Swing takes ONE char per frame off the queue into `_char` at the top of
+// @gfx (Swing_ReaKit.jsfx, "Frame globals"). A handler that only calls
+// gfx_getchar() therefore misses the first key of every frame -- at normal
+// typing speed that is every key, which is how the filter box lost them all
+// until 2026-09-30. The list below reads `_char` alone (one key per frame; the
+// rest wait in the queue); swing_fb_filter_keys takes `_char` first and then
+// drains the rest.
 //
-// ⚠️ ESC never arrives at all, and an EMBEDDED instance gets no keyboard
-// whatsoever (measured, rk_swing_padname_edit's header).
+// ⚠️ ESC does arrive, WAK on or off (a physical press logs 27; the old "never"
+// was the injection harness losing it -- kbprobe_default.jsfx, wiki 7.4). An
+// EMBEDDED instance gets no keyboard whatsoever (measured, same probe).
 FBK_UP    = 30064;        // 'up'
 FBK_DOWN  = 1685026670;   // 'down'
 FBK_LEFT  = 1818584692;   // 'left'
@@ -873,8 +980,8 @@ function swing_fb_kb_select(pr) local(p, kind, ext)
   kind == 0 ? (
     // Same three-way the click uses: load, or only audition, or only describe.
     // SFZ is a 16-pad kit import and is never walked onto a pad.
-    (fb_autoload && ext != 10) ? swing_fb_request(3, fb_sel, sel_pad) :
-    (fb_preview  && ext != 10) ? swing_fb_request(12, fb_sel, -1)
+    (fb_autoload && ext != 10) ? ( swing_fb_request(3, fb_sel, sel_pad); fb_preview ? fb_prv_name = fb_sel; ) :
+    (fb_preview  && ext != 10) ? ( swing_fb_request(12, fb_sel, -1); fb_prv_name = fb_sel; )
                                : swing_fb_request(5, fb_sel, -1);
   ) : swing_fb_request(5, fb_sel, -1);
 );
@@ -939,6 +1046,7 @@ function swing_fb_list_keys(vis) local(c, used, p)
           fb_scroll = 0; swing_fb_request(1, fb_sel, -1);
         ) : ALT ? (
           fb_drag_layer = swing_pad_next_layer(sel_pad);
+          fb_drag_count = 1;   // verb 7 takes REQ_COUNT files now: one here, not a drag's stale count
           swing_fb_request(7, fb_sel, sel_pad);
         ) : swing_fb_request(3, fb_sel, sel_pad);
       );
@@ -957,14 +1065,20 @@ function swing_fb_send_filter() local(i, n)
 );
 
 // Drain the keyboard queue into the filter box.
-// ⚠️ SEVERAL characters can arrive in ONE @gfx frame (measured 3), so this
-// loops until the queue is empty rather than taking one per frame -- typing
-// fast would otherwise drop letters. _char is consumed so the popup/overlay
-// handlers do not also act on the same keystroke.
+// ⚠️⚠️ `_char` FIRST. The frame globals already took this frame's first key
+// off the queue, so a loop that starts at gfx_getchar() never sees it -- the
+// box lost the first key of every frame, which at normal typing speed is EVERY
+// key (hand-tested 2026-09-30: "kick" typed normally left the box empty,
+// "snare" in one burst arrived as "nare"). The pad-name editor and the macro
+// rename box read the same way.
+// ⚠️ SEVERAL characters can arrive in ONE @gfx frame (measured 3), so after
+// `_char` this loops until the queue is empty rather than taking one per frame
+// -- typing fast would otherwise drop letters. _char is consumed so the
+// popup/overlay handlers do not also act on the same keystroke.
 function swing_fb_filter_keys() local(c, changed)
 (
   changed = 0;
-  c = gfx_getchar();
+  c = _char;
   while (c > 0) (
     c == 8 ? (                                   // backspace
       strlen(#fb_filt) > 0 ? (
@@ -995,7 +1109,7 @@ function swing_fb_font(sz, bold) local(_s)
   fb_font == 2 ? gfx_setfont(1, "Tahoma",   _s, bold ? 'b' : 0) :
   fb_font == 3 ? gfx_setfont(1, "Segoe UI", _s, bold ? 'b' : 0) :
   fb_font == 4 ? gfx_setfont(1, "Consolas", _s, bold ? 'b' : 0) :
-                 gfx_setfont(1, "Arial",    _s, bold ? 'b' : 0);
+                 rk_font(1, _s, bold ? 'b' : 0);
 );
 
 function swing_fb_font_name(i)
@@ -1395,9 +1509,44 @@ function swing_fb_menu_result()
     fb_drag_layer = swing_popup_result == 2
                       ? swing_pad_next_layer(max(0, sel_pad))
                       : min(swing_popup_result - 3, MAX_LAYERS - 1);
+    fb_drag_count = 1;   // verb 7 takes REQ_COUNT files now: one here, not a drag's stale count
     swing_fb_request(7, fb_menu_ridx, sel_pad);
     swing_popup_result = 0;
   );
+);
+
+// The slot's ground and text colour, in the globals the tree's own draw reads: the user's choice of ground (the pad tray,
+// or the theme's screen in LCD mode) and the text from its measured luminance -- this has to work across all 14 themes
+// AND both ground choices. Its own function since the swap's audit (round two J, 2026-10-22): with the browser placed
+// BELOW the pads its draw does not run in the side slot, and the slot paints its gutter from these.
+function swing_fb_ground() local(_fg_lum) (
+  fb_lcd ? ( _fb_gr = lcd_bg_r;   _fb_gg = lcd_bg_g;   _fb_gb = lcd_bg_b;   )
+         : ( _fb_gr = pad_well_r; _fb_gg = pad_well_g; _fb_gb = pad_well_b; );
+  _fg_lum = _fb_gr * 0.299 + _fb_gg * 0.587 + _fb_gb * 0.114;
+  _fb_tc = _fg_lum > 0.55 ? 0.12 : 0.90;
+);
+
+// ── The side slot's WIDTH HANDLE (the user, 2026-10-22: "a handle for the side panel that will allow it to adjust like
+// the bottom's handle" / "in between the pads and where the pad FX is"): the SEAM between the pads and the side panel
+// (rk_swing_ui_padfx_side swing_side_seam_draw paints it; this reads it): drag LEFT for a wider slot, right for
+// narrower, the wheel for small steps; a right-click puts the panels' own widths back (side_w 0). side_w is the slot's
+// panels' width in canvas px (gate 83); the slot's cap follows it and the pads give or take the difference inside the
+// window that is there (never a window resize). The frame's copies of the mouse (mx, my, the stash), so the rig's fake mouse drives
+// it; the gate keeps the column claimed while a drag is in flight. (x, y, w, h) = the seam; _sh_open: the slot has a
+// width to drag. Returns 1 while the seam is under the mouse. Called once a frame from the side slot's draw. ──
+function swing_side_handle(_sh_x, _sh_y, _sh_w, _sh_h, _sh_open) local(_sh_hot) (
+  _sh_hot = mx >= _sh_x && mx < _sh_x + _sh_w && my >= _sh_y && my < _sh_y + _sh_h;
+  side_cur_want = 0;
+  _sh_open ? (
+    _sh_hot && _fb_g_lmbdown ? ( side_gdrag = 1; side_gdrag_x0 = mx; side_gdrag_w0 = max(0, fb_w_cur - FB_GUTTER_W - swing_px(FB_SEAM_W)); );
+    side_gdrag && _fb_g_lmbclick ? side_w = max(swing_px(SIDE_W_MIN_B), min(2000, side_gdrag_w0 + (side_gdrag_x0 - mx)));
+    !_fb_g_lmbclick ? side_gdrag = 0;
+    _sh_hot && _fb_g_wheel != 0 ? side_w = max(swing_px(SIDE_W_MIN_B), min(2000, (side_w > 0 ? side_w : max(0, fb_w_cur - FB_GUTTER_W - swing_px(FB_SEAM_W))) + (_fb_g_wheel > 0 ? swing_px(20) : -swing_px(20))));
+    _sh_hot && _fb_g_rmbdown ? side_w = 0;
+    (_sh_hot || side_gdrag) ? side_cur_want = 32644;   // the left / right arrows (IDC_SIZEWE)
+    _sh_hot ? swing_tooltip_check(1493, "The side panel's width: drag left for wider, right for narrower (wheel for small steps); right-click for the panels' own widths. The pads give the room; the window stays.");
+  ) : side_gdrag = 0;
+  _sh_hot && _sh_open;
 );
 
 function swing_fb_draw(x, y, w, h)
@@ -1405,21 +1554,16 @@ function swing_fb_draw(x, y, w, h)
         vis, maxs, alive, cx, cy, lmb, edge, ext, _lum, _tc, _gr, _gg, _gb,
         _bw, _bx, _dc, _dr, _di, _dcx, _dcy, _dox, _doy, _dpw, _dph,
         _fy, _rh, _ty, _pkb, _wx, _wy, _ww, _wh, _pi, _pmx, _pmn, _pcx,
-        _pst, _plh, _pc, _ply, _tw, _sx, _shot, _gy, _gi, _gw, _my)
+        _pst, _plh, _pc, _ply, _tw, _sx, _shot, _gy, _gi, _gw, _my,
+        _pnx, _pmid, _pk0, _pk1, _pbd, _pj, _pcw, _ppx, _pkv, _dtk, _dtf)
 (
   // Ground colour is the user's choice. Default takes the pad TRAY, so the strip
   // reads as part of the chassis. LCD mode takes the theme's SCREEN instead --
   // that is the retro-hardware look, and on the SSL theme it is a light grey
   // panel, which is exactly the vibe rather than a bug.
-  fb_lcd ? ( _gr = lcd_bg_r;    _gg = lcd_bg_g;    _gb = lcd_bg_b;    )
-         : ( _gr = pad_well_r;  _gg = pad_well_g;  _gb = pad_well_b;  );
-  // Pick text from measured luminance rather than assuming a dark theme -- this
-  // has to work across all 14 themes AND both ground choices.
+  swing_fb_ground();   // the globals (the tree's own draw and the side slot read them); the locals below are this draw's copies
+  _gr = _fb_gr; _gg = _fb_gg; _gb = _fb_gb; _tc = _fb_tc;
   _lum = _gr * 0.299 + _gg * 0.587 + _gb * 0.114;
-  _tc  = _lum > 0.55 ? 0.12 : 0.90;
-  _fb_tc = _tc;
-  // The tree draws from a function of its own, so the ground has to reach it.
-  _fb_gr = _gr; _fb_gg = _gg; _fb_gb = _gb;
 
   // Keys first, so a filter change is on the wire before the rows are drawn.
   swing_fb_menu_result();
@@ -1454,7 +1598,17 @@ function swing_fb_draw(x, y, w, h)
   // onto the selected pad, and a focused filter box ate every keystroke a
   // modal's own text field was waiting for. _ui_modal_up is the modal gate's
   // own verdict (swing_ui_modal_gate), so the two can never disagree.
-  !is_embedded && !_ui_modal_up ? ( fb_filt_focus ? swing_fb_filter_keys() : _fb_want_keys = 1; );
+  // The docked keyboard: a click inside the strip gives it the keyboard, a click anywhere else in Swing takes it
+  // back (the dock then hands focus back too); while it holds it, a key the dock queued stands in for `_char`
+  // when REAPER delivered none (it delivers none to a docked Swing).
+  (mouse_cap & 1) && !fb_kbd_prev ? fb_kbd = mouse_x >= px && mouse_x < px + pw && mouse_y >= y && mouse_y < y + h;
+  fb_kbd_prev = mouse_cap & 1;
+  !_char && fb_kbd ? _char = swing_fb_dock_key();
+  // The list's keys YIELD to the step sequencer while it owns the last click (seq_ui_focus): Up / Down / PgUp / PgDn /
+  // Enter are both of theirs, and with the sequencer below and the strip at the side the strip draws first and ate them
+  // (found in the swap's audit, round two J, 2026-10-22, with both panels on screen at once). A click in the strip
+  // (fb_kbd) or anywhere else on the face takes them back; the filter box's focus is its own as ever.
+  !is_embedded && !_ui_modal_up ? ( fb_filt_focus ? swing_fb_filter_keys() : (fb_kbd || !seq_ui_focus) ? _fb_want_keys = 1; );
 
   // The old pad-triggered audition is GONE. It loaded onto a pad and played the
   // pad, which is why it fought AUTOLOAD, overwrote the kit, and failed silently
@@ -2062,12 +2216,27 @@ function swing_fb_draw(x, y, w, h)
     gfx_drawstr(
       p[FB_R_KIND] > 0   ? "folder" :
       p[FB_R_EXT] == 10  ? "SFZ kit - loads across 16 pads" :
-      p[FB_R_SR] > 0     ? sprintf(#, "%d ch  %d Hz  %d ms  %d KB",
-                                   p[FB_R_CH], p[FB_R_SR], p[FB_R_MS], p[FB_R_SIZE_KB])
+      p[FB_R_SR] > 0     ? sprintf(#, "%d ch  %d Hz  %.1f s  %d KB",
+                                   p[FB_R_CH], p[FB_R_SR], p[FB_R_MS] / 1000, p[FB_R_SIZE_KB])
                          : "sample");
+    // Before the drop (Spec_Swing_Pad_Banks §8.1, 2026-09-23): a file longer than a pad
+    // holds at its own rate (SLOT_SIZE cells of interleaved stereo) is trimmed on load --
+    // say so here, where it can still be avoided. ms > SLOT_SIZE / 2 / sr * 1000.
+    p[FB_R_KIND] == 0 && p[FB_R_EXT] != 10 && p[FB_R_SR] > 0 &&
+      p[FB_R_MS] > SLOT_SIZE * 500 / p[FB_R_SR] ? (
+      gfx_set(0.98, 0.70, 0.32, 0.95);
+      gfx_drawstr("  longer than a pad holds");
+    );
 
     // Peaks over the frame drawn above. Fetched once per SELECTION, never per
     // row -- that is what lets the list itself stay a plain list.
+    // 2026-10-15 (the user: "can we draw the wave forms any better?"): the band
+    // holds 512 columns and a loudness BODY per column (the bridge folds 8 finer
+    // peaks into each: extremes -> the outline, their mean amplitude -> the body).
+    // Drawn one column per PIXEL of the strip -- the old 128 bars stepped visibly --
+    // as a lighter outline with a brighter core inside, a hairline centre per lane,
+    // and the preview's playhead over the file while it plays. No library: a
+    // waveform is min / max per pixel, and the meter libs draw meters.
     p[FB_R_KIND] == 0 && p[FB_R_EXT] != 10 ? (
       _pkb = EON_SWBPK_BASE + max(0, min(EON_SWBROWSE_SLOTS - 1, _reg_my_slot)) * EON_SWBPK_STRIDE;
       // ⭐ STEREO DRAWS AS STEREO. A stereo file gets two stacked lanes with a
@@ -2077,26 +2246,53 @@ function swing_fb_draw(x, y, w, h)
       // single trace was actively contradicting it.
       _pst = p[FB_R_CH] >= 2 ? 1 : 0;
       _plh = _pst ? (_wh * 0.5 - 1) : _wh;
+      _pnx = max(1, min(FB_PK_N, _ww | 0));          // pixel columns: the strip's width, at most the band's
       _pc  = 0;
       loop(_pst ? 2 : 1,
         _ply = _wy + _pc * (_wh * 0.5 + 1);
-        gfx_set(0.45, 0.72, 0.92, _pc ? 0.80 : 0.95);   // R a shade quieter
+        _pmid = _ply + _plh * 0.5;
         _pi = 0;
-        loop(FB_PK_N,
-          _pmx = gmem[_pkb + _pc * 2 * FB_PK_N + _pi];
-          _pmn = gmem[_pkb + _pc * 2 * FB_PK_N + FB_PK_N + _pi];
-          _pcx = _wx + (_pi / FB_PK_N) * _ww;
-          // at least a pixel, or a quiet file draws as nothing at all
-          gfx_rect(_pcx, _ply + _plh * 0.5 - max(0.5, _pmx * _plh * 0.5),
-                   max(1, _ww / FB_PK_N),
-                   max(1, (_pmx - _pmn) * _plh * 0.5));
+        loop(_pnx,
+          // the band columns this pixel folds: [_pk0, _pk1)
+          _pk0 = (_pi * FB_PK_N / _pnx) | 0;
+          _pk1 = max(_pk0 + 1, ((_pi + 1) * FB_PK_N / _pnx) | 0);
+          _pmx = -1; _pmn = 1; _pbd = 0; _pj = _pk0;
+          loop(_pk1 - _pk0,
+            _pkv = gmem[_pkb + _pc * 2 * FB_PK_N + _pj];           _pkv > _pmx ? _pmx = _pkv;
+            _pkv = gmem[_pkb + _pc * 2 * FB_PK_N + FB_PK_N + _pj]; _pkv < _pmn ? _pmn = _pkv;
+            _pbd += gmem[_pkb + 4 * FB_PK_N + _pc * FB_PK_N + _pj];
+            _pj += 1;
+          );
+          _pbd /= (_pk1 - _pk0);
+          _pcx = _wx + _pi * _ww / _pnx;
+          _pcw = max(1, _ww / _pnx);
+          // the outline: the column's extremes; at least a pixel, or a quiet file draws as nothing
+          gfx_set(0.45, 0.72, 0.92, _pc ? 0.40 : 0.48);   // R a shade quieter
+          gfx_rect(_pcx, _pmid - max(0.5, _pmx * _plh * 0.5), _pcw, max(1, (_pmx - _pmn) * _plh * 0.5));
+          // the core: the column's average amplitude, symmetric about the centre, brighter
+          _pbd > 0 ? (
+            gfx_set(0.56, 0.84, 1.0, _pc ? 0.82 : 0.96);
+            gfx_rect(_pcx, _pmid - _pbd * _plh * 0.5, _pcw, max(1, _pbd * _plh));
+          );
           _pi += 1;
         );
+        gfx_set(_tc, _tc, _tc, 0.16);
+        gfx_rect(_wx, _pmid, _ww, 1);                   // this lane's centre line
         _pc += 1;
       );
       _pst ? (
         gfx_set(_tc, _tc, _tc, 0.13);
         gfx_rect(_wx, _wy + _wh * 0.5, _ww, 1);         // the channel split
+      );
+      // The playhead while the preview of THIS row plays: the player publishes its read
+      // position every block (PP_PRV_RD, interleaved cells, climbing past one pass on a long
+      // LOOP), shown as a fraction of one pass; the part already heard is tinted faintly.
+      _prv_on && fb_prv_name == fb_sel && _prv_total_frames > 0 ? (
+        _ppx = ((gmem[EON_PADPCM_HDR + PP_PRV_RD] * 0.5) % _prv_total_frames) / _prv_total_frames;
+        gfx_set(1.0, 0.86, 0.40, 0.10);
+        gfx_rect(_wx, _wy, _ppx * _ww, _wh);
+        gfx_set(1.0, 0.86, 0.40, 0.90);
+        gfx_rect(_wx + _ppx * _ww, _wy, 1, _wh);
       );
     );
   ) : (
@@ -2111,7 +2307,11 @@ function swing_fb_draw(x, y, w, h)
   // its own player, so PLAY means play and STOP means stop.
   _ty = y + h - 26;
   swing_fb_btn(px + 8,  _ty, 44, 20, _prv_on ? "STOP" : "PLAY", _prv_on, edge) ? (
-    fb_prv_cmd = _prv_on ? 2 : 1;
+    // PLAY on a LONG file whose stream has ended or was cancelled: frame 0 has left the
+    // ring, so the row is asked for again (verb 12, the row the player last loaded). A
+    // short file, or a long one still streaming, replays / restarts from the ring.
+    _prv_on ? fb_prv_cmd = 2 :
+    (_prv_long && fb_prv_name >= 0) ? swing_fb_request(12, fb_prv_name, -1) : fb_prv_cmd = 1;
   );
   swing_fb_btn(px + 56, _ty, 44, 20, "LOOP", fb_prv_loop, edge) ? fb_prv_loop = !fb_prv_loop;
 
@@ -2165,6 +2365,22 @@ function swing_fb_draw(x, y, w, h)
       _dr += 1;
     );
 
+    // The pad editor's layer tabs (published by the editor within the last quarter second): a drop there lands on that
+    // layer (the user, 2026-10-22: "a very cool gesture"); over a tab the pad grid is not the target. The tabs light
+    // themselves from ovl_drag_* (the run the drop fills).
+    fb_drag_tab = -1;
+    time_precise() - ovl_tabs_t < 0.25 && mouse_y >= ovl_tabs_y && mouse_y <= ovl_tabs_y + ovl_tabs_h ? (
+      _dtk = 0; loop(MAX_LAYERS,
+        mouse_x >= ovl_tabs_x + _dtk * ovl_tabs_w && mouse_x <= ovl_tabs_x + _dtk * ovl_tabs_w + ovl_tabs_w - 2 ? fb_drag_tab = _dtk;
+        _dtk += 1;
+      );
+    );
+    fb_drag_tab >= 0 ? (
+      fb_drag_pad = -1;
+      _dtf = swing_layer_drop_first(ovl_tabs_pad, fb_drag_tab);
+      ovl_drag_l0 = max(0, _dtf); ovl_drag_n = min(fb_drag_count, MAX_LAYERS - ovl_drag_l0); ovl_drag_t = time_precise();
+    );
+
     // Light the landing pad, same treatment the OS-drag path uses so the two
     // gestures read identically.
     // Light the landing pad AND the run a multi-drop would fill, so the reach
@@ -2194,8 +2410,8 @@ function swing_fb_draw(x, y, w, h)
     gfx_set(0.10, 0.13, 0.18, 0.88);
     gfx_rect(mouse_x + 10, mouse_y - 8, 168, 18);
     // Green = will land. Amber = will land as a LAYER (Alt). Grey = nowhere.
-    fb_drag_pad < 0 ? gfx_set(0.75, 0.78, 0.84, 0.8)
-                    : ALT ? gfx_set(0.95, 0.72, 0.30, 1)
+    fb_drag_pad < 0 && fb_drag_tab < 0 ? gfx_set(0.75, 0.78, 0.84, 0.8)
+                    : (ALT || fb_drag_tab >= 0) ? gfx_set(0.95, 0.72, 0.30, 1)
                           : gfx_set(0.45, 0.85, 0.55, 1);
     gfx_rect(mouse_x + 10, mouse_y - 8, 3, 18);
     gfx_set(0.92, 0.94, 0.97, 1);
@@ -2208,13 +2424,28 @@ function swing_fb_draw(x, y, w, h)
     fb_drag_pad >= 0 && ALT ? (
       gfx_set(0.95, 0.72, 0.30, 1);
       gfx_x = mouse_x + 18; gfx_y = mouse_y + 12;
-      gfx_drawstr(sprintf(#, "+ LAYER %d", swing_pad_next_layer(fb_drag_pad) + 1));
+      _dtf = swing_pad_next_layer(swing_bp(fb_drag_pad));   // several files stack after it (the bridge's verb 7)
+      fb_drag_count > 1 ? gfx_drawstr(sprintf(#, "+ LAYERS %d-%d", _dtf + 1, min(MAX_LAYERS, _dtf + fb_drag_count)))
+                        : gfx_drawstr(sprintf(#, "+ LAYER %d", _dtf + 1));
+    );
+    fb_drag_tab >= 0 ? (
+      gfx_set(0.95, 0.72, 0.30, 1);
+      gfx_x = mouse_x + 18; gfx_y = mouse_y + 12;
+      ovl_drag_n > 1 ? gfx_drawstr(sprintf(#, "LAYERS %d-%d", ovl_drag_l0 + 1, ovl_drag_l0 + ovl_drag_n))
+                     : gfx_drawstr(sprintf(#, "LAYER %d", ovl_drag_l0 + 1));
     );
   );
 
   // ── resolve on release ──
   _fb_rel && fb_drag_state > 0 ? (
-    fb_drag_state == 2 && fb_drag_pad >= 0 && fb_drag_ext != 10 ? (
+    fb_drag_state == 2 && fb_drag_tab >= 0 && fb_drag_ext != 10 ? (
+      // onto the pad editor's layer tab: the bridge takes REQ_COUNT files from the resolved layer
+      // (swing_layer_drop_first; -1 = the first replaces the pad, the rest from layer 1), four layers at most
+      fb_drag_layer = swing_layer_drop_first(ovl_tabs_pad, fb_drag_tab);
+      swing_fb_request(7, fb_drag_ridx, ovl_tabs_pad);   // the editor's pad is a slot: absolute already
+      overlay_layer = max(0, fb_drag_layer);              // the editor shows the layer the drop lands on
+      sel_pad = ovl_tabs_pad;
+    ) : fb_drag_state == 2 && fb_drag_pad >= 0 && fb_drag_ext != 10 ? (
       // ALT = stack as a LAYER instead of replacing the pad. Same convention
       // the big browser already uses (Swing_Browser.lua:4772), so the gesture
       // means the same thing in both places.
@@ -2223,11 +2454,15 @@ function swing_fb_draw(x, y, w, h)
       // silently do nothing; a PLAIN pad stacks on layer 1 (its sample is
       // layer 0 and gets promoted by the loader).
       ALT ? (
-        fb_drag_layer = swing_pad_next_layer(fb_drag_pad);
-        swing_fb_request(7, fb_drag_ridx, fb_drag_pad);
-      ) : fb_drag_count > 1 ? swing_fb_request(8, fb_drag_ridx, fb_drag_pad)
-                            : swing_fb_request(3, fb_drag_ridx, fb_drag_pad);
-      sel_pad = fb_drag_pad;
+        fb_drag_layer = swing_pad_next_layer(swing_bp(fb_drag_pad));
+        swing_fb_request(7, fb_drag_ridx, swing_bp(fb_drag_pad));   // the delivery names the ABSOLUTE pad (step 4a)
+      ) : fb_drag_count > 1 ? swing_fb_request(8, fb_drag_ridx, swing_bp(fb_drag_pad))
+                            : swing_fb_request(3, fb_drag_ridx, swing_bp(fb_drag_pad));
+      // ⚠ The SLOT, both verbs (2026-10-15, the user: a drop on bank B..D landed on bank A). fb_drag_pad is
+      // the 0..15 TILE from the hit test above; the bridge reads REQ_PAD as an absolute pad since step 4a
+      // (verb 3 queues it as is, verb 8 fills from it to the end of ITS bank). Only the ALT branch had
+      // been mapped. banks_adjacency_check's escape class now holds the 4x4 tile itself.
+      sel_pad = swing_bp(fb_drag_pad);
       // No arming here any more: verb 3 carries REQ_AUD, so the bridge queues
       // the preview load right behind the pad load.
     ) : fb_drag_state == 1 ? (
@@ -2238,20 +2473,22 @@ function swing_fb_draw(x, y, w, h)
       (fb_autoload && fb_drag_ext != 10) ? (
         // verb 3 = load the pad, and (via REQ_AUD) queue the preview behind it
         swing_fb_request(3, fb_drag_ridx, sel_pad);
+        fb_preview ? fb_prv_name = fb_drag_ridx;   // the row PLAY re-requests after a long file's end
       ) : (fb_preview && fb_drag_ext != 10) ? (
         // autoload OFF but audition ON: hear it without touching the kit. This
         // is the pairing the old pad-triggered audition could not express.
         swing_fb_request(12, fb_drag_ridx, -1);
+        fb_prv_name = fb_drag_ridx;
       ) : swing_fb_request(5, fb_drag_ridx, -1);   // describe only
     );
     // dragged but released off the grid = CANCEL, deliberately doing nothing
-    fb_drag_state = 0; fb_drag_pad = -1;
+    fb_drag_state = 0; fb_drag_pad = -1; fb_drag_tab = -1;
   );
 
   );  // fb_open
 
   // A drag must not survive the panel closing under it -- nor the audition (D-7):
   // the strip owns its player, so the frame it closes posts its STOP once.
-  !fb_open ? ( fb_drag_state = 0; fb_drag_pad = -1; _fb_was_open ? fb_prv_cmd = 2; );
+  !fb_open ? ( fb_drag_state = 0; fb_drag_pad = -1; fb_drag_tab = -1; _fb_was_open ? fb_prv_cmd = 2; );
   _fb_was_open = fb_open;
 );

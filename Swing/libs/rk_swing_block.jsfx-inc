@@ -16,7 +16,7 @@
 // runs, so a request that lands during it differs again next block. The macro
 // engine's kmac_rcp bits are consumed inside kmac_tick as before.
 function swing_block_rcp_settle() local(_rs_p) (
-  _rs_p = 0; loop(NUM_PADS,
+  _rs_p = 0; loop(NUM_SLOTS,
     _rcp_req_fx[_rs_p] != _rcp_done_fx[_rs_p] ? (
       _rcp_done_fx[_rs_p] = _rcp_req_fx[_rs_p]; recalc_fx(_rs_p);
     );
@@ -29,16 +29,35 @@ function swing_block_rcp_settle() local(_rs_p) (
   _rcp_req_master != _rcp_done_master ? ( _rcp_done_master = _rcp_req_master; recalc_global_fx(); );
 );
 
+// The trigger gate every launch source applies: muted, silenced by someone else's solo,
+// not playable, or skipped. The MIDI loop and the repeat scheduler spell it out inline;
+// the pad-click ring below and the companion trigger (GS_PAD_TRIGGER, Swing_ReaKit.jsfx)
+// used to check only "playable", so a click on a muted pad played it (user, 2026-09-23:
+// "mute not working at all").
+function swing_pad_blocked(_pb_i) (
+  p_mute[_pb_i] || (any_solo && !p_solo[_pb_i]) || !pad_is_playable(_pb_i) || s_skip[_pb_i];
+);
+
 // ─── Pad clicks and gate-mode releases posted by the UI thread (A-9b) ─────
 // Rings and posts: swing_gt_post* in rk_drumkit_dsp. This side owns the read
 // indexes. The launch is the same call the MIDI loop and the bridge trigger
-// make; the release sends every SOUNDING voice of the pad to its release
+// make, behind the same gate (swing_pad_blocked); the release sends every SOUNDING voice of the pad to its release
 // stage (v_stage > 0, like the note-off and choke sites: a dead voice set to 4
 // would never be free again, which the @gfx loop this replaces did not guard).
-function swing_block_gt_consume() local(_gc_i) (
+// A post whose flash is -1 is the SYNTH view's audition (2026-10-11): the synth layer alone, the way the view
+// always played it, and with no mute / solo gate, as before. It used to call launch_syn_for_pad from @gfx: a voice
+// started mid-block on a pad nobody had woken, so above the high-water mark the start of the sound was lost until
+// the next block. Here it is woken first and launched in @block like every other click.
+function swing_block_gt_consume() local(_gc_i, _gc_p) (
   while (_gt_rd < _gt_wr) (
     _gc_i = _gt_rd % GT_RING;
-    launch_voices_for_pad(_gt_pad[_gc_i] | 0, _gt_note[_gc_i], _gt_vel[_gc_i], _gt_flash[_gc_i]);
+    _gc_p = _gt_pad[_gc_i] | 0;
+    _gt_flash[_gc_i] < 0 ? (
+      swing_pad_wake(_gc_p);
+      launch_syn_for_pad(_gc_p, _gt_note[_gc_i], _gt_vel[_gc_i], 1, 0);
+    ) : (
+      !swing_pad_blocked(_gc_p) ? launch_voices_for_pad(_gc_p, _gt_note[_gc_i], _gt_vel[_gc_i], _gt_flash[_gc_i]);
+    );
     _gt_rd += 1;
   );
 );
@@ -73,7 +92,7 @@ local(_now, _gap, _fi, _bq_st)
   );
   (_gap > 0.05 && _gap < 10) ? (
     // Flush per-pad SVF integrator state (5 filters × 16 pads; coefficients kept)
-    _fi = 0; loop(NUM_PADS * SVF_PER_PAD,
+    _fi = 0; loop(NUM_SLOTS * SVF_PER_PAD,
       svf_flush_state(svf_pad + _fi * SVF_STEREO_SIZE);
       _fi += 1;
     );
@@ -83,13 +102,13 @@ local(_now, _gap, _fi, _bq_st)
       _fi += 1;
     );
     // Flush one-pole filter tracking state
-    _fi = 0; loop(NUM_PADS,
+    _fi = 0; loop(NUM_SLOTS,
       fx_hpf_stL[_fi] = 0; fx_hpf_stR[_fi] = 0;
       fx_lpf_stL[_fi] = 0; fx_lpf_stR[_fi] = 0;
       _fi += 1;
     );
     // Flush per-pad compressor envelopes
-    _fi = 0; loop(NUM_PADS,
+    _fi = 0; loop(NUM_SLOTS,
       fx_cmp_env[_fi] = 0;
       fx_cmp_last_gr[_fi] = 0;
       fx_cmp_last_lin[_fi] = 1.0;
@@ -110,9 +129,9 @@ local(i)
 (
   srate != last_srate ? (
     svf_update_srate();   // 30 ms ramp step is srate-derived
-    i = 0; loop(NUM_PADS, recalc_pad(i); recalc_fx(i); i += 1;);
+    i = 0; loop(NUM_SLOTS, recalc_pad(i); recalc_fx(i); i += 1;);
     // Snap SVFs to the recomputed targets — an srate change must not ramp
-    i = 0; loop(NUM_PADS * SVF_PER_PAD, svf_snap(svf_pad + i * SVF_STEREO_SIZE); i += 1;);
+    i = 0; loop(NUM_SLOTS * SVF_PER_PAD, svf_snap(svf_pad + i * SVF_STEREO_SIZE); i += 1;);
     steal_coeff = exp(-1.0 / max(1, 0.005 * srate));
     _pad_meter_decay = exp(-1.0 / max(1, 0.090 * srate));
     _mst_meter_decay = exp(-1.0 / max(1, 0.450 * srate));
@@ -246,7 +265,7 @@ local(_n, _guard) (
 // hit and so cannot flam against it.
 function swing_rpt_fire_pads(_ofs, _mingap)
 local(i, blocked) (
-  i = 0; loop(NUM_PADS,
+  i = 0; loop(NUM_SLOTS,
     p_held[i] && !_blk_trig[i] && p_rpt_hold[i] >= _mingap ? (
       blocked = p_mute[i] || (any_solo && !p_solo[i]) || !pad_is_playable(i) || s_skip[i];
       !blocked && swing_rpt_roll() ? launch_voices_for_pad_ofs(i, p_held_note[i], swing_rpt_vel(i), 4, _ofs);
@@ -265,7 +284,7 @@ local(rpt_interval, rpt_threshold, _rpt_iters, i, blocked, _pp_interval, _pp_thr
 
   // How long each pad has been held, for the grid-entry guard. Block resolution
   // is enough -- the guard is 30% of a step, not a timing decision.
-  i = 0; loop(NUM_PADS,
+  i = 0; loop(NUM_SLOTS,
     p_held[i] ? p_rpt_hold[i] += samplesblock : p_rpt_hold[i] = 0;
     i += 1;
   );
@@ -310,7 +329,7 @@ local(rpt_interval, rpt_threshold, _rpt_iters, i, blocked, _pp_interval, _pp_thr
       rpt_counter -= rpt_interval;
       rpt_swing_phase = !rpt_swing_phase;
       rpt_threshold = rpt_interval + (rpt_swing_phase ? swing_amt * rpt_interval * 0.5 : 0);
-      i = 0; loop(NUM_PADS,
+      i = 0; loop(NUM_SLOTS,
         p_held[i] && !_blk_trig[i] ? (  // skip pads that JUST triggered this block
           blocked = p_mute[i] || (any_solo && !p_solo[i]) || !pad_is_playable(i) || s_skip[i];
           !blocked && swing_rpt_roll() ? launch_voices_for_pad_ofs(i, p_held_note[i], swing_rpt_vel(i), 4, _rpt_ofs);
@@ -324,7 +343,7 @@ local(rpt_interval, rpt_threshold, _rpt_iters, i, blocked, _pp_interval, _pp_thr
 
   // Per-pad note repeat (only when global repeat is OFF)
   repeat_div == 0 ? (
-    i = 0; loop(NUM_PADS,
+    i = 0; loop(NUM_SLOTS,
       p_rpt_div[i] > 0 && p_held[i] && !_blk_trig[i] ? (  // skip pads just triggered
         p_rpt_div[i] = max(0, min(15, p_rpt_div[i]|0));
         _pp_interval = max(1, get_rpt_interval(p_rpt_div[i]));

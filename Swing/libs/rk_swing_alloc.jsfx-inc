@@ -1,0 +1,674 @@
+// rk_swing_alloc.jsfx-inc -- the pad-audio allocator (Spec_Swing_Pad_Banks §5.3, step 2a,
+// 2026-09-23; plan Plan_Swing_Pad_Banks_Step2.md).
+//
+// Every slot's audio lives in REGIONS carved out of the one pad-audio area above
+// s_audio_start: a PLAIN region (p_aptr / p_alen, cap SLOT_SIZE) or up to MAX_LAYERS LAYER
+// regions (p_lptr / p_llen per layer, cap LAYER_SIZE). A region is `len` cells at `ptr`;
+// len 0 means no region (ptr -1). A pad is plain or layered, never both live at once: a
+// promotion moves the plain region to layer 0, a pad-main load takes layer 0's back. A
+// region holds what a load ASKED for at begin (rounded up to ALLOC_PAGE, plus the voice
+// read-ahead margin, never past the cap), so a short file costs a short region and the 64
+// slots of step 2b share the area first come, first served. Regions never shrink on a
+// reload -- a pad keeps the biggest region it has needed until it is cleared or reloaded
+// with something bigger -- so undo always fits back in place.
+//
+// The allocator is a BUMP POINTER: alloc_top grows, a freed region becomes a hole unless it
+// is the top-most one (then alloc_top pulls back: the cheap common case, reload the pad you
+// just loaded). Holes are reclaimed by the compaction job (step 2a, third commit), never
+// here. "Does not fit" is a refusal, never a truncation (§5.4): every fit function returns
+// 0 with the pad untouched, and the caller says so on the LCD (alloc_refuse_*).
+//
+// THREADS. @block (loader lane 0, kit imports, bakes), @gfx (clears, swaps, lane 1, undo)
+// and @serialize (the embed read) all reach these tables, and alloc_top / alloc_live are
+// shared across them, so every mutation runs under one EEL2 atomic spinlock
+// (atomic_setifequal returns the OLD value: 0 back = ours). The hold is a handful of
+// operations; the lock is per instance (wiki §5.4), which is exactly the scope needed.
+// A caller that owns a pad may read that pad's tables without the lock.
+//
+// THE VIRTUAL SLOT. The command-undo backup (udo_s2_audio, rk_drumkit_dsp) keeps the
+// pre-banks layout -- plain at virtual [0, SLOT_SIZE), layer l at [l * LAYER_SIZE, ...) --
+// and swing_slot_v2p_t / swing_slot_vend_t map a virtual cell onto whichever physical region
+// holds it (or report a gap). The barrier callers keep passing virtual coordinates.
+//
+// This inc claims NO freemem (wiki §2.4): the tables are the host's (p_aptr, p_alen, p_lptr,
+// p_llen beside s_sr in Swing_ReaKit.jsfx) and the allocator's own state is scalar. It is
+// imported BEFORE rk_drumkit_dsp because the undo engine there calls the mapping helpers, and
+// EEL2 binds a call to a function defined earlier in import order (wiki §2.1).
+@init
+
+// The bank helper (step 2b) lives here because this is the earliest engine include: the slot a
+// UI-side or gmem-side pad index i (0..NUM_PADS-1, the bank on screen) means.
+function swing_bp(i) ( bank_cur * NUM_PADS + i; );
+// Step 4a: the pad NUMBER a slot shows (1..16 inside its bank) and the bank a slot lives in.
+function swing_pad_num(ap) ( (ap % NUM_PADS) + 1; );
+function swing_pad_bank(ap) ( (ap / NUM_PADS) | 0; );
+// The band-relative index of a slot: the sixteen-wide companion bands (categories, root notes, IDENT) are
+// indexed by the pad's position in its bank. Always 0..15, so a band write can never leave its band.
+function swing_pad_tile(ap) ( ap % NUM_PADS; );
+// Step 4d: a pad's label for text -- its number (1..16) when it lives in the bank on screen, else the bank
+// letter and the number ("C4"). The editors show the selected pad, which is always on screen (select
+// follows bank), so they print swing_pad_num; banners and the mapping view's other-bank keys use this.
+function swing_pad_lbl(ap, dest) (
+  swing_pad_bank(ap) == bank_cur ? sprintf(dest, "%d", swing_pad_num(ap)) : sprintf(dest, "%c%d", 65 + swing_pad_bank(ap), swing_pad_num(ap));
+);
+
+// Pad Banks Outputs step 1 (Plan_Swing_Pad_Banks_Outputs.md 4, 5): the stereo PAIR a slot plays out of in
+// multi-out. p_output is what was chosen, this is where it goes: 0..15 bank A's sixteen pairs (channels 1-32),
+// OUT_PAIR_BANK.. the bank B, C, D tracks (39-44), OUT_PAIR_SPLIT.. a split-off pad's own pair (45-64). 16..18 are
+// the returns, never a pad's. A bank A slot reads 0..15 as it always did (anything else below the bank pairs
+// clamped, as every use did); it may also choose a bank track (decision 9). A bank B-D slot plays through its
+// bank's track unless it chose a pair from OUT_PAIR_BANK up: its 0..15 are the step 2b default (its position in
+// the bank) and every older build's value, and none of them ever meant one of bank A's tracks.
+// The rule for any chosen value `v`: swing_out_pair reads the slot's own p_output; the off-Wired OUT_WPAIR publish
+// reads what the Wired switch-on will give the slot (swing_out_wpair_next below).
+function swing_out_pair_of(ap, v) local(b) (
+  b = swing_pad_bank(ap);
+  v >= OUT_PAIR_BANK && v < OUT_PAIRS ? v : b == 0 ? max(0, min(NUM_PADS - 1, v)) : OUT_PAIR_BANK + b - 1;
+);
+function swing_out_pair(ap) ( swing_out_pair_of(ap, p_output[ap] | 0); );
+// The track CHANNEL a slot leaves on under Wired (Outputs step 5, 2026-10-12). v2 = the Patchbay rings the new
+// layout (Swing reads its NCH cell every block): bank A's pairs one up (channels 2..33), a bank or split pair its
+// multi-out channel (38..63; rk_swing_patchbay CHANNEL LAYOUT). v2 = 0, the old layout: EXACTLY the routing before
+// step 5 -- every slot's p_output clamped to bank A's sixteen, a bank / split choice on the pad's position in its
+// bank, one up -- so a new Swing beside an old Patchbay sounds as it did.
+function swing_out_wired(ap, v2) local(p, v) (
+  v2 ? (
+    p = swing_out_pair(ap);
+    p < NUM_PADS ? (p + 1) * 2 : p * 2;
+  ) : (
+    v = p_output[ap] | 0;
+    ((v < OUT_PAIR_BANK ? max(0, min(NUM_PADS - 1, v)) : swing_pad_tile(ap)) + 1) * 2;
+  );
+);
+// The PAIR a slot's audio rides under Wired (Outputs step 5, the FX picker): swing_out_wired's channel read back as a
+// pair -- bank A's 0..15 on channels 2..33 (one up), the bank and split pairs 19..31 on 38..63. The picker keys a
+// slot's container by it (the strip band's OUT_WPAIR), so a plugin lands where the slot's audio really goes, in
+// either layout.
+function swing_out_wpair(ap, v2) local(c) (
+  c = swing_out_wired(ap, v2);
+  c < (NUM_PADS + 1) * 2 ? c / 2 - 1 : c / 2;
+);
+// What the automatic "every pad on its own output" resets give a slot (the build's adopt, Swing's own builder, the
+// Wired switch-on): its position in the bank -- except a bank-track or split-pad choice, which stays (Outputs step
+// 2: every multi-out build and Update goes through the adopt, and wiping the choice there took the split pad's
+// track away before the bridge could make it). The user's own resets (MULTI / STEREO, Auto Assign, Reset All) still
+// reset everything.
+function swing_out_default(ap) local(v) (
+  v = p_output[ap] | 0;
+  v >= OUT_PAIR_BANK && v < OUT_PAIRS ? v : swing_pad_tile(ap);
+);
+// The pair a slot's audio WILL ride once Wired switches on in stereo: the switch-on's 0->1 edge (@block) points
+// every slot at swing_out_default, and this build's Patchbay rings the new layout, where a Wired pair is the output
+// pair itself. Published as OUT_WPAIR while Wired is off, so the FX picker keys a pad's container by the pair the
+// audio will use -- not by p_output as it stands before the reset. A fresh stereo Swing has every slot at 0, so the
+// first plugin added to any pad through the FX tab (which asks for Wired AFTER the add) landed in pad 1's
+// container and stayed there when Wired came on and the pad moved to its own pair (EON_Probe_PadPick, 2026-10-22).
+function swing_out_wpair_next(ap) ( swing_out_pair_of(ap, swing_out_default(ap)); );
+// A pair's name for the labels ("Out 5", "Bank B", "Own 3") and its short form for small cells ("5", "B", "o3").
+function swing_out_pair_name(pr, dest) (
+  pr < NUM_PADS ? sprintf(dest, "Out %d", pr + 1) :
+  pr < OUT_PAIR_SPLIT ? sprintf(dest, "Bank %c", 66 + pr - OUT_PAIR_BANK) : sprintf(dest, "Own %d", pr - OUT_PAIR_SPLIT + 1);
+);
+function swing_out_pair_short(pr, dest) (
+  pr < NUM_PADS ? sprintf(dest, "%d", pr + 1) :
+  pr < OUT_PAIR_SPLIT ? sprintf(dest, "%c", 66 + pr - OUT_PAIR_BANK) : sprintf(dest, "o%d", pr - OUT_PAIR_SPLIT + 1);
+);
+// The hue an output gives (the Out labels, the OUTPUT colour mode): bank A's pairs as before (pair / 16); a bank or
+// split pair halfway between two of them, so it never wears one of bank A's (Outputs step 3: every value from 16
+// up hued past 1.0 before).
+function swing_out_hue(ap) local(p) (
+  p = swing_out_pair(ap);
+  p < NUM_PADS ? p / 16 : (p - NUM_PADS + 0.5) / 16;
+);
+
+ALLOC_PAGE   = 8192;   // rounding granule, cells (~93 ms of stereo at 44.1k). §5.3: never raise it --
+                       // 256 short layers round up, and the waste lands on the layered kits.
+ALLOC_MARGIN = 64;     // the voice loop's read-ahead past the last frame, kept inside the region
+
+// ─── The allocator itself ────────────────────────────────────────────────────────────────
+function swing_alloc_init(base, area) (
+  alloc_base = base; alloc_end = base + area;
+  alloc_top = base; alloc_live = 0;
+  _alloc_lock = 0;
+  _al_reg0 = 0; _al_reg1 = 0; _al_reg2 = 0; _al_reg3 = 0;   // the host registers its displaced lists after this
+  _al_stg = 0;                 // the browser load's STAGING record (ptr, len), registered by the host (swing_alloc_register_stage)
+  alloc_refused_bits = 0;      // pads whose last load was refused for room (ORed into the kit ack)
+  alloc_refuse_pad = -1; alloc_refuse_until = 0;   // the LCD banner (rk_swing_ui_state)
+  // The compaction job (below): alc_req = someone needs room that only packing frees; alc_wait =
+  // the LAST failed fit / can_fit would succeed after packing (advisory to that caller);
+  // alc_hold = a long unlocked writer (undo restore, the @serialize read) asks the tick to stand
+  // still; alc_mv + alc_ap/r/src/len/pos = the region move in progress; alc_dst = the frontier.
+  alc_req = 0; alc_wait = 0; alc_hold = 0; alc_mv = 0;
+  alc_dst = base; alc_ap = -1; alc_r = -1; alc_src = -1; alc_len = 0; alc_pos = 0;
+  // The stall guard: passes in a row that reclaimed nothing (alloc_top did not fall). Three of
+  // them and requests stop being filed -- the caller is refused instead of waiting for a
+  // compaction that cannot help (holes under pinned regions, or a compactor that is stuck:
+  // the skipcommit mutation of EON_Probe_BanksMem spun for ever without this). Any free
+  // resets it: the picture changed.
+  alc_stall = 0; alc_top0 = base;
+  alloc_top_max = base;    // the highest alloc_top ever reached: pages above it still hold the backing markers
+  alloc_backed = 1;        // 0 = the startup self-check found an unbacked page (the pool's top was lowered to it)
+  alloc_short_dismissed = 0;
+);
+
+// Spin until the lock is ours. Bounded so a lock that could never clear (it cannot: EEL2
+// sections run to completion) still cannot hang a thread.
+function swing_alloc_lock() local(_n) (
+  _n = 0;
+  while (atomic_setifequal(_alloc_lock, 0, 1) != 0 && _n < 1048576) ( _n += 1; );
+);
+function swing_alloc_unlock() ( atomic_set(_alloc_lock, 0); );
+
+function swing_alloc_free_cells() ( alloc_end - alloc_base - alloc_live; );
+function swing_alloc_free_secs()  ( max(0, swing_alloc_free_cells()) / (2 * max(1, srate)); );
+
+// Cells a region gets for `need` content cells under `cap`: the read-ahead margin, rounded
+// up to a page, never past the cap (a full pad is exactly SLOT_SIZE; the rounding must not
+// push a pad that fits exactly out of the area).
+function swing_alloc_size(need, cap) local(_s) (
+  _s = need + ALLOC_MARGIN;
+  _s = ((_s + ALLOC_PAGE - 1) / ALLOC_PAGE | 0) * ALLOC_PAGE;
+  min(_s, cap);
+);
+
+// ─── Region tables: r = 0 plain, 1..MAX_LAYERS = layer r - 1 ────────────────────────────
+// (Defined before the settle scan below, which reads them: EEL2 binds a call at definition time.)
+function swing_region_ptr(ap, r) ( r == 0 ? p_aptr[ap] : p_lptr[ap * MAX_LAYERS + r - 1]; );
+function swing_region_len(ap, r) ( r == 0 ? p_alen[ap] : p_llen[ap * MAX_LAYERS + r - 1]; );
+function swing_region_cap(r)     ( r == 0 ? SLOT_SIZE : LAYER_SIZE; );
+function swing_region_set(ap, r, ptr, len) (
+  // the one choke point for a table write: a writer on the region the compactor is moving
+  // abandons that move (nothing was committed; the tick re-scans)
+  (alc_mv && ap == alc_ap && r == alc_r) ? alc_mv = 0;
+  r == 0 ? ( p_aptr[ap] = ptr; p_alen[ap] = len; )
+         : ( p_lptr[ap * MAX_LAYERS + r - 1] = ptr; p_llen[ap * MAX_LAYERS + r - 1] = len; );
+);
+function swing_alloc_cancel_move() ( alc_mv = 0; );
+
+// The displaced lists the settle below must see (a loader job's regions in flight are live
+// memory that is in no table). The host registers its four -- both loader lanes' and the two
+// one-shot lists -- right after swing_ldr_init. Unregistered slots read 0 = none.
+function swing_alloc_register_dl(dl) (
+  _al_reg0 == 0 ? ( _al_reg0 = dl; ) : (
+  _al_reg1 == 0 ? ( _al_reg1 = dl; ) : (
+  _al_reg2 == 0 ? ( _al_reg2 = dl; ) : (
+  _al_reg3 == 0 ? ( _al_reg3 = dl; ); ); ); );
+);
+function swing_alloc_settle_dl_(dl) local(_r, _l) (
+  dl > 0 ? (
+    _r = 0; loop(MAX_LAYERS + 1,
+      _l = dl[MAX_LAYERS + 1 + _r];
+      _l > 0 ? alloc_top = max(alloc_top, dl[_r] + _l);
+      _r += 1;
+    );
+  );
+);
+// After a release: alloc_top falls to the highest live end -- every region in every slot's
+// table plus the displaced lists -- so a kit load that frees sixteen pads in ORDER reclaims
+// all sixteen (a plain "pull back when the freed region is top-most" reclaimed the last one
+// and left the other fifteen as holes: a second kit load would have eaten a kit's worth of
+// area). Holes UNDER a live region stay until the compaction job moves it down. O(slots x 5)
+// reads, under the lock; a clear is a handful of these. CALLER HOLDS THE LOCK.
+function swing_alloc_settle_() local(_ap, _r, _l) (
+  alloc_top = alloc_base;
+  _ap = 0; loop(NUM_SLOTS,
+    _r = 0; loop(MAX_LAYERS + 1,
+      _l = swing_region_len(_ap, _r);
+      _l > 0 ? alloc_top = max(alloc_top, swing_region_ptr(_ap, _r) + _l);
+      _r += 1;
+    );
+    _ap += 1;
+  );
+  swing_alloc_settle_dl_(_al_reg0); swing_alloc_settle_dl_(_al_reg1);
+  swing_alloc_settle_dl_(_al_reg2); swing_alloc_settle_dl_(_al_reg3);
+  // the staging region of a browser load in flight is in no table and no list: live all the same
+  (_al_stg > 0 && _al_stg[1] > 0) ? alloc_top = max(alloc_top, _al_stg[0] + _al_stg[1]);
+);
+
+// The two primitives. THE CALLER HOLDS THE LOCK. A take that fails although the area has the
+// room (a hole under a live region) files a compaction request and tells the caller to wait.
+function swing_alloc_take_(cells) local(_p) (
+  (cells > 0 && alloc_top + cells <= alloc_end) ? (
+    alc_wait = 0;
+    _p = alloc_top; alloc_top += cells; alloc_live += cells;
+    alloc_top > alloc_top_max ? alloc_top_max = alloc_top;
+    _p;
+  ) : (
+    alc_wait = (cells > 0 && cells <= alloc_end - alloc_base - alloc_live && alc_stall < 3) ? 1 : 0;
+    alc_wait ? alc_req = 1;
+    -1;
+  );
+);
+function swing_alloc_release_(ptr, len) (
+  len > 0 ? (
+    alloc_live -= len;
+    swing_alloc_settle_();
+    alc_stall = 0;   // room moved: a compaction is worth asking for again
+  );
+);
+
+// ─── The staging region (2026-10-15; the user: "the pad goes blank then the sample loads") ──────────
+// A browser drop (CMD 63) used to clear the pad at its FIRST chunk and stream into the pad's own region, so
+// the pad stood empty -- no name, no wave, no sound -- for the whole load. Now, when the area has the room
+// above alloc_top, the stream lands in a fresh STAGING region while the pad keeps its old sample, and the
+// loader's finish switches the pad over in one block (swing_ldr_stage_commit, rk_swing_core). The record is
+// two cells (ptr, len) of the loader job, registered once by the host so a release anywhere (another pad's
+// clear during the load) settles alloc_top above it. Compaction never runs while a loader job is in a phase
+// other than 6 (swing_alloc_compact_tick), and a staged job never waits in phase 6, so the region cannot move.
+// No room above the top: the caller falls back to the in-place load (the old behaviour, blank and all).
+function swing_alloc_register_stage(rec) ( _al_stg = rec; );
+// Take a staging region for `need` cells of a pad-main load: its pointer, or -1 (no room above the top --
+// never a compaction request: the in-place path can still reuse the pad's own region). Sets _al_stg_sz.
+function swing_alloc_take_stage(need) local(_sz, _p) (
+  _sz = swing_alloc_size(min(need, SLOT_SIZE), SLOT_SIZE);
+  swing_alloc_lock();
+  _p = (need > 0 && alloc_top + _sz <= alloc_end) ? swing_alloc_take_(_sz) : -1;
+  swing_alloc_unlock();
+  _al_stg_sz = _p >= 0 ? _sz : 0;
+  _p;
+);
+
+// ─── Freeing ───────────────────────────────────────────────────────────────────────────────
+// Free one region now (a real clear, or a kit import wiping a pad it is about to refill).
+// NOT for a load in flight: its old regions go onto the displaced list below and stay live
+// until finish, because the undo capture may still be reading them.
+function swing_region_free(ap, r) local(_p, _l) (
+  _l = swing_region_len(ap, r);
+  _l > 0 ? (
+    _p = swing_region_ptr(ap, r);
+    swing_alloc_lock();
+    swing_alloc_release_(_p, _l);
+    swing_alloc_unlock();
+  );
+  swing_region_set(ap, r, -1, 0);
+);
+function swing_pad_free_all(ap) local(_r) (
+  _r = 0; loop(MAX_LAYERS + 1, swing_region_free(ap, _r); _r += 1;);
+);
+
+// Drop every region of every slot and start the area over: the @serialize read rebuilds
+// the tables from the stream (every embedded length allocates as it arrives). Under the
+// lock as one operation so a concurrent allocation cannot land between the two halves.
+function swing_alloc_reset(nslots) local(_ap, _r) (
+  swing_alloc_lock();
+  _ap = 0; loop(nslots,
+    _r = 0; loop(MAX_LAYERS + 1, swing_region_set(_ap, _r, -1, 0); _r += 1;);
+    _ap += 1;
+  );
+  alloc_top = alloc_base; alloc_live = 0;
+  alc_req = 0; alc_mv = 0; alc_dst = alloc_base; alc_stall = 0;   // nothing left to pack
+  swing_alloc_unlock();
+);
+
+// Snapshot a pad's five regions into two flat tables (ptr[0..MAX_LAYERS], len[0..MAX_LAYERS])
+// -- what the undo capture reads through for as long as the op runs. Under the lock, so a
+// compaction commit cannot land between a pointer and its length.
+function swing_pad_regions_copy(ap, tp, tl) local(_r) (
+  swing_alloc_lock();
+  _r = 0; loop(MAX_LAYERS + 1,
+    tp[_r] = swing_region_ptr(ap, _r); tl[_r] = swing_region_len(ap, _r);
+    _r += 1;
+  );
+  swing_alloc_unlock();
+);
+
+// ─── The virtual slot ────────────────────────────────────────────────────────────────────
+// Plain at [0, SLOT_SIZE); layer l at [l * LAYER_SIZE, (l + 1) * LAYER_SIZE). Over the flat
+// tables tp / tl (swing_pad_regions_copy): the physical cell for virtual v, or -1 in a gap
+// (past a short layer, or a layer the pad does not have).
+function swing_slot_v2p_t(tp, tl, v) local(_l, _o) (
+  tl[0] > 0 ? ( v < tl[0] ? tp[0] + v : -1 ) : (
+    _l = (v / LAYER_SIZE) | 0; _o = v - _l * LAYER_SIZE;
+    (_l < MAX_LAYERS && _o < tl[1 + _l]) ? tp[1 + _l] + _o : -1;
+  );
+);
+// The virtual cell where the mapping of v next changes: the end of its region, or of the
+// gap it sits in. Always > v, so a walk over [v, end) terminates. The plain branch's gap runs
+// to the END OF THE VIRTUAL SLOT (MAX_LAYERS * LAYER_SIZE), not SLOT_SIZE: since layers grew to
+// pad length (2026-09-23) a capture goal can exceed SLOT_SIZE, and a gap end <= v would stall
+// the walk (audit 2026-09-23, finding 3 -- reachable only with l_len set on a plain pad).
+function swing_slot_vend_t(tp, tl, v) local(_l, _o) (
+  tl[0] > 0 ? ( v < tl[0] ? tl[0] : MAX_LAYERS * LAYER_SIZE ) : (
+    _l = (v / LAYER_SIZE) | 0; _o = v - _l * LAYER_SIZE;
+    (_l < MAX_LAYERS && _o < tl[1 + _l]) ? _l * LAYER_SIZE + tl[1 + _l] : (_l + 1) * LAYER_SIZE;
+  );
+);
+
+// ─── The displaced list: dl[r] = ptr, dl[MAX_LAYERS + 1 + r] = len (0 = none) ───────────
+// A load that replaces a region (or turns a layered pad plain) hands the old regions here;
+// the job frees them at finish / abort. 2 * (MAX_LAYERS + 1) cells, host-owned.
+function swing_disp_clear(dl) ( memset(dl, 0, 2 * (MAX_LAYERS + 1)); );
+function swing_disp_push_(dl, r, ptr, len) (
+  len > 0 ? ( dl[r] = ptr; dl[MAX_LAYERS + 1 + r] = len; );
+);
+function swing_disp_any(dl) local(_r, _a) (
+  _a = 0; _r = 0; loop(MAX_LAYERS + 1, dl[MAX_LAYERS + 1 + _r] > 0 ? _a = 1; _r += 1;);
+  _a;
+);
+function swing_disp_free(dl) local(_r, _l) (
+  swing_alloc_lock();
+  _r = 0; loop(MAX_LAYERS + 1,
+    _l = dl[MAX_LAYERS + 1 + _r];
+    _l > 0 ? swing_alloc_release_(dl[_r], _l);
+    _r += 1;
+  );
+  swing_alloc_unlock();
+  memset(dl, 0, 2 * (MAX_LAYERS + 1));
+);
+
+// ─── Fitting a load ─────────────────────────────────────────────────────────────────────
+// The pad becomes PLAIN holding `need` cells: reuse the plain region when it is big enough,
+// else layer 0's (a promotion's transfer, in reverse), else take a new one. Every other live
+// region goes onto `dl`. Returns 0 with the pad untouched when nothing fits.
+function swing_pad_fit_main(ap, need, dl) local(_r, _ok, _keep, _l, _np, _sz) (
+  need = min(need, SLOT_SIZE);
+  swing_alloc_lock();
+  _keep = -1; _np = -1; _ok = 1;
+  p_alen[ap] >= need ? ( _keep = 0; ) : ( p_llen[ap * MAX_LAYERS] >= need ? ( _keep = 1; ); );
+  _keep < 0 ? (
+    _sz = swing_alloc_size(need, SLOT_SIZE);
+    _np = swing_alloc_take_(_sz);
+    _np < 0 ? ( _ok = 0; );
+  );
+  _ok ? (
+    _r = 0; loop(MAX_LAYERS + 1,
+      _r != _keep ? (
+        _l = swing_region_len(ap, _r);
+        _l > 0 ? swing_disp_push_(dl, _r, swing_region_ptr(ap, _r), _l);
+        swing_region_set(ap, _r, -1, 0);
+      );
+      _r += 1;
+    );
+    _keep == 1 ? (
+      swing_region_set(ap, 0, p_lptr[ap * MAX_LAYERS], p_llen[ap * MAX_LAYERS]);
+      swing_region_set(ap, 1, -1, 0);
+    );
+    _keep < 0 ? swing_region_set(ap, 0, _np, _sz);
+  );
+  swing_alloc_unlock();
+  _ok;
+);
+
+// Layer `l` gets `need` cells. Layer 0 on a PLAIN pad takes the plain region over (a layer-0
+// load replaces the plain sample outright); a layer >= 1 on a plain pad leaves the plain
+// region alone -- swing_pad_promote moves it to layer 0 right after this, a transfer with no
+// allocation. Otherwise layer l's own region is reused when it is big enough, else a new one
+// is taken and the old goes onto `dl`. Returns 0 with the pad untouched when nothing fits.
+function swing_pad_fit_layer(ap, l, need, dl) local(_r, _ok, _sz, _np, _li, _plain) (
+  need = min(need, LAYER_SIZE);
+  _li = ap * MAX_LAYERS + l; _r = l + 1; _ok = 1;
+  _plain = (l == 0 && p_layer_cnt[ap] == 0);
+  swing_alloc_lock();
+  p_llen[_li] >= need ? ( 0; ) :
+  (_plain && p_alen[ap] >= need) ? (
+    p_llen[_li] > 0 ? swing_disp_push_(dl, _r, p_lptr[_li], p_llen[_li]);
+    swing_region_set(ap, 1, p_aptr[ap], p_alen[ap]);
+    swing_region_set(ap, 0, -1, 0);
+  ) : (
+    _sz = swing_alloc_size(need, LAYER_SIZE);
+    _np = swing_alloc_take_(_sz);
+    _np < 0 ? ( _ok = 0; ) : (
+      p_llen[_li] > 0 ? swing_disp_push_(dl, _r, p_lptr[_li], p_llen[_li]);
+      swing_region_set(ap, _r, _np, _sz);
+      (_plain && p_alen[ap] > 0) ? (
+        swing_disp_push_(dl, 0, p_aptr[ap], p_alen[ap]);
+        swing_region_set(ap, 0, -1, 0);
+      );
+    );
+  );
+  swing_alloc_unlock();
+  _ok;
+);
+
+// Would a load of `need` cells into (ap, layer) fit? The same rules as the two fit
+// functions, read-only -- for a caller that must know BEFORE it clears the pad
+// (the EON_PADPCM drop, the no-bridge CMD 63), so a refusal leaves the pad as it was.
+function swing_pad_can_fit(ap, layer, need) local(_ok, _li, _sz) (
+  swing_alloc_lock();
+  layer < 0 ? (
+    need = min(need, SLOT_SIZE);
+    _sz = swing_alloc_size(need, SLOT_SIZE);
+    _ok = p_alen[ap] >= need || p_llen[ap * MAX_LAYERS] >= need || alloc_top + _sz <= alloc_end;
+  ) : (
+    need = min(need, LAYER_SIZE);
+    _li = ap * MAX_LAYERS + layer;
+    _sz = swing_alloc_size(need, LAYER_SIZE);
+    _ok = p_llen[_li] >= need ||
+          (layer == 0 && p_layer_cnt[ap] == 0 && p_alen[ap] >= need) ||
+          alloc_top + _sz <= alloc_end;
+  );
+  // no room now, room after packing: file the request and tell the caller to wait (alc_wait)
+  alc_wait = (!_ok && _sz <= alloc_end - alloc_base - alloc_live && alc_stall < 3) ? 1 : 0;
+  alc_wait ? alc_req = 1;
+  swing_alloc_unlock();
+  _ok;
+);
+
+// After undo restored a pad's lengths (s_len, p_layer_cnt, l_len), give it regions that hold
+// them: move the plain region to layer 0 or back when the needed side is missing and the
+// other fits, free what the restored state does not use (this can pull alloc_top back before
+// anything is taken), then grow or take what is missing. Returns 1 when every needed region
+// exists; 0 when one could not be taken (alc_wait says whether packing would free the room:
+// the caller may compact synchronously and call this again, then trim what is still missing
+// with swing_pad_regions_trim_missing). Regions never shrink on a reload, so the common undo
+// fits in place; the alloc here is the drop-onto-a-layered-pad case (its layers 1..3 were
+// freed at the drop's finish).
+function swing_pad_fit_restore(ap) local(_r, _need, _ok, _sz, _np, _plain, _l0) (
+  _ok = 1; _l0 = ap * MAX_LAYERS;
+  _plain = p_layer_cnt[ap] == 0;
+  swing_alloc_lock();
+  _plain ? (
+    (s_len[ap] > 0 && p_alen[ap] < s_len[ap] && p_llen[_l0] >= s_len[ap]) ? (
+      p_alen[ap] > 0 ? swing_alloc_release_(p_aptr[ap], p_alen[ap]);
+      swing_region_set(ap, 0, p_lptr[_l0], p_llen[_l0]);
+      swing_region_set(ap, 1, -1, 0);
+    );
+  ) : (
+    (l_len[_l0] > 0 && p_llen[_l0] < l_len[_l0] && p_alen[ap] >= l_len[_l0]) ? (
+      p_llen[_l0] > 0 ? swing_alloc_release_(p_lptr[_l0], p_llen[_l0]);
+      swing_region_set(ap, 1, p_aptr[ap], p_alen[ap]);
+      swing_region_set(ap, 0, -1, 0);
+    );
+  );
+  _r = 0; loop(MAX_LAYERS + 1,
+    _need = _r == 0 ? (_plain ? s_len[ap] : 0) : (_plain ? 0 : l_len[_l0 + _r - 1]);
+    (_need <= 0 && swing_region_len(ap, _r) > 0) ? (
+      swing_alloc_release_(swing_region_ptr(ap, _r), swing_region_len(ap, _r));
+      swing_region_set(ap, _r, -1, 0);
+    );
+    _r += 1;
+  );
+  _r = 0; loop(MAX_LAYERS + 1,
+    _need = _r == 0 ? (_plain ? s_len[ap] : 0) : (_plain ? 0 : l_len[_l0 + _r - 1]);
+    (_need > 0 && swing_region_len(ap, _r) < _need) ? (
+      // release first: a top-most region then grows in place instead of leaving a hole
+      swing_region_len(ap, _r) > 0 ? swing_alloc_release_(swing_region_ptr(ap, _r), swing_region_len(ap, _r));
+      swing_region_set(ap, _r, -1, 0);
+      _sz = swing_alloc_size(_need, swing_region_cap(_r));
+      _np = swing_alloc_take_(_sz);
+      _np >= 0 ? swing_region_set(ap, _r, _np, _sz) : ( _ok = 0; );
+    );
+    _r += 1;
+  );
+  swing_alloc_unlock();
+  _ok;
+);
+// After a restore whose fit could not take a region back even after packing: zero the length
+// of every region the pad does not actually hold, so nothing reads a dead pointer. A partial
+// undo; the caller says so on the LCD.
+function swing_pad_regions_trim_missing(ap) local(_r, _l0) (
+  _l0 = ap * MAX_LAYERS;
+  p_layer_cnt[ap] == 0 ? ( p_alen[ap] < s_len[ap] ? s_len[ap] = 0; ) : (
+    _r = 0; loop(MAX_LAYERS, p_llen[_l0 + _r] < l_len[_l0 + _r] ? l_len[_l0 + _r] = 0; _r += 1;);
+  );
+);
+
+// ─── The backing self-check (2026-09-23) ─────────────────────────────────────────────────────
+// __memtop() echoes the grant; it does not prove the memory is there. EEL2 hands every address
+// past the grant, and every block it could not allocate, ONE shared dummy cell: a write there
+// reads back in the same frame and is gone at the next distinct write. So a DIFFERENT marker in
+// every probed page, all written and then all read back at once, exposes an unbacked page on the
+// spot -- which is what the old "72M ceiling" was (markers written past the grant; the Sept
+// probe f87d688c showed the 128M grant fully backed on this machine). The host runs this once
+// at @init over the pool and the region above it where the send FX, the swap chunk and the undo
+// slot will live, and lowers the pool's top to the first failing page: a machine short of memory
+// gets a smaller pool and an honest readout, not silent pads. Pages are ALLOC_BK_STEP apart
+// (each touch commits one 64K-cell block, so the sweep costs a few MB of RAM, once); the last
+// cell before `hi` is probed as well. `hi` is the whole INTENDED layout, never what
+// __memtop() reports -- a REAPER that grants less than the layout needs must be caught here
+// (the lowgrant mutation of EON_Probe_BanksMem found the first draft bounded by the report and
+// therefore blind to exactly that). When a page fails, the boundary is bisected to the cell
+// between the last good page and it, each probe clobbering the dummy cell through a known-bad
+// address first so a same-frame readback cannot lie. Returns the first unbacked address, or `hi`
+// when everything up to it is backed. A second pass at block 10 (swing_alloc_backing_recheck)
+// re-reads the pages no allocation has reached, to catch a page that did not survive the frame.
+ALLOC_BK_STEP = 8000000;
+ALLOC_BK_WALL = 134221824;   // 2^27 + 4096: past the JSFX engine's absolute cell count (the measured clamp), so a write
+                             // here can only land in the shared dummy cell -- the clobber that makes an unbacked
+                             // page show. Without it the LAST marker written is also the dummy's content, and an
+                             // unbacked last page reads back correctly (the first draft's blind spot).
+function swing_alloc_backing_scan(lo, hi) local(_a, _first, _last, _good, _mid, _clob) (
+  _clob = ALLOC_BK_WALL;
+  _a = lo;
+  while (_a < hi) ( _a[0] = _a + 0.5; _a += ALLOC_BK_STEP; );
+  _last = hi - 1; _last[0] = _last + 0.5;
+  _clob[0] = -7;   // every unbacked probe now holds -7, not its marker
+  _first = -1; _good = lo; _a = lo;
+  while (_a < hi && _first < 0) (
+    _a[0] != _a + 0.5 ? _first = _a : _good = _a;
+    _a += ALLOC_BK_STEP;
+  );
+  (_first < 0 && _last[0] != _last + 0.5) ? _first = _last;
+  _first >= 0 ? (
+    // bisect (_good, _first]: write the probe, clobber the dummy, read the probe back
+    while (_first - _good > 1) (
+      _mid = ((_good + _first) / 2) | 0;
+      _mid[0] = _mid + 0.5;
+      _clob[0] = -1;
+      _mid[0] == _mid + 0.5 ? _good = _mid : _first = _mid;
+    );
+    _first;
+  ) : hi;
+);
+function swing_alloc_backing_recheck() local(_a, _first) (
+  // only the pages no allocation has ever reached still hold their markers
+  _a = alloc_base + ((alloc_top_max - alloc_base + ALLOC_BK_STEP - 1) / ALLOC_BK_STEP | 0) * ALLOC_BK_STEP;
+  _first = -1;
+  while (_a < alloc_end && _first < 0) ( _a[0] != _a + 0.5 ? _first = _a; _a += ALLOC_BK_STEP; );
+  _first >= 0 ? (
+    swing_alloc_lock();
+    _first < alloc_end ? alloc_end = _first;
+    swing_alloc_unlock();
+    alloc_backed = 0;
+  );
+);
+
+// ─── Compaction ─────────────────────────────────────────────────────────────────────────────
+// A hole under a live region is room the bump pointer cannot hand out. When a take fails for
+// that reason (alc_req), the tick below -- once per @block, and synchronously by a caller that
+// cannot wait -- packs the live regions down, lowest first, one region at a time, through
+// _swap_tmp_buf in SWAP_CHUNK pieces (ALLOC_MV_CHUNKS of them per tick), and commits the
+// pointer when the region's last chunk has landed. Safe by construction: nothing reads the
+// destination before the commit (it is a hole: below alloc_top, in no table), nothing writes
+// the source while the move runs (both loader lanes idle or waiting, alc_hold clear; a bake or
+// a kit copy runs on this same thread between ticks and re-derives its pointer per block), and
+// at the commit both copies hold the same cells, so a voice reading the pad per sample simply
+// follows the pointer -- no voice is ended, nothing is heard twice. Any writer that touches the
+// moving region (every table write passes swing_region_set) abandons the move; the next tick
+// re-scans from the frontier. A region a loader job displaced (in a registered list, not in a
+// table) is PINNED: never moved, never moved into; the frontier steps over it.
+ALLOC_MV_CHUNKS = 8;   // x SWAP_CHUNK cells per tick, ~0.4 ms of memcpy under the lock
+
+// CALLER HOLDS THE LOCK. The lowest pinned (displaced) region at or above the frontier across
+// one list; `best` carries the lowest start found so far, _al_pin_end its end.
+function swing_alloc_next_dl_(dl, best) local(_r, _l) (
+  dl > 0 ? (
+    _r = 0; loop(MAX_LAYERS + 1,
+      _l = dl[MAX_LAYERS + 1 + _r];
+      (_l > 0 && dl[_r] >= alc_dst && (best < 0 || dl[_r] < best)) ? ( best = dl[_r]; _al_pin_end = dl[_r] + _l; );
+      _r += 1;
+    );
+  );
+  best;
+);
+// CALLER HOLDS THE LOCK. The lowest live thing at or above the frontier: 1 = a table region
+// (alc_ap / alc_r / alc_src / alc_len set), 2 = a pinned region (the frontier moved past it),
+// 0 = nothing (the area above the frontier is empty).
+function swing_alloc_next_region_() local(_ap, _r, _p, _l, _best, _pin) (
+  _best = -1;
+  _ap = 0; loop(NUM_SLOTS,
+    _r = 0; loop(MAX_LAYERS + 1,
+      _l = swing_region_len(_ap, _r);
+      _l > 0 ? (
+        _p = swing_region_ptr(_ap, _r);
+        (_p >= alc_dst && (_best < 0 || _p < _best)) ? ( _best = _p; alc_ap = _ap; alc_r = _r; alc_src = _p; alc_len = _l; );
+      );
+      _r += 1;
+    );
+    _ap += 1;
+  );
+  _pin = -1; _al_pin_end = 0;
+  _pin = swing_alloc_next_dl_(_al_reg0, _pin); _pin = swing_alloc_next_dl_(_al_reg1, _pin);
+  _pin = swing_alloc_next_dl_(_al_reg2, _pin); _pin = swing_alloc_next_dl_(_al_reg3, _pin);
+  (_pin >= 0 && (_best < 0 || _pin < _best)) ? ( alc_dst = _al_pin_end; 2; ) : ( _best >= 0 ? 1 : 0; );
+);
+
+// One step. Returns 1 when nothing is left to pack (the request is cleared).
+function swing_alloc_compact_tick() local(_n, _k, _found, _done) (
+  swing_alloc_lock();
+  _done = !alc_req;
+  (alc_req && !alc_hold &&
+   !(ldr_job0[LDR_F_PHASE] > 0 && ldr_job0[LDR_F_PHASE] != 6) &&
+   !(ldr_job1[LDR_F_PHASE] > 0 && ldr_job1[LDR_F_PHASE] != 6)) ? (
+    !alc_mv ? (
+      alc_dst == alloc_base ? alc_top0 = alloc_top;   // a pass starts: remember where the top was
+      _found = swing_alloc_next_region_();
+      _found == 0 ? (
+        // the pass is complete: the top falls to the frontier; a pass that reclaimed nothing
+        // counts toward the stall guard (see swing_alloc_init)
+        alloc_top = alc_dst;
+        alloc_top < alc_top0 ? ( alc_stall = 0; ) : ( alc_stall += 1; );
+        alc_req = 0; alc_dst = alloc_base; _done = 1;
+      ) : (
+        _found == 1 ? (
+          alc_src == alc_dst ? ( alc_dst += alc_len; ) : ( alc_mv = 1; alc_pos = 0; );
+        );
+      );
+    );
+    alc_mv ? (
+      (swing_region_ptr(alc_ap, alc_r) != alc_src || swing_region_len(alc_ap, alc_r) != alc_len) ? ( alc_mv = 0; ) : (
+        _k = 0;
+        while (_k < ALLOC_MV_CHUNKS && alc_pos < alc_len) (
+          _n = min(SWAP_CHUNK, alc_len - alc_pos);
+          memcpy(_swap_tmp_buf, alc_src + alc_pos, _n);
+          memcpy(alc_dst + alc_pos, _swap_tmp_buf, _n);
+          alc_pos += _n;
+          _k += 1;
+        );
+        alc_pos >= alc_len ? (
+          swing_region_set(alc_ap, alc_r, alc_dst, alc_len);   // the commit (it clears alc_mv itself)
+          alc_mv = 0;
+          alc_dst += alc_len;
+        );
+      );
+    );
+  );
+  swing_alloc_unlock();
+  _done;
+);
+
+// Pack now, on the calling thread, for up to `secs`: a UI-side loader lane waiting in phase 6
+// and the undo restore cannot wait for @block. The same locked step; two threads ticking at once
+// simply share the work.
+function swing_alloc_compact_sync(secs) local(_t0) (
+  _t0 = time_precise();
+  while (alc_req && time_precise() - _t0 < secs) ( swing_alloc_compact_tick(); );
+);
+
+// A load was refused for room: remember the pad (the kit ack carries the bit) and arm the
+// LCD banner "instrument full" (rk_swing_ui_state reads alloc_refuse_* and the free figure).
+function swing_alloc_refuse_note(ap) (
+  alloc_refused_bits |= 2 ^ (ap % NUM_PADS);   // bank-relative (step 3a): 2^ap is past a double's integers from slot 53; step 3b gives the ack one cell per bank pass
+  alloc_refuse_pad = ap;
+  alloc_refuse_until = time_precise() + 6;
+);

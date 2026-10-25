@@ -59,6 +59,9 @@ out_pin:right output
 
 import libs/rk_biquad.jsfx-inc
 import libs/rk_svf.jsfx-inc
+// rk_swing_alloc first: rk_drumkit_dsp's undo engine calls its mapping helpers (banks
+// step 2a), and EEL2 binds a call at definition time.
+import libs/rk_swing_alloc.jsfx-inc
 import libs/rk_drumkit_dsp.jsfx-inc
 import libs/knobs_kbsg.jsfx-inc
 import libs/rk_spectrum.jsfx-inc
@@ -127,7 +130,7 @@ meq_cv_valid = 0;
 rk_spectrum.init_memory(freemem);
 rk_spectrum.init();
 freemem = rk_spectrum.get_memory_index();
-freemem = swing_popup_init(freemem);   // the THEME menu's row lists (194 cells)
+freemem = swing_popup_init(freemem);   // the THEME menu's row lists (386 cells: 64 items x 6 tables + 2)
 // The SAME x-axis as the curve. _lcd_log_lo 1.301 / _lcd_log_range 3.0 is
 // 20 Hz - 20 kHz, and with these the two maps reduce to the identical
 // log(f/20)/log(1000) -- so a peak sits exactly on its gridline. Set after
@@ -646,6 +649,9 @@ function tn_draw_eq(chrome) (
         gfx_hpf_freq >= 1000 ? sprintf(#_lv, "%.1fk", gfx_hpf_freq / 1000) : sprintf(#_lv, "%.0f", gfx_hpf_freq);
       ) : strcpy(#_lv, "OFF");
       gfx_set(1, 1, 1, _lcd_hpf_active ? 0.9 : 0.5);
+      // The values are bold from 10 px only: bold Arial at 8-9 px draws 5 as 6
+      // and 6, 9 as 8 (wiki 4.7). "HPF" / "LPF" stay bold.
+      gfx_setfont(1, "Arial", max(8, floor(9 * sc)), floor(9 * sc) >= 10 ? 'b' : 0);
       gfx_measurestr(#_lv, tw, th);
       gfx_x = _meq_hpf_cx - tw / 2; gfx_y = _meq_hpf_cy - th / 2; gfx_drawstr(#_lv);
 
@@ -664,17 +670,19 @@ function tn_draw_eq(chrome) (
         0, 0.08, 0.08, 0.10);
       dist(mx, my, _meq_lpf_cx, _meq_lpf_cy) <= _meq_kr + 4 ? ( _tn_hov = 1; tn_hint("LPF — low-pass, 200 Hz to 20 kHz (log). Tames the top after the EQ. OFF at maximum."); );
       gfx_set(EQC_LPF_R, EQC_LPF_G, EQC_LPF_B, _lcd_lpf_active ? 0.9 : 0.5);
+      gfx_setfont(1, "Arial", max(8, floor(9 * sc)), 'b');
       gfx_measurestr("LPF", tw, th);
       gfx_x = _meq_lpf_cx - tw / 2; gfx_y = _meq_lpf_cy - _meq_kr - th - 1; gfx_drawstr("LPF");
       _lcd_lpf_active ? (
         gfx_lpf_freq >= 1000 ? sprintf(#_lv, "%.1fk", gfx_lpf_freq / 1000) : sprintf(#_lv, "%.0f", gfx_lpf_freq);
       ) : strcpy(#_lv, "OFF");
       gfx_set(1, 1, 1, _lcd_lpf_active ? 0.9 : 0.5);
+      gfx_setfont(1, "Arial", max(8, floor(9 * sc)), floor(9 * sc) >= 10 ? 'b' : 0);
       gfx_measurestr(#_lv, tw, th);
       gfx_x = _meq_lpf_cx - tw / 2; gfx_y = _meq_lpf_cy - th / 2; gfx_drawstr(#_lv);
 
-      // dB labels on the nodes
-      gfx_setfont(1, "Arial", max(8, floor(9 * sc)), 'b');
+      // dB labels on the nodes (numbers: bold from 10 px only, wiki 4.7)
+      gfx_setfont(1, "Arial", max(8, floor(9 * sc)), floor(9 * sc) >= 10 ? 'b' : 0);
       gfx_eq_lo != 0 ? (
         gfx_set(EQC_LO_R, EQC_LO_G, EQC_LO_B, 1); tn_node_label(gfx_eq_lo, meq_lo_bell ? gfx_eq_lo_bq : gfx_eq_lo_sq, meq_lo_bell ? 0.8 : sqrt(0.5));
         gfx_measurestr(#_lv, tw, th);
@@ -1137,7 +1145,7 @@ micro ? (
   dist(mx, my, _tn_kcx, _tn_kcy) <= _tn_kr + 4 * ret ? _tn_hov = 1;
   // the amount, only when the band is tall enough to seat it under the knob
   _tn_kz >= 30 * ret ? (
-    gfx_setfont(1, "Arial", max(7, floor(_tn_kz * 0.19)), 'b');
+    gfx_setfont(1, "Arial", max(7, floor(_tn_kz * 0.19)), floor(_tn_kz * 0.19) >= 10 ? 'b' : 0);   // bold from 10 px (wiki 4.7)
     gfx_set(0.93, 0.62, 0.30, 0.95);
     sprintf(#tn_hint, "%d%%", floor(gfx_sat_drv * 100 + 0.5));
     gfx_measurestr(#tn_hint, tw, th);
@@ -1166,9 +1174,15 @@ micro ? (
     thm_anchor_x = _tn_cx2; thm_anchor_y = _tn_cy2;
     thm_anchor_w = _tn_cw;  thm_anchor_h = _tn_ch;
     _tn_chit = mx >= _tn_cx2 && mx < _tn_cx2 + _tn_cw && my >= _tn_cy2 && my < _tn_cy2 + _tn_ch;
-    // lmb withheld from rkth_input so a LEFT click opens the PANEL, not the
-    // widget's own list; RIGHT click and wheel keep their usual meaning.
-    rkth_input(_tn_cx2, _tn_cy2, _tn_cw, _tn_ch, mx, my, 0, rmb_down, frame_wheel, _tn_ch) ?
+    // ⚠️⚠️ lmb reaches rkth_input ONLY while its list is
+    // already OPEN. Shut, it is withheld so a left click on the chip opens the
+    // THEME MENU rather than the widget's own list. Open, the click is the LIST'S:
+    // rk_theme.jsfx-inc:118 picks the hovered row under `lmb ?`, so withholding it
+    // unconditionally left the list openable by right-click and impossible to
+    // choose from -- which is how it shipped in 3.0.18.
+    // ⭐ The chip test below reads lmb_down AFTER this call, so it needs no gate of its
+    // own: a click consumed by the open list zeroes lmb_down and the chip test misses.
+    rkth_input(_tn_cx2, _tn_cy2, _tn_cw, _tn_ch, mx, my, rkth_open ? lmb_down : 0, rmb_down, frame_wheel, _tn_ch) ?
       ( lmb_down = 0; frame_wheel = 0; mouse_wheel = 0; );
     _tn_chit && lmb_down ? ( thm_open = 1 - thm_open; rkth_open = 0; lmb_down = 0; );
     rkth_draw_chip(max(9, floor(11 * sc)));
@@ -1224,7 +1238,7 @@ micro ? (
   );
   rk_knob_draw(_tn_kp, _kcx, _kcy, _kr, gfx_sat_drv, 0, 1, 0, tn_kmem[0], _tdrv_r, _tdrv_g, _tdrv_b, 0, 0.13, 0.14, 0.16);
   dist(mx, my, _kcx, _kcy) <= _kr + 6 ? ( _tn_hov = 1; tn_hint("DRIVE — 0 is clean. 8x into the selected curve, blended back in by this amount. Double-click resets."); );
-  gfx_setfont(1, "Arial", max(9, floor(12 * sc)), 'b');
+  gfx_setfont(1, "Arial", max(9, floor(12 * sc)), floor(12 * sc) >= 10 ? 'b' : 0);   // bold from 10 px (wiki 4.7)
   gfx_set(0.93, 0.62, 0.30, 1);
   sprintf(#_lv, "%d%%", floor(gfx_sat_drv * 100 + 0.5));
   gfx_measurestr(#_lv, tw, th);

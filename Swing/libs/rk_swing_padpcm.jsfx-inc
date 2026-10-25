@@ -12,13 +12,23 @@
 // Protocol (.refs/gmem_regions_supplement.tsv row EON_PADPCM; mirrors the KIT_HS handshake):
 //   header block 473 = EON_PADPCM_HDR, window A block 474 = EON_PADPCM_WIN (65 536 cells,
 //   interleaved STEREO always -- the bridge asks the accessor for 2 channels, so mono arrives
-//   L==R), window B block 475 reserved.
+//   L==R), window B block 475 = EON_PADPCM_WIN_B (in use since 2026-10-15, below).
 //   bridge per chunk: GEN odd -> payload -> OFF/LEN/FLAGS -> GEN even (LAST). Job start also
 //   writes JOB/PAD/LAYER/KIND/TOTAL/SR/NCH/PEAK/INST/PATH before the first GEN flip.
 //   JSFX: a new even GEN addressed to THIS instance latches the chunk; _pp_budget cells per
 //   block are copied into the job's destination; ECHO = GEN only when the chunk is complete;
 //   FIRST runs the setup before any cell lands, LAST runs the finish BEFORE the echo.
-//   A republished chunk (fresh GEN, same content) is idempotent: a FIRST re-runs the setup.
+//   TWO WINDOWS (2026-10-15, level 205; the user: a sample takes too long to land). With one
+//   window a load paced at one chunk per BRIDGE TICK: we copied the chunk in ~35 ms, then sat
+//   idle until the bridge's next defer saw the echo and published the next (4-5.6 s for a 30-40 s
+//   file, 2026-09-08). Now chunk k sits in window k % 2, each window with its own GEN / OFF / LEN /
+//   FLAGS / ECHO cells (window B's at +29..+33); the bridge keeps both filled, we take them in
+//   sequence (a fresh job starts in A), so the pace is our own copy budget. Both sides must be at
+//   205 (PP_BRIDGE_LEVEL / PP_JSFX_LEVEL); either below -> window A alone, the old protocol exactly.
+//   A chunk is published ONCE: one we have not echoed by its deadline waits under the same GEN
+//   (rk_padpcm.lua, audit H08, 2026-10-23). A bridge older than that REPUBLISHED it under a fresh
+//   GEN, which we still take as idempotent (a FIRST re-runs the setup) -- but a republish that
+//   came while we were copying the chunk was copied twice and put the window sequence one step off.
 //   FAILED / ABORT on a job that never began leaves every pad exactly as it was and acks the
 //   CMD; an ABORT mid-job drops the half-landed job (zero length, path kept).
 //   +15 JSFX_LEVEL: this build writes 204 every block. +16 BRIDGE_LEVEL: the bridge writes
@@ -37,9 +47,11 @@
 
 EON_PADPCM_HDR     = 30998528;   // block 473: header + path record
 EON_PADPCM_WIN     = 31064064;   // block 474: window A, EON_PADPCM_CHUNK cells
-EON_PADPCM_WIN_B   = 31129600;   // block 475: window B (reserved double-buffer)
+EON_PADPCM_WIN_B   = 31129600;   // block 475: window B, the same size (chunk k % 2 == 1)
 EON_PADPCM_CHUNK   = 65536;
-EON_PADPCM_LEVEL   = 204;        // protocol level this build speaks (== KIT_HS_CAP)
+EON_PADPCM_LEVEL   = 205;        // protocol level this build speaks (two windows)
+EON_PADPCM_LEVEL_MIN  = 204;     // the lowest bridge level that streams at all (one window): _bridge_state 2
+EON_PADPCM_LEVEL_DUAL = 205;     // the bridge level from which window B carries every second chunk
 
 // header offsets (bridge writes unless noted)
 PP_JOB = 0;        // monotonic job id; a new value = a new job
@@ -63,6 +75,30 @@ PP_PRV_ON = 17;       // JSFX diagnostics, every block: the preview player's sta
 PP_PRV_LEN = 18;      //   (_prv_on, _prv_len frames, fb_prv_loop) -- probes read them
 PP_PRV_LOOP = 19;
 PP_BRIDGE_STATE = 20; // JSFX diagnostics, every block: _bridge_state (0 no bridge / 1 older / 2 current) -- probes read it
+PP_AUD_ID = 23;       // bridge: this preview job's audition identity, written before its CMD 69 (2026-10-14)
+PP_AUD_ISSUED = 24;   // bridge: the latest audition identity minted (0 = a bridge that never minted: the old rule)
+// The preview RING (Spec_Swing_Preview_Ring, 2026-10-14): JSFX -> bridge, every block.
+PP_PRV_RD = 25;       // the player's read position in the CURRENT preview job's stream, interleaved cells
+PP_PRV_RING = 26;     // the ring's size in cells (FB_PRV_MAX); 0 = a JSFX without the ring -> the bridge keeps the 1 M-cell cap
+PP_PRV_JOB = 27;      // the job PP_PRV_RD refers to (a stale position from the last job must not read as free space)
+PP_PRV_HOLD = 28;     // diagnostic: samples the player held on an underrun (data not landed yet) since @init; probes expect 0
+// Window B's descriptor (2026-10-15, level 205): the same five cells window A has at +1 / +10 / +11 / +12 / +2.
+PP_GEN_B = 29;        // bridge: window B's chunk generation (one monotonic count shared with window A)
+PP_OFF_B = 30;        // bridge: window B's chunk offset in the destination
+PP_LEN_B = 31;        // bridge: window B's chunk cells
+PP_FLAGS_B = 32;      // bridge: window B's chunk flags
+PP_ECHO_B = 33;       // JSFX: last window-B GEN fully copied
+PP_JOB_A = 34;        // bridge: the job whose chunk window A holds, written with the chunk (two-window bridges)
+PP_JOB_B = 35;        // bridge: the same for window B. A cancelled / aborted job can leave an unconsumed chunk
+                      // in one window while the next job's first chunk lands in the other; the header's JOB
+                      // names the NEW job, so only this stamp tells the leftover from the new job's second chunk.
+PP_ACKED = 22;        // JSFX: the job whose CMD this JSFX has just acked (2026-10-10), written right AFTER the ack.
+                      // The bridge held a job until its tick saw the CMD leave 63 / 64 / 69 -- but a producer
+                      // (the Sample Browser's queues, Choppa) posts the next one the moment the CMD reads 0, so
+                      // a load posted between our ack and that tick looked like the old one still waiting: it
+                      // was never streamed, and the bus was cleared under it (FILL's N3 race; FINDINGS_LOG
+                      // 2026-10-09). Written by the drop / layer completion halves (rk_swing_browser_load),
+                      // the preview's finish and the fail path.
 PP_MEM_HEAD = 21;     // JSFX diagnostics, every block: _mem_head, the audit band's headroom
                       // in CELLS (__memtop() - the top of everything addressed). Negative =
                       // past the ceiling, where writes land in a phantom page and NOTHING
@@ -90,7 +126,12 @@ _pp_job = -1;        // job being adopted, -1 = idle
 // from here is addressed to it. (A job mid-flight at birth is a sub-second race the
 // bridge's own stall watchdog releases; adopting half of it would be worse.)
 _pp_gen_seen = gmem[EON_PADPCM_HDR + PP_GEN] | 0;   // last GEN fully copied (mirrors what we echoed)
+_pp_gen_seen_b = gmem[EON_PADPCM_HDR + PP_GEN_B] | 0;   // the same for window B (seeded live for the same reason)
 _pp_gen_cur = 0;     // GEN being copied right now, 0 = none
+// Two windows (2026-10-15): which window the chunk being copied sits in, which one the NEXT chunk of the
+// same job will sit in (the bridge alternates per published chunk), the job the last latched chunk belonged
+// to (a different job id always starts in window A), and whether the bridge speaks the two-window level.
+_pp_win = 0; _pp_win_next = 0; _pp_last_job = -1; _pp_dual = 0;
 _pp_pos = 0;         // cells of the current chunk already copied
 _pp_len = 0; _pp_off = 0; _pp_flags = 0; _pp_kind = -1; _pp_total = 0;
 _pp_dst = -1;        // destination base in local memory, -1 = nothing adopted for this job
@@ -106,6 +147,16 @@ _pp_deferring = 0;   // ... and the FIRST chunk is being left unlatched on purpo
 _pp_landed = 0;
 _pp_fail_until = 0;  // LCD notice "couldn't read that file" (rk_swing_ui_state rung 1e)
 _pp_pl = 0; _pp_ci = 0; _pp_fresh = 0;
+// The preview ring's incoming side (Spec_Swing_Preview_Ring): the job being streamed into the ring, kept apart from
+// the PLAYER's (_prv_job & co, rk_swing_ui_minibrowser) so a new preview can land while the old voice still fades.
+_pp_prv_job = -1;    // the preview job the ring holds (or is receiving); -1 = none; survives the job's finish until superseded
+_pp_prv_base = 0;    // that job's ring base: the ring index of its stream offset 0
+_pp_prv_len = 0;     // frames of it landed so far (absolute in its stream, passes included)
+_pp_prv_eos = 0;     // 1 once its LAST landed
+_pp_prv_sr = 0;      // its source rate
+_pp_prv_total = 0;   // its TOTAL (one pass of the file, cells)
+_pp_whead = 0;       // the ring index just past the last cell written (the next job's base goes 4 096 cells past it)
+_pp_acked = 0;       // this job acked its CMD at FIRST (a ring preview): finish / fail must not touch the bus again
 // Bridge presence + capability for the load gates (2026-09-10, plan Phase B). Decided once
 // per block in swing_padpcm_tick and read by rk_swing_browser_load (CMD 63/64) and the
 // CMD-69 dispatch: 0 = no bridge, 1 = a bridge older than this JSFX, 2 = current. A global
@@ -160,37 +211,102 @@ local(_n, _i, _c, _last, _len)
   _pp_fail_until = time_precise() + 4;
 );
 
+// ── The preview ring's player hand-over (Spec_Swing_Preview_Ring) ─────────────
+// The player takes the job the ring is receiving once nothing is playing (the old voice
+// has finished its release), STOP is not standing, and a chunk has landed. Every block
+// and at LAST, so a one-chunk file starts at its LAST and a long one on its first chunk.
+function swing_padpcm_prv_arm_check()
+(
+  _pp_prv_job >= 0 && _prv_job != _pp_prv_job && !_prv_on && !_prv_stopped && _pp_prv_len > 1 ? (
+    _prv_job = _pp_prv_job; _prv_ring_base = _pp_prv_base; _prv_pos = 0;
+    _prv_len = _pp_prv_len; _prv_eos = _pp_prv_eos;
+    _prv_total_frames = (_pp_prv_total / 2) | 0;
+    _prv_long = _pp_prv_total > FB_PRV_MAX;      // frame 0 leaves the ring: PLAY after the end re-requests
+    _prv_ch = 2; _prv_sr = _pp_prv_sr; _prv_rate = _prv_sr / srate;
+    swing_prv_arm();
+  );
+);
+// PLAY (the browser's button): a voice on restarts from the top as before; nothing on takes
+// the job the ring holds (a STOP before its first chunk, then PLAY), else replays the player's.
+function swing_padpcm_prv_play()
+(
+  _prv_stopped = 0;
+  !_prv_on && _pp_prv_job >= 0 && _prv_job != _pp_prv_job ? swing_padpcm_prv_arm_check() : swing_prv_arm();
+);
+// STOP (or the browser's close) during a LONG stream: nobody will hear the rest, and the
+// bridge holds the decoder's array and the window for it -- DONE = -job tells it to finish
+// quietly (the bus was acked at FIRST, nothing to clear). A short file streams on: it fits
+// the ring and PLAY replays it, as before. The chunk in flight is dropped; a republish of it
+// is refused by the finished-work lock (abs(DONE) == job).
+function swing_padpcm_prv_cancel()
+(
+  _pp_job >= 0 && _pp_kind == PP_KIND_PREVIEW && _pp_total > FB_PRV_MAX ? (
+    gmem[EON_PADPCM_HDR + PP_DONE] = -_pp_job;
+    gmem[EON_PADPCM_HDR + PP_ACKED] = _pp_job;
+    _pp_gen_cur = 0; _pp_deferring = 0;
+    _pp_job = -1; _pp_dst = -1; _pp_prv_job = -1;
+  );
+);
+
 // ── Job setup at FIRST: choose and prepare the destination for this kind. ────
 function swing_padpcm_begin(job)
+local(_stg)
 (
   _pp_defer = 0;
-  _pp_dst = -1; _pp_cap = 0; _pp_cmd = 0; _pp_peak = 0; _pp_base = 0;
+  _pp_dst = -1; _pp_cap = 0; _pp_cmd = 0; _pp_peak = 0; _pp_base = 0; _pp_acked = 0;
   _pp_kind == PP_KIND_PREVIEW ? (
     _pp_job = job;
     // The mini browser's audition buffer: no pad, no undo, no kit state (that is the whole
     // point, as swing_fb_prv_load says). The payload is interleaved stereo whatever the file.
-    swing_prv_kill();
-    _prv_len = 0; _prv_pos = 0;
-    // ⭐ _prv_stopped is NOT cleared here any more. FIRST is when the data
-    // arrives, not when the user asked, and clearing a cancellation on arrival
-    // is what made a STOP before the first chunk vanish. The clear now happens
-    // on the CMD-69 rising edge in swing_padpcm_tick, which is the request.
-    _prv_ch = 2;
-    _prv_sr = gmem[EON_PADPCM_HDR + PP_SR] > 0 ? gmem[EON_PADPCM_HDR + PP_SR] : srate;
-    _prv_rate = _prv_sr / srate;
-    _pp_dst = _prv_buf; _pp_cap = FB_PRV_MAX;
-    _pp_cmd = 69;
+    // ⭐ _prv_stopped is NOT cleared here. FIRST is when the data arrives, not when the user
+    // asked, and clearing a cancellation on arrival is what made a STOP before the first
+    // chunk vanish. The clear happens on the CMD-69 rising edge in swing_padpcm_tick.
+    // THE RING (Spec_Swing_Preview_Ring, 2026-10-14). The buffer is a ring the bridge keeps
+    // topped up as the player consumes, so a file is no longer cut at the buffer's ~11 s.
+    _pp_prv_job == job ? (
+      // a republished FIRST of the SAME job (its echo was late): the setup already ran -- the
+      // base, the voice and the landed count stay; only the destination is restated
+      _pp_dst = _prv_buf; _pp_cap = FB_PRV_MAX; _pp_cmd = 0; _pp_acked = 1;
+    ) :
+    _pp_total > FB_PRV_MAX && _prv_stopped ? (
+      // A LONG file that the audition identity HELD (a STOP / the close landed before this
+      // chunk): declined before a cell lands -- no destination, and the caller's fail path
+      // writes DONE = -job, which the bridge reads as "cancelled", and acks the CMD. A short
+      // file streams on even when held: it fits the ring and PLAY can replay it.
+      _pp_dst = -1;
+    ) : (
+      // The new job's base: 4 096 cells past the last write head when a voice is still on,
+      // so the old voice fades (below) on cells nobody overwrites for a long while, and the
+      // new stream lands ahead of it. Stereo pairs stay aligned. With no voice on, 0.
+      _pp_prv_base = _prv_on ? (_pp_whead + 4096) % FB_PRV_MAX : 0;
+      (_pp_prv_base & 1) ? _pp_prv_base += 1;
+      _pp_prv_base >= FB_PRV_MAX ? _pp_prv_base -= FB_PRV_MAX;
+      // the old voice RELEASES (4 ms) instead of being killed: the one click the memory
+      // still listed ("starting a new preview while one is playing")
+      _prv_on ? swing_prv_release();
+      _pp_prv_job = job; _pp_prv_len = 0; _pp_prv_eos = 0;
+      _pp_prv_sr = gmem[EON_PADPCM_HDR + PP_SR] > 0 ? gmem[EON_PADPCM_HDR + PP_SR] : srate;
+      _pp_prv_total = _pp_total;
+      _pp_dst = _prv_buf; _pp_cap = FB_PRV_MAX;
+      // EARLY ACK: the bus is released HERE, not at LAST. The stream continues on the GEN /
+      // ECHO handshake alone, so a 2-minute audition never blocks a pad load, a kit action or
+      // the next click. finish / fail see _pp_acked and leave the bus alone (another command
+      // may own it by then).
+      (gmem[KIT_GMEM_CMD] | 0) == 69 ? gmem[KIT_GMEM_CMD] = 0;
+      gmem[EON_PADPCM_HDR + PP_ACKED] = job;
+      _pp_cmd = 0; _pp_acked = 1;
+    );
   ) :
   (_pp_kind == PP_KIND_DROP || _pp_kind == PP_KIND_LAYER) ? (
     kit_busy ? (
       // A kit import owns the pad bank (the same gate the file path used). Leave the
-      // chunk unlatched; the bridge republishes it until we are free (~10 s of tries).
+      // chunk unlatched; the bridge waits on it until we are free (~10 s of deadlines).
       _pp_defer = 1;
     ) : (
       _pp_job = job;
       _pp_pad = gmem[EON_PADPCM_HDR + PP_PAD] | 0;
       _pp_layer = _pp_kind == PP_KIND_DROP ? -1 : (gmem[EON_PADPCM_HDR + PP_LAYER] | 0);
-      _pp_base = _pp_layer < 0 ? 0 : _pp_layer * LAYER_SIZE;   // barrier coords are slot-relative
+      _pp_base = _pp_layer < 0 ? 0 : _pp_layer * LAYER_SIZE;   // barrier coords are VIRTUAL-slot cells (the undo backup's layout: layer l at l * LAYER_SIZE); rk_swing_alloc maps them onto the regions
       // ⚠️ The layer bound needs BOTH ends. It was `_pp_layer < MAX_LAYERS`
       // alone, and the line directly above turns ANY negative into the main pad
       // (`_pp_layer < 0 ? 0`) -- not only the -1 that means "this is a pad
@@ -201,9 +317,38 @@ function swing_padpcm_begin(job)
       // of a pad the user never touched. DROP is spelled out rather than left
       // implicit: it is assigned -1 two lines up, and if that ever changes this
       // guard should fail loudly instead of quietly widening.
-      _pp_pad >= 0 && _pp_pad < NUM_PADS &&
+      _pp_pad >= 0 && _pp_pad < NUM_SLOTS &&   // an absolute pad (step 4a)
       (_pp_kind == PP_KIND_DROP ? _pp_layer == -1
                                 : (_pp_layer >= 0 && _pp_layer < MAX_LAYERS)) ? (
+        // THE STAGED DROP (2026-10-15; the user: "its like the pad goes blank then the sample loads"). A pad
+        // drop with room above the allocator's top streams into a fresh staging region while the pad keeps its
+        // old sample -- name, waveform, sound -- and the loader's finish switches it over in one block
+        // (swing_ldr_stage_commit). Here: the path, the sliced undo capture of the OLD pad (its regions stay
+        // live and untouched until the commit), the job. No voice kill and no clear_pad here any more: both
+        // happen at the switch. No room above the top: the in-place load below, as before.
+        _stg = _pp_kind == PP_KIND_DROP ? swing_alloc_take_stage(_pp_total) : -1;
+        _stg >= 0 ? (
+          swing_padpcm_read_path();
+          _udo_cap_lazy_req = 1;
+          undo_begin_pad(_pp_pad);
+          _udo_cap_lazy_req = 0;
+          swing_ldr_begin_gmem_staged(ldr_job0, _pp_pad, #_browser_path,
+                                      gmem[EON_PADPCM_HDR + PP_SR], _pp_total, _stg, _al_stg_sz);
+          _bl_job_pending = 1;
+          _bl_job_cmd = 63;
+          _bl_job_pad = _pp_pad; _bl_job_layer = -1;
+          _pp_dst = ldr_job0[LDR_F_BUF]; _pp_cap = ldr_job0[LDR_F_CAP];
+        ) :
+        // Step 2a (Spec_Swing_Pad_Banks §5.4): does it fit? Asked BEFORE the pad is cleared,
+        // so a refusal leaves the pad exactly as it was; _pp_dst stays -1 and the tick fails
+        // the job (the CMD is acked, the bridge echoed). The LCD says "instrument full".
+        // _pp_total is the interleaved cell count the bridge will deliver.
+        !swing_pad_can_fit(_pp_pad, _pp_layer, _pp_total) ? (
+          // Room after packing (the check filed the request): decline exactly as kit_busy does
+          // -- no job latched, the FIRST chunk left unlatched, the bridge waits on it and the
+          // compaction tick runs meanwhile. No room at all: refuse.
+          alc_wait ? ( _pp_job = -1; _pp_defer = 1; ) : ( swing_alloc_refuse_note(_pp_pad); );
+        ) : (
         swing_padpcm_read_path();
         // Kill the pad's voices + 10 ms crossfade -- the start half of
         // swing_browser_load_pad (rk_drumkit_dsp has the rationale).
@@ -232,8 +377,9 @@ function swing_padpcm_begin(job)
         _bl_job_cmd = _pp_kind == PP_KIND_DROP ? 63 : 64;
         _bl_job_pad = _pp_pad; _bl_job_layer = _pp_layer;
         _pp_dst = ldr_job0[LDR_F_BUF]; _pp_cap = ldr_job0[LDR_F_CAP];
+        );   // fits
       );
-      // an invalid target keeps _pp_dst = -1: the tick fails the job (acks the CMD)
+      // an invalid target (or a refusal above) keeps _pp_dst = -1: the tick fails the job (acks the CMD)
     );
   ) : (
     _pp_job = job;   // a kind this build does not adopt: failed below, CMD acked
@@ -244,11 +390,13 @@ function swing_padpcm_begin(job)
 function swing_padpcm_finish()
 (
   _pp_kind == PP_KIND_PREVIEW ? (
-    _prv_len = (_pp_total / 2) | 0;          // frames of interleaved stereo
-    _prv_len > _pp_cap / 2 ? _prv_len = (_pp_cap / 2) | 0;
-    // audition means "let me hear it": a one-chunk file starts here; a longer one is
-    // already playing progressively and just learns its final length
-    !_prv_on && !_prv_stopped ? swing_prv_arm();   // not after a STOP (D-7); arm() owns the envelope
+    // The stream's END: what landed is the length (absolute frames, passes included -- a
+    // long LOOP repeats through the bridge, so this can exceed the file). The player on
+    // this job learns it is complete; a one-chunk file starts here (the arm check).
+    _pp_prv_len = ((_pp_off + _pp_len) / 2) | 0;
+    _pp_prv_eos = 1;
+    _prv_job == _pp_prv_job ? ( _prv_len = _pp_prv_len; _prv_eos = 1; );
+    swing_padpcm_prv_arm_check();
   );
   (_pp_kind == PP_KIND_DROP || _pp_kind == PP_KIND_LAYER) && _pp_dst >= 0 ? (
     // Hand the loader job to phase 2 with what landed. From here the resume half in
@@ -263,6 +411,9 @@ function swing_padpcm_finish()
   );
   gmem[EON_PADPCM_HDR + PP_DONE] = _pp_job;
   _pp_cmd > 0 && (gmem[KIT_GMEM_CMD] | 0) == _pp_cmd ? gmem[KIT_GMEM_CMD] = 0;
+  // a ring preview acked at FIRST (_pp_cmd is 0 then) and names itself again here: the bridge's
+  // post-LAST wait matches ACKED == job, and the bus may already carry the next command
+  (_pp_cmd > 0 || _pp_acked) ? gmem[EON_PADPCM_HDR + PP_ACKED] = _pp_job;   // a drop acks in its completion half
   _pp_job = -1; _pp_dst = -1;
 );
 
@@ -273,7 +424,12 @@ function swing_padpcm_fail(job)
 local(_cmd)
 (
   _cmd = _pp_kind == PP_KIND_PREVIEW ? 69 : _pp_kind == PP_KIND_DROP ? 63 : _pp_kind == PP_KIND_LAYER ? 64 : 0;
-  _pp_kind == PP_KIND_PREVIEW ? swing_prv_kill();
+  // a preview RELEASES (4 ms), never cuts: an ABORT mid-stream is the bridge superseding it
+  // with a newer request, and the voice fades on cells the new stream lands ahead of
+  _pp_kind == PP_KIND_PREVIEW ? (
+    _prv_job == _pp_prv_job ? swing_prv_release();
+    _pp_prv_job == job || _pp_job == job ? _pp_prv_job = -1;   // nothing left to arm from this job
+  );
   (_pp_kind == PP_KIND_DROP || _pp_kind == PP_KIND_LAYER) ? (
     _pp_dst >= 0 && _pp_job == job ? (
       swing_ldr_abort(ldr_job0);
@@ -284,19 +440,28 @@ local(_cmd)
     _pp_kind == PP_KIND_DROP ? gmem[GS_BROWSE_NAME_ADOPT] = 0;
   );
   gmem[EON_PADPCM_HDR + PP_DONE] = -job;
-  _cmd > 0 && (gmem[KIT_GMEM_CMD] | 0) == _cmd ? gmem[KIT_GMEM_CMD] = 0;
+  // a ring preview acked its CMD at FIRST: the 69 on the bus now may be the NEXT request's --
+  // never clear it; ACKED = job still names this job so the bridge's wait matches
+  _cmd > 0 && !_pp_acked && (gmem[KIT_GMEM_CMD] | 0) == _cmd ? gmem[KIT_GMEM_CMD] = 0;
+  gmem[EON_PADPCM_HDR + PP_ACKED] = job;
   _pp_job = -1; _pp_dst = -1;
 );
 
 // ── @block: advertise, latch a published chunk, copy a bounded slice, echo. ──
 function swing_padpcm_tick()
-local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim, _prv_cmd_now)
+local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim, _prv_cmd_now, _ri, _wsel)
 (
   gmem[EON_PADPCM_HDR + PP_JSFX_LEVEL] = EON_PADPCM_LEVEL;
   gmem[EON_PADPCM_HDR + PP_PRV_ON] = _prv_on;
   gmem[EON_PADPCM_HDR + PP_PRV_LEN] = _prv_len;
   gmem[EON_PADPCM_HDR + PP_PRV_LOOP] = fb_prv_loop;
   gmem[EON_PADPCM_HDR + PP_MEM_HEAD] = _mem_head;
+  // the ring's flow control (Spec_Swing_Preview_Ring): where the player reads, in which job, and the ring's size
+  gmem[EON_PADPCM_HDR + PP_PRV_RD] = (_prv_pos | 0) * 2;
+  gmem[EON_PADPCM_HDR + PP_PRV_JOB] = _prv_job;
+  gmem[EON_PADPCM_HDR + PP_PRV_RING] = FB_PRV_MAX;
+  gmem[EON_PADPCM_HDR + PP_PRV_HOLD] = _prv_hold_n;
+  swing_padpcm_prv_arm_check();   // the player takes a landed preview once the old voice has gone
   // Bridge-dead guard: a streamable CMD that a level-204 bridge should turn into a job but
   // never does (it died between posting and streaming) must not wedge the browser queue --
   // the bridge's own stale-CMD watchdog is dead with it. 3 s unadopted -> ack. Not while
@@ -313,8 +478,10 @@ local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim, _prv_cmd_now)
   _bs_v = gmem[KIT_GMEM_BRIDGE_ALIVE];
   _bs_v != _bs_hb_seen ? ( _bs_hb_seen = _bs_v; _bs_hb_t = time_precise(); );
   _bridge_state = (_bs_v == 0 || time_precise() - _bs_hb_t > 5) ? 0 :
-                  (gmem[EON_PADPCM_HDR + PP_BRIDGE_LEVEL] >= EON_PADPCM_LEVEL ? 2 : 1);
+                  (gmem[EON_PADPCM_HDR + PP_BRIDGE_LEVEL] >= EON_PADPCM_LEVEL_MIN ? 2 : 1);
   gmem[EON_PADPCM_HDR + PP_BRIDGE_STATE] = _bridge_state;   // diagnostic: what the gates will see
+  // two windows only when the bridge speaks them; a 204 bridge publishes window A alone and we read it alone
+  _pp_dual = (gmem[EON_PADPCM_HDR + PP_BRIDGE_LEVEL] | 0) >= EON_PADPCM_LEVEL_DUAL;
   _c = gmem[KIT_GMEM_CMD] | 0;
   // ── The audition request edge ────────────────────────────────────────────
   // ⚠️⚠️ _prv_stopped used to be cleared in swing_padpcm_begin -- when the
@@ -332,8 +499,20 @@ local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim, _prv_cmd_now)
   // ⭐ A fresh request after a cancelled one is a NEW edge, because the
   // cancelled job still runs to LAST and acks the CMD on its way out. That is
   // what stops this becoming the latch-it-off non-fix.
+  // ⚠ The edge alone was not enough (the queued audition, 2026-10-14; the user's
+  // design of 2026-09-18): a click with autoload AND audition on queues the pad
+  // load first and the preview second in the bridge, and a browser close during
+  // the pad load posts the STOP -- then the queued preview's CMD 69 arrived as a
+  // "new" edge and cleared it: sound from a window already gone. So every
+  // request carries an IDENTITY the bridge mints when the user asks (the click,
+  // rk_padpcm.mint_audition: PP_AUD_ISSUED = the latest), and writes into
+  // PP_AUD_ID before the CMD. A STOP marks everything issued so far as cancelled
+  // (_prv_cancel_through = PP_AUD_ISSUED at the STOP, Swing_ReaKit @block); the
+  // edge clears the STOP only for a request minted AFTER it. A bridge that has
+  // never minted (PP_AUD_ISSUED 0: older than this) keeps the old rule.
   _prv_cmd_now = (_c == 69) && (gmem[KIT_GMEM_INSTANCE] | 0) == (instance_id | 0);
-  _prv_cmd_now && !_prv_cmd_seen ? _prv_stopped = 0;
+  _prv_job_aud = gmem[EON_PADPCM_HDR + PP_AUD_ID] | 0;
+  _prv_cmd_now && !_prv_cmd_seen && ((gmem[EON_PADPCM_HDR + PP_AUD_ISSUED] | 0) == 0 || _prv_job_aud > _prv_cancel_through) ? _prv_stopped = 0;
   _prv_cmd_seen = _prv_cmd_now;
   (_c == 69 || _c == 63 || _c == 64) && _pp_job < 0 && _pp_gen_cur == 0 && !_pp_deferring &&
   _bridge_state == 2 ? (
@@ -341,19 +520,26 @@ local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim, _prv_cmd_now)
     (time_precise() - _pp_idle_t > 3 ? ( gmem[KIT_GMEM_CMD] = 0; _pp_idle_t = 0; ));
   ) : ( _pp_idle_t = 0; );
   _pp_gen_cur == 0 ? (
-    _gen = gmem[EON_PADPCM_HDR + PP_GEN] | 0;
     _job = gmem[EON_PADPCM_HDR + PP_JOB] | 0;
+    // Which window the next chunk is in: the bridge alternates per published chunk, so the chunk
+    // after the one we last took sits in the OTHER window -- unless the header names a different
+    // job, which always starts in window A. Without the two-window bridge, window A always.
+    _wsel = (_pp_dual && _job == _pp_last_job) ? _pp_win_next : 0;
+    _gen = gmem[EON_PADPCM_HDR + (_wsel ? PP_GEN_B : PP_GEN)] | 0;
     // Second lock behind the seeded _pp_gen_seen: a job whose finish already ran -- by
     // ANY instance, success (DONE = job) or failure (DONE = -job) -- is not a job. The
     // header says so in PP_DONE and nothing read it. Only ever declines finished work,
     // never live work, so it cannot stall a real stream.
-    _gen > 0 && (_gen & 1) == 0 && _gen != _pp_gen_seen &&
+    _gen > 0 && (_gen & 1) == 0 && _gen != (_wsel ? _pp_gen_seen_b : _pp_gen_seen) &&
     abs(gmem[EON_PADPCM_HDR + PP_DONE] | 0) != _job &&
+    // two windows: the window must hold THIS job's chunk, not a leftover of the one before (PP_JOB_A / _B)
+    (!_pp_dual || (gmem[EON_PADPCM_HDR + (_wsel ? PP_JOB_B : PP_JOB_A)] | 0) == _job) &&
     (gmem[EON_PADPCM_HDR + PP_INST] | 0) == (instance_id | 0) ? (
-      _pp_flags = gmem[EON_PADPCM_HDR + PP_FLAGS] | 0;
+      _pp_win = _wsel;
+      _pp_flags = gmem[EON_PADPCM_HDR + (_wsel ? PP_FLAGS_B : PP_FLAGS)] | 0;
       _pp_kind = gmem[EON_PADPCM_HDR + PP_KIND] | 0;
-      _pp_off = gmem[EON_PADPCM_HDR + PP_OFF] | 0;
-      _pp_len = gmem[EON_PADPCM_HDR + PP_LEN] | 0;
+      _pp_off = gmem[EON_PADPCM_HDR + (_wsel ? PP_OFF_B : PP_OFF)] | 0;
+      _pp_len = gmem[EON_PADPCM_HDR + (_wsel ? PP_LEN_B : PP_LEN)] | 0;
       _pp_total = gmem[EON_PADPCM_HDR + PP_TOTAL] | 0;
       _pp_fresh = _job != _pp_job;
       // ⚠️ A chunk that could not have come from rk_padpcm.lua is refused as a FAILED
@@ -369,8 +555,9 @@ local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim, _prv_cmd_now)
         // drops the begun job -- either way the CMD is acked and the chunk echoed
         swing_padpcm_fail(_job);
         _pp_deferring = 0;
-        _pp_gen_seen = _gen;
-        gmem[EON_PADPCM_HDR + PP_ECHO] = _gen;
+        _wsel ? _pp_gen_seen_b = _gen : _pp_gen_seen = _gen;
+        gmem[EON_PADPCM_HDR + (_wsel ? PP_ECHO_B : PP_ECHO)] = _gen;
+        _pp_last_job = _job; _pp_win_next = _pp_dual ? 1 - _wsel : 0;
       ) : (
         (_pp_fresh || (_pp_flags & PP_F_FIRST)) ? swing_padpcm_begin(_job);
         _pp_defer ? (
@@ -378,11 +565,13 @@ local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim, _prv_cmd_now)
         ) : _pp_dst < 0 ? (
           swing_padpcm_fail(_job);       // nothing to copy into: ack and move on
           _pp_deferring = 0;
-          _pp_gen_seen = _gen;
-          gmem[EON_PADPCM_HDR + PP_ECHO] = _gen;
+          _wsel ? _pp_gen_seen_b = _gen : _pp_gen_seen = _gen;
+          gmem[EON_PADPCM_HDR + (_wsel ? PP_ECHO_B : PP_ECHO)] = _gen;
+          _pp_last_job = _job; _pp_win_next = _pp_dual ? 1 - _wsel : 0;
         ) : (
           _pp_deferring = 0;
           _pp_gen_cur = _gen; _pp_pos = 0;
+          _pp_last_job = _job;
         );
       );
     );
@@ -395,11 +584,13 @@ local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim, _prv_cmd_now)
     // period at every size (768 at 64, 3 072 at 256, 12 288 at 1024). A 1 M-cell preview
     // still lands in ~3 s because the bridge's tick per 65 536-cell chunk is the slower
     // side, and the audition starts on the first chunk anyway.
-    // A pad drop is not heard until its completion half runs, so it gets ~3x the budget
-    // (~15 % of the period: a 4 M-cell file lands in ~4 s instead of ~12); a preview is
-    // audible from its first chunk and can afford the slow lane.
+    // A pad drop is not heard until its completion half runs, so it gets the fast lane:
+    // 64 cells per sample of block (~25 % of the period while a load runs, and only then;
+    // 40 until 2026-10-15, when the two-window bridge made this budget the pace of a load
+    // instead of the bridge's tick -- a 10 s file now lands in a third of a second); a
+    // preview is audible from its first chunk and can afford the slow lane.
     _pp_budget = _pp_kind == PP_KIND_PREVIEW ? max(1024, min(samplesblock * 12, 16384))
-                                             : max(2560, min(samplesblock * 40, 40960));
+                                             : max(4096, min(samplesblock * 64, 65536));
     _w = min(_pp_budget, _pp_len - _pp_pos);
     // Sliced-undo barrier (pad jobs only -- a preview writes _prv_buf, never a pad).
     // The cells we are about to overwrite may still be the only copy of the pad's old
@@ -412,16 +603,23 @@ local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim, _prv_cmd_now)
     );
     _w > 0 ? (
       _n = _w;
-      _room = _pp_cap - (_pp_off + _pp_pos);        // never write past the destination
-      _room < _n ? _n = max(_room, 0);
-      _src = EON_PADPCM_WIN + _pp_pos;
+      _pp_kind != PP_KIND_PREVIEW ? (
+        _room = _pp_cap - (_pp_off + _pp_pos);        // never write past the destination
+        _room < _n ? _n = max(_room, 0);
+      );
+      _src = (_pp_win ? EON_PADPCM_WIN_B : EON_PADPCM_WIN) + _pp_pos;
       _i = 0;
       _pp_kind == PP_KIND_PREVIEW ? (
-        // no peak fold for an audition -- nothing reads it, and it doubles the copy cost
+        // THE RING: the destination index wraps at FB_PRV_MAX (one compare per cell, not a
+        // modulo); OFF is the chunk's absolute offset in the stream, which climbs past the
+        // ring's size on a long file. No peak fold for an audition -- nothing reads it.
+        _ri = (_pp_prv_base + _pp_off + _pp_pos) % _pp_cap;
         loop(_n,
-          _pp_dst[_pp_off + _pp_pos + _i] = gmem[_src + _i];
+          _pp_dst[_ri] = gmem[_src + _i];
+          _ri += 1; _ri >= _pp_cap ? _ri = 0;
           _i += 1;
         );
+        _pp_whead = _ri;
       ) : (
         loop(_n,
           _v = gmem[_src + _i];
@@ -440,13 +638,16 @@ local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim, _prv_cmd_now)
       // consumes it, so the player may start on the first chunk and chase a growing
       // _prv_len instead of waiting seconds for a long file. LAST stamps the final length.
       _pp_kind == PP_KIND_PREVIEW && !(_pp_flags & PP_F_LAST) ? (
-        _prv_len = min((_pp_off + _pp_len) / 2, _pp_cap / 2) | 0;
-        !_prv_on && !_prv_stopped ? swing_prv_arm();   // not after a STOP (D-7); arm() owns the envelope
+        // frames landed, absolute in the job's stream (the ring: no cap). The player on this
+        // job learns the new length; the arm check (every block) starts a voice that is not on.
+        _pp_prv_len = ((_pp_off + _pp_len) / 2) | 0;
+        _prv_job == _pp_prv_job ? _prv_len = _pp_prv_len;
       );
       (_pp_flags & PP_F_LAST) ? swing_padpcm_finish();   // finish BEFORE the echo
-      _pp_gen_seen = _pp_gen_cur;
+      _pp_win ? _pp_gen_seen_b = _pp_gen_cur : _pp_gen_seen = _pp_gen_cur;
+      gmem[EON_PADPCM_HDR + (_pp_win ? PP_ECHO_B : PP_ECHO)] = _pp_gen_cur;
       _pp_gen_cur = 0;
-      gmem[EON_PADPCM_HDR + PP_ECHO] = _pp_gen_seen;
+      _pp_win_next = _pp_dual ? 1 - _pp_win : 0;   // the same job's next chunk sits in the other window
     );
   );
 );

@@ -26,6 +26,7 @@ function swing_kitsview_init(_mem) (
   memset(kv_recs, 0, 128 * 56);
   kv_nkits = 0; kv_nfolders = 0; kv_gen_seen = -1;
   kv_scroll = 0; kv_fsel = -1; kv_tfilter = 0; kv_hover = -1;
+  kv_into = 0; kv_press = -1; kv_dragging = 0; kv_menu_i = -1;   // Pad Banks step 4c: the INTO target (0 = whole instrument, 1..4 = bank), the card press / drag, the row menu's row
   _mem;
 );
 
@@ -37,6 +38,7 @@ function swing_kitsview_init(_mem) (
 function swing_kitsview_open() (
   gmem[EON_KITLIST_BASE + 5] += 1;
   kv_scroll = 0; kv_hover = -1;
+  kv_into = 0; kv_press = -1; kv_dragging = 0; kv_menu_i = -1;   // step 4c: a plain open targets the whole instrument (the tab menu sets kv_into after this call)
   swing_bigview_open(VIEW_KITS);
 );
 
@@ -106,7 +108,7 @@ local(_kv_seq0, _kv_seq1, _kv_gen, _kv_i, _kv_j, _kv_b, _kv_x, _kv_y, _kv_w,
       _kv_n, _kv_ly0, _kv_lh, _kv_rows_vis, _kv_ri, _kv_rb, _kv_typ, _kv_cnt,
       _kv_kb, _kv_fold, _kv_ry, _kv_hov_row, _kv_pick, _kv_o, _kv_fb, _kv_fl,
       _kv_chov, _kv_out, _kv_cxb, _kv_cyb, tw, th, _kv_a, _kv_fcnt, _kv_lx,
-      _kv_lw, _kv_sel_ok)
+      _kv_lw, _kv_sel_ok, _kv_banks, _kv_r, _kv_pick_into, _kv_bi, _kv_used, _kv_tot, _kv_my, _kv_bw, _kv_bx)
 (
   // ── modal-gate restore (mandatory big-view contract) ──
   lmb_down = _ov_lmb_down; rmb_down = _ov_rmb_down;
@@ -139,14 +141,15 @@ local(_kv_seq0, _kv_seq1, _kv_gen, _kv_i, _kv_j, _kv_b, _kv_x, _kv_y, _kv_w,
   gfx_set(0.07, 0.09, 0.12, 0.98); gfx_rect(grid_x, grid_y, grid_w, grid_h);
   gfx_set(0.30, 0.55, 0.90, 0.9);  gfx_rect(grid_x, grid_y, grid_w, grid_h, 0);
 
-  gfx_setfont(1, "Arial", swing_fs(13), 'b');
+  rk_font(1, swing_fs(13), 'b');
   gfx_set(0.85, 0.90, 0.96, 1);
-  gfx_x = grid_x + 10; gfx_y = grid_y + 4; gfx_drawstr("LOAD KIT");
+  gfx_x = grid_x + 10; gfx_y = grid_y + 4;
+  kv_into > 0 ? ( sprintf(#kv_title, "LOAD KIT INTO BANK %c", 64 + kv_into); gfx_drawstr(#kv_title); ) : gfx_drawstr("LOAD KIT");   // step 4c
 
   // X (canonical rect + close at the bottom of this fn)
   _kv_cxb = grid_x + grid_w - 20; _kv_cyb = grid_y + 3;
   _kv_chov = mx >= _kv_cxb - 3 && mx <= _kv_cxb + 17 && my >= _kv_cyb - 2 && my <= _kv_cyb + 15;
-  gfx_setfont(1, "Arial", swing_fs(13), 'b');
+  rk_font(1, swing_fs(13), 'b');
   gfx_set(1, 1, 1, _kv_chov ? 0.95 : 0.55);
   gfx_x = _kv_cxb + 3; gfx_y = _kv_cyb; gfx_drawstr("X");
 
@@ -162,7 +165,7 @@ local(_kv_seq0, _kv_seq1, _kv_gen, _kv_i, _kv_j, _kv_b, _kv_x, _kv_y, _kv_w,
     _kv_i == 1 ? gfx_set(0.40, 0.65, 1.00, kv_tfilter == 1 ? 1 : 0.75) :
     _kv_i == 2 ? gfx_set(0.35, 0.85, 0.50, kv_tfilter == 2 ? 1 : 0.75) :
                  gfx_set(0.95, 0.70, 0.25, kv_tfilter == 3 ? 1 : 0.75);
-    gfx_setfont(1, "Arial", swing_fs(9), 'b');
+    rk_font(1, swing_fs(9), 'b');
     strcpy(#kv_tag, _kv_i == 0 ? "ALL" : _kv_i == 1 ? "SMP" : _kv_i == 2 ? "SYN" : "HYB");
     gfx_measurestr(#kv_tag, tw, th);
     gfx_x = _kv_px + (_kv_pw - 4 - tw) / 2; gfx_y = _kv_y + (16 - th) / 2; gfx_drawstr(#kv_tag);
@@ -180,7 +183,7 @@ local(_kv_seq0, _kv_seq1, _kv_gen, _kv_i, _kv_j, _kv_b, _kv_x, _kv_y, _kv_w,
 
   // ── folder column ──
   _kv_fx = grid_x + 10; _kv_fy = grid_y + 50; _kv_fw = 118; _kv_row_h = 18;
-  gfx_setfont(1, "Arial", swing_fs(10), 'b');
+  rk_font(1, swing_fs(10), 'b');
   _kv_i = -1;   // -1 = "All kits" row, then folder 0..kv_nfolders-1
   loop(kv_nfolders + 1,
     _kv_ry = _kv_fy + (_kv_i + 1) * _kv_row_h;
@@ -236,8 +239,8 @@ local(_kv_seq0, _kv_seq1, _kv_gen, _kv_i, _kv_j, _kv_b, _kv_x, _kv_y, _kv_w,
   kv_scroll = max(0, min(kv_scroll, max(0, _kv_n - _kv_rows_vis)));
 
   kv_hover = -1;
-  _kv_pick = -1;
-  gfx_setfont(1, "Arial", swing_fs(10), 'b');
+  _kv_pick = -1; _kv_pick_into = kv_into;
+  rk_font(1, swing_fs(10), 'b');
   _kv_ri = 0;
   loop(min(_kv_rows_vis, _kv_n),
     _kv_i  = kv_view[kv_scroll + _kv_ri] | 0;
@@ -256,7 +259,20 @@ local(_kv_seq0, _kv_seq1, _kv_gen, _kv_i, _kv_j, _kv_b, _kv_x, _kv_y, _kv_w,
     _kv_typ == 3 ? gfx_set(0.95, 0.70, 0.25, 0.9) : gfx_set(0.50, 0.52, 0.56, 0.9);
     gfx_measurestr(#kv_tag, tw, th);
     gfx_x = _kv_lx + _kv_lw - tw - 6; gfx_y = _kv_ry + 3; gfx_drawstr(#kv_tag);
-    _kv_hovp && lmb_down ? _kv_pick = _kv_i;
+    // step 4c: the PRESS arms a click-or-drag (the pick is on the release, below); the right-click opens the
+    // row menu; a multi-bank kit shows its bank count before the type tag
+    _kv_hovp && lmb_down ? ( kv_press = _kv_i; kv_press_x = mx; kv_press_y = my; kv_dragging = 0; );
+    _kv_hovp && rmb_down ? (
+      kv_menu_i = _kv_i;
+      sprintf(#kv_menu, "#%s|Load (all banks)|Load into bank A|Load into bank B|Load into bank C|Load into bank D", #kv_nm);
+      swing_popup_open(mx, my, #kv_menu, SP_POPUP_CALLER_KV_ROW);
+    );
+    _kv_banks = kv_recs[_kv_rb + 45] | 0;
+    _kv_banks > 1 ? (
+      sprintf(#kv_tag, "%d banks", _kv_banks);
+      gfx_set(0.62, 0.70, 0.80, 0.85); gfx_measurestr(#kv_tag, tw, th);
+      gfx_x = _kv_lx + _kv_lw - tw - 40; gfx_y = _kv_ry + 3; gfx_drawstr(#kv_tag);
+    );
     _kv_ri += 1;
   );
   // scrollbar
@@ -268,7 +284,7 @@ local(_kv_seq0, _kv_seq1, _kv_gen, _kv_i, _kv_j, _kv_b, _kv_x, _kv_y, _kv_w,
   );
   // empty / offline states
   _kv_n == 0 ? (
-    gfx_setfont(1, "Arial", swing_fs(10), 0);
+    rk_font(1, swing_fs(10), 0);
     gfx_set(0.55, 0.60, 0.66, 0.8);
     gfx_x = _kv_lx + 6; gfx_y = _kv_ly0 + 8;
     gmem[KIT_GMEM_BRIDGE_ALIVE] > 0
@@ -276,8 +292,31 @@ local(_kv_seq0, _kv_seq1, _kv_gen, _kv_i, _kv_j, _kv_b, _kv_x, _kv_y, _kv_w,
       : gfx_drawstr("Bridge offline — kit list unavailable");
   );
 
+  // ── MEMORY: what each bank holds (Pad Banks step 4c; spec 8.1 "the per-bank bars live in the Kits view").
+  // Under the folder column, only when the folders leave the room. The bar is the bank's share of what the
+  // instrument holds plus what is free -- four bars that add up to the strip's free figure.
+  _kv_tot = swing_mem_free_secs();
+  _kv_bi = 0; loop(NUM_BANKS, _kv_tot += swing_bank_used_secs(_kv_bi); _kv_bi += 1; );
+  _kv_my = grid_y + grid_h - 22 - NUM_BANKS * 15 - 18;
+  _kv_my > _kv_fy + (kv_nfolders + 1) * _kv_row_h + 8 ? (
+    rk_font(1, swing_fs(9), 'b'); gfx_set(0.55, 0.62, 0.70, 0.9);
+    gfx_x = _kv_fx; gfx_y = _kv_my; gfx_drawstr("MEMORY");
+    _kv_bi = 0; loop(NUM_BANKS,
+      _kv_used = swing_bank_used_secs(_kv_bi);
+      _kv_bx = _kv_fx; _kv_bw = _kv_fw;
+      rk_font(1, swing_fs(9), swing_fs(9) >= 10 ? 'b' : 0);   // "A 1:25": bold from 10 px (wiki 4.7)
+      _kv_bi == bank_cur ? gfx_set(0.92, 0.95, 1, 1) : gfx_set(0.55, 0.62, 0.70, 0.9);
+      sprintf(#kv_tag, "%c %d:%02d", 65 + _kv_bi, (_kv_used / 60) | 0, (_kv_used - 60 * ((_kv_used / 60) | 0)) | 0);
+      gfx_x = _kv_bx; gfx_y = _kv_my + 16 + _kv_bi * 15; gfx_drawstr(#kv_tag);
+      gfx_set(0.11, 0.14, 0.19, 1); gfx_rect(_kv_bx + 52, _kv_my + 19 + _kv_bi * 15, _kv_bw - 52, 7);
+      _kv_bi == bank_cur ? gfx_set(0.30, 0.55, 0.90, 0.95) : gfx_set(0.35, 0.45, 0.60, 0.9);
+      _kv_tot > 0 && _kv_used > 0 ? gfx_rect(_kv_bx + 52, _kv_my + 19 + _kv_bi * 15, max(1, ((_kv_bw - 52) * _kv_used / _kv_tot) | 0), 7);
+      _kv_bi += 1;
+    );
+  );
+
   // ── footer: hover detail ──
-  gfx_setfont(1, "Arial", swing_fs(9), 0);
+  rk_font(1, swing_fs(9), 0);
   gfx_set(0.55, 0.62, 0.70, 0.9);
   gfx_x = grid_x + 10; gfx_y = grid_y + grid_h - 16;
   kv_hover >= 0 ? (
@@ -293,19 +332,59 @@ local(_kv_seq0, _kv_seq1, _kv_gen, _kv_i, _kv_j, _kv_b, _kv_x, _kv_y, _kv_w,
     _kv_kb >= 1024 ? sprintf(#kv_info, "%s  ·  %s  ·  %d pads  ·  %.1f MB  ·  %s", #kv_nm, #kv_tag, _kv_cnt, _kv_kb / 1024, #kv_fold)
                    : sprintf(#kv_info, "%s  ·  %s  ·  %d pads  ·  %d KB  ·  %s", #kv_nm, #kv_tag, _kv_cnt, _kv_kb, #kv_fold);
     gfx_drawstr(#kv_info);
+    _kv_banks = kv_recs[_kv_rb + 45] | 0;
+    _kv_banks > 1 ? ( sprintf(#kv_tag, "  ·  %d banks", _kv_banks); gfx_drawstr(#kv_tag); );
   ) : (
-    gfx_drawstr("Click a kit to load it  ·  wheel scrolls  ·  folders = Data/Swing_Kits subfolders");
+    kv_into > 0 ? (
+      sprintf(#kv_info, "Click a kit: its bank A lands in bank %c, the other banks stay  ·  right-click a kit for the menu  ·  wheel scrolls", 64 + kv_into);
+      gfx_drawstr(#kv_info);
+    ) : gfx_drawstr("Click a kit to load it (all its banks)  ·  right-click or drag onto a bank tab to load into ONE bank  ·  wheel scrolls");
   );
 
   // ── pick → shared emitter (reads the PUBLISHED band, not the snapshot;
   // GEN guard: a click on a just-republished roster is dropped — the next
   // frame's recopy re-syncs the rows the user is looking at) ──
+  // ── the press resolves on the RELEASE (step 4c): a press that travelled more than 6 px is a DRAG of the card;
+  // while it lasts the bank strip (drawn after this view) frames the tab under the cursor (banktabs_drop_hl) and
+  // a ghost of the name rides the cursor; a release on a tab loads the kit's bank A into that bank, a release
+  // anywhere else drops it. A press that did not travel is the click: the kit loads with the view's INTO target. ──
+  kv_press >= 0 ? (
+    LMB ? (
+      !kv_dragging && (abs(mx - kv_press_x) > 6 || abs(my - kv_press_y) > 6) ? kv_dragging = 1;
+      kv_dragging ? (
+        banktabs_drop_hl = swing_banktabs_hit(mx, my);
+        _kv_str(#kv_nm, kv_recs + kv_press * 56 + 1, kv_recs[kv_press * 56] | 0);
+        rk_font(1, swing_fs(10), 'b'); gfx_measurestr(#kv_nm, tw, th);
+        gfx_set(0.10, 0.18, 0.28, 0.95); gfx_rect(mx + 14, my + 10, tw + 12, th + 6);
+        gfx_set(0.30, 0.55, 0.90, 0.9);  gfx_rect(mx + 14, my + 10, tw + 12, th + 6, 0);
+        gfx_set(0.92, 0.95, 1, 1); gfx_x = mx + 20; gfx_y = my + 13; gfx_drawstr(#kv_nm);
+      );
+    ) : (
+      kv_dragging ? (
+        banktabs_drop_hl >= 0 ? ( _kv_pick = kv_press; _kv_pick_into = banktabs_drop_hl + 1; );
+      ) : (
+        kv_hover == kv_press ? ( _kv_pick = kv_press; _kv_pick_into = kv_into; );
+      );
+      kv_press = -1; kv_dragging = 0; banktabs_drop_hl = -1;
+    );
+  );
+  // the row menu's pick (rows: 1 header, 2 all banks, 3..6 into A..D)
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_KV_ROW ? (
+    _kv_r = swing_popup_result; swing_popup_result = 0;
+    _kv_r >= 2 && _kv_r <= 6 && kv_menu_i >= 0 ? ( _kv_pick = kv_menu_i; _kv_pick_into = _kv_r - 2; );
+    kv_menu_i = -1;
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_KV_ROW ? ( swing_popup_result = 0; kv_menu_i = -1; );
+
   _kv_pick >= 0 ? (
     (gmem[EON_KITLIST_BASE + 1] | 0) == kv_gen_seen ? (
+      gmem[GS_KIT_LOAD_INTO] = _kv_pick_into;   // step 4c: before CMD 24 (the emitter posts it last); the bridge consumes it with the request
       swing_kitsview_emit_pick(_kv_pick) ? (
         swing_bigview_close();
         active_id = -1;
+        kv_into = 0;
       ) : (
+        gmem[GS_KIT_LOAD_INTO] = 0;
         gmem[KIT_GMEM_BRIDGE_ALIVE] <= 0 ? kit_bridge_warn = 1;
       );
     );
@@ -316,6 +395,7 @@ local(_kv_seq0, _kv_seq1, _kv_gen, _kv_i, _kv_j, _kv_b, _kv_x, _kv_y, _kv_w,
   lmb_down && (_kv_chov || (_kv_out && active_id == -1)) ? (
     swing_bigview_close();
     active_id = -1;
+    kv_into = 0; kv_press = -1; kv_dragging = 0; banktabs_drop_hl = -1;   // step 4c
   );
 
   // ── mandatory re-zero: nothing after the dispatch may see live input ──

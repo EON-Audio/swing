@@ -30,10 +30,11 @@ local M = {}
 -- worst case it behaves exactly as before A1. The values below were verified
 -- against the shipped Swing JSFX, so the fallbacks match what core.GMEM holds.
 local _SSR_DIR = debug.getinfo(1, 'S').source:match('^@?(.*[\\/])') or ''
-local G
+local G, CORE
 do
   local ok, mod = pcall(dofile, _SSR_DIR .. '../../../rk_lua_core.lua')
   if ok and type(mod) == 'table' and type(mod.GMEM) == 'table' then G = mod.GMEM end
+  if ok and type(mod) == 'table' and type(mod.is_swing_fx) == 'function' then CORE = mod end
 end
 
 -- Slot bases: prefer core.GMEM, fall back to verified literals.
@@ -62,14 +63,10 @@ local KIT_META_PITCH    = 10
 -- i.e. it already folds in auto-color-by-drumtype AND manual overrides, so a
 -- pure read here gives the SAME color the pad face shows (edge case #6).
 local KIT_META_COLOR    = 12
--- Per-pad note range (piano view, Phase 2 dependency). Offsets +14/+15/+16 are
--- currently FREE in the 80-slot block — the shipped Swing build never writes
--- them, so they read 0 and GetPadRange returns nil (callers fall back to their
--- lane_info range). When Swing publishes p_note_lo/p_note_hi these light up
--- automatically with no DM change. +16 (key-track) is reserved, not yet used.
-local KIT_META_NOTE_LO  = 14
-local KIT_META_NOTE_HI  = 15
-local KIT_META_KEYTRACK = 16
+-- Per-pad note range (piano view): Swing publishes NONE. Offsets +14 / +15 / +16 of the 80-cell block are NOT
+-- free -- the kit-export dump writes p_oneshot, p_reverse and fx_hpf_freq there (rk_swing_ui_state.jsfx-inc,
+-- `gmem[_mb + 14] = p_oneshot[_ka]` ...), so reading them as a range showed a pad as 0..1 after an export
+-- (triage 2026-10-14 item 13; fixed 2026-10-16: GetPadRange answers nil and the callers' lane_info range stands).
 
 -- ── Per-instance identity (multi-Swing) ────────────────────────────────────
 -- Registry: every live Swing claims a slot and heartbeats it each @block
@@ -154,15 +151,14 @@ end
 
 -- ── Instance → registry-slot resolution ────────────────────────────────────
 
--- Same Swing-FX matching the bridge ships (is_swing_fx), so every EON tool
--- agrees on what counts as a Swing instance.
+-- Same Swing-FX matching the bridge ships (core.is_swing_fx: the plugin's FILE,
+-- never its shown name), so every EON tool agrees on what counts as a Swing
+-- instance. The fallback (core failed to load) is the same rule, written out.
 function M.IsSwingFX(tr, fx)
-  local _, fname = reaper.TrackFX_GetFXName(tr, fx, '')
+  if CORE then return CORE.is_swing_fx(tr, fx) end
   local ok, ident = reaper.TrackFX_GetNamedConfigParm(tr, fx, 'fx_ident')
-  if ok and ident and ident:find('DrumKit_ReaKit') then return true end
-  if fname and fname:find('DrumKit_ReaKit') then return true end
-  if fname and (fname:match('^JS: Swing') or fname:match('Swing %— 16%-Pad')) then return true end
-  return false
+  local f = ok and ((ident or ''):match('[^/\\]+$') or ''):lower() or ''
+  return f == 'swing_reakit.jsfx' or f == 'swing_lite.jsfx' or f == 'drumkit_reakit.jsfx'
 end
 
 -- instance_id lives on hidden slider4 ("Instance ID (internal)"). Swing's
@@ -194,6 +190,36 @@ end
 function M.SlotKitHash(slot)
   if not attached or not slot then return 0 end
   return reaper.gmem_read(REG_BASE + slot * REG_STRIDE + REG_OFF_KIT_HASH) or 0
+end
+
+-- Pad Banks step 5a: the pad bank the instance shows (0..3). The per-instance bands carry THAT bank, so
+-- Drum Matrix -- whose lanes are bank A's -- pauses while it is not 0, and its builds refuse. 0 when the
+-- cell is unknown (an older Swing never writes it: bank A, as before).
+local BANK_CUR_BASE = (G and G.GS_INST_BANK_CUR) or 26090352
+function M.SlotBankCur(slot)
+  if not attached or not slot then return 0 end
+  return math.floor(reaper.gmem_read(BANK_CUR_BASE + slot) or 0)
+end
+
+-- Pad Banks audit S13: the bank the LEGACY shared block carries. Only the browser-target Swing (gmem INSTANCE)
+-- publishes that block, and it publishes the bank it shows; lanes built before the guid was stamped read it, so
+-- they pause on it too. A target that does not resolve counts any live Swing showing bank B..D (fail safe: a
+-- paused sync keeps its digest and moves nothing).
+local KIT_GMEM_INSTANCE = (G and G.INSTANCE) or 98
+function M.SharedBankCur()
+  if not attached then return 0 end
+  local slot = M.ResolveSlot(math.floor(reaper.gmem_read(KIT_GMEM_INSTANCE) or 0))
+  if slot then return M.SlotBankCur(slot) end
+  local now = reaper.time_precise()
+  for s = 0, REG_MAX - 1 do
+    local base = REG_BASE + s * REG_STRIDE
+    if math.floor(reaper.gmem_read(base + REG_OFF_ID) or 0) > 0
+       and (now - (reaper.gmem_read(base + REG_OFF_HB) or 0)) <= REG_TIMEOUT
+       and M.SlotBankCur(s) ~= 0 then
+      return M.SlotBankCur(s)
+    end
+  end
+  return 0
 end
 
 function M.SlotPadCount(slot)
@@ -356,26 +382,13 @@ function M.GetPadPitch(pad_idx, slot)
   return pitch
 end
 
--- Live per-pad note range for a 1-based pad. Returns lo, hi, key_track when
--- Swing has published a real range (META +14/+15); returns nil when the range
--- is UNPUBLISHED (both offsets read 0 — the current Swing build) so callers
--- fall back to their own lane_info range. The per-instance IDENT band carries
--- no range fields yet, so a slot-routed call returns nil (lane_info fallback)
--- until Swing publishes one. key_track (+16) is reserved; not consumed by
--- piano view v1.
+-- Live per-pad note range for a 1-based pad: nil. Swing has no per-pad note range (a pad answers one note,
+-- p_note), and the META cells this used to read (+14 / +15 / +16) carry one-shot, reverse and the HPF after a
+-- kit export -- a 0..1 "range" on older lanes (triage 2026-10-14 item 13). Kept as a function so every caller's
+-- `swing_state.GetPadRange and ...` guard stays true and falls through to its lane_info range; if Swing ever
+-- publishes a range, it goes through the per-instance IDENT band with a field of its own, not these cells.
 function M.GetPadRange(pad_idx, slot)
-  if not attached or pad_idx < 1 or pad_idx > 16 then return nil end
-  if slot ~= nil then return nil end
-  local base = block_base() + (pad_idx - 1) * KIT_META_STRIDE
-  local lo = math.floor((reaper.gmem_read(base + KIT_META_NOTE_LO) or 0) + 0.5)
-  local hi = math.floor((reaper.gmem_read(base + KIT_META_NOTE_HI) or 0) + 0.5)
-  -- Unpublished (both zero), out of MIDI range, or inverted → treat as no
-  -- published range so the lane_info fallback (or drum default) takes over.
-  if (lo == 0 and hi == 0) or lo < 0 or lo > 127 or hi < 0 or hi > 127 or hi < lo then
-    return nil
-  end
-  local kt = math.floor((reaper.gmem_read(base + KIT_META_KEYTRACK) or 0) + 0.5)
-  return lo, hi, kt
+  return nil
 end
 
 -- True when a 1-based pad has NO sample loaded.

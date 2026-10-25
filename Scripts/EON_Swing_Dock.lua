@@ -73,6 +73,7 @@ local scan_cool = 0             -- throttle for the project-wide fallback scan
 -- 2026-08-25 attempt parked it under the main window) leaves the canvas
 -- painting glued over REAPER with an empty float beside it.
 local canvas_dx, canvas_dy, canvas_w0, canvas_h0
+local canvas_parent                  -- the canvas's own parent inside the float (REAPER's plugin container)
 
 -- ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -83,14 +84,15 @@ end
 -- FX identity via the JSFX file ident, not the display name: rename-proof
 -- (an instance the user renamed "808" keeps being followed) and
 -- collision-proof (a bus FX whose display name merely mentions the word
--- can never be mistaken for the sampler). Falls back to the display-name
--- substring on REAPER builds without fx_ident.
+-- can never be mistaken for the sampler). The file's basename is compared
+-- WHOLE (rk_lua_core's core.is_swing_fx rule; this script loads nothing):
+-- a substring also took "my_swing_reakit.jsfx.bak"-style copies. Falls back
+-- to the display-name substring on REAPER builds without fx_ident.
 local function is_swing_fx(tr, i)
   local ok, ident = reaper.TrackFX_GetNamedConfigParm(tr, i, "fx_ident")
   if ok and ident and ident ~= "" then
-    ident = ident:lower():gsub("\\", "/")
-    return ident:find("swing_reakit.jsfx", 1, true) ~= nil
-        or ident:find("swing_lite.jsfx", 1, true) ~= nil
+    local f = (ident:match("[^/\\]+$") or ""):lower()
+    return f == "swing_reakit.jsfx" or f == "swing_lite.jsfx" or f == "drumkit_reakit.jsfx"
   end
   local ok2, name = reaper.TrackFX_GetFXName(tr, i, "")
   return (ok2 and name and name:lower():find(FX_MATCH, 1, true)) and true or false
@@ -147,12 +149,30 @@ local function find_canvas(float_hwnd)
   return nil
 end
 
--- Put the canvas back inside the wrapper at its captured home geometry.
+-- Put the canvas back inside the wrapper at its captured home geometry: INSIDE the float's plugin container (the
+-- "#32770" child REAPER lays out), the parent it came from. Handed to the float's top window instead, the canvas sat
+-- beside that container and the float's background wipe on every resize step painted its whole face bare until the
+-- plugin's next frame (the ReaKit FX dock, 2026-10-05: filmed on the user's screen; its handoff
+-- Resize_No_Picture_Swing_Control_2026-10-05.md). That parent when it still lives in this float, else this float's own
+-- container (REAPER rebuilt the float), else the float.
 -- Returns true only when the canvas genuinely landed back in REAPER's tree.
+local function container_of(float_hwnd)
+  local ok, list = reaper.JS_Window_ListAllChild(float_hwnd)
+  if not ok or not list or list == "" then return nil end
+  for addr in list:gmatch("[^,]+") do
+    local a = tonumber(addr)
+    local h = a and reaper.JS_Window_HandleFromAddress(a)
+    if h and reaper.JS_Window_GetParent(h) == float_hwnd and reaper.JS_Window_GetClassName(h) == "#32770" then return h end
+  end
+  return nil
+end
 local function restore_canvas_to_wrapper()
   if not (canvas and wrapper and reaper.JS_Window_IsWindow(canvas)
           and reaper.JS_Window_IsWindow(wrapper)) then return false end
-  reaper.JS_Window_SetParent(canvas, wrapper)
+  local target = (canvas_parent and reaper.JS_Window_IsWindow(canvas_parent)
+                  and reaper.JS_Window_IsChild(wrapper, canvas_parent)) and canvas_parent
+                 or container_of(wrapper) or wrapper
+  reaper.JS_Window_SetParent(canvas, target)
   if canvas_dx then
     reaper.JS_Window_Move(canvas, canvas_dx, canvas_dy)
     reaper.JS_Window_Resize(canvas, canvas_w0, canvas_h0)
@@ -194,6 +214,18 @@ local GS_RIG_ALIVE_SWING = 2633
 -- so a bump posted while no pane was running can't fire on a fresh launch.
 local POP_REQ        = 2627
 local pop_base       = nil
+-- THE DOCKED KEYBOARD (2026-10-15; the user: "when swing is docked and the mini browser is open the keyboard
+-- dont work in the mini browser"). A plugin gets its keys through its FX window, and this script moves the
+-- canvas out of it, so a docked Swing saw no keys. Swing's mini browser says, per instance, when it holds the
+-- keyboard (its browser band, FB_DOCK_KEYS: 2 = list, 3 = typing in the filter box; only the instance this script
+-- captured ever says so -- slider42 under the heartbeat). While one does, the keyboard focus sits on THIS window
+-- (gfx.getchar() then sees the keys) and every key is queued into that slot's ring, which the browser takes one per
+-- frame. Space in list mode also goes on to REAPER (posted to the main window, so the user's own binding runs:
+-- transport keeps working); in the filter box it is a character. When no browser holds the keyboard, focus goes
+-- back to the canvas if this script took it. MUST match rk_swing_ui_minibrowser.jsfx-inc FB_DOCK_*.
+local SWB_BASE, SWB_STRIDE, SWB_SLOTS = 26607616, 4096, 16
+local FB_DOCK_KEYS, FB_DOCK_KW, FB_DOCK_KR, FB_DOCK_KRING, FB_DOCK_KRING_N = 47, 48, 49, 50, 8
+local key_focus_taken = false
 -- One-shot diagnostic trace: SetExtState(EXT, "debug", "1") in a ReaScript
 -- console (or EON menu), reproduce, read the console. "0"/unset = silent.
 -- inst_tag tells two copies of this script apart -- the two-captor fight is
@@ -253,7 +285,7 @@ local function release()
   end
   tgt_track, tgt_fx, tgt_guid, wrapper, canvas = nil, nil, nil, nil, nil
   wait_float, wait_canvas, shown_w, shown_h = 0, 0, -1, -1
-  canvas_dx, canvas_dy, canvas_w0, canvas_h0 = nil, nil, nil, nil
+  canvas_dx, canvas_dy, canvas_w0, canvas_h0, canvas_parent = nil, nil, nil, nil, nil
 end
 
 -- Fit the captured canvas to this window's client area.
@@ -306,12 +338,13 @@ local function tick_capture()
       if wait_canvas <= 0 then release() end  -- no canvas child = nothing safe to show
       return
     end
-    -- Save the canvas's home geometry (wrapper-client coords + size) BEFORE
-    -- taking it — the restore on every release path must be byte-exact.
+    -- Save the canvas's home geometry (its parent, coords in that parent, size)
+    -- BEFORE taking it — the restore on every release path must be byte-exact.
     local okc, cl, ct, cr, cb = reaper.JS_Window_GetRect(canvas)
+    canvas_parent = reaper.JS_Window_GetParent(canvas) or wrapper
     if okc then
       canvas_w0, canvas_h0 = cr - cl, cb - ct
-      canvas_dx, canvas_dy = reaper.JS_Window_ScreenToClient(wrapper, cl, ct)
+      canvas_dx, canvas_dy = reaper.JS_Window_ScreenToClient(canvas_parent, cl, ct)
     end
     reaper.JS_Window_SetParent(canvas, dock_hwnd)
     reaper.JS_Window_Show(wrapper, "HIDE")
@@ -523,7 +556,7 @@ local function loop()
         -- dock face ("toggles to full then docks", 2026-08-26).
         rig_flag(tgt_track, tgt_fx, tgt_guid, false)
         tgt_track, tgt_fx, tgt_guid, wrapper, canvas = nil, nil, nil, nil, nil
-        canvas_dx, canvas_dy, canvas_w0, canvas_h0 = nil, nil, nil, nil
+        canvas_dx, canvas_dy, canvas_w0, canvas_h0, canvas_parent = nil, nil, nil, nil, nil
         save_dock()
         gfx.quit()
         return
@@ -532,12 +565,43 @@ local function loop()
   end
   tick_follow()
   gfx.update()
-  if gfx.getchar() >= 0 then
-    reaper.defer(loop)
-  else
+  local c = gfx.getchar()
+  if c < 0 then
     save_dock()
     release()
+    return
   end
+  -- the docked keyboard (see FB_DOCK_* above): which browser slot holds it, if any
+  local kslot, kmode = nil, 0
+  for s = 0, SWB_SLOTS - 1 do
+    local m = math.floor(reaper.gmem_read(SWB_BASE + s * SWB_STRIDE + FB_DOCK_KEYS) or 0)
+    if m >= 2 then kslot, kmode = s, m; break end
+  end
+  local focus = reaper.JS_Window_GetFocus and reaper.JS_Window_GetFocus()
+  if kslot and canvas and focus == canvas then
+    reaper.JS_Window_SetFocus(dock_hwnd); key_focus_taken = true
+  elseif not kslot and key_focus_taken then
+    if canvas and focus == dock_hwnd then reaper.JS_Window_SetFocus(canvas) end
+    key_focus_taken = false
+  end
+  while c and c > 0 do
+    if kslot then
+      local b = SWB_BASE + kslot * SWB_STRIDE
+      local kw = math.floor(reaper.gmem_read(b + FB_DOCK_KW) or 0)
+      local kr = math.floor(reaper.gmem_read(b + FB_DOCK_KR) or 0)
+      if kw - kr < FB_DOCK_KRING_N then
+        reaper.gmem_write(b + FB_DOCK_KRING + (kw % FB_DOCK_KRING_N), c)
+        reaper.gmem_write(b + FB_DOCK_KW, kw + 1)   -- the count LAST: the face reads it to know the key is there
+      end
+    end
+    if c == 32 and kmode ~= 3 and reaper.JS_WindowMessage_Post then
+      local main = reaper.GetMainHwnd()
+      reaper.JS_WindowMessage_Post(main, "WM_KEYDOWN", 0x20, 0, 0, 0)
+      reaper.JS_WindowMessage_Post(main, "WM_KEYUP", 0x20, 0, 0, 0)
+    end
+    c = gfx.getchar()
+  end
+  reaper.defer(loop)
 end
 
 local function main()

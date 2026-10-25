@@ -146,9 +146,12 @@ function swing_chgmap_cell_col(_code)
 // use for TEXT, because here the colour is a FILL with white text on top.
 function swing_kdd_bus_col(_bus)
 (
-  _bus = max(0, min(15, _bus | 0));
-  hsl_to_rgb(_bus / 16.0, 0.55, 0.34);
-  gfx_set(_hsl_r, _hsl_g, _hsl_b, 1);
+  _bus = max(0, _bus | 0);
+  // Bank A's sixteen pairs keep their hues; a bank track or a split pair (Outputs step 1) one neutral fill.
+  _bus < NUM_PADS ? (
+    hsl_to_rgb(_bus / 16.0, 0.55, 0.34);
+    gfx_set(_hsl_r, _hsl_g, _hsl_b, 1);
+  ) : gfx_set(0.30, 0.33, 0.38, 1);
   1;
 );
 
@@ -196,7 +199,7 @@ function swing_kdd_chip(_lbl, _rx, _by, _bh, _mode)
 local(_tw, _th, _bw, _bx, _hov, _on)
 (
   _on = (kdd_open == _mode);
-  gfx_setfont(1, "Arial", swing_fs(9), 'b');
+  rk_font(1, swing_fs(9), 'b');
   gfx_measurestr(_lbl, _tw, _th);
   _bw = _tw + 16;
   _bx = _rx - _bw;
@@ -236,7 +239,8 @@ local(_tw, _th, _bw, _bx, _hov, _on)
 // it already. Same input-early / paint-late split as the shared theme picker
 // (rkth_input / rkth_overlay_draw).
 function swing_chgmap_draw(_cx, _cy, _cw, _ch)
-local(_live, _bx, _by, _bh, _tw, _th, _in_panel, _nw, _nh, _uw, _uh)
+local(_live, _bx, _by, _bh, _tw, _th, _in_panel, _nw, _nh, _uw, _uh,
+      _mfs, _mw, _mh, _fw, _fh, _fx, _both, _memfit)
 (
   swing_chgmap_read();
   _live = swing_chgmap_live();
@@ -259,29 +263,59 @@ local(_live, _bx, _by, _bh, _tw, _th, _in_panel, _nw, _nh, _uw, _uh)
   // the font the NAME was drawn in — swing_lcd_draw_kit uses Arial 11 bold — or
   // it would land on top of a longer name. Dropped entirely when the name has
   // eaten the row: overlapping the chips is worse than not showing the tempo.
-  gfx_setfont(1, "Arial", swing_fs(11), 'b');
+  rk_font(1, swing_fs(11), 'b');
   gfx_measurestr(strlen(#kit_name) > 0 ? #kit_name : "Untitled Kit", _nw, _nh);
   sprintf(#_kdd_bpm, "%.4g", tempo);
-  gfx_setfont(1, "Arial", swing_fs(15), 'b');
+  rk_font(1, swing_fs(15), 'b');
   gfx_measurestr(#_kdd_bpm, _tw, _th);
-  gfx_setfont(1, "Arial", swing_fs(9), 'b');
+  rk_font(1, swing_fs(9), 'b');
   gfx_measurestr(" BPM", _uw, _uh);
-  (_cx + 4 + _nw + 12 + _tw + _uw) < (_bx - 6) ? (
+  // ── Memory left, beside the tempo (Spec_Swing_Pad_Banks §8.1, 2026-09-23) ──
+  // "8:32 free": what is LEFT of the pad-audio area, seconds at the project rate
+  // (swing_mem_free_secs, rk_swing_core), styled like the tempo -- number bright and
+  // large, unit small and dim. Amber under a minute, red at zero. Memory outranks
+  // tempo when the name has eaten the row: tempo is dropped first, memory second -- a
+  // number counting down is worth more than one the transport already shows.
+  // Step 4b: the bank strip carries the INSTRUMENT's free time, so the kit bar narrows to the ACTIVE bank's
+  // usage (spec 8.1, "when banks land"): "1:12 in B" -- what this bank holds, at its stored rates.
+  _mfs = swing_bank_used_secs(bank_cur);
+  sprintf(#_kdd_mem, "%d:%02d", (_mfs / 60) | 0, (_mfs - 60 * ((_mfs / 60) | 0)) | 0);
+  sprintf(#_kdd_bk, " in %c", 65 + bank_cur);
+  rk_font(1, swing_fs(15), 'b');
+  gfx_measurestr(#_kdd_mem, _mw, _mh);
+  rk_font(1, swing_fs(9), 'b');
+  gfx_measurestr(#_kdd_bk, _fw, _fh);
+  _fx     = _cx + 4 + _nw + 12;                                // the row continues here, after the name
+  _both   = (_fx + _tw + _uw + 14 + _mw + _fw) < (_bx - 6);   // tempo AND memory fit
+  _memfit = (_fx + _mw + _fw) < (_bx - 6);                    // memory fits on its own
+  _both ? (
     // Number at full brightness and larger than the kit name; the unit stays
     // small and dim so the eye lands on the figure, not the word.
-    gfx_setfont(1, "Arial", swing_fs(15), 'b');
+    rk_font(1, swing_fs(15), 'b');
     gfx_set(lcd_bar_tx_r, lcd_bar_tx_g, lcd_bar_tx_b, 1);
-    gfx_x = _cx + 4 + _nw + 12;
+    gfx_x = _fx;
     gfx_y = _cy + 2 + (_nh - _th) * 0.5;
     gfx_drawstr(#_kdd_bpm);
-    gfx_setfont(1, "Arial", swing_fs(9), 'b');
+    rk_font(1, swing_fs(9), 'b');
     gfx_set(lcd_bar_tx_r * 0.55, lcd_bar_tx_g * 0.55, lcd_bar_tx_b * 0.55, 1);
     gfx_y = _cy + 2 + (_nh - _th) * 0.5 + (_th - _uh) - 1;
     gfx_drawstr(" BPM");
+    _fx += _tw + _uw + 14;
+  );
+  _memfit ? (
+    rk_font(1, swing_fs(15), 'b');
+    gfx_set(lcd_bar_tx_r, lcd_bar_tx_g, lcd_bar_tx_b, 1);   // usage is a fact, not a warning: the strip's free figure carries the colour
+    gfx_x = _fx;
+    gfx_y = _cy + 2 + (_nh - _mh) * 0.5;
+    gfx_drawstr(#_kdd_mem);
+    rk_font(1, swing_fs(9), 'b');
+    gfx_set(lcd_bar_tx_r * 0.55, lcd_bar_tx_g * 0.55, lcd_bar_tx_b * 0.55, 1);
+    gfx_y = _cy + 2 + (_nh - _mh) * 0.5 + (_mh - _fh) - 1;
+    gfx_drawstr(#_kdd_bk);
   );
 
-  // ── Last-operation summary ──
-  gfx_setfont(1, "Arial", swing_fs(9), 'b');
+  // ── Last-operation summary ── (counts: bold from 10 px only, wiki 4.7)
+  rk_font(1, swing_fs(9), swing_fs(9) >= 10 ? 'b' : 0);
   _live ? (
     chgmap_op == 1 ? strcpy(#_chg_hd, "Load") :
     chgmap_op == 2 ? strcpy(#_chg_hd, "Fill") :
@@ -301,14 +335,14 @@ local(_live, _bx, _by, _bh, _tw, _th, _in_panel, _nw, _nh, _uw, _uh)
       sprintf(#_chg_sub, "%s%d sample(s) unused", #_chg_sub, chgmap_surplus);
     );
     strlen(#_chg_sub) > 0 ? (
-      gfx_setfont(1, "Arial", swing_fs(9));
+      rk_font(1, swing_fs(9), 0);
       gfx_set(lcd_bar_tx_r * 0.62, lcd_bar_tx_g * 0.62, lcd_bar_tx_b * 0.62, 1);
       gfx_x = _cx + 6; gfx_y = _cy + 40; gfx_drawstr(#_chg_sub);
     );
   ) : (
     // Idle text has to read on its own — it is no longer a caption sitting next
     // to a visible grid.
-    gfx_setfont(1, "Arial", swing_fs(9));
+    rk_font(1, swing_fs(9), 0);
     gfx_set(lcd_bar_tx_r * 0.45, lcd_bar_tx_g * 0.45, lcd_bar_tx_b * 0.45, 1);
     gfx_x = _cx + 6; gfx_y = _cy + 26; gfx_drawstr("No recent kit change");
   );
@@ -353,7 +387,7 @@ function swing_kdd_legend(_lx, _ly, _kind, _code, _lbl) local(_filled)
     gfx_rect(_lx, _ly + 2, 1, 9);
     gfx_rect(_lx + 8, _ly + 2, 1, 9);
   );
-  gfx_setfont(1, "Arial", swing_fs(9));
+  rk_font(1, swing_fs(9), 0);
   gfx_set(lcd_bar_tx_r * 0.72, lcd_bar_tx_g * 0.72, lcd_bar_tx_b * 0.72, 1);
   gfx_x = _lx + 14; gfx_y = _ly;
   gfx_drawstr(_lbl);
@@ -369,7 +403,7 @@ function swing_kdd_legend(_lx, _ly, _kind, _code, _lbl) local(_filled)
 // A transposed map teaches the wrong pad and is worse than no map at all.
 function swing_kdd_panel(_mode)
 local(_px, _py, _gx, _gy, _lx, _ly, _row, _col, _pad, _x, _y,
-      _code, _filled, _live, _tw, _th, _hov, _n, _i, _cnt, _lm, _bus)
+      _code, _filled, _live, _tw, _th, _hov, _n, _i, _cnt, _lm, _bus, _pad_s, _col_s)
 (
   _px = kdd_px; _py = kdd_py;
   _live = swing_chgmap_live();
@@ -386,7 +420,7 @@ local(_px, _py, _gx, _gy, _lx, _ly, _row, _col, _pad, _x, _y,
   gfx_rect(_px + CHGMAP_PANEL_W - 1, _py, 1, CHGMAP_PANEL_H);
 
   // Title
-  gfx_setfont(1, "Arial", swing_fs(9), 'b');
+  rk_font(1, swing_fs(9), 'b');
   gfx_set(lcd_bar_tx_r * 0.75, lcd_bar_tx_g * 0.75, lcd_bar_tx_b * 0.75, 1);
   gfx_x = _px + 8; gfx_y = _py + 6;
   _mode == KDD_MODE_NOTES ? gfx_drawstr("NOTE MAP") :
@@ -402,26 +436,26 @@ local(_px, _py, _gx, _gy, _lx, _ly, _row, _col, _pad, _x, _y,
   loop(4,
     _col = 0;
     loop(4,
-      _pad = (3 - _row) * 4 + _col;          // MPC layout
+      _pad = (3 - _row) * 4 + _col; _pad_s = swing_bp(_pad);          // MPC layout
       _x = _gx + _col * (CHGMAP_CELL_W + CHGMAP_GAP);
       _y = _gy + _row * (CHGMAP_CELL_H + CHGMAP_GAP);
 
       _hov = mx >= _x && mx < _x + CHGMAP_CELL_W && my >= _y && my < _y + CHGMAP_CELL_H;
-      _hov ? kdd_hover = _pad;
+      _hov ? kdd_hover = _pad;   // a TILE (the cell); engine reads map it (step 4d)
 
       // Fill + cell text, per mode.
       _mode == KDD_MODE_NOTES ? (
         _code = _live ? chgmap_codes[_pad] : 0;
         _filled = swing_chgmap_cell_col(_code);
-        swing_chgmap_note(#_chg_nn, p_note[_pad]);
+        swing_chgmap_note(#_chg_nn, p_note[_pad_s]);
       ) : _mode == KDD_MODE_OUT ? (
-        _bus = max(0, min(15, p_output[_pad] | 0));
+        _bus = swing_out_pair(_pad_s);   // where it plays (Outputs step 1)
         _code = 0;
         _filled = swing_kdd_bus_col(_bus);
-        sprintf(#_chg_nn, "%d", _bus + 1);
+        swing_out_pair_short(_bus, #_chg_nn);
       ) : (
-        _cnt = p_layer_cnt[_pad] | 0;
-        _lm  = p_layer_mode[_pad] | 0;
+        _cnt = p_layer_cnt[_pad_s] | 0;
+        _lm  = p_layer_mode[_pad_s] | 0;
         _code = 0;
         _filled = swing_kdd_layer_col(_cnt, _lm);
         _cnt >= 2 ? (
@@ -460,7 +494,8 @@ local(_px, _py, _gx, _gy, _lx, _ly, _row, _col, _pad, _x, _y,
         gfx_rect(_x + CHGMAP_CELL_W, _y - 1, 1, CHGMAP_CELL_H + 2);
       );
 
-      gfx_setfont(1, "Arial", swing_fs(9), 'b');
+      // Notes / bus numbers / layer counts: bold from 10 px only (wiki 4.7).
+      rk_font(1, swing_fs(9), swing_fs(9) >= 10 ? 'b' : 0);
       _filled ? gfx_set(1, 1, 1, 0.95)
               : gfx_set(lcd_bar_tx_r * 0.65, lcd_bar_tx_g * 0.65, lcd_bar_tx_b * 0.65, 0.9);
       gfx_measurestr(#_chg_nn, _tw, _th);
@@ -488,14 +523,16 @@ local(_px, _py, _gx, _gy, _lx, _ly, _row, _col, _pad, _x, _y,
     //
     // A kit CAN use more than five buses, so the last row reports the overflow
     // instead of silently stopping: a legend that just ends looks complete.
+    // Every pair a pad can play out of (Outputs step 1: banks B-D on their bank's track, split-off pads).
     _i = 0; _row = 0; _n = 0;
-    loop(16,
+    loop(OUT_PAIRS,
       _cnt = 0; _col = 0;
-      loop(16, (max(0, min(15, p_output[_col] | 0)) == _i) ? _cnt += 1; _col += 1; );
+      loop(16, _col_s = swing_bp(_col); swing_out_pair(_col_s) == _i ? _cnt += 1; _col += 1; );
       _cnt > 0 ? (
         _n += 1;
         _row < 5 ? (
-          sprintf(#_kdd_lg, "Out %d \x2D %d pad%s", _i + 1, _cnt, _cnt == 1 ? "" : "s");
+          swing_out_pair_name(_i, #_kdd_on);
+          sprintf(#_kdd_lg, "%s \x2D %d pad%s", #_kdd_on, _cnt, _cnt == 1 ? "" : "s");
           swing_kdd_legend(_lx, _ly + _row * 14, 1, _i, #_kdd_lg);
           _row += 1;
         );
@@ -503,7 +540,7 @@ local(_px, _py, _gx, _gy, _lx, _ly, _row, _col, _pad, _x, _y,
       _i += 1;
     );
     _n > 5 ? (
-      gfx_setfont(1, "Arial", swing_fs(9));
+      rk_font(1, swing_fs(9), 0);
       gfx_set(lcd_bar_tx_r * 0.55, lcd_bar_tx_g * 0.55, lcd_bar_tx_b * 0.55, 1);
       sprintf(#_kdd_lg, "+%d more bus%s", _n - 5, (_n - 5) == 1 ? "" : "es");
       gfx_x = _lx; gfx_y = _ly + 4 * 14 + 14;
@@ -517,7 +554,7 @@ local(_px, _py, _gx, _gy, _lx, _ly, _row, _col, _pad, _x, _y,
   );
 
   // ── Hover detail ──
-  gfx_setfont(1, "Arial", swing_fs(9));
+  rk_font(1, swing_fs(9), 0);
   kdd_hover >= 0 ? (
     // Read PADCAT directly rather than via swing_lcd_padcat_eff(): that lives in
     // rk_swing_lcd, which imports AFTER this file, and EEL resolves function
@@ -529,7 +566,7 @@ local(_px, _py, _gx, _gy, _lx, _ly, _row, _col, _pad, _x, _y,
 
     _mode == KDD_MODE_NOTES ? (
       _code = _live ? chgmap_codes[kdd_hover] : 0;
-      swing_chgmap_note(#_chg_nn, p_note[kdd_hover]);
+      swing_chgmap_note(#_chg_nn, p_note[swing_bp(kdd_hover)]);
       swing_chgmap_reason(#_chg_rs, _code);
       strlen(#_chg_cat) > 0 ?
         sprintf(#_chg_det, "Pad %d \x2D %s \x2D %s \x2D %s",
@@ -539,14 +576,14 @@ local(_px, _py, _gx, _gy, _lx, _ly, _row, _col, _pad, _x, _y,
       _code == 3 ? gfx_set(0.88, 0.63, 0.13, 1) :
                    gfx_set(lcd_bar_tx_r * 0.85, lcd_bar_tx_g * 0.85, lcd_bar_tx_b * 0.85, 1);
     ) : _mode == KDD_MODE_OUT ? (
-      _bus = max(0, min(15, p_output[kdd_hover] | 0));
+      swing_out_pair_name(swing_out_pair(swing_bp(kdd_hover)), #_kdd_on);   // where it plays (Outputs step 1)
       strlen(#_chg_cat) > 0 ?
-        sprintf(#_chg_det, "Pad %d \x2D %s \x2D Out %d", kdd_hover + 1, #_chg_cat, _bus + 1) :
-        sprintf(#_chg_det, "Pad %d \x2D Out %d", kdd_hover + 1, _bus + 1);
+        sprintf(#_chg_det, "Pad %d \x2D %s \x2D %s", kdd_hover + 1, #_chg_cat, #_kdd_on) :
+        sprintf(#_chg_det, "Pad %d \x2D %s", kdd_hover + 1, #_kdd_on);
       gfx_set(lcd_bar_tx_r * 0.85, lcd_bar_tx_g * 0.85, lcd_bar_tx_b * 0.85, 1);
     ) : (
-      _cnt = p_layer_cnt[kdd_hover] | 0;
-      swing_kdd_layer_mode_name(#_chg_rs, p_layer_mode[kdd_hover] | 0);
+      _cnt = p_layer_cnt[swing_bp(kdd_hover)] | 0;
+      swing_kdd_layer_mode_name(#_chg_rs, p_layer_mode[swing_bp(kdd_hover)] | 0);
       _cnt >= 2 ?
         sprintf(#_chg_det, "Pad %d \x2D %d layers, %s", kdd_hover + 1, _cnt, #_chg_rs) :
         sprintf(#_chg_det, "Pad %d \x2D single sample", kdd_hover + 1);

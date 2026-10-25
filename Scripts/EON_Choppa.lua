@@ -933,14 +933,9 @@ local function registry_live(inst_id)
   return false
 end
 
--- Swing JSFX detector — same conditions as the bridge's is_swing_fx.
+-- Swing JSFX detector — the bridge's rule, core.is_swing_fx: the plugin's file, never its shown name.
 local function is_swing_fx(tr, fx)
-  local _, fname = reaper.TrackFX_GetFXName(tr, fx, "")
-  local retval, ident = reaper.TrackFX_GetNamedConfigParm(tr, fx, "fx_ident")
-  if retval and ident:find("DrumKit_ReaKit") then return true end
-  if fname:find("DrumKit_ReaKit") then return true end
-  if fname:match("^JS: Swing") or fname:match("Swing %— 16%-Pad") then return true end
-  return false
+  return core.is_swing_fx(tr, fx)
 end
 
 -- Track-GUID token of the target Swing (chop-dir naming — same convention as

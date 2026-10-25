@@ -15,6 +15,45 @@
 // Denormal guard for per-pad compressor envelope (same as bus comp's cmp_denorm)
 FX_CMP_DENORM = pow(10, -30);
 
+// ─── A sleeping pad's smoothers sit on their targets ──
+// SNAP the pan and drive smoothers to target rather than leaving them stranded: a pad whose pan
+// moved while it was silent would otherwise sweep across the first 8 ms of its next hit.
+// (The master does the same for its own smoothers when idle.) Called by process_pad_fx's quiet
+// branch for a pad that goes silent in @sample, and once per block by @block for every pad that
+// starts the block asleep -- @sample no longer visits those (the awake list, 2026-10-11).
+// GUARDED: on target -- which is the whole of a quiet session -- it writes nothing at all.
+// ⚠️⚠️ The guard has to ask about BOTH coefficients. It used to test only
+// p_panL_sm, and the pan law is a linear balance, not constant power:
+//   p_panL = 1.0 - max(0, p_pan)      p_panR = 1.0 + min(0, p_pan)
+// (rk_drumkit_dsp.jsfx-inc). So for EVERY pan value left of centre, p_panL
+// sits at exactly 1.0 and does not move at all -- 1.0 != 1.0 is false, the
+// guard never fired, and p_panR_sm stayed stranded at its old value. The
+// next hit then swept centre -> left across its first 8 ms: precisely the
+// sweep this snap exists to prevent, on half the knob. Panning RIGHT always
+// worked, because there it is L that moves, so it survives an ear test done
+// in one direction.
+// ⚠️⚠️ n = the samples this call stands for (1 from @sample, samplesblock from @block). The pad compressor's
+// envelope RELEASES over them (2026-10-23, H18): it only moved inside the chain below, so once a pad went quiet it
+// froze, and the next hit -- however much later -- started under the last hit's gain reduction (about 21 dB in
+// SQUASH after a loud snare). A quiet pad's detector input is 0, so the release is env *= rel_c per sample, i.e.
+// rel_c^n. The ?: runs only its own branch: @sample (n == 1) never calls pow. The floor (120 dB under the knee)
+// ends the work a few seconds after the pad sleeps; at rest the guard writes nothing.
+function pad_fx_snap(i, n) local(_sm, _smR) (
+  _sm  = strip_tk[i] ? 1.0 : p_panL[i];
+  _smR = strip_tk[i] ? 1.0 : p_panR[i];
+  p_panL_sm[i] != _sm || p_panR_sm[i] != _smR ||
+  fx_sat_drv_sm[i] != fx_sat_drv[i] ? (
+    p_panL_sm[i] = _sm;
+    p_panR_sm[i] = _smR;
+    fx_sat_drv_sm[i] = fx_sat_drv[i];
+  );
+  fx_res[i] > 0 ? fx_res[i] = 0;
+  fx_cmp_env[i] > FX_CMP_DENORM ? (
+    fx_cmp_env[i] *= (n == 1 ? fx_cmp_rel_c[i] : pow(fx_cmp_rel_c[i], n));
+    fx_cmp_env[i] < fx_cmp_knee_lo_lin[i] * 0.000001 ? fx_cmp_env[i] = FX_CMP_DENORM;
+  );
+);
+
 // ─── Per-pad FX chain: HPF → LPF → EQ → COMP → Bitcrush → Drive ──
 // Reads pad_accL[i]/pad_accR[i], writes _pfxL/_pfxR (post-pan),
 // and _pfx_sendL/_pfx_sendR (post-FX, pre-pan — for send buses).
@@ -46,7 +85,8 @@ local(_aL, _aR, _svf_base, _svf,
     // strip_takeover (set in @block) = multi_out AND the strip-sync script's
     // heartbeat is fresh. Internal FX XOR child-track FX (Groove Agent
     // model): pan + sends still apply; HPF→drive are skipped entirely.
-    // If the script dies the heartbeat stalls and this chain resumes.
+    // If the script dies the heartbeat stalls and this chain resumes (after a
+    // stop: takeover is held while the transport runs, renders included).
     !strip_tk[i] ? (   // per pad: this pad's strip is live (see the @block mask)
 
     // ── HPF (2nd-order SVF highpass) ──
@@ -247,33 +287,7 @@ local(_aL, _aR, _svf_base, _svf,
   ) : (
     _pfxL = 0; _pfxR = 0;
     _pfx_sendL = 0; _pfx_sendR = 0;
-    // Asleep: SNAP the smoothers to target rather than leaving them stranded.
-    // A pad whose pan moved while it was silent would otherwise sweep across
-    // the first 8 ms of its next hit, which is the opposite of the fix.
-    // (The master does the same for its own smoothers when idle.)
-    // GUARDED: this branch runs for every silent pad on every sample, and
-    // writing four cells unconditionally doubled the cost of the idle path.
-    // On target -- which is the whole of a quiet session -- it now writes
-    // nothing at all.
-    // ⚠️⚠️ The guard has to ask about BOTH coefficients. It used to test only
-    // p_panL_sm, and the pan law is a linear balance, not constant power:
-    //   p_panL = 1.0 - max(0, p_pan)      p_panR = 1.0 + min(0, p_pan)
-    // (rk_drumkit_dsp.jsfx-inc). So for EVERY pan value left of centre, p_panL
-    // sits at exactly 1.0 and does not move at all -- 1.0 != 1.0 is false, the
-    // guard never fired, and p_panR_sm stayed stranded at its old value. The
-    // next hit then swept centre -> left across its first 8 ms: precisely the
-    // sweep this snap exists to prevent, on half the knob. Panning RIGHT always
-    // worked, because there it is L that moves, so it survives an ear test done
-    // in one direction.
-    _sm  = strip_tk[i] ? 1.0 : p_panL[i];
-    _smR = strip_tk[i] ? 1.0 : p_panR[i];
-    p_panL_sm[i] != _sm || p_panR_sm[i] != _smR ||
-    fx_sat_drv_sm[i] != fx_sat_drv[i] ? (
-      p_panL_sm[i] = _sm;
-      p_panR_sm[i] = _smR;
-      fx_sat_drv_sm[i] = fx_sat_drv[i];
-    );
-    fx_res[i] > 0 ? fx_res[i] = 0;
+    pad_fx_snap(i, 1);   // asleep: the pan and drive smoothers onto their targets, the comp releases a sample (see pad_fx_snap)
     0;
   );
 );

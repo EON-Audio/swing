@@ -206,6 +206,23 @@ Plain answers, because you shouldn't have to read source to know:
   logs: `Data/EON_Swing/` and `Data/Swing_Cache/` — all inside your REAPER
   resource folder. The only thing written next to a project is that project's
   own kit audio.
+- **Kit files are data, not code.** Older `.swing` kits and the browser's
+  caches are Lua text. They load with no access to REAPER, files or the
+  shell, and with an instruction budget, so a broken or hostile file fails
+  to load and that is all it does. Current kits are zip archives; an entry
+  whose name tries to climb out of the kit folder is refused.
+- **Automatic deletion, two places.** When the bridge starts it sweeps
+  `Data/EON_Swing/unsaved/`, the holding area for kits and chops made in a
+  project that was never saved, and empties folders nothing has touched for
+  30 days. A folder's clock resets every time a kit in it is used, and a
+  folder seen for the first time gets the full 30 days. Kit audio saved
+  with a project is never swept. When the bridge exits it also removes the
+  WAV files it made itself in `eon_swing_pitch` under your system temp folder.
+- **A drop folder for other scripts.** The bridge creates `Data/EON_Loader/`
+  and watches it for small text requests: a sample path and a pad number.
+  Other scripts use it to send a sample to a pad. A request is checked (the
+  file must exist, the pad must be 0-15) and then handed to Swing exactly as
+  the browser hands over a sample; a request that fails a check is deleted.
 
 ## Good to know
 

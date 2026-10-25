@@ -19,14 +19,14 @@ local M = {}
 M.KEY   = "P_EXT:EON_LANE_COLOR_POLICY"
 M.MODES = { "swing", "reaper", "none" }
 
--- Mirror of eon_action_target.fx_is_swing / bridge is_swing_fx.
+-- Mirror of rk_lua_core's core.is_swing_fx (the owner; eon_action_target and the
+-- bridge agree), written out because this helper loads nothing: the plugin's
+-- FILE, compared whole -- never the shown name (a rename, or a path when REAPER's
+-- JSFX name cache is blank).
 local function fx_is_swing(tr, fx)
-  local _, fname = reaper.TrackFX_GetFXName(tr, fx, "")
   local ok, ident = reaper.TrackFX_GetNamedConfigParm(tr, fx, "fx_ident")
-  if ok and ident and ident:find("DrumKit_ReaKit") then return true end
-  if fname and fname:find("DrumKit_ReaKit") then return true end
-  if fname and (fname:match("^JS: Swing") or fname:match("Swing %— 16%-Pad")) then return true end
-  return false
+  local f = ok and ((ident or ""):match("[^/\\]+$") or ""):lower() or ""
+  return f == "swing_reakit.jsfx" or f == "swing_lite.jsfx" or f == "drumkit_reakit.jsfx"
 end
 
 local function track_has_swing(tr)

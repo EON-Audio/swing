@@ -422,6 +422,12 @@ local function MainLoopBody()
   local visible = overlay.BeginFrame(PAINT_MODE, hole_hover)
   local L, T, R, B = overlay.GetBounds()
   if visible then
+    -- The DPI scale read INSIDE the overlay's window: ImGui_GetWindowDpiScale answers for the current window's
+    -- viewport, and the read above runs before any window of ours is begun (first-run issue 1, point 6: the lanes
+    -- drew wrong at 175 % -- I_TCPY / I_TCPH are physical and divide by this scale, so a 1.0 here puts every lane
+    -- 1.75x too far down; by reading, no 175 % screen here).
+    local ds2 = r.ImGui_GetWindowDpiScale(ctx)
+    if ds2 and ds2 > 0 then coords.SetScale(ds2) end
     coords.SetBounds(L, T, R, B, overlay.GetScrollSize())
     -- Single per-frame snapshot of view range + grid lines. Every renderer
     -- + paint helper reads from the cache instead of re-querying REAPER.

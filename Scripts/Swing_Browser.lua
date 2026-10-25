@@ -23,14 +23,33 @@
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- DEPENDENCY CHECK
 -- ═══════════════════════════════════════════════════════════════════════════════
+local function _get_script_dir()
+  local info = debug.getinfo(1, "S")
+  local path = info.source:match("@?(.*)")
+  return path:match("^(.*)[/\\]") or ""
+end
+local _SCRIPT_DIR = _get_script_dir()
+local _sep = package.config:sub(1,1)
+
+-- The script dir stays FIRST, so the imgui.lua shipped beside this script keeps
+-- resolving ahead of ReaImGui's builtin copy. Without ReaImGui the builtin entry
+-- is left out: rk_lua_core needs nothing from it, and loading it here lets the
+-- flag below be written by its core.GMEM name.
+package.path = _SCRIPT_DIR .. _sep .. "?.lua;" ..
+               (reaper.ImGui_GetBuiltinPath and reaper.ImGui_GetBuiltinPath() .. "/?.lua;" or "") ..
+               (package.path or "")
+local core = require("rk_lua_core")
+
 if not reaper.ImGui_GetBuiltinPath then
   -- Signal back to JSFX so a "ReaImGui not installed" banner appears in
   -- the LCD area (rk_swing_ui_state.jsfx-inc — same pattern as the
-  -- bridge-not-running warning). GS_REAIMGUI_MISSING = 2368.
+  -- bridge-not-running warning). By name, never a number: this once wrote
+  -- cell 2368 (inside the undo-description text) while Swing reads
+  -- GS_REAIMGUI_MISSING = 2624, so the banner could never appear.
   -- We attach to gmem here even though we're early-returning; the cost
   -- is negligible and signaling the JSFX is the whole point.
-  reaper.gmem_attach("Swing_Media_Transfer")
-  reaper.gmem_write(2368, 1)
+  reaper.gmem_attach(core.GMEM_NAME)
+  reaper.gmem_write(core.GMEM.GS_REAIMGUI_MISSING, 1)
   reaper.MB(
     "Swing Browser requires the ReaImGui extension.\n\n"..
     "Install it from ReaPack:\n"..
@@ -43,26 +62,15 @@ end
 -- ReaImGui is present this session. Clear the flag if it was set by a
 -- previous failed launch (e.g., user installed ReaImGui via ReaPack
 -- without restarting REAPER, then re-clicked BROWSE).
-reaper.gmem_attach("Swing_Media_Transfer")
-reaper.gmem_write(2368, 0)
+reaper.gmem_attach(core.GMEM_NAME)
+reaper.gmem_write(core.GMEM.GS_REAIMGUI_MISSING, 0)
 
-local function _get_script_dir()
-  local info = debug.getinfo(1, "S")
-  local path = info.source:match("@?(.*)")
-  return path:match("^(.*)[/\\]") or ""
-end
-local _SCRIPT_DIR = _get_script_dir()
-local _sep = package.config:sub(1,1)
-
-package.path = _SCRIPT_DIR .. _sep .. "?.lua;" ..
-               reaper.ImGui_GetBuiltinPath() .. "/?.lua;" ..
-               (package.path or "")
 local ImGui = require 'imgui' '0.9.3.2'
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- SHARED MODULES (ReaKit Lua library)
 -- ═══════════════════════════════════════════════════════════════════════════════
-local core    = require("rk_lua_core")
+-- (rk_lua_core is required above, before the dependency check.)
 local categorizer = require("eon_filename_categorizer")
 local widgets = require("rk_lua_widgets")
 local rootnote = require("rk_root_note")
@@ -722,6 +730,7 @@ local function save_settings()
     f:write(string.format('  grid_overlay = %s,\n',  tostring(settings.grid_overlay == true)))
     f:write(string.format('  recurse_subfolders = %s,\n', tostring(settings.recurse_subfolders == true)))
     f:write(string.format('  kit_fill_mode = %s,\n', tostring(settings.kit_fill_mode == true)))
+    f:write(string.format('  store_rate_max = %d,\n', math.floor(tonumber(settings.store_rate_max) or 48000)))
     -- favorites
     f:write('  favorites = {\n')
     for _, fav in ipairs(settings.favorites) do
@@ -1175,6 +1184,7 @@ local function process_metadata_queue()
       if src then
         e.duration = reaper.GetMediaSourceLength(src)
         e.nch      = reaper.GetMediaSourceNumChannels(src)
+        e.sr       = reaper.GetMediaSourceSampleRate(src)   -- the pad cap is in frames at the file's rate
         reaper.PCM_Source_Destroy(src)
       end
     end
@@ -1998,12 +2008,16 @@ local import_load_queue = {}
 local function import_execute()
   -- Build a deferred load queue (one pad per frame to avoid CMD 63 collisions)
   import_load_queue = {}
+  -- The bank on screen, read ONCE at IMPORT (audit H26, 2026-10-23): imports fill the bank on screen, as
+  -- LOAD N -> PADS and the bridge's FILL do. The loads take an ABSOLUTE pad (bank * 16 + tile); a bare
+  -- pad_idx - 1 always landed in bank A, whatever bank the dialog was opened on.
+  local bank = math.floor((ui.target_pad or 0) / G.NUM_PADS)
   for pad_idx = 1, 16 do
     local src_idx = import_state.mapping[pad_idx]
     if src_idx then
       local pad = import_state.pads[src_idx]
       if pad then
-        local target = pad_idx - 1 -- 0-indexed
+        local target = bank * G.NUM_PADS + pad_idx - 1 -- absolute: bank * 16 + tile
         -- Carry the parsed metadata so process_import_queue can re-apply it
         -- after the audio loads (the CMD-63/64 load only transfers samples).
         -- `layers` (RS5k velocity/RR import) is nil for SFZ → single-sample path.
@@ -2055,14 +2069,25 @@ local function process_import_queue()
   -- layered pads, layer_mode sets vel-split / RR (auto even-split JSFX-side).
   local slot = core.resolve_inst_slot(active_inst_id)
   if slot then
+    -- INCMD is bank-RELATIVE (audit H26): each region is sixteen pads wide, so the TILE is posted. The flag
+    -- carries the item's BANK (2 + 4 x (bank + 1), Swing_ReaKit's swing_incmd_slot): the instance takes the cell
+    -- when it can -- the whole mailbox is held while it is busy -- and without the stamp it mapped the tile
+    -- through whatever bank showed THEN (round 2, the coordinator's Codex review). Posted only while the
+    -- instance still shows the item's bank, too: a Swing older than the stamp reads any flag >= 1 as "the bank
+    -- on screen", so it gets the old behaviour at its best (the item waits otherwise, and posts when that bank
+    -- is back).
+    local bank = math.floor(item.pad / G.NUM_PADS)
+    if math.floor(reaper.gmem_read(G.GS_INST_BANK_CUR + slot) or 0) ~= bank then return end
+    local t = item.pad % G.NUM_PADS
+    local stamp = 2 + 4 * (bank + 1)
     if item.note then
-      core.post_pad_incmd(slot, G.INCMD_NOTE_OFF, item.pad, item.note, 2)
+      core.post_pad_incmd(slot, G.INCMD_NOTE_OFF, t, item.note, stamp)
     end
-    core.post_pad_incmd(slot, G.INCMD_TUNE_OFF, item.pad, item.tune or 0, 2)
-    core.post_pad_incmd(slot, G.INCMD_GAIN_OFF, item.pad, 10 ^ ((item.volume or 0) / 20), 2)
-    core.post_pad_incmd(slot, G.INCMD_PAN_OFF,  item.pad, item.pan or 0, 2)
+    core.post_pad_incmd(slot, G.INCMD_TUNE_OFF, t, item.tune or 0, stamp)
+    core.post_pad_incmd(slot, G.INCMD_GAIN_OFF, t, 10 ^ ((item.volume or 0) / 20), stamp)
+    core.post_pad_incmd(slot, G.INCMD_PAN_OFF,  t, item.pan or 0, stamp)
     if item.layer_mode and item.layer_mode > 0 then
-      core.post_pad_incmd(slot, G.INCMD_LMODE_OFF, item.pad, item.layer_mode, 2)
+      core.post_pad_incmd(slot, G.INCMD_LMODE_OFF, t, item.layer_mode, stamp)
     end
   end
   table.remove(import_load_queue, 1)
@@ -2159,8 +2184,8 @@ local function draw_import_dialog(ctx)
 
             local type_label = AUTO_MAP_TYPES[pad_idx] or ""
 
-            -- Pad label + combo for source selection
-            ImGui.Text(ctx, string.format("Pad %2d %-9s", pad_idx, type_label))
+            -- Pad label + combo for source selection; the label names the bank the import fills (H26)
+            ImGui.Text(ctx, "Pad " .. core.pad_label(math.floor((ui.target_pad or 0) / 16) * 16 + pad_idx - 1) .. "  " .. type_label)
             ImGui.SameLine(ctx, 160)
             ImGui.SetNextItemWidth(ctx, 250)
             local preview = src_idx and (tostring(src_idx) .. ": " .. sample_name) or "(none)"
@@ -2189,15 +2214,17 @@ local function draw_import_dialog(ctx)
         if preview_vis then
           for pad_idx = 1, 16 do
             local src_idx = import_state.mapping[pad_idx]
+            -- the label names the bank the import fills (H26): the bank on screen
+            local plabel = core.pad_label(math.floor((ui.target_pad or 0) / 16) * 16 + pad_idx - 1)
 
             if src_idx and import_state.pads[src_idx] then
               local pad = import_state.pads[src_idx]
               local sample_name = pad.path:match("[/\\]([^/\\]+)$") or pad.path
               local type_label = import_state.mode == 1 and (" [" .. (AUTO_MAP_TYPES[pad_idx] or "?") .. "]") or ""
-              local label = string.format("Pad %2d: %s%s", pad_idx, sample_name, type_label)
+              local label = string.format("Pad %s: %s%s", plabel, sample_name, type_label)
               ImGui.Text(ctx, label)
             else
-              ImGui.TextDisabled(ctx, string.format("Pad %2d: —", pad_idx))
+              ImGui.TextDisabled(ctx, string.format("Pad %s: —", plabel))
             end
           end
         end
@@ -3003,13 +3030,7 @@ local function enumerate_swing_instances()
   local per_track = {}
   for tr in core.iter_all_tracks() do
     for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
-      local _, fname = reaper.TrackFX_GetFXName(tr, fx, "")
-      local retval, ident = reaper.TrackFX_GetNamedConfigParm(tr, fx, "fx_ident")
-      local is_swing = (retval and ident:find("DrumKit_ReaKit"))
-                    or fname:find("DrumKit_ReaKit")
-                    or fname:match("^JS: Swing")
-                    or fname:match("Swing %— 16%-Pad")
-      if is_swing then
+      if core.is_swing_fx(tr, fx) then   -- the plugin's file, never its shown name (the bridge's rule)
         local inst_id = math.floor(reaper.TrackFX_GetParam(tr, fx, 3) or 0)
         local meta = alive[inst_id]
         if meta then
@@ -3084,7 +3105,9 @@ end
 
 load_sample_to_pad = function(filepath, pad_idx)
   if not filepath or not pad_idx then return false end
-  if pad_idx < 0 or pad_idx >= G.NUM_PADS then return false end
+  -- Pad Banks step 5c: pad_idx is ABSOLUTE (0..63, bank * 16 + tile) -- GS_BROWSE_PAD has been since step 4a,
+  -- and Swing's CMD 63 takes it so. The legacy name / BPM / key bands below are sixteen wide: the pad's tile.
+  if pad_idx < 0 or pad_idx >= G.NUM_PADS * 4 then return false end
   if math.floor(reaper.gmem_read(G.CMD)) ~= 0 then return false end -- busy
   if math.floor(reaper.gmem_read(G.LOCK)) ~= 0 then return false end -- bridge busy
 
@@ -3098,7 +3121,7 @@ load_sample_to_pad = function(filepath, pad_idx)
   -- Write pad name to gmem PADNAME area
   local fname = filepath:match("[/\\]([^/\\]+)$") or filepath
   local short_name = fname:match("(.*)%.[^%.]+$") or fname
-  write_pad_name_to_gmem(pad_idx, short_name:sub(1, 32))
+  write_pad_name_to_gmem(pad_idx % G.NUM_PADS, short_name:sub(1, 32))
 
   -- Set target pad and send CMD 63 (JSFX handles directly via load_from_path).
   -- Re-assert INSTANCE so the active instance is the one that loads (other
@@ -3116,7 +3139,7 @@ load_sample_to_pad = function(filepath, pad_idx)
     a = analysis_cache[filepath]
   end
   if a and a.analyzed then
-    reaper.gmem_write(G.GS_PAD_BPM_BASE + pad_idx, a.bpm or 0)
+    reaper.gmem_write(G.GS_PAD_BPM_BASE + pad_idx % G.NUM_PADS, a.bpm or 0)
     -- Key: encode as note index (1-12) + minor flag (0 or 100)
     local key_val = 0
     if a.key then
@@ -3125,7 +3148,7 @@ load_sample_to_pad = function(filepath, pad_idx)
         if a.key == name .. "m" then key_val = i + 100; break end
       end
     end
-    reaper.gmem_write(G.GS_PAD_KEY_BASE + pad_idx, key_val)
+    reaper.gmem_write(G.GS_PAD_KEY_BASE + pad_idx % G.NUM_PADS, key_val)
   end
   queue_pad_category(pad_idx, filepath)
   return true
@@ -3133,7 +3156,7 @@ end
 
 load_layer_to_pad = function(filepath, pad_idx, layer_idx)
   if not filepath or not pad_idx then return false end
-  if pad_idx < 0 or pad_idx >= G.NUM_PADS then return false end
+  if pad_idx < 0 or pad_idx >= G.NUM_PADS * 4 then return false end   -- absolute (step 5c; see load_sample_to_pad)
   if math.floor(reaper.gmem_read(G.CMD)) ~= 0 then return false end -- busy
   if math.floor(reaper.gmem_read(G.LOCK)) ~= 0 then return false end -- bridge busy
 
@@ -3148,7 +3171,7 @@ load_layer_to_pad = function(filepath, pad_idx, layer_idx)
   if layer_idx == 0 then
     local fname = filepath:match("[/\\]([^/\\]+)$") or filepath
     local short_name = fname:match("(.*)%.[^%.]+$") or fname
-    write_pad_name_to_gmem(pad_idx, short_name:sub(1, 32))
+    write_pad_name_to_gmem(pad_idx % G.NUM_PADS, short_name:sub(1, 32))
     -- Layer 0 names the pad, so it also decides the pad's category. Layers
     -- 1..n are velocity/RR variants of the SAME drum and must not re-post.
     queue_pad_category(pad_idx, filepath)
@@ -3208,25 +3231,30 @@ local function load_selected_to_pads(as_layers)
   multi_load_status = ""
 
   if as_layers then
-    -- Layer mode: stack selected files as layers on active pad
-    -- Start from layer 0 (replaces all layers with the selection)
+    -- Layer mode: the selection goes AFTER the pad's layers, four at most -- the mini browser's rule and the user's
+    -- (2026-10-22: add, never replace; clear the pad first for a fresh stack). It used to start at layer 0 "replacing
+    -- all layers", and CMD 64 being additive, the old upper layers kept playing under the new ones. An empty pad starts
+    -- at layer 0, a pad with one plain sample at layer 1 (the sample becomes layer 0), a layered pad after its last.
     local max_layers = 4
+    local tile = ui.target_pad % 16   -- the META / AUDIOLEN bands are the bank on screen's
+    local first = pad_has_audio(tile) and math.max(get_pad_layer_count(tile), 1) or 0
+    local room = math.max(0, max_layers - first)
     for i, f in ipairs(files) do
-      local layer = i - 1
-      if layer >= max_layers then break end
+      if i > room then break end
       multi_load_queue[#multi_load_queue + 1] = {
-        filepath = f.entry.path, pad_idx = ui.target_pad, is_layer = true, layer = layer
+        filepath = f.entry.path, pad_idx = ui.target_pad, is_layer = true, layer = first + i - 1
       }
     end
-    if #files > max_layers then
-      multi_load_status = max_layers .. " of " .. #files .. " layered \xC2\xB7 max 4 layers"
+    if #files > room then
+      multi_load_status = room .. " of " .. #files .. " layered \xC2\xB7 max 4 layers"
     end
   else
-    -- Default: sequential fill from active pad
+    -- Default: sequential fill from active pad, to the end of its bank (step 5c)
     local pad = ui.target_pad
+    local bank_end = math.floor(pad / G.NUM_PADS) * G.NUM_PADS + G.NUM_PADS
     local loaded, total = 0, #files
     for _, f in ipairs(files) do
-      if pad >= G.NUM_PADS then break end
+      if pad >= bank_end then break end
       multi_load_queue[#multi_load_queue + 1] = {
         filepath = f.entry.path, pad_idx = pad, is_layer = false
       }
@@ -3389,7 +3417,8 @@ function xdrag.read_claim()
     if echo > 0 and (now - echo) < 0.25 then
       local pad  = math.floor(reaper.gmem_read(cb + G.EON_DRAG_CLAIM_PAD) or -1)
       local inst = math.floor(reaper.gmem_read(cb + G.EON_DRAG_CLAIM_INST) or 0)
-      if pad >= 0 and inst > 0 then return inst, pad end
+      local code = math.floor(reaper.gmem_read(cb + (G.EON_DRAG_CLAIM_LAYER or 3)) or 0)   -- the pad editor's layer tab
+      if pad >= 0 and inst > 0 then return inst, pad, code end
     end
   end
   return nil
@@ -3398,23 +3427,47 @@ end
 -- Queue the drop through the SAME retry-safe path the multi-select load uses
 -- (load_sample_to_pad fails fast while a CMD/LOCK is in flight, so a direct
 -- call here could silently drop the file).
-function xdrag.commit(inst, pad)
+function xdrag.commit(inst, pad, code)
   if not xdrag.paths or not pad or pad < 0 then return end
   multi_load_status = ""
+  if code and code > 0 then
+    -- onto the pad editor's layer tab (the user, 2026-10-22): the JSFX resolved where -- code - 1 = the first layer,
+    -- 9 = the first file replaces the pad and the rest stack from layer 1 -- four layers at most
+    local L, n = (code == 9) and -1 or (code - 1), 0
+    for _, p in ipairs(xdrag.paths) do
+      if L == -1 then
+        multi_load_queue[#multi_load_queue + 1] = { filepath = p, pad_idx = pad, is_layer = false, inst_id = inst }; L = 1
+      elseif L < 4 then
+        multi_load_queue[#multi_load_queue + 1] = { filepath = p, pad_idx = pad, is_layer = true, layer = L, inst_id = inst }
+        L = L + 1
+      else break end
+      n = n + 1
+    end
+    if n < #xdrag.paths then
+      multi_load_status = n .. " of " .. #xdrag.paths .. " layered \xC2\xB7 max 4 layers"
+    end
+    if n > 0 and inst and inst > 0 and inst ~= active_inst_id then
+      active_inst_id = inst
+      reaper.gmem_write(G.INSTANCE, active_inst_id)
+    end
+    xdrag.consumed_at = reaper.time_precise()
+    return
+  end
   -- Stamp the target instance on every queue ITEM. The queue drains over
   -- several frames and load_sample_to_pad routes by whatever gmem[INSTANCE]
   -- says at drain time, so binding globally here would misroute anything
   -- already queued for a different instance.
   local n = 0
+  local bank_end = math.floor(pad / G.NUM_PADS) * G.NUM_PADS + G.NUM_PADS   -- the claim names an absolute pad (4a)
   for i, p in ipairs(xdrag.paths) do
     local target = pad + i - 1
-    if target >= G.NUM_PADS then break end
+    if target >= bank_end then break end
     multi_load_queue[#multi_load_queue + 1] =
       {filepath = p, pad_idx = target, is_layer = false, inst_id = inst}
     n = n + 1
   end
   if n < #xdrag.paths then
-    multi_load_status = n .. " of " .. #xdrag.paths .. " loaded Â· not enough pads"
+    multi_load_status = n .. " of " .. #xdrag.paths .. " loaded \xC2\xB7 not enough pads"
   end
   -- Retarget the browser too, so the title bar and pad tiles follow the drop.
   if n > 0 and inst and inst > 0 and inst ~= active_inst_id then
@@ -3435,7 +3488,7 @@ function xdrag.update()
   if (reaper.JS_Mouse_GetState(1) & 1) == 0 then
     -- Released. Prefer a claim answered RIGHT NOW — the JSFX repaints on its
     -- own clock, so the freshest answer is the pad actually still lit.
-    local inst, pad = xdrag.read_claim()
+    local inst, pad, code = xdrag.read_claim()
     if not (inst and pad) then
       -- Nothing fresh. Fall back to the held claim, but ONLY if the cursor is
       -- still exactly where that claim was given: an instance that repaints
@@ -3444,14 +3497,14 @@ function xdrag.update()
       -- to get right.
       local m, cx, cy = xdrag.hit()
       if m and xdrag.at == (m .. ":" .. cx .. ":" .. cy) then
-        inst, pad = xdrag.inst, xdrag.pad
+        inst, pad, code = xdrag.inst, xdrag.pad, xdrag.code
       end
     end
     -- A release that ends over the browser's own window resolves to nothing
     -- here (xdrag.hit rejects our ImGui class), so ImGui's mini pad grid keeps
     -- sole ownership of that drop and nothing loads twice.
     if inst and pad and pad >= 0 then
-      xdrag.commit(inst, pad)
+      xdrag.commit(inst, pad, code)
     end
     xdrag.abort()
     return
@@ -3469,9 +3522,9 @@ function xdrag.update()
   -- Read the claim BEFORE publishing this frame's coords, so the pad we hold
   -- always corresponds to a broadcast the instances have already answered.
   local here = mode .. ":" .. cx .. ":" .. cy
-  local inst, pad = xdrag.read_claim()
+  local inst, pad, code = xdrag.read_claim()
   if inst and pad then
-    xdrag.inst, xdrag.pad, xdrag.pad_t = inst, pad, reaper.time_precise()
+    xdrag.inst, xdrag.pad, xdrag.code, xdrag.pad_t = inst, pad, code, reaper.time_precise()
     xdrag.at = here    -- remember WHERE this answer was given
   elseif xdrag.at and xdrag.at ~= here then
     -- The cursor has moved and nobody has answered for the new position yet.
@@ -4187,15 +4240,15 @@ local function draw_file_table(ctx)
               local ctx_sel_count = get_selected_count()
               if ctx_sel_count > 1 then
                 -- Multi-select context menu
-                if ImGui.MenuItem(ctx, "Load " .. ctx_sel_count .. " to Pads " .. (ui.target_pad + 1) .. "+") then
+                if ImGui.MenuItem(ctx, "Load " .. ctx_sel_count .. " to Pads " .. core.pad_label(ui.target_pad) .. "+") then
                   load_selected_to_pads(false)
                 end
-                if ImGui.MenuItem(ctx, "Layer " .. ctx_sel_count .. " on Pad " .. (ui.target_pad + 1)) then
+                if ImGui.MenuItem(ctx, "Layer " .. ctx_sel_count .. " on Pad " .. core.pad_label(ui.target_pad)) then
                   load_selected_to_pads(true)
                 end
               else
                 -- Single-file context menu
-                local load_label = "Load to Pad " .. (ui.target_pad + 1)
+                local load_label = "Load to Pad " .. core.pad_label(ui.target_pad)
                 if ImGui.MenuItem(ctx, load_label) then
                   load_sample_to_pad(e.path, ui.target_pad)
                 end
@@ -4207,7 +4260,9 @@ local function draw_file_table(ctx)
                     local pi_label = tostring(pi + 1)
                     if pi_name ~= "" then pi_label = pi_label .. " — " .. pi_name end
                     if ImGui.MenuItem(ctx, pi_label) then
-                      load_sample_to_pad(e.path, pi)
+                      -- the ABSOLUTE pad of the bank on screen, whose names label these rows (the audit, 2026-10-22:
+                      -- the tile alone loaded into bank A whatever bank was shown); on_pad_drop's rule
+                      load_sample_to_pad(e.path, math.floor(ui.target_pad / 16) * 16 + pi)
                     end
                   end
                   ImGui.EndMenu(ctx)
@@ -4488,6 +4543,19 @@ local function draw_playback_bar(ctx)
     end
     ImGui.Text(ctx, info)
     ImGui.PopStyleColor(ctx)
+    -- Before the drop (Spec_Swing_Pad_Banks §8.1, 2026-09-23): a file longer than a pad
+    -- holds at its own rate is trimmed on load -- 2,000,000 frames (SLOT_SIZE cells of
+    -- interleaved stereo in Swing_ReaKit.jsfx): 45 s at 44.1k, 20 s at 96k. Said here, in the
+    -- browser's own warning colour, where the drop can still be avoided.
+    if sel.duration and sel.duration > 0 then
+      local pad_cap = 2000000 / ((sel.sr and sel.sr > 0) and sel.sr or 44100)
+      if sel.duration > pad_cap then
+        ImGui.SameLine(ctx)
+        ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0xFFAA44FF))
+        ImGui.Text(ctx, ("  |  longer than a pad holds (%s)"):format(format_duration(pad_cap)))
+        ImGui.PopStyleColor(ctx)
+      end
+    end
 
     -- Measured character. Separate line and dimmer than the name row: these are
     -- derived labels, not file facts. SPACE is omitted on mono material rather
@@ -4700,6 +4768,28 @@ local function draw_playback_bar(ctx)
   if ImGui.IsItemHovered(ctx) then
     ImGui.SetTooltip(ctx, "Show time-grid overlay on the waveform")
   end
+
+  -- Sample storage rate (Spec_Swing_Pad_Banks §5.5, 2026-09-23): the ceiling the Kit
+  -- Bridge asks the decoder for. 48k by default -- a 96k file would otherwise cost twice
+  -- the room of a 48k one on a pad that holds a fixed number of cells; 96k and Native
+  -- are there for sound design (pitching a 96k sample down brings its top octave into
+  -- range). Read by the bridge from this same settings file.
+  ImGui.SameLine(ctx, nil, 12)
+  local srm = tonumber(settings.store_rate_max) or 48000
+  local srm_label = (srm == 0) and "Native" or ((srm == 96000) and "96k" or "48k")
+  ImGui.SetNextItemWidth(ctx, 84)
+  if ImGui.BeginCombo(ctx, "##store_rate", "Store " .. srm_label) then
+    for _, opt in ipairs({ { 48000, "48k (default)" }, { 96000, "96k" }, { 0, "Native" } }) do
+      if ImGui.Selectable(ctx, opt[2], srm == opt[1]) then
+        settings.store_rate_max = opt[1]
+        save_settings()
+      end
+    end
+    ImGui.EndCombo(ctx)
+  end
+  if ImGui.IsItemHovered(ctx) then
+    ImGui.SetTooltip(ctx, "Sample storage rate: files above this are converted as they load.\n48k keeps a 96k file from costing twice the pad room; Native stores it as-is.")
+  end
 end
 
 -- ─── Pad-info strip ─────────────────────────────────────────────────────
@@ -4734,12 +4824,12 @@ local function toggle_pad_ms(pad, ident_off, region_off)
 end
 local function draw_pad_info_strip(ctx)
   local pad = ui.target_pad or 0
-  local cur_note = core.read_pad_note(pad)
+  local cur_note = core.read_pad_note(pad % 16)   -- the META mirror is the active bank's sixteen (step 4a)
   local note_label = core.midi_to_note_name(cur_note)
   ImGui.AlignTextToFramePadding(ctx)
-  ImGui.Text(ctx, string.format("Pad %d  ", pad + 1))
-  if pad_playable(pad) then
-    local name = read_pad_name(pad)
+  ImGui.Text(ctx, "Pad " .. core.pad_label(pad) .. "  ")
+  if pad_playable(pad % 16) then   -- the IDENT / name bands are the bank on screen's tiles (step 5c)
+    local name = read_pad_name(pad % 16)
     if name and name ~= "" then
       ImGui.SameLine(ctx)
       ImGui.TextColored(ctx, widgets.ink(widgets.colors.text_dim), name)
@@ -4752,7 +4842,7 @@ local function draw_pad_info_strip(ctx)
     ImGui.OpenPopup(ctx, "##pad_note_picker")
   end
   if ImGui.IsItemHovered(ctx) then
-    ImGui.SetTooltip(ctx, "Set MIDI trigger note for pad " .. (pad + 1))
+    ImGui.SetTooltip(ctx, "Set MIDI trigger note for pad " .. core.pad_label(pad))
   end
   if ImGui.BeginPopup(ctx, "##pad_note_picker") then
     -- 11 octaves × 12 notes; render in a 12-column grid for compactness.
@@ -4766,7 +4856,7 @@ local function draw_pad_info_strip(ctx)
           local label = NOTE_PICKER_NAMES[pitch + 1] .. octave .. "##nt" .. n
           local sel = (n == cur_note)
           if ImGui.Selectable(ctx, label, sel, 0, 32, 0) then
-            post_pad_action(core.GMEM.INCMD_NOTE_OFF, pad, n)
+            post_pad_action(core.GMEM.INCMD_NOTE_OFF, pad % 16, n)   -- INCMD is bank-relative (4a)
             ImGui.CloseCurrentPopup(ctx)
           end
         end
@@ -4778,7 +4868,7 @@ end
 
 local function draw_pad_grid(ctx)
   widgets.draw_pad_grid(ctx, {
-    target_pad      = ui.target_pad,
+    target_pad      = ui.target_pad % 16,   -- the grid's tiles are the active bank (step 4a)
     read_pad_name   = read_pad_name,
     pad_has_audio   = pad_playable,   -- tile "loaded" state: synth pads count
     get_pad_color   = get_pad_color_from_gmem,
@@ -4788,7 +4878,7 @@ local function draw_pad_grid(ctx)
     -- muted pads dim to match the JSFX UI.
     is_pad_muted    = function(p) return reaper.gmem_read(G.GS_PAD_MUTED_BASE + p) > 0 end,
     on_pad_click = function(p)
-      ui.target_pad = p
+      ui.target_pad = math.floor(ui.target_pad / 16) * 16 + p   -- the same bank the JSFX shows (step 4a)
       reaper.gmem_write(G.GS_PAD_SELECT_REQ, p)
       -- Trigger pad playback if it's playable (sample OR synth — the JSFX
       -- handler gates on pad_is_playable too)
@@ -4804,10 +4894,13 @@ local function draw_pad_grid(ctx)
       if xdrag.consumed_at and (reaper.time_precise() - xdrag.consumed_at) < 0.10 then
         return
       end
+      -- Pad Banks step 5c: p is a TILE of the bank on screen; the loads take the absolute pad (the tile alone
+      -- landed in bank A whatever bank was shown).
+      local ap = math.floor(ui.target_pad / 16) * 16 + p
       if payload_type == "SWING_MULTI" then
         local is_alt = (ImGui.GetKeyMods(ctx) & ImGui.Mod_Alt) ~= 0
         local prev_target = ui.target_pad
-        ui.target_pad = p
+        ui.target_pad = ap
         reaper.gmem_write(G.GS_PAD_SELECT_REQ, p)
         if is_alt then
           load_selected_to_pads(true)   -- Alt+drop: layer on this pad
@@ -4815,8 +4908,16 @@ local function draw_pad_grid(ctx)
           load_selected_to_pads(false)  -- Normal drop: sequential fill from this pad
         end
         ui.target_pad = prev_target
+      elseif (ImGui.GetKeyMods(ctx) & ImGui.Mod_Alt) ~= 0 and pad_has_audio(p) then
+        -- ONE file with Alt: the pad's NEXT layer, the "+ LAYER" button's rule and the mini browser's (the audit,
+        -- 2026-10-22: Alt was read for a multi-drag only, so a single file replaced the pad). Queued, so a busy
+        -- channel retries it instead of dropping it. A full pad (4 layers) takes nothing, like the greyed button.
+        local nl = math.max(get_pad_layer_count(p), 1)
+        if nl < 4 then
+          multi_load_queue[#multi_load_queue + 1] = { filepath = payload, pad_idx = ap, is_layer = true, layer = nl }
+        end
       else
-        load_sample_to_pad(payload, p)
+        load_sample_to_pad(payload, ap)
       end
     end,
     -- Right-click menu: per-pad mute / solo / reverse / set-note / open-FX.
@@ -4863,13 +4964,7 @@ local function draw_pad_grid(ctx)
         local opened = false
         for tr in core.iter_all_tracks() do
           for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
-            local _, fname = reaper.TrackFX_GetFXName(tr, fx, "")
-            local retval, ident = reaper.TrackFX_GetNamedConfigParm(tr, fx, "fx_ident")
-            local is_swing = (retval and ident:find("DrumKit_ReaKit"))
-                          or fname:find("DrumKit_ReaKit")
-                          or fname:match("^JS: Swing")
-                          or fname:match("Swing %— 16%-Pad")
-            if is_swing then
+            if core.is_swing_fx(tr, fx) then   -- the plugin's file, never its shown name
               local id = math.floor(reaper.TrackFX_GetParam(tr, fx, 3) or 0)
               local pick = (target_id > 0 and id == target_id) or (target_id <= 0 and not opened)
               if pick then
@@ -4892,25 +4987,25 @@ local function draw_pad_controls(ctx)
   local entries = get_display_entries()
   local sel = entries[file_mgr.selected_index]
   local sel_count = get_selected_count()
-  local layer_cnt = get_pad_layer_count(ui.target_pad)
-  local has_audio = pad_has_audio(ui.target_pad)
+  local layer_cnt = get_pad_layer_count(ui.target_pad % 16)   -- the META / AUDIOLEN bands are the bank on screen's
+  local has_audio = pad_has_audio(ui.target_pad % 16)
 
   if sel_count > 1 then
-    -- Multi-select: two buttons — LOAD (sequential) and LAYER (stack)
-    local end_pad = math.min(ui.target_pad + sel_count, G.NUM_PADS)
-    local load_label = "LOAD " .. sel_count .. " \xE2\x86\x92 PADS " .. (ui.target_pad + 1) .. "-" .. end_pad
+    -- Multi-select: two buttons — LOAD (sequential) and LAYER (stack); the fill stops at the end of the bank
+    local end_pad = math.min(ui.target_pad + sel_count, math.floor(ui.target_pad / 16) * 16 + 16)
+    local load_label = "LOAD " .. sel_count .. " \xE2\x86\x92 PADS " .. core.pad_label(ui.target_pad) .. "-" .. core.pad_label(end_pad - 1)
     if ImGui.Button(ctx, load_label, -1, 26) then
       load_selected_to_pads(false)
     end
-    -- Layer button: stack all on one pad (replaces from layer 0)
+    -- Layer button: stack all on one pad, after its layers (load_selected_to_pads)
     local max_layers = 4
     if sel_count > max_layers then
       ImGui.BeginDisabled(ctx)
-      local layer_label = "LAYER " .. sel_count .. " \xE2\x86\x92 PAD " .. (ui.target_pad + 1) .. " (MAX " .. max_layers .. ")"
+      local layer_label = "LAYER " .. sel_count .. " \xE2\x86\x92 PAD " .. core.pad_label(ui.target_pad) .. " (MAX " .. max_layers .. ")"
       ImGui.Button(ctx, layer_label, -1, 26)
       ImGui.EndDisabled(ctx)
     else
-      local layer_label = "LAYER " .. sel_count .. " \xE2\x86\x92 PAD " .. (ui.target_pad + 1)
+      local layer_label = "LAYER " .. sel_count .. " \xE2\x86\x92 PAD " .. core.pad_label(ui.target_pad)
       if ImGui.Button(ctx, layer_label, -1, 26) then
         load_selected_to_pads(true)
       end
@@ -4919,7 +5014,7 @@ local function draw_pad_controls(ctx)
     -- Single-file: primary LOAD button
     local can_load = sel and not sel.is_dir
     if not can_load then ImGui.BeginDisabled(ctx) end
-    local load_label = "LOAD \xE2\x86\x92 PAD " .. (ui.target_pad + 1)
+    local load_label = "LOAD \xE2\x86\x92 PAD " .. core.pad_label(ui.target_pad)
     if ImGui.Button(ctx, load_label, -1, 28) then
       if sel then load_sample_to_pad(sel.path, ui.target_pad) end
     end
@@ -4930,7 +5025,7 @@ local function draw_pad_controls(ctx)
       local max_layers = 4
       local next_layer = math.max(layer_cnt, 1)
       if next_layer < max_layers then
-        local layer_label = "+ LAYER \xE2\x86\x92 PAD " .. (ui.target_pad + 1) .. " [" .. next_layer .. "/" .. max_layers .. "]"
+        local layer_label = "+ LAYER \xE2\x86\x92 PAD " .. core.pad_label(ui.target_pad) .. " [" .. next_layer .. "/" .. max_layers .. "]"
         if ImGui.Button(ctx, layer_label, -1, 24) then
           load_layer_to_pad(sel.path, ui.target_pad, next_layer)
         end
@@ -5224,6 +5319,13 @@ local function handle_keys(ctx)
         if sel then
           if sel.is_dir then
             navigate_to(sel.path)
+          elseif as_layers and pad_has_audio(ui.target_pad % 16) then
+            -- Shift+Enter on ONE file: the next layer, as the help table says ("Layer selected on active pad"); it
+            -- replaced the pad (the audit, 2026-10-22). The "+ LAYER" button's rule, queued.
+            local nl = math.max(get_pad_layer_count(ui.target_pad % 16), 1)
+            if nl < 4 then
+              multi_load_queue[#multi_load_queue + 1] = { filepath = sel.path, pad_idx = ui.target_pad, is_layer = true, layer = nl }
+            end
           else
             load_sample_to_pad(sel.path, ui.target_pad)
           end
@@ -5498,10 +5600,7 @@ local function frame()
       for ti = 0, reaper.CountTracks(0) - 1 do
         local tr = reaper.GetTrack(0, ti)
         for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
-          local _, fname = reaper.TrackFX_GetFXName(tr, fx, "")
-          local rv, ident = reaper.TrackFX_GetNamedConfigParm(tr, fx, "fx_ident")
-          if (rv and ident:find("DrumKit_ReaKit")) or fname:find("DrumKit_ReaKit")
-             or fname:match("^JS: Swing") or fname:match("Swing %— 16%-Pad") then
+          if core.is_swing_fx(tr, fx) then   -- the plugin's file, never its shown name
             ui.swing_present = true
             break
           end
@@ -5554,7 +5653,7 @@ local function frame()
   -- Read target pad from gmem each frame
   ui.target_pad = math.floor(reaper.gmem_read(G.GS_BROWSE_PAD))
   if ui.target_pad < 0 then ui.target_pad = 0 end
-  if ui.target_pad > 15 then ui.target_pad = 15 end
+  if ui.target_pad > 63 then ui.target_pad = 63 end   -- an ABSOLUTE pad since Pad Banks step 4a (bank * 16 + tile)
 
   if ui.target_pad ~= ui.prev_target_pad then
     ui.prev_target_pad = ui.target_pad
@@ -5667,13 +5766,7 @@ local function frame()
       for tr in core.iter_all_tracks() do
         local found = false
         for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
-          local _, fname = reaper.TrackFX_GetFXName(tr, fx, "")
-          local retval, ident = reaper.TrackFX_GetNamedConfigParm(tr, fx, "fx_ident")
-          local is_swing = (retval and ident:find("DrumKit_ReaKit"))
-                        or fname:find("DrumKit_ReaKit")
-                        or fname:match("^JS: Swing")
-                        or fname:match("Swing %— 16%-Pad")
-          if is_swing then
+          if core.is_swing_fx(tr, fx) then   -- the plugin's file, never its shown name
             local id = math.floor(reaper.TrackFX_GetParam(tr, fx, 3) or 0)
             if id == current_target then
               track_num = math.floor(reaper.GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"))
@@ -5825,13 +5918,7 @@ local function frame()
         local found = false
         for tr in core.iter_all_tracks() do
           for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
-            local _, fname = reaper.TrackFX_GetFXName(tr, fx, "")
-            local retval, ident = reaper.TrackFX_GetNamedConfigParm(tr, fx, "fx_ident")
-            local is_swing = (retval and ident:find("DrumKit_ReaKit"))
-                          or fname:find("DrumKit_ReaKit")
-                          or fname:match("^JS: Swing")
-                          or fname:match("Swing %— 16%-Pad")
-            if is_swing then
+            if core.is_swing_fx(tr, fx) then   -- the plugin's file, never its shown name
               local id = math.floor(reaper.TrackFX_GetParam(tr, fx, 3) or 0)
               if id == target_id then
                 local floating = reaper.TrackFX_GetFloatingWindow(tr, fx) ~= nil

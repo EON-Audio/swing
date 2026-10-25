@@ -142,7 +142,8 @@ end
 
 -- Cheap signature of everything the mirror output depends on: per MIDI item,
 -- REAPER's own note hash plus the item geometry/flags that move notes in
--- project time. Rebuilds only happen when this string changes.
+-- project time. Sync rebuilds when this string OR the trigger's own signature
+-- (trigger_sig below) changes.
 function M.Digest(lanes)
   local parts = {}
   for _, L in ipairs(lanes) do
@@ -298,12 +299,38 @@ end
 -- sync
 -- ---------------------------------------------------------------------------
 
--- Per-instance digest of the last successful rebuild.
+-- Per-instance digest of the last successful rebuild: the lanes' Digest plus
+-- the trigger's signature as the rebuild LEFT it.
 local last_digest = {}
 
--- Forget the cached digest so the next Sync rebuilds unconditionally. Call
--- after anything that can change the trigger track behind our back (project
--- load, undo, a rebuilt kit).
+-- The trigger track's own contents: item count, then per item its take's note
+-- hash and its place. The lanes alone cannot see an undo: a rebuild makes no
+-- undo point, so the next unrelated undo point takes it in, and undoing that
+-- point puts the OLD trigger item back while the lanes stay as they are -- a
+-- lane-only digest still matches and the stale trigger keeps playing (audit
+-- H02, 2026-10-23). Each rebuild makes a new item, so this changes whenever
+-- anything but the last rebuild wrote the trigger.
+local function trigger_sig(trigger)
+  local n = reaper.CountTrackMediaItems(trigger)
+  local parts = { tostring(n) }
+  for i = 0, n - 1 do
+    local item = reaper.GetTrackMediaItem(trigger, i)
+    local take = item and reaper.GetActiveTake(item)
+    local hash
+    if take and reaper.MIDI_GetHash then
+      local ok, h = reaper.MIDI_GetHash(take, false, '')
+      if ok then hash = h end
+    end
+    parts[#parts + 1] = string.format('%s|%.6f|%.6f', hash or '?',
+      item and reaper.GetMediaItemInfo_Value(item, 'D_POSITION') or -1,
+      item and reaper.GetMediaItemInfo_Value(item, 'D_LENGTH') or -1)
+  end
+  return table.concat(parts, ';')
+end
+
+-- Forget the cached digest so the next Sync rebuilds unconditionally. Undo
+-- needs no call (the trigger's signature catches it); the bridge and
+-- EON_DM_MergedMirror.lua still call it when the active project changes.
 function M.Reset(swing_guid)
   if swing_guid then last_digest[swing_guid] = nil else last_digest = {} end
 end
@@ -320,14 +347,17 @@ function M.Sync(swing_guid, force)
   local trigger = M.FindTrigger(swing_guid)
   if not trigger then return false end
 
-  local digest = M.Digest(lanes)
+  local lane_digest = M.Digest(lanes)
+  local digest = lane_digest .. '//' .. trigger_sig(trigger)
   if not force and last_digest[swing_guid] == digest then return false end
 
   reaper.PreventUIRefresh(1)
   local ok = M.Rebuild(trigger, M.Collect(lanes))
   reaper.PreventUIRefresh(-1)
   if ok then
-    last_digest[swing_guid] = digest
+    -- Re-read the trigger AFTER the rebuild: the value from before it would
+    -- differ from the next pass's and cost every lane edit a second rebuild.
+    last_digest[swing_guid] = lane_digest .. '//' .. trigger_sig(trigger)
     reaper.UpdateArrange()
   end
   return ok

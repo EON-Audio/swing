@@ -200,6 +200,21 @@ function core.jsfx_addname(basename, hint_tr, hint_fx)
   return addname, abs
 end
 
+-- A plugin's file: the basename of its fx_ident, case-folded ("swing_reakit.jsfx"); "" when REAPER gives none.
+function core.fx_file(tr, fx)
+  local ok, ident = reaper.TrackFX_GetNamedConfigParm(tr, fx, "fx_ident")
+  return ok and ((ident or ""):match("[^/\\]+$") or ""):lower() or ""
+end
+-- Is FX `fx` on `tr` a Swing instance? By its FILE, compared whole (wiki §6.16): Swing, Swing Lite (a client of
+-- the same gmem bus) and the pre-rename file. Never by the name REAPER shows: that is the user's rename when there
+-- is one, and the file's path when REAPER's JSFX name cache holds a blank entry for it -- 2026-10-15 the kit
+-- bridge's roster came back empty that way and no kit source was recorded (EON e2d2eeb2). The one owner: every
+-- script that looks for Swing asks here (the kit bridge's is_swing_fx too).
+core.SWING_FX_FILES = { ["swing_reakit.jsfx"] = true, ["swing_lite.jsfx"] = true, ["drumkit_reakit.jsfx"] = true }
+function core.is_swing_fx(tr, fx)
+  return core.SWING_FX_FILES[core.fx_file(tr, fx)] == true
+end
+
 -- Persistent analysis cache (BPM/key short-circuit data, see Swing_Browser.lua).
 -- Lives next to Swing_Kits so it ships+backs-up with the rest of Swing's data.
 function core.get_cache_dir()
@@ -471,9 +486,10 @@ core.GMEM = {
   AUDIO_BASE    = 3000,
 
   NUM_PADS      = 16,
+  NUM_SLOTS     = 64,        -- absolute pads, four banks of NUM_PADS (Swing_ReaKit.jsfx NUM_SLOTS); the bridge's retained pitch sources are keyed by these since step 3 (2026-10-05)
   MAX_LAYERS    = 4,
   SLOT_SIZE     = 4000000,
-  LAYER_SIZE    = 1000000,
+  LAYER_SIZE    = 4000000,   -- = SLOT_SIZE since 2026-09-23: a layer holds what a pad holds (Swing_ReaKit.jsfx LAYER_SIZE)
   -- Where the audio band (AUDIO_BASE+) really ends: the Stretch rings start at
   -- 16,777,216 (protocol md §3). The JSFX kit-export dump stops here
   -- (KIT_GMEM_AUDIO_DUMP_END) and the bridge's audio clamps derive from it.
@@ -526,6 +542,13 @@ core.GMEM = {
   -- Per-pad smash-send kit overflow (META's 80-float stride is full).
   -- MUST match Swing_ReaKit.jsfx GS_PAD_SMASH_BASE.
   GS_PAD_SMASH_BASE    = 26090240,  -- ..26090255
+  -- JSFX → bridge, per state-11 dump (2026-10-10): + tile * 4 + layer = the layer's bake anchor (sp_baked_tune;
+  -- 0 = its own audio, else a Tuned bake at that many semitones), then the STAMP's ID = the dumping instance_id and
+  -- the STAMP = bank + 1. The bridge takes them only for the instance it saves and zeroes the stamp after reading
+  -- (Swing Lite's dumps never write them). MUST match Swing_ReaKit.jsfx.
+  GS_KIT_EXPORT_ANCHOR       = 26090120,  -- ..26090183
+  GS_KIT_EXPORT_ANCHOR_STAMP = 26090184,
+  GS_KIT_EXPORT_ANCHOR_ID    = 26090185,
   GS_COMPANION_CMD     = 1710,
   GS_COMPANION_TARGET  = 2250,  -- instance_id the companion cmd is FOR (0 = broadcast).
                                 -- Stamp BEFORE the cmd; the consumer clears both.
@@ -614,6 +637,15 @@ core.GMEM = {
                                     -- deliberately left alone: misc_cmds eats it in ms
                                     -- and that consume doubles as the pad name/color
                                     -- refresh signal. Stamp written BEFORE CMD.
+  GS_KIT_EXPORT_BANK   = 26090344,  -- bridge → JSFX: the bank (0..3) the next state-11 kit-export
+                                    -- dump publishes (0 = bank A). Pad Banks step 3b, 2026-09-23.
+  GS_KIT_LOAD_BANK     = 26090345,  -- bridge → JSFX: bank + 16 * wipe_mask for the next kit-import
+                                    -- pass; the JSFX latches and zeroes it at its state-1 arm.
+  GS_KIT_LOAD_INTO     = 26090346,  -- JSFX → bridge: bank + 1 = the next requested kit's bank A lands in
+                                    -- that bank only (one pass, no wipe); consumed at the kit-request
+                                    -- pickup. Pad Banks step 4c, 2026-09-23.
+  GS_KIT_EXPORT_ONLY   = 26090347,  -- JSFX → bridge: bank + 1 = save that ONE bank as a one-bank kit;
+                                    -- consumed at CMD 10 / the dev-export pickup. Step 4c.
   GS_EXPORT_OVER       = 26090343,  -- JSFX → bridge: 1 = the state-11 audio dump stopped
                                     -- at the export band's ceiling (AUDIO_DUMP_END): the
                                     -- kit holds more audio than the band carries. The
@@ -638,6 +670,7 @@ core.GMEM = {
   GS_INST_REG_OFF_HEARTBEAT  = 1,
   GS_INST_REG_OFF_PAD_COUNT  = 2,
   GS_INST_REG_OFF_KIT_HASH   = 3,
+  GS_INST_BANK_CUR           = 26090352,   -- + registry slot: the pad bank on screen, 0..3 (Pad Banks step 5a)
   -- ─── EON_DRAG: browser drag-over mailbox (base + slot*STRIDE) ───────
   -- A ReaImGui drag never becomes an OLE drop, so the JSFX pad grid's
   -- gfx_getdropfile can't see a browser drag. The browser tracks the
@@ -670,6 +703,7 @@ core.GMEM = {
   EON_DRAG_CLAIM_PAD   = 0,  -- instance → browser: hovered pad (-1 = none)
   EON_DRAG_CLAIM_INST  = 1,  -- which instance is claiming
   EON_DRAG_CLAIM_ECHO  = 2,  -- echoes the broadcast stamp it answered, LAST
+  EON_DRAG_CLAIM_LAYER = 3,  -- the layer code (2026-10-22): 0 the pad, 1..4 from layer code - 1, 9 replace + stack
   -- ─── Per-pad action channel (browser → JSFX) ───────────────────────
   -- Used by the browser's note-per-pad selector and right-click menu to
   -- drive per-pad state changes. Only the browser-target Swing acts.
@@ -751,11 +785,18 @@ core.GMEM = {
   -- default after an audio-device-close re-instantiation (instead of letting that
   -- default propagate into Swing). MUST match EON_Drum_Strip.jsfx.
   GS_STRIP_REINIT_PULSE = 26090100,
+  -- The Wired ring (rk_swing_patchbay.jsfx-inc): the bridge reads the layout its Patchbay stamps every block (Pad
+  -- Banks Outputs step 5: the track grows for the bank pairs only under the new layout). MUST match the inc --
+  -- gmem_name_parity compares the shared names.
+  PATCH_BASE            = 26804224,
+  PATCH_INST_STRIDE     = 262144,
+  PATCH_OFF_NCH         = 4,
+  PATCH_CHANS           = 62,    -- the step-5 layout's stamp (the old one stamps 32, an older Patchbay nothing)
   GS_STRIP_BASE         = 26050000,
   GS_STRIP_STRIDE       = 1024,
   GS_STRIP_OFF_SEQ      = 0,   -- JSFX→Lua: publish seq (bumped per rewrite)
   GS_STRIP_OFF_MULTIOUT = 1,   -- JSFX→Lua: multi_out flag
-  GS_STRIP_OFF_LUA_HB   = 2,   -- Lua→JSFX: heartbeat (bump ~10Hz; stall = takeover off)
+  GS_STRIP_OFF_LUA_HB   = 2,   -- Lua→JSFX: heartbeat (bump once per defer tick, ~30 Hz; Swing times it on its own clock: still for 1 s with the transport stopped = takeover off, held while playing/rendering)
   GS_STRIP_OFF_VIEW_REQ = 3,   -- Swing→Lua: header STRIPS selector → (mode+1); sync_view pushes to strips
   GS_STRIP_OFF_CMD_SEQ  = 4,   -- Lua→JSFX: bump LAST, after PAD/PID/VAL
   GS_STRIP_OFF_CMD_PAD  = 5,
@@ -808,7 +849,59 @@ core.GMEM = {
   GS_STRIP_OFF_TNL_SEQ   = 656,  -- bumped LAST, after PARAM and VAL
   GS_STRIP_OFF_TNL_PARAM = 657,  -- 1..18 since ser_ver 75
   GS_STRIP_OFF_TNL_VAL   = 658,
-  -- 659..671 still free.
+  -- (659..663 the Q echo above; 664..699 still free.)
+  -- Pad Banks Outputs step 2, Swing → Lua every publish: what plays where (the bridge's bank and split-pad
+  -- tracks). OUT_GEN: odd while Swing writes the block, even (2, 4, ...) once whole -- read it before and after,
+  -- take the block only on the same even value (0 from an older Swing: no bank tracks for it).
+  -- OUT_USE + p (p 0..31) = playable slots on pair p; OUT_OWN + k (k 0..9) = lowest playable slot on split pair
+  -- 22 + k, plus 1 (0 none); BKNAME + 32 * (b - 1) = bank b's name (B, C, D), byte codes, 0-terminated.
+  -- MUST match Swing_ReaKit.jsfx.
+  GS_STRIP_OFF_OUT_GEN  = 700,
+  GS_STRIP_OFF_OUT_USE  = 704,   -- ..735
+  GS_STRIP_OFF_OUT_OWN  = 736,   -- ..745
+  GS_STRIP_OFF_BKNAME   = 768,   -- ..863
+  GS_STRIP_BKNAME_LEN   = 32,
+  -- Step 3: OUT_PAIR + slot (0..63, Swing → Lua, under OUT_GEN) = the pair the slot plays on (the FX picker aims a
+  -- pad through it); OUT_TRK + k (k 0..9, Lua → Swing, the bridge writes, NOT under OUT_GEN) = slot + 1 whose
+  -- track the bridge holds for split pair 22 + k, 0 none (Swing's "Own output" prefers a pad's own track).
+  GS_STRIP_OFF_OUT_PAIR = 864,   -- ..927
+  GS_STRIP_OFF_OUT_TRK  = 928,   -- ..937
+  -- OUT_UREQ (Swing -> Lua, under OUT_GEN; 2026-10-16): a count that moves on every output choice a person makes
+  -- (Swing's swing_out_touched); the bridge gives each one a REAPER undo point, with the track it makes when it makes
+  -- one, so Ctrl+Z takes the choice and the track back together. 0 from an older Swing (never moves).
+  GS_STRIP_OFF_OUT_UREQ = 938,
+  -- Bank colours (2026-10-15): BANK_COL + b (b 0..3, Lua -> Swing, the bridge writes, NOT under OUT_GEN) = the colour
+  -- of bank b's track (bank A's folder, B..D's bank tracks) as 0xRRGGBB + 1, 0 none. Swing's bank tabs wear it.
+  GS_STRIP_OFF_BANK_COL = 746,   -- ..749
+  -- the bank colour set (Swing's THEME menu, 2026-10-15), Swing -> Lua: BANK_SET = set + 1 (1 = Off, 0 = an older
+  -- Swing that never writes it), BANK_DEF + b = bank b's colour in the set as 0xRRGGBB + 1 (0 with Off).
+  -- MUST match Swing_ReaKit.jsfx GS_STRIP_OFF_BANK_DEF / _SET.
+  GS_STRIP_OFF_BANK_DEF = 750,   -- ..753
+  GS_STRIP_OFF_BANK_SET = 754,
+  -- Banks B..D's Drum Strips (2026-10-15): a split pair's strip belongs to its owner (OUT_OWN). Per registry slot:
+  -- + k * GS_STRIP_PAD_STRIDE the owner's record (pad-record layout), + OWNER + k its slot + 1, + MASK (Lua -> Swing,
+  -- bit k = split pair k's track has a live strip), + VER (Swing -> Lua, 1 = honoured), + TIE + k * 4 the console
+  -- tie (gain slot + 1, gain, pan slot + 1, pan). MUST match Swing_ReaKit.jsfx GS_SPLIT_*.
+  GS_SPLIT_BASE         = 26080720,
+  GS_SPLIT_STRIDE       = 512,
+  GS_SPLIT_OFF_OWNER    = 320,   -- ..329
+  GS_SPLIT_OFF_MASK     = 330,
+  GS_SPLIT_OFF_VER      = 331,
+  GS_SPLIT_OFF_TIE      = 332,   -- ..371
+  GS_SPLIT_PAIR0        = 22,    -- split pair k = pair 22 + k (Swing's OUT_PAIR_SPLIT)
+  GS_SPLIT_N            = 10,
+  -- Step 5, the FX picker: OUT_WPAIR + slot (0..63, Swing -> Lua, under OUT_GEN) = the pair the slot's audio rides
+  -- under WIRED, plus 1 (bank A's 0..15, the bank / split pairs 19..31; 0 = an older Swing). Beside an old
+  -- Patchbay (the old layout) it differs from OUT_PAIR: every slot rides a bank A pair there.
+  GS_STRIP_OFF_OUT_WPAIR = 944,  -- ..1007
+  -- Step 4, the mixer panel: MIX_STATE (Lua -> Swing: 0 not the theme that narrows the panel / no bridge, 1 not
+  -- asked, 2 full width = Swing's strip on Layout B, 3 leave it), MIX_REQ (Swing -> Lua, consumed to 0: 1 use
+  -- Layout B, 2 leave it), EMB_W / EMB_HB (Swing -> Lua: the panel's width while an embedded face draws, and a count
+  -- that moves while it does).
+  GS_STRIP_OFF_MIX_STATE = 940,
+  GS_STRIP_OFF_MIX_REQ  = 941,
+  GS_STRIP_OFF_EMB_W    = 942,
+  GS_STRIP_OFF_EMB_HB   = 943,
 
   -- ─── Comp link band (a Weld and the deck that drives it) ─────────────────
   -- MUST match EON_Weld.jsfx GS_BC_LINK_*. Row = BASE + row * STRIDE, 64 rows,
@@ -956,6 +1049,18 @@ core.GMEM = {
   INST_PADNAME_BASE        = 26010000,  -- slot*STRIDE + pad*32 chars (0-terminated)
   INST_PADNAME_INST_STRIDE = 512,       -- 16 pads * 32
   INST_PADNAME_PAD_LEN     = 32,
+  -- All-bank identity + names (2026-10-22, Plan_Swing_All_Bank_Note_Names): the same eight fields and 32-char names for
+  -- all SIXTY-FOUR pads (bank * 16 + pad): the JSFX compares the notes, blank flags and names every block and the other
+  -- fields on its heal blocks, rewriting only what differs, with a
+  -- slot header in front: +0 STAMP (1 = this instance publishes them; 0 = a Lite or an older Swing: read the sixteen-pad
+  -- bands), +1 GEN (bumped LAST when a pad's NOTE, AUDIO or name changed), +2 PUBS, +3 FGEN (any field). The bridge's
+  -- note-name walker rebuilds a track's names whole from these when GEN moves. The free gap above EON_SEQ_PRINT.
+  INST_IDENT64_BASE        = 31540000,  -- slot*528 + 16 + (bank*16+pad)*8 + field
+  INST_IDENT64_INST_STRIDE = 528,
+  INST_IDENT64_HDR         = 16,
+  IDENT64_OFF_STAMP = 0, IDENT64_OFF_GEN = 1, IDENT64_OFF_PUBS = 2, IDENT64_OFF_FGEN = 3,
+  INST_PADNAME64_BASE        = 31550000,  -- slot*2048 + (bank*16+pad)*32 chars (0-terminated)
+  INST_PADNAME64_INST_STRIDE = 2048,
   -- Kit-categories band (Spec_Swing_Kit_Categories §7a): per-pad {category, source,
   -- lock} published by the BRIDGE (owner: Lua — unlike IDENT which the JSFX owns).
   -- Same torn-read discipline as IDENT: per-pad VER written LAST; readers treat
@@ -971,6 +1076,14 @@ core.GMEM = {
   PADCAT_OFF_CAT  = 1,                  -- 46-vocab index, -1 = uncategorised
   PADCAT_OFF_SRC  = 2,                  -- 0 = kit/inferred, 1 = library, 2 = custom
   PADCAT_OFF_LOCK = 3,                  -- 1 = audio-locked (phase ② consumes)
+  -- Audio-lock masks for all four banks (2026-10-16; audit S10's remainder): the PADCAT band holds the bank ON
+  -- SCREEN's sixteen, so a kit load into another bank could not see that bank's locks. Bridge-owned, JSFX reads.
+  -- + slot * STRIDE + bank = that bank's sixteen pads as a bit mask (bit = tile); + PADLOCK_OFF_VER = 1 once this
+  -- bridge has published the slot (0 = an older bridge: Swing falls back to the band for the bank on screen).
+  -- MUST match Swing_ReaKit.jsfx EON_PADLOCK_*.
+  INST_PADLOCK_BASE   = 26004100,       -- slot*STRIDE + bank (0..3); 16 slots -> 26004100..26004227
+  INST_PADLOCK_STRIDE = 8,
+  PADLOCK_OFF_VER     = 4,
 
   -- Change-map band (Spec_Swing_Change_Map_And_Reroll §3.2): what the LAST kit
   -- operation actually did to each pad, so the KIT-tab grid can report it. BRIDGE
@@ -1271,6 +1384,36 @@ core.GMEM = {
   -- 16-instance control region (top 32525567), same NSEEL block, same stride:
   --   gmem[STRETCH_PER_PAD_SRCGEN_BASE + slot*STRETCH_CONTROL_INSTANCE_STRIDE + pad]
   STRETCH_PER_PAD_SRCGEN_BASE = 32525568,
+  -- (The Extension DOES read the SRCGEN band since 220b1ce: its Stretch preload is keyed by the
+  -- value, compared with != and cast to uint32 -- so the value stays below 2^31. Corrected
+  -- 2026-10-05; the paragraph above predates that.)
+
+  -- The pitch SPOT handshake (Plan_Swing_Pad_Banks_Tuned §5A.5, step 3, 2026-10-05). A spot is
+  -- one of the Extension's sixteen rows per instance; step 3 keeps every spot on bank A pad s
+  -- (identity), step 4 lends them to any pad. MIRROR of rk_swing_block_pitch.jsfx-inc.
+  --   SPOT MAP, Swing -> bridge, slot*SPOT_MAP_STRIDE: per spot s at +s*4: +0 OWNER = the
+  --     absolute pad + 1 (0 = free), +1 STATE (0 free, 1 pending, 2 live, 3 draining; a draining
+  --     spot writes 3 + 4 x its drain token, step 4), +2 GEN = the owner's source generation (an
+  --     @init epoch + sp_src_gen), written LAST; +63 MAP_VER = 1 (0 = an older Swing: identity,
+  --     and the SRCGEN band is watched as before). +3 is never used: spot 15's +3 IS +63.
+  --   SPOT ANSWER, bridge -> Swing, slot*SPOT_ANS_STRIDE: +0..15 per spot the GEN the bridge
+  --     has prepared (old keys blanked, queued reverts dropped, the owner's layer-0 source
+  --     published or fenced); +16 HB = the bridge's tick counter (Swing's gate: no moving
+  --     heartbeat = an older bridge, and Swing publishes SRCGEN at once as before); +17
+  --     ANS_VER = 2 (1 = the step 3 bridge, which answers no drains: Swing then lends nothing);
+  --     +32..47 per spot the drain answer (step 4): the token of the drain the bridge finished.
+  -- Swing publishes a spot's new SRCGEN only after the answer matches, so the Extension's
+  -- Stretch preload (keyed by the SRCGEN value, not the path) never pairs a new value with the
+  -- old sound (§5A.3); until 4 Extension heartbeats after the answer the owner's Stretch hits
+  -- play the plain way (the hold).
+  SPOT_MAP_BASE       = 32526784,
+  SPOT_MAP_STRIDE     = 64,
+  SPOT_MAP_OFF_VER    = 63,
+  SPOT_ANS_BASE       = 32527808,
+  SPOT_ANS_STRIDE     = 64,
+  SPOT_ANS_OFF_HB     = 16,
+  SPOT_ANS_OFF_VER    = 17,
+  SPOT_ANS_OFF_STATE  = 32,
 
   -- ────────────────────────────────────────────────────────────────────────
   -- Per-pad kit-load handshake (VER-26 protocol)
@@ -1330,6 +1473,9 @@ core.GMEM = {
   REB_PUB_COUNT     = 26320810,  -- JSFX: non-empty path cells published
   REB_SKIPPED       = 26320811,  -- JSFX: >258-char paths dropped from publish
   REB_RESTORE_GEN   = 26320812,  -- JSFX: deserialize counter (0 = never restored)
+  REB_PUB_BANK      = 26320814,  -- producer: one-shot bank selector, 0 = the old publish (pad-main of the bank on
+                                 -- screen, bank A's layers), 1..4 = bank A..D whole; the JSFX resets it to 0. HS_CAP >= 206.
+  REB_PUB_BANK_ECHO = 26320815,  -- JSFX: the selector the publish honoured (a producer presets -1)
   REB_PAD_CELLS     = 26320840,  -- + pad*260 (len-prefixed)
   REB_LAYER_CELLS   = 26325000,  -- + (pad*4+layer)*260
   REB_SLEN          = 26341640,  -- + pad
@@ -1378,6 +1524,9 @@ core.SWBROWSE = {
   FMT_VER  = 8,
   NDIRS    = 9,   -- folders sort first, so rows 0..NDIRS-1 are the folders
   CWD_LEN  = 10,
+  TR_RPT   = 11,  -- the sequencer's transport row (P0a): REAPER's repeat state 0 / 1
+  TR_MEAS  = 12,  -- the bar under the play (or edit) cursor, 1-based
+  TR_BEAT  = 13,  -- the beat inside it x 1000, 0-based
 
   -- request half (face writes) — REQ_SEQ / ACT_SEQ written LAST
   REQ_SEQ  = 32,
@@ -1403,15 +1552,21 @@ core.SWBROWSE = {
                      -- (it does today, its siblings do not). Publishing gfx_w
                      -- lets the bridge MEASURE the ratio instead of assuming it.
   REQ_AUD     = 46,  -- 1 = also load the PREVIEW voice on this click
+  REQ_GROWH   = 58,  -- px of extra CANVAS height the face wants for the step
+                     -- sequencer's panel under the pads (rk_seq_ui, 2026-10-19);
+                     -- 0 = none. The same resize as REQ_GROW, downward, kept on
+                     -- screen (eon_fb_grow).
   REQ_FILT_LEN = 192,  -- verb 9: filter text length...
   REQ_FILT     = 193,  -- ...and its chars, +193..240
   REQ_FILT_MAX = 48,
 
   -- waveform peaks for the SELECTED row, its own band (a row record is 60
-  -- cells; 256 could never ride along). Declared in the supplement tsv.
+  -- cells; these could never ride along). Declared in the supplement tsv.
+  -- 2026-10-15: 512 columns and a loudness body per column (the user: "can we
+  -- draw the wave forms any better?"); 16 slots * 4096 fill block 407 exactly.
   PK_BASE   = 26673152,   -- 407 * 65536
-  PK_STRIDE = 512,        -- L max, L min, R max, R min -- 4 * PK_N
-  PK_N      = 128,        -- columns: sized to the status strip, not the file
+  PK_STRIDE = 4096,       -- per slot: L max, L min, R max, R min, L body, R body -- 6 * PK_N (3072 used)
+  PK_N      = 512,        -- columns: the strip draws one per pixel and folds the rest
 
   CWD      = 64,  -- current folder, 128 chars for display only
   CWD_MAX  = 128,
@@ -1518,6 +1673,11 @@ end
 
 -- Read the MIDI trigger note for a given pad (0-15) from gmem.
 -- The JSFX writes this to META_BASE + pad*META_PP + 10 via sync_note_names().
+-- Pad Banks step 4a: an absolute pad (0..63) as the user reads it -- bank letter, middle dot, number 1..16.
+function core.pad_label(ap)
+  ap = math.floor(tonumber(ap) or 0)
+  return string.char(65 + math.floor(ap / 16) % 4) .. "\u{00B7}" .. (ap % 16 + 1)
+end
 function core.read_pad_note(pad)
   local G = core.GMEM
   return math.floor(reaper.gmem_read(G.META_BASE + pad * G.META_PP + 10) or 0)
@@ -1591,6 +1751,32 @@ function core.fx_embed_mcp(tr, frag)
   end
   if done then reaper.SetTrackStateChunk(tr, table.concat(out, string.char(10)), false) end
   return done
+end
+
+-- Where one FX shows its embedded UI (Pad Banks Outputs step 4): the WAK line's second field in that FX's lines of
+-- the track chunk -- bit 1 the track panel, bit 2 the mixer (no API; see core.fx_embed_mcp above). The FX is found by
+-- its FXID (TrackFX_GetFXGUID), never by its name: its lines run from its BYPASS line to the next one. Returns
+-- in_tcp, in_mcp, or nil when the chunk or the FX's WAK line cannot be read. Reads the whole track chunk, which is
+-- not small for a loaded Swing: a caller keeps this rare.
+function core.fx_embed_where(tr, fx)
+  local guid = reaper.TrackFX_GetFXGUID(tr, fx)
+  if not guid or guid == "" then return nil end
+  local ok, chunk = reaper.GetTrackStateChunk(tr, "", false)
+  if not ok or not chunk then return nil end
+  local nl = string.char(10)
+  local mine, wak = false, nil
+  for line in (chunk .. nl):gmatch("(.-)" .. nl) do
+    if line:match("^%s*BYPASS ") then
+      if mine then break end
+      wak = nil
+    end
+    local id = line:match("^%s*FXID%s+(%S+)")
+    if id and id == guid then mine = true end
+    local w = line:match("^%s*WAK%s+%d+%s+(%d+)")
+    if w then wak = tonumber(w) end
+  end
+  if not mine or not wak then return nil end
+  return wak % 2 == 1, math.floor(wak / 2) % 2 == 1
 end
 
 function core.read_selected_pad()
@@ -1971,6 +2157,52 @@ function core.srcchan_pad(src_chan)
   return ch / 2
 end
 
+-- The bank A pad a send from Swing's track feeds -- ONLY when its destination is one of Swing's own pad tracks
+-- (2026-10-10). Returns pad, dest, or -1. The pad is still the send's channel pair (every caller's mapping,
+-- unchanged); what is new is the ownership test: the P_EXT:EON_PAD_IDX tag every build stamps, or, for a track
+-- built before the tag, a destination inside Swing's Audio sub (P_EXT:EON_AUDIO_KIT_FOLDER), directly or through
+-- the "Bank A" folder (P_EXT:EON_BANK_FOLDER). A channel alone is topology, never ownership: REAPER's default for a
+-- hand-made send is channels 1-2, so a user's own send from Swing to a bus read as pad 1 -- and the bus was
+-- renamed after the pad, muted and soloed with its StepSeq lane, and given a Drum Strip.
+function core.swing_send_pad(tr, s)
+  local pad = core.srcchan_pad(reaper.GetTrackSendInfo_Value(tr, 0, s, "I_SRCCHAN"))
+  if pad < 0 or pad >= core.GMEM.NUM_PADS then return -1 end
+  local dest = reaper.BR_GetMediaTrackSendInfo_Track and reaper.BR_GetMediaTrackSendInfo_Track(tr, 0, s, 1)
+  if not dest then return -1 end
+  local _, tag = reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:EON_PAD_IDX", "", false)
+  if tag ~= "" then return pad, dest end
+  local par = reaper.GetParentTrack(dest)
+  if par then
+    local _, bf = reaper.GetSetMediaTrackInfo_String(par, "P_EXT:EON_BANK_FOLDER", "", false)
+    if bf == "A" then par = reaper.GetParentTrack(par) end
+  end
+  if not par then return -1 end
+  local _, af = reaper.GetSetMediaTrackInfo_String(par, "P_EXT:EON_AUDIO_KIT_FOLDER", "", false)
+  if af == "" then return -1 end
+  return pad, dest
+end
+
+-- The output pair a send from Swing's track carries -- ONLY when its destination is one of Swing's own output
+-- tracks (Pad Banks Outputs step 3): bank A's pad tracks as core.swing_send_pad says (pairs 0..15), a bank track
+-- whose tag names this pair's bank (P_EXT:EON_BANK_TRACK "B" = pair 19, ...), a split-pad track whose tag names
+-- this pair (P_EXT:EON_SPLIT_PAIR). Returns pair, dest, or -1.
+function core.swing_send_pair(tr, s)
+  local pad, pdest = core.swing_send_pad(tr, s)
+  if pad >= 0 then return pad, pdest end
+  local p = core.srcchan_pad(reaper.GetTrackSendInfo_Value(tr, 0, s, "I_SRCCHAN"))
+  if p < 19 or p > 31 then return -1 end
+  local dest = reaper.BR_GetMediaTrackSendInfo_Track and reaper.BR_GetMediaTrackSendInfo_Track(tr, 0, s, 1)
+  if not dest then return -1 end
+  if p < 22 then
+    local _, b = reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:EON_BANK_TRACK", "", false)
+    if b == string.char(66 + p - 19) then return p, dest end
+  else
+    local _, sp = reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:EON_SPLIT_PAIR", "", false)
+    if tonumber(sp) == p then return p, dest end
+  end
+  return -1
+end
+
 -- Iterate every track in the project — master FIRST, then regular tracks.
 -- Use this anywhere you'd otherwise write
 --     for i = 0, reaper.CountTracks(0) - 1 do
@@ -2080,8 +2312,7 @@ function core.ensure_macros_in(tr, cidx, swing_tr, swing_fx)
   end
   for k = 0, cnt - 1 do
     local e = child(k)
-    local _, nm = reaper.TrackFX_GetFXName(tr, e, "")
-    if (nm or ""):find("EON Macros", 1, true) then return k, e end
+    if core.fx_file(tr, e) == "eon_macros.jsfx" then return k, e end   -- by its file (a renamed relay got a twin)
   end
   local name = core.jsfx_addname("EON_Macros.jsfx", swing_tr, swing_fx)
   if not name then return -1 end
@@ -2093,8 +2324,7 @@ function core.ensure_macros_in(tr, cidx, swing_tr, swing_fx)
   reaper.TrackFX_AddByName(tr, name, false, -1000 - encp)
   local e = child(pos)
   if e < 0 then return -1 end
-  local _, nm = reaper.TrackFX_GetFXName(tr, e, "")
-  if not (nm or ""):find("EON Macros", 1, true) then return -1 end
+  if core.fx_file(tr, e) ~= "eon_macros.jsfx" then return -1 end
   local inst = 0
   if swing_tr and swing_fx then
     inst = math.floor((reaper.TrackFX_GetParam(swing_tr, swing_fx, 3) or 0) + 0.5)

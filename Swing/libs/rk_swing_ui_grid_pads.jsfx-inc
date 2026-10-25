@@ -23,6 +23,137 @@ function swing_grid_syn_cat(_sc_p) local(_sc_e) global(ps_engine, ps_mac4) (
   18;                 // SHAKER
 );
 
+
+// ── The bank strip (Pad Banks step 4b; Spec_Swing_Pad_Banks 8, mockup frame 1) ──────────────────────────
+// Four tabs: the letter, a dot when the bank holds sound, the bank's kit name (BKNAME_STR_BASE + b; "kit" when it
+// has sound but no name yet, "empty" otherwise), the active tab under the LCD tabs' red mark; the INSTRUMENT's free
+// time at the right end (spec 8.1: the kit bar shows the ACTIVE bank's usage instead). Two passes from the main
+// @gfx: swing_banktabs_input right after the LCD (before the grid and the views, so a tab click never reaches the
+// view under it) and swing_banktabs_draw after the big-view dispatch (over every view, undimmed -- user 2026-09-23,
+// "the strip everywhere"). Where it sits: over the right pane above the pad well; under a big view whose panel is
+// the grid rect that band is free of the panel; under the two FULL-WINDOW views (console, FX picker) it takes the
+// band right under the header, full width, and those views start below it. The rack / dock face and the embedded
+// faces draw none (spec 8.1). A click selects the bank: the selection moves to the same tile in the new bank, an
+// open pad editor closes, mark_dirty (bank_cur is serialized) -- never an undo boundary (spec 12).
+// banktabs_drop_hl is the drag-target highlight 4c sets (-1 = none).
+function swing_banktabs_geom() local(_mw, _mh, _uw, _uh, _mfs) (
+  bt_h = swing_px(BANK_STRIP_H);
+  big_view_id == VIEW_CONSOLE || big_view_id == VIEW_FXPICK || big_view_id == VIEW_SEQ ? (
+    bt_x = 0; bt_y = 28; bt_w = gfx_w;                              // the mini browser strip does not draw under these (the sequencer's grid is full-window too)
+  ) : (
+    bt_x = right_x; bt_y = grid_top - bt_h; bt_w = right_w;
+  );
+  _mfs = swing_mem_free_secs();
+  sprintf(#_bt_mem, "%d:%02d", (_mfs / 60) | 0, (_mfs - 60 * ((_mfs / 60) | 0)) | 0);
+  rk_font(1, swing_fs(10), 'b'); gfx_measurestr(#_bt_mem, _mw, _mh);
+  rk_font(1, swing_fs(8), 'b');  gfx_measurestr(" free", _uw, _uh);
+  bt_memw = _mw + _uw + swing_px(16);
+  bt_tabw = ((bt_w - bt_memw) / NUM_BANKS) | 0;
+);
+// (swing_banktabs_select and swing_banktabs_under_editor live in rk_swing_core)
+// The click. Under a big view or the pad editor the modal gate has zeroed lmb_down and kept the edge in
+// _raw_lmb_down (the views restore theirs from the _ov_* copies): the strip stays live there and reads the raw
+// edge; a popup, the macro editor and the range / category / note pickers keep it inert. A claimed click is
+// zeroed in every copy, so nothing below sees it. Under the pad editor the panel's rect is the editor's
+// (swing_banktabs_under_editor; op_x / op_y / op_w / op_h are the panel it last painted -- this pass runs before
+// its paint, and the click that opens it is the grid's).
+function swing_banktabs_input() local(_e, _r, _b) (
+  swing_banktabs_shown() && !swing_popup_active && !kmac_ed_open && rng_ov_pad < 0 && cat_ov_pad < 0 && pk_ov_pad < 0 ? (
+    _e = _ui_modal_up ? _raw_lmb_down : lmb_down;
+    _r = _ui_modal_up ? _ov_rmb_down : rmb_down;   // the gate keeps no raw copy of the right edge; the saved one is it
+    _e || _r ? (
+      swing_banktabs_geom();
+      mx >= bt_x && mx < bt_x + bt_tabw * NUM_BANKS && my >= bt_y && my < bt_y + bt_h &&
+      !(swing_banktabs_under_editor() && mx >= op_x && mx < op_x + op_w && my >= op_y && my < op_y + op_h) ? (
+        _b = ((mx - bt_x) / bt_tabw) | 0;
+        _e ? (
+          swing_banktabs_select(_b);
+          lmb_down = 0; LMB = 0; _ov_lmb_down = 0; _ov_LMB = 0; _raw_lmb_down = 0; _raw_LMB = 0;
+        ) : (
+          // the tab menu (step 4c; rows consumed in the main @gfx, SP_POPUP_CALLER_BANK_TAB)
+          banktabs_menu_bank = _b;
+          sprintf(#_bt_menu, "#Bank %c|Load kit into bank %c...|Save bank %c as kit...|Clear bank %c|Clear all four banks",
+                  65 + _b, 65 + _b, 65 + _b, 65 + _b);
+          swing_popup_open(mx, my, #_bt_menu, SP_POPUP_CALLER_BANK_TAB);
+          rmb_down = 0; RMB = 0; _ov_rmb_down = 0; _ov_RMB = 0;
+        );
+      );
+    );
+  );
+);
+// A bank's colour (2026-10-15; the user: "give the tabs some color. that color should line up to the bank parent
+// color when in multi output mode as well"). The default palette is the bridge's EON_BANK_RGB, value for value (the
+// bridge paints a bank track that has no colour with it); in multi-out the bank track's own colour, published in
+// the strip band's BANK_COL cells, wins -- recolour the track in REAPER and the tab follows. Sets bk_cr / bk_cg /
+// bk_cb (0..1). @gfx only.
+function swing_grid_bank_rgb(b) local(_c, _s, _i) (
+  _c = (multi_out && _reg_my_slot >= 0) ? gmem[GS_STRIP_BASE + _reg_my_slot * GS_STRIP_STRIDE + GS_STRIP_OFF_BANK_COL + b] | 0 : 0;
+  _c > 0 ? (
+    _c -= 1;
+    bk_cr = ((_c / 65536) | 0) / 255; bk_cg = (((_c / 256) | 0) & 255) / 255; bk_cb = (_c & 255) / 255;
+  ) : (
+    // the THEME menu's BANK COLOURS set (slider47; the table in Swing_ReaKit.jsfx @init); Classic for anything else
+    _s = max(1, min(BANK_COL_SETS, bank_col_set | 0));
+    _i = (_s - 1) * 12 + max(0, min(3, b | 0)) * 3;
+    bk_cr = bank_set_rgb[_i] / 255; bk_cg = bank_set_rgb[_i + 1] / 255; bk_cb = bank_set_rgb[_i + 2] / 255;
+  );
+);
+// (one-line header: gfx_race_audit reads a split `function` / `local(` / `(` header as top-level code)
+function swing_banktabs_draw() local(_b, _tx, _has, _on, _drop, _hov, _lw, _lh, _dx, _dy, _nm, _nx, _navail, _nw, _nh, _mx, _mw, _mh, _uw, _uh, _mfs, _k) (
+  swing_banktabs_geom();
+  gfx_set(hd_r * 0.55, hd_g * 0.55, hd_b * 0.55, 1); gfx_rect(bt_x, bt_y, bt_w, bt_h);
+  _b = 0; loop(NUM_BANKS,
+    _tx = bt_x + _b * bt_tabw;
+    _has = swing_bank_has_sound(_b); _on = _b == bank_cur; _drop = _b == banktabs_drop_hl;
+    _hov = mx >= _tx && mx < _tx + bt_tabw && my >= bt_y && my < bt_y + bt_h;
+    // the bank's colour over the strip's dark base: a tint at rest, stronger on hover, full on the bank shown -- or,
+    // with BANK COLOURS Off (slider47 = 0), the plain tabs of before the colours (2026-10-15, the user: an option)
+    swing_grid_bank_rgb(_b);
+    _k = _on ? 0.78 : _hov ? 0.46 : 0.30;
+    _drop ? gfx_set(0.16, 0.23, 0.29, 1) :
+    bank_col_set < 0.5 ? (
+      _on ? gfx_set(hd_r * 0.78, hd_g * 0.78, hd_b * 0.78, 1) :
+      _hov ? gfx_set(hd_r * 0.68, hd_g * 0.68, hd_b * 0.68, 1) :
+             gfx_set(hd_r * 0.62, hd_g * 0.62, hd_b * 0.62, 1);
+    ) : gfx_set(hd_r * 0.55 * (1 - _k) + bk_cr * _k, hd_g * 0.55 * (1 - _k) + bk_cg * _k, hd_b * 0.55 * (1 - _k) + bk_cb * _k, 1);
+    gfx_rect(_tx, bt_y, bt_tabw - 1, bt_h);
+    _drop ? ( gfx_set(0.29, 0.64, 0.88, 1); gfx_rect(_tx, bt_y, bt_tabw - 1, 2); gfx_rect(_tx, bt_y + bt_h - 2, bt_tabw - 1, 2);
+              gfx_rect(_tx, bt_y, 2, bt_h); gfx_rect(_tx + bt_tabw - 3, bt_y, 2, bt_h); );
+    // the bank shown: a bright bar in its own colour (with BANK COLOURS Off, the LCD tabs' red mark, as before)
+    _on ? ( bank_col_set < 0.5 ? gfx_set(0.85, 0.20, 0.12, 1)
+                               : gfx_set(min(1, bk_cr * 1.35 + 0.12), min(1, bk_cg * 1.35 + 0.12), min(1, bk_cb * 1.35 + 0.12), 1);
+            gfx_rect(_tx, bt_y + bt_h - 3, bt_tabw - 1, 3); );
+    // the letter
+    rk_font(1, swing_fs(11), 'b');
+    _on ? gfx_set(1, 1, 1, 1) : _has ? gfx_set(0.76, 0.76, 0.76, 1) : gfx_set(0.54, 0.54, 0.54, 1);
+    sprintf(#_bt_l, "%c", 65 + _b);
+    gfx_measurestr(#_bt_l, _lw, _lh);
+    gfx_x = _tx + swing_px(9); gfx_y = bt_y + (bt_h - _lh) * 0.5; gfx_drawstr(#_bt_l);
+    // the dot
+    _dx = _tx + swing_px(9) + _lw + swing_px(6); _dy = bt_y + bt_h * 0.5;
+    _has ? gfx_set(0.36, 0.84, 0.36, 1) : gfx_set(0.23, 0.23, 0.23, 1);
+    gfx_circle(_dx + 2.5, _dy, 2.5, 1, 1);
+    // the name, trimmed to the room left
+    _nm = BKNAME_STR_BASE + _b;
+    strlen(_nm) > 0 ? strcpy(#_bt_n, _nm) : strcpy(#_bt_n, _has ? "kit" : "empty");
+    rk_font(1, swing_fs(10), 'b');
+    _on ? gfx_set(1, 1, 1, 1) : _has ? gfx_set(0.76, 0.76, 0.76, 1) : gfx_set(0.50, 0.50, 0.50, 1);
+    _nx = _dx + swing_px(11); _navail = _tx + bt_tabw - swing_px(6) - _nx;
+    gfx_measurestr(#_bt_n, _nw, _nh);
+    while (_nw > _navail && strlen(#_bt_n) > 1) ( str_setlen(#_bt_n, strlen(#_bt_n) - 1); gfx_measurestr(#_bt_n, _nw, _nh); );
+    _navail > swing_px(10) ? ( gfx_x = _nx; gfx_y = bt_y + (bt_h - _nh) * 0.5; gfx_drawstr(#_bt_n); );
+    _b += 1;
+  );
+  // the instrument's free time, at the right end
+  _mx = bt_x + bt_w - bt_memw + swing_px(8); _mfs = swing_mem_free_secs();
+  rk_font(1, swing_fs(10), 'b'); gfx_measurestr(#_bt_mem, _mw, _mh);
+  _mfs <= 0 ? gfx_set(0.95, 0.35, 0.30, 1) : _mfs < 60 ? gfx_set(0.95, 0.65, 0.30, 1) : gfx_set(0.66, 0.66, 0.66, 1);
+  gfx_x = _mx; gfx_y = bt_y + (bt_h - _mh) * 0.5; gfx_drawstr(#_bt_mem);
+  rk_font(1, swing_fs(8), 'b'); gfx_measurestr(" free", _uw, _uh); gfx_set(0.46, 0.46, 0.46, 1);
+  gfx_y = bt_y + (bt_h - _uh) * 0.5 + 1; gfx_drawstr(" free");
+  gfx_set(0, 0, 0, 0.6); gfx_rect(bt_x, bt_y + bt_h - 1, bt_w, 1);
+);
+
 function swing_grid_draw_embedded() (
   gfx_set(bg_r, bg_g, bg_b, 1); gfx_rect(0, 0, gfx_w, gfx_h);  // cream background
   e_cw = (gfx_w / 4)|0;
@@ -33,15 +164,15 @@ function swing_grid_draw_embedded() (
   loop(4,
     gcol = 0;
     loop(4,
-      gi = (3 - grow) * 4 + gcol;
+      gi = (3 - grow) * 4 + gcol; gi_s = swing_bp(gi);
       ex_ = gcol * e_cw + e_gap;
       ey_ = grow * e_ch + e_gap;
       ew_ = e_cw - e_gap * 2;
       eh_ = e_ch - e_gap * 2;
       _cb = gi * 3; pr = col_rgba[_cb]; pgg = col_rgba[_cb+1]; pb = col_rgba[_cb+2];
-      is_muted = p_mute[gi] || (any_solo && !p_solo[gi]);
-      has_sample = pad_has_audio(gi);
-      has_syn = ps_enable[gi] > 0.5;
+      is_muted = p_mute[gi_s] || (any_solo && !p_solo[gi_s]);
+      has_sample = pad_has_audio(gi_s);
+      has_syn = ps_enable[gi_s] > 0.5;
       has_content = has_sample || has_syn;
 
       // Pad face — full color, iMPC style
@@ -64,11 +195,11 @@ function swing_grid_draw_embedded() (
       // Read BEFORE the branch: a pad the user set to NONE has no glyph to draw,
       // and falling through to the waveform says "loaded, no category" far
       // better than an empty pad face would.
-      _ic_cat = swing_lcd_padcat_eff(gi);
+      _ic_cat = swing_lcd_padcat_eff(gi_s);
       (embed_show_icons && has_sample && _ic_cat != PADCAT_NONE && min(ew_, eh_) > 24) ? (
         _ic_cat < 0 ? (
-          _ic_n = get_cname_slot(gi);
-          strlen(_ic_n) == 0 ? _ic_n = get_name_slot(gi);
+          _ic_n = get_cname_slot(gi_s);
+          strlen(_ic_n) == 0 ? _ic_n = get_name_slot(gi_s);
           _ic_cat = eon_cat_for_name(_ic_n);
         );
         _ic_r = is_muted ? pr*0.35 + 0.15 : pr*0.75 + 0.12;
@@ -89,11 +220,11 @@ function swing_grid_draw_embedded() (
       // so it's accurate regardless of source format (a stereo file with
       // mono content displays as mono — no fake "two identical waves").
       has_sample && ew_ > 16 ? (
-        ptr   = wv_cache   + gi * WV_RES;
-        ptr_R = wv_cache_R + gi * WV_RES;
+        ptr   = wv_cache   + gi_s * WV_RES;   // by SLOT, as build_wv_cache writes it (the tile showed bank A's wave on B-D)
+        ptr_R = wv_cache_R + gi_s * WV_RES;
         wv_a = is_muted ? 0.25 : 0.50;
         gfx_set(1, 1, 1, wv_a);
-        p_stereo[gi] ? (
+        p_stereo[gi_s] ? (
           _wv_scale = eh_ * 0.20;
           _wv_clamp = eh_ * 0.22;
           _wy_topc  = ey_ + eh_ * 0.25;
@@ -129,7 +260,7 @@ function swing_grid_draw_embedded() (
           _ic_lum = _ic_r*0.30 + _ic_g*0.59 + _ic_b*0.11;
           _ic_a = is_muted ? 0.40 : 0.92;
           _ic_lum > 0.55 ? gfx_set(0.08, 0.09, 0.11, _ic_a) : gfx_set(0.94, 0.95, 0.97, _ic_a);
-          eon_draw_cat_glyph_hi(swing_grid_syn_cat(gi), (ex_ + ew_*0.5)|0, (ey_ + eh_*0.5)|0, (min(ew_, eh_)*0.36)|0, -1);
+          eon_draw_cat_glyph_hi(swing_grid_syn_cat(gi_s), (ex_ + ew_*0.5)|0, (ey_ + eh_*0.5)|0, (min(ew_, eh_)*0.36)|0, -1);
         ) : (
           rk_auto_ink_a(pr, pgg, pb, is_muted ? 0.30 : 0.65);
           _sy_x0 = ex_ + ew_ * 0.19; _sy_w = ew_ * 0.62;
@@ -146,7 +277,7 @@ function swing_grid_draw_embedded() (
       );
 
       // ── Selected pad red border (embedded) ──
-      gi == sel_pad ? (
+      gi_s == sel_pad ? (
         gfx_set(0.85, 0.20, 0.12, 0.9);
         gfx_rect(ex_ - 1, ey_ - 1, ew_ + 2, 2);      // top
         gfx_rect(ex_ - 1, ey_ + eh_ - 1, ew_ + 2, 2); // bottom
@@ -155,16 +286,16 @@ function swing_grid_draw_embedded() (
       );
 
       // Flash
-      pad_flash[gi] > 0 ? (
-        gfx_set(1, 1, 1, pad_flash[gi] / 8.0 * 0.6);
+      pad_flash[gi_s] > 0 ? (
+        gfx_set(1, 1, 1, pad_flash[gi_s] / 8.0 * 0.6);
         gfx_rect(ex_, ey_, ew_, eh_);
-        pad_flash[gi] -= 1;
+        pad_flash[gi_s] -= 1;
       );
 
       // Level meter (stereo L+R bars, left edge) — wider on big pads
       e_mtr_w = max(3, (ew_ / 50)|0);
       e_mtr_h_max = eh_ - 6;
-      _mL = min(1.0, pad_meterL[gi]); _mR = min(1.0, pad_meterR[gi]);
+      _mL = min(1.0, pad_meterL[gi_s]); _mR = min(1.0, pad_meterR[gi_s]);
       _mL_fill = (_mL * e_mtr_h_max)|0; _mR_fill = (_mR * e_mtr_h_max)|0;
       gfx_set(0, 0, 0, 0.25);
       gfx_rect(ex_ + 2, ey_ + 3, e_mtr_w * 2 + 1, e_mtr_h_max);
@@ -190,8 +321,8 @@ function swing_grid_draw_embedded() (
       // there; keeping the labels was "too much going on". Meter + knob stay.
       !embed_show_icons ? (
       // Note name (top-left)
-      gfx_setfont(1, "Arial", max(9, (e_font * 0.65)|0), 0);
-      _nn = p_note[gi]; _oct = (_nn / 12 | 0) - 1; _semi = _nn % 12;
+      rk_font(1, max(9, (e_font * 0.65)|0), 0);
+      _nn = p_note[gi_s]; _oct = (_nn / 12 | 0) - 1; _semi = _nn % 12;
       _semi == 0  ? strcpy(#_note, "C")  :
       _semi == 1  ? strcpy(#_note, "C#") :
       _semi == 2  ? strcpy(#_note, "D")  :
@@ -209,15 +340,15 @@ function swing_grid_draw_embedded() (
       gfx_x = ex_ + 4; gfx_y = ey_ + 3; gfx_drawstr(#_nn_str);
 
       // Pad name or number (top-right) — uniform white + shadow on every pad
-      gfx_setfont(1, "Arial", max(12, e_font - 2), 'b');
-      _cn = get_cname_slot(gi);
+      rk_font(1, max(12, e_font - 2), 'b');
+      _cn = get_cname_slot(gi_s);
       strlen(_cn) > 0 ? strcpy(#_ep, _cn) : sprintf(#_ep, "%d", gi + 1);
       gfx_measurestr(#_ep, tw, th);
       rk_ink_label(#_ep, ex_ + ew_ - tw - 2, ey_ + 1, is_muted ? 0.55 : 0.90);
 
       // Pad number (bottom-left) — canonical pad ID for future REAPER DB matching.
       // Placed past the stereo level meter at the left edge.
-      gfx_setfont(1, "Arial", max(11, (e_font * 0.55)|0), 'b');
+      rk_font(1, max(11, (e_font * 0.55)|0), 'b');
       rk_auto_ink_a(pr, pgg, pb, is_muted ? 0.50 : 0.80);
       sprintf(#_e_pn, "%d", gi + 1);
       gfx_measurestr(#_e_pn, _e_pn_tw, _e_pn_th);
@@ -226,9 +357,9 @@ function swing_grid_draw_embedded() (
       gfx_drawstr(#_e_pn);
 
       // Output bus selector (bottom-right, clickable) — always visible
-      gfx_setfont(1, "Arial", max(10, e_font - 3), 'b');
+      rk_font(1, max(10, e_font - 3), 'b');
       rk_auto_ink_a(pr, pgg, pb, is_muted ? 0.45 : 0.75);
-      sprintf(#_ob, "Out %d", p_output[gi] + 1);
+      swing_out_pair_name(swing_out_pair(gi_s), #_ob);   // where it plays: "Bank B" for banks B-D (Outputs step 1)
       gfx_measurestr(#_ob, tw, th);
       _eout_lx = ex_ + ew_ - tw - 4; _eout_ly = ey_ + eh_ - th - 4;
       gfx_x = _eout_lx; gfx_y = _eout_ly; gfx_drawstr(#_ob);
@@ -252,10 +383,10 @@ function swing_grid_draw_embedded() (
         // off-centre knob on the first sample dropped there.
         _km_v = km_pad_vol_pan + (gi * KM_PAD_MINI + 0) * KS;
         has_content ? (
-          rk_knob_draw(sk_kp, _e_vol_cx, _e_knob_cy, _e_mini_kr, p_gain[gi], 0, 2.0, 0, _km_v[0],
+          rk_knob_draw(sk_kp, _e_vol_cx, _e_knob_cy, _e_mini_kr, p_gain[gi_s], 0, 2.0, 0, _km_v[0],
                        ac_r, ac_g, ac_b, 0, pad_bg_r*(1-dim)+pr*dim, pad_bg_g*(1-dim)+pgg*dim, pad_bg_b*(1-dim)+pb*dim);
-          nv = mpc_knob_interact(_km_v, _e_vol_cx, _e_knob_cy, _e_mini_kr, p_gain[gi], 0, 2.0, 1.0, 0);
-          nv != p_gain[gi] ? (p_gain[gi] = nv; s_dirty[gi] = 1; mark_dirty_pad(gi););
+          nv = mpc_knob_interact(_km_v, _e_vol_cx, _e_knob_cy, _e_mini_kr, p_gain[gi_s], 0, 2.0, 1.0, 0);
+          nv != p_gain[gi_s] ? (p_gain[gi_s] = nv; s_dirty[gi_s] = 1; mark_dirty_pad(gi_s););
           _km_v[1] ? _e_knob_active = 1;
           _e_knob_hover = _e_knob_active || dist(mx, my, _e_vol_cx, _e_knob_cy) <= _e_mini_kr + 3;
         );
@@ -276,9 +407,9 @@ function swing_grid_draw_embedded() (
 
       // Click to trigger via full voice launch (same path as MIDI, supports Sum/RR/VelSplit)
       mx >= ex_ && mx <= ex_ + ew_ && my >= ey_ && my <= ey_ + eh_ && lmb_down && !_eout_clicked && !_e_knob_hover ? (
-        pad_is_playable(gi) ? (
-          swing_gt_post(gi, p_note[gi], 127, 8);
-          p_held[gi] = 1; p_held_vel[gi] = 127; p_held_note[gi] = p_note[gi]; gui_held_pad = gi;
+        pad_is_playable(gi_s) ? (
+          swing_gt_post(gi_s, p_note[gi_s], 127, 8);
+          p_held[gi_s] = 1; p_held_vel[gi_s] = 127; p_held_note[gi_s] = p_note[gi_s]; gui_held_pad = gi_s;
         );
       );
 
@@ -299,23 +430,24 @@ function swing_grid_draw_embedded() (
           // Ctrl+Z. Removing it lets REAPER do its own thing.
           drop_gi = gi; drop_idx = 0;
           while(gfx_getdropfile(drop_idx, #df) && drop_gi < NUM_PADS) (
+            _da = swing_bp(drop_gi);   // the tile walks the bank; the engine takes the slot (step 4a)
             // Reset per-pad mix params so stale kit values don't leak
             // into the new sample. Lighter than full clear_pad which
             // caused voice tripling when used here.
-            p_gain[drop_gi] = 1.0; p_pan[drop_gi] = 0; p_tune[drop_gi] = 0;
-            p_panL[drop_gi] = 1.0; p_panR[drop_gi] = 1.0;
-            s_start[drop_gi] = 0; s_end[drop_gi] = 1.0;
+            p_gain[_da] = 1.0; p_pan[_da] = 0; p_tune[_da] = 0;
+            p_panL[_da] = 1.0; p_panR[_da] = 1.0;
+            s_start[_da] = 0; s_end[_da] = 1.0;
             // A sounding pad fades instead of cutting at the loader's s_len = 0
             // (A-3): the browser path's kill-and-crossfade, same helper.
-            swing_voice_kill_pad_xf(drop_gi);
-            load_from_path(drop_gi, #df);
-            swing_rcp_post_pad(drop_gi); s_dirty[drop_gi] = 1;
+            swing_voice_kill_pad_xf(_da);
+            load_from_path(_da, #df);
+            swing_rcp_post_pad(_da); s_dirty[_da] = 1;
             // The pad's JOB follows its new sample: a native drop never touches
             // the browser, so this is the only place that can classify it.
-            swing_lcd_padcat_queue_drop(drop_gi);
+            swing_lcd_padcat_queue_drop(_da);
             drop_gi += 1; drop_idx += 1;
           );
-          mark_dirty_pad(gi); sync_note_names();
+          mark_dirty_pad(gi_s); sync_note_names();
           col_dirty = 1; // re-derive auto-color from dropped samples
         );
         gfx_getdropfile(-1);
@@ -344,7 +476,7 @@ function swing_grid_draw_pads() (
   grid_x  = right_x + 4;
   grid_y  = grid_top + 4;
   grid_w  = right_w - 8;
-  grid_h  = gfx_h - grid_top - 8;
+  grid_h  = ui_bot - grid_top - 8;   // ui_bot = gfx_h in the rack face; under the sequencer's panel in the full UI (swing_seq_gate)
   cell_w  = (grid_w / 4)|0;
   cell_h  = (grid_h / 4)|0;
   // Control strip (S/M/RPT pills + VOL/PAN knobs) scales WITH the pad cell so the
@@ -363,7 +495,7 @@ function swing_grid_draw_pads() (
   loop(4,
   gcol = 0;
   loop(4,
-    gi = (3 - grow) * 4 + gcol;
+    gi = (3 - grow) * 4 + gcol; gi_s = swing_bp(gi);
     cx  = grid_x + gcol * cell_w;
     cy  = grid_y + grow * cell_h;
     pw  = cell_w - 4;
@@ -375,10 +507,10 @@ function swing_grid_draw_pads() (
     _pf_out  = swing_fs(9);   // "Out N" bus selector — smaller, secondary metadata
 
     _cb = gi * 3; pr = col_rgba[_cb]; pgg = col_rgba[_cb+1]; pb = col_rgba[_cb+2];
-    has_sample = pad_has_audio(gi);
-    has_syn = ps_enable[gi] > 0.5;
+    has_sample = pad_has_audio(gi_s);
+    has_syn = ps_enable[gi_s] > 0.5;
     has_content = has_sample || has_syn;
-    is_muted = p_mute[gi] || (any_solo && !p_solo[gi]);
+    is_muted = p_mute[gi_s] || (any_solo && !p_solo[gi_s]);
 
     // ── iMPC rubber pad (grey with 3D depth, rounded corners) ─────────
     pad_x = cx + 2; pad_y = cy + 2;
@@ -429,7 +561,7 @@ function swing_grid_draw_pads() (
     gfx_rect(pad_x + pw - 1, pad_y + _rd, 1, ph - _rd * 2);  // right edge
 
     // ── Selected pad red border ──
-    gi == sel_pad ? (
+    gi_s == sel_pad ? (
       gfx_set(0.85, 0.20, 0.12, 0.9);
       gfx_rect(pad_x - 1, pad_y - 1, pw + 2, 2);
       gfx_rect(pad_x - 1, pad_y + ph - 1, pw + 2, 2);
@@ -453,7 +585,7 @@ function swing_grid_draw_pads() (
         _mgp_j = 0;
         loop(min(kmac_nmap[_mgp_m], KMAC_MAX_MAP),
           _mgp_p = kmac_pad[_mgp_m * KMAC_MAX_MAP + _mgp_j];
-          (_mgp_p == gi || _mgp_p == -2 || (_mgp_p == -1 && gi == sel_pad)) ? _mgp_hit = 1;
+          (_mgp_p == gi_s || _mgp_p == -2 || (_mgp_p == -1 && gi_s == sel_pad)) ? _mgp_hit = 1;
           _mgp_j += 1;
         );
         _mgp_hit ? (
@@ -493,7 +625,7 @@ function swing_grid_draw_pads() (
     // pads it was a redundant bottom-right watermark (the pad number already
     // shows in both corners) and it crowded the "Out N" selector — removed.
     !has_content ? (
-      gfx_setfont(1, "Arial", _pf, 'b');
+      rk_font(1, _pf, 'b');
       sprintf(#_plab, "PAD %d", gi + 1);
       gfx_measurestr(#_plab, tw, th);
       gfx_set(0.38, 0.37, 0.35, 0.65);
@@ -509,12 +641,12 @@ function swing_grid_draw_pads() (
     // ONE SOURCE OF TRUTH (2026-07-27 audit): band first (matches the pill +
     // badge), name inference only when uncategorised — see the embedded-view
     // twin above, including why NONE falls through to the waveform.
-    _ic_cat = swing_lcd_padcat_eff(gi);
+    _ic_cat = swing_lcd_padcat_eff(gi_s);
     has_sample ? (
       (pad_icon_mode == 1 && _ic_cat != PADCAT_NONE) ? (
         _ic_cat < 0 ? (
-          _ic_n = get_cname_slot(gi);
-          strlen(_ic_n) == 0 ? _ic_n = get_name_slot(gi);
+          _ic_n = get_cname_slot(gi_s);
+          strlen(_ic_n) == 0 ? _ic_n = get_name_slot(gi_s);
           _ic_cat = eon_cat_for_name(_ic_n);
         );
         _ic_lum = _pr*0.30 + _pgg*0.59 + _pb*0.11;
@@ -524,11 +656,11 @@ function swing_grid_draw_pads() (
       ) : (
         // Waveform thumbnail — stereo (L != R content) renders top=L bottom=R
         // (Tukan-style); mono renders single classic centered waveform.
-        ptr   = wv_cache   + gi * WV_RES;
-        ptr_R = wv_cache_R + gi * WV_RES;
+        ptr   = wv_cache   + gi_s * WV_RES;   // by SLOT, as build_wv_cache writes it (the tile showed bank A's wave on B-D)
+        ptr_R = wv_cache_R + gi_s * WV_RES;
         wv_a = is_muted ? 0.20 : 0.55;
         gfx_set(1, 1, 1, wv_a);
-        p_stereo[gi] ? (
+        p_stereo[gi_s] ? (
           _wv_scale = ph * 0.20;
           _wy_topc  = pad_y + ph * 0.24;
           _wy_botc  = pad_y + ph * 0.72;
@@ -572,12 +704,12 @@ function swing_grid_draw_pads() (
       _ic_lum = _pr*0.30 + _pgg*0.59 + _pb*0.11;
       _ic_a = is_muted ? 0.35 : 0.90;
       _ic_lum > 0.55 ? gfx_set(0.08, 0.09, 0.11, _ic_a) : gfx_set(0.94, 0.95, 0.97, _ic_a);
-      eon_draw_cat_glyph_hi(swing_grid_syn_cat(gi), (pad_x + pw*0.5)|0, (pad_y + ph*0.47)|0, (min(pw, ph)*0.30)|0, -1);
+      eon_draw_cat_glyph_hi(swing_grid_syn_cat(gi_s), (pad_x + pw*0.5)|0, (pad_y + ph*0.47)|0, (min(pw, ph)*0.30)|0, -1);
     );
 
     // Flash overlay (velocity hit — white flash like real rubber pad press)
-    pad_flash[gi] > 0 ? (
-      _flash_a = pad_flash[gi] / 8.0;
+    pad_flash[gi_s] > 0 ? (
+      _flash_a = pad_flash[gi_s] / 8.0;
       gfx_set(1, 1, 1, _flash_a * 0.35);
       gfx_rect(pad_x + 2, pad_y + 2, pw - 4, ph - 4);
       // Colored glow ring around pad edge on hit
@@ -586,7 +718,7 @@ function swing_grid_draw_pads() (
         gfx_roundrect(pad_x - 1, pad_y - 1, pw + 2, ph + 2, _rd);
         gfx_roundrect(pad_x - 2, pad_y - 2, pw + 4, ph + 4, _rd + 1);
       );
-      pad_flash[gi] -= 1;
+      pad_flash[gi_s] -= 1;
     );
 
     // ── Per-pad repeat indicator (bottom-center, color-coded by div type) ──
@@ -594,13 +726,13 @@ function swing_grid_draw_pads() (
     // Straight (1,4,7,10,13)  → blue
     // Triplet  (2,5,8,11,14)  → green
     // Dotted   (3,6,9,12,15)  → amber
-    p_rpt_div[gi] > 0 ? (
-      get_rpt_div_name(p_rpt_div[gi]);
-      gfx_setfont(1, "Arial", swing_fs(10), 'b');
+    p_rpt_div[gi_s] > 0 ? (
+      get_rpt_div_name(p_rpt_div[gi_s]);
+      rk_font(1, swing_fs(10), 'b');
       gfx_measurestr(#_rpt_name, tw, th);
       _rpt_ix = pad_x + ((pw - tw) / 2)|0;
       _rpt_iy = pad_y + ph - th - 4;
-      _rpt_type = (p_rpt_div[gi] - 1) % 3;
+      _rpt_type = (p_rpt_div[gi_s] - 1) % 3;
       // Dark background pill
       gfx_set(0, 0, 0, 0.70);
       gfx_rect(_rpt_ix - 3, _rpt_iy - 2, tw + 6, th + 4);
@@ -615,10 +747,10 @@ function swing_grid_draw_pads() (
     mtr_w = 2; mtr_gap = 1;
     mtr_h_max = ph - 4;
     // Left channel
-    _mL = min(1.0, pad_meterL[gi]);
+    _mL = min(1.0, pad_meterL[gi_s]);
     _mL_fill = (_mL * mtr_h_max)|0;
     // Right channel
-    _mR = min(1.0, pad_meterR[gi]);
+    _mR = min(1.0, pad_meterR[gi_s]);
     _mR_fill = (_mR * mtr_h_max)|0;
     // Dark track background
     gfx_set(0, 0, 0, 0.25);
@@ -644,7 +776,7 @@ function swing_grid_draw_pads() (
     );
 
     // ── Note name (top-left, clickable dropdown) ──────────────────────
-    _nn = p_note[gi];
+    _nn = p_note[gi_s];
     _oct = (_nn / 12 | 0) - 1;
     _semi = _nn % 12;
     _semi == 0  ? strcpy(#_note, "C")  :
@@ -671,22 +803,22 @@ function swing_grid_draw_pads() (
     // an animated ring, RIGHT-CLICK opens the shared category picker for THIS
     // pad (LMB stays pad-trigger), wheel cycles the category through the
     // bridge. Single hover-ease state pair (one pad hovered at a time).
-    _bl_cat = swing_lcd_padcat_eff(gi);
+    _bl_cat = swing_lcd_padcat_eff(gi_s);
     // Synth-only pads have no file for the categorizer — the ENGINE is the
     // category. Published band still wins (user picks stay authoritative), and
     // that includes NONE: == -1 (nothing published) not < 0, or the engine would
     // override the one pad state the user set by hand.
     // NONE then draws the pad NUMBER, same as uncategorised — which is the
     // fallback this badge already had.
-    _bl_cat == -1 && has_syn && !has_sample ? _bl_cat = swing_grid_syn_cat(gi);
+    _bl_cat == -1 && has_syn && !has_sample ? _bl_cat = swing_grid_syn_cat(gi_s);
     _bl_bx = pad_x + 5; _bl_by = pad_y + ph - 18; _bl_bw = 20; _bl_bh = 17;
     _bl_hov = mx >= _bl_bx && mx <= _bl_bx + _bl_bw && my >= _bl_by && my <= _bl_by + _bl_bh
               && pad_input_allowed() && !swing_pne_mouse_in_box();
     _bl_hov ? (
       swing_badge_hvpad != gi ? ( swing_badge_hvpad = gi; swing_badge_hv = 0; );
       swing_badge_hv += (1 - swing_badge_hv) * 0.30;
-      frame_wheel != 0 ? swing_lcd_padcat_wheel(gi, frame_wheel|0);
-      rmb_down ? cat_ov_pad = gi;   // §9c: the glyph-grid overlay (was: text menu)
+      frame_wheel != 0 ? swing_lcd_padcat_wheel(gi_s, frame_wheel|0);
+      rmb_down ? cat_ov_pad = gi_s;   // §9c: the glyph-grid overlay (was: text menu)
     ) : ( swing_badge_hvpad == gi ? swing_badge_hv += (0 - swing_badge_hv) * 0.30; );
     swing_badge_hvpad == gi && swing_badge_hv > 0.01 ? (   // animated hover ring
       gfx_set(0.55, 0.92, 0.62, 0.55 * swing_badge_hv);
@@ -702,7 +834,7 @@ function swing_grid_draw_pads() (
         7 + (swing_badge_hvpad == gi ? swing_badge_hv : 0), -1);
     ) : (
       sprintf(#_padnum_str, "%d", gi + 1);
-      gfx_setfont(1, "Arial", _pf, 'b');
+      rk_font(1, _pf, 'b');
       rk_auto_ink_a(_pr, _pgg, _pb, is_muted ? 0.45 : 0.80);
       gfx_measurestr(#_padnum_str, _bl_pn_tw, _bl_pn_th);
       gfx_x = pad_x + 8; gfx_y = pad_y + ph - _bl_pn_th - 2;
@@ -711,7 +843,7 @@ function swing_grid_draw_pads() (
 
     // ── MIDI note label (top-left) ─────────────────────────────────
     sprintf(#_nn_str, "%s%d", #_note, _oct);
-    gfx_setfont(1, "Arial", _pf, 'b');
+    rk_font(1, _pf, 'b');
     gfx_measurestr(#_nn_str, _nn_tw, _nn_th);
     _nn_x = pad_x + 3;
     _nn_ly = pad_y + 2;
@@ -720,13 +852,13 @@ function swing_grid_draw_pads() (
     gfx_set(col_rgba[gi*3] * 0.85, col_rgba[gi*3+1] * 0.85, col_rgba[gi*3+2] * 0.85, is_muted ? 0.5 : 1.0);
     gfx_rect(_nn_x - 2, _nn_ly - 1, _nn_tw + 4, _nn_th + 2);
     // Bright text; brighter still when the note is user-locked
-    gfx_set(1, 1, 1, is_muted ? 0.45 : (p_note_lock[gi] ? 1.0 : 0.85));
+    gfx_set(1, 1, 1, is_muted ? 0.45 : (p_note_lock[gi_s] ? 1.0 : 0.85));
     gfx_x = _nn_x; gfx_y = _nn_ly; gfx_drawstr(#_nn_str);
     _nn_lx = _nn_x;
 
     // ── Pad name/number (top-right, clickable) ──────────────────────
-    _cn = get_cname_slot(gi);
-    gfx_setfont(1, "Arial", _pf_name, 'b');
+    _cn = get_cname_slot(gi_s);
+    rk_font(1, _pf_name, 'b');
     strlen(_cn) > 0 ? (
       // Custom name — truncate with ".." if it overflows the pad width
       strcpy(#_nm_disp, _cn);
@@ -757,7 +889,7 @@ function swing_grid_draw_pads() (
     // and under any open editor box.
     _nm_hov = mx >= _name_lx && mx <= _name_lx + _name_bw &&
               my >= _name_ly && my <= _name_ly + _name_bh &&
-              pad_input_allowed() && pne_pad != gi && !swing_pne_mouse_in_box();
+              pad_input_allowed() && pne_pad != gi_s && !swing_pne_mouse_in_box();
     _nm_hov ? (
       swing_nm_hvpad != gi ? ( swing_nm_hvpad = gi; swing_nm_hv = 0; );
       swing_nm_hv += (1 - swing_nm_hv) * 0.30;
@@ -787,11 +919,11 @@ function swing_grid_draw_pads() (
     // geometry every frame the grid draws (the editor box itself draws
     // later, after tooltips, from swing_pne_draw). The box spans the whole
     // top strip, covering the note pill too: an unmistakable edit signal.
-    gi == pne_pad ? ( pne_px = pad_x; pne_py = pad_y; pne_pw = pw; pne_geom_ok = 1; );
+    gi_s == pne_pad ? ( pne_px = pad_x; pne_py = pad_y; pne_pw = pw; pne_geom_ok = 1; );
 
     // ── Empty pad "DROP" hint (bottom-left) ─────────────────────────────
     !has_content ? (
-      gfx_setfont(1, "Arial", _pf, 'b');
+      rk_font(1, _pf, 'b');
       gfx_set(0.60, 0.58, 0.56, 0.50);
       gfx_measurestr("DROP", tw, th);
       gfx_x = pad_x + (pw - tw) / 2; gfx_y = pad_y + ph - th - 2;
@@ -799,14 +931,16 @@ function swing_grid_draw_pads() (
     );
 
     // ── Output bus selector (bottom-right, clickable) ──────────────────
-    gfx_setfont(1, "Arial", _pf_out, 'b');
-    sprintf(#_out, "Out %d", p_output[gi] + 1);
+    // Bold from 10 px only: _pf_out is 9 at 100 %, and a bold 9 px "5" draws
+    // as a "6" (wiki 4.7) -- "Out 5" read "Out 6". "SYN" below stays bold.
+    rk_font(1, _pf_out, _pf_out >= 10 ? 'b' : 0);
+    swing_out_pair_name(swing_out_pair(gi_s), #_out);   // where it plays: "Bank B" for banks B-D (Outputs step 1)
     gfx_measurestr(#_out, _out_tw, _out_th);
     _out_lx = pad_x + pw - _out_tw - 6;
     _out_ly = pad_y + ph - _out_th - 4;
     // Bus colour first — the hover tint is derived from it, so it has to be
     // resolved before the background rather than just before the text.
-    hsl_to_rgb(p_output[gi] / 16.0, 0.75, 0.72);
+    hsl_to_rgb(swing_out_hue(gi_s), 0.75, 0.72);
     // Hover ease. Rect matches the click test in the input pass EXACTLY, so
     // the pill only lights where a click actually lands. Single state pair —
     // one pad hovered at a time, same convention as the category badge above.
@@ -839,11 +973,11 @@ function swing_grid_draw_pads() (
     // 9 families were listed, so RIM/COWBELL/SHAKER landed there too.
     // The palette stays inlined: overlay_syn (which owns _syn_engine_col)
     // imports AFTER this file, so that helper is not resolvable from here.
-    gfx_setfont(1, "Arial", _pf_out, 'b');   // measure needs the font set
+    rk_font(1, _pf_out, 'b');   // measure needs the font set
     gfx_measurestr("SYN", _syn_tw, _syn_th);
     _syn_lx = _out_lx - _syn_tw - 10;
     has_syn ? (
-      _syn_e = (ps_engine[gi]|0) % 10;
+      _syn_e = (ps_engine[gi_s]|0) % 10;
       _syn_e == 0 ? ( _syn_cr = 0.95; _syn_cg = 0.45; _syn_cb = 0.32; ) :   // KICK
       _syn_e == 1 ? ( _syn_cr = 0.98; _syn_cg = 0.72; _syn_cb = 0.28; ) :   // SNARE
       _syn_e == 2 ? ( _syn_cr = 0.95; _syn_cg = 0.55; _syn_cb = 0.78; ) :   // CLAP
@@ -889,7 +1023,7 @@ function swing_grid_draw_pads() (
 
     // SOLO pill (left side)
     _pill_s_x = cx + 2;
-    p_solo[gi] ? (
+    p_solo[gi_s] ? (
       gfx_set(btn_blue_r, btn_blue_g, btn_blue_b, 0.90);
       gfx_rect(_pill_s_x, _ctrl_y, _pill_w, _pill_h);
       gfx_set(1, 1, 1, 0.95);
@@ -903,7 +1037,7 @@ function swing_grid_draw_pads() (
     gfx_rect(_pill_s_x + _pill_w - _pill_r, _ctrl_y, _pill_r, 1); gfx_rect(_pill_s_x + _pill_w - 1, _ctrl_y, 1, _pill_r);
     gfx_rect(_pill_s_x, _ctrl_y + _pill_h - 1, _pill_r, 1); gfx_rect(_pill_s_x, _ctrl_y + _pill_h - _pill_r, 1, _pill_r);
     gfx_rect(_pill_s_x + _pill_w - _pill_r, _ctrl_y + _pill_h - 1, _pill_r, 1); gfx_rect(_pill_s_x + _pill_w - 1, _ctrl_y + _pill_h - _pill_r, 1, _pill_r);
-    gfx_setfont(1, "Arial", _strip_f, 'b');
+    rk_font(1, _strip_f, 'b');
     gfx_measurestr("S", tw, th);
     gfx_x = _pill_s_x + (_pill_w - tw) / 2; gfx_y = _ctrl_y + (_pill_h - th) / 2;
     gfx_drawstr("S");
@@ -912,7 +1046,7 @@ function swing_grid_draw_pads() (
 
     // MUTE pill (next to solo)
     _pill_m_x = _pill_s_x + _pill_w + 1;
-    p_mute[gi] ? (
+    p_mute[gi_s] ? (
       gfx_set(btn_red_r, btn_red_g, btn_red_b, 0.90);
       gfx_rect(_pill_m_x, _ctrl_y, _pill_w, _pill_h);
       gfx_set(1, 1, 1, 0.95);
@@ -926,7 +1060,7 @@ function swing_grid_draw_pads() (
     gfx_rect(_pill_m_x + _pill_w - _pill_r, _ctrl_y, _pill_r, 1); gfx_rect(_pill_m_x + _pill_w - 1, _ctrl_y, 1, _pill_r);
     gfx_rect(_pill_m_x, _ctrl_y + _pill_h - 1, _pill_r, 1); gfx_rect(_pill_m_x, _ctrl_y + _pill_h - _pill_r, 1, _pill_r);
     gfx_rect(_pill_m_x + _pill_w - _pill_r, _ctrl_y + _pill_h - 1, _pill_r, 1); gfx_rect(_pill_m_x + _pill_w - 1, _ctrl_y + _pill_h - _pill_r, 1, _pill_r);
-    gfx_setfont(1, "Arial", _strip_f, 'b');
+    rk_font(1, _strip_f, 'b');
     gfx_measurestr("M", tw, th);
     gfx_x = _pill_m_x + (_pill_w - tw) / 2; gfx_y = _ctrl_y + (_pill_h - th) / 2;
     gfx_drawstr("M");
@@ -935,9 +1069,9 @@ function swing_grid_draw_pads() (
 
     // RPT pill (per-pad note repeat)
     _pill_rpt_x = _pill_m_x + _pill_w + 1;
-    p_rpt_div[gi] > 0 ? (
+    p_rpt_div[gi_s] > 0 ? (
       // Feel color, matching the RPT menu / global button (OFF = grey "follow global").
-      _rpt_feel = (p_rpt_div[gi] - 1) % 3;
+      _rpt_feel = (p_rpt_div[gi_s] - 1) % 3;
       _rpt_feel == 0 ? gfx_set(0.30, 0.55, 0.90, 1) :   // straight (blue)
       _rpt_feel == 1 ? gfx_set(0.30, 0.75, 0.40, 1) :   // triplet (green)
                        gfx_set(0.95, 0.65, 0.20, 1);     // dotted (amber)
@@ -953,7 +1087,7 @@ function swing_grid_draw_pads() (
     gfx_rect(_pill_rpt_x + _pill_w - _pill_r, _ctrl_y, _pill_r, 1); gfx_rect(_pill_rpt_x + _pill_w - 1, _ctrl_y, 1, _pill_r);
     gfx_rect(_pill_rpt_x, _ctrl_y + _pill_h - 1, _pill_r, 1); gfx_rect(_pill_rpt_x, _ctrl_y + _pill_h - _pill_r, 1, _pill_r);
     gfx_rect(_pill_rpt_x + _pill_w - _pill_r, _ctrl_y + _pill_h - 1, _pill_r, 1); gfx_rect(_pill_rpt_x + _pill_w - 1, _ctrl_y + _pill_h - _pill_r, 1, _pill_r);
-    gfx_setfont(1, "Arial", _strip_f, 'b');
+    rk_font(1, _strip_f, 'b');
     gfx_measurestr("R", tw, th);
     gfx_x = _pill_rpt_x + (_pill_w - tw) / 2; gfx_y = _ctrl_y + (_pill_h - th) / 2;
     gfx_drawstr("R");
@@ -1011,12 +1145,12 @@ function swing_grid_draw_pads() (
     // has_sample gate hid two working knobs and left them draggable-blind.
     _km_v = km_pad_vol_pan + (gi * KM_PAD_MINI + 0) * KS;
     has_content ? (
-      rk_knob_draw(_pk_vstyle, _vol_cx, _knob_cy, _mini_kr, p_gain[gi], 0, 2.0, 0, _km_v[0],
+      rk_knob_draw(_pk_vstyle, _vol_cx, _knob_cy, _mini_kr, p_gain[gi_s], 0, 2.0, 0, _km_v[0],
                    _pkv_r, _pkv_g, _pkv_b, 0, 0.36, 0.34, 0.32);
       // Bigger, brighter, fully opaque label so VOL/PAN read clearly
       // against the dark control-strip area at the bottom of the pad.
       // Was: Arial 9 'b', (0.78, 0.76, 0.73, 0.85) — washed out.
-      gfx_setfont(1, "Arial", _lbl_f, 'b'); rkth_setcol(2, 0.96, 0.94, 0.91, 1.0);
+      rk_font(1, _lbl_f, 'b'); rkth_setcol(2, 0.96, 0.94, 0.91, 1.0);
       gfx_measurestr("VOL", tw, th);
       gfx_x = _vol_cx - tw/2; gfx_y = _knob_cy + _mini_kr + 1; gfx_drawstr("VOL");
     );
@@ -1029,27 +1163,27 @@ function swing_grid_draw_pads() (
       // Right-click on VOL / PAN = that knob's style menu (below), not a reset;
       // see the note on the LCD PAN knob in rk_swing_lcd.
       _rmb_keep = rmb_down; rmb_down = 0;
-      nv = mpc_knob_interact(_km_v, _vol_cx, _knob_cy, _mini_kr, p_gain[gi], 0, 2.0, 1.0, 0);
+      nv = mpc_knob_interact(_km_v, _vol_cx, _knob_cy, _mini_kr, p_gain[gi_s], 0, 2.0, 1.0, 0);
       rmb_down = _rmb_keep;
-      nv != p_gain[gi] ? (p_gain[gi] = nv; s_dirty[gi] = 1; mark_dirty_pad(gi););
+      nv != p_gain[gi_s] ? (p_gain[gi_s] = nv; s_dirty[gi_s] = 1; mark_dirty_pad(gi_s););
       _km_v[1] ? _knob_active = 1;
     );
 
     // PAN mini-knob
     _km_p = km_pad_vol_pan + (gi * KM_PAD_MINI + 1) * KS;
     has_content ? (
-      rk_knob_draw(_pk_pstyle, _pan_cx, _knob_cy, _mini_kr, p_pan[gi], -1.0, 1.0, 1, _km_p[0],
+      rk_knob_draw(_pk_pstyle, _pan_cx, _knob_cy, _mini_kr, p_pan[gi_s], -1.0, 1.0, 1, _km_p[0],
                    _pkp_r, _pkp_g, _pkp_b, 0, 0.36, 0.34, 0.32);
       // Match the brighter VOL label above for legibility on the pad strip.
-      gfx_setfont(1, "Arial", _lbl_f, 'b'); rkth_setcol(2, 0.96, 0.94, 0.91, 1.0);
+      rk_font(1, _lbl_f, 'b'); rkth_setcol(2, 0.96, 0.94, 0.91, 1.0);
       gfx_measurestr("PAN", tw, th);
       gfx_x = _pan_cx - tw/2; gfx_y = _knob_cy + _mini_kr + 1; gfx_drawstr("PAN");
     );
     has_content && pad_input_allowed() ? (
       _rmb_keep = rmb_down; rmb_down = 0;     // style menu, as VOL above
-      nv = mpc_knob_interact(_km_p, _pan_cx, _knob_cy, _mini_kr, p_pan[gi], -1.0, 1.0, 0, 0);
+      nv = mpc_knob_interact(_km_p, _pan_cx, _knob_cy, _mini_kr, p_pan[gi_s], -1.0, 1.0, 0, 0);
       rmb_down = _rmb_keep;
-      nv != p_pan[gi] ? (p_pan[gi] = nv; p_panL[gi] = 1.0 - max(0.0, nv); p_panR[gi] = 1.0 + min(0.0, nv); mark_dirty_pad(gi););
+      nv != p_pan[gi_s] ? (p_pan[gi_s] = nv; p_panL[gi_s] = 1.0 - max(0.0, nv); p_panR[gi_s] = 1.0 + min(0.0, nv); mark_dirty_pad(gi_s););
       _km_p[1] ? _knob_active = 1;
     );
 
@@ -1086,12 +1220,12 @@ function swing_grid_draw_pads() (
       swing_tooltip_check(500 + gi, "Pad volume — drag for fine, scroll wheel for coarse, double-click resets to 0 dB.");
     has_content && (dist(mx, my, _pan_cx, _knob_cy) <= _mini_kr + 3) ?
       swing_tooltip_check(600 + gi, "Pad pan (-100% L to +100% R) — drag, scroll, or double-click to center.");
-    overlay_pad != gi ? (  // don't process pad clicks when overlay is open for it
+    overlay_pad != gi_s ? (  // don't process pad clicks when overlay is open for it
       in_pad = mx >= pad_x && mx <= pad_x+pw && my >= pad_y && my <= pad_y+ph;
       // Pad face hover tooltip (only when not over a sub-control, and not
       // while this pad's name is being edited in place — the tooltip box
       // would peek out around the editor).
-      in_pad && !in_s && !in_m && !in_rpt && !_knob_hover && pne_pad != gi ?
+      in_pad && !in_s && !in_m && !in_rpt && !_knob_hover && pne_pad != gi_s ?
         // "Cmd/Ctrl" because mouse_cap bit 4 IS Command on macOS — the gesture
         // has always worked there, only the printed word was Windows-only.
         swing_tooltip_check(100 + gi, "Drag samples here to load. Left-click triggers; Shift+drag swaps pads; Cmd/Ctrl+click clears; Alt+click opens the drum synth. Right-click opens the per-pad envelope/FX overlay.");
@@ -1100,10 +1234,9 @@ function swing_grid_draw_pads() (
       _out_clicked = 0;
       in_out = mx >= _out_lx && mx <= _out_lx + _out_tw + 2 && my >= _out_ly && my <= _out_ly + _out_th + 2;
       in_out && lmb_down && pad_input_allowed() ? (
-        _pad_grid_target = gi;
-        swing_popup_open(mx, my,
-          "Out 1|Out 2|Out 3|Out 4|Out 5|Out 6|Out 7|Out 8|Out 9|Out 10|Out 11|Out 12|Out 13|Out 14|Out 15|Out 16",
-          SP_POPUP_CALLER_PAD_GRID_OUTPUT);
+        _pad_grid_target = gi_s;   // a SLOT: the popup's consumer writes the engine on a later frame (step 4d)
+        swing_out_menu(gi_s, #out_menu_str);   // the one Out menu (Outputs step 3)
+        swing_popup_open(mx, my, #out_menu_str, SP_POPUP_CALLER_PAD_GRID_OUTPUT);
         _out_clicked = 1;
       );
 
@@ -1111,7 +1244,7 @@ function swing_grid_draw_pads() (
       _note_clicked = 0;
       mx >= _nn_lx && mx <= _nn_lx + _nn_tw + 4 && my >= _nn_ly && my <= _nn_ly + _nn_th + 2 && lmb_down && pad_input_allowed() ? (
         _note_clicked = 1;
-        _pad_grid_target = gi;
+        _pad_grid_target = gi_s;   // a slot (step 4d)
         swing_popup_open(mx, my, #note_menu, SP_POPUP_CALLER_PAD_GRID_NOTE);
       );
 
@@ -1128,9 +1261,9 @@ function swing_grid_draw_pads() (
       // guard is belt-and-suspenders.
       _name_clicked = 0;
       _name_hit = mx >= _name_lx && mx <= _name_lx + _name_bw && my >= _name_ly && my <= _name_ly + _name_bh && pad_input_allowed();
-      _name_hit && lmb_down && pne_pad != gi ? (
+      _name_hit && lmb_down && pne_pad != gi_s ? (
         _name_clicked = 1;
-        swing_pne_open(gi);
+        swing_pne_open(gi_s);
       );
 
       // SYN chip click → open the SYNTH big view on this pad (the chip is
@@ -1141,12 +1274,12 @@ function swing_grid_draw_pads() (
       mx >= _syn_lx - 2 && mx <= _syn_lx + _syn_tw + 2 &&
       my >= _out_ly - 1 && my <= _out_ly + _syn_th + 1 ? (
         _syn_clicked = 1;
-        swing_synthview_open(gi);
+        swing_synthview_open(gi_s);
       );
 
       // Shift+left-click pad → start drag-swap
       in_pad && lmb_down && SHIFT && pad_input_allowed() && !_knob_hover ? (
-        drag_src_pad = gi; drag_active = 0;
+        drag_src_pad = gi_s; drag_active = 0;
         drag_start_x = mx; drag_start_y = my;
       );
 
@@ -1154,17 +1287,17 @@ function swing_grid_draw_pads() (
       // pad, synth or not — the quick path to ADD a synth)
       in_pad && lmb_down && ALT && !SHIFT && !CTRL && pad_input_allowed() &&
       !_out_clicked && !_note_clicked && !_name_clicked && !_knob_hover && !_syn_clicked ? (
-        swing_synthview_open(gi);
+        swing_synthview_open(gi_s);
       );
 
       // Left-click pad → select + trigger. Not with Ctrl: that is the clear
       // gesture below, and it used to trigger the pad it was clearing (D-4).
       in_pad && lmb_down && !SHIFT && !ALT && !CTRL && pad_input_allowed() && !_out_clicked && !_note_clicked && !_name_clicked && !_knob_hover && !_syn_clicked ? (
-        sel_pad = gi;
+        sel_pad = gi_s;
         lcd_right_tab = 1;  // auto-switch to PAD tab
-        pad_is_playable(gi) ? (
-          swing_gt_post(gi, p_note[gi], 127, 8);
-          p_held[gi] = 1; p_held_vel[gi] = 127; p_held_note[gi] = p_note[gi]; gui_held_pad = gi;
+        pad_is_playable(gi_s) ? (
+          swing_gt_post(gi_s, p_note[gi_s], 127, 8);
+          p_held[gi_s] = 1; p_held_vel[gi_s] = 127; p_held_note[gi_s] = p_note[gi_s]; gui_held_pad = gi_s;
         );
         // Pad-click-selects-track (opt-in via Colors right-click menu):
         // signal the bridge to select the corresponding multi-out child
@@ -1183,12 +1316,12 @@ function swing_grid_draw_pads() (
       // Ctrl+click pad → clear pad (deferred for undo). Playable gate, not
       // audio: a synth-only pad clears too (ratified table — Clear Pad = all);
       // both downstream paths pair clear_pad + clear_pad_syn.
-      in_pad && lmb_down && CTRL && pad_input_allowed() && pad_is_playable(gi) ? (
+      in_pad && lmb_down && CTRL && pad_input_allowed() && pad_is_playable(gi_s) ? (
         gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 ? (
           gmem[KIT_GMEM_UNDO_DESC] = 2; gmem[KIT_GMEM_CMD] = 46;
-          _undo_pending = 2; _undo_pad = gi;
+          _undo_pending = 2; _undo_pad = gi_s;   // a slot: swing_ui_process_undo clears it (step 4d)
         ) : (
-          clear_pad(gi); clear_pad_syn(gi);
+          clear_pad(gi_s); clear_pad_syn(gi_s);
         );
       );
 
@@ -1199,10 +1332,10 @@ function swing_grid_draw_pads() (
         // A synth-only pad has no sample layers to edit — RMB goes straight
         // to the SYNTH view (the overlay's SYN tab was removed 2026-07-31).
         // Otherwise open the layer editor on the last-used REAL tab.
-        ps_enable[gi] > 0.5 && !pad_has_audio(gi) ? (
-          swing_synthview_open(gi);
+        ps_enable[gi_s] > 0.5 && !pad_has_audio(gi_s) ? (
+          swing_synthview_open(gi_s);
         ) : (
-          swing_padfx_open(gi);
+          swing_padfx_open(gi_s);   // the SLOT: the editor reads every array at overlay_pad (user 2026-10-15: "stuck on pad bnk a")
         );
       );
 
@@ -1220,20 +1353,21 @@ function swing_grid_draw_pads() (
           drop_gi = gi;
           drop_idx = 0;
           while(gfx_getdropfile(drop_idx, #df) && drop_gi < NUM_PADS) (
-            p_gain[drop_gi] = 1.0; p_pan[drop_gi] = 0; p_tune[drop_gi] = 0;
-            p_panL[drop_gi] = 1.0; p_panR[drop_gi] = 1.0;
-            s_start[drop_gi] = 0; s_end[drop_gi] = 1.0;
-            swing_voice_kill_pad_xf(drop_gi);   // A-3: fade, never cut (see the embedded grid)
-            load_from_path(drop_gi, #df);
-            swing_rcp_post_pad(drop_gi);
-            s_dirty[drop_gi] = 1;
+            _da = swing_bp(drop_gi);   // the tile walks the bank; the engine takes the slot (step 4a)
+            p_gain[_da] = 1.0; p_pan[_da] = 0; p_tune[_da] = 0;
+            p_panL[_da] = 1.0; p_panR[_da] = 1.0;
+            s_start[_da] = 0; s_end[_da] = 1.0;
+            swing_voice_kill_pad_xf(_da);   // A-3: fade, never cut (see the embedded grid)
+            load_from_path(_da, #df);
+            swing_rcp_post_pad(_da);
+            s_dirty[_da] = 1;
             // The pad's JOB follows its new sample: a native drop never touches
             // the browser, so this is the only place that can classify it.
-            swing_lcd_padcat_queue_drop(drop_gi);
+            swing_lcd_padcat_queue_drop(_da);
             drop_gi += 1;
             drop_idx += 1;
           );
-          mark_dirty_pad(gi);
+          mark_dirty_pad(gi_s);
           sync_note_names();
           col_dirty = 1; // re-derive auto-color from dropped samples
         );
@@ -1243,17 +1377,17 @@ function swing_grid_draw_pads() (
     );
     // M button click — blocked when any overlay is open (prevents click-through)
     in_m && lmb_down && pad_input_allowed() ? (
-      p_mute[gi] = !p_mute[gi];
-      mark_dirty_pad(gi);
+      p_mute[gi_s] = !p_mute[gi_s];
+      mark_dirty_pad(gi_s);
     );
     // S button click — blocked when any overlay is open (prevents click-through)
     in_s && lmb_down && pad_input_allowed() ? (
-      p_solo[gi] = !p_solo[gi];
-      mark_dirty_pad(gi);
+      p_solo[gi_s] = !p_solo[gi_s];
+      mark_dirty_pad(gi_s);
     );
     // RPT button: right-click = menu, scroll = cycle, blocked when overlay open
     in_rpt && rmb_down && pad_input_allowed() ? (
-      _pad_grid_target = gi;
+      _pad_grid_target = gi_s;   // a slot (step 4d)
       // Feel-first order (straights, then triplets, then dotted) — matches the
       // global RPT menu. swing_panels_rpt_pos2div() maps the position back to the
       // fixed repeat_div enum, so OFF=pos1, straights=2..6, T=7..11, D=12..16.
@@ -1262,9 +1396,9 @@ function swing_grid_draw_pads() (
         SP_POPUP_CALLER_PAD_GRID_RPT);
     );
     in_rpt && frame_wheel != 0 && pad_input_allowed() ? (
-      p_rpt_div[gi] = swing_panels_rpt_wheel(p_rpt_div[gi], sign_of(frame_wheel));  // step in feel-first menu order
-      p_rpt_ctr[gi] = 0; p_rpt_swph[gi] = 0;
-      mark_dirty_pad(gi);
+      p_rpt_div[gi_s] = swing_panels_rpt_wheel(p_rpt_div[gi_s], sign_of(frame_wheel));  // step in feel-first menu order
+      p_rpt_ctr[gi_s] = 0; p_rpt_swph[gi_s] = 0;
+      mark_dirty_pad(gi_s);
     );
     gcol += 1;
   );  // end col loop
@@ -1276,10 +1410,7 @@ function swing_grid_draw_pads() (
   // fires on a LATER frame so we use _pad_grid_target (captured at click
   // time) instead of gi (which iterates past).
   swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_PAD_GRID_OUTPUT ? (
-    _pad_grid_target >= 0 ? (
-      p_output[_pad_grid_target] = swing_popup_result - 1;
-      mark_dirty_pad(_pad_grid_target);
-    );
+    _pad_grid_target >= 0 ? swing_out_menu_pick(_pad_grid_target, swing_popup_result);
     swing_popup_result = 0;
   );
   swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_PAD_GRID_OUTPUT ? (
@@ -1369,8 +1500,8 @@ function swing_grid_draw_pads() (
             _dy = grid_y + _drow * cell_h + 3;
             _dpw = cell_w - 4;
             _dph = pad_h;
-            mx >= _dx && mx <= _dx + _dpw && my >= _dy && my <= _dy + _dph && _di != drag_src_pad ? (
-              _drop_tgt = _di;
+            mx >= _dx && mx <= _dx + _dpw && my >= _dy && my <= _dy + _dph && swing_bp(_di) != drag_src_pad ? (
+              _drop_tgt = swing_bp(_di);   // a slot, like drag_src_pad (step 4d)
               gfx_set(1, 1, 1, 0.25);
               gfx_rect(_dx, _dy, _dpw, _dph);
             );
@@ -1394,7 +1525,7 @@ function swing_grid_draw_pads() (
             _dpw = cell_w - 4;
             _dph = pad_h;
             mx >= _dx && mx <= _dx + _dpw && my >= _dy && my <= _dy + _dph ? (
-              _drop_tgt = _di;
+              _drop_tgt = swing_bp(_di);   // a slot (step 4d)
             );
             _dcol += 1;
           );
@@ -1414,7 +1545,7 @@ function swing_grid_draw_pads() (
   // here. Written at the end of the draw, read by the NEXT frame's gate -- a
   // frame stale is fine, a gesture is older than that.
   _ggl_i = 0; _ggl_knob = 0;
-  loop(NUM_PADS,
+  loop(NUM_PADS,   // sixteen: km_pad_vol_pan is the mini-knobs' GESTURE memory, kept per TILE on screen by every writer (the face's knob calls index it by gi); the NUM_SLOTS grant is never addressed past row 15
     _ggl_b = km_pad_vol_pan + _ggl_i * KM_PAD_MINI * KS;
     (_ggl_b[1] || _ggl_b[KS + 1]) ? _ggl_knob = 1;
     _ggl_i += 1;
@@ -1435,7 +1566,7 @@ function swing_grid_draw_pads() (
 function swing_grid_extdrag() local(_xd_b, _xd_st, _xd_n, _xd_mode, _xd_live,
                                    _xd_x, _xd_y, _xd_row, _xd_col, _xd_i,
                                    _xd_cx, _xd_cy, _xd_pw, _xd_ph, _xd_k,
-                                   _xd_ox, _xd_oy, _xd_sx, _xd_sy) (
+                                   _xd_ox, _xd_oy, _xd_sx, _xd_sy, _xd_f) (
   _xd_b = EON_DRAG_BASE;
   _xd_st = gmem[_xd_b + EON_DRAG_OFF_STAMP];
 
@@ -1556,6 +1687,27 @@ function swing_grid_extdrag() local(_xd_b, _xd_st, _xd_n, _xd_mode, _xd_live,
     );
   );
 
+  // The pad editor's layer tabs (the user, 2026-10-22): the same window test as the floating path, then the tabs the
+  // editor published within a quarter second; over a tab no pad is the target and the claim carries the layer code.
+  xdrag_tab = -1;
+  _xd_st != 0 && (time_precise() - xdrag_seen_t) < 0.30 && !is_embedded && !swing_popup_active
+    && gmem[_xd_b + EON_DRAG_OFF_MODE] != EON_DRAG_MODE_BLIND
+    && gmem[_xd_b + EON_DRAG_OFF_W] == gfx_w && gmem[_xd_b + EON_DRAG_OFF_H] == gfx_h
+    && abs(mouse_x - gmem[_xd_b + EON_DRAG_OFF_X]) <= 2 && abs(mouse_y - gmem[_xd_b + EON_DRAG_OFF_Y]) <= 2
+    && time_precise() - ovl_tabs_t < 0.25 && mouse_y >= ovl_tabs_y && mouse_y <= ovl_tabs_y + ovl_tabs_h ? (
+    _xd_k = 0; loop(MAX_LAYERS,
+      mouse_x >= ovl_tabs_x + _xd_k * ovl_tabs_w && mouse_x <= ovl_tabs_x + _xd_k * ovl_tabs_w + ovl_tabs_w - 2 ? xdrag_tab = _xd_k;
+      _xd_k += 1;
+    );
+  );
+  xdrag_tab >= 0 ? (
+    xdrag_pad = -1;
+    _xd_f = swing_layer_drop_first(ovl_tabs_pad, xdrag_tab);
+    ovl_drag_l0 = max(0, _xd_f);
+    ovl_drag_n = min(max(1, gmem[_xd_b + EON_DRAG_OFF_COUNT]|0), MAX_LAYERS - ovl_drag_l0);
+    ovl_drag_t = time_precise();
+  );
+
   // CLAIM: only an instance that actually resolved a pad answers, and it
   // answers in its OWN registry slot so concurrent instances never collide.
   // Payload first, stamp echo LAST (the stamp is the memory barrier
@@ -1563,9 +1715,12 @@ function swing_grid_extdrag() local(_xd_b, _xd_st, _xd_n, _xd_mode, _xd_live,
   // reading a previous frame's answer as current.
   _reg_my_slot >= 0 ? (
     _xd_cx = EON_DRAG_CLAIM_BASE + _reg_my_slot * EON_DRAG_CLAIM_STRIDE;
-    gmem[_xd_cx + 0] = xdrag_pad;
+    gmem[_xd_cx + 0] = xdrag_tab >= 0 ? ovl_tabs_pad : xdrag_pad >= 0 ? swing_bp(xdrag_pad) : -1;   // the ABSOLUTE pad (4a)
     gmem[_xd_cx + 1] = instance_id;
-    gmem[_xd_cx + 2] = xdrag_pad >= 0 ? _xd_st : 0;
+    // cell 3, the LAYER code (2026-10-22): 0 = the pad itself (an older Swing leaves it 0), 1..4 = from layer code - 1,
+    // 9 = the first file replaces the pad and the rest stack from layer 1 (swing_layer_drop_first's -1)
+    gmem[_xd_cx + 3] = xdrag_tab >= 0 ? (_xd_f < 0 ? 9 : _xd_f + 1) : 0;
+    gmem[_xd_cx + 2] = (xdrag_pad >= 0 || xdrag_tab >= 0) ? _xd_st : 0;
   );
 );
 

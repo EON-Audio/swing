@@ -20,11 +20,29 @@
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- DEPENDENCY CHECK
 -- ═══════════════════════════════════════════════════════════════════════════════
+local function _get_script_dir()
+  local info = debug.getinfo(1, "S")
+  local path = info.source:match("@?(.*)")
+  return path:match("^(.*)[/\\]") or ""
+end
+local _SCRIPT_DIR = _get_script_dir()
+local _sep = package.config:sub(1,1)
+
+-- Same order as Swing_Browser.lua: the script dir FIRST, so the imgui.lua shipped
+-- beside this script keeps resolving ahead of ReaImGui's builtin copy, and the
+-- builtin entry only when ReaImGui exists. rk_lua_core needs nothing from it, so
+-- it loads here and the flag below is written by its core.GMEM name.
+package.path = _SCRIPT_DIR .. _sep .. "?.lua;" ..
+               (reaper.ImGui_GetBuiltinPath and reaper.ImGui_GetBuiltinPath() .. "/?.lua;" or "") ..
+               (package.path or "")
+local core = require("rk_lua_core")
+
 if not reaper.ImGui_GetBuiltinPath then
   -- Signal the JSFX so its "ReaImGui not installed" banner appears (same path
-  -- the Browser uses). Use the canonical slot, not a literal.
-  reaper.gmem_attach("Swing_Media_Transfer")
-  reaper.gmem_write(2624, 1)  -- GS_REAIMGUI_MISSING
+  -- the Browser uses). By name, never a number: gmem_name_parity.py cannot see
+  -- a number, which is how the Browser's wrong cell (2368) went unnoticed.
+  reaper.gmem_attach(core.GMEM_NAME)
+  reaper.gmem_write(core.GMEM.GS_REAIMGUI_MISSING, 1)
   reaper.MB(
     "Swing Pad FX requires the ReaImGui extension.\n\n"..
     "Install it from ReaPack:\n"..
@@ -33,23 +51,12 @@ if not reaper.ImGui_GetBuiltinPath then
     "Swing Pad FX — Missing Dependency", 0)
   return
 end
-reaper.gmem_attach("Swing_Media_Transfer")
-reaper.gmem_write(2624, 0)  -- clear stale GS_REAIMGUI_MISSING
+reaper.gmem_attach(core.GMEM_NAME)
+reaper.gmem_write(core.GMEM.GS_REAIMGUI_MISSING, 0)  -- clear a stale flag
 
-local function _get_script_dir()
-  local info = debug.getinfo(1, "S")
-  local path = info.source:match("@?(.*)")
-  return path:match("^(.*)[/\\]") or ""
-end
-local _SCRIPT_DIR = _get_script_dir()
-local _sep = package.config:sub(1,1)
-package.path = _SCRIPT_DIR .. _sep .. "?.lua;" ..
-               reaper.ImGui_GetBuiltinPath() .. "/?.lua;" ..
-               (package.path or "")
 local ImGui = require 'imgui' '0.9.3.2'
 
-local core    = require("rk_lua_core")
-local widgets = require("rk_lua_widgets")
+local widgets = require("rk_lua_widgets")   -- (rk_lua_core is required above)
 widgets.init(ImGui, core)
 
 -- ═══════════════════════════════════════════════════════════════════════════════
@@ -171,13 +178,7 @@ local function enumerate_instances()
   end
   for tr in core.iter_all_tracks() do
     for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
-      local _, fname = reaper.TrackFX_GetFXName(tr, fx, "")
-      local rv, ident = reaper.TrackFX_GetNamedConfigParm(tr, fx, "fx_ident")
-      local is_swing = (rv and ident:find("DrumKit_ReaKit"))
-                    or fname:find("DrumKit_ReaKit")
-                    or fname:match("^JS: Swing")
-                    or fname:match("Swing %— 16%-Pad")
-      if is_swing then
+      if core.is_swing_fx(tr, fx) then   -- the plugin's file, never its shown name (the bridge's rule)
         local id = math.floor(reaper.TrackFX_GetParam(tr, fx, 3) or 0)
         if alive[id] then
           local tn = math.floor(reaper.GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"))
@@ -253,22 +254,33 @@ end
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- UI HELPERS
 -- ═══════════════════════════════════════════════════════════════════════════════
+-- Pad Banks: `pad` is an ABSOLUTE slot 0..63 (bank * 16 + tile, step 4a). The name and META bands
+-- are sixteen wide and carry the bank ON SCREEN, so they are read at the tile, and only while this
+-- pad's bank is the one shown -- a pad pinned in another bank would otherwise wear the name, note
+-- and colour of the pad on its tile in the shown bank. The name only for a playable pad, as the
+-- Browser's info strip does: the mirror skips an empty name, so an empty pad keeps the last one.
 local function draw_pad_header(ctx, pad)
   local dl = ImGui.GetWindowDrawList(ctx)
   local x, y = ImGui.GetCursorScreenPos(ctx)
-  -- color swatch matching the JSFX pad face
-  local col = core.get_pad_color(pad)
-  ImGui.DrawList_AddRectFilled(dl, x, y, x + 18, y + 18, col, 3)
+  local tile, slot = pad % 16, core.resolve_inst_slot(active_inst_id)
+  local shown = pad == core.read_selected_pad()   -- the selection follows the bank (step 4a)
+    or (slot ~= nil and math.floor(pad / 16) == math.floor(reaper.gmem_read(G.GS_INST_BANK_CUR + slot) or 0))
+  -- color swatch matching the JSFX pad face (an empty frame when the pad's bank is not on screen)
+  if shown then ImGui.DrawList_AddRectFilled(dl, x, y, x + 18, y + 18, core.get_pad_color(tile), 3) end
   ImGui.DrawList_AddRect(dl, x, y, x + 18, y + 18, widgets.colors.border_default, 3)
   ImGui.Dummy(ctx, 22, 18)
   ImGui.SameLine(ctx)
-  local name = core.read_pad_name(pad)
-  local note = core.midi_to_note_name(core.read_pad_note(pad))
   ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.colors.text_gold)
-  ImGui.Text(ctx, string.format("Pad %d", pad + 1))
+  ImGui.Text(ctx, "Pad " .. core.pad_label(pad))
   ImGui.PopStyleColor(ctx)
   ImGui.SameLine(ctx)
-  ImGui.Text(ctx, (name ~= "" and name or "(unnamed)") .. "   " .. note)
+  if shown then
+    local name = core.pad_is_playable(tile, slot) and core.read_pad_name(tile) or nil
+    local note = core.midi_to_note_name(core.read_pad_note(tile))
+    ImGui.Text(ctx, (name == nil and "(empty)" or (name ~= "" and name or "(unnamed)")) .. "   " .. note)
+  else
+    ImGui.TextDisabled(ctx, "bank " .. string.char(65 + math.floor(pad / 16) % 4) .. " is not on screen")
+  end
 end
 
 -- ── EQ frequency-response graph ──────────────────────────────────────────────
@@ -663,7 +675,7 @@ local function frame()
     ImGui.SameLine(ctx)
 
     -- Follow / Pin
-    local mode_label = settings.follow and "Follow" or ("Pin " .. (settings.pinned + 1))
+    local mode_label = settings.follow and "Follow" or ("Pin " .. core.pad_label(settings.pinned))
     if ImGui.Button(ctx, mode_label .. "##follow", 70, 22) then
       settings.follow = not settings.follow
       if not settings.follow then settings.pinned = math.max(0, core.read_selected_pad()) end
@@ -737,7 +749,9 @@ local function frame()
     -- ── Resolve pad ─────────────────────────────────────────────────────────
     local pad
     if settings.follow then pad = core.read_selected_pad() else pad = settings.pinned end
-    if pad and pad > 15 then pad = 15 end
+    -- An ABSOLUTE pad since Pad Banks step 4a (bank * 16 + tile), like everything Swing publishes here.
+    -- It was clamped to 15, which aimed every bank B..D edit at bank A's pad 16.
+    if pad and pad > 63 then pad = 63 end
 
     -- Pad changed → drop queued writes + drag latches so we never push a stale
     -- pid to the new pad. KEEP `display` (it refreshes from gmem next read) —

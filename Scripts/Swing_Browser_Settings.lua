@@ -58,6 +58,7 @@ return {
   left_pane_open = true,
   spectral_view = false,      -- TK-style spectral coloring of waveform preview (FFT per pixel)
   grid_overlay = false,       -- TK-style time grid overlay on waveform preview
+  store_rate_max = 48000,     -- sample storage-rate ceiling the Kit Bridge decodes to: 48000 (default), 96000, or 0 = native (Spec_Swing_Pad_Banks §5.5)
   recurse_subfolders = false, -- Subfolders mode: flatten all audio in subdirs into one list
   kit_fill_mode = false,      -- Kit categories: OFF = LOAD author's layout, ON = FILL onto MY layout
   -- Docking: 0 = floating (default). Negative IDs (-1..-16) target REAPER's

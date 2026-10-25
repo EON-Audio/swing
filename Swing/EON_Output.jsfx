@@ -75,7 +75,7 @@ OU_STALL_MAX    = 8;   // blocks without a heartbeat before the link is dead
 freemem = 0;
 OU_KNOBS = 3;
 ou_kmem = freemem; freemem += OU_KNOBS * 16;
-freemem = swing_popup_init(freemem);   // the THEME menu's row lists (194 cells)
+freemem = swing_popup_init(freemem);   // the THEME menu's row lists (386 cells: 64 items x 6 tables + 2)
 
 // GR meter, fed the limiter's own envelope (linear, 1.0 = no reduction) --
 // the same wiring EON Weld uses for its compressor. rk_vu claims no memory.
@@ -83,6 +83,7 @@ gr_vu.rk_vu_init_gr();
 
 _ou_sm      = 1.0 - exp(-1.0 / max(1, 0.0045 * srate));   // Swing's 4.5 ms
 ou_gain     = -1;   // seated from the target on the first @block, no fade-in on load
+ou_thr_s    = -1;   // the limiter's ceiling as the sample path sees it: seated likewise, then glided (click fix 2026-10-14)
 ou_lim_env  = 1;
 _ou_hb_prev = -1;
 _ou_stall   = OU_STALL_MAX;
@@ -229,6 +230,7 @@ ou_link_inst > 0 ? (
 !ou_lim_on ? ou_lim_env = 1.0;
 
 ou_gain < 0 ? ou_gain = ou_gain_t;   // first block: seat, do not fade in
+ou_thr_s < 0 ? ou_thr_s = ou_thr_lin;
 
 @sample
 
@@ -238,10 +240,16 @@ _ou_l = spl0 * ou_gain;
 _ou_r = spl1 * ou_gain;
 
 // ─── Limiter: Swing's, verbatim. Instant attack, one-pole auto release ─────
+// The ceiling GLIDES (click fix 2026-10-14; Click_Fix_Plan step 6): with an instant
+// attack, a threshold that drops in one sample drops the gain in one sample -- a
+// 0.043 step on the stress tone at a jump to -12 dB. Chased at the master volume's
+// 4.5 ms, seated on the first block, so the ramp is a ramp and a load is not a fade.
+// Swing's master limiter carries the same glide (Swing_ReaKit.jsfx, _mlim_thr_s).
+ou_thr_s += (ou_thr_lin - ou_thr_s) * _ou_sm;
 ou_lim_on ? (
   _ou_peak = max(abs(_ou_l), abs(_ou_r));
-  _ou_peak > ou_thr_lin ? (
-    _ou_g = ou_thr_lin / _ou_peak;
+  _ou_peak > ou_thr_s ? (
+    _ou_g = ou_thr_s / _ou_peak;
     ou_lim_env = min(ou_lim_env, _ou_g);   // instant attack
   );
   _ou_l *= ou_lim_env;   // apply BEFORE releasing, or the peak leaves above the ceiling
@@ -253,12 +261,17 @@ gr_vu.rk_vu_sample_gr(ou_lim_on ? ou_lim_env : 1);   // decimated inside the lib
 
 spl0 = _ou_l; spl1 = _ou_r;
 
-@gfx 300 700
+@gfx 300 900
 // ⚠️ @gfx sets the EMBED ASPECT (house rule: portrait, so the strip pairs with
-// Drum Strip / Weld / Anvil in the mixer). 300x700 is Drum Strip's ratio
-// exactly, so the two line up side by side on an Audio folder. The old
-// 420x170 was landscape: in an 82 px mixer strip that is 33 px tall, which is
-// why the embed showed a title and nothing else.
+// Drum Strip / Weld / Anvil in the mixer). 300x900 is Drum Strip's ratio
+// exactly, so the two line up side by side on an Audio folder (86 x 258 in
+// REAPER's default mixer strip). It followed the Drum Strip from 300x700 on
+// 2026-10-15 (the user: "Make Output, Macros and Patchbay taller too so they
+// line up with the Drum Strip again"). The full layout below is still drawn on
+// a 300x700 design canvas (sc = min(W/300, H/700)), so a 489x900 fresh float
+// scales it up rather than leaving a band. The old 420x170 was landscape: in
+// an 82 px mixer strip that is 33 px tall, which is why the embed showed a
+// title and nothing else.
 
 // ── Frame globals (knobs_kbsg caller contract) ─────────────────────────
 // ssl_knob_interact reads mx/my/LMB/lmb_down/CTRL/dt/hv_speed/frame_wheel as
@@ -380,9 +393,15 @@ _ou_full ? (
     thm_anchor_x = _ou_cx2; thm_anchor_y = _ou_cy2;
     thm_anchor_w = _ou_cw;  thm_anchor_h = _ou_ch;
     _ou_chit = mx >= _ou_cx2 && mx < _ou_cx2 + _ou_cw && my >= _ou_cy2 && my < _ou_cy2 + _ou_ch;
-    // lmb is withheld from rkth_input so a LEFT click opens the PANEL instead of
-    // the widget's own list; the widget still stores its geometry for the draw.
-    rkth_input(_ou_cx2, _ou_cy2, _ou_cw, _ou_ch, mx, my, 0, rmb_down, frame_wheel, _ou_ch) ?
+    // ⚠️⚠️ lmb reaches rkth_input ONLY while its list is
+    // already OPEN. Shut, it is withheld so a left click on the chip opens the
+    // THEME MENU rather than the widget's own list. Open, the click is the LIST'S:
+    // rk_theme.jsfx-inc:118 picks the hovered row under `lmb ?`, so withholding it
+    // unconditionally left the list openable by right-click and impossible to
+    // choose from -- which is how it shipped in 3.0.18.
+    // ⭐ The chip test below reads lmb_down AFTER this call, so it needs no gate of its
+    // own: a click consumed by the open list zeroes lmb_down and the chip test misses.
+    rkth_input(_ou_cx2, _ou_cy2, _ou_cw, _ou_ch, mx, my, rkth_open ? lmb_down : 0, rmb_down, frame_wheel, _ou_ch) ?
       ( lmb_down = 0; frame_wheel = 0; );
     _ou_chit && lmb_down ? ( thm_open = 1 - thm_open; rkth_open = 0; lmb_down = 0; );
     rkth_draw_chip(max(9, floor(11 * sc)));
@@ -412,7 +431,8 @@ _ou_full ? (
   gfx_setfont(2, "Arial", max(8, floor(11 * sc)));
   rkth_setcol(3, 0.60, 0.63, 0.68, 1);
   gfx_x = _cx - floor(12 * sc); gfx_y = _ky + _kr + floor(8 * sc); gfx_drawstr("VOL");
-  gfx_setfont(3, "Arial", max(9, floor(15 * sc)), 'b');
+  // Bold from 10 px only: bold Arial at 8-9 px draws 5 as 6 and 6, 9 as 8 (wiki 4.7).
+  gfx_setfont(3, "Arial", max(9, floor(15 * sc)), floor(15 * sc) >= 10 ? 'b' : 0);
   rkth_setcol(2, 0.86, 0.88, 0.92, 1);
   gfx_x = _cx - floor(30 * sc); gfx_y = _ky + _kr + floor(24 * sc);
   gfx_printf("%+.1f dB", ou_vol);
@@ -551,7 +571,7 @@ _ou_full ? (
   );
 
   // level
-  gfx_setfont(3, "Arial", max(8, floor(_ou_u * 0.20)), 'b');
+  gfx_setfont(3, "Arial", max(8, floor(_ou_u * 0.20)), floor(_ou_u * 0.20) >= 10 ? 'b' : 0);   // bold from 10 px (wiki 4.7)
   rkth_setcol(2, 0.86, 0.88, 0.92, 1);
   gfx_x = W * 0.10; gfx_y = H * 0.70;
   gfx_printf("%+.0f", ou_vol);

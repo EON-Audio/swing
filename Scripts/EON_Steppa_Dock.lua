@@ -77,6 +77,7 @@ local scan_cool = 0             -- throttle for the project-wide fallback scan
 -- must restore it byte-exact: REAPER never reclaims a child moved outside
 -- its tree (see EON Swing Dock.lua for the glued-canvas failure this fixes).
 local canvas_dx, canvas_dy, canvas_w0, canvas_h0
+local canvas_parent                  -- the canvas's own parent inside the float (REAPER's plugin container)
 
 -- ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -85,12 +86,14 @@ local function track_alive(tr)
 end
 
 -- FX identity via the JSFX file ident, not the display name: rename-proof
--- and collision-proof (mirrors is_swing_fx in EON Swing Dock.lua). Falls
--- back to the display-name substring on REAPER builds without fx_ident.
+-- and collision-proof (mirrors is_swing_fx in EON Swing Dock.lua). The
+-- file's basename is compared WHOLE (a substring also took renamed copies of
+-- the file). Falls back to the display-name substring on REAPER builds
+-- without fx_ident.
 local function fx_ident_is(tr, i, needle, name_fallback)
   local ok, ident = reaper.TrackFX_GetNamedConfigParm(tr, i, "fx_ident")
   if ok and ident and ident ~= "" then
-    return ident:lower():gsub("\\", "/"):find(needle, 1, true) ~= nil
+    return (ident:match("[^/\\]+$") or ""):lower() == needle
   end
   local ok2, name = reaper.TrackFX_GetFXName(tr, i, "")
   return (ok2 and name and name:lower():find(name_fallback, 1, true)) and true or false
@@ -181,7 +184,8 @@ local function find_swing_on(tr)
   if not tr then return nil end
   for i = 0, reaper.TrackFX_GetCount(tr) - 1 do
     if fx_ident_is(tr, i, "swing_reakit.jsfx", "swing")
-       or fx_ident_is(tr, i, "swing_lite.jsfx", "swing") then return i end
+       or fx_ident_is(tr, i, "swing_lite.jsfx", "swing")
+       or fx_ident_is(tr, i, "drumkit_reakit.jsfx", "swing") then return i end   -- core.SWING_FX_FILES' set
   end
   return nil
 end
@@ -220,12 +224,30 @@ local function find_canvas(float_hwnd)
   return nil
 end
 
--- Put the canvas back inside the wrapper at its captured home geometry.
+-- Put the canvas back inside the wrapper at its captured home geometry: INSIDE the float's plugin container (the
+-- "#32770" child REAPER lays out), the parent it came from. Handed to the float's top window instead, the canvas sat
+-- beside that container and the float's background wipe on every resize step painted its whole face bare until the
+-- plugin's next frame (the ReaKit FX dock, 2026-10-05: filmed on the user's screen; its handoff
+-- Resize_No_Picture_Swing_Control_2026-10-05.md). That parent when it still lives in this float, else this float's own
+-- container (REAPER rebuilt the float), else the float.
 -- Returns true only when the canvas genuinely landed back in REAPER's tree.
+local function container_of(float_hwnd)
+  local ok, list = reaper.JS_Window_ListAllChild(float_hwnd)
+  if not ok or not list or list == "" then return nil end
+  for addr in list:gmatch("[^,]+") do
+    local a = tonumber(addr)
+    local h = a and reaper.JS_Window_HandleFromAddress(a)
+    if h and reaper.JS_Window_GetParent(h) == float_hwnd and reaper.JS_Window_GetClassName(h) == "#32770" then return h end
+  end
+  return nil
+end
 local function restore_canvas_to_wrapper()
   if not (canvas and wrapper and reaper.JS_Window_IsWindow(canvas)
           and reaper.JS_Window_IsWindow(wrapper)) then return false end
-  reaper.JS_Window_SetParent(canvas, wrapper)
+  local target = (canvas_parent and reaper.JS_Window_IsWindow(canvas_parent)
+                  and reaper.JS_Window_IsChild(wrapper, canvas_parent)) and canvas_parent
+                 or container_of(wrapper) or wrapper
+  reaper.JS_Window_SetParent(canvas, target)
   if canvas_dx then
     reaper.JS_Window_Move(canvas, canvas_dx, canvas_dy)
     reaper.JS_Window_Resize(canvas, canvas_w0, canvas_h0)
@@ -324,7 +346,7 @@ local function release()
   end
   tgt_track, tgt_fx, tgt_guid, wrapper, canvas = nil, nil, nil, nil, nil
   wait_float, wait_canvas, shown_w, shown_h = 0, 0, -1, -1
-  canvas_dx, canvas_dy, canvas_w0, canvas_h0 = nil, nil, nil, nil
+  canvas_dx, canvas_dy, canvas_w0, canvas_h0, canvas_parent = nil, nil, nil, nil, nil
 end
 
 -- Fit the captured canvas to this window's client area.
@@ -377,12 +399,13 @@ local function tick_capture()
       if wait_canvas <= 0 then release() end  -- no canvas child = nothing safe to show
       return
     end
-    -- Save the canvas's home geometry (wrapper-client coords + size) BEFORE
-    -- taking it — the restore on every release path must be byte-exact.
+    -- Save the canvas's home geometry (its parent, coords in that parent, size)
+    -- BEFORE taking it — the restore on every release path must be byte-exact.
     local okc, cl, ct, cr, cb = reaper.JS_Window_GetRect(canvas)
+    canvas_parent = reaper.JS_Window_GetParent(canvas) or wrapper
     if okc then
       canvas_w0, canvas_h0 = cr - cl, cb - ct
-      canvas_dx, canvas_dy = reaper.JS_Window_ScreenToClient(wrapper, cl, ct)
+      canvas_dx, canvas_dy = reaper.JS_Window_ScreenToClient(canvas_parent, cl, ct)
     end
     reaper.JS_Window_SetParent(canvas, dock_hwnd)
     reaper.JS_Window_Show(wrapper, "HIDE")
@@ -608,7 +631,7 @@ local function loop()
         -- dock face ("toggles to full then docks", 2026-08-26).
         rig_flag(tgt_track, tgt_fx, tgt_guid, false)
         tgt_track, tgt_fx, tgt_guid, wrapper, canvas = nil, nil, nil, nil, nil
-        canvas_dx, canvas_dy, canvas_w0, canvas_h0 = nil, nil, nil, nil
+        canvas_dx, canvas_dy, canvas_w0, canvas_h0, canvas_parent = nil, nil, nil, nil, nil
         save_dock()
         gfx.quit()
         return

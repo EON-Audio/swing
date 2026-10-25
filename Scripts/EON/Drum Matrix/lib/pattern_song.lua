@@ -267,6 +267,20 @@ function M.SongAppend(idx)
   write_song(arr)
 end
 
+-- Insert region `idx` into the chain BEFORE position `pos` (1-based; #chain + 1 = the end),
+-- one write. A drag that drops a pattern between two chain entries (Swing's song strip,
+-- 2026-10-23, song op 17): an append then a reorder would be two requests, and the bridge's
+-- song mailbox holds one per tick, so the first would be lost. A stale position (the chain
+-- changed under the drag) is clamped into the chain rather than refused.
+function M.SongInsertAt(idx, pos)
+  if not idx then return end
+  local arr = read_song()
+  pos = math.floor(tonumber(pos) or (#arr + 1))
+  if pos < 1 then pos = 1 elseif pos > #arr + 1 then pos = #arr + 1 end
+  table.insert(arr, pos, { r = idx, n = 1 })
+  write_song(arr)
+end
+
 function M.SongRemoveAt(pos)
   local arr = read_song()
   if pos >= 1 and pos <= #arr then table.remove(arr, pos); write_song(arr) end
@@ -432,6 +446,25 @@ end
 
 function M.SongToggle()
   if playing then M.SongStop() else M.SongPlay() end
+end
+
+-- Let go of the chain WITHOUT stopping the transport (Swing's LOOP > Region, 2026-10-23, song
+-- op 16): song mode ends here, the playhead keeps going. Smoothseek is put back; REPEAT is
+-- NOT -- the caller sets the loop it wants next (restoring the parked repeat would loop the
+-- old loop points for a moment, and SongTick would no longer be there to park it again).
+-- What the chain parked in saved_rep is dropped with the chain. Returns true when a chain
+-- was playing. The chain's last queued GoToRegion is REAPER's, not ours: the caller re-aims it.
+function M.SongDetach()
+  if not playing then return false end
+  playing = false
+  pending = nil
+  if saved_ss ~= nil and reaper.SNM_SetIntConfigVar then
+    reaper.SNM_SetIntConfigVar('smoothseek', saved_ss)
+  end
+  saved_ss = nil
+  saved_rep = nil
+  status('EON DM: song released, the transport keeps playing')
+  return true
 end
 
 -- Per-frame driver. Call every frame from the overlay defer loop. Cheap no-op

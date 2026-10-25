@@ -278,6 +278,13 @@ local function read_pads(slot)
 end
 
 local function do_build(slot)
+  -- Pad Banks step 5a: Drum Matrix lanes are bank A's (v1); the bands carry the bank on screen.
+  -- With no slot, read_pads reads the legacy shared block: the bank its publisher shows (audit S13).
+  if (slot ~= nil and swing_state.SlotBankCur(slot) ~= 0)
+     or (slot == nil and swing_state.SharedBankCur() ~= 0) then
+    r.ShowMessageBox("Drum Matrix lanes follow pad bank A.\nShow bank A in Swing (click tab A, or run 'EON: Swing bank A') and build again.", "EON DM Build Merged", 0)
+    return
+  end
   local pads = read_pads(slot)
   local kit_name = (#swing_hits == 1) and read_kit_name_from_gmem() or 'Kit'
   local created_at = os.date('!%Y-%m-%dT%H:%M:%SZ')

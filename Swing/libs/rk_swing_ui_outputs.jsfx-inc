@@ -1,8 +1,9 @@
 // rk_swing_ui_outputs.jsfx-inc — Big View: OUTPUTS (pad → bus routing matrix)
 // Third registry-only view on the Big View framework (VIEW_OUTPUTS). Stage 1:
-// a 16-pad x 16-bus matrix over p_output (one bus per pad). Click a cell to
+// a 16-pad x 16-bus matrix over p_output (one bus per pad), since Outputs step 3 x 19 for bank A (the bank
+// B-D tracks) and x 2 for banks B-D (the bank's track, the pad's own output). Click a cell to
 // route that pad to that bus. Instance-local — no bridge dependency. Routing
-// only takes audible effect when multi_out is on (shown in the header); the
+// only takes audible effect when multi_out or Wired is on (shown in the header); the
 // STEREO/MULTI button + its builder still own enabling it / making tracks.
 // Stage 2 (child-track NAME column labels via a gmem name band) is deferred.
 //
@@ -12,8 +13,20 @@
 
 @init
 
+// Column c of the matrix for the bank on screen (Outputs step 3): does slot ap play there, and may a pad be sent
+// there. Bank A: Out 1-16, then the bank B-D tracks, open for banks that have sounds (the Out menu's rule; a lit
+// cell stays open). Banks B-D: column 0 = its bank's track, 1 = its own output (open while one is free).
+function swing_og_lit(ap, c) local(p) (
+  p = swing_out_pair(ap);
+  bank_cur == 0 ? p == (c < NUM_PADS ? c : OUT_PAIR_BANK + c - NUM_PADS) : c == 0 ? p < OUT_PAIR_SPLIT : p >= OUT_PAIR_SPLIT;
+);
+function swing_og_live(c) (
+  bank_cur == 0 ? c < NUM_PADS || swing_bank_has_sound(c - NUM_PADS + 1) :
+  c == 0 || _og_held < OUT_PAIRS - OUT_PAIR_SPLIT;   // _og_held: counted once per frame (the draw)
+);
+
 function swing_ui_outputs_draw()
-local(lx, lw, mx0, mw, hh, ty, rh, cw, i, b, cx, cy, hov, cb, has, nm, cnt, j) (
+local(lx, lw, mx0, mw, hh, ty, rh, cw, nc, i, b, cx, cy, hov, lit, live, cb, has, nm, cnt, j, j_s, i_s) (
   lmb_down = _ov_lmb_down; rmb_down = _ov_rmb_down;
   LMB = _ov_LMB; RMB = _ov_RMB; frame_wheel = _ov_wheel;
 
@@ -29,90 +42,132 @@ local(lx, lw, mx0, mw, hh, ty, rh, cw, i, b, cx, cy, hov, cb, has, nm, cnt, j) (
   gfx_rect(grid_x + grid_w - 1, grid_y, 1, grid_h);
 
   // ── Title + multi-out status + close X ───────────────────────────
-  gfx_setfont(1, "Arial", 12, 'b');
+  rk_font(1, 12, 'b');
   gfx_set(0.55, 0.85, 0.92, 0.95);
   gfx_x = grid_x + 8; gfx_y = grid_y + 4; gfx_drawstr("OUTPUTS");
-  gfx_setfont(1, "Arial", 9, 'b');
+  // The WIRED line carries channel numbers: regular, a bold 9 px digit misreads (wiki 4.7).
+  rk_font(1, 9, (patch_on && patch_live) ? 0 : 'b');
   patch_on ? (
     patch_live ? gfx_set(0.35, 0.80, 0.84, 0.95) : gfx_set(0.95, 0.60, 0.20, 0.95);
   ) : (
     multi_out ? gfx_set(0.4, 0.85, 0.5, 0.95) : gfx_set(0.9, 0.6, 0.3, 0.95);
   );
   gfx_x = grid_x + 82; gfx_y = grid_y + 6;
-  gfx_drawstr(patch_on ? (patch_live ? "WIRED — each Out is a channel pair one up (Out 1 = 3-4), back in through the EON Patchbay"
-                                     : "WIRED — PATCHBAY NOT ANSWERING: put EON Patchbay LAST in the chain; pads sum inside Swing meanwhile")
-              : multi_out ? "MULTI-OUT ON" : "MULTI-OUT OFF — routing set but inactive");
+  // Step 5: "one up" is bank A's Out 1-16 only; under the new layout the bank tracks' pairs and the own outputs
+  // keep their multi-out channels (39-44, 45-64). An older Patchbay keeps every slot on bank A's pairs, one up.
+  patch_on ? (
+    !patch_live ? strcpy(#_og_w, "WIRED — PATCHBAY NOT ANSWERING: put EON Patchbay LAST in the chain; pads sum inside Swing meanwhile") :
+    !patch_v2 ? strcpy(#_og_w, "WIRED — each Out is a channel pair one up (Out 1 = 3-4), back in through the EON Patchbay") :
+    bank_cur == 0 ? strcpy(#_og_w, "WIRED — Out 1-16 one pair up (Out 1 = 3-4), Bank B-D on 39-44; back in through the EON Patchbay") :
+    sprintf(#_og_w, "WIRED — Bank %c on channels %d-%d, own outputs on 45-64; back in through the EON Patchbay",
+            65 + bank_cur, 37 + 2 * bank_cur, 38 + 2 * bank_cur);
+  ) : strcpy(#_og_w, multi_out ? "MULTI-OUT ON" : "MULTI-OUT OFF — routing set but inactive");
+  // No clip exists here: a line that would run under the close X drops its "; ..." tail (review 2026-10-12: the bank
+  // A line reached the X in a 720 px window; the not-answering line already did at 780).
+  _og_tw = 0; _og_th = 0;
+  gfx_measurestr(#_og_w, _og_tw, _og_th);
+  82 + _og_tw > grid_w - 22 ? (
+    _og_k = 0; _og_n = strlen(#_og_w);
+    loop(_og_n, _og_k < _og_n && str_getchar(#_og_w, _og_k) != 59 ? _og_k += 1;);
+    str_setlen(#_og_w, _og_k);
+  );
+  gfx_drawstr(#_og_w);
   _og_cxb = grid_x + grid_w - 20; _og_cyb = grid_y + 3;
   _og_chov = mx >= _og_cxb - 3 && mx <= _og_cxb + 17 && my >= _og_cyb - 2 && my <= _og_cyb + 15;
-  gfx_setfont(1, "Arial", 13, 'b');
+  rk_font(1, 13, 'b');
   gfx_set(1, 1, 1, _og_chov ? 0.95 : 0.55);
   gfx_x = _og_cxb + 3; gfx_y = _og_cyb; gfx_drawstr("X");
 
   // ── Layout ───────────────────────────────────────────────────────
+  // The columns are what a pad of the bank on screen can choose (Outputs step 3): bank A Out 1-16 and the bank B-D
+  // tracks (B, C, D); a bank B-D pad its bank's track and its own output (OWN, a free split pair).
+  nc = bank_cur == 0 ? NUM_PADS + NUM_BANKS - 1 : 2;
+  _og_held = swing_out_split_held();
   lx = grid_x + 8; lw = 104;
   mx0 = lx + lw + 4;
   mw = grid_x + grid_w - 8 - mx0;
   hh = 20;                                   // column header band
   ty = grid_y + 28 + hh;
   rh = (grid_y + grid_h - 10 - ty) / 16;
-  cw = mw / 16;
+  cw = bank_cur == 0 ? mw / nc : min(mw / 2, mw * 3 / 16);   // two columns stay three of bank A's wide
 
-  // ── Column headers: bus number + pad-count (mixed-lane visibility) ──
-  gfx_setfont(1, "Arial", 8, 'b');
-  b = 0; loop(16,
+  // ── Column headers: output + pad-count (mixed-lane visibility) ──
+  // Regular: a bold 8 px "5" draws as a "6" (wiki 4.7).
+  rk_font(1, 8, 0);
+  b = 0; loop(nc,
     cx = mx0 + b * cw;
-    cnt = 0; j = 0; loop(16, p_output[j] == b ? cnt += 1; j += 1;);
-    gfx_set(cnt > 0 ? 0.6 : 0.3, cnt > 0 ? 0.75 : 0.32, cnt > 0 ? 0.85 : 0.38, 0.95);
-    sprintf(#_og_l, "%d", b + 1);
+    cnt = 0; j = 0; loop(16, j_s = swing_bp(j); swing_og_lit(j_s, b) ? cnt += 1; j += 1;);   // where it plays (Outputs step 1)
+    live = swing_og_live(b);
+    gfx_set(cnt > 0 ? 0.6 : 0.3, cnt > 0 ? 0.75 : 0.32, cnt > 0 ? 0.85 : 0.38, live ? 0.95 : 0.5);
+    bank_cur == 0 ? (
+      b < NUM_PADS ? sprintf(#_og_l, "%d", b + 1) : sprintf(#_og_l, "%c", 66 + b - NUM_PADS);
+    ) : (
+      b == 0 ? sprintf(#_og_l, "BANK %c", 65 + bank_cur) : strcpy(#_og_l, "OWN");
+    );
     gfx_measurestr(#_og_l, _og_tw, _og_th);
     gfx_x = cx + (cw - _og_tw) * 0.5; gfx_y = grid_y + 28 + 2; gfx_drawstr(#_og_l);
-    cnt > 0 ? (
+    bank_cur > 0 && b == 1 ? (   // the own outputs held across every bank, of ten
       gfx_set(0.35, 0.60, 0.70, 0.8);
-      sprintf(#_og_l, "%d", cnt);
-      gfx_setfont(1, "Arial", 7, 0);
+      sprintf(#_og_l, "%d of %d in use", _og_held, OUT_PAIRS - OUT_PAIR_SPLIT);
+      rk_font(1, 7, 0);
       gfx_measurestr(#_og_l, _og_tw, _og_th);
       gfx_x = cx + (cw - _og_tw) * 0.5; gfx_y = grid_y + 28 + 11; gfx_drawstr(#_og_l);
-      gfx_setfont(1, "Arial", 8, 'b');
+      rk_font(1, 8, 0);
+    ) : cnt > 0 ? (
+      gfx_set(0.35, 0.60, 0.70, 0.8);
+      sprintf(#_og_l, "%d", cnt);
+      rk_font(1, 7, 0);
+      gfx_measurestr(#_og_l, _og_tw, _og_th);
+      gfx_x = cx + (cw - _og_tw) * 0.5; gfx_y = grid_y + 28 + 11; gfx_drawstr(#_og_l);
+      rk_font(1, 8, 0);
     );
     b += 1;
   );
 
-  // ── Pad rows × bus cells ─────────────────────────────────────────
+  // ── Pad rows × output cells ──────────────────────────────────────
   i = 0; loop(16,
+    i_s = swing_bp(i);
     cy = ty + i * rh;
-    has = pad_is_playable(i);
+    has = pad_is_playable(i_s);
     cb = i * 3;
     // row label: color swatch + number + name
     gfx_set(col_rgba[cb], col_rgba[cb + 1], col_rgba[cb + 2], has ? 1.0 : 0.4);
     gfx_rect(lx, cy + 2, 12, rh - 4);
-    gfx_setfont(1, "Arial", 8, 'b');
+    rk_font(1, 8, 0);   // pad number: regular (wiki 4.7)
     gfx_set(0.82, 0.82, 0.88, has ? 0.95 : 0.5);
     sprintf(#_og_l, "%d", i + 1);
     gfx_x = lx + 16; gfx_y = cy + (rh - 8) * 0.5; gfx_drawstr(#_og_l);
-    nm = get_cname_slot(i);
-    strlen(nm) == 0 ? nm = get_name_slot(i);
+    nm = get_cname_slot(i_s);
+    strlen(nm) == 0 ? nm = get_name_slot(i_s);
     strlen(nm) > 0 ? (
-      gfx_setfont(1, "Arial", 8, 0);
+      rk_font(1, 8, 0);
       gfx_measurestr(nm, _og_tw, _og_th);
       _og_tw <= lw - 32 ? ( gfx_x = lx + 32; gfx_y = cy + (rh - _og_th) * 0.5; gfx_drawstr(nm); );
     );
     // cells
-    b = 0; loop(16,
+    b = 0; loop(nc,
       cx = mx0 + b * cw;
-      hov = mx >= cx && mx < cx + cw && my >= cy && my < cy + rh;
-      p_output[i] == b ? (
+      lit = swing_og_lit(i_s, b);
+      live = lit || swing_og_live(b);
+      hov = live && mx >= cx && mx < cx + cw && my >= cy && my < cy + rh;
+      lit ? (
         gfx_set(col_rgba[cb], col_rgba[cb + 1], col_rgba[cb + 2], has ? 0.95 : 0.5);
       ) : (
-        gfx_set(0.13, 0.13, 0.16, hov ? 0.95 : 0.6);
+        gfx_set(0.13, 0.13, 0.16, hov ? 0.95 : live ? 0.6 : 0.3);
       );
       gfx_rect(cx + 1, cy + 1, cw - 2, rh - 2);
-      hov && p_output[i] != b ? ( gfx_set(1, 1, 1, 0.18); gfx_rect(cx + 1, cy + 1, cw - 2, rh - 2); );
-      // click → reroute this pad to bus b
+      hov && !lit ? ( gfx_set(1, 1, 1, 0.18); gfx_rect(cx + 1, cy + 1, cw - 2, rh - 2); );
+      lit && bank_cur > 0 && b == 1 ? (   // which own output
+        swing_out_pair_name(swing_out_pair(i_s), #_og_l);
+        rk_font(1, 8, 0);
+        gfx_set(0.05, 0.05, 0.06, 0.9);
+        gfx_measurestr(#_og_l, _og_tw, _og_th);
+        gfx_x = cx + (cw - _og_tw) * 0.5; gfx_y = cy + (rh - _og_th) * 0.5; gfx_drawstr(#_og_l);
+      );
+      // click → route this pad there (a bank B-D pad: its bank's track, or a free own output)
       hov && lmb_down ? (
-        p_output[i] = b;
-        sel_pad = i;
-        mark_dirty_pad(i);
-        col_dirty = 1;   // OUTPUT auto-color mode derives hue from p_output
+        bank_cur == 0 ? swing_out_set(i_s, b < NUM_PADS ? b : OUT_PAIR_BANK + b - NUM_PADS) : swing_out_step(i_s, b == 0 ? -1 : 1);
+        sel_pad = i_s;
       );
       b += 1;
     );

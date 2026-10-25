@@ -102,18 +102,22 @@ local function run_script(path, what)
   return false
 end
 
-local function fx_name_contains(tr, needle)
+-- A Swing on the track, by the plugin's FILE compared whole (rk_lua_core's core.is_swing_fx rule, written out: core
+-- loads lazily below). The shown name containing "swing" took any plugin so named for Swing (no "add a Swing" offer)
+-- and missed a Swing the user renamed (a second one offered).
+local function track_has_swing(tr)
   for i = 0, reaper.TrackFX_GetCount(tr) - 1 do
-    local ok, name = reaper.TrackFX_GetFXName(tr, i, "")
-    if ok and name and name:lower():find(needle, 1, true) then return true end
+    local ok, ident = reaper.TrackFX_GetNamedConfigParm(tr, i, "fx_ident")
+    local f = ok and ((ident or ""):match("[^/\\]+$") or ""):lower() or ""
+    if f == "swing_reakit.jsfx" or f == "swing_lite.jsfx" or f == "drumkit_reakit.jsfx" then return true end
   end
   return false
 end
 
 local function project_has_swing()
-  if fx_name_contains(reaper.GetMasterTrack(0), "swing") then return true end
+  if track_has_swing(reaper.GetMasterTrack(0)) then return true end
   for i = 0, reaper.CountTracks(0) - 1 do
-    if fx_name_contains(reaper.GetTrack(0, i), "swing") then return true end
+    if track_has_swing(reaper.GetTrack(0, i)) then return true end
   end
   return false
 end

@@ -127,11 +127,14 @@ function swing_apply_defaults_fx() (
 );
 
 // ─── New-Kit full reset ──────────────────────────────────────────────────
-// Wipes pads + name + FX chain. Used by both the external "New Kit" Lua
-// action (CMD 4 path in @gfx) and the in-JSFX NEW button (via deferred
-// undo, _undo_pending == 6). Mode flags (swing, oneshot, output routing,
-// note map, palette) survive by design — they're user preferences, not
-// kit state, so we don't call swing_apply_defaults_modes() here.
+// Wipes the pads of ALL FOUR banks + name + FX chain, then shows bank A
+// (user decision 2026-10-23, audit H21: a raw 0..15 loop emptied the
+// hidden bank A and left the bank on screen loaded). Used by both the
+// external "New Kit" Lua action (CMD 4 path in @gfx) and the in-JSFX NEW
+// button (via deferred undo, _undo_pending == 6); the Random SYNTH
+// follow-up then fills swing_bp(), i.e. bank A. Mode flags (swing, oneshot,
+// output routing, note map, palette) survive by design — they're user
+// preferences, not kit state, so we don't call swing_apply_defaults_modes() here.
 function swing_new_kit_full_reset()
 local(_ci, _xf_vi)
 (
@@ -148,8 +151,13 @@ local(_ci, _xf_vi)
     _xf_pos = 0; _xf_len = swing_xf_len(0.020); _xf_active = 1;   // + a block under Wired (A-5)
   );
 
-  _ci = 0; loop(NUM_PADS,
+  // Bank A on screen BEFORE the clears: clear_pad zeroes the AUDIOLEN band
+  // only for the bank on screen, so the eager clear covers the bank shown.
+  swing_banktabs_select(0);
+  _ci = 0; loop(NUM_SLOTS,   // every slot, all four banks (H21)
     clear_pad(_ci); clear_pad_syn(_ci);
+    // clear_pad's hue is i / 16, past 1.0 on banks B..D; @init's own:
+    p_color[_ci] = (_ci % NUM_PADS) / 16.0;
     // clear_pad preserves p_adsr_user across drag-ins (so re-loading a
     // sample on a tuned pad keeps the user's ADSR). New Kit is the
     // explicit "wipe everything" gesture, so we drop the flag too.
@@ -177,4 +185,31 @@ local(_ci, _xf_vi)
   _kd_site = 4; mark_dirty_kit();
   sync_note_names();
   undo_cap_end();
+);
+
+// ─── A New Kit request: one rule for the NEW button's confirm and the New Kit action ───
+// (companion cmd 4, Swing_ReaKit's companion mailbox). Audit H23, user decisions 2026-10-23
+// (NEW the same as CLEAR): refused while THIS Swing loads or saves -- the busy flash, nothing
+// reset (a reset then raced the import). With a live idle bridge it goes through the CMD 46
+// handshake (_undo_pending 6, run by swing_ui_process_undo, which runs with the window closed
+// too). With no bridge, or the bridge's CMD taken by another Swing's load or save, at once
+// (round 3, the user: "Clear at once" -- once kit-level undo turned out to be parked, waiting
+// for the other Swing bought nothing). syn = 1: the 16 random synth pads follow
+// (_syn_newkit_req, consumed in Swing_ReaKit). Kit-level undo is parked (udo_struct_begin_kit):
+// no road can be undone.
+function swing_new_kit_request(syn)
+(
+  kit_busy ? (
+    kit_bridge_warn = 2;
+    _syn_newkit_req = 0;   // or a synth fill armed earlier would land on the kit kept
+  ) : (
+    _syn_newkit_req = syn;
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 ? (
+      gmem[KIT_GMEM_UNDO_DESC] = 6;
+      gmem[KIT_GMEM_CMD] = 46;
+      _undo_pending = 6;
+    ) : (
+      swing_new_kit_full_reset();
+    );
+  );
 );

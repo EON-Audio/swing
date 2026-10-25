@@ -80,111 +80,180 @@ function Pen:arc(cx, cy, r, a1, a2, thick)
   ImGui.DrawList_PathStroke(self.dl, self.col, 0, thick or 1.0)
 end
 
+function Pen:rect(x, y, w, h)
+  ImGui.DrawList_AddRectFilled(self.dl, x, y, x + w, y + h, self.col)
+end
+
+-- Shared by ableton + fabfilter (knobs_kbsg rk_kn_ray / rk_kn_band / rk_kn_lens).
+-- A band is one thick stroke here: the same square-ended annulus the stacked 1 px
+-- gfx_arc passes build in EEL2. Quad corners in pointer_quad's order.
+local function kn_ray(g, cx, cy, a, r0, r1, w)
+  local ux, uy = sin(a), -cos(a)
+  local px, py, h = -uy, ux, w * 0.5
+  local x0, y0, x1, y1 = cx + ux * r0, cy + uy * r0, cx + ux * r1, cy + uy * r1
+  g:quad(x0 + px * h, y0 + py * h, x0 - px * h, y0 - py * h,
+         x1 - px * h, y1 - py * h, x1 + px * h, y1 + py * h)
+end
+local function kn_band(g, cx, cy, r_in, r_out, a1, a2)
+  if a2 > a1 then g:arc(cx, cy, (r_in + r_out) * 0.5, a1, a2, r_out - r_in) end
+end
+-- disc(cx,cy,dd) ∩ disc(lcx,lcy,rho): a convex lens, one span per pixel row
+local function kn_lens(g, cx, cy, dd, lcx, lcy, rho)
+  local i = floor(math.max(cy - dd, lcy - rho))
+  local last = math.min(cy + dd, lcy + rho)
+  while i <= last do
+    local y = i + 0.5
+    local dy0, dy1 = y - cy, y - lcy
+    if math.abs(dy0) < dd and math.abs(dy1) < rho then
+      local hw, f = sqrt(dd * dd - dy0 * dy0), sqrt(rho * rho - dy1 * dy1)
+      local x0, x1 = math.max(cx - hw, lcx - f), math.min(cx + hw, lcx + f)
+      if x1 > x0 + 0.25 then
+        local xs = floor(x0 + 0.5)
+        g:rect(xs, i, math.max(1, floor(x1 + 0.5) - xs), 1)
+      end
+    end
+    i = i + 1
+  end
+end
+-- bipolar anchor, as the JSFX: 0 = from the start, 1 = centre, 0<x<1 = at x
+local function kn_start(is_sym, SW)
+  if is_sym == nil or is_sym == 0 or is_sym == false then return -SW end
+  if is_sym == true or is_sym >= 1 then return 0 end
+  return (is_sym * 2 - 1) * SW
+end
+
+-- knobs_kbsg rk_kn_vdisc: a disc filled row by row with a vertical gradient (its
+-- edge is left to an AA circle drawn after; both row ends rounded from the circle).
+local function kn_vdisc(g, cx, cy, r, tr, tg, tb, br, bg_, bb)
+  local i = floor(cy - r)
+  while i <= cy + r do
+    local y = i + 0.5 - cy
+    local hw = sqrt(math.max(r * r - y * y, 0)) - 0.5
+    if hw > 0 then
+      local x0, x1 = floor(cx - hw + 0.5), floor(cx + hw + 0.5)
+      if x1 > x0 then
+        local f = (y + r) / (2 * r)
+        g:set(tr + (br - tr) * f, tg + (bg_ - tg) * f, tb + (bb - tb) * f, 1)
+        g:rect(x0, i, x1 - x0, 1)
+      end
+    end
+    i = i + 1
+  end
+end
+-- knobs_kbsg rk_kn_pill: a radial rounded bar r0..r1 at clock angle a, width w.
+local function kn_pill(g, cx, cy, a, r0, r1, w)
+  local h = w * 0.5
+  if r1 - r0 > w then kn_ray(g, cx, cy, a, r0 + h, r1 - h, w) end
+  g:circle(cx + sin(a) * (r0 + h), cy - cos(a) * (r0 + h), h, 1)
+  g:circle(cx + sin(a) * (r1 - h), cy - cos(a) * (r1 - h), h, 1)
+end
+
 -- ── Style ports ──────────────────────────────────────────────────────────────
 
--- SSL — knobs_kbsg.jsfx-inc ssl_knob_draw (lines 525–576). Knurled body, colored
--- cap, white 3-line pointer, detent dots at 1.25r. is_sym is unused (parity).
+-- SSL (style 1) — ssl_knob_draw. The SSL E-Series knob (2026-09-24): a big flat colour
+-- cap, a light-grey rim lit from the top-left, a fluted grey skirt, a white bar
+-- painted on the cap (dark on a light cap), a soft shadow below-right; detent dots at
+-- 1.25r as before. is_sym is unused (parity).
 function K.ssl(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg, cb, n_detents)
   n_detents = n_detents or 0
-  local ht = hover_t ^ 2
-  local cap_a = lerp(0.7, 1.0, ht)
-  local ring_bright = lerp(0.45, 0.70, ht)
-  local scale = 260 / (vmax - vmin)
-  local voffset = -vmin * 260 / (vmax - vmin) - 130
-  local val_deg = value * scale + voffset
-  local val_rad = val_deg * PI / 180
-  -- Knurled body
-  g:set(0.12, 0.12, 0.14, 1)
-  g:circle(cx, cy, radius, 1)
-  g:set(ring_bright, ring_bright, ring_bright + 0.02, 1)
-  g:circle(cx, cy, radius * 0.92, 0)
-  g:circle(cx, cy, radius * 0.85, 0)
-  g:circle(cx, cy, radius * 0.78, 0)
-  -- Colored cap
-  g:set(cr, cg, cb, cap_a)
-  g:circle(cx, cy, radius * 0.55, 1)
-  g:set(cr * 0.6, cg * 0.6, cb * 0.6, cap_a)
-  g:circle(cx, cy, radius * 0.55, 0)
-  -- White pointer (3 lines for thickness)
-  g:set(0.95, 0.95, 0.95, 1)
-  local ptr_len = radius * 0.82
-  local px = sin(val_rad) * ptr_len
-  local py = -cos(val_rad) * ptr_len
-  g:line(cx, cy, cx + px, cy + py)
-  g:line(cx + cos(val_rad), cy + sin(val_rad),
-         cx + px + cos(val_rad), cy + py + sin(val_rad))
-  g:line(cx - cos(val_rad), cy - sin(val_rad),
-         cx + px - cos(val_rad), cy + py - sin(val_rad))
-  -- Detent dots
+  local ht = hover_t * hover_t
+  local val_rad = ((value - vmin) / math.max(0.0000001, vmax - vmin) * 260 - 130) * PI / 180
+  local cap, rim = radius * (0.74 + 0.04 * ht), radius * 0.88
+  -- soft shadow below-right
+  g:set(0, 0, 0, 0.18); g:circle(cx + radius * 0.06, cy + radius * 0.10, radius * 1.02, 1)
+  g:set(0, 0, 0, 0.22); g:circle(cx + radius * 0.04, cy + radius * 0.06, radius, 1)
+  -- fluted skirt: lit top-left, shade bottom-right; 24 flutes
+  kn_vdisc(g, cx, cy, radius, 0.66, 0.67, 0.68, 0.36, 0.36, 0.37)
+  local w = math.max(1, radius * 0.035)
+  for i = 0, 23 do
+    local a = i * 2 * PI / 24
+    local sh = 0.5 + 0.5 * cos(a + 0.785)
+    g:set(0.26 + 0.20 * sh, 0.26 + 0.20 * sh, 0.27 + 0.20 * sh, 1)
+    kn_ray(g, cx, cy, a, rim, radius - 0.5, w)
+  end
+  g:set(0.20, 0.20, 0.21, 0.9); g:circle(cx, cy, radius, 0)
+  -- rim: a light-grey band round the cap, lit top-left
+  for i = 0, 11 do
+    local a = -PI + i * 2 * PI / 12
+    local sh = 0.5 + 0.5 * cos(a + PI / 12 + 0.785)
+    local f = 0.60 + 0.20 * sh
+    g:set(f, f + 0.01, f + 0.01, 1)
+    kn_band(g, cx, cy, cap, rim, a, a + 2 * PI / 12 + 0.02)
+  end
+  -- flat colour cap, a touch lighter at the top, a dark seam at its edge
+  kn_vdisc(g, cx, cy, cap, math.min(cr + 0.05, 1), math.min(cg + 0.05, 1), math.min(cb + 0.05, 1), cr * 0.85, cg * 0.85, cb * 0.85)
+  g:set(cr * 0.45, cg * 0.45, cb * 0.45, 1); g:circle(cx, cy, cap, 0)
+  g:set(cr * 0.45, cg * 0.45, cb * 0.45, 0.6); g:circle(cx, cy, cap + 0.6, 0)
+  -- painted pointer bar, centre -> cap edge; a light cap gets a dark bar
+  if cr * 0.299 + cg * 0.587 + cb * 0.114 > 0.6 then g:set(0.12, 0.12, 0.14, 1) else g:set(0.95, 0.96, 0.96, 1) end
+  kn_ray(g, cx, cy, val_rad, cap * 0.05, cap * 0.97, math.max(1.5, cap * 0.22))
+  -- detent dots
   if n_detents > 0 then
     local det_step = (vmax - vmin) / math.max(1, n_detents - 1)
     local active_det = floor((value - vmin) / det_step + 0.5)
     for i = 0, n_detents - 1 do
       local da = (-130 + i * 260 / math.max(1, n_detents - 1)) * PI / 180
-      local dx = cx + sin(da) * radius * 1.25
-      local dy = cy - cos(da) * radius * 1.25
+      local dx, dy = cx + sin(da) * radius * 1.25, cy - cos(da) * radius * 1.25
       if i == active_det then
-        g:set(cr, cg, cb, cap_a)
-        g:circle(dx, dy, radius * 0.08, 1)
+        g:set(cr, cg, cb, 1); g:circle(dx, dy, radius * 0.08, 1)
       else
-        g:set(0.4, 0.4, 0.4, lerp(0.5, 0.8, ht))
-        g:circle(dx, dy, radius * 0.05, 1)
+        g:set(0.4, 0.4, 0.4, 0.5 + 0.3 * ht); g:circle(dx, dy, radius * 0.05, 1)
       end
     end
   end
 end
 
--- Vari-Mu — varimu_knob_draw (lines 1308–1377). Anodised brushed-silver body
--- (accent chroma pushed into the silver), concentric rings, recessed hub, thin
--- white pointer. 270° sweep. No detents/bg/is_sym.
+-- Vari-Mu (style 2) — varimu_knob_draw. The Manley Variable Mu knob (2026-09-25): a black
+-- bar knob — lit shoulders and dark grooves either side of a raised bar, a white pointer
+-- line at the bar's end — inside Manley's printed scale (a thin arc and 11 ticks) drawn in
+-- the accent. The knob itself ignores the accent. 270° sweep. No detents/bg/is_sym.
 function K.varimu(g, cx, cy, radius, value, vmin, vmax, hover_t, cr, cg, cb)
-  local ht = hover_t ^ 2
-  local ba = lerp(0.85, 1.0, ht)
-  local scale = 260 / (vmax - vmin)
-  local voffset = -vmin * 260 / (vmax - vmin) - 130
-  local val_rad = (value * scale + voffset) * PI / 180
-  -- Anodised tint: push accent chroma into the silver
-  local lum = (cr + cg + cb) * 0.33333
-  local atr = (cr - lum) * 0.5
-  local atg = (cg - lum) * 0.5
-  local atb = (cb - lum) * 0.5
-  -- Outer rim
-  g:set(0.22, 0.22, 0.24, 1)
-  g:circle(cx, cy, radius, 1)
-  -- Silver body (anodised toward accent)
-  local base_g = 0.62 + 0.06 * ht
-  g:set(base_g + atr, base_g + atg, base_g + 0.01 + atb, ba)
-  g:circle(cx, cy, radius * 0.92, 1)
-  -- Brushed-metal concentric rings
-  local hi_g = base_g + 0.06
-  local lo_g = base_g - 0.05
-  for i = 0, 5 do
-    local ring_r = radius * (0.85 - i * 0.09)
-    if ring_r > radius * 0.35 then
-      local ring_a = (i % 2 == 0) and hi_g or lo_g
-      g:set(ring_a + atr, ring_a + atg, ring_a + 0.01 + atb, 0.45)
-      g:circle(cx, cy, ring_r, 0)
-    end
+  local ht = hover_t * hover_t
+  local lift = 0.03 * ht
+  local SW = 135 * PI / 180
+  local rng = vmax - vmin  -- a zero range reads as 0; an inverted one works
+  local t = math.abs(rng) > 0.0000001 and clamp((value - vmin) / rng, 0, 1) or 0
+  local a = -SW + t * 2 * SW
+  -- Manley's printed scale: a thin arc at 0.86 R and 11 ticks out to R, in the accent
+  local sr = radius * 0.86
+  g:set(cr, cg, cb, 0.9)
+  g:arc(cx, cy, sr, -SW, SW, 1)
+  if radius >= 24 then g:arc(cx, cy, sr + 0.6, -SW, SW, 1) end
+  for i = 0, 10 do
+    kn_ray(g, cx, cy, -SW + i * 2 * SW / 10, sr, radius, math.max(1, radius * 0.035))
   end
-  -- Recessed center hub
-  g:set(0.15, 0.15, 0.17, 1); g:circle(cx, cy, radius * 0.22, 1)
-  g:set(0.10, 0.10, 0.12, 1); g:circle(cx, cy, radius * 0.16, 1)
-  -- Pointer line (thin white, thickened by 1px offset)
-  local ptr_in  = radius * 0.28
-  local ptr_out = radius * 0.88
-  g:set(0.95, 0.95, 0.97, 1)
-  g:line(cx + sin(val_rad) * ptr_in,  cy - cos(val_rad) * ptr_in,
-         cx + sin(val_rad) * ptr_out, cy - cos(val_rad) * ptr_out)
-  g:line(cx + sin(val_rad) * ptr_in  + cos(val_rad),
-         cy - cos(val_rad) * ptr_in  + sin(val_rad),
-         cx + sin(val_rad) * ptr_out + cos(val_rad),
-         cy - cos(val_rad) * ptr_out + sin(val_rad))
-  -- Hover glow
-  if hover_t > 0.01 then
-    g:set(cr * 0.6 + 0.4, cg * 0.6 + 0.4, cb * 0.6 + 0.4, 0.25 * ht)
-    g:circle(cx, cy, radius + 2, 0)
-    g:circle(cx, cy, radius + 3, 0)
+  local rs = radius * 0.72
+  -- soft shadow, then the black skirt: lit a touch at the top, near-black below
+  g:set(0, 0, 0, 0.35); g:circle(cx + rs * 0.05, cy + rs * 0.09, rs, 1)
+  kn_vdisc(g, cx, cy, rs, 0.22 + lift, 0.23 + lift, 0.27 + lift, 0.07, 0.075, 0.09)
+  g:set(0.04, 0.04, 0.05, 1); g:circle(cx, cy, rs, 0)
+  g:set(0.50, 0.52, 0.58, 0.45); g:arc(cx, cy, rs - 1, -2.0, -0.55, 1)  -- rim light, upper-left
+  -- the skirt's shoulders: two soft lit bands parallel to the bar (each clipped to its
+  -- chord), and a dark groove either side of the bar
+  local ux, uy = sin(a), -cos(a)
+  local px, py = -uy, ux
+  for i = -1, 1, 2 do
+    local off = i * rs * 0.66
+    local q = math.abs(off) + rs * 0.14
+    local L = sqrt(math.max(rs * rs - q * q, 0))
+    g:set(0.30 + lift, 0.31 + lift, 0.36 + lift, 0.35); kn_ray(g, cx + px * off, cy + py * off, a, -L, L, rs * 0.28)
+    g:set(0.34 + lift, 0.35 + lift, 0.40 + lift, 0.35); kn_ray(g, cx + px * off, cy + py * off, a, -L, L, rs * 0.14)
+    off = i * rs * 0.37
+    q = math.abs(off) + rs * 0.06
+    L = sqrt(math.max(rs * rs - q * q, 0))
+    g:set(0.02, 0.02, 0.03, 0.55); kn_ray(g, cx + px * off, cy + py * off, a, -L, L, rs * 0.12)
   end
+  -- the bar: its dark walls, then the top face set a hair down-left, its long edges lit
+  local bw, bl = rs * 0.48, rs * 0.90
+  local ox, oy = -rs * 0.04, rs * 0.035
+  g:set(0.03, 0.03, 0.035, 1); kn_ray(g, cx, cy, a, -bl, bl, bw + math.max(1, rs * 0.06))
+  g:set(0.15 + lift, 0.155 + lift, 0.18 + lift, 1); kn_ray(g, cx + ox, cy + oy, a, -bl + 1, bl - 1, bw)
+  g:set(0.36 + lift, 0.37 + lift, 0.42 + lift, 0.8)
+  kn_ray(g, cx + ox + px * (bw * 0.5 - 0.8), cy + oy + py * (bw * 0.5 - 0.8), a, -bl + 1, bl - 1, 1)
+  kn_ray(g, cx + ox - px * (bw * 0.5 - 0.8), cy + oy - py * (bw * 0.5 - 0.8), a, -bl + 1, bl - 1, 1)
+  -- the white pointer line, inlaid at the pointer end of the bar
+  g:set(0.93 + lift, 0.93 + lift, 0.92 + lift, 1)
+  kn_ray(g, cx + ox, cy + oy, a, rs * 0.36, rs * 0.88, math.max(1.2, rs * 0.075))
 end
 
 -- Neve 1073 — neve_knob_draw. Fluted satin cap (24 scallops), satin dome,
@@ -389,41 +458,59 @@ function K.mpc(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg, cb
   end
 end
 
--- API 550 — api_knob_draw (lines 761–808), inner knob only. Chrome rim with bevel
--- arc, dark stepped body, thick white 4-line pointer, accent-coloured dot (cr/cg/cb).
+-- API (style 3) — api_knob_draw. The API 550A knob (2026-09-25): a warm-white fin knob (a
+-- tapered pointer fin and three lobes, lit from above) that turns round a fixed blue collar
+-- (the accent, dot_r/g/b) and a flat warm-grey cap. The fin tip sits at the radius, so the
+-- body is R / 1.6. is_sym is unused (parity). Hover: the knob grows 4 %.
 function K.api(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, dot_r, dot_g, dot_b)
-  local ht = hover_t ^ 2
-  local chrome_bright = lerp(0.72, 0.88, ht)
-  local scale = 260 / (vmax - vmin)
-  local voffset = -vmin * 260 / (vmax - vmin) - 130
-  local val_rad = (value * scale + voffset) * PI / 180
-  -- Chrome rim
-  g:set(chrome_bright, chrome_bright, chrome_bright + 0.02, 1)
-  g:circle(cx, cy, radius, 1)
-  local cbri = math.min(chrome_bright + 0.1, 1)
-  g:set(cbri, cbri, math.min(chrome_bright + 0.12, 1), 0.6)
-  g:arc(cx, cy, radius - 1,   -0.8 * PI, -0.2 * PI, 1)
-  g:arc(cx, cy, radius - 1.5, -0.8 * PI, -0.2 * PI, 1)
-  g:set(0.45, 0.45, 0.48, 1); g:circle(cx, cy, radius, 0)
-  -- Dark body
-  g:set(0.10, 0.10, 0.12, 1); g:circle(cx, cy, radius * 0.82, 1)
-  g:set(0.16, 0.16, 0.18, 1); g:circle(cx, cy, radius * 0.55, 1)
-  g:set(0.13, 0.13, 0.15, 1); g:circle(cx, cy, radius * 0.35, 1)
-  -- Thick white pointer (4 lines)
-  g:set(0.95, 0.95, 0.95, 1)
-  local px = sin(val_rad) * radius * 0.75
-  local py = -cos(val_rad) * radius * 0.75
-  local perp_x = cos(val_rad)
-  local perp_y = sin(val_rad)
-  g:line(cx - perp_x * 1.5, cy - perp_y * 1.5, cx + px - perp_x * 1.5, cy + py - perp_y * 1.5)
-  g:line(cx - perp_x * 0.5, cy - perp_y * 0.5, cx + px - perp_x * 0.5, cy + py - perp_y * 0.5)
-  g:line(cx + perp_x * 0.5, cy + perp_y * 0.5, cx + px + perp_x * 0.5, cy + py + perp_y * 0.5)
-  g:line(cx + perp_x * 1.5, cy + perp_y * 1.5, cx + px + perp_x * 1.5, cy + py + perp_y * 1.5)
-  -- Colored dot
-  local dot_d = radius * 0.62
-  local dot_radius = radius * lerp(0.10, 0.14, ht)
-  g:set(dot_r, dot_g, dot_b, 1)
-  g:circle(cx + sin(val_rad) * dot_d, cy - cos(val_rad) * dot_d, dot_radius, 1)
+  local ht = hover_t * hover_t
+  local SW = 150 * PI / 180
+  local rng = vmax - vmin  -- a zero range reads as 0; an inverted one works
+  local t = math.abs(rng) > 0.0000001 and clamp((value - vmin) / rng, 0, 1) or 0
+  local a = -SW + t * 2 * SW
+  local rb = radius / 1.6 * (1 + 0.04 * ht)
+  local tr, tg, tb = 0.98, 0.965, 0.95       -- lit white (top)
+  local br, bg_, bb = 0.58, 0.50, 0.47       -- shaded white (bottom)
+  -- (the shading below divides a height by rb: a knob of no size takes the middle shade)
+  -- soft shadow below-right of the whole knob
+  g:set(0, 0, 0, 0.28); g:circle(cx + rb * 0.06, cy + rb * 0.10, rb * 1.05, 1)
+  -- the fin: a tapered quad and a rounded tip, coloured by the light at its middle
+  local ux, uy = sin(a), -cos(a)
+  local px, py = -uy, ux
+  local r0, r1, w0, w1 = rb * 0.70, rb * 1.45, rb * 0.28, rb * 0.15
+  local x0, y0, x1, y1 = cx + ux * r0, cy + uy * r0, cx + ux * r1, cy + uy * r1
+  local fy = cy + uy * rb * 1.1
+  local f = rb > 0 and clamp(0.5 + (fy - cy) / (2.4 * rb), 0, 1) or 0.5
+  g:set(tr + (br - tr) * f, tg + (bg_ - tg) * f, tb + (bb - tb) * f, 1)
+  g:quad(x0 + px * w0, y0 + py * w0, x1 + px * w1, y1 + py * w1,
+         x1 - px * w1, y1 - py * w1, x0 - px * w0, y0 - py * w0)
+  g:circle(x1, y1, w1, 1)
+  -- three lobes, each coloured by the light at its centre
+  for i = 1, 3 do
+    local la = a + i * PI / 2
+    local lx, ly = cx + sin(la) * rb * 0.85, cy - cos(la) * rb * 0.85
+    f = rb > 0 and clamp(0.5 + (ly - cy) / (2.4 * rb), 0, 1) or 0.5
+    g:set(tr + (br - tr) * f, tg + (bg_ - tg) * f, tb + (bb - tb) * f, 1)
+    g:circle(lx, ly, rb * 0.30, 1)
+  end
+  -- the round body over the roots of the fin and lobes
+  kn_vdisc(g, cx, cy, rb, tr + (br - tr) * 0.083, tg + (bg_ - tg) * 0.083, tb + (bb - tb) * 0.083,
+           tr + (br - tr) * 0.917, tg + (bg_ - tg) * 0.917, tb + (bb - tb) * 0.917)
+  g:set(tr + (br - tr) * 0.5, tg + (bg_ - tg) * 0.5, tb + (bb - tb) * 0.5, 0.6); g:circle(cx, cy, rb, 0)
+  -- the inner knob: the collar with four small scallops (fixed), a dark seam, the grey cap
+  g:set(0, 0, 0, 0.25); g:circle(cx, cy, rb * 0.83, 1)
+  for i = 0, 3 do
+    local la = PI / 4 + i * PI / 2
+    local lx, ly = cx + sin(la) * rb * 0.78, cy - cos(la) * rb * 0.78
+    f = rb > 0 and clamp(0.5 + (ly - cy) / (1.8 * rb), 0, 1) or 0.5
+    g:set(dot_r * (1 - 0.28 * f), dot_g * (1 - 0.28 * f), dot_b * (1 - 0.28 * f), 1)
+    g:circle(lx, ly, rb * 0.14, 1)
+  end
+  kn_vdisc(g, cx, cy, rb * 0.80, dot_r, dot_g, dot_b, dot_r * 0.72, dot_g * 0.72, dot_b * 0.72)
+  g:set(dot_r * 0.5, dot_g * 0.5, dot_b * 0.5, 0.8); g:circle(cx, cy, rb * 0.80, 0)
+  g:set(0.10, 0.10, 0.12, 1); g:circle(cx, cy, rb * 0.66, 1)
+  kn_vdisc(g, cx, cy, rb * 0.60, 0.80, 0.76, 0.745, 0.73, 0.69, 0.68)
+  g:set(0.55, 0.52, 0.51, 0.7); g:circle(cx, cy, rb * 0.60, 0)
 end
 
 -- Pultec EQP-1A — pultec_knob_draw. Authentic: black bakelite, ridged side wall,
@@ -510,81 +597,132 @@ function K.pultec_cream(g, cx, cy, radius, value, vmin, vmax, hover_t)
   end
 end
 
--- Ableton (style 13) — ableton_knob_draw. 1:1 Live glyph: flat low-contrast body,
--- thin rim track, thick value arc hugging the rim, needle joined to the arc in
--- the same color/weight (one glyph).
+-- Ableton (style 13) — ableton_knob_draw. The Live 12 dial (2026-09-24): no body,
+-- one band 0.83R..R over ±150°, the value in the accent, a dark ink track + thick
+-- needle, a short gap in the track past the needle. The ink sits darker than the
+-- panel; below panel luminance 0.16 it flips light.
 function K.ableton(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg, cb, bgr, bgg, bgb)
-  local ht = hover_t ^ 2
-  local RAD130 = 130 * PI / 180
-  local scale = 260 / (vmax - vmin)
-  local voffset = -vmin * 260 / (vmax - vmin) - 130
-  local val_rad = (value * scale + voffset) * PI / 180
-  local _bl = (bgr + bgg + bgb) * 0.33333
-  local ink = _bl > 0.5 and 0.0 or 1.0
-  local lift = _bl > 0.5 and -0.07 or 0.075
-  local body_r = radius * 0.86
-  -- Flat body disc + hairline outline
-  g:set(clamp(bgr + lift, 0, 1), clamp(bgg + lift, 0, 1), clamp(bgb + lift, 0, 1), 1)
-  g:circle(cx, cy, body_r, 1)
-  g:set(ink, ink, ink, 0.10); g:circle(cx, cy, body_r, 0)
-  -- Faint rim track (unswept portion)
-  g:set(ink, ink, ink, lerp(0.11, 0.17, ht))
-  g:arc(cx, cy, radius, -RAD130, RAD130, 1)
-  g:arc(cx, cy, radius - 0.7, -RAD130, RAD130, 1)
-  -- Value arc hugging the rim; bipolar (center start) when is_sym
-  local n_passes = math.max(3, floor(radius / 9))
-  g:set(cr, cg, cb, lerp(0.92, 1.0, ht))
-  local start_rad = (is_sym == 1) and 0 or -RAD130
-  for i = 0, n_passes - 1 do g:arc(cx, cy, radius - i * 0.7, start_rad, val_rad, 1) end
-  -- Needle center→rim, same color/weight as the arc (one glyph)
-  local nh = math.max(1.0, n_passes * 0.35)
-  pointer_quad(g, cx, cy, val_rad, 0, body_r, nh)
+  local SW = 150 * PI / 180
+  local t = clamp((value - vmin) / (vmax - vmin), 0, 1)
+  local val_a = -SW + 2 * SW * t
+  local start_a = kn_start(is_sym, SW)
+  local ht = hover_t * hover_t
+  local band = math.max(1.5, radius * 0.17 * (1 + 0.22 * ht))
+  local r_in, r_mid = radius - band, radius - band * 0.5
+  local nw = math.max(1.5, radius * 0.14 * (1 + 0.15 * ht))
+  local gap_a = (nw * 0.5 + math.max(1, radius * 0.12)) / r_mid
+  local bl = (bgr + bgg + bgb) * 0.33333
+  local ir, ig, ib
+  if bl >= 0.16 then
+    local k = bl > 0.45 and 0.22 or 0.45
+    ir, ig, ib = bgr * k, bgg * k, bgb * k
+  else
+    ir, ig, ib = bgr + 0.30, bgg + 0.30, bgb + 0.30
+  end
+  -- Track: everything that is neither value nor the gap past the needle
+  g:set(ir, ig, ib, 1)
+  if val_a >= start_a then
+    kn_band(g, cx, cy, r_in, radius, -SW, start_a)
+    kn_band(g, cx, cy, r_in, radius, val_a + gap_a, SW)
+  else
+    kn_band(g, cx, cy, r_in, radius, -SW, val_a - gap_a)
+    kn_band(g, cx, cy, r_in, radius, start_a, SW)
+  end
+  -- Value, in the accent
+  g:set(cr, cg, cb, 1)
+  kn_band(g, cx, cy, r_in, radius, math.min(start_a, val_a), math.max(start_a, val_a))
+  -- Needle: centre -> through the band, round inner end
+  g:set(ir, ig, ib, 1)
+  kn_ray(g, cx, cy, val_a, 0, radius - 0.5, nw)
+  g:circle(cx, cy, nw * 0.5, 1)
 end
 
--- Pro Tools (style 15) — pt_knob_draw. Old Digidesign/DigiRack: glossy colour-tinted
--- glass dome (grey accent → silver), strong specular, metallic rim, dark pointer, green arc.
+-- Pro Tools (style 15) — pt_knob_draw. The Avid EQ III knob (2026-09-25): a black track
+-- channel ±130°, a bright green LED (bipolar fills from its anchor; unipolar lights a
+-- short dot at the value), a silver skirt with a bevel lit top-left, a knurled ring, a
+-- flat cap in the accent set down-right, a thick near-black pointer. bgr/bgg/bgb unused.
 function K.pt(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg, cb, bgr, bgg, bgb)
-  local ht = hover_t ^ 2
-  local RAD130 = 130 * PI / 180
-  local scale = 260 / (vmax - vmin)
-  local voffset = -vmin * 260 / (vmax - vmin) - 130
-  local val_rad = (value * scale + voffset) * PI / 180
-  local body_r = radius * 0.72
-  local n_passes = math.max(2, floor(radius / 8))
-  local start_rad = (is_sym == 1) and 0 or -RAD130
-  -- Green LED arc above the cap
-  g:set(bgr, bgg, bgb, 0.35)
-  for i = 0, n_passes - 1 do g:arc(cx, cy, radius - i * 0.6, -RAD130, RAD130, 1) end
-  g:set(0.40, 0.90, 0.42, lerp(0.8, 1.0, ht))
-  for i = 0, n_passes - 1 do g:arc(cx, cy, radius - i * 0.6, start_rad, val_rad, 1) end
-  -- Shadow + grey metallic housing ring
-  g:set(0, 0, 0, 0.32); g:circle(cx, cy + 2, body_r, 1)
-  g:set(0.42, 0.43, 0.46, 1); g:circle(cx, cy, body_r, 1)
-  -- Glossy colour dome: DARK TOP -> BRIGHT LOWER reflection (DigiRack lighting)
-  local cap_r = body_r * 0.86
-  g:set(cr * 0.30, cg * 0.30, cb * 0.32, 1); g:circle(cx, cy, cap_r, 1)
-  for i = 0, 8 do
-    local frac = i / 8
-    local rr = cap_r * (1 - frac * 0.40)
-    local yo = cap_r * 0.30 * frac
-    g:set(lerp(cr * 0.30, math.min(cr * 1.25 + 0.20, 1), frac),
-          lerp(cg * 0.30, math.min(cg * 1.25 + 0.20, 1), frac),
-          lerp(cb * 0.32, math.min(cb * 1.25 + 0.20, 1), frac), 1)
-    g:circle(cx, cy + yo, rr, 1)
+  local ht = hover_t * hover_t
+  local lift = 0.03 * ht
+  local SW = 130 * PI / 180
+  local rng = vmax - vmin  -- a zero range reads as 0; an inverted one works
+  local t = math.abs(rng) > 0.0000001 and clamp((value - vmin) / rng, 0, 1) or 0
+  local val = -SW + t * 2 * SW
+  -- soft shadow below-right: five faint discs, the widest furthest down
+  for i = 5, 1, -1 do
+    g:set(0, 0, 0, 0.07)
+    g:circle(cx + radius * 0.012 * i, cy + radius * 0.025 * i, radius * (0.815 + 0.012 * i), 1)
   end
-  -- Bright glossy reflection crescent in the lower-middle
-  g:set(math.min(cr * 1.5 + 0.30, 1), math.min(cg * 1.5 + 0.30, 1), math.min(cb * 1.5 + 0.30, 1), 0.32)
-  g:circle(cx, cy + cap_r * 0.30, cap_r * 0.34, 1)
-  -- Dark separator between cap and housing
-  g:set(0.16, 0.17, 0.20, 1); g:circle(cx, cy, cap_r, 0)
-  -- Dark pointer (3 passes)
-  local pin, pout = cap_r * 0.12, cap_r * 0.86
-  g:set(0.08, 0.08, 0.09, 1)
-  g:line(cx + sin(val_rad) * pin, cy - cos(val_rad) * pin, cx + sin(val_rad) * pout, cy - cos(val_rad) * pout)
-  g:line(cx + sin(val_rad) * pin + cos(val_rad), cy - cos(val_rad) * pin + sin(val_rad),
-         cx + sin(val_rad) * pout + cos(val_rad), cy - cos(val_rad) * pout + sin(val_rad))
-  g:line(cx + sin(val_rad) * pin - cos(val_rad), cy - cos(val_rad) * pin - sin(val_rad),
-         cx + sin(val_rad) * pout - cos(val_rad), cy - cos(val_rad) * pout - sin(val_rad))
+  -- track: a black channel, ±130°, square ends
+  local tw = math.max(2, radius * 0.125)
+  local ri = radius - tw
+  g:set(0, 0, 0, 1); kn_band(g, cx, cy, ri, radius, -SW, SW)
+  -- the green LED
+  local a1, a2
+  local sym = is_sym == true and 1 or (type(is_sym) == "number" and is_sym or 0)  -- as EEL2: > 0 = bipolar
+  if sym > 0 then
+    local a0 = kn_start(sym, SW)
+    a1, a2 = math.min(a0, val), math.max(a0, val)
+  else
+    local hw = math.max(tw * 0.6 / math.max(radius - tw * 0.5, 1), 3 * PI / 180)
+    a1, a2 = math.max(-SW, val - hw), math.min(SW, val + hw)
+  end
+  if a2 > a1 then
+    if tw >= 4 then
+      g:set(0.01, 0.69, 0, 1); kn_band(g, cx, cy, ri, radius, a1, a2)
+      g:set(0, 0.96, 0, 1); kn_band(g, cx, cy, ri + tw * 0.3, radius - tw * 0.3, a1, a2)
+    else
+      g:set(0, 0.86, 0, 1); kn_band(g, cx, cy, ri, radius, a1, a2)
+    end
+  end
+  -- skirt: dark bevel disc, its lit part a lens toward the top-left, the bright face
+  local sk, sf = radius * 0.81, radius * 0.73
+  g:set(0.22, 0.22, 0.22, 1); g:circle(cx, cy, sk, 1)
+  g:set(0.47 + lift, 0.465 + lift, 0.46 + lift, 1)
+  kn_lens(g, cx, cy, sk, cx - radius * 0.035, cy - radius * 0.05, sk)
+  local i = floor(cy - sf)
+  while i <= cy + sf do
+    local yy = i + 0.5 - cy
+    local hwid = sqrt(math.max(sf * sf - yy * yy, 0)) - 0.5
+    if hwid > 0 then
+      local f = (yy + sf) / (2 * sf); f = f * f
+      g:set(0.80 - 0.27 * f + lift, 0.81 - 0.27 * f + lift, 0.79 - 0.27 * f + lift, 1)
+      local x0 = floor(cx - hwid + 0.5)
+      g:rect(x0, i, math.max(1, floor(cx + hwid + 0.5) - x0), 1)
+    end
+    i = i + 1
+  end
+  g:set(0.62, 0.63, 0.61, 0.55); g:circle(cx, cy, sf, 0)
+  g:set(0.13, 0.13, 0.13, 0.85); g:circle(cx, cy, sk, 0)
+  -- knurled ring; its teeth catch the light toward the top-left, from radius 28 px
+  local kr = radius * 0.56
+  kn_vdisc(g, cx, cy, kr, 0.51 + lift, 0.52 + lift, 0.51 + lift, 0.36, 0.37, 0.36)
+  g:set(0.30, 0.30, 0.30, 0.7); g:circle(cx, cy, kr, 0)
+  local fade = clamp((radius - 28) / 12, 0, 1)
+  if fade > 0 then
+    for n = 0, 47 do
+      local a = n * 2 * PI / 48
+      local w = cos(a + 0.4)
+      if w > 0.08 then
+        g:set(0.24, 0.24, 0.24, 0.5 * fade * w)
+        kn_ray(g, cx, cy, a, kr - radius * 0.03, kr + radius * 0.008, math.max(1, radius * 0.02))
+      end
+    end
+  end
+  -- cap: set down-right; light disc, the shaded lens, the middle lens in the cap colour
+  local ccx, ccy = cx + radius * 0.03, cy + radius * 0.08
+  local rb = radius * 0.50 * (1 + 0.04 * ht)
+  local rf, dd = rb * 0.88, rb * 0.07
+  g:set(0.15, 0.13, 0.13, 0.8); g:circle(ccx, ccy, rb + 0.8, 1)
+  g:set(cr + (1 - cr) * 0.55, cg + (1 - cg) * 0.55, cb + (1 - cb) * 0.55, 1); g:circle(ccx, ccy, rb, 1)
+  g:set(cr * 0.60, cg * 0.60, cb * 0.60, 1); kn_lens(g, ccx, ccy, rb, ccx + dd, ccy + dd, rb)
+  g:set(cr, cg, cb, 1); kn_lens(g, ccx + dd, ccy + dd, rb, ccx - dd, ccy - dd, rb)
+  kn_vdisc(g, ccx, ccy, rf, math.min(cr * 1.04, 1), math.min(cg * 1.04, 1), math.min(cb * 1.04, 1),
+           cr * 0.94, cg * 0.94, cb * 0.94)
+  g:set(cr * 0.85, cg * 0.85, cb * 0.85, 0.7); g:circle(ccx, ccy, rf, 0)
+  -- pointer: thick, near-black (light on a very dark cap)
+  if cr * 0.299 + cg * 0.587 + cb * 0.114 < 0.22 then g:set(0.92, 0.92, 0.92, 0.95) else g:set(0.07, 0.06, 0.06, 0.95) end
+  kn_ray(g, ccx, ccy, val, radius * 0.10, radius * 0.56, math.max(1.5, radius * 0.09))
 end
 
 -- Serum (style 17) — serum_knob_draw. Large beveled dark body, faint track + glowing
@@ -619,60 +757,89 @@ function K.serum(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg, 
   g:set(0.05, 0.05, 0.07, 1); g:circle(cx, cy, body_r * 0.22, 1)
 end
 
--- FabFilter (style 16) — fabfilter_knob_draw. Pro-G look: KNURLED grip edge (fan of
--- alternating radial ridges) + domed top-lit cap + specular gloss + halo ring + short notch.
+-- FabFilter (style 16) — fabfilter_knob_draw. The Pro-G knob (2026-09-24): a dome
+-- that follows the panel, a white lens scoop with a grey line, a dark tick channel
+-- 1.02D..1.155D filled with the accent up to the value, and on big knobs (D 36->48
+-- px) a grip of 12 dimples. Light panels: mid-tone dome, the channel sinks.
 function K.fabfilter(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg, cb, bgr, bgg, bgb)
-  local RAD130 = 130 * PI / 180
-  local scale = 260 / (vmax - vmin)
-  local voffset = -vmin * 260 / (vmax - vmin) - 130
-  local val_rad = (value * scale + voffset) * PI / 180
-  local n_passes = math.max(3, floor(radius / 4))   -- bold halo
-  local body_r = radius * 0.76
-  local cap_r = body_r * 0.80
-  g:set(0, 0, 0, 0.30); g:circle(cx, cy + 2, body_r, 1)
-  -- Knurled grip ring (accent-tinted)
-  g:set(cr * 0.18 + 0.10, cg * 0.18 + 0.10, cb * 0.18 + 0.12, 1); g:circle(cx, cy, body_r, 1)
-  local kn_in = body_r * 0.78
-  local n_teeth = math.max(20, floor(radius * 1.6))
-  for i = 0, n_teeth - 1 do
-    local ta = (i / n_teeth) * 2 * PI
-    if i % 2 == 0 then g:set(cr * 0.35 + 0.34, cg * 0.35 + 0.34, cb * 0.35 + 0.36, 1)
-    else g:set(cr * 0.28 + 0.14, cg * 0.28 + 0.14, cb * 0.28 + 0.16, 1) end
-    g:line(cx + sin(ta) * kn_in, cy - cos(ta) * kn_in, cx + sin(ta) * body_r, cy - cos(ta) * body_r)
+  local SW, TH = 150 * PI / 180, 27 * PI / 180
+  local t = clamp((value - vmin) / (vmax - vmin), 0, 1)
+  local val_a = -SW + 2 * SW * t
+  local start_a = kn_start(is_sym, SW)
+  local ht = hover_t * hover_t
+  local dd = radius / 1.155
+  local ch_in, ch_out = dd * 1.02, radius - math.max(1, radius * 0.015)
+  local gg = clamp((dd - 36) / 12, 0, 1)
+  local bl = (bgr + bgg + bgb) * 0.33333
+  local sc = bl <= 0.25 and 0.33 or 0.58 - bl
+  local lp = bl > 0.5
+  -- Channel: panel +0.03 across the sweep, the accent up to the value, a dark line
+  -- just outside, ticks every 30° (faint over the accent)
+  local f = lp and -0.05 or 0.03
+  g:set(bgr + f, bgg + f, bgb + f, 1)
+  kn_band(g, cx, cy, ch_in, ch_out, -SW, SW)
+  local lo, hi = math.min(start_a, val_a), math.max(start_a, val_a)
+  g:set(cr, cg, cb, 1)
+  kn_band(g, cx, cy, ch_in, ch_out, lo, hi)
+  f = lp and 0.12 or 0.05
+  g:set(bgr - f, bgg - f, bgb - f, 1)
+  g:arc(cx, cy, ch_out + 0.5, -SW, SW, 1)
+  local tw = math.max(1, dd * 0.02)
+  f = lp and -0.20 or 0.15
+  for i = 0, 10 do
+    local a = -SW + i * (30 * PI / 180)
+    g:set(bgr + f, bgg + f, bgb + f, (a >= lo and a <= hi) and 0.45 or 1)
+    kn_ray(g, cx, cy, a, ch_in, ch_out, tw)
   end
-  -- 2-tone domed cap (accent-tinted): dark bottom -> light top
-  g:set(cr * 0.38 + 0.10, cg * 0.38 + 0.10, cb * 0.38 + 0.10, 1); g:circle(cx, cy, cap_r, 1)
-  for i = 0, 7 do
-    local frac = i / 7
-    local rr = cap_r * (1 - frac * 0.58)
-    local yo = -cap_r * 0.30 * frac
-    g:set(lerp(cr * 0.38 + 0.12, cr * 0.45 + 0.52, frac),
-          lerp(cg * 0.38 + 0.12, cg * 0.45 + 0.52, frac),
-          lerp(cb * 0.38 + 0.12, cb * 0.45 + 0.52, frac), 1)
-    g:circle(cx, cy + yo, rr, 1)
+  -- Dome: vertical gradient row by row; hover swells it 3% and lifts it
+  dd = dd * (1 + 0.03 * ht)
+  local lift = 0.05 * ht
+  local i = floor(cy - dd)
+  while i <= cy + dd do
+    local y = i + 0.5 - cy
+    local hw = sqrt(math.max(dd * dd - y * y, 0)) - 0.6
+    if hw > 0 then
+      local s = sc + 0.16 - 0.32 * ((y + dd) / (2 * dd)) + lift
+      g:set(bgr + s - 0.044, bgg + s, bgb + s + 0.042, 1)
+      g:rect(floor(cx - hw + 0.5), i, math.max(1, floor(2 * hw + 0.5)), 1)
+    end
+    i = i + 1
   end
-  g:set(math.min(cr * 0.5 + 0.55, 1), math.min(cg * 0.5 + 0.55, 1), math.min(cb * 0.5 + 0.58, 1), 0.45)
-  g:circle(cx, cy - cap_r * 0.42, cap_r * 0.26, 1)
-  g:set(0.10, 0.12, 0.16, 0.8); g:circle(cx, cy, cap_r, 0); g:circle(cx, cy, body_r, 0)
-  -- Halo: always-visible neutral track groove + BOLD value ring on top
-  g:set(0.32, 0.34, 0.39, lerp(0.55, 0.80, hover_t))
-  for i = 0, n_passes - 1 do g:arc(cx, cy, radius - i * 0.7, -RAD130, RAD130, 1) end
-  g:set(cr, cg, cb, lerp(0.9, 1.0, hover_t))
-  local start_rad = (is_sym == 1) and 0 or -RAD130
-  for i = 0, n_passes - 1 do g:arc(cx, cy, radius - i * 0.7, start_rad, val_rad, 1) end
-  -- Indicator: thick WHITE ARC band centred on the pointer, hugging the cap's curve
-  -- (a true arc, not a pointy wedge). Filled by stacked arc passes. Recessed line.
-  local fa = 0.42
-  local ar_lo, ar_hi = cap_r * 0.50, cap_r * 0.96
-  local n_band = math.max(8, floor((ar_hi - ar_lo) / 0.6))
-  g:set(0.90, 0.93, 0.97, lerp(0.72, 0.92, hover_t))
-  for i = 0, n_band do
-    local rr = ar_lo + (ar_hi - ar_lo) * (i / n_band)
-    g:arc(cx, cy, rr, val_rad - fa, val_rad + fa, 1)
+  -- Grip: 12 dimples, a shade darker than the dome where they sit, darker inner edge
+  if gg > 0 then
+    local dc, drho = 1.039 * dd, 0.269 * dd
+    local dph = math.acos((drho * drho + dc * dc - dd * dd) / (2 * drho * dc))
+    for k = 0, 11 do
+      local a = val_a + (15 + 30 * k) * PI / 180
+      local lcx, lcy = cx + sin(a) * dc, cy - cos(a) * dc
+      local s = sc + 0.16 - 0.32 * (0.5 - cos(a) * 0.45) + lift - 0.07 * gg
+      g:set(bgr + s - 0.044, bgg + s, bgb + s + 0.042, 1)
+      kn_lens(g, cx, cy, dd - 0.6, lcx, lcy, drho)
+      g:set(bgr + s - 0.144, bgg + s - 0.10, bgb + s - 0.058, gg)
+      g:arc(lcx, lcy, drho, a + PI - dph, a + PI + dph, 1)
+    end
   end
-  g:set(0.20, 0.22, 0.28, lerp(0.6, 0.85, hover_t))
-  g:line(cx + sin(val_rad) * cap_r * 0.30, cy - cos(val_rad) * cap_r * 0.30,
-         cx + sin(val_rad) * cap_r * 0.96, cy - cos(val_rad) * cap_r * 0.96)
+  -- Scoop: the same lens, bigger, on the pointer (#e2e2e2, a #f2f2f2 core), AA edge
+  local tip = 0.30 + 0.12 * gg
+  local c = dd * (1 - tip * tip) / (2 * (cos(TH) - tip))
+  local rho = c - tip * dd
+  local ph = math.acos((rho * rho + c * c - dd * dd) / (2 * rho * c))
+  local lcx, lcy = cx + sin(val_a) * c, cy - cos(val_a) * c
+  g:set(0.885, 0.885, 0.885, 1)
+  kn_lens(g, cx, cy, dd - 0.6, lcx, lcy, rho)
+  g:set(0.95, 0.95, 0.95, 1)
+  kn_lens(g, cx, cy, dd - 0.10 * rho, lcx, lcy, rho * 0.86)
+  g:set(0.885, 0.885, 0.885, 1)
+  g:arc(lcx, lcy, rho - 0.6, val_a + PI - ph, val_a + PI + ph, 1)
+  g:set(0.10, 0.10, 0.10, 0.55)
+  g:arc(lcx, lcy, rho, val_a + PI - ph, val_a + PI + ph, 1)
+  g:set(0.44, 0.44, 0.44, 1)
+  kn_ray(g, cx, cy, val_a, dd * (0.56 + 0.06 * gg), dd * (0.81 + 0.04 * gg), math.max(1.2, dd * 0.026))
+  -- Outline, near-black, over the dome's, the dimples' and the scoop's edges
+  local olr = math.min(bgr * 0.45, 0.08)
+  g:set(olr, olr, math.min(bgb * 0.45, 0.08), 1)
+  local w, rr = math.max(1, dd * 0.035), dd - 0.3
+  while rr <= dd + w - 0.3 do g:circle(cx, cy, rr, 0); rr = rr + 0.6 end
 end
 
 -- Witti/ws (style 4) — ws_knob_draw. Bg track arc + dark inner circle + accent value
@@ -755,46 +922,44 @@ function K.sp(g, cx, cy, r, value, hover_t)
   end
 end
 
--- Encoder (style 11) — encoder_draw. 16-LED ring (lit to value) + brushed metal body
--- + 24 edge notches + white pointer.
+-- Encoder (style 11) — encoder_draw. The X-Touch Mini encoder (2026-09-24): no
+-- pointer; 13 pill LED bars from -140 to +140 degrees filling to the value in a dark
+-- well (the old LED ring's footprint, 1.38r); a small black knob with a grey top and
+-- a chamfer lit from the top.
 function K.encoder(g, cx, cy, radius, value, vmin, vmax, hover_t, cr, cg, cb)
-  local ht = hover_t ^ 2
-  local _vn = clamp((value - vmin) / (vmax - vmin), 0, 1)
-  local led_orbit = radius * 1.3
-  local led_r = radius * 0.08
-  local led_pos = _vn * 15
-  for i = 0, 15 do
-    local a = (-130 + i * 260 / 15) * PI / 180
-    local led_bright = math.max(0, 1 - math.abs(i - led_pos) * 0.4) * lerp(0.7, 1.0, ht)
-    local lx = cx + sin(a) * led_orbit
-    local ly = cy - cos(a) * led_orbit
-    g:set(0.12, 0.12, 0.13, 0.6); g:circle(lx, ly, led_r * 1.2, 1)
-    if led_bright > 0.05 then
-      g:set(cr * led_bright, cg * led_bright, cb * led_bright, 1)
-      g:circle(lx, ly, led_r * (0.8 + led_bright * 0.5), 1)
-      if led_bright > 0.5 then
-        g:set(cr * led_bright, cg * led_bright, cb * led_bright, 0.2 * led_bright)
-        g:circle(lx, ly, led_r * 2, 1)
-      end
+  local ht = hover_t * hover_t
+  local t = clamp((value - vmin) / (vmax - vmin), 0, 1)
+  local SW = 140 * PI / 180
+  local wr = radius * 1.38
+  local r0, r1, w = radius * 1.02, radius * 1.31, math.max(1.2, radius * 0.11)
+  local pos = t * 12
+  -- recessed well: darker than any panel, dark edge
+  g:set(0, 0, 0, 0.38); g:circle(cx, cy, wr, 1)
+  g:set(0, 0, 0, 0.55); g:circle(cx, cy, wr, 0)
+  -- 13 LED bars filling to the value; a lit bar blooms softly
+  for i = 0, 12 do
+    local a = -SW + i * (2 * SW / 12)
+    local b = clamp(pos - i + 1, 0, 1)
+    g:set(cr * 0.20, cg * 0.20, cb * 0.20, 1)
+    kn_pill(g, cx, cy, a, r0, r1, w)
+    if b > 0.02 then
+      local mx, my = cx + sin(a) * (r0 + r1) * 0.5, cy - cos(a) * (r0 + r1) * 0.5
+      g:set(cr, cg, cb, 0.10 * b); g:circle(mx, my, (r1 - r0) * 0.80, 1)
+      g:set(cr, cg, cb, 0.14 * b); g:circle(mx, my, (r1 - r0) * 0.55, 1)
+      g:set(cr * 0.20 + (math.min(cr * 0.45 + 0.55, 1) - cr * 0.20) * b,
+            cg * 0.20 + (math.min(cg * 0.45 + 0.55, 1) - cg * 0.20) * b,
+            cb * 0.20 + (math.min(cb * 0.45 + 0.55, 1) - cb * 0.20) * b, 1)
+      kn_pill(g, cx, cy, a, r0, r1, w)
     end
   end
-  g:set(0.42 + 0.05 * ht, 0.42 + 0.05 * ht, 0.44 + 0.05 * ht, 1); g:circle(cx, cy, radius, 1)
-  g:set(0.52 + 0.05 * ht, 0.52 + 0.05 * ht, 0.54 + 0.05 * ht, 1); g:circle(cx, cy, radius * 0.75, 1)
-  g:set(0.46, 0.46, 0.48, 1); g:circle(cx, cy, radius * 0.5, 1)
-  local notch_in, notch_out = radius * 0.88, radius
-  g:set(0.30, 0.30, 0.32, 1)
-  for i = 0, 23 do
-    local a = i * TAU / 24
-    g:line(cx + sin(a) * notch_in, cy - cos(a) * notch_in, cx + sin(a) * notch_out, cy - cos(a) * notch_out)
-  end
-  g:set(0.30, 0.30, 0.32, 1); g:circle(cx, cy, radius, 0)
-  g:set(0.2, 0.2, 0.22, 1); g:circle(cx, cy, radius * 0.12, 1)
-  local val_rad = (_vn * 260 - 130) * PI / 180
-  g:set(0.85, 0.85, 0.85, 1)
-  g:line(cx + sin(val_rad) * radius * 0.3, cy - cos(val_rad) * radius * 0.3,
-         cx + sin(val_rad) * radius * 0.8, cy - cos(val_rad) * radius * 0.8)
-  g:line(cx + sin(val_rad) * radius * 0.3 + cos(val_rad), cy - cos(val_rad) * radius * 0.3 + sin(val_rad),
-         cx + sin(val_rad) * radius * 0.8 + cos(val_rad), cy - cos(val_rad) * radius * 0.8 + sin(val_rad))
+  -- knob: black body, chamfer lit from the top, flat grey top face, no pointer
+  local k = radius * 0.73 * (1 + 0.06 * ht)
+  local tl = 0.29 + 0.04 * ht
+  g:set(0, 0, 0, 0.35); g:circle(cx + k * 0.05, cy + k * 0.09, k, 1)
+  g:set(0.08, 0.08, 0.08, 1); g:circle(cx, cy, k, 1)
+  kn_vdisc(g, cx, cy, k * 0.85, 0.52, 0.52, 0.52, 0.10, 0.10, 0.10)
+  g:set(tl, tl, tl, 1); g:circle(cx, cy, k * 0.55, 1)
+  g:set(0.05, 0.05, 0.05, 1); g:circle(cx, cy, k, 0)
 end
 
 -- Jog (style 8) — jog_knob_draw. Spice-style outer arc ring + metallic jog body with
@@ -838,29 +1003,49 @@ function K.jog(g, cx, cy, radius, value, vmin, vmax, hover_t, arc_r, arc_g, arc_
   end
 end
 
--- FL (style 14) — fl_knob_draw. Bg track + dark domed body + accent value arc + light notch.
+-- FL (style 14) — fl_knob_draw. The FL Studio knob (2026-09-25): a full turn from the
+-- bottom (bipolar from the top), the ring in a dark socket (a groove in the panel colour,
+-- lit = the accent), FL's blue-grey dome with a light rim along the top, a dot pointer.
 function K.fl(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg, cb, bgr, bgg, bgb)
-  local ht = hover_t ^ 2
-  local RAD130 = 130 * PI / 180
-  local scale = 260 / (vmax - vmin)
-  local voffset = -vmin * 260 / (vmax - vmin) - 130
-  local val_rad = (value * scale + voffset) * PI / 180
-  local body_r = radius * 0.70
-  local n_passes = math.max(2, floor(radius / 6))
-  g:set(bgr, bgg, bgb, lerp(0.18, 0.30, ht))
-  for i = 0, n_passes - 1 do g:arc(cx, cy, radius - i * 0.7, -RAD130, RAD130, 1) end
-  g:set(0, 0, 0, 0.30); g:circle(cx, cy + 1, body_r, 1)
-  g:set(0.13, 0.13, 0.15, 1); g:circle(cx, cy, body_r, 1)
-  g:set(0.22 + 0.06 * ht, 0.22 + 0.06 * ht, 0.24 + 0.06 * ht, 1); g:circle(cx, cy, body_r * 0.66, 1)
-  g:set(0.30, 0.30, 0.33, lerp(0.4, 0.8, ht)); g:circle(cx, cy, body_r, 0)
-  local arc_a = lerp(0.85, 1.0, ht)
-  g:set(cr, cg, cb, arc_a)
-  local start_rad = (is_sym == 1) and 0 or -RAD130
-  for i = 0, n_passes - 1 do g:arc(cx, cy, radius - i * 0.7, start_rad, val_rad, 1) end
-  local notch_in, notch_out = body_r * 0.30, body_r * 0.92
-  g:set(0.92, 0.92, 0.95, arc_a)
-  g:line(cx + sin(val_rad) * notch_in, cy - cos(val_rad) * notch_in, cx + sin(val_rad) * notch_out, cy - cos(val_rad) * notch_out)
-  g:line(cx + sin(val_rad) * notch_in + 1, cy - cos(val_rad) * notch_in, cx + sin(val_rad) * notch_out + 1, cy - cos(val_rad) * notch_out)
+  local ht = hover_t * hover_t
+  local lift = 0.04 * ht
+  local rng = vmax - vmin  -- a zero range reads as 0; an inverted one works
+  local t = math.abs(rng) > 0.0000001 and clamp((value - vmin) / rng, 0, 1) or 0
+  local val = -PI + t * 2 * PI
+  local bw = math.max(2, radius * 0.15)
+  local ri, rb = radius - bw, radius * 0.79
+  local io, ii = math.min(0.8, bw * 0.2), math.min(0.3, bw * 0.1)
+  -- socket: dark disc, the groove ring in the panel colour, the dark gap inside it
+  g:set(bgr * 0.72, bgg * 0.72, bgb * 0.72, 1); g:circle(cx, cy, radius + 0.5, 1)
+  g:set(math.min(bgr + 0.015, 1), math.min(bgg + 0.015, 1), math.min(bgb + 0.015, 1), 1); g:circle(cx, cy, radius - io, 1)
+  g:set(bgr * 0.72, bgg * 0.72, bgb * 0.72, 1); g:circle(cx, cy, ri + ii, 1)
+  -- the value ring: from the bottom, or from the anchor when bipolar
+  local a1, a2
+  local sym = is_sym == true and 1 or (type(is_sym) == "number" and is_sym or 0)  -- as EEL2: > 0 = bipolar
+  if sym > 0 then
+    local a0 = sym >= 1 and 0 or (-PI + sym * 2 * PI)
+    a1, a2 = math.min(a0, val), math.max(a0, val)
+  else
+    a1, a2 = -PI, val
+  end
+  if a2 > a1 then g:set(cr, cg, cb, 1); kn_band(g, cx, cy, ri + ii, radius - io, a1, a2) end
+  -- body: the dome, two soft rings into the gap colour, the rim light along the top
+  kn_vdisc(g, cx, cy, rb, 0.40 + lift, 0.427 + lift, 0.451 + lift, 0.204 + lift, 0.231 + lift, 0.247 + lift)
+  g:set(bgr * 0.72, bgg * 0.72, bgb * 0.72, 1); g:circle(cx, cy, rb, 0)
+  g:set(bgr * 0.72, bgg * 0.72, bgb * 0.72, 0.5); g:circle(cx, cy, rb - 0.8, 0)
+  local d = math.max(1.5, radius * 0.09)
+  local tt = rb + d - sqrt((rb + d) * (rb + d) - 2 * rb * d * 0.658)
+  g:set(0.52 + lift, 0.54 + lift, 0.56 + lift, 1)
+  local dp = 0.5
+  while dp < tt + 0.3 and dp < rb do
+    local ca = (2 * rb * dp - dp * dp + 2 * rb * d * 0.342) / (2 * d * (rb - dp))
+    if ca > -1 and ca < 1 then local th = math.acos(ca); g:arc(cx, cy, rb - dp, -th, th, 1) end
+    dp = dp + 0.6
+  end
+  -- the dot
+  local dr = rb * 0.74
+  local dotr = math.max(1.2, rb * 0.075) * (1 + 0.15 * ht)
+  g:set(cr, cg, cb, 1); g:circle(cx + sin(val) * dr, cy - cos(val) * dr, dotr, 1)
 end
 
 -- Roland (style 18) — roland_knob_draw. Knurled dark edge + coloured cap + top-left
@@ -943,7 +1128,7 @@ function K.draw(style, g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t,
   if style == 8  then return K.jog(g, cx, cy, radius, value, vmin, vmax, hover_t, cr, cg, cb) end
   if style == 9  then return K.rainbow(g, cx, cy, radius, value, vmin, vmax, hover_t) end
   if style == 10 then return K.sp(g, cx, cy, radius, (value - vmin) / math.max(1e-7, vmax - vmin), hover_t) end
-  if style == 11 then return K.encoder(g, cx, cy, radius, value, vmin, vmax, hover_t, cr, cg, cb) end
+  if style == 11 then return K.encoder(g, cx, cy, radius / 1.38, value, vmin, vmax, hover_t, cr, cg, cb) end  -- collar reaches 1.38 R: fit the others' footprint
   if style == 12 then return K.pultec(g, cx, cy, radius, value, vmin, vmax, hover_t) end
   if style == 13 then return K.ableton(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg, cb, bgr, bgg, bgb) end
   if style == 14 then return K.fl(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg, cb, bgr, bgg, bgb) end

@@ -1,11 +1,16 @@
 -- @description EON Floatter
--- @version 1.0.0
+-- @version 1.0.9
 -- @author EON Studios
 -- @about
 --   Opens every EON plugin's floating window at the size EON designed for it,
 --   and lets you keep your own size for any JSFX. Run it once: it switches on,
 --   starts with REAPER from then on, and shows its panel. Run it again to open
---   the panel. Closing the panel never stops it.
+--   the panel. Closing the panel never stops it. A window you resize by hand
+--   keeps that size until REAPER closes. A plugin with a drawer (the free
+--   ReaKit FX Saturation's CURVE, the 3-Band EQ's band display, Stereo
+--   Width's stereo field, the Filter's CURVE, GainKit's FILTERS) grows its
+--   window down when the drawer opens and gives the room back when it
+--   closes; in a window made bigger, the drawer is bigger too.
 --
 --   Needs js_ReaScriptAPI (the window measuring). The panel needs ReaImGui;
 --   without it the sizing still works, silently.
@@ -38,7 +43,7 @@
 
 local r = reaper
 
-local VERSION   = "1.0.0"
+local VERSION   = "1.0.8"   -- shown in the panel; keep with @version above
 local EXT_D     = "EON_FloatSize"      -- captures / scale / global (the keys the pair used)
 local EXT_F     = "EON_Floatter"       -- this script's own state
 -- ⚠ Mirrored in rk_lua_core.lua (core.ALIVE_FLOATTER_*) for the Kit Bridge,
@@ -149,32 +154,53 @@ function L.snap_scale(ratio)
   return nil
 end
 
-local function bottom_on_edge(hwnd)
+-- The screen bent the float SHORTER: its bottom sits on the screen's edge, or it
+-- is as tall as the screen's work area wherever REAPER placed it (a fresh 3-Band
+-- at 100 % opens 1032 tall at y 52 on a 1032-high work area, its bottom off the
+-- screen -- measured 2026-10-02).
+local function screen_short(hwnd)
   if not r.JS_Window_GetViewportFromRect then return false end
   local o = L.rect(hwnd)
   if not o or o.inv then return false end
   local bottom = o.y + o.h
-  local _, _, _, vb  = r.JS_Window_GetViewportFromRect(o.x, o.y, o.x + o.w, bottom, true)
-  local _, _, _, vb2 = r.JS_Window_GetViewportFromRect(o.x, o.y, o.x + o.w, bottom, false)
-  return (vb and math.abs(bottom - vb) <= 2) or (vb2 and math.abs(bottom - vb2) <= 2) or false
+  for _, work in ipairs({ true, false }) do
+    local _, vt, _, vb = r.JS_Window_GetViewportFromRect(o.x, o.y, o.x + o.w, bottom, work)
+    if vb and (math.abs(bottom - vb) <= 2 or (vt and math.abs(o.h - (vb - vt)) <= 2)) then return true end
+  end
+  return false
 end
 
 -- The scale a FRESH float reveals, or nil when the window is not fresh. What
 -- REAPER opens is @gfx x scale, bent two ways and only two: WIDER (the float's
 -- minimum width; never narrower, so sw >= true scale) and SHORTER (the screen;
 -- never taller, so sh <= true scale). When both snap to the same step that is
--- the scale; when they differ, the bottom edge on the screen says which side
--- was bent.
-function L.fresh_scale(hwnd, c, gfx_w, gfx_h)
+-- the scale; when they differ, the screen bend says which side was bent.
+-- `known` (optional) is a scale measured or remembered before, for the one case
+-- below that can be ambiguous.
+function L.fresh_scale(hwnd, c, gfx_w, gfx_h, known)
   if not c or not gfx_w or gfx_w <= 0 or not gfx_h or gfx_h <= 0 then return nil end
   local sw, sh  = L.snap_scale(c.w / gfx_w), L.snap_scale(c.h / gfx_h)
-  local h_short = bottom_on_edge(hwnd)
+  local h_short = screen_short(hwnd)
   local s
   if sw and sh then
     if sw == sh then s = sw
     else s = h_short and sw or sh end
   else
     s = sh or sw
+  end
+  if not s and h_short then
+    -- Bent BOTH ways at once: a @gfx narrower than the float's minimum AND taller
+    -- than the screen, so neither side is exact (the 3-Band at 100 %: 489 x 966
+    -- for 460 x 1380; it was never sized -- the user, 2026-10-02: "my 3 band
+    -- ain't resizing"). The scale is then the step both bends allow (canvas at
+    -- least @gfx wide, at most @gfx tall); with several, the known one among them.
+    local cand = {}
+    for _, st in ipairs(STEPS) do
+      if c.w >= gfx_w * st - 2 and c.h <= gfx_h * st + 2 then cand[#cand + 1] = st end
+    end
+    if #cand == 1 then return cand[1] end
+    for _, st in ipairs(cand) do if st == known then return st end end
+    return nil
   end
   if not s then return nil end
   local h_ok = (sh == s) or h_short
@@ -232,7 +258,7 @@ function L.set_capture(key, w, h, ident)
 end
 
 function L.del_capture(key)
-  for _, suf in ipairs({ "_cw", "_ch", "_ident", "_w", "_h" }) do
+  for _, suf in ipairs({ "_cw", "_ch", "_ident", "_w", "_h", "_dv" }) do
     r.DeleteExtState(EXT_D, key .. suf, true)
   end
   local keep = {}
@@ -294,20 +320,22 @@ end
 -- SIZES — the size EON set for each plugin: canvas, logical px at 100%, with
 -- the plugin's @gfx so a fresh window can be told from a sized one. Written
 -- by EON_Floatter_Export from captures; the rows between the markers are the
--- only thing it touches.
+-- only thing it touches. A plugin with a drawer (DRAWERS, below) has its
+-- CLOSED size here: export it with the drawer shut.
 -- ═════════════════════════════════════════════════════════════════════════════
 local SIZES = {
   -- EON SIZES BEGIN
   ["1175_ReaKit"] = { w = 545, h = 204, gfx_w = 464, gfx_h = 840 },
-  ["3BandEQ_ReaKit"] = { w = 418, h = 228, gfx_w = 460, gfx_h = 900 },
+  ["3BandEQ_ReaKit"] = { w = 418, h = 228, gfx_w = 460, gfx_h = 1380 },
   ["ChannelTool_ReaKit"] = { w = 350, h = 546, gfx_w = 450, gfx_h = 540 },
   ["DDC_ReaKit"] = { w = 573, h = 319, gfx_w = 600, gfx_h = 520 },
   ["DeEsser_ReaKit"] = { w = 465, h = 376, gfx_w = 540, gfx_h = 520 },
   ["Delay_ReaKit"] = { w = 581, h = 560, gfx_w = 620, gfx_h = 760 },
-  ["EON_Drum_Strip"] = { w = 504, h = 368, gfx_w = 300, gfx_h = 700 },
+  ["EON_Drum_Strip"] = { w = 504, h = 368, gfx_w = 300, gfx_h = 900 },
+  ["Filter_ReaKit"] = { w = 260, h = 244, gfx_w = 260, gfx_h = 283 },
   ["Gate_ReaKit"] = { w = 512, h = 430, gfx_w = 560, gfx_h = 520 },
-  ["Saturation_ReaKit"] = { w = 288, h = 506, gfx_w = 220, gfx_h = 320 },
-  ["StereoWidth_ReaKit"] = { w = 291, h = 364, gfx_w = 200, gfx_h = 280 },
+  ["Saturation_ReaKit"] = { w = 288, h = 306, gfx_w = 220, gfx_h = 320 },
+  ["StereoWidth_ReaKit"] = { w = 291, h = 204, gfx_w = 200, gfx_h = 280 },
   -- EON SIZES END
 }
 
@@ -331,7 +359,7 @@ do
   r.DeleteExtState(EXT_F, LAUNCH_KEY, false)
   local kind, t = src:match("^(%a+):([%d%.]+)$")
   S.launch = (kind and (S.now - (tonumber(t) or 0)) < 5) and kind or "user"
-  S.quiet  = S.launch ~= "user"
+  S.quiet  = S.launch ~= "user" and S.launch ~= "setup"   -- setup = a person ran the start action: messages show
 end
 
 -- Was an instance alive a moment ago? REAPER runs the old instance's atexit
@@ -371,6 +399,10 @@ end
 if r.set_action_options then r.set_action_options(1 | 2) end
 
 S.first_run  = r.GetExtState(EXT_F, "setup_v1") ~= "1"
+-- "setup" = the ReaKit FX start action's one launch (it stamps launch_src): the panel shows that
+-- Floatter is on, then closes by itself (UI.PEEK_S) unless the pointer goes over it (the user,
+-- 2026-10-02: "open, and then close after loading the first time with the ReaKit FX").
+S.peek       = S.launch == "setup"
 S.want_panel = not S.quiet
 S.msg, S.msg_t = nil, 0
 
@@ -400,6 +432,10 @@ end
 -- purpose: same helper as the other EON self-registering scripts.
 function eon_write_startup(path, content)
   local tmp, prev = path .. ".eon-tmp", path .. ".eon-prev"
+  -- A stranded original goes back first (see eon_recover_startup). If it
+  -- cannot, nothing below may run: the os.remove(prev) further down would eat
+  -- the only copy of the shared file.
+  if not eon_recover_startup(path) then return false end
   -- A read-only __startup.lua is the user's call. Windows would still let the
   -- renames below replace it -- and strand a read-only .eon-prev that blocks
   -- every later rewrite -- so refuse up front.
@@ -412,7 +448,9 @@ function eon_write_startup(path, content)
   if not wok or not cok then os.remove(tmp) return false end
   -- Windows os.rename won't overwrite, so the old file steps aside first --
   -- and steps back if the new one cannot take its place. Nothing is ever
-  -- deleted before the replacement is in.
+  -- deleted before the replacement is in (2026-09-07: the old remove-then-
+  -- rename left the shared file GONE whenever the rename failed, e.g. an
+  -- antivirus hold on the freshly written tmp file).
   os.remove(prev)
   local had_old = os.rename(path, prev)
   if os.rename(tmp, path) then
@@ -422,6 +460,35 @@ function eon_write_startup(path, content)
   if had_old then os.rename(prev, path) end
   os.remove(tmp)
   return false
+end
+
+-- ⚠ A rewrite that fails half-way leaves __startup.lua GONE and the original
+-- in .eon-prev: the new file could not take the old one's place AND the old
+-- one could not step back (an antivirus hold on both the fresh tmp and the
+-- just-renamed .eon-prev -- the same hold the 2026-09-07 fix met on one side).
+-- Nothing runs at the next launch to notice, and the writer's first act on
+-- the retry used to be os.remove(prev): every vendor's startup lines gone,
+-- then a file written holding only our block. So the writer and every
+-- self_register put a stranded original back before reading or writing, and
+-- a .eon-prev is only ever removed while the real file exists. Returns false
+-- when a stranded original is there and could not be put back, or when
+-- __startup.lua is there but cannot be read. Global, identical in all five
+-- self-registering scripts.
+function eon_recover_startup(path)
+  local f, _, ocode = io.open(path, "r")
+  if f then f:close() return true end
+  -- Present but unreadable (a lock, a permission) is not absent: nothing is
+  -- put back over it. On macOS / Linux rename REPLACES an existing file, so a
+  -- stale .eon-prev overwrote the current one (outside audit 2026-10-02; on
+  -- Windows the rename failed). ENOENT (2) is the one open failure that means
+  -- there is no file.
+  if ocode ~= 2 then return false end
+  -- No file. Put a stepped-aside original back. rename needs no read access,
+  -- so an unreadable-but-present .eon-prev is never mistaken for absent
+  -- (Codex 2026-09-23); ENOENT (2) is the one failure that means there is
+  -- nothing to recover.
+  local ok, _, code = os.rename(path .. ".eon-prev", path)
+  return (ok or code == 2) and true or false
 end
 
 -- ⭐ Strip one script's block from __startup.lua text, in WHOLE LINES. The file is
@@ -474,6 +541,9 @@ end
 function eon_startup_selfclean_src(name, section, key)
   return
     "  local p=reaper.GetResourcePath()..\"/Scripts/__startup.lua\"\n" ..
+    -- a stranded .eon-prev (an earlier replacement that failed both ways) goes back first, only while the real
+    -- file is absent: the writer's own recovery rule (outside audit 3, 2026-10-05)
+    "  do local pb=io.open(p..'.eon-prev','r'); if pb then pb:close(); local pf=io.open(p,'r'); if pf then pf:close() else os.rename(p..'.eon-prev',p) end end end\n" ..
     "  local f=io.open(p,'r'); local c=f and f:read('*a'); if f then f:close() end\n" ..
     "  local w=c and io.open(p,'a'); if w then w:close()\n" ..
     -- Markers assembled at run time: the literal "-- EON:<name> END" must never appear
@@ -494,7 +564,9 @@ function eon_startup_selfclean_src(name, section, key)
     "    if fw then ok=fw:write(c) and true or false; if not fw:close() then ok=false end end\n" ..
     "    if ok then os.remove(b); local h=os.rename(p,b); if os.rename(t,p) then os.remove(b) elseif h then os.rename(b,p) end end\n" ..
     "    os.remove(t) end\n" ..
-    "  reaper.SetExtState('" .. section .. "','" .. key .. "','',true)\n"
+    -- the flag is cleared only while the start-up file is there; a replacement that failed both ways keeps it, so
+    -- the next launch tries again (the original waits in .eon-prev)
+    "  do local pf=io.open(p,'r'); if pf then pf:close(); reaper.SetExtState('" .. section .. "','" .. key .. "','',true) end end\n"
 end
 
 local function startup_path()
@@ -534,9 +606,16 @@ function S.autostart_forget() autostart_cache.t = -1 end
 -- instance it starts knows to stay quiet (no panel at REAPER launch). If
 -- NamedCommandLookup ever stops resolving, the block strips ITSELF out.
 function S.self_register()
-  local key    = SCRIPT_NAME .. "_registered_v2"
+  local key    = SCRIPT_NAME .. "_registered_v3"   -- v3 (2026-10-14): the block checks the script file (every install re-registers once)
   local marker = "-- EON:" .. SCRIPT_NAME
   local path   = startup_path()
+  -- A rewrite that failed half-way may have left the file stepped aside as
+  -- .eon-prev; put it back before anything below reads it. If it cannot be put
+  -- back, do NOTHING this run: registering anyway would read an empty file
+  -- and, once the hold lifts, the writer's own recovery would restore the
+  -- original only for the write to replace it with a file holding just our
+  -- block (Codex 2026-09-23). The next run retries.
+  if not eon_recover_startup(path) then return false end
 
   if r.GetExtState(EXT_F, key) == "1" and S.autostart_on() then return true end
 
@@ -551,10 +630,13 @@ function S.self_register()
     and ('reaper.NamedCommandLookup("_' .. named_id .. '")')
     or tostring(reg_cmd_id)
 
+  -- The action must resolve AND the script file must open (2026-10-14: a folder deleted by hand leaves the action
+  -- behind, and REAPER showed "Can't load file" at every start); else the block strips itself. %q: a ]] in the path.
   local block =
     "\n" .. marker .. " BEGIN\n" ..
     "do local id=" .. cmd_token .. "\n" ..
-    "if id~=0 then\n" ..
+    string.format("local sf=io.open(%q,'r'); if sf then sf:close() end\n", self_path) ..
+    "if id~=0 and sf then\n" ..
     "  reaper.SetExtState('" .. EXT_F .. "','" .. LAUNCH_KEY .. "','startup:'..reaper.time_precise(),false)\n" ..
     "  reaper.Main_OnCommand(id,0)\n" ..
     "else\n" ..
@@ -576,7 +658,7 @@ function S.unregister_startup()
     local stripped, had = S.strip_block(c, SCRIPT_NAME)
     if had then eon_write_startup(path, stripped) end
   end
-  r.SetExtState(EXT_F, SCRIPT_NAME .. "_registered_v2", "", true)
+  r.SetExtState(EXT_F, SCRIPT_NAME .. "_registered_v3", "", true)
 end
 
 -- ── Retiring the pair this script replaced ───────────────────────────────────
@@ -620,6 +702,7 @@ W.scale_session = nil -- the scale read off a fresh window this session
 W.open_n    = 0
 W.ADOPT_WINDOW = 2.0  -- seconds after an apply in which a mismatch is the host,
                       -- not the user. Past it, a mismatch is somebody dragging.
+W.KEPT_PFX  = "kept_" -- + FX GUID, in EXT_F, never persisted: see W.keep
 
 local function round(v) return math.floor(v + 0.5) end
 
@@ -653,29 +736,187 @@ function W.eon_size(key)
   return e.w * s * g, e.h * s * g
 end
 
--- What this key should be sized to: yours first, then EON's.
+-- ── The drawer (1.0.5) ───────────────────────────────────────────────────────
+-- A plugin with a drawer (the free ReaKit FX Saturation's CURVE now, the 3-Band
+-- EQ's band display later; rk_drawer.jsfx-inc) keeps "open" in its own hidden
+-- slider. Floatter reads it every tick and grows the window DOWN by the drawer
+-- when it opens, and gives exactly that back when it closes, so nothing above
+-- the drawer moves (the rules of Swing's mini browser and its Kit Bridge,
+-- turned on their side). Design: the bundle's
+-- .docs/specs/Design_Saturation_Curve_Drawer_2026-10-04.md.
+--   * RELATIVE: only the drawer's room is added and given back, so a window
+--     sized by hand keeps the user's size, and a grow never ends a hand keep.
+--   * The room GROWS WITH THE WINDOW (the user, 2026-10-04: the 3-Band's graph
+--     stayed the same height while its knobs grew): an open window is shared
+--     between the face and the drawer in the design's proportions, never less
+--     than the drawer itself (room_add / room_in below; rk_drawer's
+--     rkdr_share is the same sum).
+--   * FIRST SIGHT adopts: a window REAPER restored, kept or captured is taken
+--     to hold the drawer when the slider says open. A size Floatter SETS
+--     (apply: a fresh window, the dial, Apply / Show all, the quiet pass) adds
+--     the drawer itself.
+--   * A value is acted on once read the same twice (the plugin writes its own
+--     state back over an undo that touched the slider; the two reads let that
+--     land), and one window is resized at most once every DRAWER_GAP ticks.
+--   * A hidden float (the ReaKit FX dock holds its surface) is left alone.
+--   * The plugin finds itself in the served list (gmem, EON_RKFX_DRAWER) and
+--     only then counts on Floatter; anywhere else it opens the drawer inside
+--     its window.
+-- The global dial scales the drawer with the face: a size Floatter sets is
+-- the closed size, and the room is added for that size (room_add).
+-- name: the slider's own name, so a copy from BEFORE the drawer (no such slider: Swing ships this Floatter, a
+-- user's free FX can be older) is told apart. old: what such a copy is taken to be -- Saturation's older face
+-- always held its curve under the knob (its old SIZES row was the open size), so "open"; the 3-Band's older face
+-- had no display at all (its SIZES row was already today's closed size), so "shut". A capture taken before 1.0.5
+-- is read the same way (W.closed_capture).
+-- ch / sh: the closed design height (the SIZES row's h) and the strip, at 100 %: the proportions the room grows by
+-- (the plugin's rkdr_init carries the same numbers).
+local DRAWERS = {
+  ["Saturation_ReaKit"] = { param = 5, h = 200, ch = 306, sh = 20, name = "Curve drawer", old = true },   -- slider6 sat_drawer
+  ["3BandEQ_ReaKit"]    = { param = 14, h = 118, ch = 228, sh = 20, name = "Band display", old = false }, -- slider15 eq3_display
+  -- slider5 sw_drawer (Stereo Width 1.2.0, the user 2026-10-05: "the same treatment that saturation got", "the
+  -- correlation i wanted in there as well"): the drawer holds the field and the correlation, which the older face
+  -- showed under the knob (its SIZES row, 364, was the open size: closed 204 + 160), so an older copy is "open", as
+  -- Saturation's
+  ["StereoWidth_ReaKit"] = { param = 4, h = 160, ch = 204, sh = 20, name = "Stereo field drawer", old = true },
+  -- slider6 fl_drawer (Filter 1.0.0, ReaKit FX 1.5.0, 2026-10-07): born with the drawer, so no older copy to read
+  ["Filter_ReaKit"]      = { param = 5, h = 160, ch = 244, sh = 20, name = "Curve drawer", old = false },
+  -- slider34 ct_drawer (GainKit, 2026-10-08: the FILTERS row's DRAWER): param 25, measured (sliders 1-4, 7, 12, 15-35
+  -- are sparse; gk_filtview_probe.lua). Shut unless the FILTERS row says DRAWER: GainKit keeps it 0 in every other
+  -- view, so this row never grows a window that has no drawer. ch is GainKit's SIZES row (546): the strip fits in it,
+  -- the face there is bound by its width. A GainKit from before has no such slider: "shut", as it had no drawer.
+  ["ChannelTool_ReaKit"] = { param = 25, h = 160, ch = 546, sh = 20, name = "Filter drawer", old = false },
+}
+local DRW         = 31365520   -- EON_RKFX_DRAWER (.refs/gmem_regions_supplement.tsv)
+local DRW_VERSION = 1          -- +1: the drawer protocol this Floatter speaks
+local DRW_PAIRS   = 144        -- +2 how many windows are served, +144.. (track, chain position) pairs
+local DRW_MAX     = 64
+W.DRAWER_GAP = 8               -- ticks between two resizes of one window (the Kit Bridge's rate limit)
+W.dr_tick, W.dr_pub, W.dr_beat = 0, nil, -1
+
+local function drawer_px(d) return round(d.h * (W.scale_now())) end
+
+-- The drawer's room, grown with the window (rk_drawer's rkdr_share is room_in: keep the two in step). With F the
+-- face (the closed design less its strip) and D the drawer: opening a closed canvas chh tall adds
+-- (chh - strip) x D / F; an open canvas oh tall holds (oh - strip) x D / (F + D), which is what closing gives back.
+-- Never less than the drawer itself. Each undoes the other to the pixel, so a toggle moves nothing above it.
+local function drawer_strip(d) return round(d.sh * (W.scale_now())) end
+local function room_add(d, chh)
+  return math.max(drawer_px(d), round((chh - drawer_strip(d)) * d.h / (d.ch - d.sh)))
+end
+local function room_in(d, oh)
+  return math.max(drawer_px(d), round((oh - drawer_strip(d)) * d.h / (d.ch - d.sh + d.h)))
+end
+
+-- Open, read off the plugin's own slider; nil when the record's FX cannot be read. A copy from before the drawer
+-- reads as d.old (see DRAWERS). Told by the parameter's name, which STARTS with d.name (the slider's description
+-- runs on); in an older copy that index is one of REAPER's own (Bypass, Wet...).
+function W.drawer_open(e, d)
+  if not (e.tr and e.fx and r.ValidatePtr2(0, e.tr, "MediaTrack*")) then return nil end
+  local _, nm = r.TrackFX_GetParamName(e.tr, e.fx, d.param, "")
+  if (nm or ""):sub(1, #d.name) ~= d.name then return d.old end
+  return r.TrackFX_GetParam(e.tr, e.fx, d.param) >= 0.5
+end
+
+-- What a size Floatter sets (h the CLOSED canvas height) adds for the drawer
+-- (0 for a plugin without one, or with it shut), and the open state it was
+-- read from.
+function W.drawer_add(e, h)
+  local d = DRAWERS[e.key]
+  if not d then return 0 end
+  local open = W.drawer_open(e, d)
+  return open and room_add(d, h) or 0, open
+end
+
+-- What this key should be sized to: yours first, then EON's. Both are the
+-- CLOSED size for a plugin with a drawer. A Saturation capture from before
+-- 1.0.5 holds the whole old face, the curve under the knob: it is taken as
+-- the OPEN size (the drawer comes off) until it is captured again. What
+-- comes off is the room that height holds (room_in), the same sum opening
+-- adds back (room_add), so the window reopens at the captured height: a
+-- fixed 200 off and the grown room back on brought a 700 back 836 tall
+-- (Codex delta audit, 2026-10-05).
+function W.closed_capture(key, ch)
+  local d = DRAWERS[key]
+  if d and d.old and r.GetExtState(EXT_D, key .. "_dv") ~= "1" then
+    local closed = ch - room_in(d, ch)
+    -- too short to have held the curve (the old COMPACT face): it was a closed size already
+    if closed >= d.h * 0.7 * (W.scale_now()) then return closed end
+  end
+  return ch
+end
+
 function W.effective(key)
   local cw, ch = L.get_capture(key)
-  if cw then return cw, ch, "yours" end
+  if cw then return cw, W.closed_capture(key, ch), "yours" end
   local w, h = W.eon_size(key)
   if w then return w, h, "eon" end
   return nil
 end
 
+-- A window resized by hand keeps that size until REAPER closes: THAT window
+-- only (the user, 2026-09-29: "that one window"), never the other copies of
+-- the plugin, and never written to disk -- the next REAPER start puts the
+-- stored sizes back. Keyed by the FX's GUID, because a float gets a new HWND
+-- every time it opens, and held in a NON-persisted ExtState, because running
+-- the action again (to open the panel) restarts this script and a Lua table
+-- would be gone with it. REAPER reopens a float at its last size by itself,
+-- so keeping it means leaving it alone at first sight. Floatter's own buttons
+-- (Apply to this project, Show all, Reset, Capture) still size it, and that
+-- ends the keep.
+function W.guid(e)
+  if not (e and e.tr and e.fx and r.TrackFX_GetFXGUID) then return nil end
+  local g = r.TrackFX_GetFXGUID(e.tr, e.fx)
+  return (g and g ~= "") and g or nil
+end
+
+function W.is_kept(e)
+  local g = W.guid(e)
+  return g ~= nil and r.GetExtState(EXT_F, W.KEPT_PFX .. g) == "1"
+end
+
+-- True the first time this window is kept, so the caller can say so once.
+function W.keep(e)
+  local g = W.guid(e)
+  if not g or r.GetExtState(EXT_F, W.KEPT_PFX .. g) == "1" then return false end
+  r.SetExtState(EXT_F, W.KEPT_PFX .. g, "1", false)
+  return true
+end
+
+function W.unkeep(e)
+  local g = W.guid(e)
+  if g then r.DeleteExtState(EXT_F, W.KEPT_PFX .. g, false) end
+end
+
+-- w x h is the CLOSED size of a plugin with a drawer; an open drawer is added here.
 local function apply(e, w, h, src)
   if not e.canvas then return false end
-  if not L.set_canvas(e.hwnd, e.canvas, w, h) then return false end
+  local add, open = W.drawer_add(e, h)
+  if not L.set_canvas(e.hwnd, e.canvas, w, h + add) then return false end
+  if DRAWERS[e.key] then e.dr_grown, e.dr_last, e.dr_same = add, open, 2 end
+  h = h + add
   e.src, e.applied, e.applied_t, e.adopted = src, { w = round(w), h = round(h) }, r.time_precise(), false
+  W.unkeep(e)                                     -- sized by Floatter: the hand size is over
   W.rev = W.rev + 1
   return true
 end
 
 -- A fresh window says what the display scale is; learn it whenever one is
 -- in hand, whatever is about to be done to it.
+-- A hidden TALL copy (Eon_JSFX/.tall/, the same file name, so the same rows; GainKit's long strip view, 2026-10-08)
+-- declares a taller @gfx, and a fresh window of one opens at that: GainKit's at 450 x 900 (489 x 900 on the canvas,
+-- the float's minimum width), which against the short copy's 540 never read as fresh, so it kept that height. The
+-- Filter's long view (2026-10-09): its tall copy's @gfx is 260 x 588 (the bundle's .dev_tests/gk_tall_sync.py).
+local TALL_GFX_H = { ["ChannelTool_ReaKit"] = 900, ["Filter_ReaKit"] = 588 }
 local function learn_scale(e, rc)
   local ship = SIZES[e.key]
   if not ship or not rc then return nil end
-  local s = L.fresh_scale(e.hwnd, rc, ship.gfx_w, ship.gfx_h)
+  local gh = ship.gfx_h
+  if TALL_GFX_H[e.key] and e.tr and e.fx and (L.fx_ident(e.tr, e.fx) or ""):gsub("\\", "/"):find("/.tall/", 1, true) then
+    gh = TALL_GFX_H[e.key]
+  end
+  local ks, ksrc = W.scale_now()                  -- a scale seen before settles an ambiguous double bend
+  local s = L.fresh_scale(e.hwnd, rc, ship.gfx_w, gh, ksrc ~= "assumed" and ks or nil)
   if s then
     if s ~= W.scale_session then W.rev = W.rev + 1 end
     W.scale_session = s
@@ -716,6 +957,14 @@ function W.first_sight(e)
     if W.force_apply(e) then return true end
   end
 
+  -- 0. Resized by hand earlier this session (W.keep): REAPER has reopened it
+  --    at that size, so it stays as it is.
+  if W.is_kept(e) then
+    e.src = "manual"
+    W.rev = W.rev + 1
+    return true
+  end
+
   local key = e.key
   -- 1. Yours: this machine's px, applied as-is. A capture from the pair this
   --    script replaced is an OUTER size; converted here, against this window.
@@ -726,7 +975,7 @@ function W.first_sight(e)
   end
   if w and h then
     L.note_ident(key, L.fx_ident(e.tr, e.fx))
-    apply(e, w, h, "yours")
+    apply(e, w, W.closed_capture(key, h), "yours")
     return true
   end
 
@@ -766,6 +1015,7 @@ function W.detect_manual(e, now)
       e.applied, e.adopted = { w = rc.w, h = rc.h }, true
     else
       e.src, e.applied = "manual", nil
+      if W.keep(e) then S.say(("%s: this window keeps your size until REAPER closes"):format(L.pretty(e.key))) end
       W.rev = W.rev + 1
     end
   else
@@ -794,9 +1044,10 @@ function W.poll(now)
     live[a] = true
     local key = L.fx_key(o.tr, o.fx)
     local e = W.win[a]
-    if e and e.key ~= key then e = nil end            -- a recycled HWND address: not the same window
+    if e and e.key ~= key then e = nil end   -- a recycled HWND address: not the same window
     if not e then
       e = { hwnd = o.hwnd, tr = o.tr, fx = o.fx, key = key, tries = 0, settled = false, since = now }
+      if DRAWERS[key] then e.fg = r.TrackFX_GetFXGUID(o.tr, o.fx) end   -- the drawer service follows it by GUID
       W.win[a] = e
       W.rev = W.rev + 1
     else
@@ -813,9 +1064,15 @@ function W.poll(now)
           -- No canvas child yet: a JSFX gets 20 polls (5 s) in case REAPER is
           -- still building the window; a VST never grows one and is let go.
           e.tries = e.tries + 1
-          if e.tries >= 20 then e.settled = true; e.src = nil end
+          if e.tries >= 20 then e.settled = true; e.src = nil; e.gaveup = true end
         end                                          -- "later": minimized, look again
       end
+    elseif e.gaveup and L.find_canvas(e.hwnd) then
+      -- Given up on without a canvas: the ReaKit FX dock had taken the surface out of this (hidden) window while
+      -- Floatter looked. The dock has handed it back (the plugin popped out, or shown by a script): a first sight
+      -- again, so the window is sized as a fresh one is (measured 2026-10-05, floatter_seq_probe.lua: a 3-Band popped
+      -- out more than five seconds after the dock took it stayed at REAPER's 1032 px for good).
+      e.gaveup, e.settled, e.tries = nil, false, 0
     else
       W.detect_manual(e, now)
     end
@@ -825,10 +1082,96 @@ function W.poll(now)
     end
     n = n + 1
   end
-  for a in pairs(W.win) do
+  for a, e in pairs(W.win) do
     if not live[a] then W.win[a] = nil; W.rev = W.rev + 1 end
   end
   W.by_key, W.open_n = by_key, n
+end
+
+-- ── The drawer service, every tick (the 0.25 s poll is too slow for a click) ──
+-- One window with a drawer: listed as served when Floatter can grow it (pushed
+-- onto `list` as track, chain position), then grown or shrunk to what its
+-- slider asks. See "The drawer (1.0.5)" above for the rules.
+function W.drawer_serve(e, d, list)
+  if not (e.settled and e.tr and e.fx and r.ValidatePtr2(0, e.tr, "MediaTrack*")) then return end
+  e.fg = e.fg or r.TrackFX_GetFXGUID(e.tr, e.fx)                     -- a record the passes made (loud_pass)
+  -- moved in the chain since the last poll (a reorder): follow its GUID, so the slider read and the
+  -- position published are this plugin's
+  if r.TrackFX_GetFXGUID(e.tr, e.fx) ~= e.fg then
+    local found
+    for i = 0, r.TrackFX_GetCount(e.tr) - 1 do
+      if r.TrackFX_GetFXGUID(e.tr, i) == e.fg then found = i; break end
+    end
+    if not found then return end
+    e.fx = found
+  end
+  if not r.JS_Window_IsVisible(e.hwnd) then return end             -- hidden: in the ReaKit FX dock; its record kept
+  if not (e.canvas and r.JS_Window_IsWindow(e.canvas)) then e.canvas = L.find_canvas(e.hwnd) end
+  if not e.canvas then return end
+  local c = L.rect(e.canvas)
+  if not c or c.x <= -32000 then return end                           -- minimised
+  local open = W.drawer_open(e, d)
+  if open == nil then return end
+  local tn = r.GetMediaTrackInfo_Value(e.tr, "IP_TRACKNUMBER")       -- 1-based, -1 = the master, 0 = not found
+  if tn == 0 then return end
+  list[#list + 1] = tn < 0 and -1 or tn - 1
+  list[#list + 1] = e.fx
+  -- e.dr_grown: the room Floatter last added (0 = the window is shut); only whether it is 0 is read here
+  if e.dr_grown == nil then                                           -- first contact: taken as it is
+    e.dr_grown, e.dr_last, e.dr_same = open and room_in(d, c.h) or 0, open, 2
+    return
+  end
+  if open ~= e.dr_last then e.dr_last, e.dr_same = open, 1; return end   -- read once: wait for the second
+  e.dr_same = 2
+  if open == (e.dr_grown > 0) then return end                         -- the window matches already
+  if W.dr_tick - (e.dr_at or -1e9) < W.DRAWER_GAP then return end
+  -- opening adds the room this face calls for; closing gives back the room the plugin shows now (a hand resize
+  -- while open grew it with the window)
+  local dh = open and room_add(d, c.h) or -room_in(d, c.h)
+  local nh = math.max(40, c.h + dh)
+  if not L.set_canvas(e.hwnd, e.canvas, c.w, nh) then return end
+  e.dr_grown, e.dr_at = open and dh or 0, W.dr_tick
+  if e.applied then
+    -- the record moves with it, a hand drag since the last poll still shows (detect_manual). The half-second
+    -- grace starts again (the resize lands first), but e.adopted is left as it was: a toggle is Floatter's own
+    -- resize, not a fresh apply, so the host-adjust window (W.ADOPT_WINDOW) does not open again. Reopened, a
+    -- hand resize made right after a toggle was taken for the host's and never kept, and the next dial change
+    -- resized that window (Codex delta audit, 2026-10-05).
+    e.applied = { w = e.applied.w, h = e.applied.h + (nh - c.h) }
+    e.applied_t = r.time_precise()
+  end
+  W.rev = W.rev + 1
+end
+
+-- Every tick: serve each window with a drawer, publish which ones are served,
+-- and the heartbeat (once a second; 0 while Floatter is switched off).
+function W.drawers()
+  W.dr_tick = W.dr_tick + 1
+  local list = {}
+  local on = S.enabled()
+  if on then
+    for a, e in pairs(W.win) do
+      local d = e.key and DRAWERS[e.key]
+      if d and not W.quiet_q[a] and #list < DRW_MAX * 2 then W.drawer_serve(e, d, list) end
+    end
+  end
+  local key = table.concat(list, " ")
+  if key ~= W.dr_pub then
+    W.dr_pub = key
+    for i, v in ipairs(list) do r.gmem_write(DRW + DRW_PAIRS + i - 1, v) end
+    r.gmem_write(DRW + 2, #list // 2)                                 -- the count last
+  end
+  local t = os.time()
+  if t ~= W.dr_beat then
+    W.dr_beat = t
+    r.gmem_write(DRW + 1, DRW_VERSION)
+    r.gmem_write(DRW, on and t or 0)
+  end
+end
+
+function W.drawers_stop()
+  r.gmem_write(DRW, 0)
+  r.gmem_write(DRW + 2, 0)
 end
 
 -- ── Passes ───────────────────────────────────────────────────────────────────
@@ -907,7 +1250,8 @@ function W.quiet_tick(now)
       end
       local w, h = W.effective(q.key)
       if w then
-        L.set_canvas(q.hwnd, canvas, w, h)
+        L.set_canvas(q.hwnd, canvas, w, h + (W.drawer_add(q, h)))   -- an open drawer on top of the closed size
+        W.unkeep(q)                               -- sized by the pass: the hand size is over
         W.quiet_sized = (W.quiet_sized or 0) + 1
       end
       quiet_finish(a, q)
@@ -975,8 +1319,18 @@ function W.capture(e)
   if not e or not e.canvas then return false end
   local rc = L.rect(e.canvas)
   if not rc or rc.w < 40 or rc.h < 40 then return false end
-  L.set_capture(e.key, rc.w, rc.h, L.fx_ident(e.tr, e.fx))
+  -- a plugin with a drawer: the CLOSED size is kept (less the room an open drawer holds now), marked so
+  -- W.closed_capture knows it from a capture taken before 1.0.5. Only while this Floatter is on, has grown this
+  -- window for the drawer and the plugin's own slider still says open: switched off, the drawer service stops
+  -- and e.dr_grown goes stale, while the plugin lays its drawer out INSIDE the window (or shuts it there), so
+  -- the whole window is the size (Codex delta audit, 2026-10-05: 200 too little was stored).
+  local d = DRAWERS[e.key]
+  local add = (d and S.enabled() and (e.dr_grown or 0) > 0 and W.drawer_open(e, d)) and room_in(d, rc.h) or 0
+  if rc.h - add < 40 then return false end
+  L.set_capture(e.key, rc.w, rc.h - add, L.fx_ident(e.tr, e.fx))
+  if DRAWERS[e.key] then r.SetExtState(EXT_D, e.key .. "_dv", "1", true) end
   e.src, e.applied, e.applied_t = "yours", { w = rc.w, h = rc.h }, r.time_precise()
+  W.unkeep(e)                                     -- the hand size is stored now, for good
   W.rev = W.rev + 1
   S.say(("%s: kept %d x %d as yours"):format(L.pretty(e.key), rc.w, rc.h))
   return true
@@ -1032,13 +1386,15 @@ UI.warned      = false
 UI.dial_drag   = nil
 UI.drag        = nil
 UI.welcome     = false
+UI.peek_t      = nil     -- seconds shown, while the start action's launch has the panel open (S.peek)
+UI.PEEK_S      = 4       -- seconds of frames it shows before closing by itself
 
 local function alpha(col, a)           -- col with its alpha replaced (a in 0..1)
   return (col & 0xFFFFFF00) | math.floor(a * 255 + 0.5)
 end
 
 function UI.open()
-  if UI.on then return true end
+  if UI.on then UI.peek_t = nil; return true end   -- asked to open while it peeks: it stays
   if not r.ImGui_GetBuiltinPath then
     if not UI.warned then
       UI.warned = true
@@ -1069,6 +1425,11 @@ function UI.open()
   end
   UI.on, UI.dirty = true, true
   UI.welcome = r.GetExtState(EXT_F, "welcomed_v1") ~= "1"
+  -- the start action's launch: this one opening closes itself (UI.draw); any later open stays.
+  -- peek_t counts the seconds of frames shown; peek_mx/my is where the pointer started.
+  UI.peek_t = S.peek and 0 or nil
+  UI.peek_last, UI.peek_mx, UI.peek_my = nil, nil, nil
+  S.peek = false
   return true
 end
 
@@ -1499,7 +1860,8 @@ function UI.proxy(ImGui, ctx, e, cur)
   ImGui.DrawList_AddRect(dl, x0, y0, x0 + BW, y0 + BH, P.line, 4, 0, 1)
 
   local ew, eh = W.eon_size(e.key)
-  local set = SIZES[e.key] and { w = ew, h = eh } or nil
+  local dd = DRAWERS[e.key]
+  local set = SIZES[e.key] and { w = ew, h = eh + ((dd and (e.dr_grown or 0) > 0) and room_add(dd, eh) or 0) } or nil   -- with its open drawer
   local mw = math.max(cur.w, set and set.w or 0)
   local mh = math.max(cur.h, set and set.h or 0)
   local ps = math.min((BW - 64) / mw, (BH - 54) / mh)
@@ -1559,8 +1921,9 @@ function UI.proxy(ImGui, ctx, e, cur)
   if ImGui.IsItemDeactivated(ctx) and UI.drag then
     UI.drag = nil
     e.src, e.applied = "manual", nil
+    W.keep(e)
     W.rev = W.rev + 1
-    S.say(("%s resized to %d × %d - Capture to keep it"):format(L.pretty(e.key), cur.w, cur.h))
+    S.say(("%s resized to %d × %d - kept until REAPER closes"):format(L.pretty(e.key), cur.w, cur.h))
   end
   ImGui.SetCursorScreenPos(ctx, x0, y0 + BH)
   ImGui.Dummy(ctx, BW, 4)
@@ -1651,6 +2014,7 @@ function UI.focus_panel(ImGui, ctx)
     if (dw ~= 0 or dh ~= 0) and e.canvas then
       L.set_canvas(e.hwnd, e.canvas, math.max(40, cur.w + dw), math.max(40, cur.h + dh))
       e.src, e.applied = "manual", nil
+      W.keep(e)
       W.rev = W.rev + 1
     end
     local dl = ImGui.GetWindowDrawList(ctx)
@@ -1794,6 +2158,35 @@ function UI.draw(ImGui, ctx)
        and ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
       open = false
     end
+    -- the start action's peek: closes after UI.PEEK_S seconds of frames (a gap between frames
+    -- counts 0.25 s at most, so a held loop cannot eat the time: the start action shows its
+    -- summary from a deferred callback, which holds every script's loop, so the panel waits behind
+    -- the box and closes about 4 s after OK -- measured 2026-10-02) and stays open once the pointer
+    -- MOVES over it, clicks it or turns the wheel on it. Merely being under the pointer does not
+    -- count: the panel opens where the action list's Run button just was.
+    if UI.peek_t then
+      local now = r.time_precise()
+      UI.peek_t = UI.peek_t + math.min(now - (UI.peek_last or now), 0.25)
+      UI.peek_last = now
+      -- the first frame has no pointer yet (-FLT_MAX), which would read as a huge move: only a
+      -- real position starts the reference
+      local moved = false
+      if ImGui.IsMousePosValid(ctx) then
+        local mx, my = ImGui.GetMousePos(ctx)
+        if UI.peek_mx then
+          moved = math.abs(mx - UI.peek_mx) + math.abs(my - UI.peek_my) > 6
+        else
+          UI.peek_mx, UI.peek_my = mx, my
+        end
+      end
+      if ImGui.IsWindowHovered(ctx, ImGui.HoveredFlags_RootAndChildWindows)
+         and (moved or ImGui.IsMouseClicked(ctx, 0) or ImGui.IsMouseClicked(ctx, 1)
+              or ImGui.GetMouseWheel(ctx) ~= 0) then
+        UI.peek_t = nil
+      elseif UI.peek_t > UI.PEEK_S then
+        UI.peek_t, open = nil, false
+      end
+    end
     ImGui.End(ctx)
   end
   UI.pop_theme(ImGui, ctx)
@@ -1822,6 +2215,7 @@ local function tick()
     W.next_poll = now + POLL_SEC
     W.poll(now)
   end
+  W.drawers()
   W.quiet_tick(now)
   if UI.on then UI.frame() end
   r.defer(tick)
@@ -1836,9 +2230,11 @@ elseif r.GetExtState(EXT_F, "autostart") ~= "0" then
 end
 
 S.set_toggle(S.enabled())
+r.gmem_attach("Swing_Media_Transfer")                     -- the drawer band (EON_RKFX_DRAWER)
 r.atexit(function()
   r.SetExtState(EXT_F, "handoff_t", tostring(r.time_precise()), false)
   for a, q in pairs(W.quiet_q) do quiet_finish(a, q) end   -- never leave an invisible float behind
+  W.drawers_stop()                                         -- the plugins open their drawers in the window now
   S.set_toggle(false)
 end)
 

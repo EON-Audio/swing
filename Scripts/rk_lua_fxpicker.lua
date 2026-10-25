@@ -1230,15 +1230,23 @@ function M.chain_save(tr, rel, guids)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════
--- PAD VIEWS — one pad's slice of Swing's OWN track (Wired)
+-- PAD VIEWS — one pair's slice of Swing's OWN track (Wired)
 -- ═══════════════════════════════════════════════════════════════════════════
 -- In Wired a pad has no track of its own: its plugins sit on Swing's track
--- between Swing and the EON Patchbay, on the pad's channel pair ((pad+1)*2,
--- +1). A VIEW is that slice as a list of chain indices in signal order, and
--- every operation below takes indices IN THE VIEW and maps them, so the picker
--- can treat "pad 5 on Swing's track" exactly like a track.
+-- between Swing and the EON Patchbay, on the channel pair its audio rides. A
+-- VIEW is that slice as a list of chain indices in signal order, and every
+-- operation below takes indices IN THE VIEW and maps them, so the picker can
+-- treat "pad 5 on Swing's track" exactly like a track.
 --
--- v2 (REAPER 7+): the slice is a CONTAINER, one per pad, named for it and
+-- The key (`pad` below) is a PAIR (Pad Banks Outputs step 5): bank A's pads
+-- 0..15 on channels (p+1)*2,+1 (2..33, one up -- 0/1 carry the returned sum),
+-- the bank pairs 19..21 (Bank B, C, D: a whole bank, shared by its pads) and
+-- the split pairs 22..31 on their multi-out channels p*2,+1 (38..63). 34..37
+-- carry the bank pairs' sends and 16..18 are never a pad's (rk_swing_patchbay
+-- CHANNEL LAYOUT; Swing's swing_out_wired). Which pair a SLOT rides is Swing's
+-- to say (the strip band's OUT_WPAIR); the picker bridge hands the pair in.
+--
+-- v2 (REAPER 7+): the slice is a CONTAINER, one per pair, named for it and
 -- pinned to the pair ONCE. The plugins inside see plain stereo, so nothing
 -- inside ever carries a pin -- a plugin dropped in through REAPER's own FX
 -- browser is routed the moment it lands. Children are addressed with REAPER's
@@ -1250,13 +1258,76 @@ end
 -- does (core.macro_source handles that).
 --
 -- pad = -1 is the MASTER view: everything after Swing that is neither
--- pad-pinned (flat or container) nor the Patchbay -- a plugin on channels 1/2
+-- pair-pinned (flat or container) nor the Patchbay -- a plugin on channels 1/2
 -- there is a master insert whichever side of the Patchbay it sits.
 --
 -- A track with no Swing on it has no views: every function falls back to the
 -- whole-chain call of the same name, so callers need not special-case it.
 local NUM_PADS = 16
+local PAIR_BANK, PAIR_SPLIT, PAIR_MAX = 19, 22, 31   -- Swing's OUT_PAIR_BANK / OUT_PAIR_SPLIT / OUT_PAIRS - 1
 local CENC = 0x2000000
+
+--- A pair's first channel (0-based), or nil when no pad ever rides it.
+function M.pair_ch(p)
+  if p == nil then return nil end
+  if p >= 0 and p < NUM_PADS then return (p + 1) * 2 end
+  if p >= PAIR_BANK and p <= PAIR_MAX then return p * 2 end
+  return nil
+end
+
+--- The pair a channel belongs to, or -1 (0/1, the bank pairs' sends 34..37, past 63).
+function M.ch_pair(ch)
+  if ch < 2 then return -1 end
+  if ch < (NUM_PADS + 1) * 2 then return math.floor(ch / 2) - 1 end
+  if ch >= PAIR_BANK * 2 and ch < (PAIR_MAX + 1) * 2 then return math.floor(ch / 2) end
+  return -1
+end
+
+--- A pair's short name for messages and undo: "pad 5", "Bank B", "Own 3" (Swing's own names for the pairs).
+function M.pair_label(p)
+  if p < NUM_PADS then return "pad " .. (p + 1) end
+  if p < PAIR_SPLIT then return "Bank " .. string.char(66 + p - PAIR_BANK) end
+  return "Own " .. (p - PAIR_SPLIT + 1)
+end
+
+--- The name a pair's container wears -- the multi-out tracks' names (Swing_Kit_Bridge's eon_out_bank_name /
+-- eon_out_split_name), so a plugin is under the same name whichever way the kit is wired. Bank A: "<pad name>
+-- (pad N)"; a bank pair: "Bank B" / "Bank B: <bank name>"; a split pair: "C3" / "C3: <pad name>" by its
+-- OWNER slot (0..63), "Own 3" while the owner is not known. `name` = the pad's, the bank's or the owner's name.
+function M.pair_caption(p, name, owner)
+  name = name or ""
+  if p < NUM_PADS then return ((name ~= "") and name or "Pad") .. " (pad " .. (p + 1) .. ")" end
+  if p < PAIR_SPLIT then
+    return "Bank " .. string.char(66 + p - PAIR_BANK) .. ((name ~= "") and (": " .. name) or "")
+  end
+  if owner then
+    local lbl = string.char(65 + math.floor(owner / NUM_PADS) % 4) .. tostring(owner % NUM_PADS + 1)
+    return (name ~= "") and (lbl .. ": " .. name) or lbl
+  end
+  return M.pair_label(p)
+end
+
+-- The name this code last gave pair p's container on track tr (the track's P_EXT EON_WCAP_<p>), "" none; `set`
+-- records one. A container name is OURS -- it may follow the pad, the bank, the owner -- only while the container
+-- still wears exactly what we recorded: the multi-out tracks' EON_OUT_NAME rule. A pattern ("Bank B: ...",
+-- "C3: ...") also matched what a user would type, and the publisher put it back every half second (review
+-- 2026-10-12). Bank A's containers also count as ours by their "(pad N)" tail: every one made before step 5
+-- carries it and none recorded it.
+local function caption_rec(tr, p, set)
+  local key = "P_EXT:EON_WCAP_" .. p
+  if set then
+    local _, cur = r.GetSetMediaTrackInfo_String(tr, key, "", false)
+    if cur ~= set then r.GetSetMediaTrackInfo_String(tr, key, set, true) end
+    return set
+  end
+  local _, v = r.GetSetMediaTrackInfo_String(tr, key, "", false)
+  return v or ""
+end
+local function caption_ours(tr, p, capt)
+  local rec = caption_rec(tr, p)
+  if rec ~= "" and capt == rec then return true end
+  return p < NUM_PADS and capt:match("%(pad %d+%)$") ~= nil
+end
 
 local function is_enc(i) return i ~= nil and i >= CENC end
 
@@ -1298,16 +1369,14 @@ local function container_children(tr, c)
   return out
 end
 
+-- Swing by its FILE, compared whole: core.is_swing_fx's rule (core.SWING_FX_FILES, the owner), read through this
+-- module's pcall'd fx_ident so it holds without core too. Never the shown name -- the user's rename, or a path when
+-- REAPER's JSFX name cache is blank (the excluded "Patchbay" / "EON Tone" ... names were guarding that match).
 function M.is_swing(tr, i)
-  local ident = fx_ident(tr, i) or ""
-  if ident:find("Swing_ReaKit", 1, true) or ident:find("DrumKit_ReaKit", 1, true) then
-    return true
-  end
-  local _, disp = r.TrackFX_GetFXName(tr, i, "")
-  disp = disp or ""
-  if disp:find("Patchbay", 1, true) or disp:find("EON Tone", 1, true)
-     or disp:find("EON Output", 1, true) or disp:find("EON Macros", 1, true) then return false end
-  return disp:match("^JS: Swing") ~= nil
+  local f = ((fx_ident(tr, i) or ""):match("[^/\\]+$") or ""):lower()
+  local set = core and core.SWING_FX_FILES
+  if set then return set[f] == true end
+  return f == "swing_reakit.jsfx" or f == "swing_lite.jsfx" or f == "drumkit_reakit.jsfx"
 end
 
 function M.find_swing(tr)
@@ -1318,21 +1387,20 @@ function M.find_swing(tr)
   return -1
 end
 
+-- The Patchbay by its FILE compared whole (the kit bridge's eon_find_patchbay, wiki §6.16): an ident substring also
+-- took renamed copies, and the shown name is the user's rename or, with a blank cache NAME, the file's path.
 function M.find_patchbay(tr)
   if not tr then return -1 end
   for i = 0, r.TrackFX_GetCount(tr) - 1 do
-    local ident = fx_ident(tr, i) or ""
-    local _, disp = r.TrackFX_GetFXName(tr, i, "")
-    if ident:find("EON_Patchbay", 1, true) or (disp or ""):find("EON Patchbay", 1, true) then
-      return i
-    end
+    if ((fx_ident(tr, i) or ""):match("[^/\\]+$") or ""):lower() == "eon_patchbay.jsfx" then return i end
   end
   return -1
 end
 
---- The pad whose Wired pair a plugin's (or container's) FIRST INPUT PIN reads,
--- or -1. Same reading the kit bridge's Wired -> Multi-Out inventory uses. Pad
--- 15's pair (channels 32/33) lives in the HIGH word.
+--- The PAIR a plugin's (or container's) FIRST INPUT PIN reads, or -1. Lenient:
+-- pin 0's lowest channel decides (the kit bridge's Wired -> Multi-Out inventory
+-- reads strictly, both pins, and only bank A's pairs until the conversion step).
+-- Channels 32..63 live in the HIGH word.
 function M.pad_of(tr, i)
   local lo, hi = r.TrackFX_GetPinMappings(tr, i, 0, 0)
   lo = math.floor(lo or 0); hi = math.floor(hi or 0)
@@ -1342,24 +1410,33 @@ function M.pad_of(tr, i)
   elseif hi ~= 0 then
     for b = 0, 31 do if hi & (1 << b) ~= 0 then ch = 32 + b break end end
   end
-  if ch < 2 then return -1 end
-  local pad = math.floor(ch / 2) - 1
-  if pad < 0 or pad >= NUM_PADS then return -1 end
-  return pad
+  if ch < 0 then return -1 end
+  return M.ch_pair(ch)
 end
 
 local function pin_mask(ch)
   if ch < 32 then return 1 << ch, 0 end
-  return 0, 1 << (ch - 32)
+  local v = 1 << (ch - 32)
+  -- Channel 63 is bit 31 of the high word: handed over as the SIGNED int32 (-2147483648), which every reading of
+  -- a 32-bit argument takes as that bit; 2147483648 is out of an int's range (step 5's split pair 31 is the first
+  -- Wired pin to reach it; read back in the PadView rig).
+  if v >= 0x80000000 then v = v - 0x100000000 end
+  return 0, v
 end
 
---- Pin a plugin's (or container's) inputs AND outputs to a pad's Wired pair.
+--- Pin a plugin's (or container's) inputs AND outputs to a Wired pair. The track
+-- grows to the pair's channels first when it is narrower (a bank or split pair
+-- above the 38 a Wired track starts with): a pin past the last channel carries
+-- nothing. False for a pair no pad rides.
 function M.pin_pad(tr, i, pad)
-  local c = (pad + 1) * 2
+  local c = M.pair_ch(pad)
+  if not c then return false end
+  if (r.GetMediaTrackInfo_Value(tr, "I_NCHAN") or 2) < c + 2 then r.SetMediaTrackInfo_Value(tr, "I_NCHAN", c + 2) end
   for io = 0, 1 do
     local l0, h0 = pin_mask(c);     r.TrackFX_SetPinMappings(tr, i, io, 0, l0, h0)
     local l1, h1 = pin_mask(c + 1); r.TrackFX_SetPinMappings(tr, i, io, 1, l1, h1)
   end
+  return true
 end
 
 --- Plain stereo pins (1/2) -- what a container child should carry.
@@ -1370,9 +1447,9 @@ function M.pin_stereo(tr, i)
   end
 end
 
---- The pad's container on Swing's track (top-level index), or -1.
+--- The pair's container on Swing's track (top-level index), or -1.
 function M.pad_container(tr, pad)
-  if not tr or pad == nil or pad < 0 then return -1 end
+  if not tr or pad == nil or not M.pair_ch(pad) then return -1 end
   local si = M.find_swing(tr)
   if si < 0 then return -1 end
   local pb = M.find_patchbay(tr)
@@ -1383,9 +1460,29 @@ function M.pad_container(tr, pad)
   return -1
 end
 
---- Make sure the pad has a container: created directly above the Patchbay
+--- Every pair's container on Swing's track in one pass: { [pair] = top-level
+-- index } (the first per pair, as pad_container finds it).
+function M.pair_containers(tr)
+  local out = {}
+  local si = M.find_swing(tr)
+  if si < 0 then return out end
+  local pb = M.find_patchbay(tr)
+  local last = (pb >= 0) and pb or r.TrackFX_GetCount(tr)
+  for i = si + 1, last - 1 do
+    if M.is_container(tr, i) then
+      local p = M.pad_of(tr, i)
+      if p >= 0 and out[p] == nil then out[p] = i end
+    end
+  end
+  return out
+end
+
+--- Make sure the pair has a container: created directly above the Patchbay
 -- (or last), 2 in / 2 out, pinned to the pair, named. Returns its index.
+-- `name`: bank A's pad name (" (pad N)" is added), or a bank / split pair's
+-- whole caption (M.pair_caption; "Bank B" / "Own 3" when nil).
 function M.ensure_pad_container(tr, pad, name)
+  if not M.pair_ch(pad) then return -1 end
   local c = M.pad_container(tr, pad)
   if c >= 0 then return c end
   local pb = M.find_patchbay(tr)
@@ -1404,23 +1501,27 @@ function M.ensure_pad_container(tr, pad, name)
   r.TrackFX_SetNamedConfigParm(tr, c, "container_nch_in", "2")
   r.TrackFX_SetNamedConfigParm(tr, c, "container_nch_out", "2")
   M.pin_pad(tr, c, pad)
-  r.TrackFX_SetNamedConfigParm(tr, c, "renamed_name",
-    (name and name ~= "" and name or "Pad") .. " (pad " .. (pad + 1) .. ")")
+  local cap = (pad < NUM_PADS) and M.pair_caption(pad, name) or ((name and name ~= "") and name or M.pair_caption(pad))
+  r.TrackFX_SetNamedConfigParm(tr, c, "renamed_name", cap)
+  caption_rec(tr, pad, cap)
   return c
 end
 
---- Rename the pad's container when the pad's name changed (cheap, idempotent).
-function M.name_pad_container(tr, pad, name)
+--- Rename the pair's container when its name changed -- the pad's, the bank's,
+-- a split pair's owner (cheap, idempotent). `name` as for ensure_pad_container;
+-- `at` = the container's index when the caller already has it (pair_containers).
+function M.name_pad_container(tr, pad, name, at)
   if not name or name == "" then return false end          -- nothing published yet: leave it
-  local c = M.pad_container(tr, pad)
+  local c = at or M.pad_container(tr, pad)
   if c < 0 then return false end
   local _, cur = r.TrackFX_GetFXName(tr, c, "")
   cur = cur or ""
-  -- Only a name WE gave ("... (pad N)") follows the pad. A container the user
-  -- renamed by hand keeps their name.
-  if not cur:match("%(pad %d+%)$") then return false end
-  local want = name .. " (pad " .. (pad + 1) .. ")"
+  -- Only a name WE gave follows (caption_ours). A container the user renamed by
+  -- hand keeps their name.
+  if not caption_ours(tr, pad, cur) then return false end
+  local want = (pad < NUM_PADS) and M.pair_caption(pad, name) or name
   if cur ~= want then r.TrackFX_SetNamedConfigParm(tr, c, "renamed_name", want) end
+  caption_rec(tr, pad, want)
   return true
 end
 
@@ -1537,7 +1638,7 @@ function M.view_insert(tr, pad, add, after, name)
   local at, err
   if pad >= 0 and M.containers_ok() then
     local c = M.ensure_pad_container(tr, pad, name)
-    if c < 0 then undo_end("insert"); return nil, "insert: could not make the pad's container" end
+    if c < 0 then undo_end("insert"); return nil, "insert: could not make the container for " .. M.pair_label(pad) end
     local pos = M.container_count(tr, c)
     if after and after >= 0 and v.idx[after + 1] and is_enc(v.idx[after + 1]) then
       local p = child_pos(tr, c, v.idx[after + 1])
@@ -1564,7 +1665,7 @@ function M.view_insert(tr, pad, add, after, name)
     at, err = insert_raw(tr, add, view_insert_pos(v, after))
     if at and pad >= 0 then M.pin_pad(tr, at, pad) end
   end
-  undo_end("insert " .. tostring(add) .. (pad >= 0 and (" on pad " .. (pad + 1)) or ""))
+  undo_end("insert " .. tostring(add) .. (pad >= 0 and (" on " .. M.pair_label(pad)) or ""))
   return at, err
 end
 
@@ -1647,7 +1748,7 @@ function M.view_move(tr, pad, vfrom, vto)
       end
     end
     if e >= 0 then M.pin_stereo(tr, e) end
-    undo_end("move slot into the pad's container")
+    undo_end("move slot into the " .. M.pair_label(pad) .. " container")
     return e >= 0
   elseif is_enc(a) and not is_enc(b) then
     return nil, "move: a container child cannot take a flat slot -- move the other one in instead"
@@ -1684,7 +1785,7 @@ function M.view_chain_apply(tr, pad, rel, mode, name)
   end
   if pad >= 0 and M.containers_ok() then
     local c = M.ensure_pad_container(tr, pad, name)
-    if c < 0 then undo_end("add chain"); return nil, "chain: could not make the pad's container" end
+    if c < 0 then undo_end("add chain"); return nil, "chain: could not make the container for " .. M.pair_label(pad) end
     local before = M.container_count(tr, c)
     r.TrackFX_AddByName(tr, abs, false, -1000 - M.enc(tr, c, before))
     if M.container_count(tr, c) <= before then
@@ -1743,7 +1844,7 @@ end
 function M.view_chain_save(tr, pad, rel)
   local v = M.view(tr, pad)
   if not v then return M.chain_save(tr, rel) end
-  if #v.idx == 0 then return nil, "chain save: this pad has no inserts" end
+  if #v.idx == 0 then return nil, "chain save: " .. ((pad >= 0) and M.pair_label(pad) or "the master") .. " has no inserts" end
   if not rel or rel == "" then return nil, "chain save: no name given" end
   local rerr
   rel, rerr = M.chain_rel(rel)

@@ -113,6 +113,14 @@ if not ok then
                         .. tostring(fx) .. "\n")
   return
 end
+-- The shared core (Pad Banks Outputs step 3): which of Swing's sends are its own output tracks
+-- (core.swing_send_pair -- a channel alone is no owner: a user's own send from Swing's channels 1-2 read as pad 1),
+-- and the strip band, where Swing says which pair each slot plays on.
+local okc, core = pcall(require, "rk_lua_core")
+if not okc then
+  reaper.ShowConsoleMsg("FX picker bridge: could not load rk_lua_core\n" .. tostring(core) .. "\n")
+  return
+end
 
 -- Styled dialog module (ReaImGui), the Kit Bridge's contract: pcall'd, gated on
 -- available(), and every call site keeps its native GetUserInputs /
@@ -654,20 +662,127 @@ local ci_tgt, ci_tgt_seq, ci_pads = {}, {}, {}
 local TGT_PIN = 54
 local ci_pin = {}
 
--- A pad's name as Swing publishes it (INST_PADNAME: slot*512 + pad*32 chars,
--- 0-terminated). "" when Swing has published nothing for that pad. Read here,
--- above publish_chain, for the same compile-time reason as ci_tgt below.
-local PN_BASE, PN_STRIDE, PN_LEN = 26010000, 512, 32
-local function ci_pad_name(slot, pad)
-  local b = PN_BASE + slot * PN_STRIDE + pad * PN_LEN
-  local t = {}
-  for i = 0, PN_LEN - 1 do
-    local c = math.floor(reaper.gmem_read(b + i) or 0)
-    if c <= 0 then break end
-    if c < 32 or c > 126 then c = 63 end
-    t[#t + 1] = string.char(c)
+-- ── WIRED PAIRS (Pad Banks Outputs step 5) ───────────────────────────────────
+-- A pad's Wired container is keyed by the PAIR its audio rides (rk_lua_fxpicker
+-- PAD VIEWS): bank A's 0..15, a bank's 19..21 (shared by its pads), a split pad's
+-- 22..31. Swing publishes each slot's (the strip band's OUT_WPAIR) and the names
+-- the captions need. One table, not five locals: this chunk is near Lua's
+-- 200-local ceiling. Declared here, above publish_chain, for the same compile-time
+-- reason as ci_tgt.
+-- ciw.pn[slot] = { id = instance id, bank = the bank seen last pass, [abs slot
+-- 0..63] = name }; ciw.bank_seen[slot] = the bank on screen at the last tick.
+local ciw = { pn = {}, bank_seen = {} }
+
+-- Every bank's pad names, as far as each bank has been on screen. Swing publishes
+-- only the bank ON SCREEN's sixteen (INST_PADNAME, slot*512 + pad*32 chars, beside
+-- GS_INST_BANK_CUR, which leads its names by up to a block), so a bank is copied
+-- in once it has stayed on screen from one pass to the next and still is after
+-- the read -- the kit bridge's eon_out_names_tick, the same rule. (The old reader
+-- took the band as bank A's whatever bank was on screen: with bank B shown, bank
+-- A's pad containers were renamed after bank B's pads.)
+function ciw.names_tick(slot)
+  local G = core.GMEM
+  local id = math.floor(reaper.gmem_read(G.GS_INST_REG_BASE + slot * G.GS_INST_REG_STRIDE + G.GS_INST_REG_OFF_ID) or 0)
+  local c = ciw.pn[slot]
+  if not c or c.id ~= id then c = { id = id }; ciw.pn[slot] = c end
+  local b = math.floor(reaper.gmem_read(G.GS_INST_BANK_CUR + slot) or 0)
+  if b == c.bank and b >= 0 and b <= 3 then
+    local got = {}
+    for pad = 0, G.NUM_PADS - 1 do
+      local base, t = G.INST_PADNAME_BASE + slot * G.INST_PADNAME_INST_STRIDE + pad * G.INST_PADNAME_PAD_LEN, {}
+      for i = 0, G.INST_PADNAME_PAD_LEN - 1 do
+        local ch = math.floor(reaper.gmem_read(base + i) or 0)
+        if ch <= 0 then break end
+        t[#t + 1] = (ch >= 32 and ch <= 126) and string.char(ch) or "?"
+      end
+      got[b * G.NUM_PADS + pad] = table.concat(t)
+    end
+    if math.floor(reaper.gmem_read(G.GS_INST_BANK_CUR + slot) or 0) == b then
+      for k, v in pairs(got) do c[k] = v end
+    end
   end
-  return table.concat(t)
+  c.bank = b
+end
+
+-- A slot's (0..63) name -- "" for a pad with none -- or nil while its bank has not been on screen since the
+-- bridge started: not known, which is not the same as empty (a caption built from it is not one to rename to).
+function ciw.name(slot, o)
+  local c = ciw.pn[slot]
+  return c and c[o]
+end
+
+-- The pair slot `o` rides under Wired (OUT_WPAIR, published as pair + 1), or nil
+-- from a Swing that does not publish it (OUT_GEN 0, or a build before step 5's
+-- picker): the caller falls back to bank A's pad = its pair, what every older
+-- Swing routed.
+function ciw.wpair(slot, o)
+  local G = core.GMEM
+  local band = G.GS_STRIP_BASE + slot * G.GS_STRIP_STRIDE
+  if math.floor(reaper.gmem_read(band + G.GS_STRIP_OFF_OUT_GEN) or 0) == 0 then return nil end
+  local w = math.floor(reaper.gmem_read(band + G.GS_STRIP_OFF_OUT_WPAIR + o) or 0)
+  return (w > 0) and (w - 1) or nil
+end
+
+-- Swing's whole output block for one instance, or nil (an older Swing, or every try
+-- met a block being written): OUT_GEN is odd while Swing writes, even once whole,
+-- and a read is kept only on the same even value before and after (the kit
+-- bridge's eon_out_use). { pair[o], wpair[o] (nil unpublished), own[p] = the
+-- owner slot of split pair p, bank[b] = bank b's name (1..3 = B..D) }.
+function ciw.read_out(slot)
+  local G = core.GMEM
+  local band = G.GS_STRIP_BASE + slot * G.GS_STRIP_STRIDE
+  for _ = 1, 5 do
+    local g0 = math.floor(reaper.gmem_read(band + G.GS_STRIP_OFF_OUT_GEN) or 0)
+    if g0 == 0 then return nil end
+    if g0 % 2 == 0 then
+      local u = { pair = {}, wpair = {}, own = {}, bank = {} }
+      for o = 0, 63 do
+        u.pair[o] = math.floor(reaper.gmem_read(band + G.GS_STRIP_OFF_OUT_PAIR + o) or 0)
+        local w = math.floor(reaper.gmem_read(band + G.GS_STRIP_OFF_OUT_WPAIR + o) or 0)
+        u.wpair[o] = (w > 0) and (w - 1) or nil
+      end
+      for p = 22, 31 do
+        local w = math.floor(reaper.gmem_read(band + G.GS_STRIP_OFF_OUT_OWN + p - 22) or 0)
+        u.own[p] = (w > 0) and (w - 1) or nil
+      end
+      for bk = 1, 3 do
+        local t, base = {}, band + G.GS_STRIP_OFF_BKNAME + (bk - 1) * G.GS_STRIP_BKNAME_LEN
+        for j = 0, G.GS_STRIP_BKNAME_LEN - 1 do
+          local ch = math.floor(reaper.gmem_read(base + j) or 0)
+          if ch <= 0 or ch > 255 then break end
+          t[#t + 1] = string.char(ch)
+        end
+        u.bank[bk] = table.concat(t)
+      end
+      if math.floor(reaper.gmem_read(band + G.GS_STRIP_OFF_OUT_GEN) or 0) == g0 then return u end
+    end
+  end
+  return nil
+end
+
+-- Pair p's caption for instance `slot` -- what its container is called (rk_lua_
+-- fxpicker's pair_caption: "Kick (pad 1)", "Bank B: Toms", "C3: Snare") -- and the
+-- `name` the library's container calls take for it: bank A's pad name (the library
+-- adds " (pad N)"), a bank or split pair's whole caption. `u` = ciw.read_out's
+-- block when the caller has one. Third value: whether everything the caption
+-- is built from is KNOWN -- the pad's name cached, the block read, a split pair's
+-- owner and its name -- so a container is renamed only to a real caption. On a
+-- bridge start no name is cached yet, and "C3: Snare" was renamed to the bare
+-- "C3" (review 2026-10-12; the kit bridge's eon_out_follow has the same rule).
+function ciw.caption(slot, p, u)
+  if p < 16 then
+    local nm = ciw.name(slot, p)
+    return fx.pair_caption(p, nm or ""), nm or "", nm ~= nil
+  end
+  u = u or ciw.read_out(slot)
+  if p < 22 then
+    local cap = fx.pair_caption(p, u and u.bank[p - 18] or "")
+    return cap, cap, u ~= nil
+  end
+  local o = u and u.own[p]
+  local nm = o and ciw.name(slot, o)
+  local cap = fx.pair_caption(p, nm or "", o)
+  return cap, cap, o ~= nil and nm ~= nil
 end
 
 -- A pad AIM -> the target it means on THIS tick. The console's insert slots and
@@ -679,11 +794,39 @@ end
 -- -1 = the master/bus strip. A pad with NO track (stereo) is a VIEW of Swing's
 -- own track: its Wired slice, pinned to the pad's pair (fx.view) -- the
 -- publisher stashes that track as pads.swing_tr.
-local function pad_target(slot, pad)
+-- The pair a slot plays on, from Swing's strip band (OUT_PAIR, Pad Banks Outputs step 3); nil from a Swing that
+-- does not publish it (OUT_GEN 0).
+local function ci_slot_pair(slot, s)
+  local G = core.GMEM
+  local band = G.GS_STRIP_BASE + slot * G.GS_STRIP_STRIDE
+  if math.floor(reaper.gmem_read(band + G.GS_STRIP_OFF_OUT_GEN) or 0) == 0 then return nil end
+  return math.floor(reaper.gmem_read(band + G.GS_STRIP_OFF_OUT_PAIR + s) or 0)
+end
+-- kind (TGT_KIND, written with the aim): 0 = `pad` is one of bank A's sixteen output tracks (what older faces' console
+-- strips send); 1 = a SLOT 0..63 (Swing's FX tab following the selected pad, and since step 5 a console strip, as
+-- its slot on the bank on screen): the track it plays through now -- its pad track, a bank's track or its own split
+-- track (step 3) -- or in stereo the Wired container of the pair it rides (step 5: a bank B-D pad's bank pair, a
+-- split pad's own pair). The target's `pad` is then that PAIR, the view's key; `aim` stays the slot.
+local function pad_target(slot, pad, kind)
   local pads = ci_pads[slot]
   if not pads then return nil end
   if pad < 0 then
     return pads.master and { tr = pads.master, pad = pads.master_pad, aim = pad } or nil
+  end
+  if kind == 1 then
+    -- The order the console publisher draws a strip in -- ONE resolver: the slot's own output track first (multi-
+    -- out, or a multi-out kit with tracks deleted, which counts as stereo with some tracks left), else the Wired
+    -- container of the pair it rides. Wired first drew one chain and acted on another there (review 2026-10-12).
+    local p = ci_slot_pair(slot, pad)
+    if p == nil and pad < 16 then p = pad end
+    local tr = p and (p < 16 and pads[p] or pads.pair[p])
+    if tr then return { tr = tr, aim = pad, kind = 1 } end
+    if pads.swing_tr then
+      local wp = ciw.wpair(slot, pad)
+      if wp == nil and pad < 16 then wp = pad end   -- an older Swing: bank A's pad on its own pair
+      return wp and { tr = pads.swing_tr, pad = wp, aim = pad, kind = 1 } or nil
+    end
+    return nil
   end
   if pads[pad] then return { tr = pads[pad], aim = pad } end
   if pads.swing_tr then return { tr = pads.swing_tr, pad = pad, aim = pad } end
@@ -696,14 +839,14 @@ end
 -- out-rank it. The pin only displaces the last-touched fallback, which is the
 -- drift it exists to stop.
 local function resolve_target(slot)
-  -- A target is { tr = MediaTrack, pad = nil | 0..15 | -1 }: nil = the whole
-  -- track; a pad = that pad's Wired slice of Swing's own track (fx.view);
+  -- A target is { tr = MediaTrack, pad = nil | a pair | -1 }: nil = the whole
+  -- track; a pair (0..15, 19..31) = its Wired slice of Swing's own track (fx.view);
   -- -1 = the master slice of it. The last-touched fallback is a whole track.
   -- An AIMED target also carries aim = the pad it names and is re-resolved
   -- here on every call, so it follows that pad to whatever track holds it
   -- now. When this tick cannot resolve it, the last answer stands.
   local a = ci_tgt[slot]
-  if a and a.aim ~= nil then ci_tgt[slot] = pad_target(slot, a.aim) or a end
+  if a and a.aim ~= nil then ci_tgt[slot] = pad_target(slot, a.aim, a.kind) or a end
   local t = ci_tgt[slot] or ci_pin[slot]
   local tr, pad
   if t then tr, pad = t.tr, t.pad else tr = reaper.GetLastTouchedTrack() end
@@ -811,8 +954,13 @@ end
 local function chain_save_prompt(tr, pad, v, slot)
   if eon_dlg and eon_dlg.busy and eon_dlg.busy() then return end
   local folder = ch_rel[slot] or ""
-  -- A default worth keeping: the pad's own name in a pad view, else the track's.
-  local def = (pad ~= nil and pad >= 0) and ci_pad_name(slot, pad) or ""
+  -- A default worth keeping: the pad's own name in a pad view (a bank's or a split
+  -- pad's caption in theirs), else the track's.
+  local def = ""
+  if pad ~= nil and pad >= 0 then
+    local cap, nm = ciw.caption(slot, pad)
+    def = (pad < 16) and nm or cap
+  end
   if def == "" and reaper.GetTrackName then
     local _, tn = reaper.GetTrackName(tr)
     def = tn or ""
@@ -837,8 +985,9 @@ local function do_action(slot, verb, a, bnum)
   -- the one on screen is not a wrong result, it is an invisible one.
   local tr, pad = resolve_target(slot)
   if not tr then return end
-  -- A PAD VIEW (Wired, stereo): the target is one pad's slice of Swing's own
-  -- track and every index the face sends is a slot IN THAT SLICE. Map it to
+  -- A PAD VIEW (Wired, stereo): the target is one pair's slice of Swing's own
+  -- track (a pad's, a bank's, a split pad's) and every index the face sends is
+  -- a slot IN THAT SLICE. Map it to
   -- the chain index here, once, so no verb below can reach the wrong plugin.
   -- (pad == -1 is the master slice; nil is a whole track, unmapped.)
   local v = (pad ~= nil) and fx.view(tr, pad) or nil
@@ -880,7 +1029,7 @@ local function do_action(slot, verb, a, bnum)
       -- send this for a folder row; refusing again here means a stray
       -- action from anywhere cannot wipe a chain with a directory name.
       if row and row.kindix == K_CHAIN then
-        if v then fx.view_chain_apply(tr, pad, row.rel, "replace", pad >= 0 and ci_pad_name(slot, pad) or nil)
+        if v then fx.view_chain_apply(tr, pad, row.rel, "replace", pad >= 0 and select(2, ciw.caption(slot, pad)) or nil)
         else fx.chain_apply(tr, row.rel, "replace") end
         ch_fp[slot] = nil          -- the chain definitely moved
       end
@@ -895,18 +1044,18 @@ local function do_action(slot, verb, a, bnum)
     if ai < 0 then return end
     -- The picker engine reads offline but has never written it; one call
     -- rather than a new engine function, since nothing else needs it yet.
-    local ch = fx.chain(tr)
-    local e = ch[ai + 1]
-    if e and reaper.TrackFX_SetOffline then
-      reaper.TrackFX_SetOffline(tr, ai, not e.offline)
+    -- The state of the INDEX itself: a Wired insert is a child of its pair's
+    -- container (an encoded index), and fx.chain lists the top level only --
+    -- looked up there, Offline toggled nothing on any of them (2026-10-12).
+    if reaper.TrackFX_GetOffline and reaper.TrackFX_SetOffline then
+      reaper.TrackFX_SetOffline(tr, ai, not reaper.TrackFX_GetOffline(tr, ai))
     end
     return
   end
   if verb == A_ENABLE then
     if ai < 0 then return end
-    local ch = fx.chain(tr)
-    local e = ch[ai + 1]
-    if e then fx.set_enabled(tr, ai, not e.enabled) end
+    -- The index itself, as for Offline above (a container child is not in fx.chain).
+    fx.set_enabled(tr, ai, not reaper.TrackFX_GetEnabled(tr, ai))
   elseif verb == A_REMOVE then
     if ai < 0 then return end
     fx.remove(tr, ai)
@@ -937,9 +1086,9 @@ local function do_action(slot, verb, a, bnum)
     if verb == A_SWAP and a >= 0 then
       if v then fx.view_swap(tr, pad, a, add) else fx.swap(tr, a, add) end
     else
-      -- The pad's name goes along: on REAPER 7 the first insert on a pad makes
-      -- its container, named "KICK (pad 1)" from Swing's published pad names.
-      if v then fx.view_insert(tr, pad, add, (a >= 0) and a or nil, pad >= 0 and ci_pad_name(slot, pad) or nil)
+      -- The name goes along: on REAPER 7 the first insert on a pair makes its
+      -- container, "KICK (pad 1)", "Bank B: Toms" or "C3: Snare" (ciw.caption).
+      if v then fx.view_insert(tr, pad, add, (a >= 0) and a or nil, pad >= 0 and select(2, ciw.caption(slot, pad)) or nil)
       else fx.insert(tr, add, a >= 0 and a + 1 or nil) end
     end
   end
@@ -957,11 +1106,34 @@ end
 -- underneath us, and a stale pointer would have the picker quietly editing a
 -- track that no longer exists.
 local TGT_SEQ, TGT_PAD, TGT_SLOT = 142, 143, 144
+local TGT_KIND = 57   -- what TGT_PAD names: 0 a console strip, 1 a slot (Swing's FXP_TGT_KIND, Outputs step 3)
 -- ⚠️ TGT_PIN and ci_pin USED TO BE DECLARED HERE. Re-declaring them below
 -- do_action did not just hide them from it -- a second `local` of the same
 -- name is a DIFFERENT table, so even after do_action was taught to read the
 -- pin it would have read the empty first one forever while this half wrote
 -- the second. They now live once, up beside ci_tgt.
+
+-- A trace of what an aim resolved to, GATED (ExtState EON_FXPICK/trace = "1": the rigs set it; a customer never
+-- sees it): slot, the aim's words, the strip band's output block for the aimed slot and the target it became.
+-- Appended to <resource>/Data/EON_Swing/fxpick_trace.txt (2026-10-22, EON_Probe_PadPick: an aim at pad 3 named pad 1).
+local function tgt_trace(slot, pad, kind, t)
+  if reaper.GetExtState("EON_FXPICK", "trace") ~= "1" then return end
+  local G = core.GMEM
+  local band = G.GS_STRIP_BASE + slot * G.GS_STRIP_STRIDE
+  local gen = math.floor(reaper.gmem_read(band + G.GS_STRIP_OFF_OUT_GEN) or 0)
+  local op = pad >= 0 and math.floor(reaper.gmem_read(band + G.GS_STRIP_OFF_OUT_PAIR + pad) or 0) or -1
+  local ow = pad >= 0 and math.floor(reaper.gmem_read(band + G.GS_STRIP_OFF_OUT_WPAIR + pad) or 0) or -1
+  local pads = ci_pads[slot]
+  local dir = reaper.GetResourcePath() .. "/Data/EON_Swing"
+  reaper.RecursiveCreateDirectory(dir, 0)
+  local f = io.open(dir .. "/fxpick_trace.txt", "a")
+  if not f then return end
+  f:write(("%s slot=%d aim pad=%d kind=%d | gen=%d out_pair=%d out_wpair=%d | pads=%s swing_tr=%s pads[0]=%s pair0=%s | -> pad=%s aim=%s kind=%s tr=%s\n"):format(
+    os.date("%H:%M:%S"), slot, pad, kind, gen, op, ow, tostring(pads ~= nil), tostring(pads and pads.swing_tr ~= nil),
+    tostring(pads and pads[0] ~= nil), tostring(pads and pads.pair and pads.pair[0] ~= nil),
+    tostring(t and t.pad), tostring(t and t.aim), tostring(t and t.kind), tostring(t and t.tr ~= nil)))
+  f:close()
+end
 
 local function consume_target(slot)
   local b = BASE + slot * STRIDE
@@ -975,7 +1147,9 @@ local function consume_target(slot)
   -- ago is not in ci_pads until the next publish (<= 0.5 s). Dropping it left
   -- REAPER's last-touched track on screen until something aimed again, and the
   -- FX tab never re-aims at a pad it already asked for. resolve_target retries.
-  ci_tgt[slot] = pad_target(slot, pad) or { aim = pad }
+  local kind = math.floor(reaper.gmem_read(b + TGT_KIND) or 0)
+  ci_tgt[slot] = pad_target(slot, pad, kind) or { aim = pad, kind = kind }
+  tgt_trace(slot, pad, kind, ci_tgt[slot])
   local sel = math.floor(reaper.gmem_read(b + TGT_SLOT) or -1)
   reaper.gmem_write(b + CH_SEL, sel)
   ch_fp[slot] = nil            -- force a republish for the new target
@@ -1040,11 +1214,11 @@ local function publish_chain(slot)
     if pad ~= nil then ch, v = fx.chain_view(tr, pad) else ch = fx.chain(tr) end
   end
   -- A view is named for what it is, so the chain column says WHOSE inserts
-  -- these are: "KICK (pad 1)", not the name of the track they all share.
+  -- these are: "KICK (pad 1)", "Bank B: Toms" (every bank B pad on its bank's
+  -- pair), "C3: Snare" -- not the name of the track they all share.
   if v then
     if pad >= 0 then
-      local pn = ci_pad_name(slot, pad)
-      tname = ascii_fold((pn ~= "" and pn or "Pad") .. " (pad " .. (pad + 1) .. ")")
+      tname = ascii_fold((ciw.caption(slot, pad)))
     else
       tname = ascii_fold(tname .. " (master)")
     end
@@ -1113,8 +1287,12 @@ local CI_HASH = 105   -- card-name hash per slot, over the FULL name
 -- Bump BOTH this and CI_FMT_VER in the .jsfx whenever the record moves, so a
 -- face talking to a not-yet-restarted bridge says so instead of drawing the
 -- old shape read as the new one.
-local CI_FMT, CI_FMT_VER = 3, 2
--- 17 records: pads 0..15, then the MASTER as record 16. It used to ride in the
+local CI_FMT, CI_FMT_VER = 3, 3
+-- CI_BANK (header word 4, step 5): the bank on screen the sixteen strip records
+-- were built for -- record i is strip i of that bank (its slot's track, or its
+-- slot's Wired container). Version 3 = records keyed by the bank on screen.
+local CI_BANK = 4
+-- 17 records: the sixteen STRIPS, then the MASTER as record 16. It used to ride in the
 -- header's spare words; with names the records are big enough that it is
 -- simpler, and one less special case, for the master to just BE a record --
 -- the same publish loop and the same draw call handle it.
@@ -1124,11 +1302,7 @@ local REG_BASE, REG_STRIDE, REG_MAX, REG_TIMEOUT = 2556, 4, 16, 3.0
 local ci_fp = {}
 
 local function ci_is_swing(tr, fx)
-  local ok, ident = reaper.TrackFX_GetNamedConfigParm(tr, fx, "fx_ident")
-  if ok and ident and ident:find("DrumKit_ReaKit") then return true end
-  local _, fname = reaper.TrackFX_GetFXName(tr, fx, "")
-  if fname and fname:find("DrumKit_ReaKit") then return true end
-  return fname and (fname:match("^JS: Swing") or fname:match("Swing %— 16%-Pad")) and true or false
+  return core.is_swing_fx(tr, fx)   -- the plugin's file, never its shown name (the bridge's rule)
 end
 
 local function ci_slot_of(iid)
@@ -1205,27 +1379,26 @@ local function publish_console_inserts()
           if slot and not seen[slot] then
             seen[slot] = true
             -- Pad tracks are the Swing track's SENDS: source channel pair ->
-            -- pad index. Same mapping the kit bridge colours lanes by.
-            local pads, nsend = {}, reaper.GetTrackNumSends(tr, 0)
+            -- pad index. Same mapping the kit bridge colours lanes by -- and
+            -- since Outputs step 3 the same OWNER test (core.swing_send_pair):
+            -- a send whose destination is not one of Swing's own output tracks
+            -- is no pad's (a user's bus fed from channels 1-2 took pad 1's
+            -- console strip, the LAST send winning). pads.pair[p] = the bank
+            -- and split-pad tracks (pairs 19..31), for the FX tab's slot aims.
+            local pads, nsend = { pair = {} }, reaper.GetTrackNumSends(tr, 0)
             local no_sws = false
             for s = 0, nsend - 1 do
-              local sc = reaper.GetTrackSendInfo_Value(tr, 0, s, "I_SRCCHAN")
-              local pad = -1
-              if sc then
-                sc = math.floor(sc)
-                local c = sc >= 0 and (sc % 1024) or -1
-                if c >= 0 and c % 2 == 0 then pad = c / 2 end
-              end
               -- ⚠️ BR_GetMediaTrackSendInfo_Track is SWS. Without it this
               -- resolved NOTHING and every pad published as "owns no
               -- track" -- indistinguishable from a project that simply is
               -- not in multi-out, with no error anywhere.
-              if pad >= 0 and pad < 16 then
-                if reaper.BR_GetMediaTrackSendInfo_Track then
-                  pads[pad] = reaper.BR_GetMediaTrackSendInfo_Track(tr, 0, s, 1)
-                else
-                  no_sws = true
-                end
+              if reaper.BR_GetMediaTrackSendInfo_Track then
+                local p, dest = core.swing_send_pair(tr, s)
+                if p >= 0 and p < 16 then pads[p] = pads[p] or dest
+                elseif p >= 16 then pads.pair[p] = pads.pair[p] or dest end
+              else
+                local c = core.srcchan_pad(reaper.GetTrackSendInfo_Value(tr, 0, s, "I_SRCCHAN"))
+                if c >= 0 and c < 16 then no_sws = true end
               end
             end
 
@@ -1254,24 +1427,45 @@ local function publish_console_inserts()
             -- gmem when something actually changed. Sixteen chains re-read per
             -- tick is fine; sixteen chains re-WRITTEN per tick would make the
             -- face's seq-gate fire every frame for no reason.
-            local rec, fpp = {}, {}
+            -- Step 5: record i is STRIP i of the bank on screen (CI_BANK), i.e.
+            -- slot bank*16 + i: the track its pair plays on in multi-out (bank
+            -- A's pad, its bank's, its split track), the Wired container of the
+            -- pair it rides in stereo. Bank A's strips by position, as before.
+            ciw.names_tick(slot)
+            local u = ciw.read_out(slot)
+            local bank = math.floor(reaper.gmem_read(core.GMEM.GS_INST_BANK_CUR + slot) or 0)
+            if bank < 0 or bank > 3 then bank = 0 end
+            local rec, fpp = {}, { "B:" .. bank }
             for pad = 0, 15 do
-              local ptr = pads[pad]
+              local o = bank * 16 + pad
+              local p = u and u.pair[o]
+              if p == nil and o < 16 then p = o end      -- an older Swing: bank A by position
+              local ptr = p and ((p < 16) and pads[p] or pads.pair[p])
+              local wp = u and u.wpair[o]
+              if wp == nil and o < 16 then wp = o end
               if ptr then
                 local w, n, nm, hs = ci_pad_words(ptr)
                 rec[pad] = { n = n, w = w, nm = nm, hs = hs }
-                fpp[#fpp + 1] = pad .. ":" .. n .. ":" .. table.concat(w, ",")
+                fpp[#fpp + 1] = pad .. ">" .. p .. ":" .. n .. ":" .. table.concat(w, ",")
                                     .. ":" .. table.concat(nm, ",")
-              elseif stereo then
-                -- A pad container follows the pad's name (renamed pads, kit loads).
-                fx.name_pad_container(tr, pad, ci_pad_name(slot, pad))
-                local w, n, nm, hs = ci_words(tr, (fx.chain_view(tr, pad)))
+              elseif stereo and wp then
+                local w, n, nm, hs = ci_words(tr, (fx.chain_view(tr, wp)))
                 rec[pad] = { n = n, w = w, nm = nm, hs = hs }
-                fpp[#fpp + 1] = pad .. ":" .. n .. ":" .. table.concat(w, ",")
+                fpp[#fpp + 1] = pad .. "=" .. wp .. ":" .. n .. ":" .. table.concat(w, ",")
                                     .. ":" .. table.concat(nm, ",")
               else
                 rec[pad] = { n = -1, w = {}, nm = {}, hs = {} }
                 fpp[#fpp + 1] = pad .. ":-1"
+              end
+            end
+            -- Every pair container on Swing's track follows its name -- a pad's,
+            -- a bank's, a split pad's owner (renamed pads, kit loads, a new owner);
+            -- one pass finds them all, whichever bank is on screen. A split pair
+            -- with no known owner keeps the name it has.
+            if stereo then
+              for p, c in pairs(fx.pair_containers(tr)) do
+                local _, nm, known = ciw.caption(slot, p, u)
+                if known then fx.name_pad_container(tr, p, nm, c) end
               end
             end
 
@@ -1286,6 +1480,12 @@ local function publish_console_inserts()
             local mtr, mrec
             for pad = 0, 15 do
               if pads[pad] then mtr = reaper.GetParentTrack(pads[pad]) break end
+            end
+            -- Since Outputs step 2 bank A's pads sit in a "Bank A" folder; the
+            -- desk's master is the folder over every bank (Audio), as before.
+            if mtr then
+              local _, bf = reaper.GetSetMediaTrackInfo_String(mtr, "P_EXT:EON_BANK_FOLDER", "", false)
+              if bf == "A" then mtr = reaper.GetParentTrack(mtr) or mtr end
             end
             if mtr then
               pads.master, pads.master_pad = mtr, nil
@@ -1334,6 +1534,7 @@ local function publish_console_inserts()
               reaper.gmem_write(b + CI_SEQ, seq - 1)     -- ODD: mid-write
               reaper.gmem_write(b + CI_FMT, CI_FMT_VER)
               reaper.gmem_write(b + CI_FLAGS, flags)
+              reaper.gmem_write(b + CI_BANK, bank)
               -- One loop for all 17. The master stopped being a special
               -- case the moment it became a record like any other.
               for ri = 0, CI_RECS - 1 do
@@ -1385,6 +1586,12 @@ local function tick()
   -- pad chain, which is far too much to do per defer tick. Twice a second is
   -- faster than anyone can insert a plugin and notice the lag.
   local tnow = reaper.time_precise()
+  -- A bank switch re-keys that console's strips (CI_BANK): publish now, not
+  -- within the half second -- the face draws no inserts until the records match.
+  for s in pairs(ci_pads) do
+    local bk = math.floor(reaper.gmem_read(core.GMEM.GS_INST_BANK_CUR + s) or 0)
+    if bk ~= ciw.bank_seen[s] then ciw.bank_seen[s] = bk; ci_last = 0 end
+  end
   if tnow - (ci_last or 0) >= 0.5 then
     ci_last = tnow
     local cok, cerr = pcall(publish_console_inserts)
@@ -1461,6 +1668,10 @@ end
 -- the same helper rides in every EON self-registering script.
 function eon_write_startup(path, content)
   local tmp, prev = path .. ".eon-tmp", path .. ".eon-prev"
+  -- A stranded original goes back first (see eon_recover_startup). If it
+  -- cannot, nothing below may run: the os.remove(prev) further down would eat
+  -- the only copy of the shared file.
+  if not eon_recover_startup(path) then return false end
   -- A read-only __startup.lua is the user's call. Windows would still let the
   -- renames below replace it -- and strand a read-only .eon-prev that blocks
   -- every later rewrite -- so refuse up front.
@@ -1485,6 +1696,35 @@ function eon_write_startup(path, content)
   if had_old then os.rename(prev, path) end
   os.remove(tmp)
   return false
+end
+
+-- ⚠ A rewrite that fails half-way leaves __startup.lua GONE and the original
+-- in .eon-prev: the new file could not take the old one's place AND the old
+-- one could not step back (an antivirus hold on both the fresh tmp and the
+-- just-renamed .eon-prev -- the same hold the 2026-09-07 fix met on one side).
+-- Nothing runs at the next launch to notice, and the writer's first act on
+-- the retry used to be os.remove(prev): every vendor's startup lines gone,
+-- then a file written holding only our block. So the writer and every
+-- self_register put a stranded original back before reading or writing, and
+-- a .eon-prev is only ever removed while the real file exists. Returns false
+-- when a stranded original is there and could not be put back, or when
+-- __startup.lua is there but cannot be read. Global, identical in all five
+-- self-registering scripts.
+function eon_recover_startup(path)
+  local f, _, ocode = io.open(path, "r")
+  if f then f:close() return true end
+  -- Present but unreadable (a lock, a permission) is not absent: nothing is
+  -- put back over it. On macOS / Linux rename REPLACES an existing file, so a
+  -- stale .eon-prev overwrote the current one (outside audit 2026-10-02; on
+  -- Windows the rename failed). ENOENT (2) is the one open failure that means
+  -- there is no file.
+  if ocode ~= 2 then return false end
+  -- No file. Put a stepped-aside original back. rename needs no read access,
+  -- so an unreadable-but-present .eon-prev is never mistaken for absent
+  -- (Codex 2026-09-23); ENOENT (2) is the one failure that means there is
+  -- nothing to recover.
+  local ok, _, code = os.rename(path .. ".eon-prev", path)
+  return (ok or code == 2) and true or false
 end
 
 -- ⭐ Strip one script's block from __startup.lua text, in WHOLE LINES. The file is
@@ -1537,6 +1777,9 @@ end
 function eon_startup_selfclean_src(name, section, key)
   return
     "  local p=reaper.GetResourcePath()..\"/Scripts/__startup.lua\"\n" ..
+    -- a stranded .eon-prev (an earlier replacement that failed both ways) goes back first, only while the real
+    -- file is absent: the writer's own recovery rule (outside audit 3, 2026-10-05)
+    "  do local pb=io.open(p..'.eon-prev','r'); if pb then pb:close(); local pf=io.open(p,'r'); if pf then pf:close() else os.rename(p..'.eon-prev',p) end end end\n" ..
     "  local f=io.open(p,'r'); local c=f and f:read('*a'); if f then f:close() end\n" ..
     "  local w=c and io.open(p,'a'); if w then w:close()\n" ..
     -- Markers assembled at run time: the literal "-- EON:<name> END" must never appear
@@ -1557,7 +1800,9 @@ function eon_startup_selfclean_src(name, section, key)
     "    if fw then ok=fw:write(c) and true or false; if not fw:close() then ok=false end end\n" ..
     "    if ok then os.remove(b); local h=os.rename(p,b); if os.rename(t,p) then os.remove(b) elseif h then os.rename(b,p) end end\n" ..
     "    os.remove(t) end\n" ..
-    "  reaper.SetExtState('" .. section .. "','" .. key .. "','',true)\n"
+    -- the flag is cleared only while the start-up file is there; a replacement that failed both ways keeps it, so
+    -- the next launch tries again (the original waits in .eon-prev)
+    "  do local pf=io.open(p,'r'); if pf then pf:close(); reaper.SetExtState('" .. section .. "','" .. key .. "','',true) end end\n"
 end
 
 local function fxpick_self_register()
@@ -1567,8 +1812,15 @@ local function fxpick_self_register()
   if reaper.GetExtState("EON_Bridge", "no_self_register") == "1" then return end
   local _, script_path = reaper.get_action_context()
   local NAME = "EON_FXPicker_Bridge"
-  local key = NAME .. "_registered_v4"
+  local key = NAME .. "_registered_v5"   -- v5 (2026-10-14): the block checks the script file (every install re-registers once)
   local marker = "-- EON:" .. NAME
+  -- A rewrite that failed half-way may have left the file stepped aside as
+  -- .eon-prev; put it back before anything below reads it. If it cannot be put
+  -- back, do NOTHING this run: registering anyway would read an empty file
+  -- and, once the hold lifts, the writer's own recovery would restore the
+  -- original only for the write to replace it with a file holding just our
+  -- block (Codex 2026-09-23). The next run retries.
+  if not eon_recover_startup(reaper.GetResourcePath() .. "/Scripts/__startup.lua") then return end
 
   -- Trust ExtState only when __startup.lua actually still contains our block:
   -- an uninstall step can delete that file without clearing the ExtState, and
@@ -1601,13 +1853,16 @@ local function fxpick_self_register()
     and ('reaper.NamedCommandLookup("_' .. named_id .. '")')
     or tostring(cmd_id)
 
-  -- Self-cleaning: when the script file is gone the lookup returns 0, and the
-  -- block removes itself and clears the ExtState so a reinstall registers
-  -- fresh. Runs at most once per uninstall.
+  -- Self-cleaning: when the action is gone (a ReaPack uninstall: the lookup
+  -- returns 0) or the script file is gone while the action stays (a folder
+  -- deleted by hand, 2026-10-14), the block removes itself and clears the
+  -- ExtState so a reinstall registers fresh. Runs at most once. %q: a ]] in
+  -- the path would end a long bracket.
   local block =
     "\n" .. marker .. " BEGIN\n" ..
     "do local id=" .. cmd_token .. "\n" ..
-    "if id~=0 then reaper.Main_OnCommand(id,0) else\n" ..
+    string.format("local sf=io.open(%q,'r'); if sf then sf:close() end\n", script_path) ..
+    "if id~=0 and sf then reaper.Main_OnCommand(id,0) else\n" ..
     eon_startup_selfclean_src(NAME, NAME, key) ..
     "end end\n" ..
     marker .. " END\n"

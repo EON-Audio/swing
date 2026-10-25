@@ -25,7 +25,8 @@
 // A-5 the Wired pad pairs).
 //
 // swing_xf_len(len_s): the crossfade length in samples for a nominal len_s
-//   seconds. Under Wired (patch_live) every pad leaves on channels 2..33 and
+//   seconds. Under Wired (patch_live) every pad leaves on channels 2..33 (bank A)
+//   or 38..63 (the bank and split pairs, Outputs step 5) and
 //   comes back through the Patchbay ring ONE BLOCK later, so the blend is
 //   lengthened by a block: the pair's step still lands inside it when it
 //   returns (A-5). samplesblock is the host's block size, valid in every section.
@@ -182,7 +183,7 @@ function recalc_pad(i) (
   p_rel_c[i]  = exp(-5.0 / max(1, p_release[i] * 0.001 * srate));
   p_panL[i] = 1.0 - max(0.0, p_pan[i]);
   p_panR[i] = 1.0 + min(0.0, p_pan[i]);
-  !p_note_lock[i] ? p_note[i] = root_note + i;
+  !p_note_lock[i] ? p_note[i] = min(127, root_note + i);   // step 4d: root + slot passes 127 in bank D for a root above 64
 );
 
 // ─── Per-pad compressor coefficient recalc ───────────────────────────────
@@ -485,7 +486,7 @@ function undo_unpack(src, pad) local(k, off, _fb, l) (
   k = 0;
   loop(UDO_NS,
     _fb = udo_fs[k];
-    _fb[pad] = src[k];
+    k == UDO_K_OUT && _udo_skip_out ? 0 : ( _fb[pad] = src[k]; );   // the output choice is REAPER's undo's (UDO_K_OUT)
     k += 1;
   );
   off = UDO_NS;
@@ -507,7 +508,7 @@ function undo_unpack(src, pad) local(k, off, _fb, l) (
 function undo_capture_baseline() local(p) (
   _udo_applying ? 0 : (
     p = 0;
-    loop(NUM_PADS,
+    loop(NUM_SLOTS,
       undo_pack(udo_base + p * UDO_STRIDE, p);
       p += 1;
     );
@@ -531,7 +532,7 @@ function undo_push_param(pad) (
 function undo_commit_gesture() local(p, pushed, k, _changed, _b) (
   pushed = 0;
   p = 0;
-  loop(NUM_PADS,
+  loop(NUM_SLOTS,
     _udo_pend[p] ? (
       _udo_pend[p] = 0;
       // Only record an undo entry if the pad's state ACTUALLY changed vs the
@@ -539,7 +540,7 @@ function undo_commit_gesture() local(p, pushed, k, _changed, _b) (
       // must not leave a no-op entry that "wastes" an undo click.
       undo_pack(udo_cmp, p);
       _b = udo_base + p * UDO_STRIDE; _changed = 0; k = 0;
-      loop(UDO_STRIDE, udo_cmp[k] != _b[k] ? _changed = 1; k += 1;);
+      loop(UDO_STRIDE, k != UDO_K_OUT && udo_cmp[k] != _b[k] ? _changed = 1; k += 1;);   // an output choice alone is no entry (UDO_K_OUT)
       _changed ? ( undo_push_param(p); pushed = 1; );
     );
     p += 1;
@@ -563,6 +564,40 @@ function undo_commit_gesture() local(p, pushed, k, _changed, _b) (
 // helper documents). udo_st_str stays reserved for a later names pass (which
 // would move get_name_slot earlier, or relocate the engine after core).
 
+// ─── The backup's copy path (banks step 2a) ─────────────────────────────────
+// The backup (udo_s2_audio) keeps the pre-banks slot layout as a VIRTUAL slot: the plain
+// sample at [0, SLOT_SIZE), layer l at [l * LAYER_SIZE, ...). The pad's regions are no
+// longer laid out that way (rk_swing_alloc), so every copy goes through the snapshot the
+// capture took of them (udo_s2_srcp / udo_s2_srcl, swing_pad_regions_copy) and
+// swing_slot_v2p_t maps each virtual cell onto the region that holds it. A load that
+// replaces a region keeps the old one live until finish (the loader's displaced list), so
+// the snapshot stays valid for as long as the op runs. Gaps -- past a short layer 0, or a
+// layer the pad does not have -- are skipped, never copied.
+// Copy virtual [udo_s2_extent, upto) into the backup, at most `budget` cells (-1 = all).
+function udo_cow_copy(upto, budget) local(_p, _e, _n) (
+  while (udo_s2_extent < upto && budget != 0) (
+    _p = swing_slot_v2p_t(udo_s2_srcp, udo_s2_srcl, udo_s2_extent);
+    _e = min(upto, swing_slot_vend_t(udo_s2_srcp, udo_s2_srcl, udo_s2_extent));
+    _p < 0 ? ( udo_s2_extent = _e; ) : (
+      _n = _e - udo_s2_extent;
+      budget > 0 ? _n = min(_n, budget);
+      memcpy(udo_s2_audio + udo_s2_extent, _p, _n);
+      udo_s2_extent += _n;
+      budget > 0 ? budget -= _n;
+    );
+  );
+);
+// Is a sliced capture of `pad` still short of its goal? (The same gate udo_cow_upto uses.)
+function udo_cow_pending(pad) (
+  _udo_cap_lazy && _udo_cap_depth > 0 && _udo_st_valid && udo_s2_type == 1 && udo_s2_pad == pad &&
+  udo_s2_extent < _udo_cap_goal;
+);
+// Finish it now, whatever it costs -- for a load about to free the regions it reads from
+// (the loader's finish and abort; the sliced phase 2 has normally drained it already).
+function udo_cow_drain(pad) (
+  udo_cow_pending(pad) ? udo_cow_copy(_udo_cap_goal, -1);
+);
+
 // Back up ONE pad's slot (audio + metadata) — the reversible record for a
 // per-pad structural op. The audio copy is addressed from the slot base (no
 // per-layer offset math, the source of the old last-pad bugs), and it runs
@@ -582,18 +617,20 @@ function undo_capture_pad(pad) local(l, _li) (
       l_len[_li] > 0 ? _udo_cap_goal = max(_udo_cap_goal, l * LAYER_SIZE + l_len[_li]);
       l += 1;
     );
-    _udo_cap_goal = max(0, min(_udo_cap_goal, SLOT_SIZE)) | 0;
+    _udo_cap_goal = max(0, min(_udo_cap_goal, UDO_VSLOT)) | 0;   // the virtual slot: four full layers since 2026-09-23
     // SLICED (2026-09-09): a caller that pumps udo_cow_upto before every write into
     // this slot saves nothing here -- each region is copied out a bounded slice at a
     // time, in the block before a writer destroys it, so the drop's first block costs
     // nothing instead of up to 32 MB. Everyone else still gets the copy up front,
     // because their writers (clear_pad's memsets, the file loader's read) trample the
     // slot without asking. udo_s2_extent is "cells saved" either way.
+    // Step 2a: snapshot the pad's regions; every copy (eager here, sliced in udo_cow_upto)
+    // reads through it, so a load that replaces a region keeps the old one live until
+    // finish and the backup still sees the original audio.
+    swing_pad_regions_copy(pad, udo_s2_srcp, udo_s2_srcl);
     _udo_cap_lazy = _udo_cap_lazy_req;
-    _udo_cap_lazy ? ( udo_s2_extent = 0; ) : (
-      udo_s2_extent = _udo_cap_goal;
-      udo_s2_extent > 0 ? memcpy(udo_s2_audio, s_audio_start + pad * SLOT_SIZE, udo_s2_extent);
-    );
+    udo_s2_extent = 0;
+    !_udo_cap_lazy ? udo_cow_copy(_udo_cap_goal, -1);
     undo_pack(udo_st_meta, pad);
     udo_s2_aud[0] = s_len[pad]; udo_s2_aud[1] = s_sr[pad]; udo_s2_aud[2] = p_layer_cnt[pad];
     l = 0; loop(MAX_LAYERS,
@@ -607,7 +644,7 @@ function undo_capture_pad(pad) local(l, _li) (
   );
   // any structural op drops the param branch + pending gestures (1-level rule)
   _udo_uc = 0; _udo_rc = 0;
-  l = 0; loop(NUM_PADS, _udo_pend[l] = 0; l += 1;);
+  l = 0; loop(NUM_SLOTS, _udo_pend[l] = 0; l += 1;);
 );
 
 // Sliced-capture barrier. "Cells [0, limit) of `pad`'s slot are about to be
@@ -630,18 +667,11 @@ function undo_capture_pad(pad) local(l, _li) (
 // barrier no live writer is asking for, and it stops a finished op's flag from
 // throttling, or half-extending, an unrelated later one.
 function udo_cow_upto(pad, limit)
-local(_g, _n)
+local(_g)
 (
   (_udo_cap_lazy && _udo_cap_depth > 0 && _udo_st_valid && udo_s2_type == 1 && udo_s2_pad == pad) ? (
     _g = min(limit, _udo_cap_goal);
-    _g > udo_s2_extent ? (
-      _n = min(_g - udo_s2_extent, _udo_cow_budget);
-      _n > 0 ? (
-        memcpy(udo_s2_audio + udo_s2_extent,
-               s_audio_start + pad * SLOT_SIZE + udo_s2_extent, _n);
-        udo_s2_extent += _n;
-      );
-    );
+    _g > udo_s2_extent ? udo_cow_copy(_g, _udo_cow_budget);   // through the snapshot (step 2a)
     udo_s2_extent >= _g ? limit : udo_s2_extent;
   ) : limit;
 );
@@ -658,7 +688,7 @@ function udo_struct_begin_swap(a, b) local(l) (
   (_udo_cap_depth == 0 && !_udo_applying) ? (
     udo_s2_type = 2; udo_s2_pad = a; udo_s2_pad2 = b; _udo_st_valid = 1;
     _udo_uc = 0; _udo_rc = 0;
-    l = 0; loop(NUM_PADS, _udo_pend[l] = 0; l += 1;);
+    l = 0; loop(NUM_SLOTS, _udo_pend[l] = 0; l += 1;);
   );
   _udo_cap_depth += 1;
 );
@@ -673,7 +703,7 @@ function udo_struct_begin_kit() local(l) (
   (_udo_cap_depth == 0 && !_udo_applying) ? (
     udo_s2_type = 3; _udo_st_valid = 0;   // PARKED: not undoable (was 1)
     _udo_uc = 0; _udo_rc = 0;
-    l = 0; loop(NUM_PADS, _udo_pend[l] = 0; l += 1;);
+    l = 0; loop(NUM_SLOTS, _udo_pend[l] = 0; l += 1;);
   );
   _udo_cap_depth += 1;
 );
@@ -681,7 +711,7 @@ function udo_struct_begin_kit() local(l) (
 // Restore the structural undo entry (scoped). Dispatches by type:
 //   per-pad → restore just that pad's slot + metadata (no collateral)
 //   swap    → re-swap (self-inverse; capture suppressed via _udo_applying)
-function undo_restore_struct() local(pad, l, _li) (
+function undo_restore_struct() local(pad, l, _li, _fit, _v, _p, _e) (
   _udo_st_valid ? (
     udo_s2_type == 1 ? (
       _udo_applying = 1;
@@ -702,7 +732,27 @@ function undo_restore_struct() local(pad, l, _li) (
       // whole used extent. Sliced: the prefix a writer had reached -- everything above
       // it was never written, so the slot still holds the original there. Beyond both,
       // the restored s_len / l_len leave the tail unread.
-      udo_s2_extent > 0 ? memcpy(s_audio_start + pad * SLOT_SIZE, udo_s2_audio, udo_s2_extent);
+      // Step 2a: give the pad regions that hold the restored lengths -- in place when they
+      // never shrank, which is the rule; an allocation when a drop freed this pad's layers --
+      // then copy the virtual backup into them, region by region, skipping the gaps.
+      alc_hold = 1;   // the compaction tick stands still while this copies unlocked
+      _fit = swing_pad_fit_restore(pad);
+      (!_fit && alc_wait) ? (
+        // the room exists but is fragmented: pack now, on this thread, and try once more
+        alc_hold = 0; swing_alloc_compact_sync(1.0); alc_hold = 1;
+        _fit = swing_pad_fit_restore(pad);
+      );
+      !_fit ? swing_pad_regions_trim_missing(pad);
+      swing_pad_regions_copy(pad, udo_s2_srcp, udo_s2_srcl);
+      _v = 0;
+      while (_v < udo_s2_extent) (
+        _p = swing_slot_v2p_t(udo_s2_srcp, udo_s2_srcl, _v);
+        _e = min(udo_s2_extent, swing_slot_vend_t(udo_s2_srcp, udo_s2_srcl, _v));
+        _p >= 0 ? memcpy(_p, udo_s2_audio + _v, _e - _v);
+        _v = _e;
+      );
+      !_fit ? swing_alloc_refuse_note(pad);   // a region could not be taken back: told on the LCD
+      alc_hold = 0;
       _udo_cap_lazy = 0;   // entry consumed: stop throttling any writer still in flight
       sp_src_gen[pad] += 1;       // invalidate Extension cache / Tuned-Stretch re-bake
       swing_rcp_post_pad(pad); swing_rcp_post_fx(pad);   // @block performs (A-9a)
@@ -747,7 +797,7 @@ function undo_do() local(ei, pad) (
     udo_urd_pad[_udo_rc] = pad;
     _udo_rc += 1;
     // restore the undo entry into the live pad
-    undo_unpack(udo_ust + ei * UDO_STRIDE, pad);
+    _udo_skip_out = 1; undo_unpack(udo_ust + ei * UDO_STRIDE, pad); _udo_skip_out = 0;   // the output choice stays (UDO_K_OUT)
     _udo_uc = ei;
     swing_rcp_post_pad(pad); swing_rcp_post_fx(pad);   // @block performs (A-9a)
     s_dirty[pad] = 1; col_dirty = 1;
@@ -773,7 +823,7 @@ function redo_do() local(ei, pad) (
     undo_pack(udo_ust + _udo_uc * UDO_STRIDE, pad);
     udo_ust_pad[_udo_uc] = pad;
     _udo_uc += 1;
-    undo_unpack(udo_urd + ei * UDO_STRIDE, pad);
+    _udo_skip_out = 1; undo_unpack(udo_urd + ei * UDO_STRIDE, pad); _udo_skip_out = 0;   // the output choice stays (UDO_K_OUT)
     _udo_rc = ei;
     swing_rcp_post_pad(pad); swing_rcp_post_fx(pad);   // @block performs (A-9a)
     s_dirty[pad] = 1; col_dirty = 1;
@@ -784,9 +834,12 @@ function redo_do() local(ei, pad) (
 
 // ─── Swap two pads (all metadata, FX, layers, audio) ─────────────────────
 function swap_pads(a, b)
-  local(tmp, li, la, lb, j, _swap_len_a, _swap_len_b, _swap_len, _sw_a, _sw_b, _sw_p, _sw_n)
+  local(tmp, li, la, lb, j)
 (
   a == b ? 0 : (
+    // The pitch bands hold while this runs (sp_swap_busy, through atomic_set: before any per-pad value moves) and
+    // until @block's spot map has followed (the swap queue below): swing_block_pitch_tick, 2026-10-12.
+    atomic_set(sp_swap_busy, 1);
     udo_struct_begin_swap(a, b);  // Phase 2: self-inverse swap entry (1-level structural undo)
     // A sounding voice would otherwise finish in the OTHER pad's audio once the
     // slots move under it (A-4): end both pads' voices and fade the output first.
@@ -810,6 +863,7 @@ function swap_pads(a, b)
     tmp = p_decay[a]; p_decay[a] = p_decay[b]; p_decay[b] = tmp;
     tmp = p_sustain[a]; p_sustain[a] = p_sustain[b]; p_sustain[b] = tmp;
     tmp = p_release[a]; p_release[a] = p_release[b]; p_release[b] = tmp;
+    tmp = p_adsr_user[a]; p_adsr_user[a] = p_adsr_user[b]; p_adsr_user[b] = tmp;   // "I tuned this envelope" travels with it (H17)
     tmp = p_tune[a]; p_tune[a] = p_tune[b]; p_tune[b] = tmp;
     tmp = p_note[a]; p_note[a] = p_note[b]; p_note[b] = tmp;
     tmp = p_note_lock[a]; p_note_lock[a] = p_note_lock[b]; p_note_lock[b] = tmp;
@@ -841,6 +895,12 @@ function swap_pads(a, b)
     // ── FX params ──
     tmp = fx_hpf_freq[a]; fx_hpf_freq[a] = fx_hpf_freq[b]; fx_hpf_freq[b] = tmp;
     tmp = fx_lpf_freq[a]; fx_lpf_freq[a] = fx_lpf_freq[b]; fx_lpf_freq[b] = tmp;
+    // the filters' resonance and the pad compressor (2026-10-23, H17: these three stayed on the SLOT, so the moved
+    // sound lost its COMP and RESO and the sound left behind took them; the comp's running envelope stays: both
+    // pads' voices were ended above, it just decays)
+    tmp = fx_reso[a]; fx_reso[a] = fx_reso[b]; fx_reso[b] = tmp;
+    tmp = fx_cmp_amt[a]; fx_cmp_amt[a] = fx_cmp_amt[b]; fx_cmp_amt[b] = tmp;
+    tmp = fx_cmp_mode[a]; fx_cmp_mode[a] = fx_cmp_mode[b]; fx_cmp_mode[b] = tmp;
     tmp = fx_eq_lo[a]; fx_eq_lo[a] = fx_eq_lo[b]; fx_eq_lo[b] = tmp;
     tmp = fx_eq_mid[a]; fx_eq_mid[a] = fx_eq_mid[b]; fx_eq_mid[b] = tmp;
     tmp = fx_eq_mid2[a]; fx_eq_mid2[a] = fx_eq_mid2[b]; fx_eq_mid2[b] = tmp;
@@ -868,6 +928,22 @@ function swap_pads(a, b)
     tmp = p_sum_tight[a]; p_sum_tight[a] = p_sum_tight[b]; p_sum_tight[b] = tmp;
     tmp = p_rpt_div[a]; p_rpt_div[a] = p_rpt_div[b]; p_rpt_div[b] = tmp;
     tmp = p_sample_offset[a]; p_sample_offset[a] = p_sample_offset[b]; p_sample_offset[b] = tmp;
+    // ── Pitch state (2026-09-23: a Tuned pad came out of a swap as Repitch -- the sp_*
+    //    arrays were never in this list, so the mode and algo stayed with the SLOT) ──
+    tmp = sp_pitch_mode[a]; sp_pitch_mode[a] = sp_pitch_mode[b]; sp_pitch_mode[b] = tmp;
+    tmp = sp_pitch_algo[a]; sp_pitch_algo[a] = sp_pitch_algo[b]; sp_pitch_algo[b] = tmp;
+    // sp_pitch_trigger_cnt stays put (since Pad Banks step 4 it is the SPOT's): the Extension diffs it against a per-spot
+    // shadow, so swapping it would read as a trigger. Both slots' sources moved, so both
+    // re-capture (the same bump a load, a clear and a promotion make):
+    sp_src_gen[a] += 1; sp_src_gen[b] += 1;
+    // The spots follow the audio (Pad Banks step 4, plan §6.4): a pad's spot keeps serving the same sound. The spot
+    // tables have ONE writer, @block (swing_spot_tick), and a swap runs from @gfx: the pair goes in the swap queue,
+    // one cell (a * NUM_SLOTS + b, one store), the count last. sp_swap_req is kept global on purpose (wiki 4.1): it
+    // is the queue's count, written here only, through atomic_set (EEL2's atomics take a lock, so the cell is
+    // visible before the count on a CPU that reorders stores too). Until 2026-10-12 this was ONE pair
+    // (sp_swap_a / sp_swap_b): a second swap before @block read it replaced the first, whose spots stayed behind.
+    sp_swap_q[sp_swap_req % SP_SWAP_QN] = a * NUM_SLOTS + b;
+    atomic_set(sp_swap_req, sp_swap_req + 1);
     li = 0;
     loop(MAX_LAYERS,
       la = a * MAX_LAYERS + li;
@@ -882,31 +958,30 @@ function swap_pads(a, b)
       tmp = l_rr_order[la]; l_rr_order[la] = l_rr_order[lb]; l_rr_order[lb] = tmp;
       tmp = l_sr[la]; l_sr[la] = l_sr[lb]; l_sr[lb] = tmp;
       tmp = l_gain[la]; l_gain[la] = l_gain[lb]; l_gain[lb] = tmp;
+      tmp = sp_baked_tune[la]; sp_baked_tune[la] = sp_baked_tune[lb]; sp_baked_tune[lb] = tmp;  // the bake anchor travels with the baked audio
+      ov_cap[la] = 0; ov_cap[lb] = 0;   // re-arm the overlay waveform capture on both sides, as a load does
       li += 1;
     );
 
-    // ── Audio buffer swap (interleaved stereo, SLOT_SIZE per pad) ──
-    // Only swap the used portions to avoid moving 4M zeros
-    _swap_len_a = max(s_len[a], pad_eff_len(a)) * 2 + 64;  // stereo interleaved + safety margin
-    _swap_len_b = max(s_len[b], pad_eff_len(b)) * 2 + 64;
-    _swap_len = max(_swap_len_a, _swap_len_b);
-    _swap_len = min(_swap_len, SLOT_SIZE);  // clamp
-    _swap_len > 0 ? (
-      // Chunked three-way swap through _swap_tmp_buf, which is ONE SWAP_CHUNK
-      // (allocated under the undo slot, always backed). The old whole-slot
-      // scratch sat above the backed ceiling; EEL2's memcpy stops at the first
-      // unbacked cell, so long samples lost their tail (2026-09-07 audit).
-      _sw_a = s_audio_start + a * SLOT_SIZE;
-      _sw_b = s_audio_start + b * SLOT_SIZE;
-      _sw_p = 0;
-      while (_sw_p < _swap_len) (
-        _sw_n = min(SWAP_CHUNK, _swap_len - _sw_p);
-        memcpy(_swap_tmp_buf, _sw_a + _sw_p, _sw_n);
-        memcpy(_sw_a + _sw_p, _sw_b + _sw_p, _sw_n);
-        memcpy(_sw_b + _sw_p, _swap_tmp_buf, _sw_n);
-        _sw_p += _sw_n;
-      );
+    // ── Audio swap: the REGIONS change hands (banks step 2a) ──
+    // Until 2026-09-23 the audio itself was copied, slot to slot, through _swap_tmp_buf (and
+    // until the same morning only region 0 of it: layers 1..3 stayed behind). With per-pad
+    // regions (rk_swing_alloc) a swap is five pointer pairs: the plain region and the four
+    // layer regions exchange owners, audio untouched, nothing allocated or freed. The
+    // metadata was exchanged above, so lengths and regions travel together. Undo re-runs
+    // this swap, so it stays self-inverse. Voices were ended first (kill + crossfade).
+    swing_alloc_lock();           // table writes outside swing_region_set: under the lock, and
+    swing_alloc_cancel_move();    // they abandon a compaction move in flight on either pad
+    tmp = p_aptr[a]; p_aptr[a] = p_aptr[b]; p_aptr[b] = tmp;
+    tmp = p_alen[a]; p_alen[a] = p_alen[b]; p_alen[b] = tmp;
+    li = 0; loop(MAX_LAYERS,
+      la = a * MAX_LAYERS + li;
+      lb = b * MAX_LAYERS + li;
+      tmp = p_lptr[la]; p_lptr[la] = p_lptr[lb]; p_lptr[lb] = tmp;
+      tmp = p_llen[la]; p_llen[la] = p_llen[lb]; p_llen[lb] = tmp;
+      li += 1;
     );
+    swing_alloc_unlock();
 
     // NOTE: pad name strings must be swapped by caller (get_cname_slot defined in main file)
 
@@ -914,6 +989,7 @@ function swap_pads(a, b)
     swing_rcp_post_pad(a); swing_rcp_post_pad(b);
     swing_rcp_post_fx(a); swing_rcp_post_fx(b);
     undo_cap_end();
+    atomic_set(sp_swap_busy, 0);   // after the queue post above: the bands stay held until @block follows
   );
 );
 

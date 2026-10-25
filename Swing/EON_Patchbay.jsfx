@@ -1,18 +1,27 @@
 desc:EON Patchbay
 //tags: EON ReaKit swing wired patchbay loopback return
 // EON Studios — EON Patchbay
-// The return half of Swing's WIRED mode. Swing sends every pad out on its own
-// channel pair (pad 1 = channels 3/4, pad 2 = 5/6 ... pad 16 = 33/34); the
+// The return half of Swing's WIRED mode. Swing sends every pad out on its
+// channel pair (bank A: pad 1 = channels 3/4 ... pad 16 = 33/34; Pad Banks
+// Outputs step 5: bank B/C/D on 39/40, 41/42, 43/44, the ten split-off pads on
+// 45..64, the bank pairs' sends on 35..38); the
 // user's plugins sit between Swing and this, pinned to a pair; this plugin --
-// LAST in the chain -- copies the 32 processed channels into a shared ring
+// LAST in the chain -- copies the processed channels into a shared ring
 // that Swing drains at the top of its next block, ahead of its master
 // section, and zeroes them on the way past so nothing reaches the track output
 // twice. One audio buffer of latency, which Swing reports as PDC.
 //
-// It has no controls. The face is a meter: sixteen lanes, one per pad, showing
-// what is coming back through the loopback, and a lamp that says whether Swing
-// is actually reading the ring. Embedded in the TCP/MCP it is a 4x4 grid of
-// the same lanes.
+// It has no controls. The face is a meter: twenty-nine lanes -- bank A's sixteen
+// pads in a 4x4 grid (laid out like Swing's pads), Bank B/C/D, and the ten
+// split-off pads' own outputs (Own 1-10, Swing's OUTPUTS names) -- showing what
+// is coming back through the loopback, and a lamp that says whether Swing is
+// actually reading the ring. Embedded in the TCP/MCP it is the 4x4 and one row of
+// the thirteen others. All twenty-nine all the time (the user's decision,
+// 2026-10-12): under the old layout the thirteen stay dark. The ring's two send
+// columns (35..38) are measured but not drawn: they are no pad's.
+//
+// The layout is negotiated (rk_swing_patchbay.jsfx-inc, CHANNEL LAYOUT): this
+// starts in the old one and moves to the new one when Swing proves it reads it.
 //
 // link_inst: the Swing's INSTANCE ID, pushed by the bridge when Wired switches
 // on and re-stamped by its identity walker; it selects the ring, resolved from
@@ -59,6 +68,36 @@ in_pin:Pad 15 L
 in_pin:Pad 15 R
 in_pin:Pad 16 L
 in_pin:Pad 16 R
+in_pin:Bank sends delay L
+in_pin:Bank sends delay R
+in_pin:Bank sends reverb L
+in_pin:Bank sends reverb R
+in_pin:Bank B L
+in_pin:Bank B R
+in_pin:Bank C L
+in_pin:Bank C R
+in_pin:Bank D L
+in_pin:Bank D R
+in_pin:Own 1 L
+in_pin:Own 1 R
+in_pin:Own 2 L
+in_pin:Own 2 R
+in_pin:Own 3 L
+in_pin:Own 3 R
+in_pin:Own 4 L
+in_pin:Own 4 R
+in_pin:Own 5 L
+in_pin:Own 5 R
+in_pin:Own 6 L
+in_pin:Own 6 R
+in_pin:Own 7 L
+in_pin:Own 7 R
+in_pin:Own 8 L
+in_pin:Own 8 R
+in_pin:Own 9 L
+in_pin:Own 9 R
+in_pin:Own 10 L
+in_pin:Own 10 R
 out_pin:Return L
 out_pin:Return R
 out_pin:Pad 1 L
@@ -93,6 +132,36 @@ out_pin:Pad 15 L
 out_pin:Pad 15 R
 out_pin:Pad 16 L
 out_pin:Pad 16 R
+out_pin:Bank sends delay L
+out_pin:Bank sends delay R
+out_pin:Bank sends reverb L
+out_pin:Bank sends reverb R
+out_pin:Bank B L
+out_pin:Bank B R
+out_pin:Bank C L
+out_pin:Bank C R
+out_pin:Bank D L
+out_pin:Bank D R
+out_pin:Own 1 L
+out_pin:Own 1 R
+out_pin:Own 2 L
+out_pin:Own 2 R
+out_pin:Own 3 L
+out_pin:Own 3 R
+out_pin:Own 4 L
+out_pin:Own 4 R
+out_pin:Own 5 L
+out_pin:Own 5 R
+out_pin:Own 6 L
+out_pin:Own 6 R
+out_pin:Own 7 L
+out_pin:Own 7 R
+out_pin:Own 8 L
+out_pin:Own 8 R
+out_pin:Own 9 L
+out_pin:Own 9 R
+out_pin:Own 10 L
+out_pin:Own 10 R
 
 import libs/rk_swing_patchbay.jsfx-inc
 
@@ -125,19 +194,52 @@ PB_REG_MAX    = 16;
 // distance behind (see PATCH_OFF_GEN). Read-modify-write so the count keeps
 // rising across incarnations -- Swing only ever compares it with the last value
 // it saw, never assumes a starting number.
+// The layout in force (step 5): the channels a frame holds and the frames the ring holds. @block stamps it into
+// NCH every block (and @init once, after it seeds it).
+function pb_layout() (
+  _pb_nch   = _pb_v2 ? PATCH_CHANS  : PATCH_CHANS_V1;
+  _pb_depth = _pb_v2 ? PATCH_FRAMES : PATCH_FRAMES_V1;
+);
+
 function pb_aim(slot) (
   _pb_slot = slot | 0;
   _pb_base = swing_patch_base(_pb_slot);
   _pb_wpos = 0;
   gmem[_pb_base + PATCH_OFF_WPOS]  = 0;
   gmem[_pb_base + PATCH_OFF_OWNER] = _pb_slot;
-  gmem[_pb_base + PATCH_OFF_NCH]   = PATCH_CHANS;
+  // NCH (the layout) is NOT stamped here: @block stamps it every block, right after any re-aim it makes. One
+  // writer, in one section -- an aim from @slider would otherwise read the layout before @block sets it.
   gmem[_pb_base + PATCH_OFF_GEN]   = (gmem[_pb_base + PATCH_OFF_GEN] | 0) + 1;
 );
 
 _pb_slot = -1;
-pb_aim(link_slot | 0);
+_pb_votes = 0; _pb_chb_seen = -1;
+_pb_fit = samplesblock <= PATCH_FRAMES ? 64 : 0;   // blocks in a row that fit the new ring (capped at 64): see @block
+// The ring: the Swing's slot by its instance id, the registry scan @block runs every block (C-1), else link_slot.
+// link_slot is only the slot at Wired-on and goes stale when the Swing lands on another one (a reopen, a second
+// project first); this @init re-runs at every play start, and aiming at link_slot there bumped another Swing's
+// ring and seeded the layout below from it -- the old layout for our first blocks of every Play, bank B through
+// bank A's pairs until the votes and the registry re-aim caught up (2026-10-12).
+_pb_fs = -1; _pb_s = 0;
+(link_inst | 0) > 0 ? loop(PB_REG_MAX,
+  (_pb_fs < 0 && (gmem[PB_REG_BASE + _pb_s * PB_REG_STRIDE] | 0) == (link_inst | 0)) ? _pb_fs = _pb_s;
+  _pb_s += 1;
+);
+pb_aim(_pb_fs >= 0 ? _pb_fs : (link_slot | 0));
+// The layout, SEEDED from this ring's own header (step 5). REAPER re-runs this @init, every variable zeroed first,
+// on every play start and every enable (no ext_noinit, no @serialize: wiki 3.2). Starting each time in the old
+// layout made every Play renegotiate -- two more held blocks, the first two blocks of every pad lost (review
+// 2026-10-12). The previous incarnation stamped NCH every block, and a step-5 consumer writes CONS_V2 beside
+// CONS_HB, so the new layout carries over exactly when it was in force and its consumer is a step-5 Swing; the
+// votes in @block undo a wrong seed within two blocks. A fresh Patchbay on a ring nobody uses gets the old one.
+_pb_v2 = ((gmem[_pb_base + PATCH_OFF_NCH] | 0) == PATCH_CHANS
+          && gmem[_pb_base + PATCH_OFF_CONS_V2] == gmem[_pb_base + PATCH_OFF_CONS_HB]
+          && samplesblock <= PATCH_FRAMES) ? 1 : 0;
+_pb_nch   = _pb_v2 ? PATCH_CHANS  : PATCH_CHANS_V1;   // = pb_layout(), written out so @init is seen to set them
+_pb_depth = _pb_v2 ? PATCH_FRAMES : PATCH_FRAMES_V1;
+gmem[_pb_base + PATCH_OFF_NCH] = _pb_nch;
 gmem[_pb_base + PATCH_OFF_HB] = 0;
+gmem[_pb_base + PATCH_OFF_NCH_HB] = 0;   // = HB: the layout stamp is this producer's from the first block
 _pb_hb   = 0;
 
 // Per-pad peaks. _pb_acc fills in @sample (audio thread), @block hands the
@@ -145,11 +247,11 @@ _pb_hb   = 0;
 // only ever READS _pb_pk into its own decayed copy -- no gfx write that the
 // audio thread reads.
 freemem = 0;
-_pb_acc = freemem; freemem += 16;
-_pb_pk  = freemem; freemem += 16;
-_pb_gpk = freemem; freemem += 16;   // gfx-side, decayed
+_pb_acc = freemem; freemem += PATCH_PCOLS;
+_pb_pk  = freemem; freemem += PATCH_PCOLS;
+_pb_gpk = freemem; freemem += PATCH_PCOLS;   // gfx-side, decayed (one per pair column; the face draws all but the sends)
 _pb_c = 0;
-loop(16, _pb_acc[_pb_c] = 0; _pb_pk[_pb_c] = 0; _pb_gpk[_pb_c] = 0; _pb_c += 1; );
+loop(PATCH_PCOLS, _pb_acc[_pb_c] = 0; _pb_pk[_pb_c] = 0; _pb_gpk[_pb_c] = 0; _pb_c += 1; );
 
 @slider
 
@@ -183,15 +285,40 @@ loop(16, _pb_acc[_pb_c] = 0; _pb_pk[_pb_c] = 0; _pb_gpk[_pb_c] = 0; _pb_c += 1; 
   (_pb_fs >= 0 && _pb_fs != _pb_slot) ? pb_aim(_pb_fs);
 );
 
+// ── The layout (Pad Banks Outputs step 5) ──────────────────────────────────
+// A step-5 Swing writes its consumer counter into PATCH_OFF_CONS_V2 as well as
+// CONS_HB; an older one writes CONS_HB only. Each time the counter moves, it is
+// a vote: the new layout when both cells agree and the block fits the new ring,
+// else the old one. Two votes against the layout in force change it -- a re-aim
+// (WPOS 0, NCH, GEN + 1), on which Swing re-primes. No consumer moving: a block
+// deeper than the new ring still drops to the old layout.
+// After a block too deep for the new ring, the upgrade waits for 64 blocks in a row that fit it (_pb_fit), so a
+// buffer near its depth -- some blocks over, some split shorter -- cannot flip the layout to and fro (each flip
+// is a re-prime). Without such a block the count stays full and the two votes decide.
+_pb_fit = samplesblock <= PATCH_FRAMES ? min(_pb_fit + 1, 64) : 0;
+_pb_ch2 = gmem[_pb_base + PATCH_OFF_CONS_HB];
+_pb_ch2 != _pb_chb_seen ? (
+  _pb_chb_seen = _pb_ch2;
+  _pb_want = (gmem[_pb_base + PATCH_OFF_CONS_V2] == _pb_ch2 && _pb_fit >= 64) ? 1 : 0;
+  _pb_want == _pb_v2 ? _pb_votes = 0 : _pb_votes += 1;
+  _pb_votes >= 2 ? ( _pb_v2 = _pb_want; _pb_votes = 0; pb_layout(); pb_aim(_pb_slot); );
+);
+// A block the new ring cannot hold drops to the old layout at once, consumer or not.
+_pb_v2 && samplesblock > PATCH_FRAMES ? ( _pb_v2 = 0; _pb_votes = 0; pb_layout(); pb_aim(_pb_slot); );
+// Re-asserted every block: a fresh Patchbay's @init stamps its default slot 0 before the bridge links it, and
+// that foreign stamp must not stand as slot 0's layout for longer than a block.
+gmem[_pb_base + PATCH_OFF_NCH] = _pb_nch;
+
 // The heartbeat is a COUNTER, not a clock — this has no wall clock and Swing
 // only needs to know it moved.
 _pb_hb += 1;
 gmem[_pb_base + PATCH_OFF_HB] = _pb_hb;
+gmem[_pb_base + PATCH_OFF_NCH_HB] = _pb_hb;   // with HB: the NCH stamp is this beating producer's (step 5)
 
 // Hand last block's peaks to the face and start the next block clean. @block
 // runs before this block's @sample, so the copy is always a whole block.
 _pb_c = 0;
-loop(16, _pb_pk[_pb_c] = _pb_acc[_pb_c]; _pb_acc[_pb_c] = 0; _pb_c += 1; );
+loop(PATCH_PCOLS, _pb_pk[_pb_c] = _pb_acc[_pb_c]; _pb_acc[_pb_c] = 0; _pb_c += 1; );
 
 @sample
 
@@ -201,10 +328,10 @@ loop(16, _pb_pk[_pb_c] = _pb_acc[_pb_c]; _pb_acc[_pb_c] = 0; _pb_c += 1; );
 // definition. Buffering the block and flushing in @block is not an option —
 // @block for block N runs before @sample for block N, so the flush would land
 // after Swing has already read and the round trip would cost two blocks.
-_pb_row = _pb_base + PATCH_HEADER_SLOTS + _pb_wpos * PATCH_CHANS;
+_pb_row = _pb_base + PATCH_HEADER_SLOTS + _pb_wpos * _pb_nch;   // the layout in force (pb_layout)
 
 _pb_c = 0;
-loop(PATCH_CHANS,
+loop(_pb_nch,
   _pb_v = spl(PATCH_CH0 + _pb_c);
   // ⚠ THE TRUST BOUNDARY. Everything on these channels came out of arbitrary
   // third-party code, and what Swing does with it next is STATEFUL: the drained
@@ -223,7 +350,8 @@ loop(PATCH_CHANS,
   _pb_a = abs(_pb_v);
   !(_pb_a <= 8) ? ( _pb_v = 0; _pb_a = 0; );
   atomic_set(gmem[_pb_row + _pb_c], _pb_v);
-  // Peak per pad (both channels of the pair fold into one lane).
+  // Peak per pair column (both channels fold into one lane): bank A's pads 0..15, then (the new layout) the
+  // bank sends 16/17, Bank B/C/D 18..20, Own 1-10 21..30.
   _pb_pi = (_pb_c * 0.5) | 0;
   _pb_a > _pb_acc[_pb_pi] ? _pb_acc[_pb_pi] = _pb_a;
   // Zeroed on the way past. Anything left on these channels would reach the
@@ -234,15 +362,18 @@ loop(PATCH_CHANS,
 );
 
 _pb_wpos += 1;
-_pb_wpos >= PATCH_FRAMES ? _pb_wpos = 0;
+_pb_wpos >= _pb_depth ? _pb_wpos = 0;
 atomic_set(gmem[_pb_base + PATCH_OFF_WPOS], _pb_wpos);
 
-@gfx 300 700
+@gfx 300 900
 // ⚠️ @gfx sets the EMBED ASPECT (house rule: portrait, so the strip pairs with
 // Drum Strip / Output / Macros in the mixer). The old 420x300 was landscape:
-// 59 px tall in an 82 px mixer strip, which is not enough for sixteen meters.
-// 300x700 is Drum Strip's ratio, and the sixteen lanes become a 4x4 GRID --
-// which is the shape Swing's pads are in anyway, so lane 6 sits where pad 6 is.
+// 59 px tall in an 82 px mixer strip, which is not enough for the meters.
+// 300x900 is Drum Strip's ratio (it followed the Drum Strip from 300x700 on
+// 2026-10-15; 86 x 258 in the default mixer strip; the full layout is still
+// drawn on a 300x700 design canvas, sc below); bank A's sixteen lanes are a 4x4 GRID -- the
+// shape Swing's pads are in, so lane 6 sits where pad 6 is -- and the thirteen
+// others (step 5) sit below it in their own groups.
 
 micro = gfx_ext_flags & 1;
 ret = max(1, gfx_ext_retina);
@@ -257,12 +388,12 @@ W = gfx_w; H = gfx_h;
 // ⚠️ HEIGHT COUNTS TOO, not just width -- same trap as EON_Output. This face
 // went from 420x300 to 300x700, so a project saved before that reopens it at
 // 420x300, where the fourth row of lanes runs into the footer text.
-// 610 * sc = the last lane number's TOP (558) plus the 52 footer. The label's
-// own height is added separately because its font FLOORS at 8 px -- it does not
-// keep shrinking with sc, so a purely proportional 620 * sc was 3 px short at
-// the sc = 0.5 floor and the numbers still crossed the footer rule at H = 310.
+// 663 * sc = the last lane label's TOP (611: the grid below) plus the 52 footer.
+// The label's own height is added separately because its font FLOORS at 8 px --
+// it does not keep shrinking with sc, so a purely proportional figure came out
+// short at the sc = 0.5 floor and the labels crossed the footer rule.
 sc = max(0.5, min(W / 300, H / 700));
-_pb_full = W >= 150 && H >= 610 * sc + max(8, 10 * sc);
+_pb_full = W >= 150 && H >= 663 * sc + max(8, 10 * sc);
 
 // ── Is Swing reading the ring? Its consumer counter moves every live block. ─
 _pb_chb = gmem[_pb_base + PATCH_OFF_CONS_HB];
@@ -274,30 +405,37 @@ _pb_now = time_precise();
 _pb_dt = min(0.1, _pb_now - _pb_gt); _pb_gt = _pb_now;
 _pb_fall = _pb_dt * 3.3;
 _pbg_i = 0;
-loop(16,
+loop(PATCH_PCOLS,   // every column's ballistics; the face draws the 29 lanes (pb_col)
   _pb_lv = _pb_pk[_pbg_i];
   _pb_lv > _pb_gpk[_pbg_i] ? _pb_gpk[_pbg_i] = _pb_lv
                           : _pb_gpk[_pbg_i] = max(0, _pb_gpk[_pbg_i] - _pb_fall);
   _pbg_i += 1;
 );
 
-function pb_lane(x, y, w, h, i) local(lv, fh, r, g, b) (
+// Lane l (0..28) -> its pair column: bank A's sixteen are columns 0..15; Bank B/C/D
+// and Own 1-10 skip the two send columns (16, 17).
+function pb_col(l) ( l < 16 ? l : l + 2; );
+
+function pb_lane(x, y, w, h, i) local(lv, fh, r, g, b, e) (
   lv = _pb_gpk[i];
+  // the 1 px edge only where the lane has room for it: the compact face's thin bars in a short TCP embed come out
+  // under 3 px, and an inner rect of w - 2 there never lit (review 2026-10-12)
+  e = (w >= 3 && h >= 3) ? 1 : 0;
   // dB-ish taper: 0.001 -> bottom, 1.0 -> top
   fh = lv <= 0.001 ? 0 : max(0, min(1, 1 + log10(lv) / 3));
-  // The track carries an edge so a silent lane still reads as a LANE -- sixteen
-  // unlit meters on a dark plate are otherwise invisible, and silent is the
-  // normal resting state here.
+  // The track carries an edge so a silent lane still reads as a LANE -- a plate
+  // of unlit meters is otherwise invisible, and silent is the normal resting
+  // state here.
   gfx_set(0.19, 0.20, 0.23, 1);
   gfx_rect(x, y, w, h);
   gfx_set(0.09, 0.10, 0.12, 1);
-  gfx_rect(x + 1, y + 1, w - 2, h - 2);
+  gfx_rect(x + e, y + e, w - 2 * e, h - 2 * e);
   fh > 0 ? (
     lv >= 0.99 ? ( r = 0.93; g = 0.35; b = 0.28; ) :
     lv >= 0.5  ? ( r = 0.93; g = 0.68; b = 0.22; ) :
                  ( r = 0.35; g = 0.80; b = 0.84; );
     gfx_set(r, g, b, 0.95);
-    gfx_rect(x + 1, y + 1 + (h - 2) * (1 - fh), w - 2, (h - 2) * fh);
+    gfx_rect(x + e, y + e + (h - 2 * e) * (1 - fh), w - 2 * e, (h - 2 * e) * fh);
   );
 );
 
@@ -318,38 +456,69 @@ _pb_full ? (
   gfx_set(1, 1, 1, 0.06);
   gfx_rect(floor(12 * sc), floor(58 * sc), W - floor(24 * sc), 1);
 
-  // 4x4, laid out like Swing's pads: lane 6 sits where pad 6 is.
+  // Three groups, top to bottom (300x700 at sc = 1): bank A's 4x4, laid out like
+  // Swing's pads (lane 6 sits where pad 6 is), rows at 78 + 76 r; Bank B/C/D, a
+  // row of three at 390; Own 1-10, two rows of five at 474 and 550. Rows are 76:
+  // a 58 lane and its label; 8 between the groups, with a faint rule. The last
+  // label's top is 550 + 58 + 3 = 611 (the gate above).
   _pb_gx = floor(16 * sc); _pb_gy = floor(78 * sc);
-  _pb_cw = (W - floor(32 * sc)) / 4;
-  _pb_rh = floor(124 * sc);
-  _pb_lh = _pb_rh - floor(20 * sc);
-  gfx_setfont(3, "Arial", max(8, floor(10 * sc)), 'b');
+  _pb_gw = W - floor(32 * sc);
+  _pb_rh = floor(76 * sc);
+  _pb_lh = _pb_rh - floor(18 * sc);
+  _pb_gg = floor(8 * sc);
+  // Lane labels are bold from 10 px only: bold Arial at 8-9 px draws 5 as 6
+  // and 6, 9 as 8 (wiki 4.7) -- "Own 3" carries a digit too.
+  gfx_setfont(3, "Arial", max(8, floor(10 * sc)), floor(10 * sc) >= 10 ? 'b' : 0);
   _pbg_i = 0;
-  loop(16,
-    _pb_x = _pb_gx + (_pbg_i % 4) * _pb_cw;
-    _pb_y = _pb_gy + ((_pbg_i / 4) | 0) * _pb_rh;
-    pb_lane(_pb_x + floor(5 * sc), _pb_y, _pb_cw - floor(10 * sc), _pb_lh, _pbg_i);
+  loop(29,
+    _pbg_i < 16 ? (
+      _pb_cw = _pb_gw / 4;
+      _pb_x = _pb_gx + (_pbg_i % 4) * _pb_cw;
+      _pb_y = _pb_gy + ((_pbg_i / 4) | 0) * _pb_rh;
+      sprintf(#_pb_s, "%d", _pbg_i + 1);
+      strcpy(#_pb_t, #_pb_s);
+    ) : _pbg_i < 19 ? (
+      _pb_cw = _pb_gw / 3;
+      _pb_x = _pb_gx + (_pbg_i - 16) * _pb_cw;
+      _pb_y = _pb_gy + 4 * _pb_rh + _pb_gg;
+      sprintf(#_pb_s, "Bank %c", 66 + _pbg_i - 16);
+      sprintf(#_pb_t, "%c", 66 + _pbg_i - 16);
+    ) : (
+      _pb_cw = _pb_gw / 5;
+      _pb_x = _pb_gx + ((_pbg_i - 19) % 5) * _pb_cw;
+      _pb_y = _pb_gy + (5 + (((_pbg_i - 19) / 5) | 0)) * _pb_rh + 2 * _pb_gg;
+      sprintf(#_pb_s, "Own %d", _pbg_i - 18);
+      sprintf(#_pb_t, "%d", _pbg_i - 18);
+    );
+    pb_lane(_pb_x + floor(5 * sc), _pb_y, _pb_cw - floor(10 * sc), _pb_lh, pb_col(_pbg_i));
     gfx_set(0.62, 0.66, 0.72, 0.9);
-    sprintf(#_pb_s, "%d", _pbg_i + 1);
+    // the long label where it fits its column, else the short one ("Bank B" -> "B", "Own 3" -> "3")
+    tw = 0; th = 0;
     gfx_measurestr(#_pb_s, tw, th);
-    gfx_x = _pb_x + (_pb_cw - tw) / 2; gfx_y = _pb_y + _pb_lh + floor(4 * sc);
+    tw > _pb_cw - 2 ? ( strcpy(#_pb_s, #_pb_t); tw = 0; th = 0; gfx_measurestr(#_pb_s, tw, th); );
+    gfx_x = _pb_x + (_pb_cw - tw) / 2; gfx_y = _pb_y + _pb_lh + floor(3 * sc);
     gfx_drawstr(#_pb_s);
     _pbg_i += 1;
   );
+  // the groups' rules, in the gaps
+  gfx_set(1, 1, 1, 0.05);
+  gfx_rect(_pb_gx, _pb_gy + 4 * _pb_rh + floor(_pb_gg / 2) - floor(2 * sc), _pb_gw, 1);
+  gfx_rect(_pb_gx, _pb_gy + 5 * _pb_rh + _pb_gg + floor(_pb_gg / 2) - floor(2 * sc), _pb_gw, 1);
 
   gfx_set(1, 1, 1, 0.05);
   gfx_rect(0, H - floor(52 * sc), W, 1);
   gfx_setfont(2, "Arial", max(8, floor(10 * sc)));
   gfx_set(0.72, 0.75, 0.80, 0.95);
   gfx_x = floor(14 * sc); gfx_y = H - floor(44 * sc);
-  sprintf(#_pb_s, "%d channels back to Swing, slot %d.", PATCH_CHANS, _pb_slot);
+  sprintf(#_pb_s, "%d channels back to Swing, slot %d.", _pb_nch, _pb_slot);   // the layout in force
   gfx_drawstr(#_pb_s);
   gfx_set(0.52, 0.56, 0.62, 0.9);
   gfx_x = floor(14 * sc); gfx_y = H - floor(31 * sc);
-  gfx_drawstr("Out 1 = 3/4 ... Out 16 = 33/34.");
+  // the layout in force: since step 5 the banks and the own outputs keep their multi-out channels
+  gfx_drawstr(_pb_v2 ? "Pads 3-34, banks 39-44, own 45-64." : "Out 1 = 3/4 ... Out 16 = 33/34.");
   gfx_set(0.42, 0.46, 0.53, 0.9);
   gfx_x = floor(14 * sc); gfx_y = H - floor(18 * sc);
-  gfx_drawstr("Keep this last; pad inserts go above it.");
+  gfx_drawstr("Keep this last; inserts go above it.");
   gfx_setfont(4, "Arial", max(8, floor(10 * sc)), 'b');
   gfx_set(0.52, 0.56, 0.62, 0.6);
   gfx_x = W - floor(34 * sc); gfx_y = H - floor(18 * sc);
@@ -357,12 +526,13 @@ _pb_full ? (
 
 ) : (
 
-  // ── Compact: the same 4x4, with the lamp SAID as well as lit. ──
+  // ── Compact: the same 4x4 and a row of the thirteen others (Bank B/C/D, a gap,
+  // Own 1-10, as thin bars), with the lamp SAID as well as lit. ──
   // A colour alone makes you remember which one means what; the word does not.
   // "Swing is reading the ring" cannot fit an 82 px strip, so it is the short
   // form, sized to the strip: measure it, and if it overhangs, shrink the font
   // by exactly the overhang and measure again. One retry always lands it.
-  // ⛔⛔ NOT _pb_fs -- that is @block's RESOLVED REGISTRY SLOT (line 178), and
+  // ⛔⛔ NOT _pb_fs -- that is @block's RESOLVED REGISTRY SLOT (pb_aim), and
   // @gfx runs on the other thread. At an 82 px strip this expression is exactly
   // 12, so a write landing between the registry scan and pb_aim() aimed this
   // Patchbay's ring at slot 12: audio redirected into another instance's ring.
@@ -393,12 +563,21 @@ _pb_full ? (
   _pb_gap = max(1, _pb_u * 0.03);
   _pb_cw = (W - _pb_gap * 5) / 4;
   _pb_top = gfx_y + th + max(2, H * 0.012);
-  _pb_chh = (H - _pb_top - _pb_gap * 5) / 4;
+  _pb_chh = max(1, (H - _pb_top - _pb_gap * 6) / 5);   // five rows: the 4x4, then the thirteen
   _pbg_i = 0;
   loop(16,
     pb_lane(_pb_gap + (_pbg_i % 4) * (_pb_cw + _pb_gap),
             _pb_top + ((_pbg_i / 4) | 0) * (_pb_chh + _pb_gap),
             _pb_cw, _pb_chh, _pbg_i);
+    _pbg_i += 1;
+  );
+  // the thirteen: thin bars, Bank B/C/D, then a gap three wide, then Own 1-10
+  _pb_bw = max(0, (W - _pb_gap * 16) / 13);   // never past W: under ~29 px the bars simply vanish
+  _pbg_i = 0;
+  loop(13,
+    pb_lane(_pb_gap + _pbg_i * (_pb_bw + _pb_gap) + (_pbg_i >= 3 ? 2 * _pb_gap : 0),
+            _pb_top + 4 * (_pb_chh + _pb_gap),
+            _pb_bw, _pb_chh, pb_col(16 + _pbg_i));
     _pbg_i += 1;
   );
 );

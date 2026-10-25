@@ -368,19 +368,20 @@ local(_cn, _len, _i, _ch, _h)
 
 // ─── Apply auto-color → col_auto_hue[] ─────────────────────────────────
 function swing_color_apply_auto(mode_id)
-local(_i)
+local(_i, _i_s)
 (
   _i = 0; loop(NUM_PADS,
+    _i_s = swing_bp(_i);
     mode_id == COL_AUTO_DRUMTYPE ? (
-      col_auto_hue[_i] = swing_color_drumtype_hue(_i);
+      col_auto_hue[_i] = swing_color_drumtype_hue(_i_s);
     ) :
     mode_id == COL_AUTO_OUTPUT ? (
-      col_auto_hue[_i] = p_output[_i] / 16.0;
+      col_auto_hue[_i] = swing_out_hue(_i_s);   // where it plays (a bank B-D pad: its bank's track or its own, Outputs step 3)
     ) :
     mode_id == COL_AUTO_RAINBOW ? (
       col_auto_hue[_i] = _i / 16.0;
     ) : (
-      col_auto_hue[_i] = p_color[_i];
+      col_auto_hue[_i] = p_color[_i_s];
     );
     _i += 1;
   );
@@ -394,12 +395,13 @@ local(_i)
 // changed"). exclude_pad = the pad being edited (its new color is applied
 // by the caller); no-op when already in manual mode.
 function swing_color_manualize(exclude_pad)
-local(_i)
+local(_i, _i_s)
 (
   col_auto_mode_id > 0 ? (
     _i = 0;
     loop(NUM_PADS,
-      _i != exclude_pad && pad_is_playable(_i) ? p_color[_i] = col_auto_hue[_i];
+      _i_s = swing_bp(_i);
+      _i != swing_pad_tile(exclude_pad) && pad_is_playable(_i_s) ? p_color[_i_s] = col_auto_hue[_i];   // callers pass a tile or a slot (step 4d)
       _i += 1;
     );
     col_auto_mode_id = 0;
@@ -423,9 +425,18 @@ local(_i)
 // made it one click away instead of buried in the KIT tab.)
 //
 // Returns -2 blank / -1 white / 0..1 hue, the same specials swing_color_rebuild uses.
+// Pad Banks step 5c: `pad` is ABSOLUTE; col_auto_hue[] holds the bank on screen's sixteen tiles, so another bank's
+// pad (the mapping view's other-bank keys, 4d) derives its auto hue the way swing_color_apply_auto does -- it read
+// col_auto_hue[pad] past the buffer.
+function swing_color_auto_hue(pad) (
+  swing_pad_bank(pad) == bank_cur ? col_auto_hue[swing_pad_tile(pad)] :
+  col_auto_mode_id == COL_AUTO_DRUMTYPE ? swing_color_drumtype_hue(pad) :
+  col_auto_mode_id == COL_AUTO_OUTPUT ? swing_out_hue(pad) :
+  col_auto_mode_id == COL_AUTO_RAINBOW ? swing_pad_tile(pad) / 16.0 : p_color[pad];
+);
 function swing_color_pad_hue(pad) (
   pad < 0 || !pad_is_playable(pad) ? -2 :
-  col_auto_mode_id > 0 ? col_auto_hue[pad] : p_color[pad];
+  col_auto_mode_id > 0 ? swing_color_auto_hue(pad) : p_color[pad];
 );
 
 // hsl_to_rgb for a pad at a caller-chosen S/L, with the achromatic specials
@@ -439,7 +450,7 @@ function swing_color_pad_hsl(pad, s, l) local(_h) (
 );
 
 function swing_color_rebuild()
-local(_i, _h, _cb, _eff_s)
+local(_i, _h, _cb, _eff_s, _i_s)
 (
   // Apply auto-color if active
   col_auto_mode_id > 0 ? swing_color_apply_auto(col_auto_mode_id);
@@ -454,15 +465,16 @@ local(_i, _h, _cb, _eff_s)
   gmem[GS_COL_EFFECTIVE_L] = _sc_l;
 
   _i = 0; loop(NUM_PADS,
+    _i_s = swing_bp(_i);
     // Hue source: auto buffer or manual p_color
-    _h = col_auto_mode_id > 0 ? col_auto_hue[_i] : p_color[_i];
+    _h = col_auto_mode_id > 0 ? col_auto_hue[_i] : p_color[_i_s];
 
     // Blank pads render in the neutral dark-grey "black" achromatic special
     // (_h = -2 → handled by the _h <= -1.5 branch below) instead of a vivid
     // assigned hue, so an empty pad looks empty everywhere it's drawn.
     // Playable = sample OR enabled synth — a synth-only pad is NOT blank
     // (the all-black synth pads bug, 2026-07-29).
-    !pad_is_playable(_i) ? _h = -2;
+    !pad_is_playable(_i_s) ? _h = -2;
 
     _cb = _i * 3;
     _h < 0 ? (
@@ -504,7 +516,7 @@ local(_row_h, _row_y, _ti, _tx, _tw_btn, _tw_m, _th_m, _lbl,
   // these three concerns: auto-color mode (these rows), Mono toggle (Row 3),
   // and intensity (Row 4).
   _row_y = _cp_y + 4;
-  gfx_setfont(1, "Arial", 8);
+  rk_font(1, 8, 0);
   gfx_set(0.85, 0.92, 0.95, 1.0);
   gfx_x = _cp_x + 4; gfx_y = _row_y;
   gfx_drawstr("AUTO-COLOR");
@@ -527,7 +539,7 @@ local(_row_h, _row_y, _ti, _tx, _tw_btn, _tw_m, _th_m, _lbl,
     _mi == 1 ? _mx_lbl = "DrumType" :
     _mi == 2 ? _mx_lbl = "Output" :
                _mx_lbl = "Rainbow";
-    gfx_setfont(1, "Arial", 9);
+    rk_font(1, 9, 0);
     // Brighter inactive text for readability (was 0.70/0.85/0.88 at 0.8α).
     _is_active ? gfx_set(1, 1, 1, 1) : gfx_set(0.92, 0.96, 0.98, 1.0);
     gfx_measurestr(_mx_lbl, _tw_m, _th_m);
@@ -545,7 +557,7 @@ local(_row_h, _row_y, _ti, _tx, _tw_btn, _tw_m, _th_m, _lbl,
 
   // ── Row 2: MONO toggle (single button — grayscale vs full color) ──
   _row_y = _cp_y + 4 + 12 + 16 + 18;
-  gfx_setfont(1, "Arial", 8);
+  rk_font(1, 8, 0);
   gfx_set(0.85, 0.92, 0.95, 1.0);
   gfx_x = _cp_x + 4; gfx_y = _row_y;
   gfx_drawstr("MONO");
@@ -561,7 +573,7 @@ local(_row_h, _row_y, _ti, _tx, _tw_btn, _tw_m, _th_m, _lbl,
   gfx_rect(_tx, _row_y, _tw_btn, 14);
 
   _mx_lbl = col_mono ? "Mono ON" : "Mono OFF";
-  gfx_setfont(1, "Arial", 9, 'b');
+  rk_font(1, 9, 'b');
   col_mono ? gfx_set(1, 1, 1, 1) : gfx_set(0.92, 0.96, 0.98, 1.0);
   gfx_measurestr(_mx_lbl, _tw_m, _th_m);
   gfx_x = _tx + (_tw_btn - _tw_m) * 0.5;
@@ -578,7 +590,7 @@ local(_row_h, _row_y, _ti, _tx, _tw_btn, _tw_m, _th_m, _lbl,
   // slider (slider22 precedent): set the named var, slider_automate the token,
   // mark_dirty for the chunk-diff undo.
   _row_y = _cp_y + 4 + 12 + 16 + 18 + 12 + 16 + 4;
-  gfx_setfont(1, "Arial", 8);
+  rk_font(1, 8, 0);
   gfx_set(0.85, 0.92, 0.95, 1.0);
   gfx_x = _cp_x + 4; gfx_y = _row_y;
   gfx_drawstr("PAD FACE");
@@ -592,7 +604,7 @@ local(_row_h, _row_y, _ti, _tx, _tw_btn, _tw_m, _th_m, _lbl,
     _is_active ? gfx_set(0.20, 0.65, 0.70, 0.9) : gfx_set(0.15, 0.25, 0.30, 0.8);
     gfx_rect(_tx, _row_y, _tw_btn - 2, 14);
     _mx_lbl = _mi == 0 ? "Waveform" : "Icon";
-    gfx_setfont(1, "Arial", 9);
+    rk_font(1, 9, 0);
     _is_active ? gfx_set(1, 1, 1, 1) : gfx_set(0.92, 0.96, 0.98, 1.0);
     gfx_measurestr(_mx_lbl, _tw_m, _th_m);
     gfx_x = _tx + (_tw_btn - 2 - _tw_m) * 0.5;
@@ -613,7 +625,7 @@ local(_row_h, _row_y, _ti, _tx, _tw_btn, _tw_m, _th_m, _lbl,
   // no ser_ver involvement. Greyed out until a bridge has published (fresh
   // instance, no bridge running, or pre-identity build).
   _row_y = _cp_y + 4 + 12 + 16 + 18 + 12 + 16 + 4 + 12 + 16 + 4;
-  gfx_setfont(1, "Arial", 8);
+  rk_font(1, 8, 0);
   gfx_set(0.85, 0.92, 0.95, 1.0);
   gfx_x = _cp_x + 4; gfx_y = _row_y;
   gfx_drawstr("LANE TRACKS");
@@ -635,7 +647,7 @@ local(_row_h, _row_y, _ti, _tx, _tw_btn, _tw_m, _th_m, _lbl,
     _mi == 0 ? _mx_lbl = "Swing" :
     _mi == 1 ? _mx_lbl = "REAPER" :
                _mx_lbl = "None";
-    gfx_setfont(1, "Arial", 9);
+    rk_font(1, 9, 0);
     _is_active ? gfx_set(1, 1, 1, 1) : gfx_set(0.92, 0.96, 0.98, _lp_live ? 1.0 : 0.4);
     gfx_measurestr(_mx_lbl, _tw_m, _th_m);
     gfx_x = _tx + (_tw_btn - _tw_m) * 0.5;
@@ -650,7 +662,7 @@ local(_row_h, _row_y, _ti, _tx, _tw_btn, _tw_m, _th_m, _lbl,
 
   // ── Row 5: Intensity slider ──
   _row_y = _cp_y + 4 + 12 + 16 + 18 + 12 + 16 + 4 + 12 + 16 + 4 + 12 + 16 + 4;
-  gfx_setfont(1, "Arial", 8);
+  rk_font(1, 8, 0);
   gfx_set(0.85, 0.92, 0.95, 1.0);
   gfx_x = _cp_x + 4; gfx_y = _row_y;
   gfx_drawstr("INTENSITY");
@@ -675,7 +687,7 @@ local(_row_h, _row_y, _ti, _tx, _tw_btn, _tw_m, _th_m, _lbl,
   gfx_rect(_knob_x - 2, _row_y - 1, 5, _bar_h + 2);
 
   // Percentage label
-  gfx_setfont(1, "Arial", 8);
+  rk_font(1, 8, 0);
   gfx_set(0.70, 0.90, 0.92, 1);
   gfx_x = _bar_x + _bar_w + 4;
   gfx_y = _row_y;

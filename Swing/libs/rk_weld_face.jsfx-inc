@@ -14,14 +14,112 @@
 //   mx, my            — the host's mouse position (wface_btn reads them)
 //   #wface_val / #wface_lbl / #wface_lad — the strings the parts print
 // Interaction stays in the host: these functions only draw (wface_btn returns
-// hover, nothing more). Fonts: slot 5 (labels, ladders) and slot 6 (readouts);
-// the host owns slots 1-4. Knob style 21 (the G-series knob) is what
+// hover, nothing more). Fonts: every Arial font goes through rk_font below,
+// which keeps each size in a slot of its own (2..15); slots 0, 1 and 16 stay
+// with the host's own direct calls. Knob style 21 (the G-series knob) is what
 // wface_knob_cell draws; the host's own style choice does not reach the card.
 //
 // ⚠️ EON_Weld.jsfx's window must stay pixel-identical across any edit here:
 // .dev_tests/weld_face_shot.sh before/after + a PIL diff is the gate.
 
 @init
+
+// ── rk_font: one slot per font (Swing and EON Weld) ────────────────────────────
+// A gfx_setfont that gives a slot a NEW size or flags makes REAPER build that font again, and the next
+// text call pays for it: ~185 us, against ~1.5 us with the font unchanged (measured 2026-10-11). Swing
+// re-sized slot 1 150-230 times a frame, a third of REAPER's drawing time with its window open
+// (.docs/audits/Swing_Speed_Checks_Plan_2026-10-11.md). rk_font keeps each Arial (size, flags) in a slot
+// of its own, 2..15: it defines the slot the first time and only selects it after that. When a fifteenth
+// one turns up, the slot used longest ago is defined again (the busiest view measured needs 14).
+// It lives here because this is the first drawing library BOTH hosts import (Swing, EON Weld): every
+// other font user in either comes after it, and EEL2 resolves a call where the caller is defined.
+//
+//   rk_font(slot, size, flags) replaces gfx_setfont(slot, "Arial", size, flags). `slot` is the slot the
+//     call used before the cache; only rk_font_direct reads it.
+//   ⚠️ Nothing else may set slots 2..15 in Swing or EON Weld, or the cache hands out a slot whose font
+//     changed behind it (.dev_tests/font_slot_check.py). Slots 0, 1 and 16 stay with the code that sets
+//     them itself: rk_vu, rk_theme, the popups, the theme menu, the non-Arial faces.
+//   The cache starts over when the drawing place changes (embedded or not, its size, its retina scale):
+//     an embedded face and the floating window are not known to share font slots.
+//   rk_font_direct = 1 turns every call back into the direct gfx_setfont (verification; nothing sets it).
+//     Those direct calls overwrite slots the cache filled, so flipping it starts the cache over too
+//     (measured 2026-10-11: without that, the first pages drawn after flipping back came out in old sizes).
+function rk_font(slot, sz, fl) local(key, k, b, bu) (
+  (gfx_ext_flags & 1) != rkf_cx_e || gfx_w != rkf_cx_w || gfx_h != rkf_cx_h || gfx_ext_retina != rkf_cx_r ||
+  rk_font_direct != rkf_cx_d ? (
+    rkf_cx_e = (gfx_ext_flags & 1); rkf_cx_w = gfx_w; rkf_cx_h = gfx_h; rkf_cx_r = gfx_ext_retina;
+    rkf_cx_d = rk_font_direct;
+    rkf_k2 = -1; rkf_k3 = -1; rkf_k4 = -1; rkf_k5 = -1; rkf_k6 = -1; rkf_k7 = -1; rkf_k8 = -1;
+    rkf_k9 = -1; rkf_k10 = -1; rkf_k11 = -1; rkf_k12 = -1; rkf_k13 = -1; rkf_k14 = -1; rkf_k15 = -1;
+  );
+  rk_font_direct ? gfx_setfont(slot, "Arial", sz, fl) : (
+    key = sz * 16777216 + fl;   // flags are up to three characters, so they stay below 2^24
+    rkf_t += 1;
+    k =
+      rkf_k2 == key ? 2 :
+      rkf_k3 == key ? 3 :
+      rkf_k4 == key ? 4 :
+      rkf_k5 == key ? 5 :
+      rkf_k6 == key ? 6 :
+      rkf_k7 == key ? 7 :
+      rkf_k8 == key ? 8 :
+      rkf_k9 == key ? 9 :
+      rkf_k10 == key ? 10 :
+      rkf_k11 == key ? 11 :
+      rkf_k12 == key ? 12 :
+      rkf_k13 == key ? 13 :
+      rkf_k14 == key ? 14 :
+      rkf_k15 == key ? 15 :
+      0;
+    k ? (
+      gfx_setfont(k);
+      k == 2 ? ( rkf_u2 = rkf_t; ) :
+      k == 3 ? ( rkf_u3 = rkf_t; ) :
+      k == 4 ? ( rkf_u4 = rkf_t; ) :
+      k == 5 ? ( rkf_u5 = rkf_t; ) :
+      k == 6 ? ( rkf_u6 = rkf_t; ) :
+      k == 7 ? ( rkf_u7 = rkf_t; ) :
+      k == 8 ? ( rkf_u8 = rkf_t; ) :
+      k == 9 ? ( rkf_u9 = rkf_t; ) :
+      k == 10 ? ( rkf_u10 = rkf_t; ) :
+      k == 11 ? ( rkf_u11 = rkf_t; ) :
+      k == 12 ? ( rkf_u12 = rkf_t; ) :
+      k == 13 ? ( rkf_u13 = rkf_t; ) :
+      k == 14 ? ( rkf_u14 = rkf_t; ) :
+      k == 15 ? ( rkf_u15 = rkf_t; );
+    ) : (
+      b = 2; bu = rkf_u2;   // the slot used longest ago (an empty one has 0)
+      rkf_u3 < bu ? ( b = 3; bu = rkf_u3; );
+      rkf_u4 < bu ? ( b = 4; bu = rkf_u4; );
+      rkf_u5 < bu ? ( b = 5; bu = rkf_u5; );
+      rkf_u6 < bu ? ( b = 6; bu = rkf_u6; );
+      rkf_u7 < bu ? ( b = 7; bu = rkf_u7; );
+      rkf_u8 < bu ? ( b = 8; bu = rkf_u8; );
+      rkf_u9 < bu ? ( b = 9; bu = rkf_u9; );
+      rkf_u10 < bu ? ( b = 10; bu = rkf_u10; );
+      rkf_u11 < bu ? ( b = 11; bu = rkf_u11; );
+      rkf_u12 < bu ? ( b = 12; bu = rkf_u12; );
+      rkf_u13 < bu ? ( b = 13; bu = rkf_u13; );
+      rkf_u14 < bu ? ( b = 14; bu = rkf_u14; );
+      rkf_u15 < bu ? ( b = 15; bu = rkf_u15; );
+      gfx_setfont(b, "Arial", sz, fl);
+      b == 2 ? ( rkf_k2 = key; rkf_u2 = rkf_t; );
+      b == 3 ? ( rkf_k3 = key; rkf_u3 = rkf_t; );
+      b == 4 ? ( rkf_k4 = key; rkf_u4 = rkf_t; );
+      b == 5 ? ( rkf_k5 = key; rkf_u5 = rkf_t; );
+      b == 6 ? ( rkf_k6 = key; rkf_u6 = rkf_t; );
+      b == 7 ? ( rkf_k7 = key; rkf_u7 = rkf_t; );
+      b == 8 ? ( rkf_k8 = key; rkf_u8 = rkf_t; );
+      b == 9 ? ( rkf_k9 = key; rkf_u9 = rkf_t; );
+      b == 10 ? ( rkf_k10 = key; rkf_u10 = rkf_t; );
+      b == 11 ? ( rkf_k11 = key; rkf_u11 = rkf_t; );
+      b == 12 ? ( rkf_k12 = key; rkf_u12 = rkf_t; );
+      b == 13 ? ( rkf_k13 = key; rkf_u13 = rkf_t; );
+      b == 14 ? ( rkf_k14 = key; rkf_u14 = rkf_t; );
+      b == 15 ? ( rkf_k15 = key; rkf_u15 = rkf_t; );
+    );
+  );
+);
 
 // ── Palette: the vintage console centre-section blue-grey, one identity ──
 function wface_palette() (
@@ -39,7 +137,8 @@ function wface_readout(cx, ry, rw, rh, tr, tg, tb) local(tw, th) (
   gfx_rect(cx - rw * 0.5, ry, rw, rh);
   gfx_set(tr, tg, tb, 0.25);
   gfx_rect(cx - rw * 0.5, ry, rw, rh, 0);
-  gfx_setfont(6, "Arial", max(8, floor(rh * 0.62)), 'b');
+  // Bold from 10 px only: bold Arial at 8-9 px draws 5 as 6 and 6, 9 as 8 (wiki 4.7).
+  rk_font(6, max(8, floor(rh * 0.62)), floor(rh * 0.62) >= 10 ? 'b' : 0);
   gfx_measurestr(#wface_val, tw, th);
   gfx_set(tr, tg, tb, 0.95);
   gfx_x = cx - tw * 0.5; gfx_y = ry + floor((rh - th) * 0.5);
@@ -120,7 +219,8 @@ function wface_knob_ring_ladder(ki, cx, cy, kr) local(_di, _la) (
                max(1, kr * 0.038), 1);
     _di += 1;
   );
-  gfx_setfont(5, "Arial", max(7, floor(8 * wface_sc)), 'b');
+  // The ladder is all numbers: bold from 10 px only (wiki 4.7).
+  rk_font(5, max(7, floor(8 * wface_sc)), floor(8 * wface_sc) >= 10 ? 'b' : 0);
   ki == 0 ? (
     strcpy(#wface_lad, "-40"); wface_ladt(cx, cy, kr, 0);
     strcpy(#wface_lad, "-30"); wface_ladt(cx, cy, kr, 0.25);
@@ -175,7 +275,7 @@ function wface_knob_cell(ki, cx, cy, kr, dv, dmin, dmax, dsym, hov) local(_tw, _
   wface_knob_ring_ladder(ki, cx, cy, kr);
   wface_readout(cx, cy + kr + floor(24 * wface_sc), floor(64 * wface_sc), floor(16 * wface_sc),
                 wface_ac_r, wface_ac_g, wface_ac_b);
-  gfx_setfont(5, "Arial", max(9, floor(13 * wface_sc)), 'b');
+  rk_font(5, max(9, floor(13 * wface_sc)), 'b');
   gfx_set(wface_tx_r, wface_tx_g, wface_tx_b, 0.95);
   gfx_measurestr(#wface_lbl, _tw, _th);
   gfx_x = cx - _tw * 0.5;
@@ -187,13 +287,13 @@ function wface_knob_cell(ki, cx, cy, kr, dv, dmin, dmax, dsym, hov) local(_tw, _
 // dark ink centred on the cap, the small dim caption below. Returns hover.
 function wface_btn_labeled(bx, by, bw, bh, lit, cap, caption) local(_hv, _tw, _th) (
   _hv = wface_btn(bx, by, bw, bh, lit);
-  gfx_setfont(5, "Arial", max(9, floor(14 * wface_sc)), 'b');
+  rk_font(5, max(9, floor(14 * wface_sc)), 'b');
   gfx_set(0.15, 0.15, 0.17, 1);
   gfx_measurestr(cap, _tw, _th);
   gfx_x = bx + bw * 0.5 - _tw * 0.5;
   gfx_y = by + (bh - _th) * 0.5 - floor(2 * wface_sc);
   gfx_drawstr(cap);
-  gfx_setfont(5, "Arial", max(7, floor(8 * wface_sc)), 'b');
+  rk_font(5, max(7, floor(8 * wface_sc)), 'b');
   gfx_set(wface_td_r, wface_td_g, wface_td_b, 0.85);
   gfx_measurestr(caption, _tw, _th);
   gfx_x = bx + bw * 0.5 - _tw * 0.5; gfx_y = by + bh + floor(4 * wface_sc);

@@ -43,7 +43,7 @@ local UPDATE_URL        = "https://api.github.com/repos/EON-Audio/swing/releases
 -- never fired only because no GitHub release exists yet. deploy.sh now refuses
 -- to publish when this does not match the version being released, so the drift
 -- cannot come back silently.
-local CURRENT_VERSION   = "3.0.18"
+local CURRENT_VERSION   = "3.0.19"
 local POLL_INTERVAL     = 5.0        -- seconds between heartbeat polls
 local HEARTBEAT_TIMEOUT = 2.0        -- seconds of stale counter = Swing gone
 
@@ -73,6 +73,10 @@ local GS_UPDATE_STATE      = 1713
 -- Bridge a top-level local would count against Lua's 200-local ceiling.
 function eon_write_startup(path, content)
   local tmp, prev = path .. ".eon-tmp", path .. ".eon-prev"
+  -- A stranded original goes back first (see eon_recover_startup). If it
+  -- cannot, nothing below may run: the os.remove(prev) further down would eat
+  -- the only copy of the shared file.
+  if not eon_recover_startup(path) then return false end
   -- A read-only __startup.lua is the user's call. Windows would still let the
   -- renames below replace it -- and strand a read-only .eon-prev that blocks
   -- every later rewrite -- so refuse up front.
@@ -97,6 +101,35 @@ function eon_write_startup(path, content)
   if had_old then os.rename(prev, path) end
   os.remove(tmp)
   return false
+end
+
+-- ⚠ A rewrite that fails half-way leaves __startup.lua GONE and the original
+-- in .eon-prev: the new file could not take the old one's place AND the old
+-- one could not step back (an antivirus hold on both the fresh tmp and the
+-- just-renamed .eon-prev -- the same hold the 2026-09-07 fix met on one side).
+-- Nothing runs at the next launch to notice, and the writer's first act on
+-- the retry used to be os.remove(prev): every vendor's startup lines gone,
+-- then a file written holding only our block. So the writer and every
+-- self_register put a stranded original back before reading or writing, and
+-- a .eon-prev is only ever removed while the real file exists. Returns false
+-- when a stranded original is there and could not be put back, or when
+-- __startup.lua is there but cannot be read. Global, identical in all five
+-- self-registering scripts.
+function eon_recover_startup(path)
+  local f, _, ocode = io.open(path, "r")
+  if f then f:close() return true end
+  -- Present but unreadable (a lock, a permission) is not absent: nothing is
+  -- put back over it. On macOS / Linux rename REPLACES an existing file, so a
+  -- stale .eon-prev overwrote the current one (outside audit 2026-10-02; on
+  -- Windows the rename failed). ENOENT (2) is the one open failure that means
+  -- there is no file.
+  if ocode ~= 2 then return false end
+  -- No file. Put a stepped-aside original back. rename needs no read access,
+  -- so an unreadable-but-present .eon-prev is never mistaken for absent
+  -- (Codex 2026-09-23); ENOENT (2) is the one failure that means there is
+  -- nothing to recover.
+  local ok, _, code = os.rename(path .. ".eon-prev", path)
+  return (ok or code == 2) and true or false
 end
 
 -- ⭐ Strip one script's block from __startup.lua text, in WHOLE LINES. The file is
@@ -149,6 +182,9 @@ end
 function eon_startup_selfclean_src(name, section, key)
   return
     "  local p=reaper.GetResourcePath()..\"/Scripts/__startup.lua\"\n" ..
+    -- a stranded .eon-prev (an earlier replacement that failed both ways) goes back first, only while the real
+    -- file is absent: the writer's own recovery rule (outside audit 3, 2026-10-05)
+    "  do local pb=io.open(p..'.eon-prev','r'); if pb then pb:close(); local pf=io.open(p,'r'); if pf then pf:close() else os.rename(p..'.eon-prev',p) end end end\n" ..
     "  local f=io.open(p,'r'); local c=f and f:read('*a'); if f then f:close() end\n" ..
     "  local w=c and io.open(p,'a'); if w then w:close()\n" ..
     -- Markers assembled at run time: the literal "-- EON:<name> END" must never appear
@@ -169,13 +205,22 @@ function eon_startup_selfclean_src(name, section, key)
     "    if fw then ok=fw:write(c) and true or false; if not fw:close() then ok=false end end\n" ..
     "    if ok then os.remove(b); local h=os.rename(p,b); if os.rename(t,p) then os.remove(b) elseif h then os.rename(b,p) end end\n" ..
     "    os.remove(t) end\n" ..
-    "  reaper.SetExtState('" .. section .. "','" .. key .. "','',true)\n"
+    -- the flag is cleared only while the start-up file is there; a replacement that failed both ways keeps it, so
+    -- the next launch tries again (the original waits in .eon-prev)
+    "  do local pf=io.open(p,'r'); if pf then pf:close(); reaper.SetExtState('" .. section .. "','" .. key .. "','',true) end end\n"
 end
 
 local function self_register()
   local _, script_path = reaper.get_action_context()
-  local key = SCRIPT_NAME .. "_registered_v4"
+  local key = SCRIPT_NAME .. "_registered_v5"   -- v5 (2026-10-14): the block checks the script file (every install re-registers once)
   local marker = "-- EON:" .. SCRIPT_NAME
+  -- A rewrite that failed half-way may have left the file stepped aside as
+  -- .eon-prev; put it back before anything below reads it. If it cannot be put
+  -- back, do NOTHING this run: registering anyway would read an empty file
+  -- and, once the hold lifts, the writer's own recovery would restore the
+  -- original only for the write to replace it with a file holding just our
+  -- block (Codex 2026-09-23). The next run retries.
+  if not eon_recover_startup(reaper.GetResourcePath() .. "/Scripts/__startup.lua") then return end
 
   -- Check both ExtState AND __startup.lua. If the ExtState says registered
   -- but __startup.lua is missing or doesn't contain our block, re-register.
@@ -218,15 +263,17 @@ local function self_register()
     and ('reaper.NamedCommandLookup("_' .. named_id .. '")')
     or tostring(cmd_id)
 
-  -- Self-cleaning block. When `id` resolves (script file present), runs
-  -- the script as usual. When `id == 0` (file removed via ReaPack uninstall),
-  -- strips this block from __startup.lua and clears the registered_v3
-  -- ExtState. The cleanup runs at most once per uninstall -- once the block
-  -- is gone, this code never executes again.
+  -- Self-cleaning block. When `id` resolves AND the script file opens, runs
+  -- the script as usual. Otherwise -- the action gone (a ReaPack uninstall)
+  -- or the file gone while the action stays (a folder deleted by hand,
+  -- 2026-10-14) -- strips this block from __startup.lua and clears the
+  -- registered ExtState. The cleanup runs at most once -- once the block is
+  -- gone, this code never executes again. %q: a ]] in the path.
   local block =
     "\n" .. marker .. " BEGIN\n" ..
     "do local id=" .. cmd_token .. "\n" ..
-    "if id~=0 then reaper.Main_OnCommand(id,0) else\n" ..
+    string.format("local sf=io.open(%q,'r'); if sf then sf:close() end\n", script_path) ..
+    "if id~=0 and sf then reaper.Main_OnCommand(id,0) else\n" ..
     eon_startup_selfclean_src(SCRIPT_NAME, SCRIPT_NAME, key) ..
     "end end\n" ..
     marker .. " END\n"
@@ -282,9 +329,23 @@ end
 -- quotes, spaces, $, backticks or other shell metacharacters to break out
 -- with. (The only caller feeds it html_url parsed from the GitHub API with a
 -- quote-free capture, so the gate is belt-and-braces, not load-bearing.)
+--
+-- Origin pin (2026-09-23): the ONLY page this ever opens is a release page of
+-- the repo UPDATE_URL asks about. A well-formed HTTPS URL to anywhere else --
+-- which is all the character gate above checks -- is refused, so a tampered
+-- API answer cannot turn the UPDATE button into "open the attacker's site".
+-- The prefix ends in the slash after the host on purpose: "github.com@evil"
+-- (userinfo) and "github.com:443" and "swing2" all fail it. ".." and "%" are
+-- refused outright: a browser folds "/swing/../x" -- and its encoded twins
+-- "%2e%2e", ".%2e" -- back to another repo, and no release page of ours
+-- carries either (tags are semver, git refuses ".." in a ref), so nothing
+-- legitimate is lost.
+local RELEASE_PAGE_PREFIX = "https://github.com/EON-Audio/swing/"
 local function open_url(url)
   if type(url) ~= "string"
-     or not url:match("^https://[%w%.%-_/#%%%?=&:+~@]+$") then
+     or not url:match("^https://[%w%.%-_/#%%%?=&:+~@]+$")
+     or url:sub(1, #RELEASE_PAGE_PREFIX) ~= RELEASE_PAGE_PREFIX
+     or url:find("..", 1, true) or url:find("%", 1, true) then
     return
   end
   if reaper.CF_ShellExecute then

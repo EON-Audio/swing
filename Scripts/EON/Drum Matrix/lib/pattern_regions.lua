@@ -37,6 +37,11 @@ end
 local SECTION  = 'EON_DRUM_MATRIX'
 local KEY      = 'patterns'
 local CUR_KEY  = 'current'   -- "current pattern" region idx, shared via ExtState
+-- The FIXED LINK (Swing's song, the user's choice 2026-10-23: "a region keeps its pattern by a fixed
+-- link", not by its place in time): JSON { "<region idx>": pattern0 }, a key of its own beside KEY, keyed
+-- by the region idx the membership set and the song chain use. KEY's format is left alone: an older
+-- reader skips any entry that is not a number, and its next write would wipe the membership.
+local LINK_KEY = 'pattern_link'
 
 -- Pattern color palette. Each new pattern cycles to the next swatch so patterns
 -- are individually color-coded — and we apply the SAME color to the actual
@@ -115,6 +120,64 @@ local function write_set(set)
   if ok and enc then reaper.SetProjExtState(0, SECTION, KEY, enc) end
 end
 
+-- The link as stored: { [idx] = pattern0 } (a fresh copy: callers edit it). The decode is cached by the
+-- stored text, so the courier's once-a-tick read costs one GetProjExtState. A missing or unreadable
+-- key reads as an empty link: every member then gets its pattern on first sight (M.LinkMap).
+local link_raw, link_tbl = nil, nil
+local function read_link()
+  local out = {}
+  if not json then return out end
+  local _, raw = reaper.GetProjExtState(0, SECTION, LINK_KEY)
+  raw = raw or ''
+  if raw ~= link_raw then
+    local t = {}
+    if raw ~= '' then
+      local ok, obj = pcall(json.decode, raw)
+      if ok and type(obj) == 'table' then
+        for k, v in pairs(obj) do
+          local idx = tonumber(k)
+          if idx and type(v) == 'number' and v >= 0 and v == math.floor(v) then
+            t[math.floor(idx)] = math.floor(v)
+          end
+        end
+      end
+    end
+    link_raw, link_tbl = raw, t
+  end
+  for idx, p in pairs(link_tbl) do out[idx] = p end
+  return out
+end
+
+local function write_link(t)
+  if not json then return end
+  local obj = {}
+  for idx, p in pairs(t) do obj[tostring(math.floor(idx))] = p end
+  local ok, enc = pcall(json.encode, obj)
+  if ok and enc then
+    reaper.SetProjExtState(0, SECTION, LINK_KEY, enc)
+    link_raw, link_tbl = nil, nil   -- the next read decodes what was written
+  end
+end
+
+-- The lowest pattern no entry of `link` holds.
+local function lowest_free(link)
+  local used = {}
+  for _, p in pairs(link) do used[p] = true end
+  local p = 0
+  while used[p] do p = p + 1 end
+  return p
+end
+
+-- Drop the link entries of regions that are no longer members (the self-heal's half for the link).
+local function drop_dead_links(alive)
+  local link = read_link()
+  local changed = false
+  for idx in pairs(link) do
+    if not alive[idx] then link[idx] = nil; changed = true end
+  end
+  if changed then write_link(link) end
+end
+
 -- Enumerate every region in the project, keyed by its index number.
 local function enum_regions()
   local out = {}
@@ -143,12 +206,46 @@ function M.List()
     local r = regions[idx]
     if r then out[#out + 1] = r; kept[idx] = true else changed = true end
   end
-  if changed then write_set(kept) end
+  if changed then
+    write_set(kept)
+    -- A gone region's link goes with it: REAPER hands its idx to the next region it makes.
+    drop_dead_links(kept)
+  end
   table.sort(out, function(a, b) return a.start < b.start end)
   -- Drop a stale "current" if its region is gone.
   local cur = get_current()
   if cur and not kept[cur] then set_current(nil) end
   return out
+end
+
+-- The FIXED LINK, healed: { [region idx] = pattern0 } for every member, and nothing else. A member
+-- with no link -- a project from before the link, a region Adopt()ed by the Song Starter or the DM's
+-- Adopt Regions, one an undo brought back -- gets the lowest pattern no region holds, members taken
+-- in time order; so a project from before the link keeps exactly what it played (ordinal - 1) and a
+-- new pattern fills the first hole. Entries of regions that are no longer members are dropped. Writes
+-- the key only when something changed. `list` = a fresh M.List() if the caller holds one.
+-- Two regions may share a pattern (nothing here makes that, nothing here undoes it).
+function M.LinkMap(list)
+  list = list or M.List()
+  local link = read_link()
+  local out, alive, changed = {}, {}, false
+  for _, r in ipairs(list) do alive[r.idx] = true end
+  for idx, p in pairs(link) do
+    if alive[idx] then out[idx] = p else changed = true end
+  end
+  for _, r in ipairs(list) do
+    if out[r.idx] == nil then
+      out[r.idx] = lowest_free(out)
+      changed = true
+    end
+  end
+  if changed then write_link(out) end
+  return out
+end
+
+-- The pattern region `idx` plays by the fixed link (nil when it is not a member).
+function M.PatternOf(idx)
+  return M.LinkMap()[idx]
 end
 
 function M.GetByIndex(idx)
@@ -253,15 +350,24 @@ function M.New(name, t0, t1)
     if not (t0 and t1) then t0, t1 = append_range() end
   end
   if not (t0 and t1) or t1 <= t0 then status('EON DM: could not determine a range for the new pattern'); return nil end
-  local count = #M.List()
+  local list = M.List()
+  local count = #list
+  -- The fixed link: the members there are get theirs first (a project from before the link migrates
+  -- as it played, before this region can shift anyone's place in time); the new one then takes the
+  -- lowest free pattern, and its default name says that pattern, so "Pattern 3" plays pattern 3 even
+  -- after pattern 2's region was deleted.
+  local link = M.LinkMap(list)
+  local pat = lowest_free(link)
   if not name or name == '' then
-    name = 'Pattern ' .. tostring(count + 1)
+    name = 'Pattern ' .. tostring(pat + 1)
   end
   local idx = reaper.AddProjectMarker2(0, true, t0, t1, name, -1, pick_color(count))
   if not idx or idx < 0 then return nil end
   local set = read_set()
   set[idx] = true
   write_set(set)
+  link[idx] = pat
+  write_link(link)
   set_current(idx)
   return idx
 end
@@ -285,6 +391,8 @@ function M.Delete(idx)
   local set = read_set()
   set[idx] = nil
   write_set(set)
+  local link = read_link()
+  if link[idx] ~= nil then link[idx] = nil; write_link(link) end   -- its pattern is free again
   if get_current() == idx then set_current(nil) end
   return reaper.DeleteProjectMarker(0, idx, true)
 end

@@ -171,32 +171,48 @@ end
 
 -- Shift all selected notes by `qn_delta` quarter notes. Updates the selection
 -- entries with the new ppq positions so subsequent ops still find them.
+--
+-- Find every note FIRST, then move them. Moving each note as it is found let
+-- the next entry re-find the note just moved onto its cell (same pitch, same
+-- ppq), so a right nudge over neighbouring hats walked ONE note to the end and
+-- left the rest in place: the cells looked right, the velocities and lengths
+-- rotated (audit H03, 2026-10-23). Not via MoveBy: it re-inserts with mute off
+-- and channel 0, while SetNote (nil = keep) keeps both. noSort on every SetNote
+-- keeps the stored indices valid until the one MIDI_Sort per take below.
 function M.ShiftBy(qn_delta)
   if #entries == 0 or qn_delta == 0 then return 0 end
-  local new_entries = {}
-  reaper.Undo_BeginBlock()
-  local touched_takes = {}
+  local plan, claimed = {}, {}   -- plan rows { take, idx, ppq_s, ppq_e, pitch }; claimed[take][idx]
   for _, e in ipairs(entries) do
     if reaper.ValidatePtr(e.take, 'MediaItem_Take*') then
       local _, ncount = reaper.MIDI_CountEvts(e.take)
+      local taken = claimed[e.take] or {}
+      claimed[e.take] = taken
       for i = 0, ncount - 1 do
         local ok, _, _, ppq_s, ppq_e, _, pitch = reaper.MIDI_GetNote(e.take, i)
-        if ok and pitch == e.pitch and math.abs(ppq_s - e.ppq_s) < 1 then
-          local proj_s = reaper.MIDI_GetProjTimeFromPPQPos(e.take, ppq_s)
-          local proj_e = reaper.MIDI_GetProjTimeFromPPQPos(e.take, ppq_e)
-          local qn_s   = reaper.TimeMap_timeToQN(proj_s) + qn_delta
-          local qn_e   = reaper.TimeMap_timeToQN(proj_e) + qn_delta
-          local new_t_s = reaper.TimeMap_QNToTime(qn_s)
-          local new_t_e = reaper.TimeMap_QNToTime(qn_e)
-          local nppq_s  = reaper.MIDI_GetPPQPosFromProjTime(e.take, new_t_s)
-          local nppq_e  = reaper.MIDI_GetPPQPosFromProjTime(e.take, new_t_e)
-          reaper.MIDI_SetNote(e.take, i, nil, nil, nppq_s, nppq_e, nil, nil, nil, true)
-          touched_takes[e.take] = true
-          new_entries[#new_entries + 1] = { take = e.take, ppq_s = nppq_s, pitch = e.pitch }
+        if ok and not taken[i] and pitch == e.pitch and math.abs(ppq_s - e.ppq_s) < 1 then
+          taken[i] = true
+          plan[#plan + 1] = { take = e.take, idx = i, ppq_s = ppq_s, ppq_e = ppq_e, pitch = e.pitch }
           break
         end
       end
     end
+  end
+  if #plan == 0 then return 0 end
+  local new_entries = {}
+  reaper.Undo_BeginBlock()
+  local touched_takes = {}
+  for _, pr in ipairs(plan) do
+    local proj_s = reaper.MIDI_GetProjTimeFromPPQPos(pr.take, pr.ppq_s)
+    local proj_e = reaper.MIDI_GetProjTimeFromPPQPos(pr.take, pr.ppq_e)
+    local qn_s   = reaper.TimeMap_timeToQN(proj_s) + qn_delta
+    local qn_e   = reaper.TimeMap_timeToQN(proj_e) + qn_delta
+    local new_t_s = reaper.TimeMap_QNToTime(qn_s)
+    local new_t_e = reaper.TimeMap_QNToTime(qn_e)
+    local nppq_s  = reaper.MIDI_GetPPQPosFromProjTime(pr.take, new_t_s)
+    local nppq_e  = reaper.MIDI_GetPPQPosFromProjTime(pr.take, new_t_e)
+    reaper.MIDI_SetNote(pr.take, pr.idx, nil, nil, nppq_s, nppq_e, nil, nil, nil, true)
+    touched_takes[pr.take] = true
+    new_entries[#new_entries + 1] = { take = pr.take, ppq_s = nppq_s, pitch = pr.pitch }
   end
   for take, _ in pairs(touched_takes) do
     reaper.MIDI_Sort(take)

@@ -29,6 +29,8 @@
 //   mx, my        — mouse_x, mouse_y
 //   LMB           — mouse_cap & 1
 //   lmb_down      — LMB && !prev_LMB (edge detect, computed ONCE per frame)
+//   rmb_down      — RMB && !prev_RMB (right-click resets to the default; unset
+//                   reads 0 in EEL2, so a host that never sets it loses only that)
 //   CTRL          — mouse_cap & 4
 //   SHIFT         — mouse_cap & 8
 //   dt            — frame delta time
@@ -46,12 +48,19 @@
 // MEMORY CONVENTION (16 slots per instance):
 //   [0]  hover_t        [1]  is_dragging     [2]  drag_ref (mouse pos)
 //   [3]  drag_start_val [4]  last_click_time  [5]  automate_flag
-//   [6]  is_active      [7]  aux_value        [8..15] type-specific
+//   [6]  is_active      [7]  aux_value        [8..9] type-specific
+//   [10] default_set    [11] default (0..1)   [12..15] free
 //
-//   Range slider: [7]=which_thumb (0=lo,1=hi), [8]=drag_start_val2
+//   Range slider: [7]=which_thumb (0=lo,1=hi), [8]=drag_start_val2, [9]=drag ref hi
+//
+// RESET: a double-click or a right-click puts the slider at its default. The
+//   default is 0.5 unless the host says otherwise, once, after allocating:
+//     sld_set_default(mem, v)     v in 0..1, the same units the interact returns
+//   (a unity fader whose 0 dB sits at 0.75 says sld_set_default(fm, 0.75)).
+//   The range slider resets to 0.25 / 0.75.
 //
 // INTERACT RETURN: new slider value (0..1). Caller checks change, calls
-//                  sliderchange/automate.
+//                  slider_automate (which also does sliderchange's job).
 // ═══════════════════════════════════════════════════════════════════════════
 
 @init
@@ -61,6 +70,23 @@
 // ─────────────────────────────────────────────────────────────────────────
 function _sld_clamp(x, lo, hi) ( min(max(x, lo), hi); );
 function _sld_lerp(a, b, t)   ( a + (b - a) * t; );
+
+// The reset value (double-click / right-click). 0.5 until the host sets one:
+// a fresh mem block reads 0 in [10], so a plugin that never calls the setter
+// resets exactly as before.
+function sld_set_default(mem, v) ( mem[10] = 1; mem[11] = _sld_clamp(v, 0, 1); );
+function _sld_default(mem) ( mem[10] ? mem[11] : 0.5; );
+
+// The modifier pair as one number, for the drag re-anchor in every interact
+// that scales its WHOLE travel from the press (the horizontal, vertical,
+// stepped, click-to-set and range sliders; the two per-frame ones need none).
+// Scaling the whole travel by the CURRENT modifier made the value jump when
+// CTRL or SHIFT changed mid-drag, with the pointer still (the 2026-09-20
+// widget audit, the knob library's P2 repeated here). So a drag restarts from
+// the pointer and the value of the moment the modifiers change. The global is
+// the knob library's (_rk_drag_mod): one pointer, one drag at a time, and
+// this helper is defined here too so a host may import either library alone.
+function _sld_mods() ( (CTRL ? 1 : 0) + (SHIFT ? 2 : 0); );
 
 // Double-click window, in seconds. Defined here too so this file stays
 // standalone — the *_kbsg libraries import nothing. knobs_kbsg sets the same
@@ -158,15 +184,18 @@ function sld_horiz_interact(mem, x, y, w, h, cur_val)
 
   hover && lmb_down ? (
     now = time_precise();
-    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = 0.5; mem[5] = 1; );
+    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = _sld_default(mem); mem[5] = 1; );
     mem[4] = now;
   );
+  hover && rmb_down ? ( new_val = _sld_default(mem); mem[5] = 1; );
   lmb_down && hover && !mem[1] && !mem[5] ? (
     mem[1] = 1;
     mem[2] = mx;
     mem[3] = cur_val;
+    _rk_drag_mod = _sld_mods();
   );
   mem[1] && LMB ? (
+    _sld_mods() != _rk_drag_mod ? ( mem[2] = mx; mem[3] = cur_val; _rk_drag_mod = _sld_mods(); );   // re-anchor
     dx = mx - mem[2];
     sens = CTRL ? (w * 4) : SHIFT ? (w * 16) : w;
     new_val = _sld_clamp(mem[3] + dx / sens, 0, 1);
@@ -249,15 +278,18 @@ function sld_vert_interact(mem, x, y, w, h, cur_val)
 
   hover && lmb_down ? (
     now = time_precise();
-    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = 0.5; mem[5] = 1; );
+    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = _sld_default(mem); mem[5] = 1; );
     mem[4] = now;
   );
+  hover && rmb_down ? ( new_val = _sld_default(mem); mem[5] = 1; );
   lmb_down && hover && !mem[1] && !mem[5] ? (
     mem[1] = 1;
     mem[2] = my;
     mem[3] = cur_val;
+    _rk_drag_mod = _sld_mods();
   );
   mem[1] && LMB ? (
+    _sld_mods() != _rk_drag_mod ? ( mem[2] = my; mem[3] = cur_val; _rk_drag_mod = _sld_mods(); );   // re-anchor
     dy = mem[2] - my;
     sens = CTRL ? (h * 4) : SHIFT ? (h * 16) : h;
     new_val = _sld_clamp(mem[3] + dy / sens, 0, 1);
@@ -325,15 +357,18 @@ function sld_fillbar_interact(mem, x, y, w, h, cur_val)
 
   hover && lmb_down ? (
     now = time_precise();
-    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = 0.5; mem[5] = 1; );
+    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = _sld_default(mem); mem[5] = 1; );
     mem[4] = now;
   );
+  hover && rmb_down ? ( new_val = _sld_default(mem); mem[5] = 1; );
   lmb_down && hover && !mem[1] && !mem[5] ? (
     mem[1] = 1;
     mem[2] = mx;
     mem[3] = cur_val;
+    _rk_drag_mod = _sld_mods();
   );
   mem[1] && LMB ? (
+    _sld_mods() != _rk_drag_mod ? ( mem[2] = mx; mem[3] = cur_val; _rk_drag_mod = _sld_mods(); );   // re-anchor
     dx = mx - mem[2];
     sens = CTRL ? (w * 4) : SHIFT ? (w * 16) : w;
     new_val = _sld_clamp(mem[3] + dx / sens, 0, 1);
@@ -367,7 +402,7 @@ function sld_stepped_draw(x, y, w, h, value, n_steps, mem)
   gfx_set(0.40, 0.40, 0.42, 1);
   i = 0;
   loop(n_steps,
-    sx = x + floor(i / (n_steps - 1) * (w - 1));
+    sx = x + floor(i / (max(n_steps, 2) - 1) * (w - 1));
     gfx_line(sx, track_y - 4, sx, track_y + track_h + 3);
     i += 1;
   );
@@ -401,19 +436,22 @@ function sld_stepped_interact(mem, x, y, w, h, cur_val, n_steps)
   mem[6] = hover || mem[1];
   new_val = cur_val;
   mem[5] = 0;
-  step_sz = 1 / (n_steps - 1);
+  step_sz = 1 / (max(n_steps, 2) - 1);   // one step would divide by zero; it behaves as two
 
   hover && lmb_down ? (
     now = time_precise();
-    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = 0.5; mem[5] = 1; );
+    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = _sld_default(mem); mem[5] = 1; );
     mem[4] = now;
   );
+  hover && rmb_down ? ( new_val = _sld_default(mem); mem[5] = 1; );
   lmb_down && hover && !mem[1] && !mem[5] ? (
     mem[1] = 1;
     mem[2] = mx;
     mem[3] = cur_val;
+    _rk_drag_mod = _sld_mods();
   );
   mem[1] && LMB ? (
+    _sld_mods() != _rk_drag_mod ? ( mem[2] = mx; mem[3] = cur_val; _rk_drag_mod = _sld_mods(); );   // re-anchor
     dx = mx - mem[2];
     sens = CTRL ? (w * 4) : SHIFT ? (w * 16) : w;
     raw = _sld_clamp(mem[3] + dx / sens, 0, 1);
@@ -492,15 +530,18 @@ function sld_bipolar_interact(mem, x, y, w, h, cur_val)
 
   hover && lmb_down ? (
     now = time_precise();
-    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = 0.5; mem[5] = 1; );
+    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = _sld_default(mem); mem[5] = 1; );
     mem[4] = now;
   );
+  hover && rmb_down ? ( new_val = _sld_default(mem); mem[5] = 1; );
   lmb_down && hover && !mem[1] && !mem[5] ? (
     mem[1] = 1;
     mem[2] = mx;
     mem[3] = cur_val;
+    _rk_drag_mod = _sld_mods();
   );
   mem[1] && LMB ? (
+    _sld_mods() != _rk_drag_mod ? ( mem[2] = mx; mem[3] = cur_val; _rk_drag_mod = _sld_mods(); );   // re-anchor
     dx = mx - mem[2];
     sens = CTRL ? (w * 4) : SHIFT ? (w * 16) : w;
     new_val = _sld_clamp(mem[3] + dx / sens, 0, 1);
@@ -561,16 +602,19 @@ function sld_mini_interact(mem, x, y, w, h, cur_val)
 
   hover && lmb_down ? (
     now = time_precise();
-    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = 0.5; mem[5] = 1; );
+    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = _sld_default(mem); mem[5] = 1; );
     mem[4] = now;
   );
+  hover && rmb_down ? ( new_val = _sld_default(mem); mem[5] = 1; );
   lmb_down && hover && !mem[1] && !mem[5] ? (
     mem[1] = 1;
     new_val = _sld_clamp((mx - x) / w, 0, 1);
     mem[2] = mx;
     mem[3] = new_val;
+    _rk_drag_mod = _sld_mods();
   );
   mem[1] && LMB ? (
+    _sld_mods() != _rk_drag_mod ? ( mem[2] = mx; mem[3] = cur_val; _rk_drag_mod = _sld_mods(); );   // re-anchor
     dx = mx - mem[2];
     sens = CTRL ? (w * 4) : SHIFT ? (w * 16) : w;
     new_val = _sld_clamp(mem[3] + dx / sens, 0, 1);
@@ -677,9 +721,10 @@ function sld_arc_interact(mem, cx, cy, r, arc_thick, cur_val)
 
   hover && lmb_down ? (
     now = time_precise();
-    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = 0.5; mem[5] = 1; );
+    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = _sld_default(mem); mem[5] = 1; );
     mem[4] = now;
   );
+  hover && rmb_down ? ( new_val = _sld_default(mem); mem[5] = 1; );
   lmb_down && hover && !mem[1] && !mem[5] ? (
     mem[1] = 1;
     mem[2] = my;
@@ -776,6 +821,7 @@ function sld_range_interact(mem, x, y, w, h, cur_lo, cur_hi)
     );
     mem[4] = now;
   );
+  hover && rmb_down ? ( new_lo = 0.25; new_hi = 0.75; mem[5] = 1; );
 
   lmb_down && hover && !mem[1] && !mem[5] ? (
     lo_d = abs(mx - lo_x);
@@ -788,9 +834,11 @@ function sld_range_interact(mem, x, y, w, h, cur_lo, cur_hi)
     // rewritten every frame, so anchoring the drag on it made each frame
     // add the whole displacement again. The anchor needs its own slot.
     mem[9] = cur_hi;
+    _rk_drag_mod = _sld_mods();
   );
 
   mem[1] && LMB ? (
+    _sld_mods() != _rk_drag_mod ? ( mem[2] = mx; mem[3] = cur_lo; mem[9] = cur_hi; _rk_drag_mod = _sld_mods(); );   // re-anchor
     dx = mx - mem[2];
     sens = CTRL ? (w * 4) : SHIFT ? (w * 16) : w;
     mem[7] == 0 ? (
@@ -890,9 +938,10 @@ function sld_vled_interact(mem, x, y, w, h, cur_val)
 
   hover && lmb_down ? (
     now = time_precise();
-    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = 0.5; mem[5] = 1; );
+    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = _sld_default(mem); mem[5] = 1; );
     mem[4] = now;
   );
+  hover && rmb_down ? ( new_val = _sld_default(mem); mem[5] = 1; );
   lmb_down && hover && !mem[1] && !mem[5] ? (
     mem[1] = 1;
     new_val = _sld_clamp(1 - (my - y) / h, 0, 1);
@@ -1009,15 +1058,18 @@ function sld_vgroove_interact(mem, x, y, w, h, cur_val)
 
   hover && lmb_down ? (
     now = time_precise();
-    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = 0.5; mem[5] = 1; );
+    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = _sld_default(mem); mem[5] = 1; );
     mem[4] = now;
   );
+  hover && rmb_down ? ( new_val = _sld_default(mem); mem[5] = 1; );
   lmb_down && hover && !mem[1] && !mem[5] ? (
     mem[1] = 1;
     mem[2] = my;
     mem[3] = cur_val;
+    _rk_drag_mod = _sld_mods();
   );
   mem[1] && LMB ? (
+    _sld_mods() != _rk_drag_mod ? ( mem[2] = my; mem[3] = cur_val; _rk_drag_mod = _sld_mods(); );   // re-anchor
     dy = mem[2] - my;
     sens = CTRL ? (h * 4) : SHIFT ? (h * 16) : h;
     new_val = _sld_clamp(mem[3] + dy / sens, 0, 1);
@@ -1064,17 +1116,20 @@ function sld_vbipolar_interact(mem, x, y, w, h, cur_val)
   // Double-click → reset to center (0.5)
   hover && lmb_down ? (
     now = time_precise();
-    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = 0.5; mem[5] = 1; );
+    (now - mem[4] < RK_DBLCLICK_T) ? ( new_val = _sld_default(mem); mem[5] = 1; );
     mem[4] = now;
   );
+  hover && rmb_down ? ( new_val = _sld_default(mem); mem[5] = 1; );
   // Start drag
   lmb_down && hover && !mem[1] && !mem[5] ? (
     mem[1] = 1;
     mem[2] = my;
     mem[3] = cur_val;
+    _rk_drag_mod = _sld_mods();
   );
   // Continue drag (inverted: up = increase)
   mem[1] && LMB ? (
+    _sld_mods() != _rk_drag_mod ? ( mem[2] = my; mem[3] = cur_val; _rk_drag_mod = _sld_mods(); );   // re-anchor
     dy = mem[2] - my;
     sens = CTRL ? (h * 4) : SHIFT ? (h * 16) : h;
     new_val = _sld_clamp(mem[3] + dy / sens, 0, 1);

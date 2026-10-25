@@ -51,15 +51,19 @@ local last_tr     = nil
 local opened_once = false
 
 -- The captured kinds: their canvas lives in a dock pane, so displaying them in
--- the chain would show chrome with no drawing surface. Matched on fx_ident
--- (stable), display-name substring as a pre-6.37 fallback.
+-- the chain would show chrome with no drawing surface. Matched on the basename
+-- of fx_ident compared whole (Swing's set is rk_lua_core's core.is_swing_fx,
+-- written out: this script loads nothing; a substring also took renamed copies),
+-- display-name substring as a pre-6.37 fallback.
 local function is_captured_kind(tr, fx)
   local ok, ident = reaper.TrackFX_GetNamedConfigParm(tr, fx, "fx_ident")
-  local hay = (ok and ident or ""):lower()
-  if hay == "" then
-    local _, nm = reaper.TrackFX_GetFXName(tr, fx, "")
-    hay = (nm or ""):lower()
+  if ok and ident and ident ~= "" then
+    local f = ((ident or ""):match("[^/\\]+$") or ""):lower()
+    return f == "swing_reakit.jsfx" or f == "swing_lite.jsfx" or f == "drumkit_reakit.jsfx"
+        or f == "eon_stepseq.jsfx"
   end
+  local _, nm = reaper.TrackFX_GetFXName(tr, fx, "")
+  local hay = (nm or ""):lower()
   return hay:find("swing_reakit", 1, true) or hay:find("swing_lite", 1, true)
       or hay:find("eon_stepseq", 1, true) or hay:find("swing", 1, true)
       and hay:find("reakit", 1, true) or false

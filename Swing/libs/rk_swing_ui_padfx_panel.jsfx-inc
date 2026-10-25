@@ -1,0 +1,153 @@
+// rk_swing_ui_padfx_panel.jsfx-inc
+// Swing: the PAD EDITOR AS A PANEL with two pages -- SOUND, the whole per-pad editor (the overlay's sections, in the overlay's
+// order), and SYNTH, the drum synth's editor (rk_swing_ui_synthview's body) -- each laid out
+// NARROW for the column at the side of the pads (the overlay's own 420 x 560) or WIDE for the slot below the pads (two
+// columns: the name bar and the colours across the top; layers, mode, volume, waveform and envelope on the left; the EQ,
+// the filters, FX, sends and the buttons on the right). The user, 2026-10-22: "I want it all" -- the pad editor below the
+// pads as an option beside the sequencer and the browser (the render: editor_below.png).
+// (c) EON Studios — All Rights Reserved
+//
+// Imported after the overlay's sections (rk_swing_ui_grid_overlay / _fx) and BEFORE the sequencer's UI, which draws the
+// wide form in the bottom slot (rk_seq_ui swing_seq_under_draw, bot_panel 3); the side slot (rk_swing_ui_padfx_side, after
+// the sequencer) draws the narrow form. EEL2 knows a function only once it has been defined, so the form that two slots
+// share lives here, below both.
+//
+// THE MOUSE: the sections read the FRAME's globals (lmb_down, LMB, rmb_down, frame_wheel) as the caller left them -- the
+// side slot hands its stash in, the bottom slot's draw already runs on its own stash -- and this draw SPENDS them (zeros
+// after the sections), so a press reaches the editor's controls once and nothing after. A modal up (a popup, another
+// editor) hands the sections none, so a drag can never run in two places. While the pad editor itself is open over the
+// pads (the compact faces), the panel shows a note instead.
+@init
+PFX_EDITOR_H = 560;      // the editor's own height (the overlay's op_h): the narrow form is laid out for at least this
+PFX_BOTTOM_H_B = 300;    // the wide form's default height below the pads, design px (its two columns need ~280)
+PFX_BOTTOM_MIN_B = 300;  // and its floor: shorter and the bottom buttons would run into the sends
+PFX_PAGE_H = 22;         // the page chips' row at the top of the panel, design px
+SIDE_TAB_H = 22;         // the side slot's top row (its tabs or titles), design px -- here, below the bottom slot's gate, which reads the need
+
+// The height the side slot NEEDS for what is open in it: the editor's column is laid out for PFX_EDITOR_H under the tab
+// row (the browser and the sequencer fold to any height). The bottom slot's gate keeps the pads' area at least this
+// tall, so the panel below gives up height before the editor's bottom is cut (the user, 2026-10-22: "the bottom gets
+// chopped off when resized").
+function swing_side_need_h() ( (pfx_open && fx_place != 3) ? swing_px(PFX_EDITOR_H + SIDE_TAB_H) : 0; );
+
+// The editor's ask when it is placed below the pads (fx_place 3): its dragged height (fx_h, gate 82, 0 = the default) or
+// the default.
+function swing_pfx_req_h() (
+  fx_h > 0 ? max(swing_px(PFX_BOTTOM_MIN_B), min(2000, fx_h | 0)) : swing_px(PFX_BOTTOM_H_B);
+);
+
+// The SOUND page: the editor's sections for the pad clicked last, in (x, y, w, h); wide = the two-column form.
+function swing_pfx_sections_draw(x, y, w, h, wide)
+local(_ps_sel, _ps_tile, _ps_tw, _ps_th, _ps_cw, _ps_cw2, _ps_m,
+      _ps_oi, _ps_opx, _ps_opy, _ps_opw, _ps_oph, _ps_kr, _ps_ky, _ps_pr, _ps_pg, _ps_pb)
+(
+  _ps_sel = (sel_pad >= 0 && sel_pad < NUM_SLOTS) ? (sel_pad | 0) : -1;
+  _ps_sel >= 0 ? (
+    // the sections, handed their rectangles through the editor's own globals, which are put back after
+    _ps_oi = oi; _ps_opx = op_x; _ps_opy = op_y; _ps_opw = op_w; _ps_oph = op_h; _ps_kr = knob_r; _ps_ky = krow_y;
+    _ps_pr = pr; _ps_pg = pgg; _ps_pb = pb;
+    oi = _ps_sel;
+    _ps_tile = swing_pad_tile(_ps_sel) * 3;
+    swing_pad_bank(_ps_sel) == bank_cur ? ( pr = col_rgba[_ps_tile]; pgg = col_rgba[_ps_tile + 1]; pb = col_rgba[_ps_tile + 2]; )
+                                        : ( pr = 0.50; pgg = 0.50; pb = 0.55; );
+    _ui_modal_up ? ( lmb_down = 0; LMB = 0; rmb_down = 0; frame_wheel = 0; );
+    !wide ? (
+      // NARROW: the overlay's own stack. op_h is the editor's 560 at least: a shorter column lets the lower part run
+      // under whatever paints after this slot (the sequencer's panel owns the clicks below its top).
+      op_x = x; op_y = y; op_w = w; op_h = max(h, PFX_EDITOR_H);
+      _ov_draw_header_and_colorpicker();          // the ground, the border, the PAD N -- name bar, the colour swatches and hue slider
+      overlay_layer >= MAX_LAYERS ? overlay_layer = 0;
+      _ov_draw_layers_and_mode();                 // L1..L4, the mode menu, TIGHT / LOOSE and VOL
+      _ov_draw_waveform_and_adsr();               // the waveform, its trim and envelope, the ATK .. OFS knobs (sets knob_r and krow_y)
+      _ov_draw_eq_and_filters();                  // the EQ display with its nodes, the HPF / LPF markers
+      _ov_draw_fx_knobs();                        // HPF LPF RESO | RATE BITS DRIVE COMP | DLY RVB SMSH
+      _ov_draw_buttons();                         // Out, LEARN, CHK, GLOBAL, REV; Clear Layer, Clear Pad -- 66 px above op_y + op_h
+    ) : (
+      // WIDE: two columns (the sections lay themselves out from op_w: the knob rows spread, the waveform and the EQ take the
+      // column's width) -- the left one 56 % of the room, so the TIGHT / LOOSE / VOL row (its own width 350) fits from a
+      // 700 px window up (the pictures of 2026-10-22: at a half split the VOL box ran into the EQ); the right one, knob rows
+      // of seven and four, takes the rest. The name bar and the colour row span the panel.
+      _ps_m = swing_px(10); _ps_cw = ((w - 3 * _ps_m) * 0.56) | 0; _ps_cw2 = w - 3 * _ps_m - _ps_cw;
+      op_x = x; op_y = y; op_w = w; op_h = max(h, swing_px(PFX_BOTTOM_MIN_B));
+      _ov_draw_header_and_colorpicker();
+      overlay_layer >= MAX_LAYERS ? overlay_layer = 0;
+      op_x = x + _ps_m; op_w = _ps_cw;            // the left column: layers, mode, volume (op_y + 48), the waveform (op_y + 100 / 54) and the envelope knobs
+      _ov_draw_layers_and_mode();
+      _ov_draw_waveform_and_adsr();
+      op_x = x + 2 * _ps_m + _ps_cw; op_w = _ps_cw2;   // the right column: the EQ at the top under the colour row -- its anchor is the
+      krow_y = y + swing_px(50) - knob_r * 2 - 38; // envelope row's bottom (fxk_y = krow_y + knob_r * 2 + 38), set for it -- then FX, sends
+      _ov_draw_eq_and_filters();
+      _ov_draw_fx_knobs();
+      _ov_draw_buttons();                         // at the panel's bottom (op_y + op_h - 66 / - 38), right-aligned in the column
+    );
+    // a file dropped from the OS on the panel: the overlay's own drop -- the layer tab under it, else the layer shown
+    // (the panel took no drop at all; the audit, 2026-10-22)
+    !_ui_modal_up && mouse_x >= x && mouse_x < x + w && mouse_y >= y && mouse_y < y + h ? _ov_take_drop();
+    lmb_down = 0; LMB = 0; rmb_down = 0; frame_wheel = 0;   // spent
+    pfx_hpf_cx = op_x + (op_w / 7) * 0.5; pfx_hpf_cy = eq_dy + eq_dh + 4 + 10 + 11 + 2;   // the HPF knob's centre, for the rig (the column it is in)
+    pfx_sw_x0 = _sw_x0; pfx_sw_w = _sw_w; pfx_sw_y = _cp_y;                                 // the colour swatch row, for the rig
+    oi = _ps_oi; op_x = _ps_opx; op_y = _ps_opy; op_w = _ps_opw; op_h = _ps_oph; knob_r = _ps_kr; krow_y = _ps_ky;
+    pr = _ps_pr; pgg = _ps_pg; pb = _ps_pb;
+  );
+);
+
+// ── The page chips: SOUND | SYNTH at the panel's top, and the pad's name after them. A click picks the page (pfx_page,
+// saved under gate 82); a pad with its synth on and no sample opens on SYNTH when the panel opens for it
+// (swing_synthview_open), a pad with layers on SOUND (swing_padfx_open): the openers set the page, the chips let you look
+// at the other. ──
+function swing_pfx_pages_draw(x, y, w, h, sel)
+local(_pg_i, _pg_x, _pg_cw, _pg_hot, _pg_tw, _pg_th)
+(
+  gfx_set(_fb_gr * 0.62, _fb_gg * 0.62, _fb_gb * 0.62, 1); gfx_rect(x, y, w, h);
+  rk_font(1, swing_fs(9), 'b');
+  _pg_cw = swing_px(70);
+  pfx_pg_cx0 = x + swing_px(4) + _pg_cw * 0.5; pfx_pg_cx1 = pfx_pg_cx0 + _pg_cw + swing_px(4); pfx_pg_cy = y + h * 0.5;   // for the rig
+  _pg_i = 0; _pg_x = x + swing_px(4);
+  loop(2,
+    _pg_hot = mx >= _pg_x && mx < _pg_x + _pg_cw && my >= y && my < y + h;
+    pfx_page == _pg_i ? gfx_set(0.25, 0.47, 0.68, 1) : gfx_set(_fb_gr * 0.78, _fb_gg * 0.78, _fb_gb * 0.78, _pg_hot ? 1 : 0.9);
+    gfx_rect(_pg_x, y + 2, _pg_cw, h - 4);
+    gfx_set(1, 1, 1, pfx_page == _pg_i ? 1 : 0.7);
+    gfx_measurestr(_pg_i == 0 ? "SOUND" : "SYNTH", _pg_tw, _pg_th);
+    gfx_x = _pg_x + (_pg_cw - _pg_tw) * 0.5; gfx_y = y + (h - _pg_th) * 0.5; gfx_drawstr(_pg_i == 0 ? "SOUND" : "SYNTH");
+    _pg_hot ? swing_tooltip_check(1491 + _pg_i, _pg_i == 0 ? "The pad's sound: layers, envelope, EQ, filters, FX and sends." : "The pad's drum synth: family, type, macros, level and velocity window.");
+    _pg_hot && lmb_down ? ( pfx_page = _pg_i; mark_dirty(); );
+    _pg_x += _pg_cw + swing_px(4); _pg_i += 1;
+  );
+  sel >= 0 ? (
+    swing_pad_lbl(sel, #pfx_lbl); sprintf(#pfx_ttl, "%s  %s", #pfx_lbl, get_name_slot(sel));
+    gfx_set(_fb_tc, _fb_tc, _fb_tc, 0.7); gfx_measurestr(#pfx_ttl, _pg_tw, _pg_th);
+    _pg_tw < w - (_pg_x - x) - swing_px(8) ? ( gfx_x = _pg_x + swing_px(6); gfx_y = y + (h - _pg_th) * 0.5; gfx_drawstr(#pfx_ttl); );
+  );
+);
+
+// ── The panel: what both slots draw -- the ground, the notes (the pad editor open over the pads in a compact face; no pad
+// clicked yet), the page chips and the page. (x, y, w, h) = the whole panel; wide = the form below the pads. The mouse:
+// the frame's globals as the caller left them; a modal up hands the panel none; spent after. ──
+function swing_pfx_panel_draw(x, y, w, h, wide)
+local(_pp_sel, _pp_tw, _pp_th, _pp_ph, _pp_ld, _pp_lc, _pp_rd, _pp_wh)
+(
+  pfx_px = x; pfx_py = y; pfx_pw = w; pfx_ph = h; pfx_wide = wide;
+  swing_fb_ground();
+  gfx_set(_fb_gr * 0.86, _fb_gg * 0.86, _fb_gb * 0.86, 1); gfx_rect(x, y, w, h);
+  _ui_modal_up ? ( lmb_down = 0; LMB = 0; rmb_down = 0; frame_wheel = 0; );
+  _pp_sel = (sel_pad >= 0 && sel_pad < NUM_SLOTS) ? (sel_pad | 0) : -1;
+  overlay_pad >= 0 || _pp_sel < 0 ? (
+    gfx_set(0.15, 0.16, 0.19, 1); gfx_rect(x, y, w, h);
+    rk_font(1, swing_fs(10), 0); gfx_set(_fb_tc, _fb_tc, _fb_tc, 0.6);
+    strcpy(#pfx_ttl, overlay_pad >= 0 ? "The pad editor is open over the pads." : "Click a pad: its editor shows here.");
+    gfx_measurestr(#pfx_ttl, _pp_tw, _pp_th);
+    gfx_x = x + (w - _pp_tw) * 0.5; gfx_y = y + swing_px(24); gfx_drawstr(#pfx_ttl);
+  ) : (
+    // the page first, the chips OVER it: the synth body paints its panel from its own top, which is the chips' row (its
+    // header's 26 px are the chips'), and painted first it hid them (the pictures of 2026-10-22); the pages' controls
+    // start below the row, so the order changes nothing for the mouse
+    _pp_ph = swing_px(PFX_PAGE_H);
+    _pp_ld = lmb_down; _pp_lc = LMB; _pp_rd = rmb_down; _pp_wh = frame_wheel;   // the row reads the frame's press after the page (the sound page spends it)
+    pfx_page == 1 ? swing_synth_body_draw(x, y + _pp_ph - 26, w, h - _pp_ph + 26, _pp_sel, 0, wide)
+                  : swing_pfx_sections_draw(x, y + _pp_ph, w, h - _pp_ph, wide);
+    lmb_down = _pp_ld; LMB = _pp_lc; rmb_down = _pp_rd; frame_wheel = _pp_wh;
+    swing_pfx_pages_draw(x, y, w, _pp_ph, _pp_sel);
+  );
+  lmb_down = 0; LMB = 0; rmb_down = 0; frame_wheel = 0;   // spent
+);

@@ -232,6 +232,11 @@ local function resolve_kit_label()
 end
 
 local function do_build(slot)
+  -- Pad Banks step 5a: Drum Matrix lanes are bank A's (v1); the bands carry the bank on screen.
+  if slot ~= nil and swing_state.SlotBankCur(slot) ~= 0 then
+    r.ShowMessageBox("Drum Matrix lanes follow pad bank A.\nShow bank A in Swing (click tab A, or run 'EON: Swing bank A') and build again.", "EON DM Build Stereo", 0)
+    return
+  end
   local lo, hi = resolve_note_range(slot)
   local label = resolve_kit_label()
 

@@ -106,11 +106,19 @@ name_bar ? ( gfx_ext_flags = (gfx_ext_flags | 0x100) - 0x100; ) : ( gfx_ext_flag
 // relocated band (26090000..26090063). Was 26045000, which collided with
 // StepSeq's EON_SS_PCTRL_BASE slot-0 NAV_SEQ bump-counter (same semantics —
 // a strip re-init faked a preset-nav event). MUST match rk_lua_core.lua
-// GS_STRIP_REINIT_PULSE. Also fires harmlessly on
-// samplerate change / fresh insert / project load (the sync's restore is a no-op
-// unless a param is actually sitting at default while the band holds non-default).
+// GS_STRIP_REINIT_PULSE.
+// ⚠ ONCE PER INSTANCE (2026-10-14). @init also re-runs on every play start and
+// every enable (wiki 3.2: no ext_noinit here), and a re-run cannot wipe a slider
+// -- only a fresh instance can come up with a stale chunk. But every re-run
+// bumped this counter, so the sync's 8 s restore window opened at every play
+// start: a knob the user reset to its default in those seconds was put back to
+// its old value by the "wipe" restore, and no edit made in the window was
+// recorded as durable. Globals survive a re-run (the @serialize below is
+// non-empty) and are zero in a fresh instance, so the flag tells the two apart:
+// the pulse now fires on load / fresh insert / project load / a true
+// re-instantiation, never on play start or enable. Rig: EON_Probe_StripPulse.
 GS_STRIP_REINIT_PULSE = 26090100;
-gmem[GS_STRIP_REINIT_PULSE] = gmem[GS_STRIP_REINIT_PULSE] + 1;
+!strip_pulse_sent ? ( gmem[GS_STRIP_REINIT_PULSE] = gmem[GS_STRIP_REINIT_PULSE] + 1; strip_pulse_sent = 1; );
 
 // ─── EON "One Rack" theme listener ───────────────────────────────────────
 // Reads the unified theme band the Swing bridge publishes into the shared
@@ -267,7 +275,7 @@ local(_mode, _amt, _atk_ms, _rel_ms, _ratio, _knee, _max_thresh, _thresh, _sr, _
   strip_cmp_at_c      = exp(-1 / (_sr * _atk_ms * 0.001));
   strip_cmp_rel_c     = exp(-1 / (_sr * _rel_ms * 0.001));
   strip_cmp_inv_ratio = 1 / max(_ratio, 1.0001);
-  strip_cmp_thresh    = _thresh;
+  strip_cmp_thresh    = _thresh;        // @sample glides toward the threshold, the knee's width (hi - lo), the ratio (click fix 2026-10-14)
   strip_cmp_knee_lo   = _thresh - _knee * 0.5;
   strip_cmp_knee_hi   = _thresh + _knee * 0.5;
   strip_cmp_knee_inv  = _knee > 0 ? 1 / (2 * _knee) : 0;
@@ -418,8 +426,27 @@ local(_aL, _aR, _svf, _bc_hold,
     strip_cmp_prime ? (
       strip_cmp_env = _cmp_det;
       strip_cmp_makeup_lin_s = strip_cmp_makeup_lin;
+      // the curve's glides seat too (click fix 2026-10-14): a re-engage is a new curve, not a slide from the last one
+      strip_cmp_thresh_s = strip_cmp_thresh; strip_cmp_knee_s = strip_cmp_knee_hi - strip_cmp_knee_lo;
+      strip_cmp_inv_ratio_s = strip_cmp_inv_ratio; strip_cmp_klo_lin_s = strip_cmp_knee_lo_lin;
       strip_cmp_prime = 0;
     );
+    // The compressor CURVE glides (click fix 2026-10-14; Click_Fix_Plan step 7). Comp
+    // Amount scales the threshold, and the threshold, knee and ratio used to swap in one
+    // sample: a 0.2 step on the stress tone at a jump to 0.4. The four targets strip_recalc
+    // sets are chased here at the makeup's ~10 ms -- in dB for the curve, so the GR formula
+    // sees a sliding knee rather than a jump, and linearly for the "below the knee" shortcut,
+    // which is only an optimisation: the dB guard below keeps the curve exact in the moments
+    // the two disagree. Seated at load and at every re-engage (above), so a default render
+    // and a steady setting compute exactly what they did before. The knee's width is read
+    // off the two knee targets (no new shared name for the gfx/audio gate to learn).
+    strip_cmp_thresh_s    += (strip_cmp_thresh      - strip_cmp_thresh_s)    * strip_gain_sm_c;
+    strip_cmp_knee_s      += ((strip_cmp_knee_hi - strip_cmp_knee_lo) - strip_cmp_knee_s) * strip_gain_sm_c;
+    strip_cmp_inv_ratio_s += (strip_cmp_inv_ratio   - strip_cmp_inv_ratio_s) * strip_gain_sm_c;
+    strip_cmp_klo_lin_s   += (strip_cmp_knee_lo_lin - strip_cmp_klo_lin_s)   * strip_gain_sm_c;
+    _cmp_klo  = strip_cmp_thresh_s - strip_cmp_knee_s * 0.5;
+    _cmp_khi  = strip_cmp_thresh_s + strip_cmp_knee_s * 0.5;
+    _cmp_kinv = strip_cmp_knee_s > 0.001 ? 1 / (2 * strip_cmp_knee_s) : 0;
     _cmp_det > strip_cmp_env
       ? strip_cmp_env = _cmp_det + (strip_cmp_env - _cmp_det) * strip_cmp_at_c
       : strip_cmp_env = _cmp_det + (strip_cmp_env - _cmp_det) * strip_cmp_rel_c;
@@ -429,16 +456,18 @@ local(_aL, _aR, _svf, _bc_hold,
     // 35 s (PUNCH) to 212 s (SQUASH) afterwards. 64 lin = +36 dBFS, far above any
     // real peak, so it never touches legitimate material.
     strip_cmp_env = min(max(strip_cmp_env, STRIP_CMP_DENORM), 64);
-    strip_cmp_env < strip_cmp_knee_lo_lin ? (
+    strip_cmp_env < strip_cmp_klo_lin_s ? (
       _cmp_lin = 1.0;
       strip_cmp_gr_vis = 0;          // GUI: no gain reduction
     ) : (
       _cmp_lev = log(strip_cmp_env) * 8.6858896381;  // 20/log(10)
-      _cmp_lev <= strip_cmp_knee_hi && strip_cmp_knee_inv > 0 ? (
-        _cmp_gr = (strip_cmp_inv_ratio - 1) * (_cmp_lev - strip_cmp_knee_lo)
-                  * (_cmp_lev - strip_cmp_knee_lo) * strip_cmp_knee_inv;
+      _cmp_lev < _cmp_klo ? (
+        _cmp_gr = 0;                 // the linear shortcut lagged the sliding knee: below the knee = no GR
+      ) : _cmp_lev <= _cmp_khi && _cmp_kinv > 0 ? (
+        _cmp_gr = (strip_cmp_inv_ratio_s - 1) * (_cmp_lev - _cmp_klo)
+                  * (_cmp_lev - _cmp_klo) * _cmp_kinv;
       ) : (
-        _cmp_gr = (_cmp_lev - strip_cmp_thresh) * (strip_cmp_inv_ratio - 1);
+        _cmp_gr = (_cmp_lev - strip_cmp_thresh_s) * (strip_cmp_inv_ratio_s - 1);
       );
       abs(_cmp_gr - strip_cmp_last_gr) > 0.05 ? (
         strip_cmp_last_lin = exp(_cmp_gr * 0.11512925465);
@@ -499,8 +528,8 @@ local(_aL, _aR, _svf, _bc_hold,
   // continuous track audio that spat a brief overload (comp makeup applied
   // before the envelope establishes; filter settling). Fade the whole output in
   // (linear, ~25 ms — see strip_ss_step) so the transient is faded, not clipped. strip_ss_gain is
-  // 1 in steady state (no cost beyond the compare); armed to 0 in @init on
-  // re-init and re-armed in @slider when the restore lands.
+  // 1 in steady state (no cost beyond the compare); armed to 0 by a later @init
+  // only (play start, enable, device reopen). It is never re-armed by a slider.
   strip_ss_gain < 1.0 ? strip_ss_gain = min(1.0, strip_ss_gain + strip_ss_step);
   // Soft-clip the trimmed signal (tames filter/comp/drive overshoots → no 0 dBFS
   // overload), then apply the re-engage fade.
@@ -653,6 +682,9 @@ local(fkm, nv, on, dv, dmin, dmax, dsym, iv, imin, imax, idef, kn_s,
     (ki == 0 || ki == 1) ? gfx_set(sk_kbr, sk_kbg, sk_kbb, 1) : (_th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.78, 0.80, 0.84, 1));
     gfx_measurestr(#sk_lbl, tw, th); gfx_x = cx - tw/2; gfx_y = cy + r + 2; gfx_drawstr(#sk_lbl);
     _th_live ? setcolor_band(3, 255, 1.0) : gfx_set(0.58, 0.60, 0.64, 1);
+    // The value is bold from 10 px only (all three layouts): bold Arial at
+    // 8-9 px draws 5 as 6 and 6, 9 as 8 (wiki 4.7). The label stays bold.
+    gfx_setfont(1, "Arial", fk, fk >= 10 ? 'b' : 0);
     gfx_measurestr(#sk_val, tw, th); gfx_x = cx - tw/2; gfx_y = cy + r + 2 + th; gfx_drawstr(#sk_val);
     plx = cx - tw/2 - 3; ply = cy + r + 4 + 2 * th;
   ) : lay == 1 ? (
@@ -660,6 +692,7 @@ local(fkm, nv, on, dv, dmin, dmax, dsym, iv, imin, imax, idef, kn_s,
     gfx_setfont(1, "Arial", max(8, floor(9*kn_s)), 'b'); _th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.70, 0.72, 0.75, 1);
     gfx_measurestr(#sk_lbl, tw, th); gfx_x = lx; gfx_y = cy - th - 1; gfx_drawstr(#sk_lbl);
     _th_live ? setcolor_band(3, 255, 1.0) : gfx_set(0.55, 0.57, 0.60, 1);
+    gfx_setfont(1, "Arial", max(8, floor(9*kn_s)), floor(9*kn_s) >= 10 ? 'b' : 0);
     gfx_measurestr(#sk_val, tw, th); gfx_x = max(lx, strip_col_x2 - tw); gfx_y = cy - th - 1; gfx_drawstr(#sk_val);
     plx = lx; ply = cy + 2;
   ) : lay == 3 ? (
@@ -672,6 +705,7 @@ local(fkm, nv, on, dv, dmin, dmax, dsym, iv, imin, imax, idef, kn_s,
     (ki == 0 || ki == 1) ? gfx_set(sk_kbr, sk_kbg, sk_kbb, 1) : (_th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.82, 0.84, 0.88, 1));
     gfx_measurestr(#sk_lbl, tw, th); gfx_x = cx - tw/2; gfx_y = cy - r - th - floor(1*kn_s); gfx_drawstr(#sk_lbl);
     !sk_has_pill ? (
+      gfx_setfont(1, "Arial", max(9, min(floor(r * 0.62), 15)), min(floor(r * 0.62), 15) >= 10 ? 'b' : 0);
       gfx_measurestr(#sk_val, tw, th); _th_live ? setcolor_band(2, 220, 1.0) : gfx_set(0.72, 0.74, 0.78, 1);
       gfx_x = cx - tw/2; gfx_y = cy + r + floor(2*kn_s); gfx_drawstr(#sk_val);
     );
@@ -877,6 +911,9 @@ strip_recalc();
 strip_out_lin_s = strip_out_lin;
 strip_sat_drv_s = strip_sat_drv;
 strip_cmp_makeup_lin_s = strip_cmp_makeup_lin;
+// ...and the compressor curve's glides (click fix 2026-10-14): threshold, knee width, ratio, the knee's linear gate
+strip_cmp_thresh_s = strip_cmp_thresh; strip_cmp_knee_s = strip_cmp_knee_hi - strip_cmp_knee_lo;
+strip_cmp_inv_ratio_s = strip_cmp_inv_ratio; strip_cmp_klo_lin_s = strip_cmp_knee_lo_lin;
 _ini_i = 0; loop(STRIP_NUM_SVF,   // _ini_i not `i` — see the svf_init loop above
   svf_snap(strip_svf + _ini_i * SVF_STEREO_SIZE);
   _ini_i += 1;
@@ -884,14 +921,20 @@ _ini_i = 0; loop(STRIP_NUM_SVF,   // _ini_i not `i` — see the svf_init loop ab
 strip_svf_glide();   // (one-pole fallback coeff; unused while smooth2 mode is on)
 svf_set_smooth2_ms(STRIP_SMOOTH_MS);   // use the 2nd-order smoother (see STRIP_SMOOTH_MS)
 // Re-engage soft-start arming. The FIRST @init (fresh load) keeps the snap above
-// (no fade-in, as before). A LATER @init is a RE-instantiation (audio-device
-// close on minimize) → arm the output fade (strip_ss_gain 0→1 in @sample) so the
-// cold-state re-engage transient is masked. strip_ss_until is the window during
-// which the sync's restore (a slider push that can land seconds later, after an
-// instance rebuild) re-arms the fade; matches the sync's REINIT_HOLD.
+// (no fade-in, as before). A LATER @init → arm the output fade (strip_ss_gain 0→1
+// in @sample) so the cold-state re-engage transient is masked. A later @init is
+// NOT only the audio-device close on minimize: without ext_noinit REAPER re-runs
+// @init on EVERY play start and every enable (wiki §3.2, measured), so this fade
+// runs then too — harmless, ~25 ms.
+// ⛔ 2026-10-03: the 8 s "strip_ss_until" window that also zeroed strip_ss_gain on
+// ANY @slider is gone. It was armed by every play start, so automation, the GUI's
+// hidden view/dirty sliders, or a sync push in the first 8 s of playback cut the
+// output to silence and faded it back in, over and over (the stress harness
+// flagged all 32 sliders with the same 0.48 step). The restore it guarded is
+// covered at source: the filters glide (rk_svf 2nd-order smoother) and the
+// compressor envelope is primed (strip_process).
 strip_ss_gain = strip_init_seen ? 0.0 : 1.0;
 strip_init_seen = 1;
-strip_ss_until = time_precise() + 8.0;
 
 // ── Per-surface press latches ────────────────────────────────────────
 // ⚠⚠ VERBATIM from Swing_ReaKit.jsfx (swing_srf_load / swing_srf_store, D-3,
@@ -974,11 +1017,7 @@ function rk_srf_store()
 );
 
 @slider
-// Inside the post-re-instantiation window, a slider change is the sync restoring
-// our saved FX onto the cold strip → re-arm the output soft-start so the
-// re-engage transient is faded in instead of spat out as an overload. (A manual
-// tweak in this brief window just gets a soft ~150 ms fade-in — harmless.)
-(strip_ss_until > 0 && time_precise() < strip_ss_until) ? strip_ss_gain = 0.0;
+// (No soft-start re-arm here any more: see the arming note in @init, 2026-10-03.)
 strip_recalc();
 
 @block
@@ -1010,10 +1049,17 @@ strip_snap_req ? (
 @sample
 strip_process();
 
-@gfx 300 700
+@gfx 300 900
 // ═══ EON house GUI — Swing's per-pad FX section as a channel strip ═══════
 // Default size is PORTRAIT (tall) so REAPER gives the MCP/TCP embed a tall area
-// (it sizes embeds to this aspect — same trick as 1175's @gfx 580 1050). An
+// (it sizes embeds to this aspect — same trick as 1175's @gfx 580 1050). A mixer
+// strip's face is its width x this shape, as long as the FX area is that tall
+// (wiki 4.5): 300 x 700 gave 86 x 200 in REAPER's default strip, too short for
+// VU + graph + three knob rows (the user, 2026-10-15: "can we make the embedded
+// view taller?"); 300 x 900 gives 86 x 258, the same as both EQ strips. ⚠️ The
+// Floatter's SIZES row keys a fresh window on this line, and EON Output, Macros
+// and Patchbay copy this exact shape so they line up beside it in the mixer:
+// change all of them together. An
 // embedded portrait strip gets the channel-strip views (VU · graph · knob grid /
 // full column); the floating window (any aspect) and wide embeds get the reflow
 // DECK: one layout whose card columns follow the width (see "Layout" below).
@@ -1045,7 +1091,10 @@ rk_srf_load();
 lmb_down = LMB && !prev_LMB;
 // Face sheet open (rk_vu_picker, called last): widgets drawn before it must
 // not see this click. Stash the press edge; the picker call restores it.
-_svu_pk_lmb = lmb_down; !micro_view && strip_vu.pk_open ? lmb_down = 0;
+// ⚠️Stashed ONLY while the sheet is open: closed, the picker takes what the
+// widgets leave, so a click the THEME panel swallowed cannot also open it
+// (GainKit's FOLLOW chip did, 2026-09-28; wiki 4.5).
+_svu_pk_lmb = 0; !micro_view && strip_vu.pk_open ? ( _svu_pk_lmb = lmb_down; lmb_down = 0; );
 rmb_down = RMB && !prev_RMB;
 CTRL  = _srf_cap & 4;
 SHIFT = _srf_cap & 8;
@@ -1301,44 +1350,104 @@ zm_theme = strip_vu_style >= 0 ? (strip_vu_style | 0) : strip_vu_theme();
 // that sit 4-across, 2x2 or stacked depending on WIDTH only; height just decides
 // how tall the graph gets. Every knob exists at every size.
 emb_strip ? (
-  // ── PORTRAIT — vertical channel strip (the mixer/TCP embed, or a narrowed
-  // floating window). Top→bottom: [VU mode2] · EQ graph · 2-col×4-row knob grid.
+  // ── PORTRAIT — vertical channel strip (the mixer/TCP embed). Top→bottom:
+  // [VU modes 2-3] · EQ graph · the 3x3 knob grid (modes 1-2) or the knob column (mode 3).
+  // ⚠️ FIT (wiki 4.11; the user, 2026-10-15: "drum strip when embedded gets cut off at
+  // the bottom"). Every knob row is sized from the text strip_knob() really draws,
+  // MEASURED here at the fonts it uses, never from a fixed reserve. In REAPER's default
+  // mixer strip (86 x 200 for the old 300 x 700 shape) the old split -- half the height
+  // for the grid, 32 px of text per row -- gave 25 px rows to knobs that need ~37: the
+  // rows ran into each other and the bottom row's values fell off the face; FULL's 11 px
+  // rows were worse. What doesn't fit FOLDS, in this order, and no row is drawn clipped:
+  // the VU face becomes the thin level bar, then the knobs go (the graph alone, its
+  // nodes still live). The knob radius solves from what is left, floor 6.
   emb_mode = max(0, min(3, strip_view_mode | 0));
   top_off  = 0;   // embed: no header chrome
   _avail   = gfx_h - top_off;
-  // VU on top (mode 2): the analog house meter; thin level bar if too short.
-  vu_show = (emb_mode == 2 || emb_mode == 3) && _avail >= 100 * ret && gfx_w >= 70 * ret;
-  vu_bar  = (emb_mode == 2 || emb_mode == 3) && !vu_show;
-  // Size the VU band by WIDTH (≈ w*0.53) so the box hugs the meter face. The
+  eq_knobs = 0; deck_rows = 0;
+  eq_dx = floor(3 * ret); eq_dw = gfx_w - floor(6 * ret);
+  vu_x = eq_dx; vu_y = top_off + 1; vu_w = eq_dw;   // VU band across the top
+  // VU on top (modes 2-3): the analog house meter, or the thin level bar when the
+  // face doesn't fit. Size the face by WIDTH (≈ w*0.53) so the box hugs the meter. The
   // face fills from its top down to ~0.52*w (zm_face_bot = y + 0.04h + ~0.5*w),
   // so 0.53*w leaves only a ~3 px margin — any dead frame band below the dial
   // (the grey gap before the EQ graph) is removed and the graph rises to meet it.
   // Stay above 0.49*w or gsc (min(w/500, h/245)) flips height-limited + shrinks
   // the dial. Still capped at ~45% of height so short panels keep graph+knob room.
-  vu_h    = vu_show ? max(floor(52 * ret), min(floor((gfx_w - floor(6 * ret)) * 0.53), floor(_avail * 0.45)))
-          : vu_bar  ? floor(6 * ret) : 0;
-  eq_knobs = 0; deck_rows = 0;
-  eq_dx = floor(3 * ret); eq_dw = gfx_w - floor(6 * ret);
-  vu_x = eq_dx; vu_y = top_off + 1; vu_w = eq_dw;   // VU band across the top
+  _vu_ok   = _avail >= 100 * ret && gfx_w >= 70 * ret;
+  _vu_face = max(floor(52 * ret), min(floor((gfx_w - floor(6 * ret)) * 0.53), floor(_avail * 0.45)));
+  _vu_barh = floor(6 * ret);
+  _eq_min  = floor(32 * ret);   // the graph's floor while knobs share the strip
   emb_mode == 3 ? (
     // FULL: single-column strip — thin "EON STRIP" band, compact EQ graph, then
-    // an 8-knob column (FILTERS/FX/OUT). The band is embed-only (the floating
-    // window already shows the brand in its header). kgrid is off; the dedicated
-    // branch after the kgrid block draws the column.
-    fullcol = 1; kgrid_show = 0; kgrid_h = 0;
+    // a 6-knob column (FX DRIVE·COMP, OUT TRIM, SENDS DLY·RVB·SMSH). The band is
+    // embed-only (the floating window already shows the brand in its header). kgrid
+    // is off; the dedicated branch after the kgrid block draws the column.
+    kgrid_show = 0; kgrid_h = 0;
     strip_band_h = micro_view ? floor(14 * ret) : 0;
-    _after = max(0, _avail - vu_h - strip_band_h);
+    // Measured text (fonts as strip_knob lay 1 and the section headers below): label /
+    // value line, the DRIVE/COMP pill, a section header with its rule.
+    gfx_setfont(1, "Arial", max(8, floor(9 * ret)), 'b');
+    gfx_measurestr("Xy", _tw, fc_th); gfx_measurestr("DRIVE", fc_lw, _th);
+    gfx_setfont(1, "Arial", max(8, floor(9 * ret)), floor(9 * ret) >= 10 ? 'b' : 0);
+    gfx_measurestr("100%", fc_vw, _th);
+    gfx_setfont(1, "Arial", max(7, floor(7 * ret)), 'b'); gfx_measurestr("Xy", _tw, _th); fc_ph = _th + 2;
+    gfx_setfont(1, "Arial", max(7, floor(8 * ret)), 'b'); gfx_measurestr("Xy", _tw, _th); fc_hh = _th + floor(3 * ret);
+    // Radius cap from the width: knob · gap · "DRIVE" · "100%" across the column.
+    fc_rcap = max(6, min(floor(18 * ret), floor((eq_dw - floor(16 * ret) - fc_lw - fc_vw - 3) / 2)));
+    // Column height at radius 6: 3 headers + 2 pill rows (label above the centre line,
+    // pill below it) + 4 plain rows, 1 px apart; +4 for the gaps above and below it.
+    fc_need = 3 * fc_hh + 2 * (max(6, fc_th + 1) + max(6, 2 + fc_ph) + 1) + 4 * (max(6, fc_th + 1) + 6 + 1);
+    _kneed  = fc_need + floor(4 * ret);
+    vu_show = _vu_ok && (_avail - _vu_face - strip_band_h - 1 >= _eq_min + _kneed
+                         || _avail - _vu_barh - strip_band_h - 1 < _eq_min + _kneed);
+    vu_bar  = !vu_show;
+    vu_h    = vu_show ? _vu_face : _vu_barh;
+    _after  = max(0, _avail - vu_h - strip_band_h - 1);
+    fullcol = _after >= _eq_min + _kneed;
     eq_dy = top_off + vu_h + strip_band_h + 1;
-    eq_dh = max(floor(40 * ret), floor(_after * 0.30));   // graph carries the filter nodes; column = FX/OUT only
+    // The graph keeps its old 30 % while the column fits beside it, then gives way
+    // down to its floor; alone, it takes everything.
+    eq_dh = fullcol ? max(_eq_min, min(floor(_after * 0.30), _after - _kneed))
+                    : max(floor(16 * ret), gfx_h - eq_dy - 1);
+    fullcol ? (
+      fc_colh = gfx_h - (eq_dy + eq_dh + floor(2 * ret)) - floor(2 * ret);
+      fc_r = fc_rcap;
+      loop(max(0, fc_rcap - 6),
+        fc_need = 3 * fc_hh + 2 * (max(fc_r, fc_th + 1) + max(fc_r, 2 + fc_ph) + 1) + 4 * (max(fc_r, fc_th + 1) + fc_r + 1);
+        fc_need > fc_colh ? fc_r -= 1;
+      );
+      fc_need = 3 * fc_hh + 2 * (max(fc_r, fc_th + 1) + max(fc_r, 2 + fc_ph) + 1) + 4 * (max(fc_r, fc_th + 1) + fc_r + 1);
+    );
     eq_show_labels = 0;
   ) : (
-    // Knob grid (modes 1 & 2): 3 columns × 2 rows under the graph, with labels.
+    // Knob grid (modes 1 & 2): 3 columns × 3 rows under the graph, label above each
+    // knob, value (or the DRIVE/COMP pill) below. Measured at the radius the column
+    // width allows -- a smaller radius only shrinks the font (strip_knob lay 3).
     fullcol = 0; strip_band_h = 0;
-    kgrid_show = emb_mode >= 1 && (_avail - vu_h) >= 70 * ret;
-    kgrid_h    = kgrid_show ? floor((_avail - vu_h) * 0.50) : 0;
+    kg_colw = eq_dw / 3;
+    kg_rcap = max(6, floor(kg_colw * 0.30));
+    gfx_setfont(1, "Arial", max(9, min(floor(kg_rcap * 0.62), 15)), 'b'); gfx_measurestr("Xy", _tw, kg_th);
+    gfx_setfont(1, "Arial", max(7, floor(7 * ret)), 'b'); gfx_measurestr("Xy", _tw, _th);
+    kg_top = kg_th + floor(1 * ret);                                     // label above the knob
+    kg_bot = floor(2 * ret) + max(kg_th, _th + 2) + floor(2 * ret);      // value / pill below, then a gap
+    _kneed = 3 * (kg_top + 12 + kg_bot);                                 // three rows at radius 6
+    // The face stays when the rows fit beside it, or when they won't fit even with the
+    // bar (then it is face + graph, as before).
+    vu_show = emb_mode == 2 && _vu_ok && (_avail - _vu_face - 1 >= _eq_min + _kneed
+                                          || _avail - _vu_barh - 1 < _eq_min + _kneed);
+    vu_bar  = emb_mode == 2 && !vu_show;
+    vu_h    = vu_show ? _vu_face : vu_bar ? _vu_barh : 0;
+    _below  = _avail - vu_h - 1;
+    kgrid_show = emb_mode >= 1 && _below >= _eq_min + _kneed;
+    // Half the strip, as before, or what the rows need at the width's radius when
+    // that is more; never past the graph's floor.
+    kgrid_h = kgrid_show ? min(_below - _eq_min, max(floor(_below * 0.50), 3 * (kg_top + 2 * kg_rcap + kg_bot))) : 0;
+    kg_r    = kgrid_show ? max(6, min(kg_rcap, floor((kgrid_h / 3 - kg_top - kg_bot) / 2))) : 6;
     eq_dy = top_off + vu_h + 1;
     eq_dh = max(floor(16 * ret), gfx_h - eq_dy - kgrid_h - 1);
-    eq_show_labels = gfx_h >= 170 * ret;
+    // Node dB labels only where the graph has room for them above / below a node.
+    eq_show_labels = gfx_h >= 170 * ret && eq_dh >= 48 * ret;
   );
 ) : (
   // ── REFLOW DECK ──
@@ -1390,6 +1499,13 @@ emb_strip ? (
   card_h = deck_rows > 0 ? floor(2 * cp + ch_hdr + 2 * kr + 3 * _th0 + 10) : 0;
   deck_h = deck_rows * card_h + max(0, deck_rows - 1) * _gap;
   deck_y = gfx_h - _m - deck_h;
+  // A SQUEEZED embed lands here too: a mixer FX area shorter than 1.2 x the strip's
+  // width (the portrait test). When the deck can't sit under the graph's floor the
+  // graph shows alone, never a deck drawn from above the face's top (86 x 97 asked
+  // for three card rows of ~80 px each). The floating window is untouched.
+  micro_view && deck_rows > 0 && deck_y - _gap < top_off + _m + _vu_top_h + ((vu_top || vu_bar) ? _gap : 0) + floor(16 * ret) ? (
+    deck_rows = 0; card_h = 0; deck_h = 0; deck_y = gfx_h - _m;
+  );
   // Graph (and VU) take what remains between the header and the deck.
   _lgy = top_off + _m;
   _lgh = max(floor(16 * ret), deck_y - (deck_rows > 0 ? _gap : 0) - _lgy - _vu_top_h - ((vu_top || vu_bar) ? _gap : 0));
@@ -1448,8 +1564,9 @@ gfx_x = eq_dx + (2 - _log_lo) / _log_range * eq_dw + 1;       gfx_y = eq_dy + eq
 gfx_x = eq_dx + (3 - _log_lo) / _log_range * eq_dw + 1;       gfx_y = eq_dy + eq_dh - 9; gfx_drawstr("1k");
 gfx_x = eq_dx + (4 - _log_lo) / _log_range * eq_dw + 1;       gfx_y = eq_dy + eq_dh - 9; gfx_drawstr("10k");
 
-// HPF/LPF markers (colored verticals like the overlay; cutoff + shared-Q text)
-gfx_setfont(1, "Arial", eq_fs, 'b');
+// HPF/LPF markers (colored verticals like the overlay; cutoff + shared-Q text).
+// Bold from 10 px only: bold Arial at 8-9 px draws 5 as 6 and 6, 9 as 8 (wiki 4.7).
+gfx_setfont(1, "Arial", eq_fs, eq_fs >= 10 ? 'b' : 0);
 strip_hpf > 25 ? (
   _hpf_px = eq_dx + (log10(strip_hpf) - _log_lo) / _log_range * eq_dw;
   eq_show_labels ? (
@@ -1728,7 +1845,7 @@ _pill_hov = 0;   // DRIVE/COMP pill hover — keeps 0x200 cleared over the pill 
 
 // Node dB (+Q) labels, only when non-flat (suppressed in tiny embeds)
 eq_show_labels ? (
-gfx_setfont(1, "Arial", eq_fs, 'b');
+gfx_setfont(1, "Arial", eq_fs, eq_fs >= 10 ? 'b' : 0);   // numbers: bold from 10 px (wiki 4.7)
 strip_eq_lo != 0 ? (
   gfx_set(0.85, 0.65, 0.20, 0.9);
   strip_eq_lo_q != 0.7071 ? sprintf(#fkv, "%+.0f Q%.1f", strip_eq_lo, strip_eq_lo_q)
@@ -1795,17 +1912,19 @@ eq_knobs ? (
 // order), Row 3 = the sends DLY·RVB·SMSH — the smash send joined 2026-08-25
 // (it always existed on the floating strip; the embed's third-row cell sat
 // empty, and the strip is THE fast path to the smash bus).
-// RATE/BITS are floating-only. Knob radius leaves room for the label + value.
+// RATE/BITS are floating-only. Radius and row text come from the layout block
+// (kg_r, kg_top, kg_bot: measured, so the rows always fit the face).
 kgrid_show ? (
   kg_y0   = eq_dy + eq_dh;
   kg_colw = eq_dw / 3;
   kg_rowh = kgrid_h / 3;   // 3 rows: FILTERS · DRIVE/COMP/TRIM · DLY/RVB/SMSH
-  // Reserve ~32 px/row for the (now larger) label-above + value-below text.
-  kg_r    = max(6, min(floor(kg_colw * 0.30), floor((kg_rowh - 32 * ret) * 0.5)));
+  // The knob is centred on its CONTENT (label above, value or pill below), not on
+  // the row: the two sides are not the same height.
+  kg_cyo  = (kg_rowh - (kg_top + 2 * kg_r + kg_bot)) * 0.5 + kg_top + kg_r;
   kg_p    = 0;
   loop(9,
     kg_ki = kg_p == 0 ? 0 : kg_p == 1 ? 1 : kg_p == 2 ? 2 : kg_p == 3 ? 5 : kg_p == 4 ? 6 : kg_p == 5 ? 7 : kg_p == 6 ? 8 : kg_p == 7 ? 9 : 10;
-    strip_knob(kg_ki, eq_dx + kg_colw * ((kg_p % 3) + 0.5), kg_y0 + kg_rowh * ((kg_p / 3 | 0) + 0.5), kg_r, 3);
+    strip_knob(kg_ki, eq_dx + kg_colw * ((kg_p % 3) + 0.5), kg_y0 + kg_rowh * (kg_p / 3 | 0) + kg_cyo, kg_r, 3);
     _kn_hov |= (strip_km + kg_ki * KS)[6];   // KS slot 6 = hover, for 0x200 gating
     kg_p += 1;
   );
@@ -1819,28 +1938,27 @@ kgrid_show ? (
 // legible at normal embed heights. strip_knob() carries all drag / wheel /
 // pill-cycle interaction; this block only lays out the rows + section headers.
 // The value column right-aligns to strip_col_x2. Hover is OR'd into _kn_hov. ──
+// "EON STRIP" brand band (embed-only) just above the compact graph -- drawn even
+// when the column has folded away, since its height is still reserved.
+strip_band_h > 0 ? (
+  _by = top_off + vu_h;
+  _th_live ? setcolor_band(1, 255, 1.0) : gfx_set(0.16, 0.17, 0.20, 1);
+  gfx_rect(eq_dx, _by, eq_dw, strip_band_h);
+  gfx_setfont(1, "Arial", max(8, floor(10 * ret)), 'b');
+  gfx_set(0.95, 0.62, 0.12, 1); gfx_x = eq_dx + floor(4 * ret); gfx_y = _by + floor(1 * ret); gfx_drawstr("EON ");
+  _th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.80, 0.82, 0.86, 1); gfx_drawstr("STRIP");
+);
 fullcol ? (   // embedded portrait only (the floating window runs the deck)
   strip_col_x2 = eq_dx + eq_dw - floor(4 * ret);
-  // "EON STRIP" brand band (embed-only) just above the compact graph.
-  strip_band_h > 0 ? (
-    _by = top_off + vu_h;
-    _th_live ? setcolor_band(1, 255, 1.0) : gfx_set(0.16, 0.17, 0.20, 1);
-    gfx_rect(eq_dx, _by, eq_dw, strip_band_h);
-    gfx_setfont(1, "Arial", max(8, floor(10 * ret)), 'b');
-    gfx_set(0.95, 0.62, 0.12, 1); gfx_x = eq_dx + floor(4 * ret); gfx_y = _by + floor(1 * ret); gfx_drawstr("EON ");
-    _th_live ? setcolor_band(2, 255, 1.0) : gfx_set(0.80, 0.82, 0.86, 1); gfx_drawstr("STRIP");
-  );
   // Knob column under the graph: compact knob-left / label-right (lay 1), the
-  // approved mixer look, left-aligned at a small fixed radius.
+  // approved mixer look. Rows are the MEASURED heights from the layout block
+  // (fc_th label line, fc_ph pill, fc_hh header; fc_r solved to fit, fc_need their
+  // sum); the column's spare height is spread evenly over its 9 items.
   col_y0  = eq_dy + eq_dh + floor(2 * ret);
   col_h   = max(0, gfx_h - col_y0 - floor(2 * ret));
-  // 6 knob rows (FX DRIVE·COMP, OUT TRIM, SENDS DLY·RVB·SMSH) + 3 section
-  // headers (~0.6 row each) → 6 + 1.8 = 7.8 row-units.
-  row_h   = col_h / 7.8;
-  hdr_h   = row_h * 0.6;
+  _fc_add = max(0, col_h - fc_need) / 9;
   flay = 1;
-  kr = max(6, min(floor(row_h * 0.42), floor(18 * ret)));
-  knob_cx = eq_dx + floor(6 * ret) + kr;
+  knob_cx = eq_dx + floor(6 * ret) + fc_r;
   _cy = col_y0;
   kp = 0;
   loop(6,
@@ -1852,14 +1970,17 @@ fullcol ? (   // embedded portrait only (the floating window runs the deck)
       kp == 0 ? strcpy(#secn, "FX") : kp == 2 ? strcpy(#secn, "OUT") : strcpy(#secn, "SENDS");
       gfx_setfont(1, "Arial", max(7, floor(8 * ret)), 'b');
       _th_live ? setcolor_band(3, 230, 1.0) : gfx_set(0.58, 0.60, 0.68, 0.9);
-      gfx_x = eq_dx + floor(4 * ret); gfx_y = _cy + floor(1 * ret); gfx_drawstr(#secn);
+      gfx_x = eq_dx + floor(4 * ret); gfx_y = _cy + _fc_add + floor(1 * ret); gfx_drawstr(#secn);
       _th_live ? setcolor_band(6, 128, 1.0) : gfx_set(0.22, 0.23, 0.28, 0.5);
-      gfx_rect(eq_dx + floor(4 * ret), _cy + hdr_h - floor(1 * ret), eq_dw - floor(8 * ret), 1);
-      _cy += hdr_h;
+      gfx_rect(eq_dx + floor(4 * ret), _cy + _fc_add + fc_hh - floor(1 * ret), eq_dw - floor(8 * ret), 1);
+      _cy += fc_hh + _fc_add;
     );
-    strip_knob(ki_i, knob_cx, _cy + row_h * 0.5, kr, flay);
+    // Label line above the centre; the DRIVE/COMP pill below it (lay 1).
+    _fc_up = max(fc_r, fc_th + 1);
+    _fc_dn = kp <= 1 ? max(fc_r, 2 + fc_ph) : fc_r;
+    strip_knob(ki_i, knob_cx, _cy + _fc_add * 0.5 + _fc_up, fc_r, flay);
     _kn_hov |= (strip_km + ki_i * KS)[6];   // KS slot 6 = hover, for 0x200 gating
-    _cy += row_h;
+    _cy += _fc_up + _fc_dn + 1 + _fc_add;
     kp += 1;
   );
 );
@@ -1917,10 +2038,11 @@ fullcol ? (   // embedded portrait only (the floating window runs the deck)
   gfx_rect(ds_dd_x, ds_dd_y, ds_dd_w, ds_dd_h);
   _th_live ? setcolor_band(7, 200, 1.0) : gfx_set(0.40, 0.42, 0.48, 0.9);            // border
   gfx_rect(ds_dd_x, ds_dd_y, ds_dd_w, ds_dd_h, 0);
+  // KNOB rows are row = id since the Rainbow Arc took 9 (3f099d4); the old
+  // "above 8, one row down" map marked the row above the knob in use.
   _ddcur = ds_dd_kind == 1 ? (strip_view_mode | 0)
          : ds_dd_kind == 2 ? ((strip_vu_style | 0) + 1)
-         : ((gmem[GS_THEME_KNOB_P] | 0) <= 8 ? gmem[GS_THEME_KNOB_P] | 0
-                                             : (gmem[GS_THEME_KNOB_P] | 0) - 1);
+         : (gmem[GS_THEME_KNOB_P] | 0);
   _ddr = 0;
   loop(ds_dd_n,
     _ddry = ds_dd_y + 1 + _ddr * ds_dd_rh;
@@ -1958,8 +2080,8 @@ micro_view && !_kn_hov && !_pill_hov && _nhov == 0 && sk_node_active == 0 ? gfx_
 // floating only, and only when the dial was drawn this frame. A pick is the
 // user's face override, persisted exactly like a dropdown pick. ──
 !micro_view && strip_vu_pk ? (
-  lmb_down = _svu_pk_lmb;
-  _svu_pk = rk_vu_picker(vu_x, vu_y, vu_w, vu_h, zm_theme);
+  _svu_pk_lmb ? lmb_down = _svu_pk_lmb;    // the stash, only when the sheet took the click
+  _svu_pk = strip_vu.rk_vu_picker(vu_x, vu_y, vu_w, vu_h, zm_theme);
   _svu_pk >= 0 ? ( strip_vu_style = _svu_pk; strip_view_touch += 1; slider_automate(2^22); );
 );
 strip_vu_pk = 0;

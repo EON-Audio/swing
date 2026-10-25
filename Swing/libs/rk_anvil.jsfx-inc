@@ -579,14 +579,19 @@ function anv_det(tap)
   local(sc, rect, di, fy, sba, gq, sig, r1, r2, r3, qq, vnew, wnew, snew) (
   // sidechain high-pass: keeps the kick from owning the detector. Control
   // path only — the audio never passes through it.
-  anv_schp_on ? (
-    fy = anv_shp_b0*tap + anv_shp_b1*shx1 + anv_shp_b2*shx2
-       - anv_shp_a1*shy1 - anv_shp_a2*shy2;
-    abs(fy) < 0.000000000001 ? fy = 0;   // denormal flush on the recursion
-    shx2 = shx1; shx1 = tap;
-    shy2 = shy1; shy1 = fy;
-    tap = fy;
-  );
+  // The filter RUNS whether or not SC HP is in (click fix 2026-10-14): its state
+  // stays continuous, so switching it in no longer starts from four zeros, and
+  // what the detector sees is a 5 ms BLEND (anv_schp_w, walked in anv_process)
+  // of the raw tap and the filtered one -- not a one-sample swap of its input,
+  // which the stress gate heard as a 0.040 step on the tone at SC HP -> off.
+  // At weight 0 the last line returns the raw tap EXACTLY (x + 0), so the
+  // default (off) path is bit-identical to before.
+  fy = anv_shp_b0*tap + anv_shp_b1*shx1 + anv_shp_b2*shx2
+     - anv_shp_a1*shy1 - anv_shp_a2*shy2;
+  abs(fy) < 0.000000000001 ? fy = 0;   // denormal flush on the recursion
+  shx2 = shx1; shx1 = tap;
+  shy2 = shy1; shy1 = fy;
+  tap = tap + (fy - tap)*anv_schp_w;
 
   // amp ceiling (asymmetric), full-wave rectify, biased diode, timing cap
   sc = tap*anv_drive;
@@ -962,18 +967,26 @@ anv_ingain_t  = pow(10, (ANV_REFDRIVE + anv_inatten)/20);
   anv_sm_k3  = anv_tk_ksc*anv_sm_id3;
   anv_sm_ks  = anv_sm_k1 + anv_sm_k2 + anv_sm_k3;
 
+  // The ratio switch sets three constants: the sidechain drive, the diode bias
+  // and the diode table row. TARGETS since the click fix of 2026-10-14 --
+  // @sample (anv_process) walks anv_drive / anv_bias / anv_dioi to them over
+  // the front panel's 5 ms, seated at @init. The hardware's buttons switch the
+  // bias network in an instant and the stress gate heard exactly that: a 0.056
+  // step on the tone at a ratio change. Control, not circuit state: the timing
+  // cap, the envelope and the self-bias are untouched.
   anv_ridx  = anv_sl_ratio|0;
-  anv_drive = anv_ridx == 0 ? ANV_DRV0 : anv_ridx == 1 ? ANV_DRV1 :
-              anv_ridx == 2 ? ANV_DRV2 : anv_ridx == 3 ? ANV_DRV3 : ANV_DRV4;
-  anv_bias  = anv_ridx == 0 ? ANV_BIAS0 : anv_ridx == 1 ? ANV_BIAS1 :
-              anv_ridx == 2 ? ANV_BIAS2 : anv_ridx == 3 ? ANV_BIAS3 : ANV_BIAS4;
+  anv_drive_t = anv_ridx == 0 ? ANV_DRV0 : anv_ridx == 1 ? ANV_DRV1 :
+                anv_ridx == 2 ? ANV_DRV2 : anv_ridx == 3 ? ANV_DRV3 : ANV_DRV4;
+  anv_bias_t  = anv_ridx == 0 ? ANV_BIAS0 : anv_ridx == 1 ? ANV_BIAS1 :
+                anv_ridx == 2 ? ANV_BIAS2 : anv_ridx == 3 ? ANV_BIAS3 : ANV_BIAS4;
   anv_rth   = anv_ridx == 0 ? ANV_RTH0 : anv_ridx == 1 ? ANV_RTH1 :
               anv_ridx == 2 ? ANV_RTH2 : anv_ridx == 3 ? ANV_RTH3 : ANV_RTH4;
   // what the diode sees, instantaneously: source floor + wiper-side pot
-  // segment + the bias ladder. Converted to a fractional table row HERE.
+  // segment + the bias ladder. Converted to a fractional table row HERE (the
+  // row is interpolated, so a glided fraction is a glided diode).
   anv_dior = ANV_RDSRC + anv_tk_rb + anv_rth;
-  anv_dioi = log(anv_dior/ANV_DIO_RLO)*ANV_IDDR;
-  anv_dioi < 0 ? anv_dioi = 0 : ( anv_dioi > ANV_DIO_NR - 1.0001 ? anv_dioi = ANV_DIO_NR - 1.0001 );
+  anv_dioi_t = log(anv_dior/ANV_DIO_RLO)*ANV_IDDR;
+  anv_dioi_t < 0 ? anv_dioi_t = 0 : ( anv_dioi_t > ANV_DIO_NR - 1.0001 ? anv_dioi_t = ANV_DIO_NR - 1.0001 );
 
   anv_railn = ANV_RAIL*(1 - ANV_ASYM);
   anv_mixw_t = anv_sl_mix;
@@ -990,29 +1003,29 @@ anv_ingain_t  = pow(10, (ANV_REFDRIVE + anv_inatten)/20);
   anv_iron_t = max(0, min(1, anv_sl_iron));
 
   // sidechain HP: RBJ biquad at the EFFECTIVE rate (trig never in @sample)
+  // Below 20 Hz the control reads "off". The coefficients are derived ALWAYS
+  // (click fix 2026-10-14): the biquad runs whether or not SC HP is in, so its
+  // state is continuous when it is switched in -- it used to start from four
+  // zeros, cleared right here, a write into live detector state that @sample
+  // now reads every tick, so that clearing is gone. Off = the filter sits at
+  // 20 Hz and the blend weight walks to 0, where the detector sees the raw tap
+  // exactly (anv_det). anv_schp_wt is the TARGET; anv_process walks anv_schp_w.
   anv_schp_on = anv_sl_schp >= 20;
-  anv_schp_on ? (
-    // ANV_SRSAFE, not srate. This was the ONE place still reading the host
-    // rate raw, which reopened exactly the hole ANV_SRSAFE exists to close:
-    // @init supports being handed srate = 0 and @init calls anv_recalc(), so
-    // a preset restored with SC HP already ON would have divided by zero at
-    // load. Default-off hid it; a recalled state would not have.
-    anv_shw = 2*$pi*anv_sl_schp/(ANV_SRSAFE*anv_osf);
-    anv_shc = cos(anv_shw);
-    anv_shal = sin(anv_shw)/1.4142135623731;
-    anv_sha0 = 1 + anv_shal;
-    anv_shp_b0 = (1 + anv_shc)*0.5/anv_sha0;
-    anv_shp_b1 = -(1 + anv_shc)/anv_sha0;
-    anv_shp_b2 = anv_shp_b0;
-    anv_shp_a1 = -2*anv_shc/anv_sha0;
-    anv_shp_a2 = (1 - anv_shal)/anv_sha0;
-  ) : (
-    // Looks like the same live-state write @block now owns, and is not:
-    // @sample gates the whole biquad on anv_schp_on, so with SC HP off
-    // nothing reads these. Clearing them here has no reader to race.
-    dl.shx1 = dl.shx2 = dl.shy1 = dl.shy2 = 0;
-    dr.shx1 = dr.shx2 = dr.shy1 = dr.shy2 = 0;
-  );
+  anv_schp_wt = anv_schp_on ? 1 : 0;
+  // ANV_SRSAFE, not srate. This was the ONE place still reading the host
+  // rate raw, which reopened exactly the hole ANV_SRSAFE exists to close:
+  // @init supports being handed srate = 0 and @init calls anv_recalc(), so
+  // a preset restored with SC HP already ON would have divided by zero at
+  // load. Default-off hid it; a recalled state would not have.
+  anv_shw = 2*$pi*max(20, anv_sl_schp)/(ANV_SRSAFE*anv_osf);
+  anv_shc = cos(anv_shw);
+  anv_shal = sin(anv_shw)/1.4142135623731;
+  anv_sha0 = 1 + anv_shal;
+  anv_shp_b0 = (1 + anv_shc)*0.5/anv_sha0;
+  anv_shp_b1 = -(1 + anv_shc)/anv_sha0;
+  anv_shp_b2 = anv_shp_b0;
+  anv_shp_a1 = -2*anv_shc/anv_sha0;
+  anv_shp_a2 = (1 - anv_shal)/anv_sha0;
 
   // voice: publish a crossfade TARGET and nothing else. @sample walks the
   // weight to it. This is now a single scalar write of a 0 or a 1 -- there is
@@ -1177,6 +1190,11 @@ function anv_engine_init(mem_start) local(_m) (
   anv_ingain  = anv_ingain_t;   // seated, or the plugin fades in on load
   anv_outgain = anv_outgain_t;
   anv_mixw    = anv_mixw_t;
+  // the ratio's three constants and the SC HP blend start AT their targets (click fix 2026-10-14)
+  anv_drive   = anv_drive_t;
+  anv_bias    = anv_bias_t;
+  anv_dioi    = anv_dioi_t;
+  anv_schp_w  = anv_schp_wt;
 
                                 // (face and bezel are set at draw time)
   _m;   // next free address, the way cmp_init returns it
@@ -1365,6 +1383,19 @@ function anv_process(inL, inR) (
     abs(anv_mixw - anv_mixw_t) < 0.000000001 ? anv_mixw = anv_mixw_t;
     abs(anv_iron - anv_iron_t) < 0.000000001 ? anv_iron = anv_iron_t;
     anv_im0b  = ANV_LAMDC*ANV_ILM + anv_iron*(ANV_IM0 - ANV_LAMDC*ANV_ILM);
+    // The two SWITCHES (click fix 2026-10-14): the ratio's three constants
+    // (sidechain drive, diode bias, diode table row) and the SC HP blend weight
+    // walk at the same 5 ms as the front-panel gains, and snap on arrival so a
+    // steady setting computes exactly what the targets say. Control, not
+    // circuit state -- see anv_recalc for what each one is.
+    anv_drive  += (anv_drive_t  - anv_drive )*ANV_SMC;
+    anv_bias   += (anv_bias_t   - anv_bias  )*ANV_SMC;
+    anv_dioi   += (anv_dioi_t   - anv_dioi  )*ANV_SMC;
+    anv_schp_w += (anv_schp_wt  - anv_schp_w)*ANV_SMC;
+    abs(anv_drive  - anv_drive_t ) < 0.000000001 ? anv_drive  = anv_drive_t;
+    abs(anv_bias   - anv_bias_t  ) < 0.000000001 ? anv_bias   = anv_bias_t;
+    abs(anv_dioi   - anv_dioi_t  ) < 0.000000001 ? anv_dioi   = anv_dioi_t;
+    abs(anv_schp_w - anv_schp_wt ) < 0.000000001 ? anv_schp_w = anv_schp_wt;
 
     // walk the blue weight toward its target, clamping on arrival at EITHER
     // end -- a reversal mid-walk is just a sign change here, no reset.

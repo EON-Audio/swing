@@ -14,6 +14,12 @@
 --       ├── lane 1..15                       I_FOLDERDEPTH = 0
 --       └── lane 16                          I_FOLDERDEPTH = -2   ← closes DM AND parent
 --
+-- Pad Banks Outputs step 2: inside the audio sub, "Bank A" (P_EXT:EON_BANK_FOLDER) folds
+-- the sixteen multi-outs, and each bank B-D track (P_EXT:EON_BANK_TRACK) folds the pads
+-- split off from its bank; a bank group runs to the next bank header or the first Swing
+-- return. Those headers never count as sub-folders of the parent. The sub's own close is
+-- added to what its last child already closes (Bank D's last split: -1 + -2 = -3).
+--
 -- Key invariant: the LAST child of the LAST sub-folder closes the parent
 -- (depth -2). Every other sub-folder's last child closes only its own sub
 -- (depth -1). Run-after-build means insertion order is irrelevant — build
@@ -145,7 +151,25 @@ local function _is_tagged_sub_header(tr)
   return false
 end
 
+-- Pad Banks Outputs step 2: the Audio sub holds folders of its own -- "Bank A" (P_EXT:EON_BANK_FOLDER, a bus over
+-- the sixteen pad tracks) and the bank B, C, D tracks (P_EXT:EON_BANK_TRACK, each the folder of the pads split
+-- off from its bank). They open a folder, but INSIDE the Audio sub: never a sub-folder of the parent.
+local function _is_bank_header(tr)
+  local _, a = reaper.GetSetMediaTrackInfo_String(tr, 'P_EXT:EON_BANK_FOLDER', '', false)
+  if a and a ~= '' then return true end
+  local _, b = reaper.GetSetMediaTrackInfo_String(tr, 'P_EXT:EON_BANK_TRACK', '', false)
+  return b ~= nil and b ~= ''
+end
+local function _is_swing_return(tr)
+  for _, k in ipairs({ 'P_EXT:EON_VERB_RETURN', 'P_EXT:EON_DELAY_RETURN', 'P_EXT:EON_SMASH_RETURN' }) do
+    local _, v = reaper.GetSetMediaTrackInfo_String(tr, k, '', false)
+    if v and v ~= '' then return true end
+  end
+  return false
+end
+
 local function _is_sub_header(tr, d)
+  if _is_bank_header(tr) then return false end
   if d >= 1 then return true end
   return _is_tagged_sub_header(tr)
 end
@@ -223,8 +247,9 @@ local function _walk_parent_contents(swing_track)
         if not lane or lane == '' then break end
       else
         -- Audio outs aren't individually tagged; accept depth-0 tracks, stop at
-        -- anything opening a new folder (untagged d>=1) — outside our group.
-        if cd >= 1 then break end
+        -- anything opening a new folder (untagged d>=1) — outside our group. A bank
+        -- folder (Outputs step 2) opens one INSIDE the Audio sub: it belongs.
+        if cd >= 1 and not _is_bank_header(c) then break end
       end
       entries[#entries + 1] = { track = c, role = 'subfolder_child', original_depth = cd }
       i = i + 1
@@ -286,11 +311,32 @@ function M.EnsureSwingParentLayout(swing_track)
 
   -- Pass 2: for each real sub-folder, set header +1 and last child to
   -- -1 (or -2 if it's the FINAL sub-folder — closes parent too).
+  -- Bank folders inside it (Outputs step 2): a bank header opens a group that runs to the next bank header or the
+  -- first Swing return; a group with members opens (+1) and its last member closes it (-1), a group without stays a
+  -- plain track. The sub's own close is ADDED to whatever its last child already closes. A sub without bank headers
+  -- (the DM sub, a pre-step-2 Audio sub) comes out exactly as before.
   for sub_idx, s in ipairs(real_subs) do
     reaper.SetMediaTrackInfo_Value(s.header, 'I_FOLDERDEPTH', 1)
+    local cur
+    for _, c in ipairs(s.children) do
+      if _is_bank_header(c) then
+        if cur and cur.last then reaper.SetMediaTrackInfo_Value(cur.last, 'I_FOLDERDEPTH', -1) end
+        cur = { header = c, last = nil }
+        reaper.SetMediaTrackInfo_Value(c, 'I_FOLDERDEPTH', 0)
+      elseif _is_swing_return(c) then
+        if cur and cur.last then reaper.SetMediaTrackInfo_Value(cur.last, 'I_FOLDERDEPTH', -1) end
+        cur = nil
+      elseif cur then
+        if not cur.last then reaper.SetMediaTrackInfo_Value(cur.header, 'I_FOLDERDEPTH', 1) end
+        cur.last = c
+      end
+    end
+    if cur and cur.last then reaper.SetMediaTrackInfo_Value(cur.last, 'I_FOLDERDEPTH', -1) end
     local last = s.children[#s.children]
     local is_final_sub = (sub_idx == #real_subs)
-    reaper.SetMediaTrackInfo_Value(last, 'I_FOLDERDEPTH', is_final_sub and -2 or -1)
+    local inner = reaper.GetMediaTrackInfo_Value(last, 'I_FOLDERDEPTH')
+    if inner > 0 then inner = 0 end   -- a member-less bank header at the very end
+    reaper.SetMediaTrackInfo_Value(last, 'I_FOLDERDEPTH', inner + (is_final_sub and -2 or -1))
   end
 
   -- Edge case: no real sub-folders. Parent contains only Swing (+ maybe

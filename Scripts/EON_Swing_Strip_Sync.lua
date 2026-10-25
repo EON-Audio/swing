@@ -48,6 +48,9 @@ end
 
 reaper.gmem_attach("Swing_Media_Transfer")
 if reaper.set_action_options then reaper.set_action_options(1) end
+-- Which copy runs: this file's own folder (debug.getinfo; get_action_context would name a dofile host). A rig that
+-- stages another checkout's scripts reads it to prove the Strip Sync under test is the staged one. Non-persistent.
+reaper.SetExtState(core.ALIVE_STRIP_SYNC_SECTION, "script_dir", SCRIPT_DIR, false)
 
 -- Status reports (mode reconcile, takeover state) are diagnostics, not errors —
 -- routine and noisy once you have a couple of Swing instances. Silent unless:
@@ -58,6 +61,11 @@ local function DBG(msg)
 end
 
 local NUM_PADS = G.NUM_PADS
+-- Banks B..D's Drum Strips (2026-10-15; the user: "link bank B to D pads to their Drum Strips the way bank A works").
+-- A B..D pad has a track of its own only while it is split out onto pair SPLIT0 + k (k < SPLIT_N); that track's
+-- strip belongs to the pair's OWNER, the lowest playable slot on it, which Swing publishes in its split band
+-- (G.GS_SPLIT_*) with that slot's record. A child's key is its bank A pad (0..15) or its split pair (22..31).
+local SPLIT0, SPLIT_N = G.GS_SPLIT_PAIR0, G.GS_SPLIT_N
 
 -- FX_PID → strip slider NAME (stable API — matches EON_Drum_Strip.jsfx).
 -- Sends (pids 15/16) included since bff82fa: the strip's send knobs are
@@ -162,6 +170,11 @@ local DEF_EPS = 1e-3   -- defaults are exact; loose enough for quantized freqs
 local instances = {}
 local hb_counter = 0
 local tick = 0
+-- A child whose strip left its track (an undo, the user's FX window) or moved in the chain is dropped by
+-- validate_children on the next tick, which asks for a structure scan right away through this flag (2026-10-16).
+local strip_rescan = false
+-- Set while ensure_strip's insert holds an undo block open; the scan closes it after the migration push.
+local strip_undo_open = false
 -- Strip re-instantiation pulse (GS_STRIP_REINIT_PULSE): the strip JSFX bumps it
 -- in @init. When it changes we open a TIME-based window (re-armed on each pulse,
 -- and extended while we are actively healing) during which a strip param sitting
@@ -219,10 +232,9 @@ local function _set_param_named(tr, fx, pat, val)
   return false
 end
 
-local function _find_viewer_fx(tr)
+local function _find_viewer_fx(tr)   -- by its file, never the shown name (a renamed viewer was not found)
   for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
-    local _, fn = reaper.TrackFX_GetFXName(tr, fx, "")
-    if fn and fn:find("FX Return View") then return fx end
+    if core.fx_file(tr, fx) == "eon_fx_return_view.jsfx" then return fx end
   end
   return -1
 end
@@ -261,8 +273,7 @@ local function push_return_viewers(inst)
           -- the drum-bus instance (stays -1 → band-inert). Insert-if-absent is
           -- the BRIDGE's job at build; here we only re-link an existing one.
           for fx = 0, reaper.TrackFX_GetCount(dt) - 1 do
-            local _, fn = reaper.TrackFX_GetFXName(dt, fx, "")
-            if fn and fn:find("EON Weld") then
+            if core.fx_file(dt, fx) == "eon_weld.jsfx" then   -- by its file (a renamed Weld lost its link)
               _set_param_named(dt, fx, "Link Slot", inst.slot)
               break
             end
@@ -319,6 +330,21 @@ local function ensure_strip(tr)
     if not sname then return nil, "EON_Drum_Strip.jsfx not found under Effects" end
     fxidx = reaper.TrackFX_AddByName(tr, sname, false, 0)   -- query only
     if fxidx < 0 then
+      -- Never while REAPER can redo (2026-10-15): the insert is an undo point of its own ("Add FX: ..."), and a new
+      -- undo point throws the redo history away -- the bridge's rule for the tracks it makes. Found with the split
+      -- tracks of banks B..D (BanksTracks U): undoing an automatic split track now takes the strip's step, then the
+      -- track's, and a strip put back between them would have thrown away the redo of both. The pad keeps its
+      -- effects in Swing meanwhile (no strip, no mask bit); the strip goes in once the user acts again.
+      local redo = reaper.Undo_CanRedo2 and reaper.Undo_CanRedo2(0)
+      if redo ~= nil and redo ~= "" then return nil, "waiting: REAPER can redo" end
+      -- ONE undo point for the whole insert (2026-10-16): the strip, its mixer embed (a chunk rewrite) and the
+      -- migration push of Swing's values. Without the block REAPER made the insert its own "Add FX" point and,
+      -- most of a second later, a second "Edit FX parameter" point for what followed it, so undoing an automatic
+      -- split track took three presses (BanksTracks U.1, red only when the undo came that late), and undoing that
+      -- second point alone put the strip back to its defaults, which the sync then took for the user's edit. The
+      -- scan closes the block after the migration (strip_undo_open), whatever this function returns.
+      reaper.Undo_BeginBlock2(0)
+      strip_undo_open = true
       fxidx = reaper.TrackFX_AddByName(tr, sname, false, 1) -- insert new
       if fxidx < 0 then return nil, "AddByName failed (" .. sname .. ")" end
       was_new = true
@@ -334,8 +360,27 @@ local function ensure_strip(tr)
   return fxidx, pmap, was_new
 end
 
-local function band_value(band, pad, pid)
-  return reaper.gmem_read(band + G.GS_STRIP_PADS + pad * G.GS_STRIP_PAD_STRIDE + pid)
+-- A child's record: bank A pad `key` in the strip band, split pair `key` in the split band.
+local function band_value(inst, key, pid)
+  if key < NUM_PADS then
+    return reaper.gmem_read(inst.band + G.GS_STRIP_PADS + key * G.GS_STRIP_PAD_STRIDE + pid)
+  end
+  return reaper.gmem_read(inst.sband + (key - SPLIT0) * G.GS_STRIP_PAD_STRIDE + pid)
+end
+-- The slot a split child's strip speaks for (its pair's owner), -1 = nobody plays on the pair; a bank A child's pad.
+local function child_slot(inst, key)
+  if key < NUM_PADS then return key end
+  return math.floor(reaper.gmem_read(inst.sband + G.GS_SPLIT_OFF_OWNER + key - SPLIT0) or 0) - 1
+end
+-- The console tie's write-back: bank A's through INCMD_GAIN / PAN, a split child's through the split band's own
+-- mailbox for its owner (value first, the slot LAST -- Swing takes a cell pair once its slot cell is set).
+local function tie_post(inst, key, incmd_off, v)
+  if key < NUM_PADS then core.post_pad_incmd(inst.slot, incmd_off, key, v); return end
+  local o = child_slot(inst, key)
+  if o < 0 then return end
+  local t = inst.sband + G.GS_SPLIT_OFF_TIE + (key - SPLIT0) * 4 + ((incmd_off == G.INCMD_GAIN_OFF) and 0 or 2)
+  reaper.gmem_write(t + 1, v)
+  reaper.gmem_write(t, o + 1)
 end
 
 -- ── One-Mixer console tie (mixer VOL/PAN ↔ child track D_VOL/D_PAN) ────────
@@ -376,7 +421,7 @@ local function tie_channel(inst, pad, ch, st, bv, tr_param, incmd_off, lo, hi)
         st.exp = tv
         st.pend = math.max(lo, math.min(hi, tv))  -- JSFX clamps the same way
         st.pbv = bv
-        core.post_pad_incmd(inst.slot, incmd_off, pad, st.pend)
+        tie_post(inst, pad, incmd_off, st.pend)
       elseif st.pbv == nil or math.abs(bv - st.pbv) > TIE_EPS then
         -- Band moved but not to our pend: the echo of an intermediate post
         -- from this same drag trailing the newest payload. Re-assert the
@@ -384,7 +429,7 @@ local function tie_channel(inst, pad, ch, st, bv, tr_param, incmd_off, lo, hi)
         -- edit lands here too → the physically-held fader wins,
         -- deterministically, and the tie converges on the next confirm.
         st.pbv = bv
-        core.post_pad_incmd(inst.slot, incmd_off, pad, st.pend)
+        tie_post(inst, pad, incmd_off, st.pend)
       end
       return
     end
@@ -395,14 +440,14 @@ local function tie_channel(inst, pad, ch, st, bv, tr_param, incmd_off, lo, hi)
     if math.abs(tv - bv) > TIE_EPS then
       st.pend = math.max(lo, math.min(hi, tv))
       st.pbv = bv
-      core.post_pad_incmd(inst.slot, incmd_off, pad, st.pend)
+      tie_post(inst, pad, incmd_off, st.pend)
     end
   elseif math.abs(tv - st.exp) > TIE_EPS then
     -- Track moved → Swing follows.
     st.exp = tv
     st.pend = math.max(lo, math.min(hi, tv))
     st.pbv = bv
-    core.post_pad_incmd(inst.slot, incmd_off, pad, st.pend)
+    tie_post(inst, pad, incmd_off, st.pend)
   elseif st.cache == nil or math.abs(bv - st.cache) > TIE_EPS then
     -- Band moved → track follows.
     st.cache = bv
@@ -417,7 +462,7 @@ local function sync_mixer_tie(inst)
   if (reaper.gmem_read(inst.band + G.GS_STRIP_OFF_TIE_VER) or 0) < 1 then return end
   inst.tie = inst.tie or {}
   for pad, ch in pairs(inst.children) do
-    local bv = band_value(inst.band, pad, G.GS_STRIP_PAD_OFF_VOL)
+    local bv = band_value(inst, pad, G.GS_STRIP_PAD_OFF_VOL)
     if bv < -0.5 then
       -- Blank pad → hands-off; the marker makes a later blank→loaded
       -- transition seed the console FROM Swing (kit wins).
@@ -434,7 +479,7 @@ local function sync_mixer_tie(inst)
         if from_blank then
           -- Loaded while we watched (kit load / sample drop): Swing's values
           -- drive the console; settle state so no adoption post fires.
-          local bp = band_value(inst.band, pad, G.GS_STRIP_PAD_OFF_PAN)
+          local bp = band_value(inst, pad, G.GS_STRIP_PAD_OFF_PAN)
           local pre = reaper.GetMediaTrackInfo_Value(ch.tr, "D_VOL")
           reaper.SetMediaTrackInfo_Value(ch.tr, "D_VOL", bv)
           reaper.SetMediaTrackInfo_Value(ch.tr, "D_PAN", bp)
@@ -451,7 +496,7 @@ local function sync_mixer_tie(inst)
       end
       tie_channel(inst, pad, ch, t.vol, bv, "D_VOL", G.INCMD_GAIN_OFF, 0, 8)
       tie_channel(inst, pad, ch, t.pan,
-        band_value(inst.band, pad, G.GS_STRIP_PAD_OFF_PAN), "D_PAN", G.INCMD_PAN_OFF, -1, 1)
+        band_value(inst, pad, G.GS_STRIP_PAD_OFF_PAN), "D_PAN", G.INCMD_PAN_OFF, -1, 1)
     end
   end
 end
@@ -474,6 +519,15 @@ local function validate_children(inst)
     if not reaper.ValidatePtr2(0, ch.tr, "MediaTrack*") then
       inst.children[pad] = nil
       if inst.tie then inst.tie[pad] = nil end
+    elseif ch.guid and reaper.TrackFX_GetFXGUID(ch.tr, ch.fxidx) ~= ch.guid then
+      -- The strip is no longer at ch.fxidx (2026-10-16): an undo took it off a track that stays, the user removed or
+      -- moved it. Until the next ~1 Hz scan every tick read that slot's parameters -- -1 each with nothing there,
+      -- another plugin's otherwise -- took them for the user's edits and wrote them into Swing's pad through the
+      -- mailbox (BanksTracks U / SX: bank C pad 3 came back with its LPF at 20 Hz). Drop it now and scan now; the
+      -- scan re-finds a moved strip by its GUID.
+      inst.children[pad] = nil
+      if inst.tie then inst.tie[pad] = nil end
+      strip_rescan = true
     end
   end
   if next(inst.children) == nil then
@@ -504,12 +558,7 @@ local function scan_structure()
   for ti = 0, reaper.CountTracks(0) - 1 do
     local tr = reaper.GetTrack(0, ti)
     for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
-      local _, fname = reaper.TrackFX_GetFXName(tr, fx, "")
-      local rv, ident = reaper.TrackFX_GetNamedConfigParm(tr, fx, "fx_ident")
-      local is_swing = (rv and ident:find("DrumKit_ReaKit"))
-                    or fname:find("DrumKit_ReaKit")
-                    or fname:match("^JS: Swing")
-      if is_swing then
+      if core.is_swing_fx(tr, fx) then   -- the plugin's file, never its shown name (the bridge's rule)
         local id = math.floor(reaper.TrackFX_GetParam(tr, fx, 3) or 0)
         local slot = alive[id]
         if slot then
@@ -521,12 +570,19 @@ local function scan_structure()
             for p = 0, NUM_PADS - 1 do
               inst.cache[p] = {}; inst.expected[p] = {}; inst.inflight[p] = {}
             end
+            for p = SPLIT0, SPLIT0 + SPLIT_N - 1 do
+              inst.cache[p] = {}; inst.expected[p] = {}; inst.inflight[p] = {}
+            end
             instances[id] = inst
           end
           inst.id    = id
           inst.track = tr
           inst.slot  = slot
           inst.band  = G.GS_STRIP_BASE + slot * G.GS_STRIP_STRIDE
+          inst.sband = G.GS_SPLIT_BASE + slot * G.GS_SPLIT_STRIDE
+          -- a Swing that publishes the split records and honours their mask (an older one: no strip on a split track,
+          -- it would run that pad's effects twice)
+          inst.split_ok = (reaper.gmem_read(inst.sband + G.GS_SPLIT_OFF_VER) or 0) >= 1
           -- Seed cmd_seq from the band's CURRENT counter whenever the band
           -- (re)binds — a fresh inst.cmd_seq of 0 written into a band whose cell
           -- already holds e.g. 47 makes our first CMD_SEQ=1 REGRESS below the
@@ -561,7 +617,7 @@ local function scan_structure()
             local want_send_mute = inst.multi_out and 0 or 1
             local nsends = reaper.GetTrackNumSends(tr, 0)
             for s = 0, nsends - 1 do
-              local src_pad = core.srcchan_pad(reaper.GetTrackSendInfo_Value(tr, 0, s, "I_SRCCHAN"))
+              local src_pad = core.swing_send_pad(tr, s)   -- Swing's own pad tracks only (2026-10-10)
               if src_pad >= 0 and src_pad < NUM_PADS then
                 if reaper.GetTrackSendInfo_Value(tr, 0, s, "B_MUTE") ~= want_send_mute then
                   reaper.SetTrackSendInfo_Value(tr, 0, s, "B_MUTE", want_send_mute)
@@ -576,10 +632,15 @@ local function scan_structure()
             local found = {}
             local sends = reaper.GetTrackNumSends(tr, 0)
             for s = 0, sends - 1 do
-              local pad = core.srcchan_pad(reaper.GetTrackSendInfo_Value(tr, 0, s, "I_SRCCHAN"))
+              local pad = core.swing_send_pad(tr, s)   -- Swing's own pad tracks only: never a Drum Strip on a user's bus (2026-10-10)
+              -- banks B..D: a split pad's own track (tagged with its pair, core.swing_send_pair) -- keyed by the pair
+              if pad < 0 and inst.split_ok then
+                local sp = core.swing_send_pair(tr, s)
+                if sp >= SPLIT0 and sp < SPLIT0 + SPLIT_N then pad = sp end
+              end
               if pad >= 0 then
                 -- (nesting kept: core.srcchan_pad already rejects no-audio/odd)
-                if pad < NUM_PADS then
+                if pad < NUM_PADS or pad >= SPLIT0 then
                   local dest = reaper.BR_GetMediaTrackSendInfo_Track(tr, 0, s, 1)
                   if dest then
                     local ch = inst.children[pad]
@@ -618,17 +679,26 @@ local function scan_structure()
                     if fxidx then
                       if not ch or ch.tr ~= dest or ch.fxidx ~= fxidx then
                         local prev_tr = ch and ch.tr
-                        ch = { tr = dest, fxidx = fxidx, pmap = pmap, ready = true }
+                        ch = { tr = dest, fxidx = fxidx, pmap = pmap, ready = true,
+                               guid = reaper.TrackFX_GetFXGUID(dest, fxidx) }   -- validate_children's strip check
                         inst.children[pad] = ch
                         -- One-Mixer tie: a re-mapped child TRACK invalidates the
                         -- tie bookkeeping (exp refers to the old track) → reset
                         -- so the next sync pass re-adopts (console wins).
                         if inst.tie and prev_tr ~= dest then inst.tie[pad] = nil end
-                        if was_new then
+                        if was_new and child_slot(inst, pad) < 0 then
+                          -- a split track whose pair nobody plays on: nothing to carry over; the strip's own values
+                          -- count as what we set, so the first owner's values replace them (band wins)
+                          for pid in pairs(PID_TO_STRIP) do
+                            inst.expected[pad][pid] = reaper.TrackFX_GetParam(dest, fxidx, pmap[pid])
+                          end
+                          ch.owner = -1
+                        elseif was_new then
                           -- Freshly inserted strip: migrate Swing's current
                           -- values onto it (Swing = source of truth).
+                          ch.owner = child_slot(inst, pad)
                           for pid in pairs(PID_TO_STRIP) do
-                            local v = band_value(inst.band, pad, pid)
+                            local v = band_value(inst, pad, pid)
                             inst.cache[pad][pid] = v
                             push_to_strip(inst, pad, pid, v)
                           end
@@ -639,9 +709,9 @@ local function scan_structure()
                           -- unity back into p_gain. Old Swing builds (tie flag 0)
                           -- and blank pads (VOL sentinel -1) skip the seed.
                           if (reaper.gmem_read(inst.band + G.GS_STRIP_OFF_TIE_VER) or 0) >= 1 then
-                            local bv = band_value(inst.band, pad, G.GS_STRIP_PAD_OFF_VOL)
+                            local bv = band_value(inst, pad, G.GS_STRIP_PAD_OFF_VOL)
                             if bv >= 0 then
-                              local bp = band_value(inst.band, pad, G.GS_STRIP_PAD_OFF_PAN)
+                              local bp = band_value(inst, pad, G.GS_STRIP_PAD_OFF_PAN)
                               reaper.SetMediaTrackInfo_Value(dest, "D_VOL", bv)
                               reaper.SetMediaTrackInfo_Value(dest, "D_PAN", bp)
                               inst.tie = inst.tie or {}
@@ -657,8 +727,15 @@ local function scan_structure()
                         -- pass without flashing already-correct values.
                       else
                         ch.pmap = pmap
+                        ch.guid = reaper.TrackFX_GetFXGUID(dest, fxidx)
                       end
                       found[pad] = true
+                    end
+                    -- the insert's undo block (ensure_strip), closed after the migration push, on every path
+                    if strip_undo_open then
+                      strip_undo_open = false
+                      local _, tn = reaper.GetSetMediaTrackInfo_String(dest, "P_NAME", "", false)
+                      reaper.Undo_EndBlock2(0, "Swing: EON Drum Strip on " .. (tn ~= "" and tn or "a pad track"), -1)
                     end
                   end
                 end
@@ -679,10 +756,14 @@ local function scan_structure()
             -- sixteen pads unless the flag says the writer means it, so writing
             -- the mask first would leave a one-tick window where an honest
             -- "no strips" reads as "every pad handed off".
-            local mask = 0
-            for pad in pairs(inst.children) do mask = mask | (1 << pad) end
+            local mask, smask = 0, 0
+            for pad in pairs(inst.children) do
+              if pad < NUM_PADS then mask = mask | (1 << pad) else smask = smask | (1 << (pad - SPLIT0)) end
+            end
             reaper.gmem_write(inst.band + G.GS_STRIP_OFF_MASK_VER, 1)
             reaper.gmem_write(inst.band + G.GS_STRIP_OFF_ALIVE_MASK, mask)
+            -- banks B..D: bit k = split pair k's track has a live strip (Swing hands its owner over)
+            if inst.split_ok then reaper.gmem_write(inst.sband + G.GS_SPLIT_OFF_MASK, smask) end
             local n = 0; for _ in pairs(inst.children) do n = n + 1 end
             local rep = string.format("[strip_sync] inst %d: multi-out, %d/%d strips ready%s\n",
               id, n, NUM_PADS, inst.hb_ok and " — takeover LIVE" or " — idle (no strips)") .. inst.report
@@ -695,6 +776,7 @@ local function scan_structure()
             inst.hb_ok = false
             reaper.gmem_write(inst.band + G.GS_STRIP_OFF_MASK_VER, 1)   -- flag first, see above
             reaper.gmem_write(inst.band + G.GS_STRIP_OFF_ALIVE_MASK, 0)
+            if inst.split_ok then reaper.gmem_write(inst.sband + G.GS_SPLIT_OFF_MASK, 0) end
             local rep = string.format("[strip_sync] inst %d: not multi-out — idle\n", id)
             if rep ~= inst.last_report then
               inst.last_report = rep
@@ -713,6 +795,40 @@ end
 
 -- ── Param sync (every tick) ────────────────────────────────────────────────
 
+-- Banks B..D: a split child speaks for its pair's owner. When the owner changes (the pair handed to another pad, a
+-- swap) the strip takes the new owner's values -- what it holds now counts as what we set, so the band wins -- its
+-- queued edits for the old owner are dropped, its durable record forgotten, and the console tie seeds from Swing (as
+-- for a pad that just got a sample). The first sight of a child (a fresh insert, a saved project) only records it.
+-- Returns the children that speak for a slot this tick: bank A's, and the split ones whose pair has an owner.
+local function split_owners(inst)
+  local kids = {}
+  for key, ch in pairs(inst.children) do
+    if key >= SPLIT0 then
+      local o = child_slot(inst, key)
+      if ch.owner == nil then
+        ch.owner = o
+      elseif ch.owner ~= o then
+        ch.owner = o
+        for pid in pairs(PID_TO_STRIP) do
+          inst.expected[key][pid] = reaper.TrackFX_GetParam(ch.tr, ch.fxidx, ch.pmap[pid])
+        end
+        inst.cache[key] = {}; inst.inflight[key] = {}
+        local qi = 1
+        while qi <= #inst.queue do
+          if inst.queue[qi].pad == key then table.remove(inst.queue, qi) else qi = qi + 1 end
+        end
+        if inst.tie then inst.tie[key] = { seen_blank = true } end
+        if inst.id and last_good[inst.id] then last_good[inst.id][key] = nil end
+        DBG(string.format("[strip_sync] split pair %d: now slot %d's strip\n", key, o))
+      end
+      if o >= 0 then kids[key] = ch end
+    else
+      kids[key] = ch
+    end
+  end
+  return kids
+end
+
 local function sync_instance(inst, reinit)
   if not inst.multi_out or not inst.hb_ok then return end
   -- The Swing track or the child tracks may have been deleted since the
@@ -723,6 +839,7 @@ local function sync_instance(inst, reinit)
     return
   end
   if not validate_children(inst) then return end
+  local kids = split_owners(inst)
 
   -- Heartbeat: strips are adopted+migrated → Swing may go dry.
   reaper.gmem_write(inst.band + G.GS_STRIP_OFF_LUA_HB, hb_counter)
@@ -734,15 +851,17 @@ local function sync_instance(inst, reinit)
   -- back at FACTORY DEFAULT and a live edit is lost (trace-confirmed: strip
   -- collapses to default; the band stays correct for several seconds, then the
   -- rebuilt instance's "strip wins" branch propagates the wipe into Swing).
-  -- The strip @init bumps GS_STRIP_REINIT_PULSE; `reinit` is true for a generous
-  -- window after that (it must outlast the instance drop/rebuild). During it, any
-  -- param sitting at its exact default is a suspected wipe → restore it from the
-  -- durable intended value (last_good, else the band) and RE-ASSERT into Swing so
-  -- a wiped Swing pad heals too. Only runs inside the pulse window, so normal
-  -- editing (incl. deliberately turning a filter OFF) is untouched.
+  -- The strip's FIRST @init (a fresh instance: load, insert, project open, a true
+  -- re-instantiation -- never a play start or an enable since 2026-10-14) bumps
+  -- GS_STRIP_REINIT_PULSE; `reinit` is true for a generous window after that (it
+  -- must outlast the instance drop/rebuild). During it, any param sitting at its
+  -- exact default is a suspected wipe → restore it from the durable intended value
+  -- (last_good, else the band) and RE-ASSERT into Swing so a wiped Swing pad heals
+  -- too. Only runs inside the pulse window, so normal editing (incl. deliberately
+  -- turning a filter OFF, or a double-click back to default) is untouched.
   if reinit then
     local now0 = reaper.time_precise()
-    for pad, ch in pairs(inst.children) do
+    for pad, ch in pairs(kids) do
       for pid in pairs(PID_TO_STRIP) do
         local def = STRIP_DEFAULT[pid]
         if def ~= nil and not inst.inflight[pad][pid] then
@@ -751,7 +870,7 @@ local function sync_instance(inst, reinit)
             -- strip is at factory default — find the durable intended value.
             local good = inst.id and lg_get(inst.id, pad, pid)
             if good == nil then
-              local bv = band_value(inst.band, pad, pid)
+              local bv = band_value(inst, pad, pid)
               if math.abs(bv - def) > DEF_EPS then good = bv end
             end
             if good ~= nil and math.abs(good - def) > DEF_EPS then
@@ -792,9 +911,9 @@ local function sync_instance(inst, reinit)
   local seq = reaper.gmem_read(inst.band + G.GS_STRIP_OFF_SEQ)
   if seq ~= inst.band_seq then
     inst.band_seq = seq
-    for pad, ch in pairs(inst.children) do
+    for pad, ch in pairs(kids) do
       for pid in pairs(PID_TO_STRIP) do
-        local bv = band_value(inst.band, pad, pid)
+        local bv = band_value(inst, pad, pid)
         local sv = reaper.TrackFX_GetParam(ch.tr, ch.fxidx, ch.pmap[pid])
         local infl = inst.inflight[pad][pid]
         if infl then
@@ -861,7 +980,7 @@ local function sync_instance(inst, reinit)
   -- COALESCE per (pad,pid): during a drag only the latest value matters —
   -- replaying the intermediate history through the mailbox is what built
   -- the stale backlog.
-  for pad, ch in pairs(inst.children) do
+  for pad, ch in pairs(kids) do
     for pid in pairs(PID_TO_STRIP) do
       local sv = reaper.TrackFX_GetParam(ch.tr, ch.fxidx, ch.pmap[pid])
       local ev = inst.expected[pad][pid]
@@ -894,11 +1013,16 @@ local function sync_instance(inst, reinit)
   -- Drain one queued edit into the mailbox (CMD_SEQ written LAST).
   if #inst.queue > 0 then
     local cmd = table.remove(inst.queue, 1)
-    reaper.gmem_write(inst.band + G.GS_STRIP_OFF_CMD_PAD, cmd.pad)
-    reaper.gmem_write(inst.band + G.GS_STRIP_OFF_CMD_PID, cmd.pid)
-    reaper.gmem_write(inst.band + G.GS_STRIP_OFF_CMD_VAL, cmd.val)
-    inst.cmd_seq = inst.cmd_seq + 1
-    reaper.gmem_write(inst.band + G.GS_STRIP_OFF_CMD_SEQ, inst.cmd_seq)
+    -- the slot it addresses: a bank A pad, or a split child's owner (Swing takes an absolute slot past bank A only
+    -- while it owns a split pair); a split pair nobody plays on takes nothing
+    local cslot = child_slot(inst, cmd.pad)
+    if cslot >= 0 then
+      reaper.gmem_write(inst.band + G.GS_STRIP_OFF_CMD_PAD, cslot)
+      reaper.gmem_write(inst.band + G.GS_STRIP_OFF_CMD_PID, cmd.pid)
+      reaper.gmem_write(inst.band + G.GS_STRIP_OFF_CMD_VAL, cmd.val)
+      inst.cmd_seq = inst.cmd_seq + 1
+      reaper.gmem_write(inst.band + G.GS_STRIP_OFF_CMD_SEQ, inst.cmd_seq)
+    end
   end
 
   -- One-Mixer console tie: mixer VOL/PAN ↔ child track fader/pan.
@@ -970,6 +1094,16 @@ end
 -- ── Main loop ──────────────────────────────────────────────────────────────
 
 local function loop()
+  -- A stop marker the loop honours (wiki 06: a re-run of a set_action_options script is a RESTART, never a stop):
+  -- the dev / rig way to end this copy, as the Kit Bridge's EON_Bridge/exit_req. The loop ends here WITHOUT a fresh
+  -- heartbeat, so the bridge reads it stale after core.ALIVE_STALE_S and -- while it is still in its start-up grace,
+  -- before it has confirmed a running copy -- launches its own sibling copy (a rig stages one). A bridge past that
+  -- grace does not relaunch: the designed fail-safe then is Swing's own strip takeover lapsing. Non-persistent: a
+  -- request cannot outlive the session. Nothing in production sets it.
+  if reaper.GetExtState(core.ALIVE_STRIP_SYNC_SECTION, "exit_req") == "1" then
+    reaper.SetExtState(core.ALIVE_STRIP_SYNC_SECTION, "exit_req", "", false)
+    return
+  end
   tick = tick + 1
   hb_counter = hb_counter + 1
 
@@ -998,13 +1132,15 @@ local function loop()
   -- No Swing found at all: stay fast only for the first ~10 s (startup
   -- race), then settle — don't burn 6 Hz track scans on non-Swing projects.
   local scan_every = ((any and all_ready) or (not any and tick > 300)) and 30 or 5
-  if tick % scan_every == 1 then scan_structure() end
+  if tick % scan_every == 1 or strip_rescan then strip_rescan = false; scan_structure() end
 
   -- Strip re-instantiation detection: the strip JSFX bumps GS_STRIP_REINIT_PULSE
-  -- in @init. On any change, arm a generous TIME window (REINIT_HOLD_S) during
-  -- which sync_instance restores wiped-to-default strips from last_good. Must be
-  -- time-based (not a tick count): a minimize drops+rebuilds the instance and the
-  -- wipe can surface several seconds after the pulse.
+  -- in its first @init (once per instance since 2026-10-14; a play start or an
+  -- enable re-runs @init without bumping). On any change, arm a generous TIME
+  -- window (REINIT_HOLD_S) during which sync_instance restores wiped-to-default
+  -- strips from last_good. Must be time-based (not a tick count): a minimize
+  -- drops+rebuilds the instance and the wipe can surface several seconds after
+  -- the pulse.
   local pulse = reaper.gmem_read(G.GS_STRIP_REINIT_PULSE)
   if last_reinit_pulse == nil then
     last_reinit_pulse = pulse
@@ -1030,6 +1166,10 @@ end
 -- same helper as the other EON self-registering scripts.
 function eon_write_startup(path, content)
   local tmp, prev = path .. ".eon-tmp", path .. ".eon-prev"
+  -- A stranded original goes back first (see eon_recover_startup). If it
+  -- cannot, nothing below may run: the os.remove(prev) further down would eat
+  -- the only copy of the shared file.
+  if not eon_recover_startup(path) then return false end
   -- A read-only __startup.lua is the user's call. Windows would still let the
   -- renames below replace it -- and strand a read-only .eon-prev that blocks
   -- every later rewrite -- so refuse up front.
@@ -1054,6 +1194,35 @@ function eon_write_startup(path, content)
   if had_old then os.rename(prev, path) end
   os.remove(tmp)
   return false
+end
+
+-- ⚠ A rewrite that fails half-way leaves __startup.lua GONE and the original
+-- in .eon-prev: the new file could not take the old one's place AND the old
+-- one could not step back (an antivirus hold on both the fresh tmp and the
+-- just-renamed .eon-prev -- the same hold the 2026-09-07 fix met on one side).
+-- Nothing runs at the next launch to notice, and the writer's first act on
+-- the retry used to be os.remove(prev): every vendor's startup lines gone,
+-- then a file written holding only our block. So the writer and every
+-- self_register put a stranded original back before reading or writing, and
+-- a .eon-prev is only ever removed while the real file exists. Returns false
+-- when a stranded original is there and could not be put back, or when
+-- __startup.lua is there but cannot be read. Global, identical in all five
+-- self-registering scripts.
+function eon_recover_startup(path)
+  local f, _, ocode = io.open(path, "r")
+  if f then f:close() return true end
+  -- Present but unreadable (a lock, a permission) is not absent: nothing is
+  -- put back over it. On macOS / Linux rename REPLACES an existing file, so a
+  -- stale .eon-prev overwrote the current one (outside audit 2026-10-02; on
+  -- Windows the rename failed). ENOENT (2) is the one open failure that means
+  -- there is no file.
+  if ocode ~= 2 then return false end
+  -- No file. Put a stepped-aside original back. rename needs no read access,
+  -- so an unreadable-but-present .eon-prev is never mistaken for absent
+  -- (Codex 2026-09-23); ENOENT (2) is the one failure that means there is
+  -- nothing to recover.
+  local ok, _, code = os.rename(path .. ".eon-prev", path)
+  return (ok or code == 2) and true or false
 end
 
 -- ⭐ Strip one script's block from __startup.lua text, in WHOLE LINES. The file is
@@ -1106,6 +1275,9 @@ end
 function eon_startup_selfclean_src(name, section, key)
   return
     "  local p=reaper.GetResourcePath()..\"/Scripts/__startup.lua\"\n" ..
+    -- a stranded .eon-prev (an earlier replacement that failed both ways) goes back first, only while the real
+    -- file is absent: the writer's own recovery rule (outside audit 3, 2026-10-05)
+    "  do local pb=io.open(p..'.eon-prev','r'); if pb then pb:close(); local pf=io.open(p,'r'); if pf then pf:close() else os.rename(p..'.eon-prev',p) end end end\n" ..
     "  local f=io.open(p,'r'); local c=f and f:read('*a'); if f then f:close() end\n" ..
     "  local w=c and io.open(p,'a'); if w then w:close()\n" ..
     -- Markers assembled at run time: the literal "-- EON:<name> END" must never appear
@@ -1126,7 +1298,9 @@ function eon_startup_selfclean_src(name, section, key)
     "    if fw then ok=fw:write(c) and true or false; if not fw:close() then ok=false end end\n" ..
     "    if ok then os.remove(b); local h=os.rename(p,b); if os.rename(t,p) then os.remove(b) elseif h then os.rename(b,p) end end\n" ..
     "    os.remove(t) end\n" ..
-    "  reaper.SetExtState('" .. section .. "','" .. key .. "','',true)\n"
+    -- the flag is cleared only while the start-up file is there; a replacement that failed both ways keeps it, so
+    -- the next launch tries again (the original waits in .eon-prev)
+    "  do local pf=io.open(p,'r'); if pf then pf:close(); reaper.SetExtState('" .. section .. "','" .. key .. "','',true) end end\n"
 end
 
 -- ── Self-register as startup action (one-time, first manual run) ──────────
@@ -1136,8 +1310,15 @@ end
 local SCRIPT_NAME = "EON_Swing_Strip_Sync"
 local function self_register()
   local _, script_path = reaper.get_action_context()
-  local key = SCRIPT_NAME .. "_registered_v2"
+  local key = SCRIPT_NAME .. "_registered_v3"   -- v3 (2026-10-14): the block checks the script file (every install re-registers once)
   local marker = "-- EON:" .. SCRIPT_NAME
+  -- A rewrite that failed half-way may have left the file stepped aside as
+  -- .eon-prev; put it back before anything below reads it. If it cannot be put
+  -- back, do NOTHING this run: registering anyway would read an empty file
+  -- and, once the hold lifts, the writer's own recovery would restore the
+  -- original only for the write to replace it with a file holding just our
+  -- block (Codex 2026-09-23). The next run retries.
+  if not eon_recover_startup(reaper.GetResourcePath() .. "/Scripts/__startup.lua") then return end
 
   if reaper.GetExtState(SCRIPT_NAME, key) == "1" then
     local startup_path = reaper.GetResourcePath() .. "/Scripts/__startup.lua"
@@ -1165,10 +1346,13 @@ local function self_register()
     and ('reaper.NamedCommandLookup("_' .. named_id .. '")')
     or tostring(cmd_id)
 
+  -- The action must resolve AND the script file must open (2026-10-14: a folder deleted by hand leaves the action
+  -- behind, and REAPER showed "Can't load file" at every start); else the block strips itself. %q: a ]] in the path.
   local block =
     "\n" .. marker .. " BEGIN\n" ..
     "do local id=" .. cmd_token .. "\n" ..
-    "if id~=0 then reaper.Main_OnCommand(id,0) else\n" ..
+    string.format("local sf=io.open(%q,'r'); if sf then sf:close() end\n", script_path) ..
+    "if id~=0 and sf then reaper.Main_OnCommand(id,0) else\n" ..
     eon_startup_selfclean_src(SCRIPT_NAME, SCRIPT_NAME, key) ..
     "end end\n" ..
     marker .. " END\n"
@@ -1184,7 +1368,10 @@ local function self_register()
     end
   end
 end
-self_register()
+-- A rig hosting a STAGED copy sets no_self_register (as it does for the Kit Bridge, EON_Bridge/no_self_register): the
+-- sandbox shares the user's resource folder, and a staged copy must not rewrite the real __startup.lua or register a
+-- %TEMP% path in the real reaper-kb.ini (the review of 2026-10-18). Non-persistent; nothing in production sets it.
+if reaper.GetExtState(core.ALIVE_STRIP_SYNC_SECTION, "no_self_register") ~= "1" then self_register() end
 
 DBG("[strip_sync] started: " .. tostring(strip_addname()) .. "\n")
 loop()

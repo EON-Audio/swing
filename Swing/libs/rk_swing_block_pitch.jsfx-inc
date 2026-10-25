@@ -106,6 +106,48 @@ STRETCH_CONTROL_INSTANCE_STRIDE = 80;
 // existing block-496 allocation covers it. Strided per registry slot exactly like
 // the control bands: gmem[SRCGEN_BASE + slot*STRETCH_CONTROL_INSTANCE_STRIDE + pad].
 STRETCH_PER_PAD_SRCGEN_BASE     = 32525568;
+// (The Extension DOES read the SRCGEN band since 220b1ce: its Stretch preload is keyed by the value, compared
+// with != and cast to uint32 -- so what is published there stays below 2^31. The paragraph above predates that.)
+
+// ─── The pitch SPOT handshake (Plan_Swing_Pad_Banks_Tuned §5A.5; step 3, 2026-10-05) ───────────────────────────
+// A spot is one of the Extension's sixteen rows per instance (its control cells, its ring, its voice, its bake
+// keys). Step 3 keeps every spot on bank A pad s -- identity -- and builds the wire step 4 lends them on. MIRROR
+// of rk_lua_core.lua (the names are the same on both sides: gmem_name_parity.py).
+//   SPOT MAP, Swing -> bridge, slot*SPOT_MAP_STRIDE, per spot s at +s*4: +0 OWNER = the absolute pad + 1 (0 =
+//     free), +1 STATE (0 free, 1 pending, 2 live, 3 draining; a draining spot writes 3 + 4 x its drain token,
+//     step 4), +2 GEN = the owner's source generation (the @init epoch + sp_src_gen), written LAST; +63 MAP_VER =
+//     1 (an older Swing leaves 0: the bridge then treats every spot as identity and watches the SRCGEN band as
+//     before). +3 is never used: spot 15's +3 is +63. Written only in @block (swing_spot_tick).
+//   SPOT ANSWER, bridge -> Swing, slot*SPOT_ANS_STRIDE: +0..15 per spot the GEN the bridge has prepared (the old
+//     keys blanked, its queued reverts dropped, the owner's layer-0 source published -- a fence if Tuned);
+//     +16 HB = the bridge's tick counter, +17 ANS_VER (1 = step 3, 2 = also answers drains: only a 2 is lent to);
+//     +32..47 per spot the token of the drain the bridge has finished (step 4).
+// Why: the Extension keeps a Stretch spot's old sound loaded until a new preparation lands, keys that
+// preparation by the SRCGEN VALUE (not the path) and tells nobody when it lands (§5A.1, §5A.3). If it sees a
+// new value while the OLD path is still published it prepares the old sound under the new value and stays on it
+// for good. So (a) ORDER: a spot's new SRCGEN goes out only after the bridge's answer says the old path is gone
+// and the new source is published; (b) HOLD: from the source change until SP_HOLD_TICKS Extension heartbeats after
+// that answer, the owner's Stretch hits play the plain way (the local fallback voice, v_stfb) and its ring is
+// choked, so no hit can reach the old sound. Bank A today has both holes on a re-drop and a project switch.
+// The GATE: the bridge's heartbeat must MOVE (wiki 5.8) and ANS_VER must read 1; otherwise (no bridge, an older
+// bridge) Swing publishes at once as before and holds nothing -- a hold nobody can end is worse than the race.
+SPOT_MAP_BASE       = 32526784;
+SPOT_MAP_STRIDE     = 64;
+SPOT_MAP_OFF_VER    = 63;
+SPOT_ANS_BASE       = 32527808;
+SPOT_ANS_STRIDE     = 64;
+SPOT_ANS_OFF_HB     = 16;
+SPOT_ANS_OFF_VER    = 17;
+SPOT_ANS_OFF_STATE  = 32;
+SPOT_STATE_FREE     = 0;
+SPOT_STATE_PENDING  = 1;
+SPOT_STATE_LIVE     = 2;
+SPOT_STATE_DRAINING = 3;
+// ⚠ EEL2 names are CASE-INSENSITIVE: this was SP_HOLD_HB, the same variable as the sp_hold_hb array pointer of
+// Swing_ReaKit.jsfx, so the hold's end came out as cur_hb + an address and the hold never ended (the first run,
+// 2026-10-06). A constant must never share its letters with a variable.
+SP_HOLD_TICKS       = 4;      // the hold ends this many Extension heartbeats after the answer (§5A.3: a margin)
+SP_EPOCH_UNIT       = 65536;  // the epoch is a multiple of this; sp_src_gen rides below it
 
 // Step 3b — per-pad audio ring buffer (SPSC). Extension audio_hook writes
 // stereo interleaved samples; JSFX @sample reads them and routes to the
@@ -131,6 +173,36 @@ SP_PITCH_MODE_REPITCH       = 0;
 SP_PITCH_MODE_TUNED         = 1;
 SP_PITCH_MODE_STRETCH       = 2;
 
+// CMD 65 / 67 bake-or-revert mark (2026-10-02, Plan_Swing_Pad_Banks_Tuned §5A.4b), carried in the FRACTION of the
+// pad index the Kit Bridge writes to KIT_GMEM_PARAM1: pad + 0.25 = a bake, pad + 0.5 = the leave-Tuned revert. A
+// whole pad = unmarked (an older bridge): the pad's mode when the command lands decides, as before. An older Swing
+// reads the pad with | 0 and never sees the mark, and nothing is left behind in another cell. The first build
+// stamped KIT_GMEM_NAME + 0, which the bridge reads as the kit's name outside any import (the folder label, save in
+// place, the kit-undo backfill): the swap's clear cut the name's first letter (caught before release, 2026-10-05).
+SP_MARK_BAKE                = 1;      // a bake: swapped in only while the pad is still Tuned
+SP_MARK_REVERT              = 2;      // the leave-Tuned revert: the ORIGINAL, unbaked whatever the mode
+
+// The mark in a CMD 65 / 67 pad value (above): its fraction, to the nearest quarter.
+function swing_pitch_mark(_pm_v)
+local(_pm_f)
+(
+  _pm_f = _pm_v - (_pm_v | 0);
+  _pm_f > 0.375 && _pm_f < 0.625 ? SP_MARK_REVERT : (_pm_f > 0.125 && _pm_f < 0.375 ? SP_MARK_BAKE : 0);
+);
+
+// ─── The spot map's one decision (§4.5: "which spot a pad uses is decided in ONE function") ──────────────────
+// pr_pad[row] = the absolute pad a spot serves (-1 free), sp_row[pad] = the spot a pad holds (-1 none); both
+// host-owned freemem arrays, derived, never serialized (allocated and seeded in Swing_ReaKit.jsfx @init). Step 3:
+// identity -- spot s is bank A pad s, every B..D pad has no spot and plays Repitch (4a.1), exactly today's layout.
+// The command bus (CMD 65 / 66 / 67) carries the SPOT in PARAM1, as the bridge always did; these map it to the pad.
+function swing_spot_pad(_ssp_row)
+(
+  (_ssp_row >= 0 && _ssp_row < NUM_PADS) ? pr_pad[_ssp_row] : -1;
+);
+
+// swing_spot_gen (the owner's generation as the map publishes it) and swing_pitch_held (the Stretch hold) live
+// in rk_swing_core.jsfx-inc beside swing_pitch_eff: the voice launcher compiles before this file.
+
 // Algo enum (Distinct-4 mapping, 2026-06-03 — Pro has no Monophonic submode
 // at runtime, so Drum uses Soloist and Tonal uses Pro+Preserve-Formants;
 // resolved at runtime in elastique_mode_table.cpp, never hardcoded)
@@ -153,7 +225,9 @@ sp_pitch_ext_last_hb       = 0;
 sp_pitch_ext_last_seen_blk = 0;
 sp_pitch_ext_alive         = 0;
 sp_pitch_block_counter     = 0;
-sp_pitch_ext_grace_blocks  = 64;       // ~1.4 s @ 48 kHz / 1024-frame blocks
+sp_pitch_ext_grace_blocks  = 64;       // ~1.4 s @ 48 kHz / 1024-frame blocks (kept for readers; the watchdog is wall time)
+SP_PITCH_GRACE_S           = 1.5;      // the watchdog's grace in wall time (2026-10-06; a render outruns a block count)
+sp_pitch_ext_last_seen_t   = time_precise();   // starts alive, as the block version did, for the first grace
 // Set per block beside sp_pitch_any_stretch: 1 when any pad is in Tuned or
 // Stretch, i.e. when the Extension's absence is actually AUDIBLE. Read by the
 // LCD mode stepper and the warning banner. Declared here so it is defined on
@@ -217,11 +291,12 @@ SP_SWAP_CHUNK = 524288;
 // them. Only s_len + the audio buffer change.
 //
 // Wire protocol:
-//   gmem[KIT_GMEM_PARAM1] = pad_idx     (0..15)
+//   gmem[KIT_GMEM_PARAM1] = pad_idx     (0..15), + 0.25 a bake / + 0.5 a revert (2026-10-02; whole = unmarked,
+//                                       an older bridge)
 //   gmem[KIT_GMEM_CMD]    = 65
 // JSFX reads PARAM1, computes audio_off by summing prior pads' AUDIOLEN
 // (mirrors the bridge's pack-by-prior-lengths layout in load_audio_to_pad),
-// copies gmem[AUDIO_BASE + audio_off ..] into s_audio_start[pad*SLOT_SIZE],
+// copies gmem[AUDIO_BASE + audio_off ..] into the pad's audio (p_aptr[pad]),
 // updates s_len, clears CMD.
 //
 // Length safety: AUDIOLEN written by the bridge during the load is taken
@@ -229,11 +304,15 @@ SP_SWAP_CHUNK = 524288;
 // bakes the length equals the source length (Signalsmith preserves
 // duration at rate_ratio=1.0), so audio_off for other pads doesn't shift.
 function swing_pad_audio_swap()
-local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j, _sp_n)
+local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j, _sp_n, _sp_ok, _sp_mk, _sp_pf)
 (
   _bl_inflight = 1;   // double-dispatch latch (2026-07-27; see rk_swing_browser_load)
-  _sp_pad = gmem[KIT_GMEM_PARAM1] | 0;
-  _sp_pad >= 0 && _sp_pad < NUM_PADS ? (
+  _sp_pf  = gmem[KIT_GMEM_PARAM1];
+  _sp_pad = swing_spot_pad(_sp_pf | 0);   // the bus carries the SPOT; its owner pad (identity in step 3; -1 = a free spot: ignored)
+  _sp_mk  = swing_pitch_mark(_sp_pf);   // the bridge's bake-or-revert mark (SP_MARK_*), in the pad's fraction
+  // A marked BAKE for a pad that is no longer Tuned was sent before a flip it crossed in flight: refused, the
+  // buffer stays (unmarked, it landed as "the original, unbaked" and could end a drain early -- §5A.4b).
+  _sp_pad >= 0 && _sp_pad < NUM_SLOTS && !(_sp_mk == SP_MARK_BAKE && sp_pitch_mode[_sp_pad] != SP_PITCH_MODE_TUNED) ? (
     // Length via PARAM3 + payload at AUDIO+0 — the CMD-67 protocol (fix
     // 2026-07-16). The old scheme read length AND offset from the AUDIOLEN
     // band, which the browser mirror blast-rewrites every @block with
@@ -260,7 +339,17 @@ local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j, _sp_n)
       // the old pre-bake audio (fix 2026-09-08). Outer while over pieces of at
       // most SP_SWAP_CHUNK cells (at most 8 passes), inner loop per piece. The
       // staging protocol (payload at AUDIO+0, length via NAMELEN) is unchanged.
-      _sp_dst = s_audio_start + _sp_pad * SLOT_SIZE;
+      // Step 2a: the baked buffer replaces LAYER 0's region on a layered pad (p_aptr is dead
+      // after a promotion's transfer; a layer holds LAYER_SIZE at most) or the plain region
+      // -- in place when the region holds it (bakes preserve duration), else a new one.
+      // Refused = the pad keeps its unbaked audio and the LCD says why. No undo capture: a
+      // bake is not a structural op, and the one-shot displaced list is freed at once.
+      p_layer_cnt[_sp_pad] > 0 ? _sp_len = min(_sp_len, LAYER_SIZE);
+      _sp_ok = p_layer_cnt[_sp_pad] > 0 ? swing_pad_fit_layer(_sp_pad, 0, _sp_len, _al_dl_blk)
+                                        : swing_pad_fit_main(_sp_pad, _sp_len, _al_dl_blk);
+      swing_disp_free(_al_dl_blk);
+      _sp_ok ? (
+      _sp_dst = p_layer_cnt[_sp_pad] > 0 ? p_lptr[_sp_pad * MAX_LAYERS] : p_aptr[_sp_pad];
       _sp_j = 0;
       while(_sp_j < _sp_len) (
         _sp_n = min(_sp_len - _sp_j, SP_SWAP_CHUNK);
@@ -283,7 +372,14 @@ local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j, _sp_n)
       // as a varispeed residual (see the Tuned branch in launch_voices_for_pad).
       // CMD 65 only ever delivers the pad MAIN buffer (= layer 0 region), so it
       // anchors layer 0; layers 1+ are anchored by CMD 67 (per-layer swap).
-      sp_baked_tune[_sp_pad * MAX_LAYERS + 0] = p_tune[_sp_pad];
+      // A swap onto a pad NOT in Tuned is the leave-Tuned revert putting the ORIGINAL back (the
+      // bridge delivers bakes only while the pad is Tuned): its anchor is 0, unbaked. Anchoring it
+      // at p_tune (until 2026-10-01) marked the original as baked: CMD 66 then refused a layered
+      // pad's capture, and a return to Tuned played the original at residual 0, unpitched, until a
+      // bake landed (the step A self-audit; EON_Probe_PitchA RT / LL). A MARKED revert is the
+      // original whatever the mode (2026-10-02): a pad back in Tuned before its revert landed used
+      // to get the original marked as baked, unpitched until something re-baked it (§5A.4).
+      sp_baked_tune[_sp_pad * MAX_LAYERS + 0] = _sp_mk == SP_MARK_REVERT ? 0 : (sp_pitch_mode[_sp_pad] == SP_PITCH_MODE_TUNED ? p_tune[_sp_pad] : 0);
       // Kill active voices reading the buffer we just changed — but ONLY layer-0
       // voices. CMD 65 overwrites only the layer-0 region (offset 0); voices on
       // layers 1+ read their own untouched sub-buffers, so killing them here just
@@ -296,6 +392,7 @@ local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j, _sp_n)
         (v_slot[_sp_j] == _sp_pad && v_layer[_sp_j] == 0) ? ( v_pos[_sp_j] = -1; v_env[_sp_j] = 0; v_stage[_sp_j] = 0; );
         _sp_j += 1;
       );
+      ) : swing_alloc_refuse_note(_sp_pad);
     );
   );
   gmem[KIT_GMEM_CMD] = 0;   // consume — bridge gates next send on CMD==0
@@ -318,9 +415,11 @@ local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j, _sp_n)
 // written ungated every @block by EVERY instance, so a sibling with audio on
 // the same pad index would clobber the length before the bridge reads it.
 //
-// Tuned is intentionally NOT auto-exported: after a bake its buffer holds the
-// already-pitched audio, so re-publishing that as a "source" would make the
-// Extension bake pitch on top of pitch (double-pitch on the next tune change).
+// A Tuned pad is exported too (the bridge's poll_autoexport captures Tuned and
+// Stretch pads, poll_layer_export the layers of Tuned ones), but never a BAKED
+// buffer: after a bake it holds the already-pitched audio, and re-publishing
+// that as a "source" makes the Extension bake pitch on top of pitch. Every
+// branch below refuses a region whose anchor (sp_baked_tune) is not 0.
 //
 // Wire protocol:
 //   gmem[KIT_GMEM_PARAM1]        = pad_idx   (0..15)
@@ -336,8 +435,10 @@ local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j, _sp_n)
 //   _ep_pad   = combined % NUM_PADS    (0..15)
 //   _ep_layer = (combined / NUM_PADS)  (0..MAX_LAYERS-1)
 // Layer 0 → combined == pad, so the legacy Stretch auto-export (writes PARAM1
-// = pad) is byte-compatible. Layer 0 exports the pad MAIN buffer (s_len), as
-// before. Layer L>0 exports that layer's sub-buffer (l_len) — but ONLY while
+// = pad) is byte-compatible. Layer 0 exports a plain pad's plain region (s_len)
+// and a layered pad's layer-0 region (l_len, p_lptr -- never p_aptr, which is -1
+// on a layered pad), each only while unbaked (the plain one since 2026-10-02).
+// Layer L>0 exports that layer's sub-buffer (l_len) — but ONLY while
 // the layer is still ORIGINAL (sp_baked_tune anchor == 0). Once a layer has
 // been baked its buffer holds pitched audio, which must NEVER be re-exported as
 // a source (the Extension would bake pitch-on-pitch). The per-layer source
@@ -348,33 +449,40 @@ local(_ep_comb _ep_pad _ep_layer _ep_lidx _ep_len _ep_src _ep_sr _ep_j _ep_ok _e
 (
   _bl_inflight = 1;   // double-dispatch latch (2026-07-27; see rk_swing_browser_load)
   _ep_comb  = gmem[KIT_GMEM_PARAM1] | 0;
-  _ep_pad   = _ep_comb % NUM_PADS;
+  _ep_pad   = swing_spot_pad(_ep_comb % NUM_PADS);   // the bus carries the SPOT (+ layer * NUM_PADS); its owner pad
   _ep_layer = (_ep_comb / NUM_PADS) | 0;
   _ep_len = 0;
   _ep_sr  = srate;
-  _ep_ok  = _ep_pad >= 0 && _ep_pad < NUM_PADS && _ep_layer >= 0 && _ep_layer < MAX_LAYERS;
+  _ep_ok  = _ep_pad >= 0 && _ep_pad < NUM_SLOTS && _ep_layer >= 0 && _ep_layer < MAX_LAYERS;
   _ep_ok ? (
     _ep_layer == 0 ? (
-      // Main / layer-0 buffer (Stretch auto-export path — unchanged).
-      _ep_len = s_len[_ep_pad] | 0;
-      _ep_src = s_audio_start + _ep_pad * SLOT_SIZE;
-      s_sr[_ep_pad] > 0 ? _ep_sr = s_sr[_ep_pad];
-      // Promoted-single fallback: the modern load routes (CMD 63 / VER-200/201)
-      // leave p_layer_cnt=1 with the audio in layer 0 and s_len=0, so the
-      // pad-main read above exports nothing — the bridge rejects the empty
-      // capture forever and Stretch/Tuned pads never get an Extension source.
-      // Mirror the P4 no-embed save-side fallback: read the layer-0 buffer
-      // (same base address, length/SR from the layer arrays). Same
-      // already-baked refusal as the L>0 branch so a baked layer-0 buffer is
-      // never published as an original source.
-      _ep_len == 0 && p_layer_cnt[_ep_pad] > 0 ? (
+      p_layer_cnt[_ep_pad] > 0 ? (
+        // A LAYERED pad's layer 0 lives in its own region, p_lptr. Since the step 2a allocator
+        // (2026-09-23) a layered pad's plain pointer is -1 (a promotion moves the region to
+        // layer 0, a layer-0 fit takes it over), so the old read of p_aptr here -- written when
+        // layer 0 shared the plain slot's address -- copied Swing's own memory from address -1
+        // (it starts with p_gain) and the Extension baked THAT (EON_Probe_PitchA, 2026-09-25).
+        // s_len is no guide on a layered pad either: CMD 65 writes it there too. Same
+        // already-baked refusal as layers 1+: a baked buffer holds pitched audio.
         _ep_lidx = _ep_pad * MAX_LAYERS;
         sp_baked_tune[_ep_lidx] == 0 ? (
           _ep_len = l_len[_ep_lidx] | 0;
+          _ep_src = p_lptr[_ep_lidx];
           l_sr[_ep_lidx] > 0 ? _ep_sr = l_sr[_ep_lidx];
         );
+        _ep_len > 0 && _ep_len <= LAYER_SIZE ? 0 : ( _ep_len = 0; );
+      ) : (
+        // A plain pad: its plain region, under the same already-baked refusal (2026-10-02). poll_autoexport
+        // captures Tuned pads as well as Stretch ones, and a plain Tuned pad that holds its bake -- restored from
+        // an embedded save, or a bridge restarted with no source -- exported the BAKE as its source: the
+        // Extension baked pitch on pitch and delivered it (Plan_Swing_Pad_Banks_Tuned §5A.7; EON_Probe_PitchA FX).
+        sp_baked_tune[_ep_pad * MAX_LAYERS] == 0 ? (
+          _ep_len = s_len[_ep_pad] | 0;
+          _ep_src = p_aptr[_ep_pad];
+          s_sr[_ep_pad] > 0 ? _ep_sr = s_sr[_ep_pad];
+        );
+        _ep_len > 0 && _ep_len <= SLOT_SIZE ? 0 : ( _ep_len = 0; );
       );
-      _ep_len > 0 && _ep_len <= SLOT_SIZE ? 0 : ( _ep_len = 0; );
     ) : (
       // Layer L>0: capture the ORIGINAL layer buffer for the per-layer Tuned
       // bake. Refuse if the layer has already been baked (anchor != 0) so we
@@ -382,7 +490,7 @@ local(_ep_comb _ep_pad _ep_layer _ep_lidx _ep_len _ep_src _ep_sr _ep_j _ep_ok _e
       _ep_lidx = _ep_pad * MAX_LAYERS + _ep_layer;
       sp_baked_tune[_ep_lidx] == 0 ? (
         _ep_len = l_len[_ep_lidx] | 0;
-        _ep_src = s_audio_start + _ep_pad * SLOT_SIZE + _ep_layer * LAYER_SIZE;
+        _ep_src = p_lptr[_ep_pad * MAX_LAYERS + _ep_layer];
         l_sr[_ep_lidx] > 0 ? _ep_sr = l_sr[_ep_lidx];
         _ep_len > 0 && _ep_len <= LAYER_SIZE ? 0 : ( _ep_len = 0; );
       );
@@ -418,7 +526,7 @@ local(_ep_comb _ep_pad _ep_layer _ep_lidx _ep_len _ep_src _ep_sr _ep_j _ep_ok _e
 //
 // Wire protocol (the bridge stages the baked layer audio at KIT_GMEM_AUDIO+0 —
 // a single transient staging, one swap per bridge tick — and passes):
-//   gmem[KIT_GMEM_PARAM1]        = pad_idx   (0..15)
+//   gmem[KIT_GMEM_PARAM1]        = pad_idx   (0..15), + 0.25 a bake / + 0.5 a revert (2026-10-02, as CMD 65)
 //   gmem[KIT_GMEM_NPADS]         = layer_idx (1..MAX_LAYERS-1)   (slot 2 reused)
 //   gmem[KIT_GMEM_NAMELEN]       = interleaved sample count       (slot 3 reused)
 //   gmem[GS_PENDING_PITCH_INST]  = slot      (route — only that instance acts)
@@ -427,15 +535,18 @@ local(_ep_comb _ep_pad _ep_layer _ep_lidx _ep_len _ep_src _ep_sr _ep_j _ep_ok _e
 // baked-tune anchor (residual -> 0 for that layer), kills the pad's voices on
 // THIS layer (masked by the same anti-click crossfade as CMD 65), clears CMD.
 function swing_pad_layer_audio_swap()
-local(_lp_pad _lp_layer _lp_len _lp_lidx _lp_dst _lp_j)
+local(_lp_pad _lp_layer _lp_len _lp_lidx _lp_dst _lp_j _lp_ok _lp_plain _lp_n _lp_mk _lp_pf)
 (
   _bl_inflight = 1;   // double-dispatch latch (2026-07-27; see rk_swing_browser_load)
-  _lp_pad   = gmem[KIT_GMEM_PARAM1] | 0;
+  _lp_pf    = gmem[KIT_GMEM_PARAM1];
+  _lp_pad   = swing_spot_pad(_lp_pf | 0);   // the bus carries the SPOT; its owner pad (as CMD 65)
   _lp_layer = gmem[KIT_GMEM_NPADS]  | 0;
   _lp_len   = gmem[KIT_GMEM_NAMELEN]| 0;
-  (_lp_pad >= 0 && _lp_pad < NUM_PADS &&
+  _lp_mk    = swing_pitch_mark(_lp_pf);   // the bridge's bake-or-revert mark, in the pad's fraction (as CMD 65)
+  (_lp_pad >= 0 && _lp_pad < NUM_SLOTS &&
    _lp_layer >= 0 && _lp_layer < MAX_LAYERS &&
-   _lp_len > 0 && _lp_len <= LAYER_SIZE) ? (
+   _lp_len > 0 && _lp_len <= LAYER_SIZE &&
+   !(_lp_mk == SP_MARK_BAKE && sp_pitch_mode[_lp_pad] != SP_PITCH_MODE_TUNED)) ? (   // a stale bake: refused (CMD 65)
     // Arm anti-click crossfade BEFORE killing voices (mirrors CMD 65/63).
     !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
       _xf_pos    = 0;
@@ -443,14 +554,28 @@ local(_lp_pad _lp_layer _lp_len _lp_lidx _lp_dst _lp_j)
       _xf_active = 1;
     );
     _lp_lidx = _lp_pad * MAX_LAYERS + _lp_layer;
-    _lp_dst  = s_audio_start + _lp_pad * SLOT_SIZE + _lp_layer * LAYER_SIZE;
+    // Step 2a: the layer's region, in place when it holds the length, else a new one. Layer 0
+    // of a PLAIN pad is the plain region (the pad stays plain: p_layer_cnt is not touched here).
+    _lp_plain = (p_layer_cnt[_lp_pad] == 0 && _lp_layer == 0);
+    _lp_ok = _lp_plain ? swing_pad_fit_main(_lp_pad, _lp_len, _al_dl_blk)
+                       : swing_pad_fit_layer(_lp_pad, _lp_layer, _lp_len, _al_dl_blk);
+    swing_disp_free(_al_dl_blk);
+    _lp_ok ? (
+    _lp_dst  = _lp_plain ? p_aptr[_lp_pad] : p_lptr[_lp_pad * MAX_LAYERS + _lp_layer];
+    // Chunked (2026-09-23, longer layers): _lp_len now runs to LAYER_SIZE = SLOT_SIZE = 4,000,000,
+    // past EEL2's 2^20 iteration cap -- the outer-while / inner-loop shape of CMD 65 and 66 above.
     _lp_j = 0;
-    loop(_lp_len,
-      _lp_dst[_lp_j] = gmem[KIT_GMEM_AUDIO + _lp_j];
-      _lp_j += 1;
+    while(_lp_j < _lp_len) (
+      _lp_n = min(_lp_len - _lp_j, SP_SWAP_CHUNK);
+      loop(_lp_n,
+        _lp_dst[_lp_j] = gmem[KIT_GMEM_AUDIO + _lp_j];
+        _lp_j += 1;
+      );
     );
     l_len[_lp_lidx]        = _lp_len;
-    sp_baked_tune[_lp_lidx] = p_tune[_lp_pad];
+    // Not in Tuned = the per-layer revert's ORIGINAL: unbaked, as in CMD 65 above (2026-10-01); a marked
+    // revert is unbaked in any mode (2026-10-02).
+    sp_baked_tune[_lp_lidx] = _lp_mk == SP_MARK_REVERT ? 0 : (sp_pitch_mode[_lp_pad] == SP_PITCH_MODE_TUNED ? p_tune[_lp_pad] : 0);
     // NOTE: do NOT set s_dirty here. Matching CMD 65 (the layer-0/single-layer
     // swap), a Tuned bake must NOT rebuild the waveform cache — the displayed
     // waveform stays the pre-bake (original) sample shape (the tune is a knob,
@@ -465,6 +590,7 @@ local(_lp_pad _lp_layer _lp_len _lp_lidx _lp_dst _lp_j)
       );
       _lp_j += 1;
     );
+    ) : swing_alloc_refuse_note(_lp_pad);
   );
   gmem[KIT_GMEM_CMD] = 0;   // consume — bridge gates next send on CMD==0
   _bl_inflight = 0;
@@ -643,7 +769,7 @@ local(_si _base _id _hb _now _pick)
 );
 
 function swing_block_pitch_tick()
-local(_pi _base)
+local(_pi _base _pp)
 (
   // (Tick-counter diagnostic removed 2026-07-08 — its cell 2274 collided
   // with GS_KIT_PRESERVE_LIVE; see the note at the top of this file.)
@@ -658,14 +784,23 @@ local(_pi _base)
   atomic_set(gmem[SP_PITCH_PROTOCOL_VER], SP_PITCH_PROTOCOL_VER_VALUE);
 
   // Heartbeat watchdog — read-only snapshot of the Extension's counter.
+  // Measured in WALL TIME since 2026-10-06, not in audio blocks: an offline render runs blocks far faster than the
+  // Extension's main-thread timer ticks, so the block count outran the heartbeat and the watchdog declared the
+  // Extension dead mid-render -- every Tuned pad after that point rendered its bake at the full varispeed on top
+  // (an octave up at half length; EON_Probe_PitchA T4, five pads in one render). The 1.5 s grace is the same.
+  // Kept global on purpose (wiki 4.1): this tick runs from @gfx as well as @init / @slider / @block (Swing_ReaKit.jsfx
+  // @gfx, "Drive the Tuned-mode pitch chain at GUI rate"), so the watchdog's globals have two writers at once. Every
+  // write is the moment's time_precise() or a fresh read of the Extension's rising heartbeat, so a lost race leaves
+  // sp_pitch_ext_last_seen_t microseconds old, or counts one heartbeat a tick late -- against a 1.5 s grace
+  // (gate_baseline gfx_audio accepts it, FINDINGS_LOG 2026-10-12; sp_pitch_cur_hb / _last_hb / _last_seen_blk alike).
   sp_pitch_block_counter += 1;
   sp_pitch_cur_hb = atomic_get(gmem[SP_PITCH_HEARTBEAT]);
   sp_pitch_cur_hb != sp_pitch_ext_last_hb ? (
     sp_pitch_ext_last_hb       = sp_pitch_cur_hb;
     sp_pitch_ext_last_seen_blk = sp_pitch_block_counter;
+    sp_pitch_ext_last_seen_t   = time_precise();
   );
-  sp_pitch_ext_alive =
-    (sp_pitch_block_counter - sp_pitch_ext_last_seen_blk) < sp_pitch_ext_grace_blocks;
+  sp_pitch_ext_alive = (time_precise() - sp_pitch_ext_last_seen_t) < SP_PITCH_GRACE_S;
 
   // B1 multi-instance publish — each instance writes ONLY its own band region,
   // strided by its registry slot. Because every live instance owns a distinct
@@ -679,19 +814,29 @@ local(_pi _base)
   // corrupt its band. The slot is claimed at the END of @init (before the seed
   // publish call) and re-claimed in @block, so the gap is at most ~one tick; the
   // Extension reconcile holds last state across it (no audible effect).
-  _reg_my_slot >= 0 ? (
+  //   Also held while a pad swap is under way or not yet followed (2026-10-12): swap_pads (@gfx) moves the modes and
+  // tunes with the audio at once, the spot map follows only in @block (swing_spot_tick). Published in between, a Tuned
+  // pad swapped onto a plain one showed its spot as LEFT Tuned under the old map; the bridge sent the spot's original
+  // to the map's owner, and with @block stopped (Swing bypassed) @gfx's CMD 65 fallback wrote it into the old pad: the
+  // plain pad's sample gone (EON_Probe_PitchA -Only SW, RED before this). Held, the bands keep the pre-swap state until
+  // the map has followed, then change with it. sp_swap_busy: set for the whole of swap_pads.
+  _reg_my_slot >= 0 && !atomic_get(sp_swap_busy) && atomic_get(sp_swap_req) == sp_swap_done ? (
     _base = _reg_my_slot * STRETCH_CONTROL_INSTANCE_STRIDE;
     _pi = 0;
-    loop(NUM_PADS,
+    loop(NUM_PADS,   // the spots: the pitch rings and the Extension band are sixteen per instance (spot _pi = pad pr_pad[_pi]; identity in step 3)
       // Idempotent declarative blast — every pad, every tick. Each band slot is
       // a single aligned double (naturally atomic), so atomic_set alone is
       // sufficient; no shadows, no seqlock. The Extension reconciles: it bakes
       // any Tuned pad whose published (TUNE, ALGO) differs from what it last
       // baked for THIS slot, and detects Tuned->non-Tuned via the MODE band.
-      atomic_set(gmem[STRETCH_PER_PAD_MODE_BASE        + _base + _pi], sp_pitch_mode[_pi]);
-      atomic_set(gmem[STRETCH_PER_PAD_TUNE_MIRROR_BASE + _base + _pi], p_tune[_pi]);
-      atomic_set(gmem[STRETCH_PER_PAD_ALGO_BASE        + _base + _pi], sp_pitch_algo[_pi]);
-      atomic_set(gmem[STRETCH_PER_PAD_SRCGEN_BASE      + _base + _pi], sp_src_gen[_pi]);
+      // A free spot publishes Repitch. SRCGEN is sp_pub_gen, the generation the handshake has RELEASED for the
+      // spot (swing_spot_tick) -- not sp_src_gen itself: the Extension keys its Stretch preload by this value,
+      // so it must not change until the bridge says the new source is the one published (§5A.3).
+      _pp = pr_pad[_pi];
+      atomic_set(gmem[STRETCH_PER_PAD_MODE_BASE        + _base + _pi], _pp >= 0 ? sp_pitch_mode[_pp] : SP_PITCH_MODE_REPITCH);
+      atomic_set(gmem[STRETCH_PER_PAD_TUNE_MIRROR_BASE + _base + _pi], _pp >= 0 ? p_tune[_pp] : 0);
+      atomic_set(gmem[STRETCH_PER_PAD_ALGO_BASE        + _base + _pi], _pp >= 0 ? sp_pitch_algo[_pp] : 0);
+      atomic_set(gmem[STRETCH_PER_PAD_SRCGEN_BASE      + _base + _pi], sp_pub_gen[_pi]);
       _pi += 1;
     );
   );
@@ -713,8 +858,8 @@ local(_pi _base)
   // pre-claim window). When the heartbeat watchdog flips ext_alive to 0 we
   // force the target to 0 so a dead Extension doesn't leave stale latency.
   _pi = 0; sp_pitch_any_stretch = 0; sp_pitch_any_ext_mode = 0;
-  loop(NUM_PADS,
-    sp_pitch_mode[_pi] == SP_PITCH_MODE_STRETCH ? sp_pitch_any_stretch = 1;
+  loop(NUM_SLOTS,   // every pad (Pad Banks step 4): a Stretch pad declares latency only while it holds a spot (a ring)
+    sp_pitch_mode[_pi] == SP_PITCH_MODE_STRETCH && sp_row[_pi] >= 0 ? sp_pitch_any_stretch = 1;
     // Does ANY pad currently ask for a mode the Extension provides? Tuned and
     // Stretch both degrade to plain varispeed repitch without it (see
     // rk_swing_core select-layer), which sounds like a bug rather than a tier.
@@ -727,4 +872,266 @@ local(_pi _base)
   sp_pitch_pdc_target = (sp_pitch_ext_alive && sp_pitch_any_stretch)
                         ? atomic_get(gmem[SP_PITCH_PDC_BUDGET])|0
                         : 0;
+);
+
+// ─── The spot handshake, @init half: the epoch and the identity map ─────────────────────────────────────────
+// Called from Swing_ReaKit.jsfx @init once the arrays exist (pr_pad, sp_row, sp_pub_gen, sp_map_gen, sp_hold,
+// sp_hold_hb). The epoch salts every generation this instance publishes: a multiple of SP_EPOCH_UNIT from the
+// clock, never 0, below 2^30 (the Extension casts the SRCGEN band to uint32), so a reopened instance never
+// repeats a previous one's values on the same slot and sp_src_gen (bumped per load, lifted by a spot's give
+// (swing_spot_give), far below 65536 a session)
+// rides in the low bits. sp_pub_gen starts at 0: the first spot tick sees every spot as changed and runs the
+// handshake once (an instance's first sighting is a source change to the bridge too).
+function swing_spot_init()
+local(_ssi_e _ssi_i)
+(
+  _ssi_e = time_precise() * 1000;
+  _ssi_e = _ssi_e - floor(_ssi_e / 16384) * 16384;        // 0..16383
+  sp_epoch = (floor(_ssi_e) + 1) * SP_EPOCH_UNIT;          // 65536 .. 2^30
+  memset(sp_row, -1, NUM_SLOTS);
+  _ssi_i = 0;
+  loop(NUM_PADS,   // bank A: identity at @init, bank A pad s on spot s (the spots are sixteen per instance); step 4 lends from here
+    pr_pad[_ssi_i] = _ssi_i;
+    pr_state[_ssi_i] = SPOT_STATE_LIVE;
+    pr_drain[_ssi_i] = 0;
+    sp_row[_ssi_i] = _ssi_i;
+    sp_pub_gen[_ssi_i] = 0;
+    sp_map_gen[_ssi_i] = 0;
+    _ssi_i += 1;
+  );
+  sp_gen_hw = 0;   // the highest GEN published on any spot this epoch (swing_spot_tick); a give lifts above it (H20)
+  sp_br_last_hb = 0; sp_br_last_seen_t = time_precise(); sp_br_alive = 0;   // starts alive for one grace, as the Extension's
+  sp_drain_ctr = 0;
+  sp_br_lends = 0;
+  sp_swap_done = sp_swap_req;   // the swap queue starts empty: a swap posted before the identity map cannot follow into it
+);
+
+// ─── Step 4: lending the spots to pads of every bank (Plan_Swing_Pad_Banks_Tuned §5, §5A, §8 step 4; 2026-10-09) ──
+// A pad NEEDS a spot while its stored mode is Tuned or Stretch and it holds audio (§5.2). The spots start on bank A
+// pad s (identity, today's layout) and stay there while that pad needs it. A spot whose owner does not need it is
+// IDLE and may be lent: a pad that needs one and holds none takes its own spot (a bank A pad) when that one is idle,
+// else the HIGHEST idle spot (the plan said lowest; changed 2026-10-09 so borrowed spots stay away from bank A's first
+// pads, the ones every kit fills first). A spot with no owner is given at once. One with an owner is first DRAINED:
+// it keeps publishing that owner -- now out of Tuned / Stretch, or empty -- until the bridge answers that nothing is
+// left to put back for it (SPOT_ANS +32 = the map's GEN: every queued revert sent and consumed, no command in
+// flight), so a revert can never carry the old owner's original into the new owner. Then it goes to the pad waiting
+// (its own bank A pad first, then bank A in order, then slots 16..63), else home to its own bank A pad, else free.
+// The new owner is PENDING until the bridge has prepared it (step 3's answer): the order and the hold of §5A.3 apply
+// exactly as to a re-drop, and the bridge treats an owner change as a source change (the fence, the blank, a fresh
+// capture). Lending needs a bridge that answers (sp_br_alive): an older bridge or none never sees the map change, the
+// spots stay where they are, and a B..D pad plays Repitch as before.
+// The seventeenth pad (§5.6): a pad that needs a spot while all sixteen owners need theirs WAITS -- it plays Repitch
+// and keeps its stored mode -- and the mode stepper refuses a change INTO Tuned / Stretch then (swing_spot_refuse).
+// Shared values (00-rules Q1): pr_pad / pr_state / sp_row are written here, in @block only, and read by @gfx (the LCD)
+// and the voice launcher (@block); the drain answer is gmem from the bridge.
+// swing_spot_wants / swing_spot_idle / swing_spot_refuse / swing_spot_waiting live in rk_swing_core.jsfx-inc (the LCD
+// compiles before this file).
+
+// Start draining spot _sd_r. Every drain gets a token of its own (the @init epoch + a count, published in the map's
+// STATE cell as STATE + 4 x token);
+// the bridge answers with it, so an answer left over from an earlier drain of the same owner -- one cancelled
+// because the owner went back to Tuned -- can never end this one before its reverts are out.
+function swing_spot_drain(_sd_r)
+(
+  pr_state[_sd_r] = SPOT_STATE_DRAINING;
+  sp_drain_ctr += 1;
+  pr_drain[_sd_r] = sp_epoch + sp_drain_ctr;
+);
+
+// Give spot _sg_r to pad _sg_p (-1: the spot goes free). swing_spot_assign only.
+function swing_spot_give(_sg_r, _sg_p)
+local(_sg_o _sg_l _sg_b)
+(
+  _sg_o = pr_pad[_sg_r];
+  _sg_o >= 0 ? sp_row[_sg_o] = -1;
+  pr_pad[_sg_r] = _sg_p;
+  _sg_p >= 0 ? (
+    sp_row[_sg_p] = _sg_r;
+    // The seed (§5A.7): a Tuned pad whose audio has not come through the loader since @init (sp_src_gen 0) holds what
+    // an embedded save restored -- its bake, at the saved tune. The first block seeds the spots it finds; a pad that
+    // gets one later is seeded here, before its generation can move below.
+    sp_src_gen[_sg_p] == 0 && sp_pitch_mode[_sg_p] == SP_PITCH_MODE_TUNED ? (
+      _sg_l = 0;
+      loop(MAX_LAYERS, sp_baked_tune[_sg_p * MAX_LAYERS + _sg_l] = p_tune[_sg_p]; _sg_l += 1; );
+    );
+    // A generation this spot has not published: the Extension keys a Stretch preparation by the SRCGEN VALUE, so an
+    // owner whose value equalled the old owner's would keep the old owner's sound. Lifted ABOVE every generation this
+    // instance has published on any spot (sp_gen_hw, swing_spot_tick; audit H20, 2026-10-23): one bump past map OR
+    // pub could land on the other when the two were adjacent (no hold, or a hold released in the same tick -- the
+    // new owner's Stretch hits played the old owner's sample), and the Extension may still hold an OLDER pub's
+    // preparation. Every pub and every preparation was once a map value, so a value above the mark is new to all.
+    swing_spot_gen(_sg_p) <= sp_gen_hw ? sp_src_gen[_sg_p] = sp_gen_hw - sp_epoch + 1;
+    // The ring's read cursor parked at the producer's: the old owner's tail is nobody's now.
+    _reg_my_slot >= 0 ? (
+      _sg_b = STRETCH_AUDIO_BASE + _reg_my_slot * STRETCH_INST_AUDIO_STRIDE + _sg_r * STRETCH_PAD_STRIDE;
+      stretch_read_pos[_sg_r] = atomic_get(gmem[_sg_b + STRETCH_OFF_WRITE_POS]) | 0;
+      atomic_set(gmem[_sg_b + STRETCH_OFF_READ_POS], stretch_read_pos[_sg_r]);
+    );
+    pr_state[_sg_r] = SPOT_STATE_PENDING;
+  ) : (
+    pr_state[_sg_r] = SPOT_STATE_FREE;
+  );
+);
+
+// The pad a spot drained for spot _sn_r goes to: its own bank A pad if that one waits, else the first pad waiting
+// (bank A in order, then 16..63); -1 = nobody waits.
+function swing_spot_next_wait(_sn_r)
+local(_sn_p _sn_w)
+(
+  _sn_w = -1;
+  sp_row[_sn_r] < 0 && swing_spot_wants(_sn_r) ? _sn_w = _sn_r : (
+    _sn_p = 0;
+    while(_sn_w < 0 && _sn_p < NUM_SLOTS) (
+      sp_row[_sn_p] < 0 && swing_spot_wants(_sn_p) ? _sn_w = _sn_p;
+      _sn_p += 1;
+    );
+  );
+  _sn_w;
+);
+
+// Once per @block from swing_spot_tick, only while a bridge that answers runs.
+function swing_spot_assign()
+local(_sa_r _sa_p _sa_t _sa_d _sa_ab _sa_best)
+(
+  _sa_ab = SPOT_ANS_BASE + _reg_my_slot * SPOT_ANS_STRIDE;
+  // 1. The drains. An owner that needs its spot again keeps it (the drain is cancelled: the bridge drops reverts
+  //    queued for a pad that is Tuned again). An answered drain hands the spot over.
+  _sa_r = 0;
+  loop(NUM_PADS,   // bank A: the spots; spot _sa_r's own pad is bank A pad _sa_r (sp_row[_sa_r] below)
+    pr_state[_sa_r] == SPOT_STATE_DRAINING ? (
+      _sa_p = pr_pad[_sa_r];
+      _sa_p >= 0 && swing_spot_wants(_sa_p) ? (
+        pr_state[_sa_r] = SPOT_STATE_LIVE;
+      ) : gmem[_sa_ab + SPOT_ANS_OFF_STATE + _sa_r] == pr_drain[_sa_r] ? (
+        _sa_t = swing_spot_next_wait(_sa_r);
+        _sa_t >= 0 ? swing_spot_give(_sa_r, _sa_t) : (
+          _sa_p == _sa_r ? ( pr_state[_sa_r] = SPOT_STATE_LIVE; )                  // its own pad, nobody waits: stays
+                         : swing_spot_give(_sa_r, sp_row[_sa_r] < 0 ? _sa_r : -1);  // home, or free
+        );
+      );
+    );
+    _sa_r += 1;
+  );
+  // 2. The pads waiting: each drain under way will serve one; for every other, a free spot is given at once, an
+  //    idle one with an owner starts draining. Its own spot first (a bank A pad), else the highest idle spot.
+  _sa_d = 0; _sa_r = 0;
+  loop(NUM_PADS, pr_state[_sa_r] == SPOT_STATE_DRAINING ? _sa_d += 1; _sa_r += 1; );
+  _sa_p = 0;
+  loop(NUM_SLOTS,
+    sp_row[_sa_p] < 0 && swing_spot_wants(_sa_p) ? (
+      _sa_d > 0 ? ( _sa_d -= 1; ) : (
+        _sa_best = -1;
+        _sa_p < NUM_PADS && swing_spot_idle(_sa_p) ? _sa_best = _sa_p : (
+          _sa_r = NUM_PADS - 1;
+          while(_sa_best < 0 && _sa_r >= 0) ( swing_spot_idle(_sa_r) ? _sa_best = _sa_r; _sa_r -= 1; );
+        );
+        _sa_best >= 0 ? (
+          pr_pad[_sa_best] < 0 ? swing_spot_give(_sa_best, _sa_p) : swing_spot_drain(_sa_best);
+        );
+      );
+    );
+    _sa_p += 1;
+  );
+  // 3. An idle spot away from home whose own bank A pad holds none goes back (drained first): the layout returns to
+  //    identity when nothing borrows, which is what an older bridge, a restart and every rig expect.
+  _sa_r = 0;
+  loop(NUM_PADS,   // bank A: the spots; spot _sa_r's own pad is bank A pad _sa_r
+    _sa_p = pr_pad[_sa_r];
+    _sa_p != _sa_r && sp_row[_sa_r] < 0 && swing_spot_idle(_sa_r) ? (
+      _sa_p < 0 ? swing_spot_give(_sa_r, _sa_r) : swing_spot_drain(_sa_r);
+    );
+    _sa_r += 1;
+  );
+);
+
+// ─── The spot handshake, @block half (§5A.5; the order and the hold of §5A.3) ───────────────────────────────
+// Runs right after swing_block_pitch_tick in @block ONLY (the map has one writer; @gfx and the bridge read it).
+// Per spot: publish OWNER / STATE / GEN (GEN last). When the owner's generation differs from what the map held,
+// a source change (or this instance's first block): the pad's Stretch output goes to the plain way and its
+// ring is choked, and the SRCGEN publish for the spot waits. It is released when the bridge's answer for the
+// spot equals the generation -- then the hold ends SP_HOLD_TICKS heartbeats later -- or at once when no new bridge
+// is running (the gate: its heartbeat must move while we watch, and ANS_VER must read 1), in which case nothing
+// is held: today's behaviour, for an older bridge or none. A dead Extension ends every hold too (its ring plays
+// nothing; the plain way is the fallback anyway).
+// Shared values (00-rules Q1): sp_src_gen is bumped from @block (CMD 63 / 64, the loader) and from @gfx (a grid
+// or overlay drop, undo); this tick reads it. sp_hold / sp_hold_hb are written here and read at voice launch
+// (@block). The map and the answer are gmem, per registry slot.
+function swing_spot_tick()
+local(_st_r _st_p _st_mb _st_ab _st_g _st_ans _st_hb _st_n _st_q _st_a _st_b)
+(
+  _reg_my_slot >= 0 ? (
+    _st_mb = SPOT_MAP_BASE + _reg_my_slot * SPOT_MAP_STRIDE;
+    _st_ab = SPOT_ANS_BASE + _reg_my_slot * SPOT_ANS_STRIDE;
+    // The bridge's heartbeat: alive only while it MOVES (wiki 5.8), the Extension watchdog's grace, in wall time
+    // (a render runs blocks faster than the bridge ticks).
+    _st_hb = gmem[_st_ab + SPOT_ANS_OFF_HB];
+    _st_hb != sp_br_last_hb ? (
+      sp_br_last_hb = _st_hb;
+      sp_br_last_seen_t = time_precise();
+    );
+    sp_br_alive = (time_precise() - sp_br_last_seen_t) < SP_PITCH_GRACE_S
+                  && gmem[_st_ab + SPOT_ANS_OFF_VER] >= 1;
+    // Lending needs a bridge that also answers DRAINS (ANS_VER 2, step 4): the step 3 bridge answers the handshake
+    // but never a drain, so a spot drained for a waiting pad would stay draining and the pad would wait for good.
+    sp_br_lends = sp_br_alive && gmem[_st_ab + SPOT_ANS_OFF_VER] >= 2;
+    // Pad swaps (swap_pads, @gfx) moved pads' audio: their spots follow it, every swap in the order it was made (the
+    // swap queue, read here only; Swing_ReaKit.jsfx @init). The count is read ONCE, through atomic_get (it pairs with
+    // swap_pads' atomic_set): every cell below it was written before it moved. More swaps than the queue holds while
+    // @block did not run (Swing bypassed): the oldest are dropped and their spots stay put -- those pads re-capture
+    // anyway (the swap bumped sp_src_gen; plan §6.4).
+    _st_n = atomic_get(sp_swap_req);
+    (_st_n - sp_swap_done > SP_SWAP_QN) ? sp_swap_done = _st_n - SP_SWAP_QN;
+    while (sp_swap_done < _st_n) (
+      _st_q = sp_swap_q[sp_swap_done % SP_SWAP_QN];
+      _st_a = (_st_q / NUM_SLOTS) | 0;
+      _st_b = _st_q - _st_a * NUM_SLOTS;
+      _st_r = sp_row[_st_a]; _st_p = sp_row[_st_b];
+      sp_row[_st_a] = _st_p; sp_row[_st_b] = _st_r;
+      _st_p >= 0 ? pr_pad[_st_p] = _st_a;
+      _st_r >= 0 ? pr_pad[_st_r] = _st_b;
+      sp_swap_done += 1;
+    );
+    sp_br_lends ? swing_spot_assign();   // step 4: lend, drain, hand over (nothing moves without a bridge that answers drains)
+    _st_r = 0;
+    loop(NUM_PADS,   // the spots: sixteen per instance
+      _st_p = pr_pad[_st_r];
+      _st_g = _st_p >= 0 ? swing_spot_gen(_st_p) : 0;
+      gmem[_st_mb + _st_r * 4 + 0] = _st_p + 1;
+      // STATE; a draining spot carries its drain's token in the same cell, STATE + 4 x token (step 4: the map has no
+      // free cell -- spot 15's fourth is MAP_VER at +63, which the first build's token at +3 overwrote every block)
+      gmem[_st_mb + _st_r * 4 + 1] = _st_p < 0 ? SPOT_STATE_FREE
+        : (pr_state[_st_r] == SPOT_STATE_DRAINING ? SPOT_STATE_DRAINING + 4 * pr_drain[_st_r] : pr_state[_st_r]);
+      atomic_set(gmem[_st_mb + _st_r * 4 + 2], _st_g);   // GEN last
+      _st_p >= 0 ? (
+        _st_g > sp_gen_hw ? sp_gen_hw = _st_g;   // the high-water mark of every GEN published (swing_spot_give, H20)
+        // A source change (or the first block): hold the pad's Stretch output, choke its ring, wait for the answer.
+        sp_map_gen[_st_r] != _st_g ? (
+          sp_map_gen[_st_r] = _st_g;
+          sp_hold[_st_p] = 1;
+          sp_hold_hb[_st_p] = 0;
+          sp_pitch_mode[_st_p] == SP_PITCH_MODE_STRETCH && stretch_choked[_st_p] == 0 ? stretch_choked[_st_p] = 1;
+        );
+        // The order: release the spot's SRCGEN when the bridge has prepared this generation, or at once with no
+        // new bridge to wait for.
+        sp_pub_gen[_st_r] != _st_g ? (
+          _st_ans = gmem[_st_ab + _st_r];
+          (!sp_br_alive || _st_ans == _st_g) ? (
+            sp_pub_gen[_st_r] = _st_g;
+            sp_hold_hb[_st_p] = sp_br_alive ? sp_pitch_cur_hb + SP_HOLD_TICKS : -1;   // -1: nothing to wait for
+          );
+        );
+        // A new owner is LIVE once its generation is released (prepared), or at once when it does not need the spot
+        // (a spot back home on a Repitch pad: no capture comes for it, so no answer either).
+        pr_state[_st_r] == SPOT_STATE_PENDING && (sp_pub_gen[_st_r] == _st_g || !swing_spot_wants(_st_p)) ?
+          pr_state[_st_r] = SPOT_STATE_LIVE;
+        // The hold ends SP_HOLD_TICKS heartbeats after the answer; at once with no bridge or no Extension.
+        sp_hold[_st_p] && sp_pub_gen[_st_r] == _st_g
+          && (sp_hold_hb[_st_p] < 0 || !sp_br_alive || !sp_pitch_ext_alive || sp_pitch_cur_hb >= sp_hold_hb[_st_p]) ? (
+          sp_hold[_st_p] = 0;
+        );
+      );
+      _st_r += 1;
+    );
+    gmem[_st_mb + SPOT_MAP_OFF_VER] = 1;
+  );
 );

@@ -27,6 +27,7 @@ function swing_mapping_init(fm) (
   _mv_n2p = fm; fm += 128;   // note -> owning pad index (first), else -1
   _mv_n2c = fm; fm += 128;   // note -> count of pads on it
   _mv_n2r = fm; fm += 128;   // note -> pad whose KEY RANGE covers it (first), else -1
+  _mv_n2o = fm; fm += 128;   // note -> the first SOUNDING pad of ANOTHER bank on it (Pad Banks step 4d), else -1
   _mv_drag_pad = -1;         // pad whose pin is being dragged (-1 = none)
   _mv_rdrag_pad = -1;        // pad whose span EDGE is being resized (-1 = none)
   _mv_rdrag_side = 0;        // which edge that drag holds: 0 = lo, 1 = hi
@@ -35,7 +36,7 @@ function swing_mapping_init(fm) (
   _mv_note_hash = -1;        // last-seen pad-note set; change -> re-fit the view
   _mv_layout = 6;            // 0=keys 1=8-pad 2=16-pad 3=keys+8 4=keys+16 5=push 6=notemap
                              // default = NOTEMAP (user 2026-08-18); session-sticky after that
-  _mv_bank = 0;              // 8-pad bank: 0 = pads 1-8, 1 = pads 9-16
+  _mv_bank = 0;              // 8-pad half (LOWER/UPPER): 0 = pads 1-8, 1 = pads 9-16 -- not a pad bank
   _mv_padswap = 0;           // pad-grid drag = swap pads (opt-in, off by default)
   _mv_swap_pad = -1;         // pad grabbed for a swap drag (-1 = none)
   _mv_padorder = 0;          // pad grid order: 0 = MPC bottom-left, 1 = reading top-left
@@ -67,7 +68,7 @@ function swing_mapping_btn(bx, by, bw, bh, lbl) local(hov) (
   gfx_set(0.45, 0.48, 0.54, 0.8);
   gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
   gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
-  gfx_setfont(1, "Arial", 9, 'b');
+  rk_font(1, 9, swing_txt_wt(9, lbl));   // "16 PAD" regular (wiki 4.7), "FIT" bold
   gfx_set(0.85, 0.87, 0.92, hov ? 1.0 : 0.85);
   gfx_measurestr(lbl, _mv_tw, _mv_th);
   gfx_x = bx + (bw - _mv_tw) * 0.5; gfx_y = by + (bh - _mv_th) * 0.5; gfx_drawstr(lbl);
@@ -97,11 +98,13 @@ function swing_mapping_hovinfo(p) local(nmp) (
     (p_rng_lo[p] > 0 || p_rng_hi[p] > 0) ? (
       swing_mapping_note_lbl(max(0, p_note[p] - p_rng_lo[p]), #_mv_rl);
       swing_mapping_note_lbl(min(127, p_note[p] + p_rng_hi[p]), #_mv_rl2);
-      sprintf(#_mv_hovinfo, "PAD %d %s — range %s..%s (-%d/+%d) · right-click key edits",
-              p + 1, nmp, #_mv_rl, #_mv_rl2, p_rng_lo[p], p_rng_hi[p]);
+      swing_pad_lbl(p, #_mv_pn);   // step 4d: "4" on screen, "A4" in another bank
+      sprintf(#_mv_hovinfo, "PAD %s %s — range %s..%s (-%d/+%d) · right-click key edits",
+              #_mv_pn, nmp, #_mv_rl, #_mv_rl2, p_rng_lo[p], p_rng_hi[p]);
     ) : (
       swing_mapping_note_lbl(p_note[p], #_mv_rl);
-      sprintf(#_mv_hovinfo, "PAD %d %s — %s", p + 1, nmp, #_mv_rl);
+      swing_pad_lbl(p, #_mv_pn);
+      sprintf(#_mv_hovinfo, "PAD %s %s — %s", #_mv_pn, nmp, #_mv_rl);
     );
   );
 );
@@ -110,7 +113,7 @@ function swing_mapping_hovinfo(p) local(nmp) (
 // a dark pill so it reads on any key color. Hidden if it can't fit the width.
 function swing_mapping_draw_note_lbl(cx, key_bottom, w, note) (
   swing_mapping_note_lbl(note, #_mv_kl);
-  gfx_setfont(1, "Arial", 9, 'b');
+  rk_font(1, 9, 0);   // regular: a bold 9 px "5" draws as a "6" -- "C5" read "C6" (wiki 4.7)
   gfx_measurestr(#_mv_kl, _mv_tw, _mv_th);
   _mv_tw <= w - 1 ? (
     gfx_set(0, 0, 0, 0.62);
@@ -124,9 +127,11 @@ function swing_mapping_draw_note_lbl(cx, key_bottom, w, note) (
 // shrinking the font (11 -> 9 -> 7) to fit the key width. Shadow + ink auto-
 // contrast (dark = light keys). Returns the line height it used.
 function swing_mapping_name_line(cx, y, kw, s, dark) local(f) (
-  f = 11; gfx_setfont(1, "Arial", f, 'b'); gfx_measurestr(s, _mv_tw, _mv_th);
-  _mv_tw > kw - 2 ? ( f = 9; gfx_setfont(1, "Arial", f, 'b'); gfx_measurestr(s, _mv_tw, _mv_th); );
-  _mv_tw > kw - 2 ? ( f = 7; gfx_setfont(1, "Arial", f, 'b'); gfx_measurestr(s, _mv_tw, _mv_th); );
+  // Under 10 px a name with a digit goes regular (wiki 4.7: bold 8-9 px draws
+  // 5 as 6); names in letters stay bold at every step.
+  f = 11; rk_font(1, f, 'b'); gfx_measurestr(s, _mv_tw, _mv_th);
+  _mv_tw > kw - 2 ? ( f = 9; rk_font(1, f, swing_txt_wt(f, s)); gfx_measurestr(s, _mv_tw, _mv_th); );
+  _mv_tw > kw - 2 ? ( f = 7; rk_font(1, f, swing_txt_wt(f, s)); gfx_measurestr(s, _mv_tw, _mv_th); );
   dark ? gfx_set(1, 1, 1, 0.4) : gfx_set(0, 0, 0, 0.5);
   gfx_x = cx - _mv_tw * 0.5 + 1; gfx_y = y + 1; gfx_drawstr(s);
   dark ? gfx_set(0.05, 0.05, 0.08, 1) : gfx_set(1, 1, 1, 1);
@@ -140,7 +145,7 @@ function swing_mapping_name_line(cx, y, kw, s, dark) local(f) (
 // note gets its own name line (layering, e.g. Kick + Sub). Label modes:
 // 0=icon+name 1=icon 2=name.
 function swing_mapping_key_content(kx, ky, kw, kh, note, r, g, b)
-local(nm, dark, gs, cat, footh, owner, icon_top, ny, pi) (
+local(nm, dark, gs, cat, footh, owner, icon_top, ny, pi, pi_s) (
   dark = (r + g + b) * 0.333 > 0.5;
   owner = _mv_n2p[note];
   nm = get_cname_slot(owner);
@@ -160,11 +165,12 @@ local(nm, dark, gs, cat, footh, owner, icon_top, ny, pi) (
     ny = icon_top - 3;
     pi = 0;
     loop(NUM_PADS,
-      p_note[pi] == note ? (
-        nm = get_cname_slot(pi);
-        strlen(nm) == 0 ? nm = get_name_slot(pi);
+      pi_s = swing_bp(pi);
+      p_note[pi_s] == note ? (
+        nm = get_cname_slot(pi_s);
+        strlen(nm) == 0 ? nm = get_name_slot(pi_s);
         strlen(nm) > 0 ? (
-          gfx_setfont(1, "Arial", 11, 'b'); gfx_measurestr(nm, _mv_tw, _mv_th);
+          rk_font(1, 11, 'b'); gfx_measurestr(nm, _mv_tw, _mv_th);
           ny -= _mv_th;
           ny > ky + 2 ? swing_mapping_name_line(kx + kw * 0.5, ny, kw, nm, dark);
           ny -= 2;
@@ -183,12 +189,13 @@ local(nm, dark, gs, cat, footh, owner, icon_top, ny, pi) (
 // notemap renderer WITHOUT the big view running) rebuilds them identically.
 function swing_mapping_build_lookups() (
     // ── note -> pad lookup (owner = first pad on the note; + count) ──
-    _mv_j = 0; loop(128, _mv_n2p[_mv_j] = -1; _mv_n2c[_mv_j] = 0; _mv_n2r[_mv_j] = -1; _mv_j += 1;);
+    _mv_j = 0; loop(128, _mv_n2p[_mv_j] = -1; _mv_n2c[_mv_j] = 0; _mv_n2r[_mv_j] = -1; _mv_n2o[_mv_j] = -1; _mv_j += 1;);
     _mv_i = 0; loop(NUM_PADS,
-      _mv_n = p_note[_mv_i];
+      _mv_i_s = swing_bp(_mv_i);
+      _mv_n = p_note[_mv_i_s];
       (_mv_n >= 0 && _mv_n < 128) ? (
         _mv_n2c[_mv_n] += 1;
-        _mv_n2p[_mv_n] < 0 ? _mv_n2p[_mv_n] = _mv_i;
+        _mv_n2p[_mv_n] < 0 ? _mv_n2p[_mv_n] = _mv_i_s;   // the tables hold ABSOLUTE pads (step 4a)
       );
       _mv_i += 1;
     );
@@ -201,16 +208,44 @@ function swing_mapping_build_lookups() (
     // only, via swing_mapping_rng_tintable, so color noise is suppressed
     // without lying about ownership.
     _mv_i = 0; loop(NUM_PADS,
-      (p_rng_lo[_mv_i] > 0 || p_rng_hi[_mv_i] > 0) ? (
-        _mv_n   = max(0, p_note[_mv_i] - p_rng_lo[_mv_i]);
-        _mv_rhi = min(127, p_note[_mv_i] + p_rng_hi[_mv_i]);
+      _mv_i_s = swing_bp(_mv_i);
+      (p_rng_lo[_mv_i_s] > 0 || p_rng_hi[_mv_i_s] > 0) ? (
+        _mv_n   = max(0, p_note[_mv_i_s] - p_rng_lo[_mv_i_s]);
+        _mv_rhi = min(127, p_note[_mv_i_s] + p_rng_hi[_mv_i_s]);
         while(_mv_n <= _mv_rhi) (
-          _mv_n2r[_mv_n] < 0 ? _mv_n2r[_mv_n] = _mv_i;
+          _mv_n2r[_mv_n] < 0 ? _mv_n2r[_mv_n] = _mv_i_s;
           _mv_n += 1;
         );
       );
       _mv_i += 1;
     );
+    // Pad Banks step 4d: the OTHER banks, as the engine hears them -- the first PLAYABLE pad of another bank on
+    // each note (an empty pad claims no note, spec 4.3). Drawn dimmed and clickable (select follows bank).
+    // And the span of the bank on screen's sixteen notes, which the keyboard frames.
+    _mv_blk_lo = 127; _mv_blk_hi = 0;
+    _mv_i = 0; loop(NUM_PADS,
+      _mv_i_s = swing_bp(_mv_i);
+      p_note[_mv_i_s] < _mv_blk_lo ? _mv_blk_lo = p_note[_mv_i_s];
+      p_note[_mv_i_s] > _mv_blk_hi ? _mv_blk_hi = p_note[_mv_i_s];
+      _mv_i += 1;
+    );
+    _mv_i = 0; loop(NUM_SLOTS,
+      swing_pad_bank(_mv_i) != bank_cur && pad_is_playable(_mv_i) ? (
+        _mv_n = p_note[_mv_i];
+        _mv_n >= 0 && _mv_n < 128 && _mv_n2o[_mv_n] < 0 ? _mv_n2o[_mv_n] = _mv_i;
+      );
+      _mv_i += 1;
+    );
+);
+
+// Pad Banks step 4d: another bank's sounding pad on a key -- its bank letter and number ("A4"), a small pill.
+function swing_mapping_other_lbl(cx, y, w, ap) (
+  swing_pad_lbl(ap, #_mv_ol);
+  rk_font(1, 9, 0); gfx_measurestr(#_mv_ol, _mv_tw, _mv_th);   // "A5": regular (wiki 4.7)
+  _mv_tw <= w - 2 ? (
+    gfx_set(0, 0, 0, 0.55); gfx_rect((cx - _mv_tw * 0.5 - 2) | 0, y | 0, (_mv_tw + 4) | 0, _mv_th + 2);
+    gfx_set(1, 1, 1, 0.85); gfx_x = cx - _mv_tw * 0.5; gfx_y = y + 1; gfx_drawstr(#_mv_ol);
+  );
 );
 
 function swing_mapping_draw_padgrid(px, py, pw, ph, rows, cols, first)
@@ -222,7 +257,7 @@ local(n, gap, cw, ch, p, pad, col, row, cx, cy, hov, dark, gs, cat, nm, has) (
   _mv_pg_hit = -1;
   p = 0;
   loop(n,
-    pad = first + p;
+    pad = swing_bp(first + p);   // the grid's tiles are the active bank's slots (step 4a)
     col = p % cols;
     // MPC (default): first pad bottom-left; reading order: first pad top-left
     row = _mv_padorder ? (p / cols | 0) : (rows - 1) - (p / cols | 0);
@@ -241,10 +276,10 @@ local(n, gap, cw, ch, p, pad, col, row, cx, cy, hov, dark, gs, cat, nm, has) (
     gfx_rect(cx, cy, cw, 1); gfx_rect(cx, cy + ch - 1, cw, 1);
     gfx_rect(cx, cy, 1, ch); gfx_rect(cx + cw - 1, cy, 1, ch);
 
-    // pad number (top-left)
-    gfx_setfont(1, "Arial", 9, 'b');
+    // pad number (top-left); regular: a bold 9 px "5" draws as a "6" (wiki 4.7)
+    rk_font(1, 9, 0);
     dark ? gfx_set(0.08, 0.08, 0.10, 0.9) : gfx_set(0.98, 0.98, 1, 0.9);
-    sprintf(#_mv_pl, "%d", pad + 1);
+    sprintf(#_mv_pl, "%d", swing_pad_num(pad));   // 1..16 (step 4d; pad is a slot)
     gfx_x = cx + 3; gfx_y = cy + 2; gfx_drawstr(#_mv_pl);
     // note label (top-right) — a ranged pad shows its whole span
     // ("F1..F3" — the RANGE pill's -x/+y offsets resolved to real keys, so
@@ -256,7 +291,7 @@ local(n, gap, cw, ch, p, pad, col, row, cx, cy, hov, dark, gs, cat, nm, has) (
       // writing (self-reference reads half-overwritten data).
       sprintf(#_mv_kl, "%s..%s", #_mv_rl, #_mv_rl2);
     ) : swing_mapping_note_lbl(p_note[pad], #_mv_kl);
-    gfx_setfont(1, "Arial", 8, 'b');
+    rk_font(1, 8, 0);   // note span: regular (wiki 4.7)
     gfx_measurestr(#_mv_kl, _mv_tw, _mv_th);
     // Fit guard (audit R2): the span label can hit ~10 chars; on narrow cells
     // it would run left into the pad number. Too wide -> root-only, remeasure.
@@ -290,7 +325,7 @@ local(n, gap, cw, ch, p, pad, col, row, cx, cy, hov, dark, gs, cat, nm, has) (
     hov ? _mv_pg_hit = pad;   // pad under the cursor (for swap-drag)
     // audition + select
     hov && lmb_down ? (
-      sel_pad = pad;
+      swing_select_pad(pad);
       has ? swing_gt_post(pad, p_note[pad], 110, 8);
     );
     // wheel over a cell → nudge its note (Shift = octave)
@@ -377,7 +412,7 @@ local(gap, cw, ch, r, c, rowb, note, cx, cy, hov, own, dark, gs, cat, nm, base) 
       // note name (top-right)
       (note >= 0 && note < 128) ? (
         swing_mapping_note_lbl(note, #_mv_kl);
-        gfx_setfont(1, "Arial", 7, 0);
+        rk_font(1, 7, 0);
         own >= 0 ? ( dark ? gfx_set(0.1, 0.1, 0.12, 0.8) : gfx_set(0.95, 0.95, 1, 0.8) ) : gfx_set(0.5, 0.5, 0.55, 0.7);
         gfx_measurestr(#_mv_kl, _mv_tw, _mv_th);
         gfx_x = cx + cw - _mv_tw - 2; gfx_y = cy + 1; gfx_drawstr(#_mv_kl);
@@ -398,19 +433,19 @@ local(gap, cw, ch, r, c, rowb, note, cx, cy, hov, own, dark, gs, cat, nm, base) 
           _mv_label_mode != 1 ? swing_mapping_name_line(cx + cw * 0.5, cy + ch - 13, cw - 3, nm, dark);
         );
         hov && lmb_down ? (
-          sel_pad = own;
+          swing_select_pad(own);
           pad_is_playable(own) ? swing_gt_post(own, p_note[own], 110, 8);
         );
       );
       // covered cell: audition the range owner at this cell's pitch
       own < 0 && note >= 0 && note < 128 && _mv_n2r[note] >= 0 && hov && lmb_down ? (
-        sel_pad = _mv_n2r[note];
+        swing_select_pad(_mv_n2r[note]);
         pad_is_playable(sel_pad) ? swing_gt_post(sel_pad, note, 110, 8);
       );
       // right-click any resolvable cell → RANGE EDITOR
       hov && rmb_down && note >= 0 && note < 128 && (own >= 0 || _mv_n2r[note] >= 0) ? (
         rng_ov_pad = own >= 0 ? own : _mv_n2r[note];
-        sel_pad = rng_ov_pad;
+        swing_select_pad(rng_ov_pad);
         _mv_drag_pad = -1; _mv_drag_moved = 0;   // no ghost drop after rng closes (audit R1)
       );
       c += 1;
@@ -466,15 +501,15 @@ local(wc, wh, bw, bh, note, y, own, hov, wi, wb, k) (
       // 7px font; below that, C-only exactly as before — never a clipped
       // half-label. Black keys stay unlabeled; the white anchors identify them.
       (wh >= 9 || (note - floor(note / 12) * 12) == 0) ? (
-        gfx_setfont(1, "Arial", 7, 0); gfx_set(0.20, 0.20, 0.24, 1);
+        rk_font(1, 7, 0); gfx_set(0.20, 0.20, 0.24, 1);
         swing_mapping_note_lbl(note, #_mv_kl);
         gfx_x = px + 2; gfx_y = y + wh - 9; gfx_drawstr(#_mv_kl);
       );
       hov ? swing_mapping_hovinfo(own >= 0 ? own : _mv_n2r[note]);
-      hov && lmb_down && own >= 0 ? ( sel_pad = own; pad_is_playable(own) ? swing_gt_post(own, p_note[own], 110, 8); );
+      hov && lmb_down && own >= 0 ? ( swing_select_pad(own); pad_is_playable(own) ? swing_gt_post(own, p_note[own], 110, 8); );
       // covered key, no exact owner: audition the range owner AT THIS pitch
       hov && lmb_down && own < 0 && _mv_n2r[note] >= 0 ? (
-        sel_pad = _mv_n2r[note];
+        swing_select_pad(_mv_n2r[note]);
         pad_is_playable(sel_pad) ? swing_gt_post(sel_pad, note, 110, 8);
       );
       wi += 1;
@@ -495,10 +530,10 @@ local(wc, wh, bw, bh, note, y, own, hov, wi, wb, k) (
       gfx_rect(px, y, bw, bh);
       gfx_set(0, 0, 0, 0.85); gfx_rect(px, y, bw, 1); gfx_rect(px, y + bh - 1, bw, 1); gfx_rect(px + bw - 1, y, 1, bh);
       hov ? swing_mapping_hovinfo(own >= 0 ? own : _mv_n2r[note]);
-      hov && lmb_down && own >= 0 ? ( sel_pad = own; pad_is_playable(own) ? swing_gt_post(own, p_note[own], 110, 8); );
+      hov && lmb_down && own >= 0 ? ( swing_select_pad(own); pad_is_playable(own) ? swing_gt_post(own, p_note[own], 110, 8); );
       // covered key, no exact owner: audition the range owner AT THIS pitch
       hov && lmb_down && own < 0 && _mv_n2r[note] >= 0 ? (
-        sel_pad = _mv_n2r[note];
+        swing_select_pad(_mv_n2r[note]);
         pad_is_playable(sel_pad) ? swing_gt_post(sel_pad, note, 110, 8);
       );
     ) : 0;
@@ -537,7 +572,7 @@ local(cols, rows, gap, cw, ch, hh, i, col, rowb, srow, note, cx, cy, hov, own, d
       own = _mv_n2p[note];
       hov ? (
         _mv_nm_hn = note; _mv_nm_hit = own;
-        swing_mapping_hovinfo(own >= 0 ? own : _mv_n2r[note]);
+        swing_mapping_hovinfo(own >= 0 ? own : _mv_n2r[note] >= 0 ? _mv_n2r[note] : _mv_n2o[note]);
       );
 
       // body: pad well (mapped) or empty slot
@@ -557,6 +592,11 @@ local(cols, rows, gap, cw, ch, hh, i, col, rowb, srow, note, cx, cy, hov, own, d
           swing_color_pad_hsl(_mv_n2r[note], 0.55, 0.22);
           gfx_set(_hsl_r, _hsl_g, _hsl_b, hov ? 1.0 : 0.9);
           gfx_rect(cx, cy + hh, cw, ch - hh);
+        ) : _mv_n2o[note] >= 0 ? (
+          // step 4d: another bank's sounding pad on this note -- dim, clickable
+          swing_color_pad_hsl(_mv_n2o[note], 0.25, 0.20);
+          gfx_set(_hsl_r, _hsl_g, _hsl_b, hov ? 1.0 : 0.85);
+          gfx_rect(cx, cy + hh, cw, ch - hh);
         ) : (
           gfx_set(0.10, 0.10, 0.12, 1);
           gfx_rect(cx, cy + hh, cw, ch - hh);
@@ -565,23 +605,29 @@ local(cols, rows, gap, cw, ch, hh, i, col, rowb, srow, note, cx, cy, hov, own, d
         );
       );
       // header band + note name
-      gfx_set(0.13, 0.13, 0.16, 1);
+      note >= _mv_blk_lo && note <= _mv_blk_hi ? gfx_set(0.34, 0.11, 0.09, 1) : gfx_set(0.13, 0.13, 0.16, 1);   // step 4d: the bank on screen's span
       gfx_rect(cx, cy, cw, hh);
       swing_mapping_note_lbl(note, #_mv_kl);
-      gfx_setfont(1, "Arial", 9, 'b');
+      rk_font(1, 9, 0);   // note + pad number: regular (wiki 4.7)
       gfx_set(0.88, 0.88, 0.93, 0.95);
       gfx_x = cx + 4; gfx_y = cy + (hh - 9) * 0.5; gfx_drawstr(#_mv_kl);
       own >= 0 ? (
-        sprintf(#_mv_pl, "%d", own + 1);
+        sprintf(#_mv_pl, "%d", swing_pad_num(own));   // 1..16 (step 4d)
         gfx_measurestr(#_mv_pl, _mv_tw, _mv_th);
         gfx_set(0.65, 0.65, 0.72, 0.9);
         gfx_x = cx + cw - _mv_tw - 4; gfx_y = cy + (hh - _mv_th) * 0.5; gfx_drawstr(#_mv_pl);
       ) : _mv_n2r[note] >= 0 ? (
         // covered cell: the covering pad's number, dimmed — answers "whose
         // range is this" without opening anything
-        sprintf(#_mv_pl, "%d", _mv_n2r[note] + 1);
+        sprintf(#_mv_pl, "%d", swing_pad_num(_mv_n2r[note]));
         gfx_measurestr(#_mv_pl, _mv_tw, _mv_th);
         gfx_set(0.55, 0.55, 0.60, 0.6);
+        gfx_x = cx + cw - _mv_tw - 4; gfx_y = cy + (hh - _mv_th) * 0.5; gfx_drawstr(#_mv_pl);
+      ) : _mv_n2o[note] >= 0 ? (
+        // step 4d: another bank's pad -- its bank letter and number
+        swing_pad_lbl(_mv_n2o[note], #_mv_pl);
+        gfx_measurestr(#_mv_pl, _mv_tw, _mv_th);
+        gfx_set(0.70, 0.62, 0.55, 0.8);
         gfx_x = cx + cw - _mv_tw - 4; gfx_y = cy + (hh - _mv_th) * 0.5; gfx_drawstr(#_mv_pl);
       );
       // pad content in the body
@@ -606,7 +652,7 @@ local(cols, rows, gap, cw, ch, hh, i, col, rowb, srow, note, cx, cy, hov, own, d
       gfx_rect(cx, cy, 1, ch); gfx_rect(cx + cw - 1, cy, 1, ch);
       // audition
       hov && lmb_down && own >= 0 ? (
-        sel_pad = own;
+        swing_select_pad(own);
         pad_is_playable(own) ? swing_gt_post(own, p_note[own], 110, 8);
       );
     );
@@ -620,13 +666,18 @@ local(cols, rows, gap, cw, ch, hh, i, col, rowb, srow, note, cx, cy, hov, own, d
   // Covered cell (no exact owner): audition the range owner AT the cell's
   // pitch + select — these cells were previously dead to clicks.
   lmb_down && _mv_nm_hit < 0 && _mv_nm_hn >= 0 && _mv_n2r[_mv_nm_hn] >= 0 ? (
-    sel_pad = _mv_n2r[_mv_nm_hn];
+    swing_select_pad(_mv_n2r[_mv_nm_hn]);
     pad_is_playable(sel_pad) ? swing_gt_post(sel_pad, _mv_nm_hn, 110, 8);
+  ) :
+  // step 4d: another bank's pad -- select it (the view follows to its bank) and audition it
+  lmb_down && _mv_nm_hit < 0 && _mv_nm_hn >= 0 && _mv_n2o[_mv_nm_hn] >= 0 ? (
+    swing_select_pad(_mv_n2o[_mv_nm_hn]);
+    swing_gt_post(sel_pad, p_note[sel_pad], 110, 8);
   );
   // Right-click a cell → RANGE EDITOR for its resolved pad.
   rmb_down && _mv_nm_hn >= 0 && (_mv_nm_hit >= 0 || _mv_n2r[_mv_nm_hn] >= 0) ? (
     rng_ov_pad = _mv_nm_hit >= 0 ? _mv_nm_hit : _mv_n2r[_mv_nm_hn];
-    sel_pad = rng_ov_pad;
+    swing_select_pad(rng_ov_pad);
     // Kill any in-flight tile drag: the range overlay replaces this view in
     // the dispatch chain, so the drop handler would otherwise fire with STALE
     // drag state on the first frame after it closes — a ghost reassignment to

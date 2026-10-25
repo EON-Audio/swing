@@ -30,12 +30,9 @@ local function swing_addname()
   return name
 end
 
--- Same Swing-instance test the bridge/browser use.
+-- Same Swing-instance test the bridge/browser use: the plugin's file, never its shown name.
 local function fx_is_swing(tr, fx)
-  local _, fname = reaper.TrackFX_GetFXName(tr, fx, "")
-  return (fname:find("DrumKit_ReaKit")
-       or fname:match("^JS: Swing")
-       or fname:match("Swing %— 16%-Pad")) ~= nil
+  return core.is_swing_fx(tr, fx)
 end
 
 local function any_swing_exists()

@@ -748,7 +748,7 @@ nextslot1           = eon_adapt_scratch   + 001536;   // 0..1407 (128 steps x 11
 KS = 16;
 ss_knob_mem         = nextslot1;            // max_numnotes * 2 knobs * KS
 nextslot1           = ss_knob_mem         + 001568;   // 49 * 2 * 16
-nextslot1           = swing_popup_init(nextslot1);    // THEME menu row lists (194)
+nextslot1           = swing_popup_init(nextslot1);    // THEME menu row lists (386: 64 items x 6 tables + 2)
 memset(ss_knob_mem, 0, 1568);
 // Lane-header column spans, recorded by eon_ms_geo for the column-header strip.
 // 7 columns: 0 icon, 1 name, 2 mute, 3 solo, 4 vol, 5 pan, 6 swing.
@@ -2026,7 +2026,7 @@ function change_pattern(new_p) local(i)
 // lane's groove), its ties (LEN), its un-accented velocity, and the CC lanes (2B:
 // rows matched to lanes by type + channel). Only ever called from the gated @block
 // trigger, so Sync OFF / unpaired = this never runs.
-function eon_ss_import_grid() local(np, buf_ns, use_ns, r, s, pad, vel, sd, sdn, bm, k, sv, off, len, nudge, amp, run, j, cct, ccc, ln)
+function eon_ss_import_grid() local(np, buf_ns, use_ns, r, s, pad, vel, sd, sdn, bm, k, sv, off, len, nudge, amp, run, j, held, cct, ccc, ln)
 (
   eon_gc_blkseq += 1;   // grid cache: this rewrites the grid without touching p -- invalidate
   np     = gmem[EON_SS_XFER_BASE + 2]|0;          // numpads
@@ -2051,7 +2051,9 @@ function eon_ss_import_grid() local(np, buf_ns, use_ns, r, s, pad, vel, sd, sdn,
           amp = groove_amp_rt[r*max_seqlength + s];
           amp > 0 ? vel = floor(vel / amp + 0.5);
           vel < 1 ? vel = 1 : vel > 127 ? vel = 127;
-          notelist[s] += 2^r;                                  // set lane r presence bit
+          // Set lane r's presence bit -- guarded: an add onto a set bit carries into lane r+1.
+          // The tie loop below no longer runs into a hit step, so this is the safety net.
+          !(notelist[s] & (2^r)) ? notelist[s] += 2^r;
           setVelo(r*listlength + s, vel);
           // P3b-5b: adopt the cell's ratchet (count + mask + per-sub-hit velocities).
           // The slabs were cleared above, so a cell without subdiv data stays plain.
@@ -2083,9 +2085,15 @@ function eon_ss_import_grid() local(np, buf_ns, use_ns, r, s, pad, vel, sd, sdn,
             nudge > 0 ? setStart(r*listlength + s, nudge);
             run = floor(len + off + 0.5);   // steps the note spans (1 = a plain step)
             run < 1 ? run = 1;
-            j = 1;
+            // The tie ENDS at the pad's next hit (or the grid's end), as a new note-on ends a held
+            // note in MIDI and in the engine. Run on into that hit, it set the hit's bit first, the
+            // hit's own add then carried into lane r+1 (a stray velocity-0 cell, cascading down),
+            // and the tie swallowed the hit (audit H09, 2026-10-23: triplets painted in the DM).
+            // A flag, not j = run: loop() has a fixed count. Ratchet cells carry DATA > 0 too.
+            j = 1; held = 1;
             loop(run - 1,
-              (s + j < use_ns) ? (
+              (held && (s + j >= use_ns || (gmem[EON_SS_XFER_DATA + pad*buf_ns + s + j]|0) > 0)) ? held = 0;
+              held ? (
                 notetie[s + j - 1] += 2^r;                     // carry through the next step
                 !(notelist[s + j] & (2^r)) ? (
                   notelist[s + j] += 2^r;
@@ -7452,13 +7460,22 @@ colorscheme==10 ? (
   thm_anchor_w = eon_thw; thm_anchor_h = eon_thh;
   // ⭐ HOUSE RULE: a LEFT click opens the menu — the one panel with every
   // appearance option. The theme list stays one RIGHT click away and is also
-  // the menu's first row, so nothing is lost. lmb is withheld from rkth_input
-  // so the widget still stores its geometry without toggling its own list.
-  _ss_thit = mstate==0 && mouse_cap==1
+  // the menu's first row, so nothing is lost.
+  // ⚠️⚠️ lmb reaches rkth_input ONLY while its list is
+  // already OPEN. Shut, it is withheld so a left click on the chip opens the
+  // THEME MENU rather than the widget's own list. Open, the click is the LIST'S:
+  // rk_theme.jsfx-inc:118 picks the hovered row under `lmb ?`, so withholding it
+  // unconditionally left the list openable by right-click and impossible to
+  // choose from -- which is how it shipped in 3.0.18.
+  // ⭐ _ss_thit is gated the same way, and it must be: it is computed BEFORE the call,
+  // so a consumed click cannot unset it. This face reads the RAW buttons, so lmb is
+  // mouse_cap==1 here, the mirror of the rmb argument below.
+  _ss_thit = !rkth_open && mstate==0 && mouse_cap==1
           && mouse_x>=eon_thx && mouse_x<eon_thx+eon_thw
           && mouse_y>=eon_thy && mouse_y<eon_thy+eon_thh;
   rkth_input(eon_thx, eon_thy, eon_thw, eon_thh, mouse_x, mouse_y,
-             0, (mstate==0 && mouse_cap==2) ? 1 : 0,
+             rkth_open ? ((mstate==0 && mouse_cap==1) ? 1 : 0) : 0,
+             (mstate==0 && mouse_cap==2) ? 1 : 0,
              mouse_wheel, 19) ? (
     mstate=ms_tb_button_noundo; refresh_tb=1; eon_pdraw=4; mouse_wheel=0;
   );
@@ -11595,21 +11612,34 @@ eon_so_open ? (
   // Grid feel: flip the active pattern between STRAIGHT (4 steps/beat) and TRIPLET-capable
   // (12/beat). 12 holds straight 16ths (every 3rd cell) + 8th-triplets (every 4th) +
   // 16th-triplets (every 2nd) on ONE grid (deep-research wf_085daf33: the high-res common-grid
-  // approach). Scales Seq Length x3 / /3 to keep the bar count. SYNC-mode only: the bridge
-  // re-imports the region at the new resolution (it watches listlen/spb), so notes land
-  // correctly -- the region is the source of truth, so no in-plugin note remap is needed.
-  eon_is_trip = (steps_per_beat % 3) == 0 && steps_per_beat >= 6;   // 6/12 = triplet-capable
+  // approach). Keeps the pattern's length in beats: the bound region's QN when there is one
+  // (the length-follow formula, so its next block agrees), else listlength/steps_per_beat.
+  // SYNC-mode only: the bridge re-imports the region at the new resolution (it watches
+  // listlen/spb), so notes land correctly -- the region is the source of truth, so no
+  // in-plugin note remap is needed.
+  // A pattern too long for the new resolution (a 2-bar pattern at 12/beat in the 96x64 layout)
+  // greys the row out and says so (user 2026-10-23, audit H10). It used to clamp silently to
+  // max_seqlength: the grid lost the pattern's tail and the next edit's export wiped it from the
+  // region. 3, 6 and 12 steps per beat all count as triplet (the toolbar chip offers 3 and 6).
+  eon_is_trip = steps_per_beat > 0 && (steps_per_beat % 3) == 0;
+  eon_new_spb = eon_is_trip ? 4 : 12;
+  eon_gf_q = (eon_pair_slot>=0) ? gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_RGNQN] : 0;
+  eon_gf_q <= 0 ? eon_gf_q = (steps_per_beat > 0 ? listlength / steps_per_beat : 4);
+  eon_new_len = floor(eon_gf_q * eon_new_spb + 0.5);
+  eon_gf_ok = eon_new_len <= max_seqlength;
+  eon_gf_on = eon_sync_mode && eon_pair_slot>=0 && eon_gf_ok;
   gfx_set(0.14,0.16,0.14,1); gfx_x=eon_so_lx; gfx_y=eon_so_ry+4; gfx_drawstr("Grid feel");
-  (eon_sync_mode && eon_pair_slot>=0) ? (eon_is_trip ? gfx_set(0.42,0.30,0.16,1) : gfx_set(0.16,0.34,0.42,1)) : gfx_set(0.18,0.19,0.19,1);
+  eon_gf_on ? (eon_is_trip ? gfx_set(0.42,0.30,0.16,1) : gfx_set(0.16,0.34,0.42,1)) : gfx_set(0.18,0.19,0.19,1);
   gfx_rect(eon_so_cx, eon_so_ry, 200, 22);
   gfx_set(0.90,0.95,0.97,1); gfx_x=eon_so_cx+8; gfx_y=eon_so_ry+5;
-  gfx_drawstr((eon_sync_mode && eon_pair_slot>=0) ? (eon_is_trip ? "Triplet (12/beat)" : "Straight (4/beat)") : "(enable Sync + pair)");
-  (eon_so_click && eon_sync_mode && eon_pair_slot>=0 && mouse_x>=eon_so_cx && mouse_x<eon_so_cx+200 && mouse_y>=eon_so_ry && mouse_y<eon_so_ry+22) ? (
-    eon_is_trip ? (
-      eon_new_spb = 4;  eon_new_len = max(2, (listlength/3)|0);
-    ) : (
-      eon_new_spb = 12; eon_new_len = min(max_seqlength, listlength*3);
-    );
+  !(eon_sync_mode && eon_pair_slot>=0) ? gfx_drawstr("(enable Sync + pair)")
+  : !eon_gf_ok ? gfx_drawstr(eon_is_trip ? "(too long for 4/beat)" : "(too long for triplets)")
+  : (
+    sprintf(#eon_gft, eon_is_trip ? "Triplet (%d/beat)" : "Straight (%d/beat)", steps_per_beat);
+    gfx_drawstr(#eon_gft);
+  );
+  (eon_so_click && eon_gf_on && mouse_x>=eon_so_cx && mouse_x<eon_so_cx+200 && mouse_y>=eon_so_ry && mouse_y<eon_so_ry+22) ? (
+    eon_new_len = max(2, eon_new_len);
     listlength = eon_new_len; sliderchange(slider3=listlength); change_seqlen(listlength);
     steps_per_beat = eon_new_spb; steps_per_beat_pat[p] = eon_new_spb; sliderchange(slider9=eon_new_spb); rateadj = steps_per_beat*rate;
     p <= chain ? update_chain_beats();

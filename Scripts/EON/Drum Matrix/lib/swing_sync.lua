@@ -516,6 +516,12 @@ function M.Tick()
       last_digest[guid] = nil
     end
     local slot = slot_for_group(guid, n_groups)
+    -- Pad Banks step 5a: the lanes are bank A's. While the Swing shows another bank its bands carry that bank,
+    -- and a sync would rename the lanes and TRANSPOSE their MIDI to that bank's notes. Pause; the digest is
+    -- kept, so coming back to bank A changes nothing unless bank A itself changed meanwhile.
+    if slot and swing_state.SlotBankCur(slot) ~= 0 then slot = nil end
+    -- ...and lanes with no guid read the legacy shared block: the bank ITS publisher shows (audit S13)
+    if slot == false and swing_state.SharedBankCur() ~= 0 then slot = nil end
     if slot ~= nil then
       -- AFTER slot_for_group: it ran SlotForGuid, priming swing_state's cache,
       -- so TrackForGuid is a free peek. Policy rides the digest below — flipping
@@ -553,6 +559,8 @@ function M.ForceResync()
   local touched, any = 0, false
   for guid, lanes in pairs(groups) do
     local slot = slot_for_group(guid, n_groups)
+    if slot and swing_state.SlotBankCur(slot) ~= 0 then slot = nil end   -- step 5a: not while another bank is shown
+    if slot == false and swing_state.SharedBankCur() ~= 0 then slot = nil end   -- the shared block's bank (audit S13)
     if slot ~= nil then
       any = true
       local policy, pol_name = policy_for_guid(guid)

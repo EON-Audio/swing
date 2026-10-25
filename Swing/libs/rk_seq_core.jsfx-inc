@@ -1,0 +1,1705 @@
+// rk_seq_core.jsfx-inc -- the Swing step sequencer's engine (Spec_Swing_Seq_View.md; phases S1 + S2, 2026-10-19).
+// The data model (spec 6), the walker (spec 12, host mode), the note-off schedule and the project save
+// (spec 8). No gfx here: the grid is rk_seq_ui.jsfx-inc. The host claims the memory and calls seq_init;
+// this inc never claims freemem itself (wiki 2.4). Imported AFTER rk_swing_block (swing_pad_blocked) and
+// rk_swing_core (the launcher, the voice schedule): EEL2 binds a call at definition time.
+//
+// S1 (the user: "Go: build the first step (the part that plays steps in time, the project save, a plain
+// full-window grid)"): sixteen lanes aimed at pads, each lane its length and division, steps on / off with a
+// velocity, lane mute / solo, GATE on gate-mode pads, the sequencer's own PLAY switch.
+// P0.0 (2026-10-20, the release plan's groundwork): the walk per lane (seq_walk_lane) with an ANCHOR and a SINK, the
+// pattern SELECTOR (seq_eng_pat / seq_eng_anchor) and the OP QUEUE (seq_post_op) -- no change of behaviour.
+// S2 (the user: "Go: start the per-step features"): per step probability, rolls (ratchets 1..4 with their own
+// sub-velocities), nudge and accent; per pattern swing, humanize (velocity and time), the accent offset; per
+// lane the offset in ms and the swing strength W. Every one of these was already in the data model and the
+// stream, so no new serialize gate. Not yet read by the walker: tie / slide, per-step pitch / pan (1b), the
+// groove slot and LINK (S4), the song chain (S4, the regions).
+// S3 (2026-10-20, the user: "go"): thirty-two patterns and a clipboard slot; the pattern ops (clear all, copy, paste,
+// duplicate, halve, double) through the op queue; the MIDI triggers (seq_trig_note from the host's MIDI loop: a note in
+// the trigger range picks a pattern at the next 1/16 boundary -- change, change + resync, change + resync on the beat)
+// with the switch inside the block: the outgoing pattern plays to the switch beat and its later hits are cut.
+// (c) EON Studios -- All Rights Reserved
+
+@init
+
+SEQ_PATS     = 32;   // patterns held live (16 until S3, 2026-10-20). The stream carries its own pattern count
+                     // (seq_serialize), so this constant can grow without a new gate; a stream with more patterns
+                     // than this build holds is read to the end and the extra patterns dropped. The host claims one
+                     // slot MORE: SEQ_CLIP, the clipboard (never walked, never saved).
+SEQ_LANES    = 16;
+SEQ_STEPS    = 64;
+SEQ_ATTR     = 10;   // per step: 0 on, 1 vel 1..127, 2 prob 0..100, 3 ratchet 1..4, 4 tie (0 none 1 tie 2 slide),
+                     //           5 nudge -50..50 (% of a step), 6 pitch -48..48, 7 pan -100..100, 8 acc 0/1, 9 cond (reserved)
+SEQ_RSUB_N   = 3;    // per step: the velocities of a roll's 2nd, 3rd and 4th hit (0 = the step's own velocity).
+                     // _N because EEL2 names are case-insensitive: SEQ_RSUB would BE the array seq_rsub (wiki 1.13)
+SEQ_LANE_F   = 13;   // per lane record: 0 target (a pad slot 0..NUM_SLOTS-1; -1..-16 = a MIDI channel, phase 4b),
+                     //   1 len 1..64, 2 div (index, seq_div_beats), 3 offset_ms (-500..500), 4 / 5 the pattern's own mute / solo
+                     //   until the polish pass (2026-10-20: now one mute and one solo per LANE for every pattern, seq_gmute /
+                     //   seq_gsolo; these two cells stay in the record and the stream, read once to migrate an older file), 6 vol, 7 pan,
+                     //   8 SW: the lane's OWN swing 0..100 % (odd steps late by SW % of half a step), or -1 = the pattern's
+                     //     SWING (P0a, 2026-10-20, the user: "swing per lane" = "its own swing per lane"; until P0a this
+                     //     cell was W, a strength 0..100 % OF the pattern's swing, default 100 -- a 78 stream is converted),
+                     //   9 link_src (-1 none), 10 piano, 11 scale, 12 groove_slot
+SEQ_PAT_F    = 12;   // per pattern record: 0 len, 1 rate, 2 feel, 3 swing 0..100 % (100 = odd steps half a step late),
+                     //   4 gate %, 5 hum_v % (velocity, +-), 6 hum_t % (time, +- half a step at 100), 7 acc (the accent
+                     //   offset, -127..127), 8 used, 9 seed, 10 fill_src (-1 none), 11 reserved
+SEQ_SONG_MAX = 64;   // song chain slots (pattern, repeats) -- phase 3 fills them; the stream carries them now
+SEQ_WK_F     = 16;   // per lane runtime: 0 the first step index not yet done (the window's start), 1 the step under the
+                     //   playhead (-1 none), 2 the division that index was counted in, 3 fresh (1 right after a jump: hits
+                     //   already past are skipped, not fired late), 4..6 unused since S5's window (were the roll hit, the
+                     //   roll count and the die of one step), 7 the lane's kind last walked (1 grid, 2 roll; a change
+                     //   resets the walker), 8..11 the window's steps' judged hits (a bit per roll hit or note slot), 12..15 spare
+SEQ_WIN      = 4;    // S5 (Codex): the walker judges this many steps at once (a step's hits within [-1, +2.25] steps)
+SEQ_HB_MAX   = 512;  // S5 (Codex): the walk's hits per block, sorted by time before they fire (entries of SEQ_HB_F)
+SEQ_HB_F     = 8;    //   0 time (beats), 1 lane, 2 step index, 3 hit / slot, 4 the step on the lane, 5 hold (beats), 6 kind
+SEQ_NOQ_MAX  = 256;  // note-off schedule: entries of SEQ_NOQ_F (pad, note, due beat, the mirror; pad < 0 = a MIDI channel lane's
+                     // note, -channel). 32 until S5: chords and held notes need the room
+SEQ_NOQ_F    = 4;    // S6: [3] = the drum mirror's channel owed a note-off (0 none) + 100 x mirror-only (a one-shot pad: no voice release)
+SEQ_PRINT_F  = 5;    // S6: a printed hit in the EON_SEQ_PRINT band: beat, note, velocity, length (beats), channel: 100 + the
+                     // absolute pad 0..63 for a pad hit (the small-things round: PRINT SONG puts each drum on its own track;
+                     // an older bridge maps anything outside 1..16 to channel 1), 1..16 a channel lane's note, 0 a roll note
+                     // on a pad lane (it prints at its own pitch: the item's channel 1)
+SEQ_MAP_SPAN = 452;  // the small-things round: the map band's tail per slot (and the mirror's, the same offsets): +452 the count
+SEQ_SPAN_MAX = 29;   //   of the spans the bridge's PRINT SONG items cover (0..29), pairs (start, end) in quarter notes from +454
+                     //   -- the region entries' units; the engine plays no hit inside one while SONG is on (seq_span_at)
+SEQ_ECHO_WIN = 0.25; // S6: seconds -- a note arriving on the mirror's channel this soon after its mirror went out is the mirror's own echo
+SEQ_CHORD_N  = 6;    // S5, the piano roll: up to six notes start on one step of a roll lane (a chord)
+SEQ_NOTE_F   = 3;    // per note: 0 pitch + 1 (0 = an empty slot; written LAST), 1 velocity, 2 length in quarter steps x 128 +
+                     //   (nudge + 50) -- one cell, an integer under 2^16. Notes live in a store of their own, per pattern, lane,
+                     //   step and slot (seq_note_at); a roll lane's step grid is not played
+SEQ_MO_CAP     = 512;  // S5: MIDI out this block (channel lanes): entries of 4, sorted by offset before they are sent. Room
+                       // for SEQ_NOQ_MAX note-offs is always kept (seq_midi_note): an owed note-off is never lost (Codex)
+SEQ_DIV_N    = 9;    // divisions: 0 1/4, 1 1/8, 2 1/16, 3 1/32, 4 1/4T, 5 1/8T, 6 1/16T, 7 1/8., 8 1/16.
+SEQ_DIV_DEFAULT  = 2;
+SEQ_LEN_DEFAULT  = 16;
+SEQ_VEL_DEFAULT  = 100;
+SEQ_GATE_DEFAULT = 100;
+SEQ_LSW_FOLLOW   = -1;   // lane field 8: "the pattern's swing" (the default)
+SEQ_EPS = 0.000000001;   // a billionth of a beat: the walker's boundary tolerance (0.003 samples at 1000 BPM)
+SEQ_SRZ_PATS_MAX = 256;  // the static bound on a stream's pattern count (wiki 3.5)
+SEQ_REACH = 2.6;         // steps: how far a hit can sit past its boundary -- swing 0.5 + nudge 0.5 + humanize 0.5 and a
+                         // roll's last hit 0.75, with margin (the lane offset is added separately) -- so the walker knows
+                         // how far behind a jump to start judging (self-audit 2026-10-20 finding 3: 1.6 lost a x4 roll's
+                         // late hits right after a jump at the extremes)
+
+// A bit of a lane mask (lanes 0..15): pow and floor, no variable shift (the shift_32bit rule).
+function seq_bit(_bi_m, _bi_b) ( floor(_bi_m / (2 ^ _bi_b)) & 1; );
+function seq_bit_flip(_bf_m, _bf_b) ( seq_bit(_bf_m, _bf_b) ? _bf_m - 2 ^ _bf_b : _bf_m + 2 ^ _bf_b; );
+
+// Beats (quarter notes) per step for a division index. beat_position counts quarter notes, as the note
+// repeat's grid does (rk_swing_block swing_block_process_note_repeat).
+function seq_div_beats(d) (
+  d == 0 ? 1 : d == 1 ? 0.5 : d == 2 ? 0.25 : d == 3 ? 0.125 :
+  d == 4 ? 2 / 3 : d == 5 ? 1 / 3 : d == 6 ? 1 / 6 : d == 7 ? 0.75 : d == 8 ? 0.375 : 0.25;
+);
+
+// A repeatable die, 0..1: the same (seed, lane, step index, salt) always rolls the same, so a render and the
+// playback agree and a probability or a humanized hit lands the same way every time the project plays from the
+// same place (spec 12: "seeded per bar, repeatable"). Integer mixing in doubles, every product under 2^53.
+function seq_hash01(_h_a, _h_b, _h_c, _h_d) local(_h_x) (
+  _h_x = (_h_a + 1) * 73856093 + (_h_b + 1) * 19349663 + (_h_c + 1) * 83492791 + (_h_d + 1) * 50331653;
+  _h_x = _h_x - floor(_h_x / 16777213) * 16777213;
+  _h_x = (_h_x + 1) * 48271;
+  _h_x = _h_x - floor(_h_x / 2147483647) * 2147483647;
+  _h_x = (_h_x + 1) * 16807;
+  _h_x = _h_x - floor(_h_x / 2147483647) * 2147483647;
+  _h_x / 2147483647;
+);
+
+// ─── Addresses ───────────────────────────────────────────────────────────────
+function seq_step_at(p, l, s) ( seq_step + ((p * SEQ_LANES + l) * SEQ_STEPS + s) * SEQ_ATTR; );
+function seq_rsub_at(p, l, s) ( seq_rsub + ((p * SEQ_LANES + l) * SEQ_STEPS + s) * SEQ_RSUB_N; );
+function seq_lane_at(p, l)    ( seq_lane + (p * SEQ_LANES + l) * SEQ_LANE_F; );
+function seq_pat_at(p)        ( seq_pat + p * SEQ_PAT_F; );
+function seq_note_at(p, l, s) ( seq_note + ((p * SEQ_LANES + l) * SEQ_STEPS + s) * SEQ_CHORD_N * SEQ_NOTE_F; );   // S5: the step's six slots
+// A roll lane plays its notes, not its step grid: switched to ROLL (lane field 10), or aimed at a MIDI channel (target < 0).
+function seq_lane_roll(_lr_lb) ( _lr_lb[10] || (_lr_lb[0] | 0) < 0; );
+// A note's length in steps and its nudge (% of a step), out of the packed cell; and the cell from them.
+function seq_nlen(_nl_c) ( floor(_nl_c / 128) * 0.25; );
+function seq_nnud(_nn_c) ( (_nn_c - 128 * floor(_nn_c / 128)) - 50; );
+function seq_npack(_np_len, _np_nud) ( max(1, min(256, floor(_np_len * 4 + 0.5))) * 128 + max(0, min(100, floor(_np_nud + 50.5))); );
+
+// ─── Defaults and clears ─────────────────────────────────────────────────────
+// A lane aims at its own slot index (bank A for a one-bank kit; spec 6.1), sixteen steps of 1/16, the pattern's swing.
+function seq_lane_default(p, l) local(_ld_b) (
+  _ld_b = seq_lane_at(p, l);
+  _ld_b[0] = l; _ld_b[1] = SEQ_LEN_DEFAULT; _ld_b[2] = SEQ_DIV_DEFAULT; _ld_b[3] = 0;
+  _ld_b[4] = 0; _ld_b[5] = 0; _ld_b[6] = 1; _ld_b[7] = 0; _ld_b[8] = SEQ_LSW_FOLLOW; _ld_b[9] = -1;
+  _ld_b[10] = 0; _ld_b[11] = 0; _ld_b[12] = 0;
+);
+function seq_pat_default(p) local(_pd_b) (
+  _pd_b = seq_pat_at(p);
+  _pd_b[0] = SEQ_LEN_DEFAULT; _pd_b[1] = SEQ_DIV_DEFAULT; _pd_b[2] = 0; _pd_b[3] = 0;
+  _pd_b[4] = SEQ_GATE_DEFAULT; _pd_b[5] = 0; _pd_b[6] = 0; _pd_b[7] = 0; _pd_b[8] = 0;
+  _pd_b[9] = 0; _pd_b[10] = -1; _pd_b[11] = 0;
+);
+function seq_clear_pattern(p) local(_cp_l) (
+  memset(seq_step_at(p, 0, 0), 0, SEQ_LANES * SEQ_STEPS * SEQ_ATTR);
+  memset(seq_note_at(p, 0, 0), 0, SEQ_LANES * SEQ_STEPS * SEQ_CHORD_N * SEQ_NOTE_F);   // S5: the notes
+  memset(seq_rsub_at(p, 0, 0), 0, SEQ_LANES * SEQ_STEPS * SEQ_RSUB_N);
+  _cp_l = 0; loop(SEQ_LANES, seq_lane_default(p, _cp_l); _cp_l += 1; );
+  seq_pat_default(p);
+);
+// Everything the stream carries, back to a fresh instance: every pattern, the song, the settings.
+// seq_cur / seq_page / seq_off and the placement cells are zero by design (the fb_open rule: zero is
+// the default and is assigned nowhere else in @init).
+function seq_clear_all() local(_ca_p) (
+  _ca_p = 0; loop(SEQ_PATS, seq_clear_pattern(_ca_p); _ca_p += 1; );
+  memset(seq_song, 0, SEQ_SONG_MAX * 2);
+  seq_song_len = 0; seq_song_loop = 0; seq_song_pos = 0;
+  seq_cur = 0; seq_page = 0; seq_view = 0; seq_off = 0; seq_run = 0; seq_h = 0; seq_shown = 0;
+  seq_place = 0; fb_place = 0; fx_place = 0; seq_trig_mode = 0; seq_trig_base = 0;
+  seq_opt_icons = 0; seq_opt_follow = 0; seq_opt_transport = 1; seq_opt_sync = 0; seq_opt_midiout = 1; seq_opt_midich = 10;
+  seq_opt_adapt = 0;   // S4: re-aim the lanes when a kit load moves the pads (the bridge's ADAPT permutation); off, Steppa's default
+  seq_gmute = 0; seq_gsolo = 0;   // the polish pass: one mute and one solo per lane, for every pattern (bit l = lane l)
+  seq_gms_srz = 0;                // the stream carried them (SETTINGS cell 21); 0 after a read = an older file: migrate
+  seq_col_hide = 0;               // the lane columns hidden (bit 0 M / S, 1 name, 2 length, 3 division, 4 swing; the icon is seq_opt_icons)
+  seq_opt_snap = 0;               // S5: SNAP -- where a moved hit or note lands: 0 a step, 1 a half, 2 a third, 3 free
+  seq_opt_rollh = 0;              // S5: the piano roll's share of the lane area, per cent (0 = half); the grabber sets it
+  seq_opt_topdown = 0;            // 0 = the lanes bottom-up like the pads, lane 1 (the kick) at the bottom -- the default (the user, 2026-10-20:
+                                  // "can we change the order to match our pads. the kick starting at the bottom"); 1 = lane 1 at the top
+);
+// The walker forgets where it was (a jump in the timeline, a stop, a division change).
+function seq_wk_reset(_wr_l) local(_wr_b) (
+  _wr_b = seq_wk + _wr_l * SEQ_WK_F;
+  _wr_b[0] = 0; _wr_b[1] = -1; _wr_b[3] = 1; _wr_b[4] = 0; _wr_b[5] = 1; _wr_b[6] = 0;   // index 0 + fresh: the tick re-aims it
+  _wr_b[8] = 0; _wr_b[9] = 0; _wr_b[10] = 0; _wr_b[11] = 0;   // the window: nothing judged
+);
+// Called once from the host's @init with the bases it claimed (in this order: steps, lane records,
+// pattern records, song, runtime, the note-off schedule, a 16-cell serialize scratch, the roll sub-velocities,
+// the op queue's ring).
+function seq_init(_si_step, _si_lane, _si_pat, _si_song, _si_wk, _si_noq, _si_tmp, _si_rsub, _si_opq, _si_note, _si_mo, _si_hb, _si_io) local(_si_l) (
+  seq_io = _si_io; memset(seq_io, 0, 2 * SEQ_IO_F);   // S3c: the stream's two channels
+  seq_note = _si_note; seq_mo = _si_mo; seq_mo_n = 0;   // S5: the note store, the MIDI out buffer
+  seq_hb = _si_hb; seq_hb_n = 0;                        // S5 (Codex): the walk's hit list
+  seq_step = _si_step; seq_lane = _si_lane; seq_pat = _si_pat; seq_song = _si_song;
+  seq_wk = _si_wk; seq_noq = _si_noq; seq_srz_tmp = _si_tmp; seq_rsub = _si_rsub; seq_opq = _si_opq;
+  seq_clear_all();
+  _si_l = 0; loop(SEQ_LANES, seq_wk_reset(_si_l); seq_wk[_si_l * SEQ_WK_F + 2] = -1; _si_l += 1; );
+  seq_noq_n = 0; seq_prev_b1 = -1000000; seq_playing = 0;
+  memset(seq_opq, 0, SEQ_OPQ_N * 4); seq_opq_r = 0; seq_eng_pat = 0; seq_eng_anchor = 0;
+  seq_wk_anchor = 0;   // the anchor the walkers last walked with (seq_walk_all; the host branch's reset, audit H19)
+  seq_trig_pat = -1; seq_sw_pat = -1; seq_sw_beat = 0; seq_sw_resync = 0; seq_clip_full = 0; seq_blk_w0 = 0;
+  seq_ap_primed = 0;   // the presets' baseline is taken again after a re-init (S3b)
+  seq_rs_pat = -1; seq_rs_anchor = 0; seq_rs_edge = 0; seq_rs_i = -1; seq_sync_sil = 0; seq_sync_was = 0;   // the regions (S4)
+  seq_rs_prev_i = -2; seq_rs_prev_a = 0;   // the region (and its anchor) the last block walked; -2 = none
+  seq_adapt_primed = 0; seq_adapt_seq = 0; seq_dm_patseq_primed = 0;
+  // seq_opq_w is @gfx's alone (a global starts at 0): one writer per counter is what makes the ring race-free
+);
+
+// ─── Step edits (single-cell writes; @gfx calls these directly, spec 9) ─────
+// A step switched on gets every attribute's neutral value, so the fields the walker reads later never find a
+// zero left by the clear. This one takes the step's address alone (the rigs' hooks call it so); the grid calls
+// seq_step_on_at below, which also puts the roll's sub-velocities back to "the step's own" -- this one cannot,
+// it has no address for them (self-audit 2026-10-20 finding 2).
+function seq_step_on(_so_b, _so_vel) (
+  _so_b[1] = max(1, min(127, _so_vel | 0)); _so_b[2] = 100; _so_b[3] = 1; _so_b[4] = 0; _so_b[5] = 0;
+  _so_b[6] = 0; _so_b[7] = 0; _so_b[8] = 0; _so_b[9] = 0;
+  _so_b[0] = 1;
+);
+function seq_step_off(_sf_b) ( _sf_b[0] = 0; );
+// Aim every lane of a pattern at bank _ap_bank: a lane keeps its pad number inside the bank (P0a; the OPTIONS menu).
+// Sixteen single-cell writes; the walker reads a lane's record once per block, so a half-done set lasts one block
+// and every lane lands whole.
+function seq_aim_pattern(_ap_p, _ap_bank) local(_ap_l, _ap_lb, _ap_t) (
+  _ap_bank = max(0, min(NUM_BANKS - 1, _ap_bank | 0));
+  _ap_l = 0; loop(SEQ_LANES,
+    _ap_lb = seq_lane_at(_ap_p, _ap_l); _ap_t = _ap_lb[0] | 0;
+    _ap_t >= 0 ? _ap_lb[0] = _ap_bank * NUM_PADS + (_ap_t - NUM_PADS * floor(_ap_t / NUM_PADS));
+    _ap_l += 1;
+  );
+);
+// The grid's switch-on: the step by its indices, its attributes neutral AND its three sub-velocities cleared, so a
+// step switched off and on again does not carry the HIT 2..4 values of a roll it no longer has.
+function seq_step_on_at(_sa_p, _sa_l, _sa_s, _sa_vel) (
+  seq_step_on(seq_step_at(_sa_p, _sa_l, _sa_s), _sa_vel);
+  memset(seq_rsub_at(_sa_p, _sa_l, _sa_s), 0, SEQ_RSUB_N);
+);
+
+// ─── The walker: once per @block, after the MIDI loop, before the note repeat ─
+// Host mode: the step grid IS the project timeline. Step n of a lane at division d starts at beat n * d
+// (quarter notes from the project start), so a lane's phase never depends on when play began, the swung
+// step always lands in the same place of the bar, and every lane is polymetric by construction: after len
+// steps it wraps (step = n mod len). A hit's own time is its boundary plus, in this order, the pattern's
+// swing on odd steps (the lane's own SW %, or the pattern's SWING when the lane follows it), the lane's offset, the
+// step's nudge and the humanize of its time;
+// a roll puts its hits evenly across the step. Each hit fires at its own sample offset inside the block that
+// holds it, the sub-block accuracy MIDI and the note repeat have.
+// Hits are judged in order of their step index (and roll hit) per lane, each exactly once: the lane's next
+// (index, hit) is kept in seq_wk, judged when its time falls before the block's end, left for a later block
+// otherwise. Right after a jump in the timeline (play start, a seek, a loop) the hits already past are
+// skipped rather than fired late; the one case where a hit is heard late -- by less than a block -- is two
+// neighbours nudged at each other so hard that their order reverses, and it is heard once, never lost.
+// The queued note-offs survive a PLAY-off and a jump while the transport runs: they are released at once
+// (the reset block below); a transport stop leaves them to the host's stop pass.
+// Reads the lane's record ONCE per block into locals: @gfx writes those cells directly (single cells), and
+// one read keeps the walk consistent for the block.
+//
+// P0.0 (2026-10-20, the release plan's groundwork; no change of behaviour): the walk of ONE lane is its own
+// function, seq_walk_lane, fed by the block's context (the seq_blk_* cells, set once per block, @block's alone),
+// told where the pattern's step 0 sits -- the ANCHOR in beats, 0 = the project's start, host mode exactly as built;
+// the MIDI triggers (S3) and the regions (S4) move it -- and what a hit DOES -- the SINK: 0 fires the pad; later 1
+// lists the hits for a MIDI item (S6) and 2 feeds the note pool (S5), through seq_emit. The pattern and the anchor
+// come from the SELECTOR (seq_eng_pat / seq_eng_anchor: today the pattern on screen at anchor 0), so the later
+// steps change the selector and add sinks and never fork this loop. The structural edits ride an OP QUEUE
+// (seq_post_op from @gfx, consumed here) instead of the one-word mailbox CLR had.
+
+SEQ_SINK_FIRE = 0;    // the hit plays its pad (seq_fire)
+SEQ_SINK_PRINT = 1;   // S6: the hit goes to the print list (seq_print_push), the beat and the length kept
+SEQ_OPQ_N     = 8;    // the op queue's ring: SEQ_OPQ_N slots of 4 cells (op, a, b, spare)
+SEQ_OP_CLEAR  = 1;    // clear pattern a
+SEQ_OP_CLEAR_ALL = 2; // clear every pattern (S3)
+SEQ_OP_COPY   = 3;    // pattern a -> the clipboard
+SEQ_OP_PASTE  = 4;    // the clipboard -> pattern a (nothing when the clipboard is empty)
+SEQ_OP_DUP    = 5;    // pattern a -> pattern b (the face picked b with seq_dup_target and selects it)
+SEQ_OP_HALVE  = 6;    // pattern a: every lane one division coarser, half the steps, the hits re-mapped (seq_halve_check first)
+SEQ_OP_DOUBLE = 7;    // pattern a: every lane one division finer, twice the steps, the hits re-mapped (seq_double_check first)
+SEQ_OP_FILL   = 8;    // lane fill (S3a): a = pattern, b = lane + 16 x (start + 64 x every): from `start` a hit every `every` steps
+                      //   to the lane's end, the steps between cleared, the steps before `start` untouched
+SEQ_OP_LANE_CLEAR = 9; // a = pattern, b = lane: every step of the lane off
+SEQ_CLIP      = SEQ_PATS;   // the clipboard: the pattern slot after the live ones (the host claims SEQ_PATS + 1)
+SEQ_TRIG_N    = 16;   // the trigger range: SEQ_TRIG_N notes up from seq_trig_base pick patterns 1..SEQ_TRIG_N
+
+// ─── S5: firing a note (the piano roll) ─────────────────────────────────────────────────────────────────────
+// A note-off owed: the schedule's entry; on overflow a pad note rings to its sample's end, a MIDI note is ended at
+// once (never left hanging). Returns 1 when scheduled.
+function seq_noq_push(_qp_pad, _qp_note, _qp_due, _qp_mir) local(_qp_b) (
+  seq_noq_n < SEQ_NOQ_MAX ? (
+    _qp_b = seq_noq + seq_noq_n * SEQ_NOQ_F;
+    _qp_b[0] = _qp_pad; _qp_b[1] = _qp_note; _qp_b[2] = _qp_due; _qp_b[3] = _qp_mir;
+    seq_noq_n += 1; 1;
+  ) : 0;
+);
+// A MIDI event for this block's output (sent sorted by offset at the block's end, seq_mo_flush).
+function seq_mo_push(_mp_ofs, _mp_s, _mp_d1, _mp_d2) (
+  seq_mo_n < SEQ_MO_CAP ? (
+    seq_mo[seq_mo_n * 4] = _mp_ofs; seq_mo[seq_mo_n * 4 + 1] = _mp_s; seq_mo[seq_mo_n * 4 + 2] = _mp_d1; seq_mo[seq_mo_n * 4 + 3] = _mp_d2;
+    seq_mo_n += 1; 1;
+  ) : 0;
+);
+// The sort key: the offset, and on one sample a note-off before a note-on (a note ending where the next of the same key
+// begins must end FIRST, or a receiver ends the new one at once: Codex S5 finding 3).
+function seq_mo_key(_mk_i) ( seq_mo[_mk_i * 4] * 2 + (((seq_mo[_mk_i * 4 + 1] | 0) & 0xF0) == 0x90 && (seq_mo[_mk_i * 4 + 3] | 0) > 0 ? 1 : 0); );
+function seq_mo_flush() local(_mf_i, _mf_j, _mf_k) (
+  // insertion sort by offset, note-offs first on a sample (a handful of events a block), stable otherwise
+  _mf_i = 1;
+  while(_mf_i < seq_mo_n) (
+    _mf_j = _mf_i;
+    while(_mf_j > 0 && seq_mo_key(_mf_j - 1) > seq_mo_key(_mf_j)) (
+      _mf_k = 0; loop(4, seq_mo[SEQ_MO_CAP * 4 + _mf_k] = seq_mo[(_mf_j - 1) * 4 + _mf_k]; seq_mo[(_mf_j - 1) * 4 + _mf_k] = seq_mo[_mf_j * 4 + _mf_k]; seq_mo[_mf_j * 4 + _mf_k] = seq_mo[SEQ_MO_CAP * 4 + _mf_k]; _mf_k += 1; );
+      _mf_j -= 1;
+    );
+    _mf_i += 1;
+  );
+  _mf_i = 0; loop(seq_mo_n, midisend(seq_mo[_mf_i * 4] | 0, seq_mo[_mf_i * 4 + 1] | 0, seq_mo[_mf_i * 4 + 2] | 0, seq_mo[_mf_i * 4 + 3] | 0); _mf_i += 1; );
+  seq_mo_n = 0;
+);
+// ─── S6: the drum mirror (spec 2.7) ──────────────────────────────────────────────────────────────────────────────
+// Every pad hit the sequencer fires also goes out as MIDI on seq_opt_midich (the pad's note; a roll note its pitch; the
+// velocity; the note-off at the hit's gate), so REAPER's record-output prints a pattern with no bridge and a send drives
+// a second instrument. THRU is untouched. The note-off rides the pad's own release entry when it has one (a gate-mode
+// pad), else an entry of its own (a one-shot pad: mirror-only, no voice release). A note goes out only when its note-off
+// is guaranteed -- the schedule and the block's MIDI out keep the room (seq_midi_note's rule). seq_echo_on_t /
+// seq_echo_off_t[note] (the host's cells) remember when the mirror sent each note's on and off, in samples, so the host's
+// MIDI loop can tell the mirror's own echo (a loopback send) from a player's note and swallow it (seq_echo_is): a note
+// of the mirror's channel within SEQ_ECHO_WIN of its mirror. seq_echo_pos counts the samples (the block's first).
+seq_echo_pos = 0;
+seq_mirror_pulses = 0;   // the toolbar pass: bumped per mirrored note-on, so the face's lamp can blink (a whole number)
+function seq_mirror_on(_mo_note, _mo_vel, _mo_ofs) (
+  seq_opt_midiout && seq_noq_n < SEQ_NOQ_MAX && seq_mo_n < SEQ_MO_CAP - SEQ_NOQ_MAX ? (
+    seq_mo_push(_mo_ofs, 0x90 + max(1, min(16, seq_opt_midich | 0)) - 1, _mo_note, max(1, min(127, _mo_vel | 0)));
+    seq_echo_on_t[_mo_note] = seq_echo_pos + _mo_ofs;
+    seq_mirror_pulses += 1;
+    max(1, min(16, seq_opt_midich | 0));
+  ) : 0;
+);
+function seq_mirror_off(_mf_ch, _mf_note, _mf_ofs) (   // -> 1 when it went out (0: no room this block, the entry waits)
+  seq_mo_push(_mf_ofs, 0x80 + _mf_ch - 1, _mf_note, 0) ? ( seq_echo_off_t[_mf_note] = seq_echo_pos + _mf_ofs; 1; ) : 0;
+);
+function seq_echo_is(_ei_on, _ei_note, _ei_ofs) (
+  seq_opt_midiout && seq_echo_pos + _ei_ofs - (_ei_on ? seq_echo_on_t[_ei_note] : seq_echo_off_t[_ei_note]) <= SEQ_ECHO_WIN * srate;
+);
+
+// ─── Firing ──────────────────────────────────────────────────────────────────
+// The same gate and the same launcher as a MIDI hit (Swing_ReaKit.jsfx's midirecv loop): a muted,
+// soloed-out, empty or skipped pad stays silent; a second hit on a pad inside one block plays only
+// when it starts later in the block and the pad is not Stretch (one trigger per buffer there). The hit
+// is marked in _blk_trig like a MIDI hit, so the note repeat does not double it this block.
+// A gate-mode pad (its one-shot off) ends after GATE % of its step: queued by its beat here, released
+// at its sample in seq_block_tick; the mirror's note-off rides the same entry (S6).
+function seq_fire(_sq_pad, _sq_vel, _sq_ofs, _sq_due) local(_sq_eos, _sq_rel, _sq_mir) (
+  !swing_pad_blocked(_sq_pad)
+    && (!_blk_trig[_sq_pad] || (_sq_ofs > _blk_trig_ofs[_sq_pad] && swing_pitch_eff(_sq_pad) != SP_PITCH_MODE_STRETCH)) ? (
+    launch_voices_for_pad_ofs(_sq_pad, p_note[_sq_pad], _sq_vel, 8, _sq_ofs);
+    _blk_trig[_sq_pad] = 1; _blk_trig_ofs[_sq_pad] = _sq_ofs;
+    _sq_eos = p_oneshot[_sq_pad];
+    _sq_rel = (_sq_eos == 0 || (_sq_eos < 0 && !oneshot_global)) ? 1 : 0;
+    _sq_mir = seq_mirror_on(p_note[_sq_pad], _sq_vel, _sq_ofs);
+    _sq_rel || _sq_mir ? seq_noq_push(_sq_pad, p_note[_sq_pad], _sq_due, _sq_mir + (_sq_rel ? 0 : 100));
+  );
+);
+// A note on a pad: the pad's own launch at the note's pitch (Repitch / Tuned pitch it from the pad's root). The MIDI
+// path's one-trigger-a-sample rule is not applied -- a chord's notes start on one sample -- except on a Stretch pad,
+// which plays one note at a time. A pad with a key range is monophonic by design (the manual; swing_voice_choke_pass):
+// a chord's notes start together and survive each other, a LATER note on the pad ends them.
+function seq_fire_note(_fn_pad, _fn_pitch, _fn_vel, _fn_ofs, _fn_due) local(_fn_eos, _fn_rel, _fn_mir) (
+  _fn_pad >= 0 && _fn_pad < NUM_SLOTS && !swing_pad_blocked(_fn_pad)
+    && (swing_pitch_eff(_fn_pad) != SP_PITCH_MODE_STRETCH || !_blk_trig[_fn_pad] || _fn_ofs > _blk_trig_ofs[_fn_pad]) ? (
+    launch_voices_for_pad_ofs(_fn_pad, max(0, min(127, _fn_pitch | 0)), _fn_vel, 8, _fn_ofs);
+    _blk_trig[_fn_pad] = 1; _blk_trig_ofs[_fn_pad] = _fn_ofs;
+    _fn_eos = p_oneshot[_fn_pad];
+    _fn_rel = (_fn_eos == 0 || (_fn_eos < 0 && !oneshot_global)) ? 1 : 0;
+    _fn_mir = seq_mirror_on(max(0, min(127, _fn_pitch | 0)), _fn_vel, _fn_ofs);   // S6: the mirror, at the note's pitch
+    _fn_rel || _fn_mir ? seq_noq_push(_fn_pad, max(0, min(127, _fn_pitch | 0)), _fn_due, _fn_mir + (_fn_rel ? 0 : 100));
+  );
+);
+// A note out as MIDI on a channel (a channel lane): note-on now, its note-off from the schedule at its due beat. It goes
+// out only when the schedule can owe its note-off AND the block's MIDI out keeps room for every note-off the schedule can
+// hold; else the note is not played at all (never a note-on without its note-off: Codex S5 finding 1).
+function seq_midi_note(_mn_ch, _mn_pitch, _mn_vel, _mn_ofs, _mn_due) (
+  _mn_ch = max(1, min(16, _mn_ch | 0)); _mn_pitch = max(0, min(127, _mn_pitch | 0));
+  seq_noq_n < SEQ_NOQ_MAX && seq_mo_n < SEQ_MO_CAP - SEQ_NOQ_MAX ? (
+    seq_noq_push(-_mn_ch, _mn_pitch, _mn_due, 0);
+    seq_mo_push(_mn_ofs, 0x90 + _mn_ch - 1, _mn_pitch, max(1, min(127, _mn_vel | 0)));
+  );
+);
+// S6: a hit for the PRINT list (the EON_SEQ_PRINT band, SEQ_PRINT_F cells each, from +8): the beat, the note, the velocity,
+// the length in beats and the channel (0 = a pad hit: the item's channel 1). A full list is cut and says so (+5).
+seq_print_n = 0; seq_print_over = 0; seq_print_done = 0;
+seq_print_pat = 0; seq_print_job = 0;   // round two G: the pattern the last walk printed; the song job's label (mode x 10000 + count x 100 + k; 0 = a plain print)
+function seq_print_push(_pp_t, _pp_note, _pp_vel, _pp_len, _pp_ch) local(_pp_b) (
+  seq_print_n < EON_SEQ_PRINT_CAP ? (
+    _pp_b = EON_SEQ_PRINT_BASE + 8 + seq_print_n * SEQ_PRINT_F;
+    gmem[_pp_b] = _pp_t; gmem[_pp_b + 1] = _pp_note; gmem[_pp_b + 2] = max(1, min(127, _pp_vel | 0)); gmem[_pp_b + 3] = max(0.01, _pp_len); gmem[_pp_b + 4] = _pp_ch;
+    seq_print_n += 1;
+  ) : seq_print_over = 1;
+);
+// What a note does, by sink (the roll's counterpart of seq_emit): a pad lane plays its pad, a channel lane sends MIDI.
+function seq_emit_note(_sn_sink, _sn_tgt, _sn_pitch, _sn_vel, _sn_ofs, _sn_due, _sn_t) (
+  _sn_sink == SEQ_SINK_FIRE ? ( _sn_tgt >= 0 ? seq_fire_note(_sn_tgt, _sn_pitch, _sn_vel, _sn_ofs, _sn_due) : seq_midi_note(-_sn_tgt, _sn_pitch, _sn_vel, _sn_ofs, _sn_due); )
+  : _sn_sink == SEQ_SINK_PRINT ? (   // S6: a pad note prints when the pad would sound; a channel note on its channel
+    _sn_tgt >= 0 ? ( !swing_pad_blocked(_sn_tgt) ? seq_print_push(_sn_t, max(0, min(127, _sn_pitch | 0)), _sn_vel, _sn_due - _sn_t, 0); )
+                 : seq_print_push(_sn_t, max(0, min(127, _sn_pitch | 0)), _sn_vel, _sn_due - _sn_t, -_sn_tgt);
+  );
+);
+
+// What a hit does, by sink (the only place the walk hands a hit on). A printed pad hit carries its drum: the channel
+// cell is 100 + the absolute pad (the small-things round), so the bridge can put it on that pad's own track.
+function seq_emit(_se_sink, _se_pad, _se_vel, _se_ofs, _se_due, _se_t) (
+  _se_sink == SEQ_SINK_FIRE ? seq_fire(_se_pad, _se_vel, _se_ofs, _se_due)
+  : _se_sink == SEQ_SINK_PRINT ? ( _se_pad >= 0 && _se_pad < NUM_SLOTS && !swing_pad_blocked(_se_pad) ? seq_print_push(_se_t, p_note[_se_pad], _se_vel, _se_due - _se_t, 100 + _se_pad); );   // S6
+);
+
+// The op queue: @gfx posts (payload first, the op, then the write counter LAST -- the consumer reads a slot only once
+// the counter has moved past it), @block consumes in order. One writer per counter (seq_opq_w is @gfx's, seq_opq_r is
+// @block's), so nothing is ever lost or applied twice; a full ring refuses the post (returns 0) rather than overwrite.
+function seq_post_op(_po_op, _po_a, _po_b) local(_po_i) (
+  seq_opq_w - seq_opq_r < SEQ_OPQ_N ? (
+    _po_i = (seq_opq_w & (SEQ_OPQ_N - 1)) * 4;
+    seq_opq[_po_i + 1] = _po_a; seq_opq[_po_i + 2] = _po_b; seq_opq[_po_i] = _po_op;
+    seq_opq_w += 1;
+    1;
+  ) : 0;
+);
+
+// ─── The pattern ops (S3): whole-pattern moves, applied in @block from the op queue ──────────────────────
+// A pattern's four blocks copied whole (the steps, the roll sub-velocities, the lane records, the pattern record).
+function seq_copy_pattern(_cy_src, _cy_dst) (
+  memcpy(seq_step_at(_cy_dst, 0, 0), seq_step_at(_cy_src, 0, 0), SEQ_LANES * SEQ_STEPS * SEQ_ATTR);
+  memcpy(seq_rsub_at(_cy_dst, 0, 0), seq_rsub_at(_cy_src, 0, 0), SEQ_LANES * SEQ_STEPS * SEQ_RSUB_N);
+  memcpy(seq_lane_at(_cy_dst, 0), seq_lane_at(_cy_src, 0), SEQ_LANES * SEQ_LANE_F);
+  memcpy(seq_pat_at(_cy_dst), seq_pat_at(_cy_src), SEQ_PAT_F);
+  memcpy(seq_note_at(_cy_dst, 0, 0), seq_note_at(_cy_src, 0, 0), SEQ_LANES * SEQ_STEPS * SEQ_CHORD_N * SEQ_NOTE_F);   // S5
+);
+// The division one step finer / coarser in its own family (straight, triplet, dotted); -1 = none.
+function seq_div_finer(_df_d)   ( _df_d == 0 ? 1 : _df_d == 1 ? 2 : _df_d == 2 ? 3 : _df_d == 4 ? 5 : _df_d == 5 ? 6 : _df_d == 7 ? 8 : -1; );
+function seq_div_coarser(_dc_d) ( _dc_d == 1 ? 0 : _dc_d == 2 ? 1 : _dc_d == 3 ? 2 : _dc_d == 5 ? 4 : _dc_d == 6 ? 5 : _dc_d == 8 ? 7 : -1; );
+// Can the pattern be doubled? Every lane needs a finer division and no more than 32 steps. Returns 0 = yes, else
+// the first lane in the way + 1 (the face names it). The whole pattern or nothing.
+function seq_double_check(_dk_p) local(_dk_l, _dk_lb, _dk_bad, _dk_b) (
+  _dk_bad = 0; _dk_l = 0;
+  loop(SEQ_LANES,
+    _dk_lb = seq_lane_at(_dk_p, _dk_l);
+    !_dk_bad && (seq_div_finer(_dk_lb[2] | 0) < 0 || (_dk_lb[1] | 0) > SEQ_STEPS / 2) ? _dk_bad = _dk_l + 1;
+    // S5: a note longer than 32 steps would double past the longest length a note holds (64 steps)
+    _dk_b = seq_note_at(_dk_p, _dk_l, 0);
+    !_dk_bad ? loop(SEQ_STEPS * SEQ_CHORD_N, _dk_b[0] > 0 && floor(_dk_b[2] / 128) > 128 ? _dk_bad = _dk_l + 1; _dk_b += SEQ_NOTE_F; );
+    _dk_l += 1;
+  );
+  _dk_bad;
+);
+// Can the pattern be halved? Every lane needs a coarser division, an even number of steps, and no hit on an odd
+// step (it would be lost: halve then double is the identity whenever halve is allowed). 0 = yes, else lane + 1.
+function seq_halve_check(_hk_p) local(_hk_l, _hk_lb, _hk_bad, _hk_s, _hk_len, _hk_b) (
+  _hk_bad = 0; _hk_l = 0;
+  loop(SEQ_LANES,
+    _hk_lb = seq_lane_at(_hk_p, _hk_l); _hk_len = max(1, min(SEQ_STEPS, _hk_lb[1] | 0));
+    !_hk_bad && (seq_div_coarser(_hk_lb[2] | 0) < 0 || (_hk_len & 1)) ? _hk_bad = _hk_l + 1;
+    !_hk_bad ? (
+      _hk_b = seq_step_at(_hk_p, _hk_l, 0);
+      _hk_s = 1; loop(_hk_len / 2, _hk_b[_hk_s * SEQ_ATTR] ? _hk_bad = _hk_l + 1; _hk_s += 2; );
+      // S5: a note on an odd step, or one whose length is an odd number of quarter steps (half of it is no length the
+      // coarser step can hold: 3/4 of a step would come back a whole step after DOUBLE)
+      _hk_b = seq_note_at(_hk_p, _hk_l, 0); _hk_s = 0;
+      loop(_hk_len * SEQ_CHORD_N, _hk_b[0] > 0 && ((floor(_hk_s / SEQ_CHORD_N) & 1) || (floor(_hk_b[2] / 128) & 1)) ? _hk_bad = _hk_l + 1; _hk_b += SEQ_NOTE_F; _hk_s += 1; );
+    );
+    _hk_l += 1;
+  );
+  _hk_bad;
+);
+// Double: step s -> step 2 s (the odd steps emptied), the division one finer, the length doubled. Top down, in
+// place: a step's new home is never below it. The nudge (% of a step) and the swing stay as they are.
+function seq_double_pattern(_dp_p) local(_dp_l, _dp_lb, _dp_len, _dp_s, _dp_b, _dp_rb, _dp_nb, _dp_k) (
+  _dp_l = 0;
+  loop(SEQ_LANES,
+    _dp_lb = seq_lane_at(_dp_p, _dp_l); _dp_len = max(1, min(SEQ_STEPS / 2, _dp_lb[1] | 0));
+    _dp_b = seq_step_at(_dp_p, _dp_l, 0); _dp_rb = seq_rsub_at(_dp_p, _dp_l, 0);
+    _dp_s = _dp_len - 1;
+    loop(_dp_len,
+      memcpy(_dp_b + 2 * _dp_s * SEQ_ATTR, _dp_b + _dp_s * SEQ_ATTR, SEQ_ATTR);
+      memcpy(_dp_rb + 2 * _dp_s * SEQ_RSUB_N, _dp_rb + _dp_s * SEQ_RSUB_N, SEQ_RSUB_N);
+      memset(_dp_b + (2 * _dp_s + 1) * SEQ_ATTR, 0, SEQ_ATTR);
+      memset(_dp_rb + (2 * _dp_s + 1) * SEQ_RSUB_N, 0, SEQ_RSUB_N);
+      memcpy(seq_note_at(_dp_p, _dp_l, 2 * _dp_s), seq_note_at(_dp_p, _dp_l, _dp_s), SEQ_CHORD_N * SEQ_NOTE_F);   // S5: the notes move too
+      memset(seq_note_at(_dp_p, _dp_l, 2 * _dp_s + 1), 0, SEQ_CHORD_N * SEQ_NOTE_F);
+      _dp_s -= 1;
+    );
+    // the notes' lengths double with the steps (the same time); the nudge is a % of the step and stays
+    _dp_nb = seq_note_at(_dp_p, _dp_l, 0); _dp_k = 0;
+    loop(2 * _dp_len * SEQ_CHORD_N, _dp_nb[0] > 0 ? _dp_nb[2] = seq_npack(seq_nlen(_dp_nb[2]) * 2, seq_nnud(_dp_nb[2])); _dp_nb += SEQ_NOTE_F; _dp_k += 1; );
+    _dp_lb[1] = _dp_len * 2; _dp_lb[2] = seq_div_finer(_dp_lb[2] | 0);
+    _dp_l += 1;
+  );
+);
+// Halve: step 2 s -> step s (bottom up, in place: a step's new home is never above it), the upper half emptied,
+// the division one coarser, the length halved. Only after seq_halve_check said yes.
+function seq_halve_pattern(_hp_p) local(_hp_l, _hp_lb, _hp_len, _hp_s, _hp_b, _hp_rb, _hp_nb) (
+  _hp_l = 0;
+  loop(SEQ_LANES,
+    _hp_lb = seq_lane_at(_hp_p, _hp_l); _hp_len = max(2, min(SEQ_STEPS, _hp_lb[1] | 0)) / 2;
+    _hp_b = seq_step_at(_hp_p, _hp_l, 0); _hp_rb = seq_rsub_at(_hp_p, _hp_l, 0);
+    _hp_s = 0;
+    loop(_hp_len,
+      memcpy(_hp_b + _hp_s * SEQ_ATTR, _hp_b + 2 * _hp_s * SEQ_ATTR, SEQ_ATTR);
+      memcpy(_hp_rb + _hp_s * SEQ_RSUB_N, _hp_rb + 2 * _hp_s * SEQ_RSUB_N, SEQ_RSUB_N);
+      memcpy(seq_note_at(_hp_p, _hp_l, _hp_s), seq_note_at(_hp_p, _hp_l, 2 * _hp_s), SEQ_CHORD_N * SEQ_NOTE_F);   // S5
+      _hp_s += 1;
+    );
+    memset(seq_note_at(_hp_p, _hp_l, _hp_len), 0, _hp_len * SEQ_CHORD_N * SEQ_NOTE_F);
+    _hp_nb = seq_note_at(_hp_p, _hp_l, 0);
+    loop(_hp_len * SEQ_CHORD_N, _hp_nb[0] > 0 ? _hp_nb[2] = seq_npack(max(0.25, seq_nlen(_hp_nb[2]) * 0.5), seq_nnud(_hp_nb[2])); _hp_nb += SEQ_NOTE_F; );
+    memset(_hp_b + _hp_len * SEQ_ATTR, 0, _hp_len * SEQ_ATTR);
+    memset(_hp_rb + _hp_len * SEQ_RSUB_N, 0, _hp_len * SEQ_RSUB_N);
+    _hp_lb[1] = _hp_len; _hp_lb[2] = seq_div_coarser(_hp_lb[2] | 0);
+    _hp_l += 1;
+  );
+);
+
+// ─── The lane fill (S3a; the user, 2026-10-20: "Where are the options for every 2, 4, 8, steps") ──────────────
+// From step `start`, a hit every `every` steps to the lane's end at the default velocity, the steps between cleared;
+// the steps before `start` are left alone. The lane menu fills from step 1, the step menu from the clicked step.
+function seq_lane_clear(_lc_p, _lc_l) (
+  memset(seq_step_at(_lc_p, _lc_l, 0), 0, SEQ_STEPS * SEQ_ATTR);
+  memset(seq_note_at(_lc_p, _lc_l, 0), 0, SEQ_STEPS * SEQ_CHORD_N * SEQ_NOTE_F);   // S5: a roll lane's notes too
+  memset(seq_rsub_at(_lc_p, _lc_l, 0), 0, SEQ_STEPS * SEQ_RSUB_N);
+);
+function seq_lane_fill(_lf_p, _lf_l, _lf_start, _lf_every) local(_lf_len, _lf_s) (
+  _lf_len = max(1, min(SEQ_STEPS, seq_lane_at(_lf_p, _lf_l)[1] | 0));
+  _lf_every = max(1, _lf_every | 0);
+  _lf_start = max(0, min(SEQ_STEPS - 1, _lf_start | 0));
+  _lf_s = _lf_start;
+  while(_lf_s < _lf_len) (
+    memset(seq_step_at(_lf_p, _lf_l, _lf_s), 0, SEQ_ATTR); memset(seq_rsub_at(_lf_p, _lf_l, _lf_s), 0, SEQ_RSUB_N);
+    ((_lf_s - _lf_start) % _lf_every) == 0 ? seq_step_on_at(_lf_p, _lf_l, _lf_s, SEQ_VEL_DEFAULT);
+    _lf_s += 1;
+  );
+);
+
+// ─── The factory presets (S3b; decision 23: the bridge's hand-off) ─────────────────────────────────────────
+// The face asks on this instance's registry slot (a NAV bump on EON_SS_PCTRL, or the browser's SELECT); the bridge
+// stages the preset -- the velocity plane, the ratchet list, the feel -- into EON_SS_APPLY tagged with the slot and
+// bumps its seq LAST; seq_preset_tick takes it into the pattern on screen: every lane's steps off, then plane row r
+// lands on the lane aimed at pad r of the bank on screen (else lane r, re-aimed there), with the preset's length and
+// division (steps per beat 4 = 1/16, 3 = 1/8T, 2 = 1/8, 6 = 1/16T, 8 = 1/32); a ratchet cell becomes a roll of up to
+// four hits with its own sub-velocities; the preset's swing becomes the pattern's SWING and its hat swing the hat
+// lanes' own (the bridge marks the hat rows). A request older than this instance (a seq left in gmem) is baselined on
+// the first block and never applied (Steppa's rule); @init re-baselines. The face sees seq_preset_seq move and makes
+// the undo point.
+seq_ap_last = 0; seq_ap_primed = 0;
+seq_preset_seq = 0;
+seq_pa_used = 0;   // the lanes this apply has put a row on (bit l = lane l)
+// The lane plane row r lands on: the lane aimed at pad r of the bank, else lane r re-aimed there -- unless an earlier
+// row already sits on lane r (a lane aimed at that row's pad), then the first lane no row has taken: re-aiming it would
+// move that row's hits onto pad r (the audit's factory rig, 2026-10-22).
+function seq_preset_lane(_pl_p, _pl_r, _pl_bank) local(_pl_l, _pl_hit, _pl_pad) (
+  _pl_pad = _pl_bank * NUM_PADS + _pl_r; _pl_hit = -1; _pl_l = 0;
+  loop(SEQ_LANES, _pl_hit < 0 && (seq_lane_at(_pl_p, _pl_l)[0] | 0) == _pl_pad ? _pl_hit = _pl_l; _pl_l += 1; );
+  _pl_hit < 0 ? (
+    _pl_hit = _pl_r;
+    seq_pa_used & 2^_pl_r ? (
+      _pl_hit = -1; _pl_l = 0;
+      loop(SEQ_LANES, _pl_hit < 0 && !(seq_pa_used & 2^_pl_l) ? _pl_hit = _pl_l; _pl_l += 1; );
+      _pl_hit < 0 ? _pl_hit = _pl_r;
+    );
+    seq_lane_at(_pl_p, _pl_hit)[0] = _pl_pad;
+  );
+  seq_pa_used |= 2^_pl_hit;
+  _pl_hit;
+);
+function seq_preset_apply(_pa_p)
+local(_pa_ns, _pa_spb, _pa_div, _pa_nr, _pa_r, _pa_s, _pa_l, _pa_lb, _pa_v, _pa_n, _pa_i, _pa_ptr, _pa_cell, _pa_k, _pa_sb,
+      _pa_rsb, _pa_hats, _pa_sw, _pa_hsw, _pa_bank, _pa_bit) (
+  _pa_ns = max(1, min(SEQ_STEPS, gmem[EON_SS_APPLY_BASE + 3] | 0)); _pa_spb = gmem[EON_SS_APPLY_BASE + 4] | 0;
+  _pa_nr = max(0, min(16, gmem[EON_SS_APPLY_BASE + 2] | 0));
+  _pa_div = _pa_spb == 1 ? 0 : _pa_spb == 2 ? 1 : _pa_spb == 3 ? 5 : _pa_spb == 6 ? 6 : _pa_spb == 8 ? 3 : 2;
+  _pa_bank = max(0, min(NUM_BANKS - 1, bank_cur | 0));
+  _pa_hats = gmem[EON_SS_APPLY_HATS] | 0;
+  _pa_sw = max(0, min(100, gmem[EON_SS_APPLY_BASE + 6] | 0)); _pa_hsw = max(0, min(100, gmem[EON_SS_APPLY_BASE + 7] | 0));
+  _pa_l = 0; loop(SEQ_LANES, seq_lane_clear(_pa_p, _pa_l); seq_lane_at(_pa_p, _pa_l)[8] = SEQ_LSW_FOLLOW; _pa_l += 1; );
+  seq_pa_used = 0;
+  _pa_r = 0; _pa_bit = 1;
+  loop(_pa_nr,
+    _pa_l = seq_preset_lane(_pa_p, _pa_r, _pa_bank);
+    _pa_lb = seq_lane_at(_pa_p, _pa_l); _pa_lb[1] = _pa_ns; _pa_lb[2] = _pa_div;
+    (_pa_hats & _pa_bit) && _pa_hsw > 0 ? _pa_lb[8] = _pa_hsw;
+    _pa_s = 0;
+    loop(_pa_ns,
+      _pa_v = gmem[EON_SS_APPLY_DATA + _pa_r * _pa_ns + _pa_s] | 0;
+      _pa_v > 0 ? seq_step_on_at(_pa_p, _pa_l, _pa_s, min(127, _pa_v));
+      _pa_s += 1;
+    );
+    _pa_r += 1; _pa_bit *= 2;
+  );
+  // the ratchets: hit 1's velocity on the step, hits 2..4 as the roll's own (Swing rolls to four; a longer list is cut)
+  gmem[EON_SS_APPLY_BASE + 5] == gmem[EON_SS_APPLY_BASE + 1] ? (
+    _pa_n = max(0, min(72, gmem[EON_SS_APPLY_SD] | 0)); _pa_i = 0;
+    loop(_pa_n,
+      _pa_ptr = EON_SS_APPLY_SD + 1 + _pa_i * 10;
+      _pa_cell = gmem[_pa_ptr] | 0; _pa_k = gmem[_pa_ptr + 1] | 0;
+      _pa_r = floor(_pa_cell / _pa_ns); _pa_s = _pa_cell - _pa_r * _pa_ns;
+      _pa_k > 1 && _pa_r >= 0 && _pa_r < _pa_nr && _pa_s >= 0 && _pa_s < _pa_ns ? (
+        _pa_l = seq_preset_lane(_pa_p, _pa_r, _pa_bank);
+        _pa_sb = seq_step_at(_pa_p, _pa_l, _pa_s);
+        _pa_sb[0] ? (
+          _pa_sb[3] = min(4, _pa_k);
+          _pa_v = gmem[_pa_ptr + 2] | 0; _pa_v > 0 ? _pa_sb[1] = min(127, _pa_v);
+          _pa_rsb = seq_rsub_at(_pa_p, _pa_l, _pa_s);
+          _pa_rsb[0] = _pa_k > 1 ? max(0, min(127, gmem[_pa_ptr + 3] | 0)) : 0;
+          _pa_rsb[1] = _pa_k > 2 ? max(0, min(127, gmem[_pa_ptr + 4] | 0)) : 0;
+          _pa_rsb[2] = _pa_k > 3 ? max(0, min(127, gmem[_pa_ptr + 5] | 0)) : 0;
+        );
+      );
+      _pa_i += 1;
+    );
+  );
+  seq_pat_at(_pa_p)[3] = _pa_sw;
+  seq_preset_seq += 1;
+);
+function seq_preset_tick() (
+  _reg_my_slot >= 0 ? (
+    seq_ap_primed ? (
+      gmem[EON_SS_APPLY_BASE + 1] != seq_ap_last && (gmem[EON_SS_APPLY_BASE] | 0) == _reg_my_slot ? (
+        seq_preset_apply(max(0, min(SEQ_PATS - 1, seq_cur | 0)));
+        seq_ap_last = gmem[EON_SS_APPLY_BASE + 1];
+      );
+    ) : ( seq_ap_last = gmem[EON_SS_APPLY_BASE + 1]; seq_ap_primed = 1; );
+  );
+);
+
+// ─── The regions (S4; decision 23: the song chain is the regions'): the courier's map picks the pattern ───────
+// With SYNC on, Swing raises SYNCON (+ the SWINGSEQ flag) on its registry slot; the Kit Bridge's courier publishes the
+// adopted regions in time order -- start and end in quarter notes, the pattern (the region's FIXED LINK since the
+// small-things round: a region keeps its pattern when it moves; the region's ordinal - 1 before), the colour,
+// the name -- into EON_SS_MAP for the slot, GEN bumped last, and the song chain into EON_SS_SONG. The engine mirrors
+// the map when GEN moves and, playing, picks the region under the block's start: its pattern with ITS START as the
+// anchor (step 1 at the region's first sample, on the bar or off it); a gap, or a region past the patterns, is silent.
+// The region's end (in a gap: the next region's start) is the edge; an edge inside the block splits the walk there,
+// the way a trigger's switch does (the outgoing pattern cut, every walker fresh). One edge a block (a region shorter
+// than a block is not a case). The trigger's switch yields while the regions pick.
+function seq_map_init(_mi_base) ( seq_map = _mi_base; seq_map_n = 0; seq_map_gen = -1; seq_map[SEQ_MAP_SPAN] = 0; );   // the spans' count: the face reads the mirror's (+452)
+function seq_sync_resolve(_rs_bp) local(_rs_i, _rs_p, _rs_nxt) (
+  seq_rs_pat = -1; seq_rs_anchor = 0; seq_rs_edge = 1000000000; seq_rs_i = -1; _rs_nxt = 1000000000; _rs_i = 0;
+  loop(seq_map_n,
+    seq_rs_pat == -1 && seq_rs_i < 0 && _rs_bp >= seq_map[_rs_i * 4] - SEQ_EPS && _rs_bp < seq_map[_rs_i * 4 + 1] - SEQ_EPS ? (
+      _rs_p = seq_map[_rs_i * 4 + 2] | 0; seq_rs_edge = seq_map[_rs_i * 4 + 1]; seq_rs_i = _rs_i;
+      _rs_p >= 0 && _rs_p < SEQ_PATS ? ( seq_rs_pat = _rs_p; seq_rs_anchor = seq_map[_rs_i * 4]; ) : seq_rs_pat = -2;   // a region past the patterns: silent to its end
+    );
+    seq_map[_rs_i * 4] > _rs_bp + SEQ_EPS && seq_map[_rs_i * 4] < _rs_nxt ? _rs_nxt = seq_map[_rs_i * 4];
+    _rs_i += 1;
+  );
+  seq_rs_pat == -1 ? seq_rs_edge = _rs_nxt;   // a gap: wake at the next region's start
+  seq_rs_pat < 0 ? seq_rs_pat = -1;
+);
+// The small-things round (the user: PRINT SONG = "the span cleared first, the sequencer stepping aside there"): is the
+// beat _sa_t inside a span this Swing's printed items cover? Start in, end out, with the regions' tolerance. The map
+// band carries the spans only while SONG is on; seq_hits_emit asks for its FIRE hits alone (a PRINT walks through).
+function seq_span_at(_sa_t) local(_sa_i, _sa_in) (
+  _sa_in = 0; _sa_i = 0;
+  loop(seq_span_n,
+    !_sa_in && _sa_t >= seq_map[SEQ_MAP_SPAN + 2 + _sa_i * 2] - SEQ_EPS && _sa_t < seq_map[SEQ_MAP_SPAN + 3 + _sa_i * 2] - SEQ_EPS ? _sa_in = 1;
+    _sa_i += 1;
+  );
+  _sa_in;
+);
+// Each block: SYNCON and the SWINGSEQ flag on this slot while SYNC is on (0 once, when it goes off), the map mirrored
+// when the courier bumps GEN, and a region clicked in the Drum Matrix (DM_PATSET, its bump) selecting the pattern here.
+// The small-things round: the map's tail -- the spans this Swing's PRINT SONG items cover (SEQ_MAP_SPAN) -- is mirrored
+// with it; seq_span_n is the engine's count (0 while SONG is off), and the mirror's count cell is 0 then too (the face
+// draws the spans from the mirror).
+seq_span_n = 0;
+function seq_sync_tick() local(_st_b, _st_mb, _st_i, _st_p) (
+  _reg_my_slot >= 0 ? (
+    _st_b = EON_SS_SYNC_BASE + _reg_my_slot * EON_SS_SYNC_STRIDE;
+    seq_opt_sync ? ( gmem[_st_b + 11] = 1; gmem[_st_b + 60] = 1; seq_sync_was = 1; )
+    : seq_sync_was ? ( gmem[_st_b + 11] = 0; gmem[_st_b + 60] = 0; seq_sync_was = 0; seq_map_n = 0; seq_map_gen = -1; seq_rs_i = -1; seq_sync_sil = 0; seq_span_n = 0; seq_map[SEQ_MAP_SPAN] = 0; );
+    seq_opt_sync ? (
+      _st_mb = EON_SS_MAP_BASE + _reg_my_slot * EON_SS_MAP_STRIDE;
+      gmem[_st_mb] != seq_map_gen ? (
+        seq_map_gen = gmem[_st_mb];
+        seq_map_n = max(0, min(EON_SS_MAP_MAXRGN, gmem[_st_mb + 1] | 0));
+        _st_i = 0; loop(seq_map_n * 4, seq_map[_st_i] = gmem[_st_mb + 2 + _st_i]; _st_i += 1; );
+        _st_i = 0; loop(seq_map_n * 3, seq_map[256 + _st_i] = gmem[_st_mb + 260 + _st_i]; _st_i += 1; );
+        seq_span_n = max(0, min(SEQ_SPAN_MAX, gmem[_st_mb + SEQ_MAP_SPAN] | 0)); seq_map[SEQ_MAP_SPAN] = seq_span_n;
+        _st_i = 0; loop(seq_span_n * 2, seq_map[SEQ_MAP_SPAN + 2 + _st_i] = gmem[_st_mb + SEQ_MAP_SPAN + 2 + _st_i]; _st_i += 1; );
+      );
+      seq_dm_patseq_primed ? (
+        gmem[_st_b + 20] != seq_dm_patseq ? (
+          seq_dm_patseq = gmem[_st_b + 20]; _st_p = gmem[_st_b + 15] | 0;
+          _st_p >= 0 && _st_p < SEQ_PATS ? seq_cur = _st_p;
+        );
+      ) : ( seq_dm_patseq = gmem[_st_b + 20]; seq_dm_patseq_primed = 1; );
+    );
+  );
+);
+// ADAPT (S4): a kit load moved the pads -- the bridge publishes the permutation for the slot (seq last). With the option
+// on, every pattern's lanes aimed at the bank on screen follow their sound to its new pad (one undo point from the face);
+// an identity permutation, or the option off, leaves the lanes alone. A permutation already in gmem at start is baselined.
+function seq_adapt_tick() local(_ad_p, _ad_l, _ad_lb, _ad_t, _ad_bank, _ad_id, _ad_i, _ad_d) (
+  _reg_my_slot >= 0 ? (
+    seq_adapt_primed ? (
+      gmem[EON_PADCAT_ADAPT] != seq_adapt_last && (gmem[EON_PADCAT_ADAPT + 1] | 0) == _reg_my_slot ? (
+        seq_adapt_last = gmem[EON_PADCAT_ADAPT];
+        _ad_id = 1; _ad_i = 0; loop(NUM_PADS, (gmem[EON_PADCAT_ADAPT + 2 + _ad_i] | 0) != _ad_i ? _ad_id = 0; _ad_i += 1; );
+        seq_opt_adapt && !_ad_id ? (
+          _ad_bank = max(0, min(NUM_BANKS - 1, bank_cur | 0));
+          _ad_p = 0;
+          loop(SEQ_PATS,
+            _ad_l = 0;
+            loop(SEQ_LANES,
+              _ad_lb = seq_lane_at(_ad_p, _ad_l); _ad_t = _ad_lb[0] | 0;
+              _ad_t >= 0 && floor(_ad_t / NUM_PADS) == _ad_bank ? (
+                _ad_d = gmem[EON_PADCAT_ADAPT + 2 + (_ad_t - _ad_bank * NUM_PADS)] | 0;
+                _ad_d >= 0 && _ad_d < NUM_PADS ? _ad_lb[0] = _ad_bank * NUM_PADS + _ad_d;
+              );
+              _ad_l += 1;
+            );
+            _ad_p += 1;
+          );
+          seq_adapt_seq += 1;
+        );
+      );
+    ) : ( seq_adapt_last = gmem[EON_PADCAT_ADAPT]; seq_adapt_primed = 1; );
+  );
+);
+
+// ─── The MIDI trigger (S3; spec 13): called from the host's MIDI loop, before the pad lookup ──────────────
+// A note in [seq_trig_base, seq_trig_base + SEQ_TRIG_N) picks pattern (note - base) while a trigger mode is on:
+// 1 change, 2 change + resync (the new pattern's step 0 at the switch), 3 change + resync on the beat. The first
+// trigger note of a block wins (Steppa's rule); every trigger note and its note-off is consumed, never a pad's.
+seq_trig_pat = -1;   // the pattern a trigger note picked this block, -1 none (seq_block_tick takes it)
+seq_trig_ofs = 0;    // that note's sample offset in the block
+function seq_trig_in_range(_ti_note) ( seq_trig_mode > 0 && _ti_note >= seq_trig_base && _ti_note < seq_trig_base + SEQ_TRIG_N; );
+function seq_trig_note(_tn_note, _tn_ofs) (
+  seq_trig_in_range(_tn_note) ? (
+    seq_trig_pat < 0 && _tn_note - seq_trig_base < max(1, seq_npat | 0) ? ( seq_trig_pat = _tn_note - seq_trig_base; seq_trig_ofs = _tn_ofs; );   // past the patterns on show: nothing (round two H)
+    1;
+  ) : 0;
+);
+
+// ─── The walk (S5 after the Codex audit: one walker for both kinds of lane, a window of steps, the hits sorted) ──
+// A step's hits lie within [step - 1, step + 2.25] steps of its boundary: a nudge and the humanize half a step early
+// each; the swing, a nudge and the humanize half a step late each, and a roll's last hit three quarters. So a later
+// step's hit can be due before an earlier step's late one (a swung step nudged late, the next nudged early). The walk
+// judges a WINDOW of SEQ_WIN steps from the first step not yet done (wk[0]): every hit of those steps due before the
+// block's end is taken, and a bit per hit (wk[8 + k] for step wk[0] + k: a roll's hits, or a note's slot) says it was
+// judged; the window slides once its first step is done (every hit judged, or none and its boundary passed). Nothing
+// past the window can be due while its first step still waits: that step's latest hit lies before the window's next
+// step's earliest. The hits go to the block's list (seq_hb) and seq_hits_emit fires the whole walk's list in TIME
+// order, so a ranged (monophonic) pad or a Stretch pad meets its notes in the order the MIDI path would. (The first
+// cut walked step by step and stopped at the first hit not yet due: a waiting late hit held the next step's early one
+// back to its own block, and a step's notes fired in slot order: Codex S5 finding 2.)
+// The window judged is [seq_blk_w0, seq_blk_b1): w0 is the block's start, or the switch beat after a pattern switch
+// inside the block (S3) or a region edge (S4); the sample offsets count from the block's start (seq_blk_b0) either way.
+
+// A step's boundary on the lane: the anchor, the step, the swing on odd steps, the lane offset, the step's humanize
+// (one per step: a roll or a chord moves together).
+function seq_win_tb(_wt_anchor, _wt_m, _wt_bps, _wt_w, _wt_lofs, _wt_l) (
+  _wt_anchor + _wt_m * _wt_bps + ((_wt_m - 2 * floor(_wt_m * 0.5)) ? _wt_w * 0.5 * _wt_bps : 0) + _wt_lofs
+    + (seq_blk_humt > 0 ? (seq_hash01(seq_blk_seed, _wt_l, _wt_m, 1) * 2 - 1) * seq_blk_humt * 0.5 * _wt_bps : 0);
+);
+// A grid step's hits this time round: its roll count when it is on and its die says it plays (the die is the step
+// index's own, so judging it again gives the same answer), else 0.
+function seq_win_grid_r(_wg_sb, _wg_l, _wg_m) (
+  _wg_sb[0] && (_wg_sb[2] >= 100 || seq_hash01(seq_blk_seed, _wg_l, _wg_m, 2) * 100 < _wg_sb[2]) ? max(1, min(4, _wg_sb[3] | 0)) : 0;
+);
+// A hit for the block's list: its time, lane, step index, hit (a roll's hit or a note's slot), the step on the lane,
+// how long it holds (beats: a gate-mode release, a note's length) and the lane's kind (2 a roll). 0 when the list is
+// full: the hit stays unjudged and is taken next block, late rather than lost.
+function seq_hb_push(_hp_t, _hp_l, _hp_m, _hp_h, _hp_st, _hp_hold, _hp_kind) local(_hp_b) (
+  seq_hb_n < SEQ_HB_MAX ? (
+    _hp_b = seq_hb + seq_hb_n * SEQ_HB_F;
+    _hp_b[0] = _hp_t; _hp_b[1] = _hp_l; _hp_b[2] = _hp_m; _hp_b[3] = _hp_h; _hp_b[4] = _hp_st; _hp_b[5] = _hp_hold; _hp_b[6] = _hp_kind;
+    seq_hb_n += 1; 1;
+  ) : 0;
+);
+// One lane's walk for this block: pattern _wl_pat, lane _wl_l, the pattern's step 0 at beat _wl_anchor. Reads the
+// block's context from seq_blk_* (set by seq_block_tick) and the lane's record once; adds its hits to seq_hb.
+function seq_walk_lane(_wl_pat, _wl_l, _wl_anchor)
+local(_wl_b1, _wl_w0, _wl_lb, _wl_wb, _wl_len, _wl_div, _wl_bps, _wl_w, _wl_lofs, _wl_roll, _wl_kind, _wl_live, _wl_fresh,
+      _wl_n, _wl_it, _wl_more, _wl_k, _wl_m, _wl_st, _wl_tb, _wl_mask, _wl_h, _wl_bit, _wl_t, _wl_r, _wl_sb, _wl_nb,
+      _wl_done, _wl_has, _wl_hold) (
+  _wl_b1 = seq_blk_b1; _wl_w0 = seq_blk_w0;
+  _wl_lb = seq_lane_at(_wl_pat, _wl_l); _wl_wb = seq_wk + _wl_l * SEQ_WK_F;
+  _wl_roll = seq_lane_roll(_wl_lb); _wl_kind = _wl_roll ? 2 : 1;
+  _wl_len = max(1, min(SEQ_STEPS, _wl_lb[1] | 0)); _wl_div = _wl_lb[2] | 0;
+  _wl_w = _wl_lb[8] < 0 ? seq_blk_swing : max(0, min(100, _wl_lb[8])) * 0.01;   // the lane's own swing, or the pattern's
+  _wl_bps = seq_div_beats(_wl_div);
+  _wl_lofs = max(-500, min(500, _wl_lb[3])) * 0.001 * seq_blk_tempo / 60;   // ms -> beats
+  // A new division, or a new kind of lane (the roll switched on or off, a MIDI channel picked or left, another pattern
+  // on the tabs whose lane differs: the bits mean other hits), starts afresh, as after a jump.
+  _wl_div != _wl_wb[2] || _wl_kind != _wl_wb[7] ? ( seq_wk_reset(_wl_l); _wl_wb[2] = _wl_div; _wl_wb[7] = _wl_kind; );
+  // Does the lane sound (its mute, the solo, a grid lane's pad)? Its hits are judged either way, so a lane unmuted
+  // mid-bar picks up at its next hit, never with a burst of the past.
+  _wl_live = !seq_bit(seq_gmute, _wl_l) && (!seq_blk_anysolo || seq_bit(seq_gsolo, _wl_l))
+             && (_wl_roll || ((_wl_lb[0] | 0) >= 0 && (_wl_lb[0] | 0) < NUM_SLOTS));
+  // Fresh after a jump: start judging a reach before the walk's start (and a lane's late offset further back), so a
+  // hit pulled early, or one still owed by a boundary long past, is not missed. Hits already past are skipped.
+  _wl_fresh = _wl_wb[3];
+  _wl_fresh && _wl_wb[0] == 0 && _wl_wb[8] == 0 && _wl_wb[9] == 0 && _wl_wb[10] == 0 && _wl_wb[11] == 0 ?
+    _wl_wb[0] = max(0, floor((_wl_w0 - _wl_anchor - SEQ_REACH * _wl_bps - max(0, _wl_lofs)) / _wl_bps));
+  _wl_n = _wl_wb[0]; _wl_it = 0; _wl_more = 1;
+  while(_wl_more && _wl_it < 64) (
+    _wl_it += 1;
+    // judge the window: every hit of steps n .. n + SEQ_WIN - 1 due before the block's end and not judged yet
+    _wl_k = 0;
+    loop(SEQ_WIN,
+      _wl_m = _wl_n + _wl_k; _wl_st = _wl_m - _wl_len * floor(_wl_m / _wl_len);   // m mod len, exact on integers
+      _wl_tb = seq_win_tb(_wl_anchor, _wl_m, _wl_bps, _wl_w, _wl_lofs, _wl_l);
+      _wl_tb < _wl_b1 - SEQ_EPS ? _wl_wb[1] = _wl_st;   // the playhead: the last step begun, its hits or none
+      _wl_mask = _wl_wb[8 + _wl_k]; _wl_h = 0; _wl_bit = 1;
+      _wl_roll ? (
+        _wl_nb = seq_note_at(_wl_pat, _wl_l, _wl_st);
+        loop(SEQ_CHORD_N,
+          (_wl_nb[0] | 0) > 0 && !(floor(_wl_mask / _wl_bit) & 1) ? (
+            _wl_t = _wl_tb + seq_nnud(_wl_nb[2]) * 0.01 * _wl_bps;
+            _wl_hold = max(0.25, seq_nlen(_wl_nb[2])) * _wl_bps;
+            _wl_t < _wl_b1 - SEQ_EPS
+              && (!_wl_live || (_wl_fresh && _wl_t < _wl_w0 - SEQ_EPS) || seq_hb_push(_wl_t, _wl_l, _wl_m, _wl_h, _wl_st, _wl_hold, 2)) ? _wl_mask += _wl_bit;
+          );
+          _wl_nb += SEQ_NOTE_F; _wl_h += 1; _wl_bit *= 2;
+        );
+      ) : (
+        _wl_sb = seq_step_at(_wl_pat, _wl_l, _wl_st);
+        _wl_r = seq_win_grid_r(_wl_sb, _wl_l, _wl_m);
+        loop(_wl_r,
+          _wl_t = _wl_tb + max(-50, min(50, _wl_sb[5])) * 0.01 * _wl_bps + _wl_h * _wl_bps / _wl_r;   // a roll's hits evenly across the step
+          !(floor(_wl_mask / _wl_bit) & 1) && _wl_t < _wl_b1 - SEQ_EPS
+            && (!_wl_live || (_wl_fresh && _wl_t < _wl_w0 - SEQ_EPS) || seq_hb_push(_wl_t, _wl_l, _wl_m, _wl_h, _wl_st, seq_blk_gate * _wl_bps / _wl_r, 1)) ? _wl_mask += _wl_bit;
+          _wl_h += 1; _wl_bit *= 2;
+        );
+      );
+      _wl_wb[8 + _wl_k] = _wl_mask;
+      _wl_k += 1;
+    );
+    // is step n done? every hit judged -- or, with none (off, its die said no, no notes), its boundary passed
+    _wl_st = _wl_n - _wl_len * floor(_wl_n / _wl_len);
+    _wl_mask = _wl_wb[8];
+    _wl_roll ? (
+      _wl_nb = seq_note_at(_wl_pat, _wl_l, _wl_st); _wl_has = 0; _wl_done = 1; _wl_bit = 1;
+      loop(SEQ_CHORD_N, (_wl_nb[0] | 0) > 0 ? ( _wl_has = 1; !(floor(_wl_mask / _wl_bit) & 1) ? _wl_done = 0; ); _wl_nb += SEQ_NOTE_F; _wl_bit *= 2; );
+    ) : (
+      _wl_r = seq_win_grid_r(seq_step_at(_wl_pat, _wl_l, _wl_st), _wl_l, _wl_n);
+      _wl_has = _wl_r > 0; _wl_done = (_wl_mask & (2 ^ _wl_r - 1)) == 2 ^ _wl_r - 1;
+    );
+    !_wl_has ? _wl_done = seq_win_tb(_wl_anchor, _wl_n, _wl_bps, _wl_w, _wl_lofs, _wl_l) < _wl_b1 - SEQ_EPS;
+    _wl_done ? (
+      _wl_wb[8] = _wl_wb[9]; _wl_wb[9] = _wl_wb[10]; _wl_wb[10] = _wl_wb[11]; _wl_wb[11] = 0;   // the window slides a step
+      _wl_n += 1;
+    ) : _wl_more = 0;
+  );
+  // Fresh ends once the walk has caught up (it stopped on a step not yet done); a walk that ran out of its 64 passes
+  // still skipping the past stays fresh, so those hits are skipped next block, not heard late. (64: a lane of 1/32 in
+  // REAPER's largest block at a fast tempo; past the cap the rest are taken next block at its first sample, never lost.)
+  _wl_wb[0] = _wl_n; !_wl_more ? _wl_wb[3] = 0;
+);
+
+// The block's feel context for a pattern: what every lane's walk reads (set once per walk of a pattern).
+function seq_blk_context(_bc_p) local(_bc_pb, _bc_l) (
+  _bc_pb = seq_pat_at(_bc_p);
+  seq_blk_gate = max(1, min(100, _bc_pb[4])) * 0.01;
+  seq_blk_swing = max(0, min(100, _bc_pb[3])) * 0.01;
+  seq_blk_humv = max(0, min(100, _bc_pb[5])) * 0.01;
+  seq_blk_humt = max(0, min(100, _bc_pb[6])) * 0.01;
+  seq_blk_accofs = max(-127, min(127, _bc_pb[7] | 0));
+  seq_blk_seed = _bc_pb[9] | 0;
+  // The sequencer's own solo: while any lane is soloed only the soloed lanes sound (the pads' own
+  // mute / solo still apply in seq_fire, as to every trigger source).
+  seq_blk_anysolo = seq_gsolo != 0; _bc_l = _bc_p;   // the lanes' solo is global now (the polish pass); _bc_l keeps the local used
+);
+// The walk's hits in time order (a stable insertion sort: hits on one sample keep the lanes' order), each fired the way
+// its lane says -- a grid hit (its roll's sub-velocity, the accent, the humanize) or a note (its pitch, its velocity) --
+// to the sink. The record is read here, at the hit's own turn (a note deleted since it was judged is not played).
+function seq_hits_emit(_he_p, _he_sink)
+local(_he_i, _he_j, _he_k, _he_b, _he_c, _he_l, _he_m, _he_h, _he_st, _he_tgt, _he_ofs, _he_vel, _he_sb, _he_nb, _he_rsb) (
+  _he_i = 1;
+  while(_he_i < seq_hb_n) (
+    _he_j = _he_i;
+    while(_he_j > 0 && seq_hb[(_he_j - 1) * SEQ_HB_F] > seq_hb[_he_j * SEQ_HB_F]) (
+      _he_b = seq_hb + (_he_j - 1) * SEQ_HB_F; _he_c = seq_hb + SEQ_HB_MAX * SEQ_HB_F;   // the swap cell after the list
+      memcpy(_he_c, _he_b, SEQ_HB_F); memcpy(_he_b, _he_b + SEQ_HB_F, SEQ_HB_F); memcpy(_he_b + SEQ_HB_F, _he_c, SEQ_HB_F);
+      _he_j -= 1;
+    );
+    _he_i += 1;
+  );
+  _he_i = 0;
+  loop(seq_hb_n,
+    _he_b = seq_hb + _he_i * SEQ_HB_F;
+    _he_l = _he_b[1] | 0; _he_m = _he_b[2]; _he_h = _he_b[3] | 0; _he_st = _he_b[4] | 0;
+    _he_tgt = seq_lane_at(_he_p, _he_l)[0] | 0;
+    _he_ofs = max(0, min(seq_blk_ofsmax, floor((_he_b[0] - seq_blk_b0) * seq_blk_spb + 0.5)));   // SEQ FIRE OFFSET
+    // The small-things round: a PLAIN PAD HIT (a grid lane's) inside a span this Swing's PRINT SONG wrote stays silent --
+    // the printed drums play there -- while the walk goes on, so the pattern is in phase past the span (the note-offs
+    // already owed still end). A roll lane's notes (kind 2: a pad lane's roll, a MIDI channel lane) keep playing live:
+    // Swing's omni input could not replay them faithfully, so the song print leaves them out (the coordinator's call)
+    _he_sink == SEQ_SINK_FIRE && _he_b[6] != 2 && seq_opt_sync && seq_span_n > 0 && seq_span_at(_he_b[0]) ? 0
+    : _he_b[6] == 2 ? (
+      _he_nb = seq_note_at(_he_p, _he_l, _he_st) + _he_h * SEQ_NOTE_F;
+      (_he_nb[0] | 0) > 0 ? (
+        _he_vel = _he_nb[1] | 0;
+        seq_blk_humv > 0 ? _he_vel = _he_vel * (1 + (seq_hash01(seq_blk_seed, _he_l, _he_m, 3 + _he_h) * 2 - 1) * seq_blk_humv);
+        seq_emit_note(_he_sink, _he_tgt, (_he_nb[0] | 0) - 1, max(1, min(127, floor(_he_vel + 0.5))), _he_ofs, _he_b[0] + _he_b[5], _he_b[0]);
+      );
+    ) : (
+      _he_sb = seq_step_at(_he_p, _he_l, _he_st);
+      _he_vel = _he_sb[1] | 0;
+      _he_h > 0 ? ( _he_rsb = seq_rsub_at(_he_p, _he_l, _he_st); _he_rsb[_he_h - 1] > 0 ? _he_vel = _he_rsb[_he_h - 1] | 0; );
+      _he_sb[8] ? _he_vel += seq_blk_accofs;
+      seq_blk_humv > 0 ? _he_vel = _he_vel * (1 + (seq_hash01(seq_blk_seed, _he_l, _he_m, 3 + _he_h) * 2 - 1) * seq_blk_humv);
+      seq_emit(_he_sink, _he_tgt, max(1, min(127, floor(_he_vel + 0.5))), _he_ofs, _he_b[0] + _he_b[5], _he_b[0]);
+    );
+    _he_i += 1;
+  );
+  seq_hb_n = 0;
+);
+function seq_walk_all(_wa_p) local(_wa_l) (
+  seq_hb_n = 0;
+  _wa_l = 0; loop(SEQ_LANES, seq_walk_lane(_wa_p, _wa_l, seq_eng_anchor); _wa_l += 1; );
+  seq_wk_anchor = seq_eng_anchor;   // every walker's step index now counts from this anchor
+  seq_hits_emit(_wa_p, SEQ_SINK_FIRE);
+);
+
+// ─── S6: PRINT (spec 2.7): the pattern on screen as a MIDI item on this track ──────────────────────────────────────────
+// The face posts CMD 96 (the cycles asked, and one cycle in beats: the longest lane's); the bridge, which knows the edit
+// cursor, snaps it down to a cycle boundary (step 1 at the item's start, and the same dice as playback there -- host
+// mode anchors the pattern at the project start), writes the span into the EON_SEQ_PRINT band and raises its state to
+// 1; this walks the span into the band with the print sink, half a beat at a time (the hit list's room), the live walkers
+// parked meanwhile and the block's window restored after (seq_block_tick sets it fresh anyway), then raises 2: the
+// bridge builds the item. A muted lane or pad prints nothing, as it plays nothing.
+function seq_pat_cycle_beats(_cb_p) local(_cb_l, _cb_lb, _cb_c, _cb_m) (
+  _cb_m = 0; _cb_l = 0;
+  loop(SEQ_LANES,
+    _cb_lb = seq_lane_at(_cb_p, _cb_l);
+    _cb_c = max(1, min(SEQ_STEPS, _cb_lb[1] | 0)) * seq_div_beats(max(0, min(SEQ_DIV_N - 1, _cb_lb[2] | 0)));
+    _cb_c > _cb_m ? _cb_m = _cb_c;
+    _cb_l += 1;
+  );
+  _cb_m;
+);
+function seq_print_run() local(_pr_p, _pr_b0, _pr_len, _pr_t, _pr_l, _pr_anchor) (
+  _pr_p = gmem[EON_SEQ_PRINT_BASE + 6] > 0 ? max(0, min(SEQ_PATS - 1, (gmem[EON_SEQ_PRINT_BASE + 6] | 0) - 1)) : max(0, min(SEQ_PATS - 1, seq_cur | 0));   // round two G: +6 = the pattern + 1 (a region's), 0 = the one on screen (an older bridge leaves 0)
+  _pr_b0 = max(0, gmem[EON_SEQ_PRINT_BASE + 1]); _pr_len = max(0, min(4096, gmem[EON_SEQ_PRINT_BASE + 2]));
+  _pr_anchor = gmem[EON_SEQ_PRINT_BASE + 6] > 0 ? _pr_b0 : 0;   // a song job (round two G) anchors at the region's start, as SONG mode plays it; a plain print at the project start, as host mode does
+  memcpy(seq_print_wk, seq_wk, SEQ_LANES * SEQ_WK_F);
+  _pr_l = 0; loop(SEQ_LANES, seq_wk_reset(_pr_l); _pr_l += 1; );
+  seq_blk_tempo = tempo > 0 ? tempo : 120; seq_blk_spb = (60 / seq_blk_tempo) * srate; seq_blk_ofsmax = 2147483647;
+  seq_blk_context(_pr_p);
+  seq_print_n = 0; seq_print_over = 0;
+  _pr_t = _pr_b0;
+  while(_pr_t < _pr_b0 + _pr_len - SEQ_EPS) (
+    seq_blk_b0 = _pr_t; seq_blk_b1 = min(_pr_b0 + _pr_len, _pr_t + 0.5); seq_blk_w0 = seq_blk_b0;
+    seq_hb_n = 0;
+    _pr_l = 0; loop(SEQ_LANES, seq_walk_lane(_pr_p, _pr_l, _pr_anchor); _pr_l += 1; );
+    seq_hits_emit(_pr_p, SEQ_SINK_PRINT);
+    _pr_t = seq_blk_b1;
+  );
+  memcpy(seq_wk, seq_print_wk, SEQ_LANES * SEQ_WK_F);
+  gmem[EON_SEQ_PRINT_BASE + 3] = seq_print_n; gmem[EON_SEQ_PRINT_BASE + 4] = _pr_p; gmem[EON_SEQ_PRINT_BASE + 5] = seq_print_over;
+  seq_print_pat = _pr_p; seq_print_job = gmem[EON_SEQ_PRINT_BASE + 7] | 0;
+  seq_print_done += 1;   // the face says so
+  gmem[EON_SEQ_PRINT_BASE] = 2;   // LAST: the bridge builds the item
+);
+
+function seq_block_tick()
+local(_sb_playing, _sb_l, _sb_k, _sb_due, _sb_v, _sb_note, _sb_pad, _sb_ofs, _sb_i, _sb_op, _sb_a, _sb_b, _sb_tb, _sb_b1s, _sb_rp, _sb_ra, _sb_keep, _sb_mir) (
+  // The op queue (the structural edits of spec 9), in order, before the walk. Halve and double are checked again
+  // here (the face checked before posting): the whole pattern or nothing.
+  while(seq_opq_r != seq_opq_w) (
+    _sb_i = (seq_opq_r & (SEQ_OPQ_N - 1)) * 4;
+    _sb_op = seq_opq[_sb_i] | 0; _sb_a = seq_opq[_sb_i + 1] | 0; _sb_b = seq_opq[_sb_i + 2] | 0;
+    _sb_a >= 0 && _sb_a < SEQ_PATS ? (
+      _sb_op == SEQ_OP_CLEAR ? seq_clear_pattern(_sb_a)
+      : _sb_op == SEQ_OP_COPY ? ( seq_copy_pattern(_sb_a, SEQ_CLIP); seq_clip_full = 1; )
+      : _sb_op == SEQ_OP_PASTE ? ( seq_clip_full ? seq_copy_pattern(SEQ_CLIP, _sb_a); )
+      : _sb_op == SEQ_OP_DUP ? ( _sb_b >= 0 && _sb_b < SEQ_PATS && _sb_b != _sb_a ? seq_copy_pattern(_sb_a, _sb_b); )
+      : _sb_op == SEQ_OP_HALVE ? ( seq_halve_check(_sb_a) == 0 ? seq_halve_pattern(_sb_a); )
+      : _sb_op == SEQ_OP_DOUBLE ? ( seq_double_check(_sb_a) == 0 ? seq_double_pattern(_sb_a); )
+      : _sb_op == SEQ_OP_FILL ? seq_lane_fill(_sb_a, _sb_b & 15, (_sb_b >> 4) & 63, _sb_b >> 10)
+      : _sb_op == SEQ_OP_LANE_CLEAR ? ( _sb_b >= 0 && _sb_b < SEQ_LANES ? seq_lane_clear(_sb_a, _sb_b); );
+    );
+    _sb_op == SEQ_OP_CLEAR_ALL ? ( _sb_k = 0; loop(SEQ_PATS, seq_clear_pattern(_sb_k); _sb_k += 1; ); );
+    seq_opq_r += 1;
+  );
+  seq_preset_tick();   // a preset the bridge staged for this instance lands in the pattern on screen (S3b)
+  seq_sync_tick();     // SYNCON, the region map's mirror, a region picked in the Drum Matrix (S4)
+  seq_adapt_tick();    // a kit load's pad permutation onto the lanes (S4, an option)
+  // S6: PRINT -- the bridge wrote the span; the hits go back to it (before the window below is set). Only the instance
+  // the bridge named walks (the small-things round: the band is one for every Swing; EON_SEQ_PRINT_OWNER). A bridge
+  // older than BRIDGE_LEVEL_PRINT_OWNER (still running after an update, until REAPER restarts) never names one: then
+  // every instance walks on state 1, as before the round, so TO ITEM still prints
+  gmem[EON_SEQ_PRINT_BASE] == 1
+    && (gmem[GS_BRIDGE_LEVEL] < BRIDGE_LEVEL_PRINT_OWNER || (instance_id > 0 && gmem[EON_SEQ_PRINT_OWNER] == instance_id)) ? seq_print_run();
+
+  _sb_playing = (play_state & 1) && !seq_off;
+  seq_blk_tempo = tempo > 0 ? tempo : 120;
+  seq_blk_spb = (60 / seq_blk_tempo) * srate;                    // samples per beat, this block's tempo
+  seq_blk_b0 = beat_position;
+  seq_blk_b1 = seq_blk_b0 + samplesblock / seq_blk_spb;
+  seq_pos_q = floor(seq_blk_b0 * 64);   // the toolbar pass: the block's beat in 64ths, a whole number, for the song strip's playhead
+  seq_blk_w0 = seq_blk_b0;
+  seq_blk_ofsmax = max(0, min(samplesblock - 1, 8192));          // the launcher's pending-voice cap (note repeat's too)
+  !_sb_playing || abs(seq_blk_b0 - seq_prev_b1) > 2 * samplesblock / seq_blk_spb + SEQ_EPS ? (
+    _sb_l = 0; loop(SEQ_LANES, seq_wk_reset(_sb_l); _sb_l += 1; );
+    // The notes the queue still owes a release: a transport STOP releases every voice itself (the host's stop
+    // pass), so nothing is owed then; but PLAY switched off, a seek or a loop while the transport keeps running
+    // left those gate-mode voices sounding to their sample's end (self-audit 2026-10-20 finding 1). REAPER's own
+    // MIDI path ends a note at a loop or a seek: so does this, at the block's first sample, on the voices that
+    // had started by then (a voice launched ON that sample is a new hit's, left alone -- the due path's rule).
+    (play_state & 1) ? (
+      _sb_k = 0; loop(seq_noq_n,
+        _sb_pad = seq_noq[_sb_k * SEQ_NOQ_F] | 0; _sb_note = seq_noq[_sb_k * SEQ_NOQ_F + 1];
+        _sb_pad >= 0 && seq_noq[_sb_k * SEQ_NOQ_F + 3] < 100 ? (   // a release entry (not a one-shot's mirror-only one)
+          _sb_v = 0; loop(V_SLOTS,
+            v_slot[_sb_v] == _sb_pad && v_note[_sb_v] == _sb_note && v_stage[_sb_v] > 0 && v_stage[_sb_v] < 4
+              && swing_voice_started_before(_sb_v, 0) ? swing_voice_release_at(_sb_v, 0);
+            _sb_v += 1;
+          );
+        );
+        _sb_k += 1;
+      );
+    );
+    // S5: a channel lane's notes still owed their note-off end now (a stop, a seek, PLAY off): never a hanging note;
+    // S6: the mirror's too
+    _sb_k = 0; loop(seq_noq_n,
+      (seq_noq[_sb_k * SEQ_NOQ_F] | 0) < 0 ? seq_mo_push(0, 0x80 + (-(seq_noq[_sb_k * SEQ_NOQ_F] | 0)) - 1, seq_noq[_sb_k * SEQ_NOQ_F + 1] | 0, 0);
+      ((seq_noq[_sb_k * SEQ_NOQ_F + 3] | 0) % 100) > 0 ? seq_mirror_off((seq_noq[_sb_k * SEQ_NOQ_F + 3] | 0) % 100, seq_noq[_sb_k * SEQ_NOQ_F + 1] | 0, 0);
+      _sb_k += 1;
+    );
+    seq_noq_n = 0;
+    seq_sw_pat = -1;   // a switch still waiting is dropped with the walk it belonged to (a stop, a jump)
+    seq_eng_anchor = 0;   // ...and a resync's anchor with it: a run begins in phase with the timeline (an anchor kept
+                          // past the playhead would silence the pattern until the playhead reached it again)
+    seq_rs_prev_i = -2;   // the regions: the next block starts a region afresh whatever it is
+  );
+  seq_prev_b1 = _sb_playing ? seq_blk_b1 : -1000000;
+  seq_playing = _sb_playing;
+  // The MIDI trigger this block (S3): the pattern it picked switches in at the next 1/16 line of the pattern playing
+  // (mode 3: the next whole beat of the timeline), from the trigger note's own sample. Mode 2 and 3 re-anchor the new
+  // pattern's step 0 at that line; mode 1 keeps the anchor, so the new pattern continues in phase with the timeline.
+  // With the transport stopped the pick is immediate: a trigger note selects the pattern on the tabs.
+  seq_trig_pat >= 0 ? (
+    _sb_playing ? (
+      _sb_tb = seq_blk_b0 + seq_trig_ofs / seq_blk_spb;
+      seq_sw_pat = min(SEQ_PATS - 1, seq_trig_pat);
+      seq_sw_beat = seq_trig_mode >= 3 ? ceil(_sb_tb - SEQ_EPS) : seq_eng_anchor + 0.25 * ceil((_sb_tb - seq_eng_anchor) / 0.25 - SEQ_EPS);
+      seq_sw_resync = seq_trig_mode >= 2;
+    ) : ( seq_cur = min(SEQ_PATS - 1, seq_trig_pat); );
+    seq_trig_pat = -1;
+  );
+  // The selector: which pattern plays and where its step 0 sits. The pattern on screen (seq_cur: the tabs, the keys,
+  // a trigger's switch below), its step 0 at the project's start (host mode) unless a resync trigger moved it; the
+  // modes without resync pin it back. S4 (the regions) sets these two cells instead.
+  seq_trig_mode < 2 ? seq_eng_anchor = 0;
+  seq_eng_pat = max(0, min(SEQ_PATS - 1, seq_cur | 0));
+  _sb_playing && seq_opt_sync && seq_map_n > 0 ? (
+    // The regions pick (S4): the region under the block's start, its pattern anchored at ITS start; an edge inside the
+    // block (the region's end, or in a gap the next region's start) splits the walk there: the outgoing pattern plays to
+    // the edge and is cut, every walker forgets, and the region past the edge plays from it (a gap plays nothing).
+    seq_sw_pat = -1;
+    seq_sync_resolve(seq_blk_b0); _sb_rp = seq_rs_pat; _sb_ra = seq_rs_anchor;
+    // The region changed between blocks -- an edge that fell exactly on a block boundary (the split below never saw
+    // it), a region moved or re-mapped, SYNC just engaged: every walker forgets here and the region's pattern starts
+    // fresh from this block's first sample (the first run, 2026-10-20: lanes that kept their division ran on the old
+    // region's phase for beats after a boundary that was a block's first sample)
+    seq_rs_i != seq_rs_prev_i || _sb_ra != seq_rs_prev_a ? ( _sb_l = 0; loop(SEQ_LANES, seq_wk_reset(_sb_l); _sb_l += 1; ); );
+    seq_rs_edge < seq_blk_b1 - SEQ_EPS ? (
+      _sb_rp >= 0 && seq_rs_edge > seq_blk_b0 + SEQ_EPS ? (
+        _sb_b1s = seq_blk_b1; seq_blk_b1 = seq_rs_edge;
+        seq_eng_pat = _sb_rp; seq_eng_anchor = _sb_ra; seq_blk_context(_sb_rp); seq_walk_all(_sb_rp);
+        seq_blk_b1 = _sb_b1s;
+      );
+      seq_blk_w0 = max(seq_blk_b0, seq_rs_edge);
+      _sb_l = 0; loop(SEQ_LANES, seq_wk_reset(_sb_l); _sb_l += 1; );
+      seq_sync_resolve(seq_rs_edge); _sb_rp = seq_rs_pat; _sb_ra = seq_rs_anchor;
+    );
+    _sb_rp >= 0 ? (
+      seq_cur = _sb_rp; seq_eng_pat = _sb_rp; seq_eng_anchor = _sb_ra;
+      seq_blk_context(_sb_rp); seq_walk_all(_sb_rp);
+    );
+    seq_sync_sil = _sb_rp < 0; seq_rs_prev_i = seq_rs_i; seq_rs_prev_a = _sb_ra;
+  ) : _sb_playing ? (
+    seq_sync_sil = 0;
+    // The anchor moved with no switch and no jump (audit H19, 2026-10-23): SONG switched off inside a region that
+    // does not start at beat 0, the region list emptied, KEYS lowered to mode 0 / 1 after a resync -- the pin above
+    // put it back to 0 while every walker still counted its steps from the old one, so every step in between was
+    // due at once (a burst of the whole kit in one block). Every walker forgets here and the pattern carries on in
+    // phase with the timeline from this block's first sample, its hits of the past skipped, as at a switch.
+    seq_eng_anchor != seq_wk_anchor ? ( _sb_l = 0; loop(SEQ_LANES, seq_wk_reset(_sb_l); _sb_l += 1; ); );
+    // ...and the regions, when they pick again (SONG back on in the same region, the map refilled), start afresh: the
+    // walkers count from this branch's anchor now, not the region's start: unreset, they sat the region's start
+    // ahead of the playhead and the region stayed silent that long, or to its end.
+    seq_rs_prev_i = -2;
+    // A switch due inside this block: the outgoing pattern plays up to the switch beat -- its hits past it, even
+    // those its boundaries before the switch owed (a roll's tail, a swung or nudged hit), are CUT -- every walker
+    // forgets, and the new pattern plays from the switch beat on, its hits of the past skipped (fresh).
+    seq_sw_pat >= 0 && seq_sw_beat < seq_blk_b1 - SEQ_EPS ? (
+      seq_sw_beat > seq_blk_b0 + SEQ_EPS ? (
+        _sb_b1s = seq_blk_b1; seq_blk_b1 = seq_sw_beat;
+        seq_blk_context(seq_eng_pat); seq_walk_all(seq_eng_pat);
+        seq_blk_b1 = _sb_b1s;
+      );
+      seq_blk_w0 = max(seq_blk_b0, seq_sw_beat);
+      _sb_l = 0; loop(SEQ_LANES, seq_wk_reset(_sb_l); _sb_l += 1; );
+      seq_cur = seq_sw_pat;
+      seq_sw_resync ? seq_eng_anchor = seq_sw_beat;
+      seq_sw_pat = -1;
+      seq_eng_pat = max(0, min(SEQ_PATS - 1, seq_cur | 0));
+    );
+    seq_blk_context(seq_eng_pat);
+    seq_walk_all(seq_eng_pat);
+  );
+  // The note-off schedule: a gate-mode step's release lands at its own sample, on the voices of that pad
+  // and note that had started by then (a voice launched ON that sample is the next step's, left alone --
+  // the MIDI note-off's rule, swing_voice_started_before). The entry is dropped once due; a due entry
+  // while stopped is dropped unplayed (the stop pass released everything).
+  _sb_k = 0;
+  while(_sb_k < seq_noq_n) (
+    _sb_due = seq_noq[_sb_k * SEQ_NOQ_F + 2];
+    !_sb_playing || _sb_due < seq_blk_b1 - SEQ_EPS ? (
+      // S5: a channel lane's note ends with a MIDI note-off at its sample (at once when stopped); S6: a pad hit's mirror
+      // note-off the same way (an entry whose note-off found no room stays and goes next block: seq_midi_note and
+      // seq_mirror_on keep that room, this is the guard). The pad's voices release only on a release entry.
+      _sb_keep = 0;
+      _sb_pad = seq_noq[_sb_k * SEQ_NOQ_F] | 0; _sb_note = seq_noq[_sb_k * SEQ_NOQ_F + 1]; _sb_mir = seq_noq[_sb_k * SEQ_NOQ_F + 3] | 0;
+      _sb_ofs = _sb_playing ? max(0, min(seq_blk_ofsmax, floor((_sb_due - seq_blk_b0) * seq_blk_spb + 0.5))) : 0;
+      _sb_pad < 0 ? ( _sb_keep = !seq_mo_push(_sb_ofs, 0x80 + (-_sb_pad) - 1, _sb_note | 0, 0); ) : (
+        (_sb_mir % 100) > 0 ? _sb_keep = !seq_mirror_off(_sb_mir % 100, _sb_note | 0, _sb_ofs);
+        _sb_playing && !_sb_keep && _sb_mir < 100 ? (
+          _sb_v = 0; loop(V_SLOTS,
+            v_slot[_sb_v] == _sb_pad && v_note[_sb_v] == _sb_note && v_stage[_sb_v] > 0 && v_stage[_sb_v] < 4
+              && swing_voice_started_before(_sb_v, _sb_ofs) ? swing_voice_release_at(_sb_v, _sb_ofs);
+            _sb_v += 1;
+          );
+        );
+      );
+      _sb_keep ? _sb_k += 1 : (
+        seq_noq_n -= 1;
+        memcpy(seq_noq + _sb_k * SEQ_NOQ_F, seq_noq + seq_noq_n * SEQ_NOQ_F, SEQ_NOQ_F);
+      );
+    ) : _sb_k += 1;
+  );
+  seq_mo_flush();   // S5: this block's MIDI out, sorted by offset
+  seq_echo_pos += samplesblock;   // S6: the echo guard's clock (the host's MIDI loop ran before this, on the same base)
+);
+
+// ─── The project save: the body of serialize gate 78 (spec 8) ───────────────
+// Sparse in both axes. Header (the instance's settings, fixed scalars with two spares), the song chain
+// (a count, then the slots), the pattern count, then per pattern a used flag; a used pattern carries its
+// record, its sixteen lane records and, per lane, a count of switched-on steps followed by that many
+// (step, word A, word B) triples. Presence in the list is "on". Word A = vel | prob<<7 | (ratchet-1)<<14 |
+// tie<<16 | acc<<18 | rsub_follows<<19; word B = (nudge+50) | (pitch+48)<<7 | (pan+100)<<14 | cond<<22:
+// both below 2^24, exact in the stream's 32-bit floats. rsub_follows = the roll's three sub-velocities
+// follow the triple (S2 writes them when any is set; S1 never did and skipped them on read). Every count
+// meets a STATIC bound before any file_mem or loop (wiki 3.5); a count past its bound ends the read --
+// nothing after it in this gate is touched, so the reader never walks the stream out of alignment. Scratch
+// that file_var writes into is global (seq_srz_*: this function is the only writer); counters are locals.
+function seq_pack_a(_pa_b, _pa_rs) (
+  (max(1, min(127, _pa_b[1] | 0))) | ((max(0, min(100, _pa_b[2] | 0))) << 7)
+    | ((max(0, min(3, (_pa_b[3] | 0) - 1))) << 14) | ((max(0, min(2, _pa_b[4] | 0))) << 16)
+    | ((_pa_b[8] ? 1 : 0) << 18) | ((_pa_rs ? 1 : 0) << 19);
+);
+function seq_pack_b(_pb_b) (
+  (max(0, min(100, (_pb_b[5] | 0) + 50))) | ((max(0, min(96, (_pb_b[6] | 0) + 48))) << 7)
+    | ((max(0, min(200, (_pb_b[7] | 0) + 100))) << 14) | ((max(0, min(3, _pb_b[9] | 0))) << 22);
+);
+function seq_unpack(_up_b, _up_a, _up_w) (
+  _up_a = _up_a | 0; _up_w = _up_w | 0;
+  _up_b[1] = max(1, _up_a & 127); _up_b[2] = (_up_a >> 7) & 127; _up_b[3] = ((_up_a >> 14) & 3) + 1;
+  _up_b[4] = (_up_a >> 16) & 3; _up_b[8] = (_up_a >> 18) & 1;
+  _up_b[5] = (_up_w & 127) - 50; _up_b[6] = ((_up_w >> 7) & 127) - 48; _up_b[7] = ((_up_w >> 14) & 255) - 100;
+  _up_b[9] = (_up_w >> 22) & 3;
+  _up_b[0] = 1;   // last: the walker reads a whole step once it sees the flag
+);
+// Is anything in this pattern worth writing? Any switched-on step, or any lane or pattern field off its default.
+// ─── The stream's channel (S3c): the project file, or a gmem band for a kit's record ─────────────────────────────────
+// Every serialize function reads and writes through these two, so the SAME code packs the project chunk (@serialize:
+// file_var / file_mem) and the kit record (a band: EON_SEQ_KIT). Each channel keeps its state in its own cells of
+// seq_io (SEQ_IO_F a channel: 0 mode -- 0 the file, 1 a band written, 2 a band read; 1 the next cell; 2 one past the
+// band's end; 3 over -- a write past the end was refused, a read past it read 0; 4 reading) and every serialize function
+// takes the channel (_ch): channel 0 is @serialize's alone, channel 1 the kit record's (@block), so the two never share
+// a cell -- wiki 4.1: @serialize runs beside the audio thread, unmutexed. The functions' own counts are locals.
+SEQ_IO_F = 8;
+seq_io_tmp = 0;   // the file channel's file_var cell (an lvalue: @serialize's alone)
+function seq_io_rd(_ir_c) ( seq_io[_ir_c * SEQ_IO_F + 4]; );
+function seq_io_var(_iv_v, _iv_c) local(_iv_b) (
+  _iv_b = seq_io + _iv_c * SEQ_IO_F;
+  _iv_b[0] == 0 ? ( seq_io_tmp = _iv_v; file_var(0, seq_io_tmp); seq_io_tmp )
+  : _iv_b[0] == 1 ? ( _iv_b[1] < _iv_b[2] ? gmem[_iv_b[1]] = _iv_v : _iv_b[3] = 1; _iv_b[1] += 1; _iv_v )
+  : ( _iv_b[1] < _iv_b[2] ? _iv_v = gmem[_iv_b[1]] : ( _iv_v = 0; _iv_b[3] = 1; ); _iv_b[1] += 1; _iv_v );
+);
+function seq_io_mem(_im_p, _im_n, _im_c) local(_im_b, _im_k) (
+  _im_b = seq_io + _im_c * SEQ_IO_F;
+  _im_b[0] == 0 ? file_mem(0, _im_p, _im_n)
+  : _im_b[0] == 1 ? ( _im_k = 0; loop(_im_n, _im_b[1] < _im_b[2] ? gmem[_im_b[1]] = _im_p[_im_k] : _im_b[3] = 1; _im_b[1] += 1; _im_k += 1; ); )
+  : ( _im_k = 0; loop(_im_n, _im_b[1] < _im_b[2] ? _im_p[_im_k] = gmem[_im_b[1]] : ( _im_p[_im_k] = 0; _im_b[3] = 1; ); _im_b[1] += 1; _im_k += 1; ); );
+);
+
+function seq_pat_used(p) local(_pu_l, _pu_s, _pu_b, _pu_lb, _pu_pb, _pu_u) (
+  _pu_u = 0;
+  _pu_pb = seq_pat_at(p);
+  (_pu_pb[0] != SEQ_LEN_DEFAULT || _pu_pb[1] != SEQ_DIV_DEFAULT || _pu_pb[2] || _pu_pb[3] || _pu_pb[4] != SEQ_GATE_DEFAULT
+    || _pu_pb[5] || _pu_pb[6] || _pu_pb[7]) ? _pu_u = 1;
+  _pu_l = 0; loop(SEQ_LANES,
+    _pu_lb = seq_lane_at(p, _pu_l);
+    (_pu_lb[0] != _pu_l || _pu_lb[1] != SEQ_LEN_DEFAULT || _pu_lb[2] != SEQ_DIV_DEFAULT || _pu_lb[3] || _pu_lb[4] || _pu_lb[5]
+      || _pu_lb[6] != 1 || _pu_lb[7] || _pu_lb[8] != SEQ_LSW_FOLLOW || _pu_lb[9] != -1 || _pu_lb[10] || _pu_lb[11] || _pu_lb[12]) ? _pu_u = 1;
+    _pu_b = seq_step_at(p, _pu_l, 0);
+    _pu_s = 0; loop(SEQ_STEPS, _pu_b[0] ? _pu_u = 1; _pu_b += SEQ_ATTR; _pu_s += 1; );
+    _pu_l += 1;
+  );
+  !_pu_u ? ( _pu_b = seq_note_at(p, 0, 0); loop(SEQ_LANES * SEQ_STEPS * SEQ_CHORD_N, _pu_b[0] > 0 ? _pu_u = 1; _pu_b += SEQ_NOTE_F; ); );   // S5: notes
+  _pu_u;
+);
+// The slot a duplicate lands in: the first unused pattern after p, wrapping round; -1 when every slot is used.
+function seq_dup_target(_dt_p) local(_dt_k, _dt_q, _dt_hit) (
+  _dt_hit = -1; _dt_k = 1;
+  loop(SEQ_PATS - 1,
+    _dt_q = _dt_p + _dt_k; _dt_q >= SEQ_PATS ? _dt_q -= SEQ_PATS;
+    _dt_hit < 0 && !seq_pat_used(_dt_q) ? _dt_hit = _dt_q;
+    _dt_k += 1;
+  );
+  _dt_hit;
+);
+// Clamp a lane record read from a file (another program's numbers). The target keeps a MIDI-channel value
+// (-1..-16, phase 4b) so a later build's lane survives a round trip through this one; the walker ignores it.
+function seq_srz_clamp_lane(_cl_b, _cl_l) (
+  _cl_b[0] = max(-16, min(NUM_SLOTS - 1, _cl_b[0] | 0));
+  _cl_b[1] = max(1, min(SEQ_STEPS, _cl_b[1] | 0)); _cl_b[2] = max(0, min(SEQ_DIV_N - 1, _cl_b[2] | 0));
+  _cl_b[3] = max(-500, min(500, _cl_b[3])); _cl_b[4] = _cl_b[4] ? 1 : 0; _cl_b[5] = _cl_b[5] ? 1 : 0;
+  _cl_b[6] = max(0, min(2, _cl_b[6])); _cl_b[7] = max(-1, min(1, _cl_b[7])); _cl_b[8] = max(-1, min(100, _cl_b[8] | 0));
+  _cl_b[9] = max(-1, min(SEQ_LANES - 1, _cl_b[9] | 0)); _cl_b[10] = _cl_b[10] ? 1 : 0;
+  _cl_b[11] = max(0, min(32, _cl_b[11] | 0)); _cl_b[12] = max(0, min(15, _cl_b[12] | 0));
+);
+function seq_srz_clamp_pat(_cq_b) (
+  _cq_b[0] = max(1, min(SEQ_STEPS, _cq_b[0] | 0)); _cq_b[1] = max(0, min(SEQ_DIV_N - 1, _cq_b[1] | 0));
+  _cq_b[2] = max(0, min(2, _cq_b[2] | 0)); _cq_b[3] = max(0, min(100, _cq_b[3])); _cq_b[4] = max(1, min(100, _cq_b[4]));
+  _cq_b[5] = max(0, min(100, _cq_b[5])); _cq_b[6] = max(0, min(100, _cq_b[6])); _cq_b[7] = max(-127, min(127, _cq_b[7]));
+  // field 8 (used) stays what the writer stored: nothing reads it yet, and a value the reader invents breaks the
+  // round trip (the rig's checksums differed by exactly 8 * 31^3 until this read it as 1, 2026-10-19)
+  _cq_b[8] = _cq_b[8] ? 1 : 0; _cq_b[10] = max(-1, min(SEQ_SRZ_PATS_MAX - 1, _cq_b[10] | 0));
+);
+// One pattern's body, both directions. _sp_dst < 0 = read and drop (a pattern past this build's count):
+// its records land in the 16-cell scratch, its triples in the scratch scalars. Returns 1, or 0 when a
+// count failed its bound (the caller then reads nothing more).
+function seq_srz_pattern(_sp_dst, _ch) local(_sp_l, _sp_s, _sp_b, _sp_lb, _sp_pb, _sp_cnt, _sp_ok, _sp_k, _sp_rs, _sp_rb, seq_srz_a, seq_srz_cnt, seq_srz_s, seq_srz_w) (
+  _sp_ok = 1;
+  _sp_pb = _sp_dst >= 0 ? seq_pat_at(_sp_dst) : seq_srz_tmp;
+  seq_io_mem(_sp_pb, SEQ_PAT_F, _ch);
+  seq_io_rd(_ch) && _sp_dst >= 0 ? seq_srz_clamp_pat(_sp_pb);
+  _sp_l = 0;
+  while(_sp_ok && _sp_l < SEQ_LANES) (
+    _sp_lb = _sp_dst >= 0 ? seq_lane_at(_sp_dst, _sp_l) : seq_srz_tmp;
+    seq_io_mem(_sp_lb, SEQ_LANE_F, _ch);
+    seq_io_rd(_ch) && _sp_dst >= 0 ? seq_srz_clamp_lane(_sp_lb, _sp_l);
+    _sp_cnt = 0;
+    !seq_io_rd(_ch) ? (
+      _sp_b = seq_step_at(_sp_dst, _sp_l, 0);
+      _sp_s = 0; loop(SEQ_STEPS, _sp_b[0] ? _sp_cnt += 1; _sp_b += SEQ_ATTR; _sp_s += 1; );
+    );
+    seq_srz_cnt = _sp_cnt;
+    seq_srz_cnt = seq_io_var(seq_srz_cnt, _ch);
+    seq_io_rd(_ch) ? ( _sp_cnt = seq_srz_cnt | 0; (_sp_cnt < 0 || _sp_cnt > SEQ_STEPS) ? _sp_ok = 0; );
+    _sp_ok ? (
+      !seq_io_rd(_ch) ? (
+        _sp_s = 0; loop(SEQ_STEPS,
+          _sp_b = seq_step_at(_sp_dst, _sp_l, _sp_s);
+          _sp_b[0] ? (
+            _sp_rb = seq_rsub_at(_sp_dst, _sp_l, _sp_s);
+            _sp_rs = (_sp_rb[0] | 0) || (_sp_rb[1] | 0) || (_sp_rb[2] | 0);
+            seq_srz_s = _sp_s;                      seq_srz_s = seq_io_var(seq_srz_s, _ch);
+            seq_srz_a = seq_pack_a(_sp_b, _sp_rs);  seq_srz_a = seq_io_var(seq_srz_a, _ch);
+            seq_srz_w = seq_pack_b(_sp_b);          seq_srz_w = seq_io_var(seq_srz_w, _ch);
+            _sp_rs ? ( seq_io_mem(_sp_rb, SEQ_RSUB_N, _ch); );
+          );
+          _sp_s += 1;
+        );
+      ) : (
+        _sp_k = 0; loop(_sp_cnt,
+          seq_srz_s = seq_io_var(seq_srz_s, _ch); seq_srz_a = seq_io_var(seq_srz_a, _ch); seq_srz_w = seq_io_var(seq_srz_w, _ch);
+          _sp_s = seq_srz_s | 0;
+          _sp_dst >= 0 && _sp_s >= 0 && _sp_s < SEQ_STEPS ? seq_unpack(seq_step_at(_sp_dst, _sp_l, _sp_s), seq_srz_a, seq_srz_w);
+          ((seq_srz_a | 0) & 524288) ? (
+            // the roll's sub-velocities: three cells, into the step (or the scratch for a dropped pattern)
+            _sp_rb = (_sp_dst >= 0 && _sp_s >= 0 && _sp_s < SEQ_STEPS) ? seq_rsub_at(_sp_dst, _sp_l, _sp_s) : seq_srz_tmp;
+            seq_io_mem(_sp_rb, SEQ_RSUB_N, _ch);
+            _sp_rb[0] = max(0, min(127, _sp_rb[0] | 0)); _sp_rb[1] = max(0, min(127, _sp_rb[1] | 0)); _sp_rb[2] = max(0, min(127, _sp_rb[2] | 0));
+          );
+          _sp_k += 1;
+        );
+      );
+    );
+    _sp_l += 1;
+  );
+  _sp_ok;
+);
+// ─── Gate 79: the TAGGED stream (P0a, 2026-10-20, decision 23) ───────────────
+// `[tag, len, cells...]` sections, a count first. A reader takes the tags it knows and SKIPS the others by their
+// length (a count-bounded skip), so a later build can add a section (the note pool, S5; the kit record's
+// revision) without a new gate number, and a missing tag means defaults: the stream cannot desync a positional
+// reader, which is what the wiki's "a new gate for every layout change, in ship order" rule exists to prevent.
+// The writer states every length (a counting pass mirrors the pattern writer). Tags: 1 SETTINGS (a fixed block
+// of SEQ_SRZ_SET_N cells, the spares written as 0 and ignored on read), 2 SONG, 3 PATTERNS (the sparse body as
+// gate 78 wrote it). A file written by gate 78 (the user's own test projects; nothing shipped) is read by the
+// 78 body below and converted: lane W (a strength of the pattern's swing) -> the lane's own swing.
+SEQ_SRZ_TAG_SET  = 1;
+SEQ_SRZ_TAG_SONG = 2;
+SEQ_SRZ_TAG_PATS = 3;
+SEQ_SRZ_SET_N    = 32;      // the SETTINGS block: 27 used (19..23 the polish pass; 24-25 the roll; 26 the patterns on show, round two H: the lanes' mute and solo masks, their marker,
+                            // the hidden columns, the lane order), the rest spare (read into the 64-cell scratch)
+SEQ_SRZ_TAGS_MAX = 64;      // static bounds (wiki 3.5)
+SEQ_SRZ_LEN_MAX  = 4000000;
+
+// How many cells the PATTERNS body will take (mirrors seq_srz_pattern's writer exactly).
+function seq_srz_count_pats() local(_cn_p, _cn_l, _cn_s, _cn_b, _cn_rb, _cn_n) (
+  _cn_n = 1;   // the pattern count
+  _cn_p = 0; loop(SEQ_PATS,
+    _cn_n += 1;   // the used flag
+    seq_pat_used(_cn_p) ? (
+      _cn_n += SEQ_PAT_F;
+      _cn_l = 0; loop(SEQ_LANES,
+        _cn_n += SEQ_LANE_F + 1;   // the lane record and the on-step count
+        _cn_b = seq_step_at(_cn_p, _cn_l, 0); _cn_rb = seq_rsub_at(_cn_p, _cn_l, 0);
+        _cn_s = 0; loop(SEQ_STEPS,
+          _cn_b[0] ? ( _cn_n += 3; ((_cn_rb[0] | 0) || (_cn_rb[1] | 0) || (_cn_rb[2] | 0)) ? _cn_n += SEQ_RSUB_N; );
+          _cn_b += SEQ_ATTR; _cn_rb += SEQ_RSUB_N; _cn_s += 1;
+        );
+        _cn_l += 1;
+      );
+    );
+    _cn_p += 1;
+  );
+  _cn_n;
+);
+// Skip _sk_n cells of a tag this build does not know (read into the scratch, 16 at a time; count-bounded).
+function seq_srz_skip(_sk_n, _ch) local(_sk_k, _sk_b) (
+  _sk_n = max(0, min(SEQ_SRZ_LEN_MAX, _sk_n | 0));
+  _sk_b = seq_io + _ch * SEQ_IO_F;
+  _sk_b[0] == 0 ? ( while(_sk_n > 0) ( _sk_k = min(16, _sk_n); seq_io_mem(seq_srz_tmp, _sk_k, _ch); _sk_n -= _sk_k; ); )
+  : ( _sk_b[1] + _sk_n > _sk_b[2] ? _sk_b[3] = 1; _sk_b[1] += _sk_n; );
+);
+// The SETTINGS block, both directions, through the scratch (64 cells; the first SEQ_SRZ_SET_N carry the block).
+function seq_srz_settings(_st_len, _ch) local(_st_k) (
+  !seq_io_rd(_ch) ? (
+    memset(seq_srz_tmp, 0, SEQ_SRZ_SET_N);
+    seq_srz_tmp[0] = seq_shown; seq_srz_tmp[1] = seq_h; seq_srz_tmp[2] = seq_view; seq_srz_tmp[3] = seq_cur;
+    seq_srz_tmp[4] = seq_page; seq_srz_tmp[5] = seq_off; seq_srz_tmp[6] = seq_run; seq_srz_tmp[7] = seq_place;
+    seq_srz_tmp[8] = fb_place; seq_srz_tmp[9] = fx_place; seq_srz_tmp[10] = seq_trig_mode; seq_srz_tmp[11] = seq_trig_base;
+    seq_srz_tmp[12] = seq_opt_icons; seq_srz_tmp[13] = seq_opt_follow; seq_srz_tmp[14] = seq_opt_transport;
+    seq_srz_tmp[15] = seq_opt_sync; seq_srz_tmp[16] = seq_opt_midiout; seq_srz_tmp[17] = seq_opt_midich;
+    seq_srz_tmp[18] = seq_opt_adapt;
+    seq_srz_tmp[19] = seq_gmute; seq_srz_tmp[20] = seq_gsolo; seq_srz_tmp[21] = 1; seq_srz_tmp[22] = seq_col_hide;   // the polish pass
+    seq_srz_tmp[23] = seq_opt_topdown; seq_srz_tmp[24] = seq_opt_snap; seq_srz_tmp[25] = seq_opt_rollh;
+    seq_srz_tmp[26] = seq_npat;   // round two H: the patterns on show
+    seq_io_mem(seq_srz_tmp, SEQ_SRZ_SET_N, _ch);
+  ) : (
+    memset(seq_srz_tmp, 0, 64);
+    _st_k = max(0, min(SEQ_SRZ_SET_N, _st_len | 0));
+    _st_k > 0 ? seq_io_mem(seq_srz_tmp, _st_k, _ch);
+    _st_len > _st_k ? seq_srz_skip(_st_len - _st_k, _ch);   // a later build's longer block: the rest is its own
+    seq_shown = seq_srz_tmp[0] ? 1 : 0; seq_h = max(0, min(4096, seq_srz_tmp[1])); seq_view = max(0, min(6, seq_srz_tmp[2] | 0));
+    seq_cur = max(0, min(SEQ_PATS - 1, seq_srz_tmp[3] | 0)); seq_page = max(0, min(3, seq_srz_tmp[4] | 0));
+    seq_off = seq_srz_tmp[5] ? 1 : 0; seq_run = seq_srz_tmp[6] ? 1 : 0;
+    seq_place = (seq_srz_tmp[7] >= 0 && seq_srz_tmp[7] <= 4) ? seq_srz_tmp[7] | 0 : 0;
+    fb_place = (seq_srz_tmp[8] >= 0 && seq_srz_tmp[8] <= 4) ? seq_srz_tmp[8] | 0 : 0;
+    fx_place = (seq_srz_tmp[9] >= 0 && seq_srz_tmp[9] <= 4) ? seq_srz_tmp[9] | 0 : 0;
+    seq_trig_mode = max(0, min(5, seq_srz_tmp[10] | 0)); seq_trig_base = max(0, min(127, seq_srz_tmp[11] | 0));
+    seq_opt_icons = seq_srz_tmp[12] ? 1 : 0; seq_opt_follow = seq_srz_tmp[13] ? 1 : 0; seq_opt_transport = seq_srz_tmp[14] ? 1 : 0;
+    seq_opt_sync = seq_srz_tmp[15] ? 1 : 0; seq_opt_midiout = seq_srz_tmp[16] ? 1 : 0; seq_opt_midich = max(1, min(16, seq_srz_tmp[17] | 0));
+    seq_opt_adapt = seq_srz_tmp[18] ? 1 : 0;
+    seq_gmute = max(0, min(65535, seq_srz_tmp[19] | 0)); seq_gsolo = max(0, min(65535, seq_srz_tmp[20] | 0));
+    seq_gms_srz = seq_srz_tmp[21] ? 1 : 0; seq_col_hide = max(0, min(31, seq_srz_tmp[22] | 0));
+    seq_opt_topdown = seq_srz_tmp[23] ? 1 : 0; seq_opt_snap = max(0, min(3, seq_srz_tmp[24] | 0));
+    seq_opt_rollh = max(0, min(100, seq_srz_tmp[25] | 0));
+    seq_npat = max(0, min(SEQ_PATS, seq_srz_tmp[26] | 0));   // 0 = an older stream: seq_npat_fix derives it after the read
+  );
+);
+// The SONG block, both directions (the count first, then the three scalars, then the slots).
+function seq_srz_song(_ch) local(_sg_ok, seq_srz_n) (
+  seq_srz_n = SEQ_SONG_MAX; seq_srz_n = seq_io_var(seq_srz_n, _ch);
+  seq_song_len = seq_io_var(seq_song_len, _ch); seq_song_loop = seq_io_var(seq_song_loop, _ch); seq_song_pos = seq_io_var(seq_song_pos, _ch);
+  _sg_ok = (seq_srz_n | 0) >= 0 && (seq_srz_n | 0) <= SEQ_SONG_MAX;
+  _sg_ok ? seq_io_mem(seq_song, (seq_srz_n | 0) * 2, _ch);
+  seq_io_rd(_ch) ? (
+    seq_song_len = max(0, min(SEQ_SONG_MAX, seq_song_len | 0)); seq_song_loop = seq_song_loop ? 1 : 0;
+    seq_song_pos = max(0, min(SEQ_SONG_MAX - 1, seq_song_pos | 0));
+  );
+  _sg_ok;
+);
+// The PATTERNS block, both directions (the count, then per pattern a used flag and its body). Returns 1, or 0
+// when a count failed its bound (the caller reads nothing more).
+function seq_srz_pats(_ch) local(_sp_p, _sp_np, _sp_ok, _sp_dst, seq_srz_n, seq_srz_u) (
+  seq_srz_n = SEQ_PATS; seq_srz_n = seq_io_var(seq_srz_n, _ch);
+  _sp_np = seq_srz_n | 0;
+  _sp_ok = _sp_np >= 0 && _sp_np <= SEQ_SRZ_PATS_MAX;
+  _sp_p = 0;
+  while(_sp_ok && _sp_p < _sp_np) (
+    _sp_dst = _sp_p < SEQ_PATS ? _sp_p : -1;
+    seq_srz_u = (!seq_io_rd(_ch) && _sp_dst >= 0) ? seq_pat_used(_sp_p) : 0;
+    seq_srz_u = seq_io_var(seq_srz_u, _ch);
+    seq_srz_u ? _sp_ok = seq_srz_pattern(_sp_dst, _ch);
+    _sp_p += 1;
+  );
+  _sp_ok;
+);
+// A 78 file's lanes: W (a strength 0..100 % of the pattern's swing, 100 the default) -> the lane's own swing:
+// 100 -> follow the pattern (-1), anything else -> round(SWING x W / 100), the same timing the file played with.
+function seq_srz_convert_78() local(_cv_p, _cv_l, _cv_lb, _cv_sw, _cv_w) (
+  _cv_p = 0; loop(SEQ_PATS,
+    _cv_sw = max(0, min(100, seq_pat_at(_cv_p)[3]));
+    _cv_l = 0; loop(SEQ_LANES,
+      _cv_lb = seq_lane_at(_cv_p, _cv_l);
+      // only a lane the file carried (W 0..100); a pattern the file left out was cleared to -1 already, and
+      // converting that -1 made every empty pattern "used" (2,600 cells of empty lane records in the project:
+      // the rig's SIZE line, 2026-10-20)
+      _cv_lb[8] >= 0 ? (
+        _cv_w = max(0, min(100, _cv_lb[8]));
+        _cv_lb[8] = _cv_w >= 100 ? SEQ_LSW_FOLLOW : floor(_cv_sw * _cv_w / 100 + 0.5);
+      );
+      _cv_l += 1;
+    );
+    _cv_p += 1;
+  );
+);
+// The 78 body (the positional stream S1 wrote; a READER now: nothing writes 78 any more).
+function seq_srz_body78(_ch) local(_ss_p, _ss_np, _ss_ok, _ss_dst, seq_srz_n, seq_srz_spare0, seq_srz_spare1, seq_srz_u) (
+  // ── header (78's: the twelve scalars and two spares) ──
+  seq_shown = seq_io_var(seq_shown, _ch); seq_h = seq_io_var(seq_h, _ch); seq_view = seq_io_var(seq_view, _ch); seq_cur = seq_io_var(seq_cur, _ch); seq_page = seq_io_var(seq_page, _ch);
+  seq_off = seq_io_var(seq_off, _ch); seq_run = seq_io_var(seq_run, _ch); seq_place = seq_io_var(seq_place, _ch); fb_place = seq_io_var(fb_place, _ch); fx_place = seq_io_var(fx_place, _ch);
+  seq_trig_mode = seq_io_var(seq_trig_mode, _ch); seq_trig_base = seq_io_var(seq_trig_base, _ch); seq_srz_spare0 = seq_io_var(seq_srz_spare0, _ch); seq_srz_spare1 = seq_io_var(seq_srz_spare1, _ch);
+  seq_io_rd(_ch) ? (
+    seq_shown = seq_shown ? 1 : 0; seq_h = max(0, min(4096, seq_h)); seq_view = max(0, min(6, seq_view | 0));
+    seq_cur = max(0, min(SEQ_PATS - 1, seq_cur | 0)); seq_page = max(0, min(3, seq_page | 0));
+    seq_off = seq_off ? 1 : 0; seq_run = seq_run ? 1 : 0;
+    seq_place = (seq_place >= 0 && seq_place <= 4) ? seq_place | 0 : 0;
+    fb_place = (fb_place >= 0 && fb_place <= 4) ? fb_place | 0 : 0;
+    fx_place = (fx_place >= 0 && fx_place <= 4) ? fx_place | 0 : 0;
+    seq_trig_mode = max(0, min(5, seq_trig_mode | 0)); seq_trig_base = max(0, min(127, seq_trig_base | 0));
+  );
+  // ── the song chain ──
+  seq_srz_n = SEQ_SONG_MAX; seq_srz_n = seq_io_var(seq_srz_n, _ch);
+  seq_song_len = seq_io_var(seq_song_len, _ch); seq_song_loop = seq_io_var(seq_song_loop, _ch); seq_song_pos = seq_io_var(seq_song_pos, _ch);
+  _ss_ok = (seq_srz_n | 0) >= 0 && (seq_srz_n | 0) <= SEQ_SONG_MAX;
+  _ss_ok ? seq_io_mem(seq_song, (seq_srz_n | 0) * 2, _ch);
+  seq_io_rd(_ch) ? (
+    seq_song_len = max(0, min(SEQ_SONG_MAX, seq_song_len | 0)); seq_song_loop = seq_song_loop ? 1 : 0;
+    seq_song_pos = max(0, min(SEQ_SONG_MAX - 1, seq_song_pos | 0));
+  );
+  // ── the patterns ──
+  _ss_ok ? (
+    seq_srz_n = SEQ_PATS; seq_srz_n = seq_io_var(seq_srz_n, _ch);
+    _ss_np = seq_srz_n | 0;
+    _ss_ok = _ss_np >= 0 && _ss_np <= SEQ_SRZ_PATS_MAX;
+    _ss_p = 0;
+    while(_ss_ok && _ss_p < _ss_np) (
+      _ss_dst = _ss_p < SEQ_PATS ? _ss_p : -1;
+      seq_srz_u = (!seq_io_rd(_ch) && _ss_dst >= 0) ? seq_pat_used(_ss_p) : 0;
+      seq_srz_u = seq_io_var(seq_srz_u, _ch);
+      seq_srz_u ? _ss_ok = seq_srz_pattern(_ss_dst, _ch);
+      _ss_p += 1;
+    );
+  );
+  seq_io_rd(_ch) && !_ss_ok ? seq_srz_bad = 1;   // a diagnostic flag: the read stopped at a count past its bound
+);
+
+// The whole gate. Called by the host inside `ser_ver >= 78 ? ...` in both directions; the host's
+// `is_read && ser_ver < 78` backfill is seq_clear_all. A write is always the tagged stream (ser_ver 79); a read
+// takes the file's own gate: 79 tagged, 78 the positional body below (then the W conversion).
+// ─── S5: the notes as their own tag (NOTES, 4) ───────────────────────────────────────────────────────────────
+// [the pattern count, then per pattern: its note count, then per note two words] -- word A = lane + 16 x step + 1024 x
+// pitch (< 2^17), word B = velocity + 128 x (length in quarter steps x 128 + nudge + 50) (< 2^23): exact in the
+// stream's 32-bit floats. A read puts each note in the first free slot of its step; a count past its static bound
+// ends the read (wiki 3.5). A build before S5 skips the tag by its length; a stream without it has no notes.
+SEQ_SRZ_TAG_NOTES = 4;
+function seq_srz_count_notes() local(_cn_p, _cn_n, _cn_b) (
+  _cn_n = 1;
+  _cn_p = 0; loop(SEQ_PATS,
+    _cn_n += 1;
+    _cn_b = seq_note_at(_cn_p, 0, 0); loop(SEQ_LANES * SEQ_STEPS * SEQ_CHORD_N, _cn_b[0] > 0 ? _cn_n += 2; _cn_b += SEQ_NOTE_F; );
+    _cn_p += 1;
+  );
+  _cn_n;
+);
+function seq_srz_notes(_ch) local(_sn_np, _sn_p, _sn_ok, _sn_n, _sn_b, _sn_k, _sn_l, _sn_s, _sn_nb, _sn_a, _sn_w, _sn_q, seq_srz_a, seq_srz_b, seq_srz_n, seq_srz_u) (
+  seq_srz_n = SEQ_PATS; seq_srz_n = seq_io_var(seq_srz_n, _ch);
+  _sn_np = seq_srz_n | 0; _sn_ok = _sn_np >= 0 && _sn_np <= SEQ_SRZ_PATS_MAX;
+  _sn_p = 0;
+  while(_sn_ok && _sn_p < _sn_np) (
+    _sn_b = _sn_p < SEQ_PATS ? seq_note_at(_sn_p, 0, 0) : -1;
+    !seq_io_rd(_ch) ? ( seq_srz_u = 0; _sn_nb = _sn_b; loop(SEQ_LANES * SEQ_STEPS * SEQ_CHORD_N, _sn_nb[0] > 0 ? seq_srz_u += 1; _sn_nb += SEQ_NOTE_F; ); );
+    seq_srz_u = seq_io_var(seq_srz_u, _ch);
+    _sn_n = seq_srz_u | 0;
+    _sn_n < 0 || _sn_n > SEQ_LANES * SEQ_STEPS * SEQ_CHORD_N ? _sn_ok = 0 : (
+      !seq_io_rd(_ch) ? (
+        _sn_k = 0;
+        loop(SEQ_LANES * SEQ_STEPS * SEQ_CHORD_N,
+          _sn_nb = _sn_b + _sn_k * SEQ_NOTE_F;
+          _sn_nb[0] > 0 ? (
+            _sn_l = floor(_sn_k / (SEQ_STEPS * SEQ_CHORD_N)); _sn_s = floor(_sn_k / SEQ_CHORD_N) - _sn_l * SEQ_STEPS;
+            seq_srz_a = _sn_l + 16 * _sn_s + 1024 * ((_sn_nb[0] | 0) - 1);
+            seq_srz_b = max(1, min(127, _sn_nb[1] | 0)) + 128 * (_sn_nb[2] | 0);
+            seq_srz_a = seq_io_var(seq_srz_a, _ch); seq_srz_b = seq_io_var(seq_srz_b, _ch);
+          );
+          _sn_k += 1;
+        );
+      ) : (
+        loop(_sn_n,
+          seq_srz_a = seq_io_var(seq_srz_a, _ch); seq_srz_b = seq_io_var(seq_srz_b, _ch);
+          _sn_a = max(0, seq_srz_a | 0); _sn_w = max(0, seq_srz_b | 0);
+          _sn_b >= 0 ? (
+            _sn_l = _sn_a % 16; _sn_s = floor(_sn_a / 16) % 64; _sn_q = floor(_sn_a / 1024);
+            _sn_nb = seq_note_at(_sn_p, _sn_l, _sn_s); _sn_k = 0;
+            loop(SEQ_CHORD_N, _sn_k >= 0 && _sn_nb[0] == 0 ? ( _sn_k = -1; ) : ( _sn_k >= 0 ? ( _sn_nb += SEQ_NOTE_F; _sn_k += 1; ); ); );
+            _sn_k < 0 && _sn_q <= 127 ? (
+              _sn_nb[1] = max(1, min(127, _sn_w % 128)); _sn_nb[2] = max(128, min(256 * 128 + 100, floor(_sn_w / 128)));
+              _sn_nb[0] = _sn_q + 1;
+            );
+          );
+        );
+      );
+    );
+    _sn_p += 1;
+  );
+  _sn_ok;
+);
+// ─── Round two H (2026-10-21): each pattern's own NAME and COLOUR, and the COUNT of patterns on show (META, 5) ───
+// The user: "the chips that indicate which pattern we have selected, can those be color-coded as well? ... it did not
+// show all the patterns at once. It allowed for there to be room until more patterns were created." A pattern keeps
+// its own name (16 chars) and colour (packed RGB, 0 = none: the chip takes a hue from its number) in the META block,
+// written as its own tag: the project file and a kit's record both carry it, and a build before this skips the tag
+// by its length. The COUNT (seq_npat: the chips on show, 1..32; "+" adds one, DUP raises it, SONG on follows the
+// regions) is SETTINGS cell 26 in the project; a kit's record has no settings, so after a kit lands the count is
+// raised to show every used pattern (seq_npat_fix; the same for an older project's stream, which has no count). The
+// face owns seq_npat and the meta; the engine reads the count for the trigger range only (a note past it does
+// nothing, the user's choice).
+SEQ_META_F   = 17;      // a pattern's record: +0 colour (packed RGB, 0 none), +1..16 the name's chars, 0-terminated
+SEQ_NAME_LEN = 16;
+SEQ_SRZ_TAG_META = 5;
+seq_npat = 1;           // the patterns on show: a fresh sequencer shows one and "+"
+seq_meta = 0;
+function seq_meta_init(_mi_base) ( seq_meta = _mi_base; memset(seq_meta, 0, SEQ_PATS * SEQ_META_F); );
+function seq_meta_clear_all() ( seq_meta ? memset(seq_meta, 0, SEQ_PATS * SEQ_META_F); );
+function seq_meta_col(_mc_p) ( seq_meta[max(0, min(SEQ_PATS - 1, _mc_p | 0)) * SEQ_META_F] | 0; );
+function seq_meta_col_set(_ms_p, _ms_c) ( seq_meta[max(0, min(SEQ_PATS - 1, _ms_p | 0)) * SEQ_META_F] = max(0, min(16777215, _ms_c | 0)); );
+function seq_meta_has_name(_mh_p) ( seq_meta[max(0, min(SEQ_PATS - 1, _mh_p | 0)) * SEQ_META_F + 1] >= 32; );
+// the name into #seq_meta_str (the caller copies it out); returns its length
+function seq_meta_name(_mn_p) local(_mn_b, _mn_k, _mn_c) (
+  _mn_b = seq_meta + max(0, min(SEQ_PATS - 1, _mn_p | 0)) * SEQ_META_F + 1;
+  strcpy(#seq_meta_str, ""); _mn_k = 0; _mn_c = _mn_b[0] | 0;
+  while(_mn_k < SEQ_NAME_LEN && _mn_c >= 32 && _mn_c < 127) (
+    sprintf(#seq_meta_c, "%c", _mn_c); strcat(#seq_meta_str, #seq_meta_c);
+    _mn_k += 1; _mn_c = _mn_k < SEQ_NAME_LEN ? _mn_b[_mn_k] | 0 : 0;
+  );
+  _mn_k;
+);
+function seq_meta_name_set(_ns_p, _ns_str) local(_ns_b, _ns_k, _ns_n, _ns_c) (
+  _ns_b = seq_meta + max(0, min(SEQ_PATS - 1, _ns_p | 0)) * SEQ_META_F + 1;
+  _ns_n = min(SEQ_NAME_LEN, strlen(_ns_str)); _ns_k = 0;
+  loop(SEQ_NAME_LEN, _ns_c = _ns_k < _ns_n ? str_getchar(_ns_str, _ns_k) : 0; _ns_b[_ns_k] = (_ns_c >= 32 && _ns_c < 127) ? _ns_c : 0; _ns_k += 1; );
+);
+function seq_meta_clear(_mx_p) ( memset(seq_meta + max(0, min(SEQ_PATS - 1, _mx_p | 0)) * SEQ_META_F, 0, SEQ_META_F); );
+// the last used pattern + 1 (0 = none)
+function seq_npat_used() local(_nu_p, _nu_u) (
+  _nu_u = 0; _nu_p = 0; loop(SEQ_PATS, seq_pat_used(_nu_p) ? _nu_u = _nu_p + 1; _nu_p += 1; );
+  _nu_u;
+);
+// the count after a project read (@serialize, which restores the face's words the same way): never below one, never
+// below the last used pattern
+function seq_npat_fix() ( seq_npat = max(1, min(SEQ_PATS, max(seq_npat | 0, seq_npat_used()))); );
+// a kit landed (@block): @block never writes seq_npat (the face's word, written every frame); it posts the count the kit's
+// patterns want -- the value first, the sequence number bumped LAST -- and the face raises its count to it once
+seq_npat_req_v = 0; seq_npat_req_n = 0;
+function seq_npat_post() ( seq_npat_req_v = seq_npat_used(); seq_npat_req_n += 1; );
+function seq_srz_count_meta() ( 1 + SEQ_PATS * SEQ_META_F; );
+// the META block, both directions: the record count, then the records; a read clamps every cell to its kind
+function seq_srz_meta(_ch) local(_sm_ok, _sm_k, _sm_v, seq_srz_n) (
+  seq_srz_n = SEQ_PATS; seq_srz_n = seq_io_var(seq_srz_n, _ch);
+  _sm_ok = (seq_srz_n | 0) >= 0 && (seq_srz_n | 0) <= SEQ_PATS;
+  _sm_ok ? seq_io_mem(seq_meta, (seq_srz_n | 0) * SEQ_META_F, _ch);
+  seq_io_rd(_ch) ? (
+    _sm_k = 0;
+    loop(SEQ_PATS * SEQ_META_F,
+      _sm_v = seq_meta[_sm_k] | 0;
+      seq_meta[_sm_k] = (_sm_k % SEQ_META_F) == 0 ? max(0, min(16777215, _sm_v)) : ((_sm_v >= 32 && _sm_v < 127) ? _sm_v : 0);
+      _sm_k += 1;
+    );
+  );
+  _sm_ok;
+);
+// The lanes' mute and solo from one pattern's legacy fields 4 / 5 (an older file; the timing rig's passes too).
+function seq_gms_migrate(_gm_p) local(_gm_l, _gm_lb) (
+  seq_gmute = 0; seq_gsolo = 0; _gm_p = max(0, min(SEQ_PATS - 1, _gm_p | 0));
+  _gm_l = 0; loop(SEQ_LANES, _gm_lb = seq_lane_at(_gm_p, _gm_l); _gm_lb[4] ? seq_gmute += 2 ^ _gm_l; _gm_lb[5] ? seq_gsolo += 2 ^ _gm_l; _gm_l += 1; );
+);
+// The tagged stream, both directions, on the channel seq_io_mode names: the tags from _st_from on (0 SETTINGS, 1 SONG,
+// 2 PATTERNS, 3 NOTES, 4 META). The project file writes all four; a kit's record (S3c) starts at 1 -- a kit carries no settings
+// (the options, the lanes' mute and solo, the view are the project's). Returns 1 when every count met its bound.
+function seq_srz_tagged(_st_from, _ch) local(_ss_k, _ss_nt, _ss_tag, _ss_len, _ss_ok, seq_srz_len, seq_srz_n, seq_srz_tag) (
+  seq_srz_n = 5 - _st_from; seq_srz_n = seq_io_var(seq_srz_n, _ch);
+  _ss_nt = seq_srz_n | 0; _ss_ok = _ss_nt >= 0 && _ss_nt <= SEQ_SRZ_TAGS_MAX;
+  _ss_k = 0;
+  while(_ss_ok && _ss_k < _ss_nt) (
+    !seq_io_rd(_ch) ? (
+      seq_srz_tag = (_st_from + _ss_k) == 0 ? SEQ_SRZ_TAG_SET : (_st_from + _ss_k) == 1 ? SEQ_SRZ_TAG_SONG : (_st_from + _ss_k) == 2 ? SEQ_SRZ_TAG_PATS : (_st_from + _ss_k) == 3 ? SEQ_SRZ_TAG_NOTES : SEQ_SRZ_TAG_META;
+      seq_srz_len = seq_srz_tag == SEQ_SRZ_TAG_SET ? SEQ_SRZ_SET_N
+                  : seq_srz_tag == SEQ_SRZ_TAG_SONG ? 4 + SEQ_SONG_MAX * 2
+                  : seq_srz_tag == SEQ_SRZ_TAG_PATS ? seq_srz_count_pats()
+                  : seq_srz_tag == SEQ_SRZ_TAG_NOTES ? seq_srz_count_notes() : seq_srz_count_meta();
+    );
+    seq_srz_tag = seq_io_var(seq_srz_tag, _ch); seq_srz_len = seq_io_var(seq_srz_len, _ch);
+    _ss_tag = seq_srz_tag | 0; _ss_len = seq_srz_len | 0;
+    _ss_len < 0 || _ss_len > SEQ_SRZ_LEN_MAX ? _ss_ok = 0 : (
+      _ss_tag == SEQ_SRZ_TAG_SET ? seq_srz_settings(_ss_len, _ch)
+      : _ss_tag == SEQ_SRZ_TAG_SONG ? _ss_ok = seq_srz_song(_ch)
+      : _ss_tag == SEQ_SRZ_TAG_PATS ? _ss_ok = seq_srz_pats(_ch)
+      : _ss_tag == SEQ_SRZ_TAG_NOTES ? _ss_ok = seq_srz_notes(_ch)
+      : _ss_tag == SEQ_SRZ_TAG_META ? _ss_ok = seq_srz_meta(_ch)
+      : seq_srz_skip(_ss_len, _ch);   // a tag this build does not know: a later build's; skipped whole
+    );
+    _ss_k += 1;
+  );
+  _ss_ok;
+);
+// The stream's size in cells from tag _sc_from on: the count word, then each tag's two words and its body.
+function seq_srz_count_all(_sc_from) local(_sc_n) (
+  _sc_n = 1;
+  _sc_from <= 0 ? _sc_n += 2 + SEQ_SRZ_SET_N;
+  _sc_from <= 1 ? _sc_n += 2 + 4 + SEQ_SONG_MAX * 2;
+  _sc_from <= 2 ? _sc_n += 2 + seq_srz_count_pats();
+  _sc_from <= 3 ? _sc_n += 2 + seq_srz_count_notes();
+  _sc_from <= 4 ? _sc_n += 2 + seq_srz_count_meta();
+  _sc_n;
+);
+function seq_serialize() local(_ss_ok) (
+  seq_io[0] = 0; seq_io[4] = is_read ? 1 : 0;   // channel 0: the project file, @serialize's alone
+  is_read ? ( seq_clear_all(); seq_meta_clear_all(); seq_npat = 1; seq_ui_undo_wait = 0; );   // whatever the stream does not carry is empty, never the
+                                                        // previous project's; and a read IS the state REAPER wants (an
+                                                        // undo, a load): a point still pending for an edit before it
+                                                        // would capture this state and drop the redo history (self-audit
+                                                        // 2026-10-20 finding 9)
+  is_read && ser_ver < 79 ? (
+    seq_srz_body78(0);
+    seq_srz_convert_78();
+  ) : (
+    _ss_ok = seq_srz_tagged(0, 0);
+    is_read && !_ss_ok ? seq_srz_bad = 1;
+    is_read ? seq_npat_fix();   // round two H: an older stream has no count; never below the last used pattern
+  );
+  // An older file kept mute and solo per PATTERN (lane fields 4 / 5): the pattern it opens on gives the lanes theirs, the
+  // way the user last heard it (the polish pass, 2026-10-20: "if the pattern changes the solos and mute changes").
+  is_read && !seq_gms_srz ? seq_gms_migrate(seq_cur);
+);
+
+// ─── S3c: the patterns in a kit file (Spec_Swing_Seq_View decision 23, the plan's S3c; 2026-10-20) ─────────────────
+// A whole-kit SAVE publishes the tagged stream from tag 1 (SONG, PATTERNS, NOTES -- no settings) into the EON_SEQ_KIT
+// band and the bridge packs it as the kit file's tail record 7 (eon_seq_pack); a whole-kit LOAD stages it back
+// (eon_seq_stage) and the plugin adopts it. The band: +0 the bridge's staged flag (written last, cleared on adopt),
+// +1 the record's version, +2 the cells the publisher wrote (0 = no record: an empty sequencer or a bank-only save;
+// -1 = refused, too big for the band: the kit is saved without, the face says so), +3 the overflow in cells when
+// refused, +8.. the cells. One band for every instance: the kit bus's LOCK serializes a save and a load, the KMAC_KIT
+// discipline. Both ends run in @block, the walk's thread (the patterns are its): seq_kit_pub_req (the export's state
+// 11 asks by bumping it, with seq_kit_pub_only the kind; state 12 hands the bus over once seq_kit_pub_ack, @block's
+// own cell, meets it -- one writer a cell) and seq_kit_adopt_req (the import's bank A pass, @block's) are the
+// requests the host's @block answers right before the walk; rk_swing_ui_state is imported before this file.
+seq_kit_pub_req = 0; seq_kit_pub_ack = 0; seq_kit_pub_only = 0;   // the request counter (@gfx's), its ack (@block's), the kind
+seq_kit_adopt_req = 0;                                           // @block's alone (the import tick asks, the host answers)
+seq_kit_last = 0; seq_kit_over = 0;   // the last publish: cells written, 0 none, -1 refused (seq_kit_over cells too many)
+seq_kit_pubs = 0;                     // bumped per publish: the face says when one was refused
+seq_kit_last_only = 0;                // the kind of the last publish (1 = a bank-only save or a bank pass: no record)
+seq_kit_adopted = 0;                  // bumped per adopt: the face says so and makes the undo point
+function seq_any_used() local(_au_p, _au_u) (
+  _au_u = seq_song_len > 0 ? 1 : 0; _au_p = 0;
+  loop(SEQ_PATS, !_au_u && seq_pat_used(_au_p) ? _au_u = 1; _au_p += 1; );
+  _au_u;
+);
+// The patterns and the song back to empty: a kit's record arrives into a clean slate; the settings stay the project's.
+function seq_kit_clear() local(_kc_p) (
+  _kc_p = 0; loop(SEQ_PATS, seq_clear_pattern(_kc_p); _kc_p += 1; );
+  seq_meta_clear_all();   // round two H: the names and colours are the kit's too
+  memset(seq_song, 0, SEQ_SONG_MAX * 2);
+  seq_song_len = 0; seq_song_loop = 0; seq_song_pos = 0;
+  seq_cur = 0;   // (the page: the face clamps it to the pattern on screen)
+);
+// The publish (@block, the block after the export's state 11 asks): _kp_only = a bank-only save or a bank pass of the
+// whole-kit walk, which carry no patterns (the walk's final pass is bank A's: that one carries them).
+function seq_kit_publish() local(_kp_n, _kp_w, _kp_b, _kp_only) (
+  _kp_only = seq_kit_pub_only; seq_kit_last_only = _kp_only;
+  gmem[EON_SEQ_KIT_BASE + 1] = 1; gmem[EON_SEQ_KIT_BASE + 3] = 0; seq_kit_over = 0;
+  _kp_only || !seq_any_used() ? ( gmem[EON_SEQ_KIT_BASE + 2] = 0; seq_kit_last = 0; ) : (
+    _kp_n = seq_srz_count_all(1);
+    _kp_n > EON_SEQ_KIT_CAP ? (
+      gmem[EON_SEQ_KIT_BASE + 2] = -1; gmem[EON_SEQ_KIT_BASE + 3] = _kp_n - EON_SEQ_KIT_CAP;
+      seq_kit_last = -1; seq_kit_over = _kp_n - EON_SEQ_KIT_CAP;
+    ) : (
+      _kp_b = seq_io + SEQ_IO_F;   // channel 1: the band, written
+      _kp_b[0] = 1; _kp_b[1] = EON_SEQ_KIT_BASE + 8; _kp_b[2] = EON_SEQ_KIT_BASE + 8 + EON_SEQ_KIT_CAP; _kp_b[3] = 0; _kp_b[4] = 0;
+      seq_srz_tagged(1, 1);
+      _kp_w = _kp_b[1] - (EON_SEQ_KIT_BASE + 8);
+      _kp_b[3] || _kp_w != _kp_n ? (   // the count and the write disagree: refused rather than a short record
+        gmem[EON_SEQ_KIT_BASE + 2] = -1; gmem[EON_SEQ_KIT_BASE + 3] = max(1, _kp_w - EON_SEQ_KIT_CAP);
+        seq_kit_last = -1; seq_kit_over = max(1, _kp_w - EON_SEQ_KIT_CAP);
+      ) : ( gmem[EON_SEQ_KIT_BASE + 2] = _kp_w; seq_kit_last = _kp_w; );
+    );
+  );
+  seq_kit_pubs += 1;
+  seq_kit_pub_ack = seq_kit_pub_req;   // LAST: the export's state 12 hands the bus to the bridge once the ack meets the request
+);
+// The adopt (@block, right before the walk; asked by the import's bank A pass of a whole-kit load, never by a preserve
+// reload or a bank pass): the staged record replaces the patterns and the song; no record (an older kit, a kit saved
+// with an empty sequencer) leaves them alone.
+function seq_kit_adopt() local(_ka_n, _ka_ok, _ka_l, _ka_b) (
+  seq_kit_adopt_req = 0;
+  gmem[EON_SEQ_KIT_BASE] > 0.5 ? (
+    gmem[EON_SEQ_KIT_BASE] = 0;
+    _ka_n = gmem[EON_SEQ_KIT_BASE + 2] | 0;
+    gmem[EON_SEQ_KIT_BASE + 1] >= 1 && _ka_n > 0 && _ka_n <= EON_SEQ_KIT_CAP ? (
+      seq_kit_clear();
+      _ka_b = seq_io + SEQ_IO_F;   // channel 1: the band, read
+      _ka_b[0] = 2; _ka_b[1] = EON_SEQ_KIT_BASE + 8; _ka_b[2] = EON_SEQ_KIT_BASE + 8 + _ka_n; _ka_b[3] = 0; _ka_b[4] = 1;
+      _ka_ok = seq_srz_tagged(1, 1);
+      seq_npat_post();   // round two H: a kit's record has no count; the face raises it to every used pattern (a request: one writer per word)
+      !_ka_ok || _ka_b[3] ? seq_srz_bad = 1;   // the diagnostic flag: a count past its bound, or the record short
+      _ka_l = 0; loop(SEQ_LANES, seq_wk_reset(_ka_l); _ka_l += 1; );   // the walkers start the new patterns afresh
+      seq_kit_adopted += 1;
+      mark_dirty();
+    );
+  );
+);
