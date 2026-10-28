@@ -4,17 +4,18 @@
 -- 1520-1610, 3095-3160):
 --   * Dark theme: 0x111111 window, 0x333333 frame, accent for tab-selected.
 --   * Window/frame/grab rounding 12/6/12 for premium feel.
---   * Header row: red "EON" + white "DRUM MATRIX" + version, close button top-right.
---   * Tab bar (Display / Paint / Pattern / Tools / Patterns / Pads).
---   * Footer with Reset All button.
+--   * Header row: red "EON" + white "DRUM MATRIX" + version.
+--   * Tab bar (Display / Paint / Pattern / Tools / Patterns / Pads / Keys).
+--   * Footer with Reset All + Close buttons.
 --   * Save-on-change: every widget writes through settings.Set immediately.
 --   * Right-click any control -> "Reset to default" context menu item.
 --   * Tooltips on every control via SetItemTooltip + settings.GetDoc(key).
 --
 -- API:
---   M.Draw(ctx)  -- call inside MainLoop each frame WHEN settings.IsWindowOpen()
---                   returns. The function handles its own Begin/End and the
---                   close button. Returns true if the window was visible.
+--   M.Draw(ctx, overlay_bounds)  -- call inside MainLoop each frame. Returns
+--                   false at once while settings.IsWindowOpen() is false;
+--                   otherwise handles its own Begin/End, the Close button and
+--                   the title-bar X, and returns the window's open flag.
 
 local M = {}
 
@@ -38,19 +39,26 @@ local r = reaper
 -- Keys tab: the action id currently armed for rebind capture (nil = none).
 local _rebind_arm = nil
 
--- True while the Keys tab is waiting to capture a rebind keypress. The main
--- overlay reads this to suppress its own shortcut dispatch so the captured key
--- doesn't also trigger an action mid-rebind.
-function M.IsCapturingKey() return _rebind_arm ~= nil end
-
 -- Drawn to the customer in the settings header (see the header block below).
 -- Drum Matrix versions independently of Swing — it is its own SKU — so this
 -- does NOT track the Swing product version. It was '0.x' up to here, which
 -- read as an unfinished placeholder inside a shipping product.
 local SCRIPT_VERSION = '1.0'
 
--- Currently selected tab (1..6). Defaults to Display.
+-- Currently selected tab (1..7). Defaults to Display.
 local active_tab = 1
+local TAB_KEYS = 7
+
+-- True while the Keys tab is waiting to capture a rebind keypress. The main
+-- overlay reads this to suppress its own shortcut dispatch so the captured key
+-- doesn't also trigger an action mid-rebind. Only while the Keys tab is on
+-- screen (DM212, 2026-10-26): a Rebind left armed used to survive Close, the
+-- title X, the cog toggle and a tab switch -- draw_keys_tab, the only place
+-- that cleared it, no longer ran -- and the overlay ignored every shortcut
+-- until the user found the Keys tab again. Draw below also disarms it then.
+function M.IsCapturingKey()
+  return _rebind_arm ~= nil and active_tab == TAB_KEYS and settings.IsWindowOpen()
+end
 
 -- Last full-kit `group` stamped per genre, so "Full Kit" reroll avoids an
 -- immediate repeat. Frame-persistent (module scope), not saved to disk.
@@ -266,7 +274,10 @@ local function draw_tools_tab(ctx)
   r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonHovered(), 0x882222FF)
   r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonActive(),  0xAA3333FF)
   if r.ImGui_Button(ctx, 'Clear ALL lanes', 200, 0) then
-    if r.ShowMessageBox('Delete every note across all 16 drum lanes?\nThis can be undone with Ctrl+Z.',
+    -- The count is the kit's, not a fixed 16 (DM227): a stereo grid is one lane, a parallel set is 32.
+    local n_lanes = #lanes
+    if r.ShowMessageBox(string.format('Delete every note across all %d drum lane%s?\nThis can be undone with Ctrl+Z.',
+                                      n_lanes, n_lanes == 1 and '' or 's'),
                         'EON Drum Matrix', 4) == 6 then
       lane_tools.ClearAllLanes()
     end
@@ -376,8 +387,11 @@ local function draw_pads_tab(ctx)
   end
   r.ImGui_Separator(ctx)
 
-  r.ImGui_BeginTable(ctx, 'pads_table', 4,
-    r.ImGui_TableFlags_BordersInnerH() | r.ImGui_TableFlags_SizingFixedFit())
+  -- BeginTable's result gates the body, as the Keys tab's does (DM228, 2026-10-26): with the window shrunk to
+  -- its minimum the tab body is clipped, BeginTable returns false, and TableSetupColumn then asserted every
+  -- frame -- the pcall around the frame caught it with Begin, the child and the style stacks unpopped.
+  if r.ImGui_BeginTable(ctx, 'pads_table', 4,
+      r.ImGui_TableFlags_BordersInnerH() | r.ImGui_TableFlags_SizingFixedFit()) then
   r.ImGui_TableSetupColumn(ctx, 'Pad',      r.ImGui_TableColumnFlags_WidthFixed(),   32)
   r.ImGui_TableSetupColumn(ctx, 'Name',     r.ImGui_TableColumnFlags_WidthStretch())
   r.ImGui_TableSetupColumn(ctx, 'Category', r.ImGui_TableColumnFlags_WidthFixed(),  120)
@@ -429,6 +443,7 @@ local function draw_pads_tab(ctx)
     r.ImGui_PopID(ctx)
   end
   r.ImGui_EndTable(ctx)
+  end
 
   r.ImGui_Separator(ctx)
   r.ImGui_TextDisabled(ctx, 'Display reorder coming in a later phase — for now lanes follow REAPER track order.')
@@ -546,7 +561,7 @@ end
 -- =============================================================================
 
 function M.Draw(ctx, overlay_bounds)
-  if not settings.IsWindowOpen() then _hovered = false; return false end
+  if not settings.IsWindowOpen() then _hovered = false; _rebind_arm = nil; return false end
 
   -- Apply any deferred ResetAll from the previous frame BEFORE drawing this
   -- frame's widgets so every slider this frame reads consistent values.
@@ -732,10 +747,12 @@ function M.Draw(ctx, overlay_bounds)
       if r.ImGui_BeginTabItem(ctx, 'Tools')    then active_tab = 4; r.ImGui_EndTabItem(ctx) end
       if r.ImGui_BeginTabItem(ctx, 'Patterns') then active_tab = 5; r.ImGui_EndTabItem(ctx) end
       if r.ImGui_BeginTabItem(ctx, 'Pads')     then active_tab = 6; r.ImGui_EndTabItem(ctx) end
-      if r.ImGui_BeginTabItem(ctx, 'Keys')     then active_tab = 7; r.ImGui_EndTabItem(ctx) end
+      if r.ImGui_BeginTabItem(ctx, 'Keys')     then active_tab = TAB_KEYS; r.ImGui_EndTabItem(ctx) end
       r.ImGui_EndTabBar(ctx)
     end
     r.ImGui_PopStyleColor(ctx, 3)
+    -- Leaving the Keys tab disarms a pending Rebind (DM212); so does closing the window (top of Draw).
+    if active_tab ~= TAB_KEYS then _rebind_arm = nil end
 
     r.ImGui_Separator(ctx)
 
@@ -777,6 +794,7 @@ function M.Draw(ctx, overlay_bounds)
 
   -- Window title-bar close (the 'X') sets open=false; mirror it to our state.
   if not open then settings.SetWindowOpen(false) end
+  if not settings.IsWindowOpen() then _rebind_arm = nil end   -- Close / the X / the cog toggle (DM212)
 
   return open
 end

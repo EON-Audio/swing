@@ -114,8 +114,11 @@ local function follow(tr)
   end
   if empty then
     -- TrackFX_Show needs a real index; the stock action opens an empty
-    -- chain for the last-touched track — which a click-selection just made
-    -- this one.
+    -- chain for the last-touched track. A click-selection makes that this
+    -- track, a script's SetOnlyTrackSelected does NOT (a Drum Matrix lane
+    -- picked from its overlay) -- so make it last-touched first, or another
+    -- track's chain opens and the follower exits next tick (sweep SCR12).
+    reaper.Main_OnCommand(40914, 0)          -- Track: set first selected track as last touched track
     reaper.Main_OnCommand(40291, 0)          -- View: show FX chain for last touched track
   else
     reaper.TrackFX_Show(tr, disp, 1)
@@ -155,7 +158,12 @@ local function loop()
   -- the other panes do. (Hidden-behind-another-tab is NOT closed — see below.)
   local shown = track_alive(last_tr) and chain_hwnd(last_tr) or nil
   if last_tr and not track_alive(last_tr) then
+    -- The followed track is gone (deleted, or its project tab left): there is
+    -- no chain to read, so follow() could never run again and the follower
+    -- sat alive but dormant for good. Re-bootstrap: the next selection opens
+    -- a chain again (sweep SCR13).
     last_tr, last_guid = nil, nil
+    opened_once = false
   elseif last_tr and not shown then
     reaper.SetExtState(EXT, "alive", "0", false)
     return

@@ -12,9 +12,10 @@
 //   2 OUT     every pad's output bus, for multi-out routing at a glance
 //   3 LAYERS  velocity layers / round-robin, which are invisible on the pad face
 //
-// MACROS is deliberately NOT a chip yet: the macro system is unbuilt, so the
-// panel would have nothing to show. Adding it later is one mode branch in
-// swing_kdd_panel plus one swing_kdd_chip call — see KDD_MODE_* below.
+// MACROS is NOT a chip: the kit macros have their own editor
+// (rk_swing_ui_macroed) and no MACROS panel is built here. Adding one is one
+// mode branch in swing_kdd_panel plus one swing_kdd_chip call — see
+// KDD_MODE_* below.
 //
 // The panels are REFERENCE readouts, not live meters, so they stay closed by
 // default and the KIT tab keeps the kit name, the project tempo and the last
@@ -62,6 +63,12 @@ function swing_chgmap_init(_mem)
   chgmap_n_chg = 0; chgmap_n_lock = 0; chgmap_n_custom = 0;
   chgmap_n_nomatch = 0; chgmap_surplus = 0;
   chgmap_stamp = 0;
+  // Nothing clears a registry slot's band when its Swing goes, so a Swing that claims a reused
+  // slot read the previous occupant's kit operation for up to 15 min (LIB227): a band stamped
+  // before this instance's @init (one-shot under ext_noinit) is not its own.
+  chgmap_t0 = time_precise();
+  // (chgmap_bank, the bank on screen when the snapshot was taken, is latched by the read: the codes
+  //  carry no bank, LIB229; it starts at 0 as every global does)
   kdd_hover = -1;
   kdd_open = KDD_MODE_NONE;     // no panel until asked for
   kdd_px = 0; kdd_py = 0;       // panel anchor, handed from input to paint
@@ -91,7 +98,7 @@ function swing_chgmap_read() local(_b, _s0, _s1, _i)
       _i += 1;
     );
     _s1 = gmem[_b + CHGMAP_OFF_SEQ];
-    _s1 == _s0 ? chgmap_seq_seen = _s0;   // commit only on a clean read
+    _s1 == _s0 ? ( chgmap_seq_seen = _s0; chgmap_bank = bank_cur; );   // commit only on a clean read; the bank on screen (LIB229)
   );
 );
 
@@ -102,6 +109,7 @@ function swing_chgmap_live()
 (
   chgmap_op > 0
     && gmem[KIT_GMEM_BRIDGE_ALIVE] > 0
+    && chgmap_stamp >= chgmap_t0   // stamped in THIS instance's lifetime, not a slot's previous occupant's (LIB227)
     && (time_precise() - chgmap_stamp) < CHGMAP_EXPIRE_S;
 );
 
@@ -248,7 +256,7 @@ local(_live, _bx, _by, _bh, _tw, _th, _in_panel, _nw, _nh, _uw, _uh,
   // ── Chip row, chained right-to-left along the name row ──
   // Laid out FIRST so the tempo below knows where the row starts and can bow
   // out rather than sliding underneath it on a long kit name.
-  _bh = 16;
+  _bh = swing_px(16);   // the chips scale with their swing_fs(9) text (LIB228)
   _by = _cy + 2;
   _bx = swing_kdd_chip(kdd_open == KDD_MODE_LAYERS ? "LAYERS ▴" : "LAYERS ▾",
                        _cx + _cw - 8, _by, _bh, KDD_MODE_LAYERS) - 4;
@@ -263,7 +271,7 @@ local(_live, _bx, _by, _bh, _tw, _th, _in_panel, _nw, _nh, _uw, _uh,
   // the font the NAME was drawn in — swing_lcd_draw_kit uses Arial 11 bold — or
   // it would land on top of a longer name. Dropped entirely when the name has
   // eaten the row: overlapping the chips is worse than not showing the tempo.
-  rk_font(1, swing_fs(11), 'b');
+  rk_font(1, 11, 'b');   // the size the name IS drawn at (rk_swing_lcd: fixed 11); measured at swing_fs(11) the tempo shifted right and dropped early in a big window (LIB228)
   gfx_measurestr(strlen(#kit_name) > 0 ? #kit_name : "Untitled Kit", _nw, _nh);
   sprintf(#_kdd_bpm, "%.4g", tempo);
   rk_font(1, swing_fs(15), 'b');
@@ -325,7 +333,7 @@ local(_live, _bx, _by, _bh, _tw, _th, _in_panel, _nw, _nh, _uw, _uh,
     chgmap_n_lock   > 0 ? sprintf(#_chg_hd, "%s, %d locked", #_chg_hd, chgmap_n_lock);
     chgmap_n_custom > 0 ? sprintf(#_chg_hd, "%s, %d yours", #_chg_hd, chgmap_n_custom);
     gfx_set(lcd_bar_tx_r, lcd_bar_tx_g, lcd_bar_tx_b, 1);
-    gfx_x = _cx + 6; gfx_y = _cy + 26; gfx_drawstr(#_chg_hd);
+    gfx_x = _cx + 6; gfx_y = _cy + swing_px(26); gfx_drawstr(#_chg_hd);   // rows scale with their text (LIB228)
 
     strcpy(#_chg_sub, "");
     chgmap_n_nomatch > 0 ?
@@ -337,14 +345,14 @@ local(_live, _bx, _by, _bh, _tw, _th, _in_panel, _nw, _nh, _uw, _uh,
     strlen(#_chg_sub) > 0 ? (
       rk_font(1, swing_fs(9), 0);
       gfx_set(lcd_bar_tx_r * 0.62, lcd_bar_tx_g * 0.62, lcd_bar_tx_b * 0.62, 1);
-      gfx_x = _cx + 6; gfx_y = _cy + 40; gfx_drawstr(#_chg_sub);
+      gfx_x = _cx + 6; gfx_y = _cy + swing_px(40); gfx_drawstr(#_chg_sub);
     );
   ) : (
     // Idle text has to read on its own — it is no longer a caption sitting next
     // to a visible grid.
     rk_font(1, swing_fs(9), 0);
     gfx_set(lcd_bar_tx_r * 0.45, lcd_bar_tx_g * 0.45, lcd_bar_tx_b * 0.45, 1);
-    gfx_x = _cx + 6; gfx_y = _cy + 26; gfx_drawstr("No recent kit change");
+    gfx_x = _cx + 6; gfx_y = _cy + swing_px(26); gfx_drawstr("No recent kit change");
   );
 
   // ── Open-panel input ──
@@ -445,7 +453,7 @@ local(_px, _py, _gx, _gy, _lx, _ly, _row, _col, _pad, _x, _y,
 
       // Fill + cell text, per mode.
       _mode == KDD_MODE_NOTES ? (
-        _code = _live ? chgmap_codes[_pad] : 0;
+        _code = _live && chgmap_bank == bank_cur ? chgmap_codes[_pad] : 0;   // the codes describe the bank they were taken on (LIB229)
         _filled = swing_chgmap_cell_col(_code);
         swing_chgmap_note(#_chg_nn, p_note[_pad_s]);
       ) : _mode == KDD_MODE_OUT ? (
@@ -513,10 +521,10 @@ local(_px, _py, _gx, _gy, _lx, _ly, _row, _col, _pad, _x, _y,
   _ly = _gy;
   _mode == KDD_MODE_NOTES ? (
     swing_kdd_legend(_lx, _ly,      0,  1, "changed");
-    swing_kdd_legend(_lx, _ly + 14, 0,  3, "locked");
-    swing_kdd_legend(_lx, _ly + 28, 0,  4, "your sample");
-    swing_kdd_legend(_lx, _ly + 42, 0,  6, "synth pad");
-    swing_kdd_legend(_lx, _ly + 56, 0, -1, "no match");
+    swing_kdd_legend(_lx, _ly + swing_px(14), 0,  3, "locked");
+    swing_kdd_legend(_lx, _ly + swing_px(28), 0,  4, "your sample");
+    swing_kdd_legend(_lx, _ly + swing_px(42), 0,  6, "synth pad");
+    swing_kdd_legend(_lx, _ly + swing_px(56), 0, -1, "no match");
   ) : _mode == KDD_MODE_OUT ? (
     // Only the buses this kit actually uses — a fixed 1..16 key would be
     // fifteen rows of nothing on a stereo kit, and only five fit anyway.
@@ -548,9 +556,9 @@ local(_px, _py, _gx, _gy, _lx, _ly, _row, _col, _pad, _x, _y,
     );
   ) : (
     swing_kdd_legend(_lx, _ly,      2,  1, "vel\x2Dsplit");
-    swing_kdd_legend(_lx, _ly + 14, 2,  2, "round\x2Drobin");
-    swing_kdd_legend(_lx, _ly + 28, 2,  3, "sum");
-    swing_kdd_legend(_lx, _ly + 42, 2, -1, "single sample");
+    swing_kdd_legend(_lx, _ly + swing_px(14), 2,  2, "round\x2Drobin");
+    swing_kdd_legend(_lx, _ly + swing_px(28), 2,  3, "sum");
+    swing_kdd_legend(_lx, _ly + swing_px(42), 2, -1, "single sample");
   );
 
   // ── Hover detail ──
@@ -565,7 +573,7 @@ local(_px, _py, _gx, _gy, _lx, _ly, _row, _col, _pad, _x, _y,
     _n >= 0 ? eon_catname(#_chg_cat, _n) : strcpy(#_chg_cat, "");
 
     _mode == KDD_MODE_NOTES ? (
-      _code = _live ? chgmap_codes[kdd_hover] : 0;
+      _code = _live && chgmap_bank == bank_cur ? chgmap_codes[kdd_hover] : 0;   // (LIB229)
       swing_chgmap_note(#_chg_nn, p_note[swing_bp(kdd_hover)]);
       swing_chgmap_reason(#_chg_rs, _code);
       strlen(#_chg_cat) > 0 ?
@@ -600,9 +608,10 @@ local(_px, _py, _gx, _gy, _lx, _ly, _row, _col, _pad, _x, _y,
 
 // Dispatcher — the name the main @gfx tail calls. Guarded on the KIT tab so a
 // panel left open behind a tab switch does not paint over the PAD tab. The
-// dock rack face has no tab row and hosts the same chips in its own header
-// (swing_ui_draw_rack_header), so there the panel paints regardless of which
-// LCD tab the full UI last showed.
+// dock rack face has no tab row and no chips (NOTES / OUT / LAYERS left its
+// header 2026-08-25/26); the dock_face clause only paints a kdd_open left over
+// from the full UI, which the header's panel-input mirror closes on the next
+// click outside it (swing_ui_draw_rack_header).
 function swing_chgmap_overlay_draw()
 (
   (kdd_open != KDD_MODE_NONE && (lcd_right_tab == 0 || dock_face)) ? swing_kdd_panel(kdd_open);

@@ -31,8 +31,10 @@ end
 r.gmem_attach('Swing_Media_Transfer')
 
 local GRV_BASE  = 26140000            -- EON_SS_GROOVE_BASE (must match the JSFX)
+local GRV_OPEN_REQ = GRV_BASE + 200   -- JSFX-bumped: "Import grooves..." (or an empty slot) was clicked
 local GRV_ALIVE = GRV_BASE + 201      -- our time_precise heartbeat (bridge won't double-launch)
 local GRV_SLOT  = GRV_BASE + 202      -- JSFX-written: which StepSeq instance to target
+local GRV_USLOT = GRV_BASE + 203      -- JSFX-written: the suggested USER slot 0..6 (an empty-slot click)
 local GRV_PUB_BASE, GRV_PUB_STRIDE = 26141000, 1200   -- JSFX-published raw user slots (read-only here)
 
 -- ── scan Data/Grooves ────────────────────────────────────────────────────────
@@ -41,6 +43,7 @@ local GROOVES_DIR = r.GetResourcePath() .. sep .. 'Data' .. sep .. 'Grooves'
 
 local files = {}
 do
+  r.EnumerateFiles(GROOVES_DIR, -1)   -- flush REAPER's per-folder listing cache (wiki 06 §6.14)
   local i = 0
   while true do
     local fn = r.EnumerateFiles(GROOVES_DIR, i)
@@ -270,6 +273,7 @@ end
 
 local function rescan_files()
   files = {}
+  r.EnumerateFiles(GROOVES_DIR, -1)   -- flush the cache: a just-exported .rgt was missing from the cached listing
   local i = 0
   while true do
     local fn = r.EnumerateFiles(GROOVES_DIR, i)
@@ -285,16 +289,27 @@ local ctx       = r.ImGui_CreateContext('EON Groove Import')
 local filter    = ''
 -- default destination = the user slot the JSFX suggested (clicking an "empty slot N" menu
 -- row passes N-1 via GRV_BASE+203); 0/unset lands on slot 1.
-local user_slot = math.max(1, math.min(7, math.floor((r.gmem_read(GRV_BASE + 203) or 0) + 0.5) + 1))
+local user_slot = math.max(1, math.min(7, math.floor((r.gmem_read(GRV_USLOT) or 0) + 0.5) + 1))
 local last_msg  = ''
 local slot_used = {}                                -- session memory of what we loaded where
+-- The open request this window was launched on. A later "Import grooves..." (or empty-slot click) from
+-- ANOTHER StepSeq while this window is open bumps it again, and the bridge skips the launch because our
+-- heartbeat is fresh -- so the target StepSeq and the suggested slot are re-read here when it moves. Read
+-- once at launch, every groove click went to the first StepSeq and overwrote its slot.
+local open_req_seen = math.floor((r.gmem_read(GRV_OPEN_REQ) or 0) + 0.5)
 
 local function frame()
   r.gmem_write(GRV_ALIVE, r.time_precise())
+  local open_req = math.floor((r.gmem_read(GRV_OPEN_REQ) or 0) + 0.5)
+  if open_req ~= open_req_seen then
+    open_req_seen = open_req
+    target_slot = math.max(0, math.min(15, math.floor((r.gmem_read(GRV_SLOT) or 0) + 0.5)))
+    user_slot   = math.max(1, math.min(7, math.floor((r.gmem_read(GRV_USLOT) or 0) + 0.5) + 1))
+  end
   r.ImGui_SetNextWindowSize(ctx, 400, 540, r.ImGui_Cond_FirstUseEver())
   local visible, open = r.ImGui_Begin(ctx, 'EON Groove Import', true)
   if visible then
-    r.ImGui_Text(ctx, ('Data/Grooves: %d templates'):format(#files))
+    r.ImGui_Text(ctx, ('Data/Grooves: %d templates   ->  StepSeq slot %d'):format(#files, target_slot))
     r.ImGui_Separator(ctx)
 
     -- destination user-slot picker (1..7)

@@ -131,20 +131,11 @@ function swing_macroed_get(_me_pad, _me_pid) (
   _me_pid == KMAC_PID_PAN        ? p_pan[_me_pad] :
   _me_pid == KMAC_PID_DECAY      ? p_decay[_me_pad] :
   _me_pid == KMAC_PID_ATTACK     ? p_attack[_me_pad] :
-  // Engine knobs. _syn_mac_get lives in rk_swing_ui_overlay_syn, imported at
-  // 139 vs this file at 148 — before, so the reference resolves.
+  // Engine knobs. _syn_mac_get lives in rk_swing_ui_overlay_syn, imported
+  // before this file in Swing_ReaKit.jsfx, so the reference resolves.
   _me_pid >= KMAC_PID_SYN_BASE && _me_pid < KMAC_PID_SYN_BASE + KMAC_PID_SYN_N ?
     _syn_mac_get(_me_pad, _me_pid - KMAC_PID_SYN_BASE) :
   0;
-);
-
-// The engine knob a pad's FAMILY calls its decay: kick has no plain DECAY, so
-// it uses A.DEC (amp decay, index 2); every other family puts DECAY at index
-// 1. Returns a pid ready for a mapping. Single source of truth for "what does
-// DECAY mean on a synth pad" — the factory baker resolves the same rule, and
-// the two must agree (.dev_tests/make_factory_macros.py SYN_DECAY_IX).
-function swing_macroed_syn_decay_pid(_me_pad) (
-  KMAC_PID_SYN_BASE + ((ps_engine[_me_pad] | 0) % 10 == 0 ? 2 : 1);
 );
 
 // How many ENGINE-knob cells the picker appends for a pad: that family's real
@@ -215,9 +206,9 @@ function swing_macroed_set_val(_me_k, _me_nv) (
 // PUNCH is CATEGORY-SMART: it targets the pads whose published category is
 // in the kick..clap family (ids 0-3, rk_cat_glyphs vocabulary), resolved
 // at click time into concrete, visible, editable rows; an uncategorised
-// rack falls back to ALL pads. WIDTH / PITCH / DECAY stay empty on purpose:
-// macros reach FX params only today — pan/tune/ADSR targeting is a future
-// engine extension, not a template's job to fake.
+// rack falls back to ALL pads. WIDTH / PITCH / DECAY reach the core pad
+// params where a template fills them: a pan fan (KMAC_PID_PAN, map_width),
+// relative tune (KMAC_PID_TUNE) and relative decay (KMAC_PID_DECAY).
 function swing_macroed_add_map(_ma_m, _ma_pad, _ma_pid, _ma_lo, _ma_hi) local(_ma_j) (
   kmac_nmap[_ma_m] < KMAC_MAX_MAP ? (
     _ma_j = _ma_m * KMAC_MAX_MAP + kmac_nmap[_ma_m];
@@ -287,7 +278,7 @@ local(_ma_p, _ma_c, _ma_n, _ma_p_s) (
 function swing_macroed_tpl_finish() (
   macro_sel = 0; slider_automate(2^40);
   mark_dirty_kit();
-  kmac_force = 1;
+  kmac_force += 1;
 );
 function swing_macroed_tpl_clear() local(_ma_m) (
   _ma_m = 0; loop(KMAC_N, kmac_nmap[_ma_m] = 0; _ma_m += 1;);
@@ -361,7 +352,7 @@ function swing_macroed_tpl_club() (
 function swing_macroed_tpl_empty() (
   swing_macroed_tpl_clear();
   mark_dirty_kit();
-  kmac_force = 1;
+  kmac_force += 1;
 );
 function swing_macroed_tpl_tape() (
   swing_macroed_tpl_clear();
@@ -537,6 +528,12 @@ local(_me_px, _me_py, _me_pw, _me_ph, _me_k, _me_cellw, _me_cellh, _me_kx,
   );
 
   // ── 4×2 big knobs ──
+  // The knobs read the FRAME's mouse (ssl_knob_interact: lmb_down, LMB, rmb_down, frame_wheel), which the modal
+  // gate zeroed; this editor restores the real mouse only into _me_* for its own hit tests, so the eight knobs
+  // lit on hover and never turned (LIB317). Hand them the real mouse for the loop, as every big view does, and
+  // spend it after. None while the swatch picker is open (the _me_* copies are zeroed above for that).
+  lmb_down = _me_mdn; LMB = _me_lmb; rmb_down = _me_rdn;
+  RMB = kmac_colpick_k >= 0 ? 0 : _ov_RMB; frame_wheel = kmac_colpick_k >= 0 ? 0 : _ov_wheel;
   _me_cellw = (_me_pw - 20) / 4; _me_cellh = 86; _me_kr = 22;
   _me_k = 0; loop(8,
     _me_kx = _me_px + 10 + (_me_k % 4) * _me_cellw + _me_cellw * 0.5;
@@ -638,13 +635,20 @@ local(_me_px, _me_py, _me_pw, _me_ph, _me_k, _me_cellw, _me_cellh, _me_kx,
     );
     _me_k += 1;
   );
+  lmb_down = 0; LMB = 0; rmb_down = 0; RMB = 0; frame_wheel = 0;   // spent: the rest of the editor reads _me_* (LIB317)
 
   // ── mappings header ──
   _me_y0 = _me_py + 34 + 2 * _me_cellh + 8;
   swing_lcd_kmac_pal(kmac_color[_me_msel] | 0);
   rk_font(1, swing_fs(10), 'b');
   swing_lcd_kmac_label(_me_msel, #_me_s2);
-  sprintf(#_me_s, "MAPPINGS — %s", #_me_s2);
+  // While the ADD picker is open the title carries its hint. Under the param grid, where it sat, the hint landed at
+  // py+416 at the default window size, and the morph graph (py+414..434) painted over it (LIB339).
+  kmac_ed_add ? (
+    kmac_ed_addpad == -3 ? sprintf(#_me_s, "ADD TO %s — pick a pad first, then the parameter", #_me_s2)
+    : ( swing_macroed_padlbl(kmac_ed_addpad, #_me_s3);
+        sprintf(#_me_s, "ADD TO %s — %s: now pick the parameter", #_me_s2, #_me_s3); );
+  ) : sprintf(#_me_s, "MAPPINGS — %s", #_me_s2);
   gfx_set(kmac_pal_r, kmac_pal_g, kmac_pal_b, 1);
   gfx_x = _me_px + 12; gfx_y = _me_y0; gfx_drawstr(#_me_s);
   gfx_set(0.30, 0.34, 0.40, 0.7);
@@ -663,7 +667,7 @@ local(_me_px, _me_py, _me_pw, _me_ph, _me_k, _me_cellw, _me_cellh, _me_kx,
         swing_macroed_add_map(_me_msel, kmac_lt_pad, kmac_lt_pid,
           swing_macroed_get(kmac_lt_pad, kmac_lt_pid), kmac_ed_pmax);
         mark_dirty_kit();
-        kmac_force = 1;
+        kmac_force += 1;
       );
     );
   ) : (
@@ -742,26 +746,13 @@ local(_me_px, _me_py, _me_pw, _me_ph, _me_k, _me_cellw, _me_cellh, _me_kx,
           swing_macroed_get(kmac_ed_addpad >= 0 ? kmac_ed_addpad : max(0, min(NUM_SLOTS - 1, sel_pad)), _me_pid),
           kmac_ed_pmax) ? (
           mark_dirty_kit();
-          kmac_force = 1;
+          kmac_force += 1;
         );
         kmac_ed_add = 0;
       );
       _me_i += 1;
     );
-    kmac_ed_addpad == -3 ? (
-      rk_font(1, swing_fs(9), 0);
-      gfx_set(0.55, 0.60, 0.66, 0.8);
-      gfx_x = _me_px + 12; gfx_y = _me_ry + 24 + 7 * 22 + 4;
-      gfx_drawstr("pick a pad first, then the parameter");
-    ) : (
-      // confirm the pick by NAME before the param click lands
-      swing_macroed_padlbl(kmac_ed_addpad, #_me_s2);
-      sprintf(#_me_s, "%s — now pick the parameter", #_me_s2);
-      rk_font(1, swing_fs(9), swing_txt_wt(swing_fs(9), #_me_s));
-      gfx_set(0.60, 0.90, 0.95, 0.9);
-      gfx_x = _me_px + 12; gfx_y = _me_ry + 24 + 7 * 22 + 4;
-      gfx_drawstr(#_me_s);
-    );
+    // the hint ("pick a pad first" / "<pad>: now pick the parameter") is in the MAPPINGS title row above (LIB339)
   ) : (
     // ── mappings list for the selected macro ──
     kmac_nmap[_me_msel] == 0 ? (
@@ -837,7 +828,7 @@ local(_me_px, _me_py, _me_pw, _me_ph, _me_k, _me_cellw, _me_cellh, _me_kx,
         kmac_curve[_me_b + _me_j] = kmac_curve[_me_i];
         kmac_nmap[_me_msel] -= 1;
         mark_dirty_kit();
-        kmac_force = 1;
+        kmac_force += 1;
       );
 
       // range-handle drag: start / continue (release handled after the loop)
@@ -853,7 +844,7 @@ local(_me_px, _me_py, _me_pw, _me_ph, _me_k, _me_cellw, _me_cellh, _me_kx,
           max(0, min(1, (_me_mx - _me_bx0) / _me_bw2)) * (kmac_ed_pmax - kmac_ed_pmin);
         (kmac_ed_drag & 1) ? ( kmac_lo[_me_b + _me_j] = _me_cur; )
                            : ( kmac_hi[_me_b + _me_j] = _me_cur; );
-        kmac_force = 1;          // live re-apply while dragging (audible edit)
+        kmac_force += 1;          // live re-apply while dragging (audible edit)
         kmac_ed_dragged = 1;
       );
       _me_ry += 22;

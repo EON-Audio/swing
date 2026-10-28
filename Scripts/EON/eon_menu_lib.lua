@@ -164,7 +164,12 @@ local function build(nodes, parts, leaves)
     else
       parts[#parts + 1] = ">" .. n[1]
       build(n[2], parts, leaves)
-      parts[#parts] = "<" .. parts[#parts]   -- close submenu on its last item
+      -- Close the submenu with an empty '<' row of its own: it inserts nothing
+      -- and takes no number (measured in the engine, rkm_parse_test.py). The
+      -- old prefix-on-the-last-item form stacked to "<<Route to Swing" when a
+      -- submenu ended in a submenu, and showmenu reads '<' as one flag, not a
+      -- count -- Pattern never closed and Tools landed inside it (sweep SCR116).
+      parts[#parts + 1] = "<"
     end
   end
 end

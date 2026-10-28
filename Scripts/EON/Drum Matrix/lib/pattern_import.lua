@@ -213,6 +213,20 @@ function M.ImportFile(path, genre, opts)
 
   genre = norm_genre(genre)
   local group = slug(basename_noext(path))
+  -- Two files whose names slug alike ("Groove (A)" / "Groove [A]", or names
+  -- outside ASCII, which %w cannot see) shared one group id, and the later one
+  -- silently overwrote the earlier one's presets (audit DM126, 2026-10-26).
+  -- opts.used_groups -- a set the Run loop shares across its files -- hands
+  -- the later one a _2, _3 ... suffix. A lone ImportFile call (no set) keeps
+  -- the plain id, so a re-import of one file still replaces its own presets.
+  if opts.used_groups then
+    local base, n = group, 1
+    while opts.used_groups[group] do
+      n = n + 1
+      group = base .. '_' .. n
+    end
+    opts.used_groups[group] = true
+  end
   local bars  = math.max(1, math.floor((len_qn or 4) / 4 + 0.5))
 
   local genre_dir = PRESETS_ROOT .. genre .. SEP
@@ -251,6 +265,7 @@ end
 -- Returns a summary table { files, presets, skipped, genres = {...}, lines = {...} }.
 function M.Run(opts)
   opts = opts or {}
+  opts.used_groups = opts.used_groups or {}   -- group ids taken in this run (see ImportFile)
   local summary = { files = 0, presets = 0, skipped = 0, genres = {}, lines = {} }
 
   local genre_dirs = list_subdirs(IMPORT_ROOT)

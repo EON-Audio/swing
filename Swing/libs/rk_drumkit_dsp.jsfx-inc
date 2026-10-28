@@ -42,12 +42,22 @@ function swing_xf_len(len_s) (
   max(1, (len_s * srate)|0) + (patch_live ? samplesblock : 0);
 );
 
+// How loud the last tracked output was, summed over every pin the crossfade blends (the same channel count as the
+// blend and the tracking in @sample: out_nch in multi-out / Wired, else 0/1). Every arm test and the @sample
+// short-circuit read this: they read only 0/1, so in multi-out a kill on any pad but OUT 1's armed no fade and its
+// track stepped to zero (PL G4, 2026-10-26). Read-only; callable from @block, @gfx and @sample.
+function swing_xf_prev_level() local(_xl_i, _xl_n, _xl_s) (
+  _xl_n = (multi_out || patch_live) ? min(out_nch, OUT_PAIRS * 2) : 2;
+  _xl_s = 0; _xl_i = 0; loop(_xl_n, _xl_s += abs(_xf_prev[_xl_i]); _xl_i += 1;);
+  _xl_s;
+);
+
 function swing_voice_kill_pad_xf(pad) local(_vk_i) (
   _vk_i = 0; loop(V_SLOTS,
     v_slot[_vk_i] == pad ? ( v_stage[_vk_i] = 0; v_env[_vk_i] = 0; v_pos[_vk_i] = -1; );
     _vk_i += 1;
   );
-  !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
+  !_xf_active && swing_xf_prev_level() > 0.01 ? (
     _xf_pos = 0;
     _xf_len = swing_xf_len(0.010);
     _xf_active = 1;
@@ -285,8 +295,12 @@ function recalc_fx(i) local(_svf_base, _sfi) (
   // flowing, so snapping straight to the new targets is inaudible and the
   // next hit starts on the new curve. The glide still applies to tweaks
   // made while the pad is sounding (the case smoothing exists for).
+  // fx_res[i] is the gate's fourth term (rk_drumkit_fx): a tail living in R or
+  // in the EQ integrators keeps the pad awake, so a bell moved while only that
+  // tail rings must glide, not snap (LIB217).
   (abs(pad_accL[i]) < 0.0000001 && abs(pad_accR[i]) < 0.0000001 &&
-   abs(fx_hpf_stL[i]) < 0.0000001 && abs(fx_lpf_stL[i]) < 0.0000001) ? (
+   abs(fx_hpf_stL[i]) < 0.0000001 && abs(fx_lpf_stL[i]) < 0.0000001 &&
+   fx_res[i] <= 0) ? (
     _sfi = 0; loop(SVF_PER_PAD,
       svf_snap(_svf_base + _sfi * SVF_STEREO_SIZE);
       _sfi += 1;
@@ -321,7 +335,9 @@ local(_x2L, _x2R, _absL, _absR)
     _doR = xR >= 0
       ? xR / (1.0 + _absR)
       : xR / (1.0 + _absR * _absR * 0.6);
-    // Slight DC offset characteristic of real tubes — removed by HPF downstream
+    // The asymmetry emits DC and there is NO HPF after the drive: every caller
+    // follows TUBE with its own TUBE-only DC blocker (see rk_drumkit_fx.jsfx-inc).
+    // The x1.2 below is output gain, not an offset.
     _doL *= 1.2; _doR *= 1.2;
   ) :
   mode == 2 ? (
@@ -417,19 +433,6 @@ function pad_is_playable(i) (
   pad_has_audio(i) || ps_enable[i] > 0.5;
 );
 
-// ─── Get effective sample length for a pad (first available layer or legacy) ─
-function pad_eff_len(i) local(li, _lidx) (
-  p_layer_cnt[i] > 0 ? (
-    li = 0;
-    while(li < p_layer_cnt[i]) (
-      _lidx = i * MAX_LAYERS + li;
-      l_len[_lidx] > 0 ? ( li = p_layer_cnt[i] + 1; ); // break
-      li += 1;
-    );
-    li > p_layer_cnt[i] ? l_len[_lidx] : 0;
-  ) : s_len[i];
-);
-
 // ════════════════════════════════════════════════════════════════════════
 // Internal per-pad PARAM undo/redo engine (v2, Phase 1A)
 //
@@ -502,9 +505,125 @@ function undo_unpack(src, pad) local(k, off, _fb, l) (
   );
 );
 
+// ════════════════════════════════════════════════════════════════════════
+// REAPER undo points for Swing's own edits (2026-10-27, the owner's decision 1)
+//
+// From Phase 1B (2026-06-29) to 3.0.20 Swing told REAPER nothing about its edits: mark_dirty only raised the project-
+// dirty flag. The reason was real -- every edit then bumped a hidden counter through slider_automate, so REAPER minted
+// points that held stale copies of Swing, and Swing's own UNDO button fired REAPER's global undo, which rolled whole
+// kits back ("pads 10-16 wiped"). The cure left REAPER's stored copy of Swing stale instead, which the measurement of
+// 2026-10-27 caught (.docs/audits/Swing_Undo_Map_Measured_2026-10-27.md): Ctrl+Z of a later step took back unrecorded
+// edits and even a kit load, and an edit made after the last recorded step could be lost for good (I2, I8).
+//
+// Now every FINISHED gesture asks for ONE point, made by the Kit Bridge (eon_rup_tick, the EON_RUP mailbox) the wiki
+// 6.23 way: an undo block around a nudge of "Dirty: Global", named for the edit ("Swing: pad 5 VOL"). REAPER's copy is
+// current after every edit and Ctrl+Z takes back exactly the last one. What keeps Phase 1B's problems away: never per
+// mouse move (a gesture's end only); never from a REAPER restore (_srz_udo_hold: a read asks for nothing and captures
+// nothing); never for housekeeping or automation (only the face's gestures and the named user operations ask); never
+// twice (a gesture that moved one of REAPER's own parameters gets REAPER's "Edit FX parameter" point, an output choice
+// gets the bridge's, a press handed to a bridge command with its own point -- rup_skip -- asks for none); and Swing's
+// UNDO / REDO stay Swing's own (each press is a point like any edit; REAPER restoring Swing clears them,
+// swing_rup_restore_heal).
+//
+// Who asks: the end of a gesture (undo_commit_gesture: the mouse-up, the wheel / right-button bracket) -- the pads
+// that changed (the param diff names the pad and the field), else a kit-level edit (mark_dirty_kit / mark_dirty_play
+// since the gesture began), else a pad edit outside the param fields; and named operations wherever they land -- a
+// sample dropped or loaded into a pad, a pad / a layer cleared and two pads swapped (the CMD 46 handshake), Clear All,
+// New Kit, a rename committed, a bank switch, Swing's UNDO / REDO. A gesture's request goes out at its end; one made
+// outside a gesture once RUP_SETTLE passed with no button held, or at the next press, so the next gesture never lands
+// in the previous point. Kit loads are the bridge's own point, made when the import lands (eon_kitpt_*).
+// ════════════════════════════════════════════════════════════════════════
+
+// The REAPER parameters the face moves through slider_automate, as one number: a gesture that moves any of them gets
+// REAPER's own "Edit FX parameter" point, so it asks for no second one. Root note, MIDI thru, pad face, embed icons, the
+// four knob-look rows, macro focus, NAME BAR, HOVER, BANK COLOURS, PAD WAVE. Not the master volume or the macros
+// (automation plays them, and the face's moves of them mark nothing) and not the sliderchange-only ones (adsr_3node,
+// map_override_locked: REAPER makes no point for those).
+function swing_rup_slsum() (
+  slider1 + 3 * slider22 + 5 * slider25 + 7 * slider26 + 11 * slider27 + 13 * slider28 + 17 * slider29 +
+  19 * slider30 + 23 * slider41 + 29 * slider45 + 31 * slider46 + 37 * slider47 + 41 * slider48;
+);
+// The mark the next gesture end compares against: taken where a gesture begins and at every end.
+function swing_rup_mark() (
+  rup_kn0 = rup_kn; rup_sl0 = swing_rup_slsum(); rup_ou0 = out_ureq; rup_skip = 0;
+);
+// Ask for a point. A stronger request keeps its words over a weaker one waiting with it (a New Kit's bank switch IS
+// the New Kit); two of a kind keep the latest; rup_wn counts them. Nothing while a kit loads (the bridge's load point
+// covers it) or while REAPER restores Swing.
+function swing_rup_want(kind, a, b, c, f) local(_p) (
+  !kit_busy && !_srz_udo_hold ? (
+    _p = (kind == RUP_K_UNDO || kind == RUP_K_REDO) ? 9 : (kind == RUP_K_NEWKIT || kind == RUP_K_CLEARALL) ? 8 :
+         (kind == RUP_K_CLEARPAD || kind == RUP_K_CLEARLAYER || kind == RUP_K_SWAP) ? 7 : kind == RUP_K_SAMPLE ? 6 :
+         (kind == RUP_K_RENAME || kind == RUP_K_BANKNAME) ? 5 : (kind == RUP_K_PAD || kind == RUP_K_PADS) ? 4 :
+         kind == RUP_K_KIT ? 3 : 2;
+    (!rup_want || _p >= rup_wpri) ? (
+      rup_wkind = kind; rup_wa = a; rup_wb = b; rup_wc = c; rup_wf = f; rup_wpri = _p;
+    );
+    rup_wn = rup_want ? rup_wn + 1 : 1;
+    rup_want = 1; rup_want_t = time_precise();
+  );
+);
+// Post the waiting request into this instance's EON_RUP row: the words first, SEQ LAST, seeded above whatever the row
+// holds (a slot's earlier owner's count never hides this one's first post).
+function swing_rup_post() local(_rb) (
+  rup_want ? (
+    rup_want = 0; rup_now = 0;
+    _reg_my_slot >= 0 && _reg_my_slot < 16 ? (
+      _rb = EON_RUP_BASE + _reg_my_slot * EON_RUP_STRIDE;
+      gmem[_rb + 1] = rup_wkind; gmem[_rb + 2] = rup_wa; gmem[_rb + 3] = rup_wb; gmem[_rb + 4] = rup_wc;
+      gmem[_rb + 5] = rup_wf; gmem[_rb + 6] = rup_wn;
+      rup_seq = max(rup_seq, gmem[_rb] | 0) + 1;
+      gmem[_rb] = rup_seq;
+      rup_posts += 1;
+      rup_post_t = time_precise();   // a typed Ctrl+Z waits for it until SERVED (swing_rup_unserved)
+    );
+  );
+);
+// Every @gfx pass (idle ones too): a gesture's request goes out at once (rup_now), one made outside a gesture once
+// RUP_SETTLE passed with no button held (_hold, the caller's: the left button down, a wheel bracket open). Nothing
+// while @serialize reads (a REAPER restore). A sample a browser landed (rk_swing_browser_load: @block, which only
+// counts it, so the words have one writer) becomes a request here first.
+function swing_rup_tick(_hold) (
+  rup_ld_n != rup_ld_seen ? ( rup_ld_seen = rup_ld_n; swing_rup_want(RUP_K_SAMPLE, rup_ld_pad, rup_ld_lay, -1, 1); );
+  rup_want && !_srz_udo_hold && (rup_now || (!_hold && time_precise() - rup_want_t >= RUP_SETTLE)) ? swing_rup_post();
+);
+// A gesture begins: whatever still waits goes out first, then the mark.
+function swing_rup_gstart() (
+  rup_want ? swing_rup_post();
+  swing_rup_mark();
+);
+// The fields that differ between the packed pads at `a` and `b`, the output choice left out (UDO_K_OUT): rup_dk the
+// first (a scalar's index into udo_fs, or 1000 + layer field * 10 + layer), rup_dk2 the second, rup_dn how many.
+// `!=` as undo_commit_gesture's change test has it, so the two agree on what changed.
+function swing_rup_diff(a, b) local(k, _cd) (
+  rup_dk = -1; rup_dk2 = -1; rup_dn = 0; k = 0;
+  loop(UDO_STRIDE,
+    k != UDO_K_OUT && a[k] != b[k] ? (
+      _cd = k < UDO_NS ? k : 1000 + (((k - UDO_NS) / MAX_LAYERS) | 0) * 10 + ((k - UDO_NS) % MAX_LAYERS);
+      rup_dn == 0 ? ( rup_dk = _cd; ) : rup_dn == 1 ? ( rup_dk2 = _cd; );
+      rup_dn += 1;
+    );
+    k += 1;
+  );
+);
+// A gesture ended (undo_commit_gesture): _gn pads changed in the param fields (_gp the first, _gk / _gk2 its first two
+// fields, _gnk how many), else what was counted since the mark. Skipped when the gesture's point is someone else's.
+// A pad edit outside the param fields (none of the face's knobs or buttons) asks for nothing here: counting
+// mark_dirty_pad would also count the Strip Sync's and the Pad FX window's edits landing in @block mid-gesture.
+function swing_rup_gend(_gn, _gp, _gk, _gk2, _gnk) (
+  !(rup_skip || _srz_udo_hold || swing_rup_slsum() != rup_sl0 || out_ureq != rup_ou0) ? (
+    _gn == 1 ? swing_rup_want(RUP_K_PAD, _gp, _gk, _gk2, _gnk) :
+    _gn > 1 ? swing_rup_want(RUP_K_PADS, _gn, _gp, -1, 0) :
+    rup_kn != rup_kn0 ? swing_rup_want(RUP_K_KIT, 0, -1, -1, 0);
+  );
+  rup_want ? ( rup_now = 1; );
+  swing_rup_mark();
+);
+
 // Snapshot every pad's pre-edit state into the baseline buffer. Called on the
 // mouse-DOWN edge so a subsequent edit can be reverted to this state. No-op
 // while we are restoring (so an undo can't re-snapshot its own result).
+// The REAPER-point mark rides along (swing_rup_gstart): every caller is where a gesture begins.
 function undo_capture_baseline() local(p) (
   _udo_applying ? 0 : (
     p = 0;
@@ -513,6 +632,7 @@ function undo_capture_baseline() local(p) (
       p += 1;
     );
   );
+  swing_rup_gstart();
 );
 
 // Push the baseline snapshot of `pad` as a new undo entry (drops oldest when
@@ -529,8 +649,9 @@ function undo_push_param(pad) (
 );
 
 // On the mouse-UP edge: commit one undo entry per pad touched this gesture.
-function undo_commit_gesture() local(p, pushed, k, _changed, _b) (
-  pushed = 0;
+// The gesture's REAPER point is asked for here too (swing_rup_gend), named by the first pad that changed.
+function undo_commit_gesture() local(p, pushed, k, _changed, _b, _gn, _gp) (
+  pushed = 0; _gn = 0; _gp = -1;
   p = 0;
   loop(NUM_SLOTS,
     _udo_pend[p] ? (
@@ -541,11 +662,16 @@ function undo_commit_gesture() local(p, pushed, k, _changed, _b) (
       undo_pack(udo_cmp, p);
       _b = udo_base + p * UDO_STRIDE; _changed = 0; k = 0;
       loop(UDO_STRIDE, k != UDO_K_OUT && udo_cmp[k] != _b[k] ? _changed = 1; k += 1;);   // an output choice alone is no entry (UDO_K_OUT)
-      _changed ? ( undo_push_param(p); pushed = 1; );
+      _changed ? (
+        undo_push_param(p); pushed = 1;
+        _gn == 0 ? ( _gp = p; swing_rup_diff(_b, udo_cmp); );   // the point's words: the first pad that changed
+        _gn += 1;
+      );
     );
     p += 1;
   );
   pushed ? ( _udo_rc = 0; );  // a fresh edit invalidates the redo branch
+  swing_rup_gend(_gn, _gp, rup_dk, rup_dk2, rup_dn);
 );
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -556,13 +682,13 @@ function undo_commit_gesture() local(p, pushed, k, _changed, _b) (
 // (undo_cap_begin/end) makes nested low-level calls capture only ONCE.
 // ──────────────────────────────────────────────────────────────────────────
 
-// NOTE (v1): pad NAME/label strings are intentionally NOT captured here.
-// get_name_slot/get_cname_slot live in rk_swing_core (import #71), which is
-// AFTER this file (#66) — referencing them would be a def-time forward-ref
-// compile error. Audio + all numeric params restore byte-exact; pad labels may
-// read stale after a structural undo (same cosmetic limitation the preserve
-// helper documents). udo_st_str stays reserved for a later names pass (which
-// would move get_name_slot earlier, or relocate the engine after core).
+// NOTE: pad NAME / label / path strings are not captured by THIS file:
+// get_name_slot / get_cname_slot live in rk_swing_core, which is imported AFTER
+// this file — referencing them here would be a def-time forward-ref compile
+// error. rk_swing_core saves them instead (undo_begin_pad -> undo_pad_names_save,
+// for a per-pad op), and undo_restore_struct asks @gfx to put them back (_udo_name_req ->
+// undo_pad_names_restore in Swing_ReaKit.jsfx). Audio + all numeric params
+// restore byte-exact here.
 
 // ─── The backup's copy path (banks step 2a) ─────────────────────────────────
 // The backup (udo_s2_audio) keeps the pre-banks slot layout as a VIRTUAL slot: the plain
@@ -678,14 +804,18 @@ local(_g)
 
 // Per-pad structural op (load/clear/clear-layer): outermost call records the
 // one-pad backup; nested calls (clear_pad -> clear_layer) just raise depth.
+// Never while @serialize READS (_srz_udo_hold, 2026-10-27): a REAPER undo / redo reloads every pad from its path
+// through load_from_path, and each capture emptied the knob history and left an entry for the last pad the read
+// reloaded -- taken while the read had just reset that pad, so it held other memory. Swing's UNDO, pressed after
+// the Ctrl+Z, wrote it over pad 16 (silence, or another sample's audio; measured, item I4).
 function udo_struct_begin_pad(pad) (
-  (_udo_cap_depth == 0 && !_udo_applying) ? undo_capture_pad(pad);
+  (_udo_cap_depth == 0 && !_udo_applying && !_srz_udo_hold) ? undo_capture_pad(pad);
   _udo_cap_depth += 1;
 );
 
 // Swap is self-inverse: record only the two indices; undo re-swaps.
 function udo_struct_begin_swap(a, b) local(l) (
-  (_udo_cap_depth == 0 && !_udo_applying) ? (
+  (_udo_cap_depth == 0 && !_udo_applying && !_srz_udo_hold) ? (
     udo_s2_type = 2; udo_s2_pad = a; udo_s2_pad2 = b; _udo_st_valid = 1;
     _udo_uc = 0; _udo_rc = 0;
     l = 0; loop(NUM_SLOTS, _udo_pend[l] = 0; l += 1;);
@@ -700,7 +830,7 @@ function udo_struct_begin_swap(a, b) local(l) (
 // INVALID so the UNDO button honestly greys for kit ops instead of lying.
 // The 1-level rule still applies: a kit op drops the param-undo branch.
 function udo_struct_begin_kit() local(l) (
-  (_udo_cap_depth == 0 && !_udo_applying) ? (
+  (_udo_cap_depth == 0 && !_udo_applying && !_srz_udo_hold) ? (
     udo_s2_type = 3; _udo_st_valid = 0;   // PARKED: not undoable (was 1)
     _udo_uc = 0; _udo_rc = 0;
     l = 0; loop(NUM_SLOTS, _udo_pend[l] = 0; l += 1;);
@@ -743,6 +873,12 @@ function undo_restore_struct() local(pad, l, _li, _fit, _v, _p, _e) (
         _fit = swing_pad_fit_restore(pad);
       );
       !_fit ? swing_pad_regions_trim_missing(pad);
+      // Under the lock, as swap_pads does: a compaction move still in flight on one of this
+      // pad's regions is abandoned here. An in-place fit never touches the table, so
+      // swing_region_set never cancelled it; once the hold cleared the tick would finish
+      // the move from alc_pos and commit a destination whose first alc_pos cells held the
+      // newer sample -- a spliced hit (LIB23). The lock also waits out a tick mid-chunk.
+      swing_alloc_lock(); alc_hold = 1; swing_alloc_cancel_move(); swing_alloc_unlock();
       swing_pad_regions_copy(pad, udo_s2_srcp, udo_s2_srcl);
       _v = 0;
       while (_v < udo_s2_extent) (
@@ -760,6 +896,7 @@ function undo_restore_struct() local(pad, l, _li, _fit, _v, _p, _e) (
       _udo_name_req = 1; _udo_name_pad = pad;  // names restored in @gfx (get_*_slot is core-only)
       _udo_st_valid = 0; _udo_rc = 0;
       gmem[GS_PROJ_DIRTY] = 1;
+      swing_rup_want(RUP_K_UNDO, pad, -2, -1, 0);   // a REAPER point for the press: "Swing: undo (pad N sample)"
       _udo_applying = 0;
     ) : udo_s2_type == 2 ? (
       // Swap is self-inverse, but swap_pads is defined LATER in this file.
@@ -767,9 +904,11 @@ function undo_restore_struct() local(pad, l, _li, _fit, _v, _p, _e) (
       _udo_swap_req = 1;
       _udo_st_valid = 0; _udo_rc = 0;
     ) : udo_s2_type == 3 ? (
-      // Kit-level undo: ask the bridge (via the @gfx processor) to reload the
-      // temp undo sidecar it dumped before the kit op. Entry is consumed now;
-      // if the file is missing the bridge no-ops (rare, acceptable).
+      // Kit-level undo -- UNREACHABLE while kit undo is PARKED (see
+      // udo_struct_begin_kit: it leaves _udo_st_valid = 0, so this dispatch never
+      // sees type 3, and the @gfx CMD 82 sender in Swing_ReaKit.jsfx never fires).
+      // Kept for the un-park: it asks the bridge (via the @gfx processor) to
+      // reload the temp undo sidecar it dumped before the kit op.
       _udo_kitundo_req = 1;
       _udo_st_valid = 0; _udo_rc = 0;
     );
@@ -795,13 +934,16 @@ function undo_do() local(ei, pad) (
     );
     undo_pack(udo_urd + _udo_rc * UDO_STRIDE, pad);
     udo_urd_pad[_udo_rc] = pad;
+    // the REAPER point's words: what this press puts back (the live pad, just packed, against the entry)
+    swing_rup_diff(udo_urd + _udo_rc * UDO_STRIDE, udo_ust + ei * UDO_STRIDE);
     _udo_rc += 1;
     // restore the undo entry into the live pad
     _udo_skip_out = 1; undo_unpack(udo_ust + ei * UDO_STRIDE, pad); _udo_skip_out = 0;   // the output choice stays (UDO_K_OUT)
     _udo_uc = ei;
     swing_rcp_post_pad(pad); swing_rcp_post_fx(pad);   // @block performs (A-9a)
     s_dirty[pad] = 1; col_dirty = 1;
-    gmem[GS_PROJ_DIRTY] = 1;  // Phase 1B: project-dirty (no REAPER undo point)
+    gmem[GS_PROJ_DIRTY] = 1;  // the project is dirty ...
+    swing_rup_want(RUP_K_UNDO, pad, rup_dk, rup_dk2, rup_dn);   // ... and the press is a REAPER point (2026-10-27)
     _udo_applying = 0;
   ) : _udo_st_valid ? (
     // param ring empty -> the structural snapshot is the next thing to undo
@@ -822,13 +964,39 @@ function redo_do() local(ei, pad) (
     );
     undo_pack(udo_ust + _udo_uc * UDO_STRIDE, pad);
     udo_ust_pad[_udo_uc] = pad;
+    swing_rup_diff(udo_ust + _udo_uc * UDO_STRIDE, udo_urd + ei * UDO_STRIDE);   // the point's words, as in undo_do
     _udo_uc += 1;
     _udo_skip_out = 1; undo_unpack(udo_urd + ei * UDO_STRIDE, pad); _udo_skip_out = 0;   // the output choice stays (UDO_K_OUT)
     _udo_rc = ei;
     swing_rcp_post_pad(pad); swing_rcp_post_fx(pad);   // @block performs (A-9a)
     s_dirty[pad] = 1; col_dirty = 1;
-    gmem[GS_PROJ_DIRTY] = 1;  // Phase 1B: project-dirty (no REAPER undo point)
+    gmem[GS_PROJ_DIRTY] = 1;  // the project is dirty, and the press is a REAPER point (2026-10-27)
+    swing_rup_want(RUP_K_REDO, pad, rup_dk, rup_dk2, rup_dn);
     _udo_applying = 0;
+  );
+);
+
+// REAPER restored Swing (an undo, a redo, an open: @serialize read, and _reb_restore_gen moved at its end). Called at
+// the @gfx head, before any press is handled. Swing's own UNDO / REDO history describes a state that is gone, so it
+// goes: an UNDO pressed now would write an old entry over the restored pads (item I4 of 2026-10-27; the owner chose
+// "clear" over "reconcile"). A request still waiting (a browser load counted before the read too) and a wheel bracket
+// still open go with it -- a point made now would sit on top of REAPER's undo and empty its redo list. A fresh
+// baseline and mark start the next gesture. (A sliced capture still in flight stops throttling by itself: its
+// barrier needs _udo_st_valid, udo_cow_upto.)
+// And Wired and Multi-Out are never both on after a restore (the Multi-Out helper's finding, 2026-10-27): a redo of
+// Multi-Out -> Wired gave back REAPER's copy of Swing taken before Swing had left MULTI (companion cmd 6 clears it
+// here in @gfx, after the bridge's block stored the copy), so Swing came back in Multi-Out beside Wired. Wired wins,
+// as cmd 6 does it: only multi_out is cleared.
+function swing_rup_restore_heal() local(l) (
+  _udo_rst_seen != _reb_restore_gen ? (
+    _udo_rst_seen = _reb_restore_gen;
+    _udo_uc = 0; _udo_rc = 0; _udo_st_valid = 0;
+    _udo_swap_req = 0; _udo_name_req = 0; _udo_kitundo_req = 0;
+    l = 0; loop(NUM_SLOTS, _udo_pend[l] = 0; l += 1;);
+    _udo_nl_t = 0;
+    rup_want = 0; rup_now = 0; rup_ld_seen = rup_ld_n;
+    patch_on > 0.5 && multi_out ? ( multi_out = 0; );
+    undo_capture_baseline();
   );
 );
 
@@ -983,7 +1151,7 @@ function swap_pads(a, b)
     );
     swing_alloc_unlock();
 
-    // NOTE: pad name strings must be swapped by caller (get_cname_slot defined in main file)
+    // NOTE: pad name strings must be swapped by caller (get_cname_slot lives in rk_swing_core)
 
     // Recalculate derived values -- requested, @block performs (A-9a)
     swing_rcp_post_pad(a); swing_rcp_post_pad(b);

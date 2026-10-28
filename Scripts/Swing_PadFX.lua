@@ -69,9 +69,9 @@ local INSTANCE    = G.INSTANCE
 local GMEM_NAME   = core.GMEM_NAME
 
 -- Compact FX layout. The interactive EQ graph owns all the EQ band params
--- (HPF/LPF + Lo/Mid/Hi-Mid/Hi freq+gain) via draggable nodes, so the only EQ knob is
--- the shared filter Q. Everything else lives in side-by-side columns so the
--- panel stays short. Ranges/defaults mirror rk_swing_ui_grid_overlay_fx.jsfx-inc.
+-- (HPF/LPF + Lo/Mid/Hi-Mid/Hi freq+gain) via draggable nodes; there are no EQ knobs --
+-- every Q is set by the wheel over a node. Everything else lives in side-by-side
+-- columns so the panel stays short. Ranges/defaults mirror rk_swing_ui_grid_overlay_fx.jsfx-inc.
 -- EQ band params the graph reflects. Synced from gmem each frame so the curve +
 -- nodes track Swing's ACTUAL values (the graph IS the EQ control now — there are
 -- no EQ knobs to refresh them otherwise). RESO (filter Q) has no on-panel control
@@ -124,10 +124,9 @@ local DYN_COLS = {
 -- STATE
 -- ═══════════════════════════════════════════════════════════════════════════════
 local ui = { ctx = nil, is_open = true, first_frame = true,
-             want_dock_change = false, pending_dock_id = 0,
-             was_docked = nil, dock_skip = 0 }
+             want_dock_change = false, pending_dock_id = 0 }
 local settings = { theme = "eon", follow = true, pinned = 0, dock_id = 0,
-                   window_w = 360, window_h = 460 }
+                   window_w = 360, window_h = 360 }
 
 local display     = {}   -- pid -> last value shown (cache; suppresses drag jitter)
 local pending     = {}   -- pid -> value queued to send (drained one/frame)
@@ -135,8 +134,24 @@ local active_pid  = nil  -- pid dragged LAST frame (suppresses its gmem refresh 
 local next_active = nil  -- pid dragged THIS frame (becomes active_pid after the draw)
 local last_pad    = -2   -- pad the cache/pending belong to
 local eq_drag     = nil  -- index of the EQ-graph node being dragged
-local eq_drag_pids = {}  -- pids the EQ graph is editing this frame (suppress gmem refresh)
 local active_inst_id = 0
+-- pid -> { v = value sent, t = when }: after a send, gmem is ignored for that pid until it ECHOES the value or
+-- SENT_HOLD_S passes. The JSFX consumes in @block and republishes from @gfx a frame or two later, so the first
+-- read-back after a send still held the OLD value: nodes and knobs snapped back for a frame on every release,
+-- and a wheel tick landing on that frame recomputed from the stale Q and was lost.
+local sent        = {}
+local SENT_HOLD_S = 0.12
+-- pid -> time_precise() of its last send: drain_pending sends the queued pid sent longest ago (see there).
+local last_send   = {}
+local function sent_settled(pid, live)
+  local s = sent[pid]
+  if not s then return true end
+  if math.abs((live or 0) - s.v) <= 1e-6 or reaper.time_precise() - s.t > SENT_HOLD_S then
+    sent[pid] = nil
+    return true
+  end
+  return false
+end
 
 -- Swing-alive tracking via the monotonic heartbeat (GS_SWING_ALIVE).
 local hb_last, hb_at = -1, 0
@@ -176,6 +191,10 @@ local function enumerate_instances()
     local hb = reaper.gmem_read(base + G.GS_INST_REG_OFF_HEARTBEAT)
     if id > 0 and hb > 0 and (now - hb) < G.GS_INST_REG_TIMEOUT then alive[id] = true end
   end
+  -- No live registry slot = no instance to find: sixteen gmem reads answer it. Without this the walk below
+  -- (every FX on every track, master included, an fx_ident string read each) ran once a second for as long as
+  -- the panel sat open in a Swing-less project, and once per FRAME while the Inst popup was open.
+  if next(alive) == nil then return list end
   for tr in core.iter_all_tracks() do
     for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
       if core.is_swing_fx(tr, fx) then   -- the plugin's file, never its shown name (the bridge's rule)
@@ -191,7 +210,13 @@ local function enumerate_instances()
   return list
 end
 
-local function auto_pick_instance()
+-- proj_changed: the caller saw the project tab move (EnumProjects(-1) is a new
+-- pointer). A Swing in a background tab keeps its registry id while its @block
+-- sleeps, so the target stayed on it across the switch: a frozen pad, knob
+-- moves into a channel nobody consumes, the dot lit by the other tab's Swing,
+-- and the Inst list (this project only) not even showing it. On a switch the
+-- target must be in THIS project, or it is dropped and re-picked here.
+local function auto_pick_instance(proj_changed)
   active_inst_id = math.floor(reaper.gmem_read(INSTANCE))
   -- Identity rollout (2026-07-08): a cached/inherited id can be re-minted
   -- mid-session (duplicate duel in the JSFX reconciler); a stale id would
@@ -205,6 +230,12 @@ local function auto_pick_instance()
       if math.floor(reaper.gmem_read(base + G.GS_INST_REG_OFF_ID) or 0) == active_inst_id then
         present = true
         break
+      end
+    end
+    if present and proj_changed then
+      present = false
+      for _, it in ipairs(enumerate_instances()) do
+        if it.inst_id == active_inst_id then present = true; break end
       end
     end
     if not present then
@@ -331,7 +362,9 @@ local function draw_eq_graph(ctx, fx_live, graph_h)
   -- Q-scroll), so the round-trip lag doesn't make the curve flicker.
   if fx_live then
     for _, pid in ipairs(EQ_BAND_PIDS) do
-      if fx_live[pid] ~= nil and pending[pid] == nil then display[pid] = fx_live[pid] end
+      if fx_live[pid] ~= nil and pending[pid] == nil and sent_settled(pid, fx_live[pid]) then
+        display[pid] = fx_live[pid]
+      end
     end
   end
   local dl = ImGui.GetWindowDrawList(ctx)
@@ -355,7 +388,8 @@ local function draw_eq_graph(ctx, fx_live, graph_h)
   for _, f in ipairs({ 50, 100, 200, 500, 1000, 2000, 5000, 10000 }) do
     local px = FX(f)
     ImGui.DrawList_AddLine(dl, px, y0, px, y0 + H, 0xFFFFFF12)
-    ImGui.DrawList_AddText(dl, px + 2, y0 + H - 12, 0xFFFFFF55, f >= 1000 and (f / 1000) .. "k" or tostring(f))
+    -- `//`, not `/`: Lua 5.4's `/` is always a float, so 1000 / 1000 .. "k" printed "1.0k 2.0k 5.0k 10.0k"
+    ImGui.DrawList_AddText(dl, px + 2, y0 + H - 12, 0xFFFFFF55, f >= 1000 and (f // 1000) .. "k" or tostring(f))
   end
   for _, d in ipairs({ 12, 6, 0, -6, -12 }) do
     local py = GY(d)
@@ -422,10 +456,10 @@ local function draw_eq_graph(ctx, fx_live, graph_h)
     local mx, my = ImGui.GetMousePos(ctx)
     local n = nodes[eq_drag]
     local nf = clampn(XF(mx), n.fmin, n.fmax)
-    display[n.fpid] = nf; pending[n.fpid] = nf; eq_drag_pids[n.fpid] = true
+    display[n.fpid] = nf; pending[n.fpid] = nf
     if n.gpid then
       local ng = clampn(YG(my), n.gmin, n.gmax)
-      display[n.gpid] = ng; pending[n.gpid] = ng; eq_drag_pids[n.gpid] = true
+      display[n.gpid] = ng; pending[n.gpid] = ng
     end
   end
   if not active then eq_drag = nil end
@@ -495,8 +529,10 @@ end
 -- handles layout (SameLine / groups).
 local function draw_fx_control(ctx, item, fx_live, knob_size, pill_w, compact)
   local pid = item.pid
-  -- Refresh cache from gmem unless this control is being dragged (knob or graph node).
-  if pid ~= active_pid and not eq_drag_pids[pid] and fx_live and fx_live[pid] ~= nil then
+  -- Refresh cache from gmem unless this knob is being dragged. (The EQ graph's
+  -- nodes keep their own guard: draw_eq_graph skips a pid with an edit queued.)
+  if pid ~= active_pid and fx_live and fx_live[pid] ~= nil
+     and sent_settled(pid, fx_live[pid]) then
     display[pid] = fx_live[pid]
   end
   if display[pid] == nil then display[pid] = (item.default or 0) end
@@ -532,15 +568,27 @@ local function draw_fx_control(ctx, item, fx_live, knob_size, pill_w, compact)
   end
 end
 
--- Send at most one queued edit per frame (channel is single-slot, last-wins;
--- a knob drag changes one pid per frame so this stays smooth).
+-- Send at most one queued edit per frame: the channel is single-slot and last-wins,
+-- so a second write in the same frame would overwrite the first before Swing's
+-- @block reads it. A knob drag changes one pid per frame, so that stays smooth. A
+-- held drag on a Low/Mid/Hi-Mid/High node re-queues TWO pids (freq + gain) every
+-- frame; the one sent is the queued pid sent LONGEST AGO (never sent = first, ties
+-- by pid), so the two alternate and both reach the pad while the node moves. This
+-- used to take pairs() order, which picked the same pid every frame: the other
+-- waited until the drag ended (C1.12, fix round 2026-10-27).
 local function drain_pending(pad)
   if pad < 0 then pending = {}; return end
-  for pid, val in pairs(pending) do
-    core.send_fx_action(pad, pid, val)
-    pending[pid] = nil
-    return  -- one per frame
+  local pick, pick_t = nil, nil
+  for pid in pairs(pending) do
+    local t = last_send[pid] or -1
+    if pick == nil or t < pick_t or (t == pick_t and pid < pick) then pick, pick_t = pid, t end
   end
+  if pick == nil then return end
+  local val, now = pending[pick], reaper.time_precise()
+  core.send_fx_action(pad, pick, val)
+  pending[pick] = nil
+  last_send[pick] = now
+  sent[pick] = { v = val, t = now }   -- hold the display until gmem echoes it (sent_settled)
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════════
@@ -579,9 +627,12 @@ local function frame()
   -- registry-absent id and re-picks; no-op while the target is healthy).
   do
     local now_t = reaper.time_precise()
-    if (ui.inst_check_t or 0) + 1.0 < now_t then
+    local proj = reaper.EnumProjects(-1)
+    local proj_changed = proj ~= ui.proj_last
+    ui.proj_last = proj
+    if proj_changed or (ui.inst_check_t or 0) + 1.0 < now_t then
       ui.inst_check_t = now_t
-      auto_pick_instance()
+      auto_pick_instance(proj_changed)
     end
   end
 
@@ -691,7 +742,13 @@ local function frame()
     -- Instance picker
     if ImGui.Button(ctx, "Inst##inst", 48, 22) then ImGui.OpenPopup(ctx, "inst_menu") end
     if ImGui.BeginPopup(ctx, "inst_menu") then
-      local list = enumerate_instances()
+      -- Built when the popup opens and refreshed once a second while it is up: the full track walk ran every
+      -- frame the popup was open.
+      local now_l = reaper.time_precise()
+      if ImGui.IsWindowAppearing(ctx) or not ui.inst_list or (ui.inst_list_t or 0) + 1.0 < now_l then
+        ui.inst_list, ui.inst_list_t = enumerate_instances(), now_l
+      end
+      local list = ui.inst_list
       if #list == 0 then
         ImGui.TextDisabled(ctx, "No live Swing instances")
       else
@@ -758,7 +815,7 @@ local function frame()
     -- clearing it blanked every control for a frame, which read as flicker on
     -- each selection change.
     if pad ~= last_pad then
-      pending, active_pid, eq_drag = {}, nil, nil
+      pending, active_pid, eq_drag, sent = {}, nil, nil, {}
       last_pad = pad
     end
 
@@ -774,7 +831,16 @@ local function frame()
       ImGui.Dummy(ctx, 1, 2)
       local fx_live = core.read_pad_fx(pad)  -- nil during a pad-switch frame
       next_active = nil                      -- collected during this frame's draw
-      eq_drag_pids = {}                      -- repopulated by the EQ graph if dragging
+      -- PINNED to a pad Swing is not publishing: the band carries only the overlay / selected pad (a request
+      -- cell the JSFX honours for the pinned pad is the other half, still to come), so there is nothing to show
+      -- and nothing safe to write. The old code drew every control at its DEFAULT and a node drag sent those
+      -- defaults to the pinned pad -- a +6 dB shelf wiped by nudging a node. Shown greyed, edits not sent.
+      local unpublished = (fx_live == nil) and not settings.follow
+      if unpublished then
+        ImGui.TextColored(ctx, widgets.colors.status_err,
+          "Swing is showing another pad. Select " .. core.pad_label(pad) .. " in Swing to edit it here.")
+        ImGui.BeginDisabled(ctx)
+      end
 
       -- Auto-fit layout: the panel scales its contents (EQ + knobs) to the
       -- docked size — but controls have a FLOOR (user 2026-08-25: "buttons
@@ -840,8 +906,8 @@ local function frame()
       local eq_h = avail_h - SEPS - dyn_h       -- EQ takes the rest
       if eq_h < EQ_THIN then eq_h = EQ_THIN end
 
-      -- EQ: the interactive graph owns the bands (HPF/LPF + Lo/Mid/Hi); the
-      -- only EQ knob is the shared filter Q.
+      -- EQ: the interactive graph owns the bands (HPF/LPF + Lo/Mid/Hi-Mid/Hi);
+      -- there are no EQ knobs (Q is the wheel over a node).
       ImGui.SeparatorText(ctx, "EQ")
       draw_eq_graph(ctx, fx_live, eq_h)
 
@@ -874,8 +940,13 @@ local function frame()
         ImGui.EndTable(ctx)
       end
 
-      active_pid = next_active               -- latch for next frame's suppression
-      drain_pending(pad)
+      if unpublished then
+        ImGui.EndDisabled(ctx)
+        pending = {}                         -- nothing reaches a pad whose values were never seen
+      else
+        active_pid = next_active             -- latch for next frame's suppression
+        drain_pending(pad)
+      end
     end
 
     -- Publish dock changes the moment they happen, the way Swing_Browser

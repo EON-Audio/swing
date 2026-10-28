@@ -65,21 +65,9 @@ local select_rect_active = false
 local select_rect_ax, select_rect_ay = 0, 0   -- anchor (drag start)
 local select_rect_bx, select_rect_by = 0, 0   -- current mouse during drag
 
--- Expose selection module to other paint_mode subscribers (render path).
+-- Expose the selection module. Nothing in the scripts reads it; the DM test
+-- harness (sw_dm1_test.py) does.
 M._selection_module = selection
-
--- Slots toolbar (#4) highlight-clear hook. Injected by eon_drum_matrix so the
--- SAME slots_strip module instance (and its last_loaded_letter state) is
--- notified. We must NOT dofile slots_strip here: that would create a SECOND
--- copy with its own state, and clearing the highlight on the copy would leave
--- the rendered strip still showing a stale "recalled" badge. Called on any
--- successful note mutation (paint/erase/velocity/length) so the lanes no
--- longer match the recalled slot.
-local _note_user_edit = nil
-function M.SetNoteUserEditHook(fn) _note_user_edit = fn end
-local function note_user_edit()
-  if _note_user_edit then _note_user_edit() end
-end
 
 -- Last preset applied per LANE TRACK (keyed by track GUID — handles parallel
 -- kits where pad_index can collide). Session-only; cleared on restart.
@@ -184,7 +172,6 @@ local function set_note_velocity(take, idx, vel)
   reaper.MIDI_Sort(take)
   local item = reaper.GetMediaItemTake_Item(take)
   if item then reaper.UpdateItemInProject(item) end
-  note_user_edit()
 end
 
 -- Grid-division cycling lives in lib/grid.lua (shared with the grid-cog widget
@@ -208,14 +195,10 @@ local active             = false
 local drag_active        = false
 local drag_mode          = nil   -- 'insert' | 'delete'
 local drag_button        = 0     -- 0 = LMB (paint/erase per cell state), 1 = RMB (erase-drag)
-local drag_anchor_time   = 0
 local drag_last_time     = nil
-local drag_anchor_pitch  = nil
 local drag_anchor_track  = nil
 local drag_anchor_lane_info = nil
-local drag_anchor_take   = nil
 local drag_anchor_item_color = nil   -- dim pad-color int for auto-created items
-local drag_created_items     = {}    -- [item] = true; items auto-created this drag
 -- Piano-mode paint state. When the anchor lane is piano-mode, the painted pitch
 -- follows the mouse-Y row instead of being the fixed pad pitch. drag_anchor_lt
 -- snapshots the lane geometry at drag-start; current_paint_pitch is refreshed
@@ -227,6 +210,9 @@ local current_paint_pitch    = nil
 -- or nil when the lane follows the project grid. Snapshotted at gesture start so
 -- ApplyAtCell / PaintCellsBetween size steps and walk cells on the lane's grid.
 local drag_anchor_subdiv     = nil
+-- The lane's effective swing (-1..1) frozen at gesture start, so the cells a
+-- drag walks are the SWUNG cells a click lands on (see PaintCellsBetween).
+local drag_anchor_swing      = nil
 
 -- Phantom-cell list (closes the 1-frame paint lag). paint_mode.Update runs
 -- AFTER the renderer each frame, so a note inserted now first appears next
@@ -280,8 +266,11 @@ end
 -- ============================================================================
 
 local function bar_end_time(start_time, bar_count)
-  local start_qn = reaper.TimeMap_timeToQN(start_time)
-  local start_meas = math.floor(reaper.TimeMap_QNToMeasures(0, start_qn))
+  -- 0-based measure of start_time via the TimeMap2 pair (the convention
+  -- lane_tools / pattern_regions use). NOT TimeMap_QNToMeasures: that one is
+  -- 1-based, and fed into the 0-based GetMeasureInfo it made every auto-created
+  -- item one bar longer than new_item_bars (audit DM15, 2026-10-26).
+  local _, start_meas = reaper.TimeMap2_timeToBeats(0, start_time)
   local _, end_qn = reaper.TimeMap_GetMeasureInfo(0, start_meas + bar_count)
   return reaper.TimeMap_QNToTime(end_qn)
 end
@@ -293,24 +282,53 @@ end
 local function grid_length(time, gdiv_override)
   local grid_div_qn = gdiv_override
   if not grid_div_qn or grid_div_qn <= 0 then
-    local _, gd = reaper.GetSetProjectGrid(0, false)
-    grid_div_qn = gd
+    grid_div_qn = grid.ProjectDivQN()   -- REAPER's whole notes -> QN (grid.lua, DM14)
   end
   if not grid_div_qn or grid_div_qn == 0 then grid_div_qn = 0.25 end
   local qn = reaper.TimeMap_timeToQN(time)
   return reaper.TimeMap_QNToTime(qn + grid_div_qn) - time
 end
 
--- Find an existing MIDI item on `track` whose [start, end] contains `time`.
--- If none, create a 1-bar item starting AT `time` and style it so it visually
--- blends in: dim pad-colored background + empty take name. The 1-bar default
--- gives the drag enough canvas to paint into; the item is trimmed to fit its
--- actual MIDI content on drag-release (see TrimItemToFitNotes).
+-- A lane's own swing subdivision (QN) when it has one, else nil = the project
+-- grid. The ONE rule for every cell sized on a lane: click, drag, right-click
+-- toggle, velocity strip, piano draw and the item auto-extend all pass it to
+-- grid_length. Sites that read the project step on a subdivided lane spanned
+-- two fine cells (audit DM111, 2026-10-26).
+local function lane_subdiv(coords, lane_info)
+  local sd = lane_info and tonumber(lane_info.swing_subdiv)
+  if sd and sd > 0 and coords and coords.EffectiveSwingDivQN then
+    return coords.EffectiveSwingDivQN(lane_info)
+  end
+  return nil
+end
+
+-- Effective swing for a lane (-1..1): its own non-zero swing wins, else the
+-- project swing (GetSetProjectGrid swingmode 1 / swingamt), else 0.
+local function effective_swing(lane_info)
+  local lane_sw = (lane_info and tonumber(lane_info.swing_amount)) or 0
+  if lane_sw ~= 0 then return lane_sw end
+  local _, swingmode, swingamt = grid.ProjectDivQN()
+  if swingmode == 1 then return tonumber(swingamt) or 0 end
+  return 0
+end
+
+-- Find an existing MIDI item on `track` whose [start, end) contains `time`.
+-- If none, create an item of `new_item_bars` bars (default 4) starting AT
+-- `time` and style it so it visually blends in: dim pad-colored background +
+-- empty take name. The item is a fixed-length canvas: it is never trimmed to
+-- its notes.
+-- `step_qn` (optional): the lane's own grid step for the auto-extend (nil =
+-- project grid), see lane_subdiv.
 -- Returns (item, take, was_newly_created).
-local function GetOrCreateMidiItemAt(track, time, dim_item_color)
+local function GetOrCreateMidiItemAt(track, time, dim_item_color, step_qn)
   local item_count = reaper.CountTrackMediaItems(track)
 
-  -- 1) Click is INSIDE an existing item -> use it as-is.
+  -- 1) Click is INSIDE an existing item -> use it as-is. The end is EXCLUSIVE,
+  --    as in find_existing_take_at / NoteInCell: a cell starting exactly at the
+  --    item's end takes the auto-extend path below like every later cell. An
+  --    inclusive end returned the item unextended and put the note at its end,
+  --    where REAPER never plays it and right-click could not find it
+  --    (audit DM16, 2026-10-26).
   for i = 0, item_count - 1 do
     local item = reaper.GetTrackMediaItem(track, i)
     local take = reaper.GetActiveTake(item)
@@ -318,7 +336,7 @@ local function GetOrCreateMidiItemAt(track, time, dim_item_color)
       local item_start = reaper.GetMediaItemInfo_Value(item, 'D_POSITION')
       local item_len   = reaper.GetMediaItemInfo_Value(item, 'D_LENGTH')
       local item_end   = item_start + item_len
-      if time >= item_start and time <= item_end then
+      if time >= item_start and time < item_end - 1e-6 then
         return item, take, false
       end
     end
@@ -351,7 +369,7 @@ local function GetOrCreateMidiItemAt(track, time, dim_item_color)
   if nearest_item and time >= nearest_start - 1e-6 and settings.Get('auto_extend') then
     -- We only auto-extend the right edge. Moving D_POSITION (the left edge)
     -- would shift the take origin and break PPQ positions of existing notes.
-    local need_end = time + grid_length(time)
+    local need_end = time + grid_length(time, step_qn)
     if need_end > nearest_end then
       reaper.SetMediaItemInfo_Value(nearest_item, 'D_LENGTH', need_end - nearest_start)
       reaper.UpdateItemInProject(nearest_item)
@@ -376,31 +394,6 @@ local function GetOrCreateMidiItemAt(track, time, dim_item_color)
     reaper.GetSetMediaItemTakeInfo_String(new_take, 'P_NAME', '', true)
   end
   return new_item, new_take, true
-end
-
--- Trim an item's right edge to match the latest note end inside it. Called on
--- drag-release for items the drag auto-created, so single-click items don't
--- leave a 1-bar "tail" stretching past the only note.
-local function TrimItemToFitNotes(item)
-  if not item or not reaper.ValidatePtr(item, 'MediaItem*') then return end
-  local take = reaper.GetActiveTake(item)
-  if not take or not reaper.TakeIsMIDI(take) then return end
-  local _, note_count = reaper.MIDI_CountEvts(take)
-  if note_count == 0 then return end
-  local max_end = 0
-  for i = 0, note_count - 1 do
-    local ok, _, _, _, ppq_e = reaper.MIDI_GetNote(take, i)
-    if ok then
-      local t = reaper.MIDI_GetProjTimeFromPPQPos(take, ppq_e)
-      if t > max_end then max_end = t end
-    end
-  end
-  local item_start = reaper.GetMediaItemInfo_Value(item, 'D_POSITION')
-  local new_len = max_end - item_start
-  if new_len > 0 then
-    reaper.SetMediaItemInfo_Value(item, 'D_LENGTH', new_len)
-    reaper.UpdateItemInProject(item)
-  end
 end
 
 -- Locate a note in `take` at given pitch whose start falls inside the grid
@@ -549,7 +542,6 @@ local function InsertNoteAtCell(take, pitch, time, length, ghost_vel)
   end
   -- Optional live preview — only fires when the user has toggled it on.
   send_live_note(pitch, vel)
-  note_user_edit()
 end
 
 -- Compute the velocity to use for a paint click given current keyboard mods.
@@ -572,7 +564,6 @@ local function DeleteNoteAtCell(take, note_idx)
   reaper.MIDI_Sort(take)
   local item = reaper.GetMediaItemTake_Item(take)
   if item then reaper.UpdateItemInProject(item) end
-  note_user_edit()
 end
 
 -- Find the existing MIDI take whose item contains `time` on `track`, WITHOUT
@@ -611,9 +602,8 @@ local function ApplyAtCell(cell_start)
   local step_len = grid_length(cell_start, drag_anchor_subdiv)
   local cell_end = cell_start + step_len
   if drag_mode == 'insert' then
-    local item, take, created = GetOrCreateMidiItemAt(drag_anchor_track, cell_start, drag_anchor_item_color)
+    local _, take = GetOrCreateMidiItemAt(drag_anchor_track, cell_start, drag_anchor_item_color, drag_anchor_subdiv)
     if not take then return end
-    if created then drag_created_items[item] = true end
     local idx = NoteInCell(take, pitch, cell_start, cell_end)
     if not idx then
       InsertNoteAtCell(take, pitch, cell_start, step_len)
@@ -632,31 +622,48 @@ end
 -- QN-indexed walking: each cell_start is computed from an integer index *
 -- grid_div_qn, so there's no float accumulation between cells. Direction-aware
 -- so fast drags work in either direction and never skip a cell.
-local function PaintCellsBetween(a, b)
+local function PaintCellsBetween(a, b, coords)
   if a == b then return end
   -- Walk at the lane's own swing subdivision when it has one (snapshotted in
   -- drag_anchor_subdiv at gesture start); otherwise the project grid.
   local grid_div_qn = drag_anchor_subdiv
   if not grid_div_qn or grid_div_qn <= 0 then
-    local _, gd = reaper.GetSetProjectGrid(0, false)
-    grid_div_qn = gd
+    grid_div_qn = grid.ProjectDivQN()
   end
   if not grid_div_qn or grid_div_qn == 0 then return end
 
-  local a_qn = reaper.TimeMap_timeToQN(a)
-  local b_qn = reaper.TimeMap_timeToQN(b)
-  -- Cell index = which grid cell the time falls into (floor-snap).
-  local a_idx = math.floor(a_qn / grid_div_qn + 1e-9)
-  local b_idx = math.floor(b_qn / grid_div_qn + 1e-9)
+  -- Cell index = which SWUNG cell the time falls into, and a cell's time = its
+  -- swung start, with the lane's swing frozen at gesture start (the same
+  -- transform snap_click_time applies to a click). Walking straight idx*g on a
+  -- swung lane laid the dragged off-beats ahead of the clicked ones, and the
+  -- next click on such a cell doubled the hit (audit DM17, 2026-10-26). With
+  -- no swing both reduce to floor(qn / g) and idx * g, as before.
+  local sw = drag_anchor_swing or 0
+  local function cell_idx(t)
+    local qn = reaper.TimeMap_timeToQN(t)
+    if sw ~= 0 and coords and coords.SwingSnapDownToCellQN then
+      -- a swung start = idx*g + s*g/3, |s| <= 1: the nearest index is its own
+      return math.floor(coords.SwingSnapDownToCellQN(qn, grid_div_qn, sw) / grid_div_qn + 0.5)
+    end
+    return math.floor(qn / grid_div_qn + 1e-9)
+  end
+  local function cell_time(idx)
+    local qn = idx * grid_div_qn
+    if sw ~= 0 and coords and coords.SwingTransformQN then
+      qn = coords.SwingTransformQN(qn, grid_div_qn, sw)
+    end
+    return reaper.TimeMap_QNToTime(qn)
+  end
+  local a_idx, b_idx = cell_idx(a), cell_idx(b)
   if a_idx == b_idx then return end
 
   if b_idx > a_idx then
     for idx = a_idx + 1, b_idx do
-      ApplyAtCell(reaper.TimeMap_QNToTime(idx * grid_div_qn))
+      ApplyAtCell(cell_time(idx))
     end
   else
     for idx = a_idx - 1, b_idx, -1 do
-      ApplyAtCell(reaper.TimeMap_QNToTime(idx * grid_div_qn))
+      ApplyAtCell(cell_time(idx))
     end
   end
 end
@@ -711,17 +718,15 @@ local function snap_click_time(coords, raw_time, lane_info)
   if mode == 'off' then return raw_time end
 
   -- Effective swing: a non-zero lane swing wins; otherwise follow the project
-  -- swing (GetSetProjectGrid swingmode/swingamt). On a power-of-2 grid this
+  -- swing (GetSetProjectGrid swingmode/swingamt) -- effective_swing, the rule
+  -- the drag walk freezes at gesture start too. On a power-of-2 grid this
   -- routes through the closed-form swung-cell snap. Swing collapses 'nearest'
   -- to floor — swung-cell step semantics are floor by nature.
-  local _, gdiv, swingmode, swingamt = reaper.GetSetProjectGrid(0, false)
+  local gdiv = grid.ProjectDivQN()
   -- Effective swing grid: a lane's own swing_subdiv (cog "Swing grid" combo)
   -- overrides the project grid; absent -> project grid (identical to before).
   local g_eff   = (coords.EffectiveSwingDivQN and coords.EffectiveSwingDivQN(lane_info)) or gdiv
-  local lane_sw = (lane_info and tonumber(lane_info.swing_amount)) or 0
-  local eff_sw  = 0
-  if lane_sw ~= 0 then eff_sw = lane_sw
-  elseif swingmode == 1 then eff_sw = tonumber(swingamt) or 0 end
+  local eff_sw  = effective_swing(lane_info)
   -- Route through the swung-cell snap when there's swing OR when this lane uses
   -- its own subdivision (so straight notes still land on the lane's finer grid).
   -- With eff_sw == 0 the snap reduces to a plain floor onto g_eff cells.
@@ -741,17 +746,14 @@ local function reset_drag_state()
   drag_active             = false
   drag_mode               = nil
   drag_button             = 0
-  drag_anchor_time        = 0
   drag_last_time          = nil
-  drag_anchor_pitch       = nil
   drag_anchor_track       = nil
   drag_anchor_lane_info   = nil
-  drag_anchor_take        = nil
   drag_anchor_item_color  = nil
-  drag_created_items      = {}
   drag_anchor_piano       = false
   drag_anchor_lt          = nil
   drag_anchor_subdiv      = nil
+  drag_anchor_swing       = nil
   current_paint_pitch     = nil
 end
 
@@ -825,8 +827,8 @@ function M.NudgeSelection(d_step, d_semi)
   if selection.Count() == 0 then return end
   reaper.Undo_BeginBlock()
   if d_step and d_step ~= 0 then
-    local _, grid = reaper.GetSetProjectGrid(0, false)
-    if grid and grid > 0 then selection.ShiftBy(d_step * grid) end
+    local step_qn = grid.ProjectDivQN()
+    if step_qn > 0 then selection.ShiftBy(d_step * step_qn) end
   end
   if d_semi and d_semi ~= 0 then selection.TransposeBy(d_semi) end
   reaper.Undo_EndBlock('EON DM: nudge selection', -1)
@@ -933,12 +935,13 @@ function M.DuplicateSelection()
     end
   end
   if t0 == math.huge then return 0 end
-  -- Bar length at the earliest selected note, taken from its measure index
-  -- directly (no boundary round-trip — that can mis-round to a 0 delta).
+  -- Bar length at the earliest selected note: the bar's own QN bounds come back
+  -- beside its (1-based) measure index. Feeding that index to the 0-based
+  -- GetMeasureInfo read the NEXT bar's length, so across a meter change the
+  -- copies landed early (audit DM18, 2026-10-26).
   local qn   = reaper.TimeMap_timeToQN(t0)
-  local meas = math.floor(reaper.TimeMap_QNToMeasures(0, qn))
-  local _, qs, qe = reaper.TimeMap_GetMeasureInfo(0, meas)
-  local qn_delta  = qe - qs
+  local _, qs, qe = reaper.TimeMap_QNToMeasures(0, qn)
+  local qn_delta  = (qe or 0) - (qs or 0)
   if qn_delta <= 0 then return 0 end
   return selection.DuplicateBy(qn_delta, 0)
 end
@@ -1084,10 +1087,14 @@ function M.Update(ctx, lane_targets, coords)
   --   over empty   → cycle the project grid, but ONLY if opted in via
   --                  'grid_scroll_in_paint'. The dedicated grid cog is the
   --                  always-on way to change the grid (works paint on/off).
-  -- Skip when a DM UI element owns the mouse (grid cog, pattern bar, settings,
-  -- tool-mode) — that widget handles its own wheel; we must not double-act.
+  -- Skip when a DM UI element owns the mouse (grid cog, pattern bar, settings)
+  -- or our own lane-tools popup is open — that widget handles its own wheel;
+  -- we must not double-act. The popup was only folded into ui_owns_mouse below
+  -- this block, so a wheel over its Patterns list also edited the note (or
+  -- cycled the grid) behind it (audit DM19, 2026-10-26).
+  local tools_popup_open = (reaper.ImGui_IsPopupOpen and reaper.ImGui_IsPopupOpen(ctx, TOOLS_POPUP_ID)) or false
   local wheel = reaper.ImGui_GetMouseWheel(ctx) or 0
-  if wheel ~= 0 and not mouse_blocked then
+  if wheel ~= 0 and not mouse_blocked and not tools_popup_open then
     local dir   = wheel > 0 and 1 or -1
     local mods  = reaper.ImGui_GetKeyMods(ctx) or 0
     local fine  = (mods & reaper.ImGui_Mod_Shift()) ~= 0
@@ -1178,8 +1185,7 @@ function M.Update(ctx, lane_targets, coords)
   -- click-initiation flags below — otherwise the click also "bleeds through"
   -- and paints/selects in the lane behind the menu. Ongoing drags use
   -- IsMouseDown/Released and are unaffected, so an in-progress gesture finishes.
-  local ui_owns_mouse = mouse_blocked
-    or (reaper.ImGui_IsPopupOpen and reaper.ImGui_IsPopupOpen(ctx, TOOLS_POPUP_ID))
+  local ui_owns_mouse = mouse_blocked or tools_popup_open
   local _click0 = (not ui_owns_mouse) and reaper.ImGui_IsMouseClicked(ctx, 0)
   local _click1 = (not ui_owns_mouse) and reaper.ImGui_IsMouseClicked(ctx, 1)
 
@@ -1354,7 +1360,6 @@ function M.Update(ctx, lane_targets, coords)
         reaper.MIDI_Sort(length_drag_take)
         local item = reaper.GetMediaItemTake_Item(length_drag_take)
         if item then reaper.UpdateItemInProject(item) end
-        note_user_edit()
       end
       return
     elseif reaper.ImGui_IsMouseReleased(ctx, 0) then
@@ -1438,9 +1443,12 @@ function M.Update(ctx, lane_targets, coords)
           local new_ppq_e = new_ppq_s + note_move_len_ppq
           if note_move_dup then
             -- Shift+drag → leave originals, drop a copy at the dragged delta.
+            -- Released back on its own cell and row = no copy: a twin stacked
+            -- on the original is invisible in the grid and plays twice
+            -- (audit DM117, 2026-10-26; DuplicateBy has the same guard).
             if grouped then
               selection.DuplicateBy(qn_delta, d_pitch)
-            else
+            elseif qn_delta ~= 0 or d_pitch ~= 0 then
               reaper.MIDI_InsertNote(note_move_take, false, false,
                 new_ppq_s, new_ppq_e, 0, pitch, note_move_orig_vel, true)
               reaper.MIDI_Sort(note_move_take)
@@ -1458,7 +1466,6 @@ function M.Update(ctx, lane_targets, coords)
           end
         end
         reaper.Undo_EndBlock(note_move_dup and 'EON DM: duplicate note' or 'EON DM: move note', -1)
-        note_user_edit()
       elseif valid then
         -- No drag -> plain click: toggle the note off (preserves old behavior).
         DeleteNoteAtCell(note_move_take, note_move_idx)
@@ -1477,7 +1484,7 @@ function M.Update(ctx, lane_targets, coords)
   if note_draw_active then
     local lt       = note_draw_lt
     local start_t  = note_draw_anchor_t
-    local min_len  = lt and grid_length(start_t) or 0
+    local min_len  = lt and grid_length(start_t, lane_subdiv(coords, lt.lane_info)) or 0
     if reaper.ImGui_IsMouseDown(ctx, 0) then
       if not note_draw_started
          and (math.abs(mx - note_draw_anchor_mx) > NOTE_MOVE_THRESHOLD
@@ -1517,7 +1524,7 @@ function M.Update(ctx, lane_targets, coords)
           if length < min_len then length = min_len end
         end
         local pitch    = lane_pitch_at_y(lt, my)
-        local item, take = GetOrCreateMidiItemAt(lt.track, start_t, lt.item_color)
+        local item, take = GetOrCreateMidiItemAt(lt.track, start_t, lt.item_color, lane_subdiv(coords, lt.lane_info))
         if take and not NoteInCell(take, pitch, start_t, start_t + min_len) then
           InsertNoteAtCell(take, pitch, start_t, length, paint_velocity_for_mods(ctx))
         end
@@ -1537,7 +1544,10 @@ function M.Update(ctx, lane_targets, coords)
     for _, lt in ipairs(lane_targets) do
       local in_lane  = (my >= lt.y1 and my <= lt.y2)
       local in_strip = lt.strip and (my >= lt.strip.y1 and my <= lt.strip.y2)
-      if in_lane and not in_strip then
+      -- A locked lane's notes are no resize target: the click falls through to
+      -- the paint branch, which says "lane locked" (audit DM110, 2026-10-26).
+      local locked   = lt.lane_info and lt.lane_info.locked == true
+      if in_lane and not in_strip and not locked then
         -- Row-aware: only the note on the clicked pitch row is a resize target.
         -- (Drum lanes: lane_pitch_at_y returns pad_pitch, so this is the single
         -- pad pitch as before. Piano lanes: the exact row under the cursor, so a
@@ -1572,8 +1582,7 @@ function M.Update(ctx, lane_targets, coords)
                   length_drag_min_len  = 0.005
                   -- Freeze the current project grid divider so a mid-drag
                   -- wheel cycle (case #14) doesn't change the snap target.
-                  local _, gdiv = reaper.GetSetProjectGrid(0, false)
-                  length_drag_grid_qn  = gdiv or 0
+                  length_drag_grid_qn  = grid.ProjectDivQN()
                   reaper.Undo_BeginBlock()
                   found = true
                   break
@@ -1621,11 +1630,21 @@ function M.Update(ctx, lane_targets, coords)
     for _, lt in ipairs(lane_targets) do
       local s = lt.strip
       if s and my >= s.y1 and my <= s.y2 then
-        -- Find which note we landed on by hit-testing the cell at this X.
+        -- Locked lane: no velocity edit either; say so, like the paint
+        -- branches do (audit DM110, 2026-10-26).
+        if lt.lane_info and lt.lane_info.locked == true then
+          if reaper.Help_Set then
+            reaper.Help_Set('EON DM: lane locked — unlock in Settings → Pads', false)
+          end
+          return
+        end
+        -- Find which note we landed on by hit-testing the cell at this X. The
+        -- cell is the LANE's step (its own subdivision when it has one), or the
+        -- project step spanned two fine cells and the drag edited the wrong note.
         local raw_time = coords.PixelToTime(mx)
         if raw_time then
           local cell_start = snap_click_time(coords, raw_time, lt.lane_info)
-          local cell_end   = cell_start + grid_length(cell_start)
+          local cell_end   = cell_start + grid_length(cell_start, lane_subdiv(coords, lt.lane_info))
           -- Find the item containing cell_start and its take.
           local n = reaper.CountTrackMediaItems(lt.track)
           for i = 0, n - 1 do
@@ -1846,8 +1865,8 @@ function M.Update(ctx, lane_targets, coords)
           if reaper.ImGui_MenuItem(ctx, 'Velocity -10')         then selection.AdjustVelocity(-10);    reaper.ImGui_CloseCurrentPopup(ctx) end
           if reaper.ImGui_MenuItem(ctx, 'Velocity -20')         then selection.AdjustVelocity(-20);    reaper.ImGui_CloseCurrentPopup(ctx) end
           reaper.ImGui_Separator(ctx)
-          local _, grid_qn = reaper.GetSetProjectGrid(0, false)
-          if grid_qn and grid_qn > 0 then
+          local grid_qn = grid.ProjectDivQN()
+          if grid_qn > 0 then
             if reaper.ImGui_MenuItem(ctx, 'Shift left 1 step')  then selection.ShiftBy(-grid_qn);      reaper.ImGui_CloseCurrentPopup(ctx) end
             if reaper.ImGui_MenuItem(ctx, 'Shift right 1 step') then selection.ShiftBy( grid_qn);      reaper.ImGui_CloseCurrentPopup(ctx) end
           end
@@ -1953,17 +1972,20 @@ function M.Update(ctx, lane_targets, coords)
         local function persist_swing()
           persist_lane_fields(lane, { 'swing_amount', 'swing_subdiv' })
         end
-        local _, gdiv = reaper.GetSetProjectGrid(0, false)
+        local gdiv = grid.ProjectDivQN()
         -- Swing grid (subdivision): the grid THIS lane's swing math runs on,
         -- independent of the project/paint grid. "Project" (default) follows the
         -- project grid; otherwise a fixed 1/8..1/16T division. Persisted as
         -- swing_subdiv (QN); Project = nil/absent so default lanes are unchanged.
+        -- The triplets were 1/12 and 1/24 (whole-note numbers, a 32nd / 64th
+        -- triplet in QN); track_detection reads a saved 1/12 / 1/24 as these
+        -- (audit DM14).
         local SUBDIV_OPTS = {
           { label = 'Project', v = 0    },
           { label = '1/8',     v = 0.5  },
           { label = '1/16',    v = 0.25 },
-          { label = '1/8T',    v = 1/12 },
-          { label = '1/16T',   v = 1/24 },
+          { label = '1/8T',    v = 1/3  },
+          { label = '1/16T',   v = 1/6  },
         }
         local cur_sd    = tonumber(li.swing_subdiv) or 0
         local cur_label = 'Project'
@@ -2042,8 +2064,7 @@ function M.Update(ctx, lane_targets, coords)
     local raw_time = coords.PixelToTime(mx)
     if not raw_time then return end
     local cell_start = snap_click_time(coords, raw_time, lt.lane_info)
-    local rc_subdiv  = (coords.EffectiveSwingDivQN and lt.lane_info and lt.lane_info.swing_subdiv
-                        and lt.lane_info.swing_subdiv > 0) and coords.EffectiveSwingDivQN(lt.lane_info) or nil
+    local rc_subdiv  = lane_subdiv(coords, lt.lane_info)
     local cell_end   = cell_start + grid_length(cell_start, rc_subdiv)
     -- 'delete' starts an ERASE-DRAG (FL-style): a tap erases one cell, hold +
     -- drag erases every cell crossed. Reuses the shared drag machinery with
@@ -2054,16 +2075,14 @@ function M.Update(ctx, lane_targets, coords)
       local del_pitch         = lane_pitch_at_y(lt, my)
       drag_mode               = 'delete'
       drag_button             = 1
-      drag_anchor_time        = cell_start
       drag_last_time          = cell_start
-      drag_anchor_pitch       = del_pitch
       drag_anchor_track       = lt.track
       drag_anchor_lane_info   = lt.lane_info
-      drag_anchor_take        = nil
       drag_anchor_item_color  = lt.item_color
       drag_anchor_piano       = lt.piano or false
       drag_anchor_lt          = lt
       drag_anchor_subdiv      = rc_subdiv
+      drag_anchor_swing       = effective_swing(lt.lane_info)
       current_paint_pitch     = del_pitch
       reaper.Undo_BeginBlock()   -- closed by the drag-release block (button 1)
       drag_active = true
@@ -2077,14 +2096,14 @@ function M.Update(ctx, lane_targets, coords)
       -- Open the Undo block BEFORE GetOrCreateMidiItemAt so any item it
       -- creates/extends is captured in the same undo step as the note edit.
       reaper.Undo_BeginBlock()
-      local item, take = GetOrCreateMidiItemAt(lt.track, cell_start, lt.item_color)
+      local item, take = GetOrCreateMidiItemAt(lt.track, cell_start, lt.item_color, rc_subdiv)
       if take then
         local pitch = lane_pitch_at_y(lt, my)
         local idx   = NoteInCell(take, pitch, cell_start, cell_end)
         if idx then
           DeleteNoteAtCell(take, idx)
         else
-          InsertNoteAtCell(take, pitch, cell_start, grid_length(cell_start))
+          InsertNoteAtCell(take, pitch, cell_start, grid_length(cell_start, rc_subdiv))
         end
       end
       -- EndBlock outside the `if take` so the block always closes, even when
@@ -2115,8 +2134,7 @@ function M.Update(ctx, lane_targets, coords)
     local cell_start = snap_click_time(coords, raw_time, lt.lane_info)
     -- Lanes with their own swing subdivision get a step sized to THAT grid so
     -- swung finer notes don't overlap; default lanes pass nil = project grid.
-    local g_eff      = coords.EffectiveSwingDivQN and coords.EffectiveSwingDivQN(lt.lane_info)
-    local lane_subdiv_step = (lt.lane_info and lt.lane_info.swing_subdiv and lt.lane_info.swing_subdiv > 0) and g_eff or nil
+    local lane_subdiv_step = lane_subdiv(coords, lt.lane_info)
     local step_len   = grid_length(cell_start, lane_subdiv_step)
     local cell_end   = cell_start + step_len
 
@@ -2172,27 +2190,23 @@ function M.Update(ctx, lane_targets, coords)
 
     reaper.Undo_BeginBlock()
 
-    local item, take, created, idx
-    item, take, created = GetOrCreateMidiItemAt(lt.track, cell_start, lt.item_color)
+    local _, take = GetOrCreateMidiItemAt(lt.track, cell_start, lt.item_color, lane_subdiv_step)
     if not take then
       reaper.Undo_EndBlock('EON DM: paint (cancelled — no take)', -1)
       return
     end
-    if created then drag_created_items[item] = true end
-    idx       = NoteInCell(take, pitch, cell_start, cell_end)
+    local idx = NoteInCell(take, pitch, cell_start, cell_end)
     drag_mode = 'insert'   -- left-click paints only; filled cells are left intact
 
     drag_button             = 0     -- left-button gesture
-    drag_anchor_time        = cell_start
     drag_last_time          = cell_start
-    drag_anchor_pitch       = pitch
     drag_anchor_track       = lt.track
     drag_anchor_lane_info   = lt.lane_info
-    drag_anchor_take        = take
     drag_anchor_item_color  = lt.item_color
     drag_anchor_piano       = lt.piano or false
     drag_anchor_lt          = lt
     drag_anchor_subdiv      = lane_subdiv_step   -- nil unless this lane has its own swing grid
+    drag_anchor_swing       = effective_swing(lt.lane_info)
     current_paint_pitch     = pitch
 
     drag_active = true
@@ -2215,7 +2229,7 @@ function M.Update(ctx, lane_targets, coords)
       if drag_anchor_piano then current_paint_pitch = lane_pitch_at_y(drag_anchor_lt, my) end
       local cell_start = snap_click_time(coords, raw_time, drag_anchor_lane_info)
       if drag_last_time and cell_start ~= drag_last_time then
-        PaintCellsBetween(drag_last_time, cell_start)
+        PaintCellsBetween(drag_last_time, cell_start, coords)
         drag_last_time = cell_start
       end
     end
@@ -2231,7 +2245,7 @@ function M.Update(ctx, lane_targets, coords)
       if drag_anchor_piano then current_paint_pitch = lane_pitch_at_y(drag_anchor_lt, my) end
       local cell_start = snap_click_time(coords, raw_time, drag_anchor_lane_info)
       if drag_last_time and cell_start ~= drag_last_time then
-        PaintCellsBetween(drag_last_time, cell_start)
+        PaintCellsBetween(drag_last_time, cell_start, coords)
         drag_last_time = cell_start
       end
     end

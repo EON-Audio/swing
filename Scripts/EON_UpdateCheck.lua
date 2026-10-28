@@ -43,9 +43,8 @@ local UPDATE_URL        = "https://api.github.com/repos/EON-Audio/swing/releases
 -- never fired only because no GitHub release exists yet. deploy.sh now refuses
 -- to publish when this does not match the version being released, so the drift
 -- cannot come back silently.
-local CURRENT_VERSION   = "3.0.19"
-local POLL_INTERVAL     = 5.0        -- seconds between heartbeat polls
-local HEARTBEAT_TIMEOUT = 2.0        -- seconds of stale counter = Swing gone
+local CURRENT_VERSION   = "3.0.20"
+local POLL_INTERVAL     = 5.0        -- seconds between heartbeat polls; a counter unchanged across one poll = Swing gone
 
 -- gmem slots
 local GS_SWING_ALIVE       = 1711
@@ -300,6 +299,14 @@ local swing_alive      = false
 -- old `checking_update` flag, which only ever guarded a call that had already
 -- finished by the time it returned (see start_update_check).
 local check_job        = nil
+-- The last GOOD answer ({ state = 2|3, url, t }), re-served for an hour. Swing
+-- asks again on every @serialize read (project load, an undo or redo of its
+-- state), and each ask spawned a curl: a session could hit GitHub's 60/h
+-- unauthenticated limit, after which the API answers 403 with no tag_name and
+-- a real "update available" went dark for the rest of the hour (sweep SCR128).
+-- Failures are not cached: an offline machine may come online any moment.
+local last_answer      = nil
+local ANSWER_TTL       = 3600
 
 ---------------------------------------------------------------------------
 -- HELPERS
@@ -399,6 +406,15 @@ end
 
 local function start_update_check()
   if check_job then return end
+  -- A good answer under an hour old is the answer: Swing zeroed STATE when it
+  -- asked, so publish it again (and the URL, in case the ExtState was cleared).
+  if last_answer and reaper.time_precise() - last_answer.t < ANSWER_TTL then
+    if last_answer.url then
+      reaper.SetExtState(SCRIPT_NAME, "download_url", last_answer.url, false)
+    end
+    gmem_write(GS_UPDATE_STATE, last_answer.state)
+    return
+  end
 
   local final = update_tmp_path()
   local part  = final .. ".part"
@@ -466,8 +482,10 @@ local function finish_update_check(retval)
         if dl then
           reaper.SetExtState(SCRIPT_NAME, "download_url", dl, false)
         end
+        last_answer = { state = 3, url = dl, t = reaper.time_precise() }
       else
         gmem_write(GS_UPDATE_STATE, 2) -- up-to-date (or ahead)
+        last_answer = { state = 2, t = reaper.time_precise() }
       end
     else
       -- Common bodies at this point: (a) 404 with {"message":"Not Found"}

@@ -51,7 +51,7 @@ function swing_mapping_init(fm) (
 // so they are excluded from COLOR only. Attribution (_mv_n2r itself, the dim
 // pad number, audition, right-click-edit) stays truthful for every span.
 function swing_mapping_rng_tintable(p) (
-  p >= 0 && p_rng_lo[p] + p_rng_hi[p] <= 48;
+  p >= 0 && swing_pad_bank(p) == bank_cur && p_rng_lo[p] + p_rng_hi[p] <= 48;   // the shown bank's owners tint; n2r may name another bank's (LIB239)
 );
 
 // Is MIDI note n a black key (sharp/flat)? floor-based so it needs no % op.
@@ -207,13 +207,17 @@ function swing_mapping_build_lookups() (
     // Full-preset pad would steal); wide spans are filtered at the TINT sites
     // only, via swing_mapping_rng_tintable, so color noise is suppressed
     // without lying about ownership.
-    _mv_i = 0; loop(NUM_PADS,
-      _mv_i_s = swing_bp(_mv_i);
-      (p_rng_lo[_mv_i_s] > 0 || p_rng_hi[_mv_i_s] > 0) ? (
-        _mv_n   = max(0, p_note[_mv_i_s] - p_rng_lo[_mv_i_s]);
-        _mv_rhi = min(127, p_note[_mv_i_s] + p_rng_hi[_mv_i_s]);
+    // Every SLOT in slot order, playable pads only -- the engine's pass 2 exactly (lowest slot
+    // wins, an unplayable pad claims nothing). Scanning the shown bank alone named bank B's
+    // pad while MIDI played bank A's, and an empty ranged pad hid the one that sounds (LIB239).
+    // The tint sites keep to the shown bank (swing_mapping_rng_tintable); hover, click and the
+    // dim number name the owner wherever it sits.
+    _mv_i = 0; loop(NUM_SLOTS,
+      (pad_is_playable(_mv_i) && (p_rng_lo[_mv_i] > 0 || p_rng_hi[_mv_i] > 0)) ? (
+        _mv_n   = max(0, p_note[_mv_i] - p_rng_lo[_mv_i]);
+        _mv_rhi = min(127, p_note[_mv_i] + p_rng_hi[_mv_i]);
         while(_mv_n <= _mv_rhi) (
-          _mv_n2r[_mv_n] < 0 ? _mv_n2r[_mv_n] = _mv_i_s;
+          _mv_n2r[_mv_n] < 0 ? _mv_n2r[_mv_n] = _mv_i;
           _mv_n += 1;
         );
       );
@@ -388,7 +392,7 @@ local(gap, cw, ch, r, c, rowb, note, cx, cy, hov, own, dark, gs, cat, nm, base) 
       own = (note >= 0 && note < 128) ? _mv_n2p[note] : -1;
       hov ? (
         _mv_push_hn = note; _mv_push_hit = own;
-        (note >= 0 && note < 128) ? swing_mapping_hovinfo(own >= 0 ? own : _mv_n2r[note]);
+        (note >= 0 && note < 128) ? swing_mapping_hovinfo(own >= 0 ? own : _mv_n2r[note] >= 0 ? _mv_n2r[note] : _mv_n2o[note]);   // another bank's pad too (LIB240)
       );
       own >= 0 ? (
         swing_color_pad_hsl(own, 0.70, 0.52);
@@ -401,6 +405,11 @@ local(gap, cw, ch, r, c, rowb, note, cx, cy, hov, own, dark, gs, cat, nm, base) 
         // (wins over the C-anchor shade; coverage carries more information).
         (note >= 0 && note < 128 && swing_mapping_rng_tintable(_mv_n2r[note])) ? (
           swing_color_pad_hsl(_mv_n2r[note], 0.55, 0.22);
+          gfx_set(_hsl_r, _hsl_g, _hsl_b, hov ? 1.0 : 0.85);
+        ) :
+        (note >= 0 && note < 128 && _mv_n2o[note] >= 0) ? (
+          // step 4d: another bank's sounding pad on this note -- dim, clickable, as the notemap (LIB240)
+          swing_color_pad_hsl(_mv_n2o[note], 0.25, 0.20);
           gfx_set(_hsl_r, _hsl_g, _hsl_b, hov ? 1.0 : 0.85);
         ) :
         (note - floor(note / 12) * 12) == 0 ? gfx_set(0.22, 0.22, 0.27, hov ? 0.95 : 0.8) : gfx_set(0.13, 0.13, 0.16, hov ? 0.9 : 0.65);
@@ -441,6 +450,11 @@ local(gap, cw, ch, r, c, rowb, note, cx, cy, hov, own, dark, gs, cat, nm, base) 
       own < 0 && note >= 0 && note < 128 && _mv_n2r[note] >= 0 && hov && lmb_down ? (
         swing_select_pad(_mv_n2r[note]);
         pad_is_playable(sel_pad) ? swing_gt_post(sel_pad, note, 110, 8);
+      );
+      // step 4d: another bank's pad -- select it (the view follows to its bank) and audition it (LIB240)
+      own < 0 && note >= 0 && note < 128 && _mv_n2r[note] < 0 && _mv_n2o[note] >= 0 && hov && lmb_down ? (
+        swing_select_pad(_mv_n2o[note]);
+        swing_gt_post(sel_pad, p_note[sel_pad], 110, 8);
       );
       // right-click any resolvable cell → RANGE EDITOR
       hov && rmb_down && note >= 0 && note < 128 && (own >= 0 || _mv_n2r[note] >= 0) ? (
@@ -494,6 +508,7 @@ local(wc, wh, bw, bh, note, y, own, hov, wi, wb, k) (
       hov = mx >= px && mx < px + pw && my >= y && my < y + wh;
       own >= 0 ? ( swing_color_pad_hsl(own, 0.60, 0.70); gfx_set(_hsl_r, _hsl_g, _hsl_b, 1); )
       : swing_mapping_rng_tintable(_mv_n2r[note]) ? ( swing_color_pad_hsl(_mv_n2r[note], 0.45, 0.80); gfx_set(_hsl_r, _hsl_g, _hsl_b, 1); )   // range wash, matches the main keyboard
+      : _mv_n2o[note] >= 0 ? ( swing_color_pad_hsl(_mv_n2o[note], 0.30, 0.74); gfx_set(_hsl_r, _hsl_g, _hsl_b, 1); )   // another bank's pad, dim (LIB240)
       : gfx_set(0.80, 0.80, 0.83, 1);
       gfx_rect(px, y, pw, wh);
       gfx_set(0.25, 0.25, 0.30, 1); gfx_rect(px, y, pw, 1);
@@ -505,12 +520,17 @@ local(wc, wh, bw, bh, note, y, own, hov, wi, wb, k) (
         swing_mapping_note_lbl(note, #_mv_kl);
         gfx_x = px + 2; gfx_y = y + wh - 9; gfx_drawstr(#_mv_kl);
       );
-      hov ? swing_mapping_hovinfo(own >= 0 ? own : _mv_n2r[note]);
+      hov ? swing_mapping_hovinfo(own >= 0 ? own : _mv_n2r[note] >= 0 ? _mv_n2r[note] : _mv_n2o[note]);   // another bank's pad too (LIB240)
       hov && lmb_down && own >= 0 ? ( swing_select_pad(own); pad_is_playable(own) ? swing_gt_post(own, p_note[own], 110, 8); );
       // covered key, no exact owner: audition the range owner AT THIS pitch
       hov && lmb_down && own < 0 && _mv_n2r[note] >= 0 ? (
         swing_select_pad(_mv_n2r[note]);
         pad_is_playable(sel_pad) ? swing_gt_post(sel_pad, note, 110, 8);
+      );
+      // step 4d: another bank's pad -- select it (the view follows to its bank) and audition it (LIB240)
+      hov && lmb_down && own < 0 && _mv_n2r[note] < 0 && _mv_n2o[note] >= 0 ? (
+        swing_select_pad(_mv_n2o[note]);
+        swing_gt_post(sel_pad, p_note[sel_pad], 110, 8);
       );
       wi += 1;
     );
@@ -526,15 +546,21 @@ local(wc, wh, bw, bh, note, y, own, hov, wi, wb, k) (
       hov = mx >= px && mx < px + bw && my >= y && my < y + bh;
       own >= 0 ? ( swing_color_pad_hsl(own, 0.75, 0.42); gfx_set(_hsl_r, _hsl_g, _hsl_b, 1); )
       : swing_mapping_rng_tintable(_mv_n2r[note]) ? ( swing_color_pad_hsl(_mv_n2r[note], 0.60, 0.25); gfx_set(_hsl_r, _hsl_g, _hsl_b, 1); )   // range tint (audit R3)
+      : _mv_n2o[note] >= 0 ? ( swing_color_pad_hsl(_mv_n2o[note], 0.25, 0.20); gfx_set(_hsl_r, _hsl_g, _hsl_b, 1); )   // another bank's pad, dim (LIB240)
       : gfx_set(0.09, 0.09, 0.11, 1);
       gfx_rect(px, y, bw, bh);
       gfx_set(0, 0, 0, 0.85); gfx_rect(px, y, bw, 1); gfx_rect(px, y + bh - 1, bw, 1); gfx_rect(px + bw - 1, y, 1, bh);
-      hov ? swing_mapping_hovinfo(own >= 0 ? own : _mv_n2r[note]);
+      hov ? swing_mapping_hovinfo(own >= 0 ? own : _mv_n2r[note] >= 0 ? _mv_n2r[note] : _mv_n2o[note]);   // another bank's pad too (LIB240)
       hov && lmb_down && own >= 0 ? ( swing_select_pad(own); pad_is_playable(own) ? swing_gt_post(own, p_note[own], 110, 8); );
       // covered key, no exact owner: audition the range owner AT THIS pitch
       hov && lmb_down && own < 0 && _mv_n2r[note] >= 0 ? (
         swing_select_pad(_mv_n2r[note]);
         pad_is_playable(sel_pad) ? swing_gt_post(sel_pad, note, 110, 8);
+      );
+      // step 4d: another bank's pad -- select it (the view follows to its bank) and audition it (LIB240)
+      hov && lmb_down && own < 0 && _mv_n2r[note] < 0 && _mv_n2o[note] >= 0 ? (
+        swing_select_pad(_mv_n2o[note]);
+        swing_gt_post(sel_pad, p_note[sel_pad], 110, 8);
       );
     ) : 0;
     note += 1;

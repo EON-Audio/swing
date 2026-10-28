@@ -68,6 +68,7 @@ function dly_init(mem_start)
   dly_lp_x1L = 0; dly_lp_x2L = 0; dly_lp_y1L = 0; dly_lp_y2L = 0;
   dly_lp_x1R = 0; dly_lp_x2R = 0; dly_lp_y1R = 0; dly_lp_y2R = 0;
   dly_hp_on = 0; dly_lp_on = 0;
+  dly_hp_was = 0; dly_lp_was = 0;   // the flags as dly_process last saw them (the off->on edge clears the state; LIB216)
   // Glide on the delay length — the tape-slide, and what makes a division or
   // tempo change musical instead of a click. 50 ms matches EON Delay's own
   // time_coeff, so the two instruments behave identically.
@@ -130,6 +131,9 @@ local(w0, alpha, cs, a0i)
   // Feedback HPF — RBJ biquad, Butterworth Q. Replaces the old one-pole:
   // 12 dB/oct instead of 6 means the rumble actually goes away without
   // hollowing out the repeat.
+  // (A filter that comes back ON starts from zero state -- dly_process clears it
+  // on the audio thread at the off->on edge, LIB216; this runs from @gfx too and
+  // must not write the state cells @sample is ticking.)
   dly_hp_on = dly_hpf_hz > 25;
   dly_hp_on ? (
     w0 = 2 * $pi * min(dly_hpf_hz, srate * 0.499) / srate;
@@ -205,6 +209,26 @@ local(tapL, tapR, fbL, fbR, t)
 
     fbL = tapL * dly_fb_s;
     fbR = tapR * dly_fb_s;
+
+    // A filter that comes back ON starts from zero state, cleared HERE on the audio
+    // thread at the off->on edge: its x/y history froze at whatever the tail held
+    // when it went off (nothing ticks it while it is off), and that stale step was
+    // written into the line as a tick that repeated with the feedback (LIB216).
+    // Two compares per sample; dly_recalc runs from @gfx and may not touch these.
+    dly_hp_on != dly_hp_was ? (
+      dly_hp_was = dly_hp_on;
+      dly_hp_on ? (
+        dly_hp_x1L = 0; dly_hp_x2L = 0; dly_hp_y1L = 0; dly_hp_y2L = 0;
+        dly_hp_x1R = 0; dly_hp_x2R = 0; dly_hp_y1R = 0; dly_hp_y2R = 0;
+      );
+    );
+    dly_lp_on != dly_lp_was ? (
+      dly_lp_was = dly_lp_on;
+      dly_lp_on ? (
+        dly_lp_x1L = 0; dly_lp_x2L = 0; dly_lp_y1L = 0; dly_lp_y2L = 0;
+        dly_lp_x1R = 0; dly_lp_x2R = 0; dly_lp_y1R = 0; dly_lp_y2R = 0;
+      );
+    );
 
     // Feedback HPF (remove rumble) — RBJ biquad, direct form 1.
     dly_hp_on ? (

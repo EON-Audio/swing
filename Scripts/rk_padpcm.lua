@@ -23,7 +23,8 @@
 --   The payload is ALWAYS interleaved stereo: the accessor is asked for 2 channels, so a
 --   mono file arrives L==R (measured 2026-09-08: no Lua per-sample loop is needed; that loop
 --   cost ~700 ms per 40 s file). PEAK = 0 -> the JSFX folds it while copying.
---   Route 1 = KIND 2 (CMD 69 preview). Routes 2/3 (drops, kit blobs) extend M.start.
+--   Routes, all started by M.consume_cmd: KIND 0 = CMD 63 (drop), KIND 1 = CMD 64 (layer),
+--   KIND 2 = CMD 69 (preview). KIND 3/4 (kit blobs, repair) are named but nothing starts them.
 --   TWO WINDOWS (2026-10-15, LEVEL_DUAL 205): chunk k goes to window k % 2 (A = block 474, B = block
 --   475, each with its own GEN / OFF / LEN / FLAGS / ECHO cells), up to two chunks outstanding, and every
 --   tick refills each window the JSFX has echoed. The JSFX reads the windows in sequence (a fresh job
@@ -90,14 +91,20 @@ M.PREVIEW_MAX_CELLS = 1000000                 -- FB_PRV_MAX (rk_swing_ui_minibro
 -- Such a JSFX acks CMD 69 at FIRST, so the bus is free while the stream runs; a new PCM command supersedes the
 -- stream (M.consume_cmd), and DONE = -job from the JSFX means "cancelled: finish quietly".
 M.PREVIEW_MAX_SECONDS = 120
+-- How long a SUPERSEDED ring preview's ABORT may go unechoed before the newer request starts anyway (2026-10-27; the
+-- owner, holding an arrow key through a sample folder: the load time "definitely gotta get fixed"). Every other abort
+-- keeps its 1 s. Starting the newer job early is safe: it starts in window A under a new JOB, and Swing takes a window
+-- only when its JOB_A / JOB_B stamp names the header's job, so the old job's leftover chunks (and its ABORT) are refused
+-- until the new job's own chunks overwrite them (pv_test.py "deaf" checks every cell the voice plays).
+M.SUPERSEDE_WAIT = 0.3
 M.KIND, M.F = KIND, F
 
-local G_CMD, G_LOCK, G_INSTANCE, G_PATH, G_PATH_LEN, G_PATH_MAX
+local G_CMD, G_INSTANCE, G_PATH, G_PATH_LEN, G_PATH_MAX
 local G_BPAD, G_BLAYER, SLOT_SIZE, LAYER_SIZE
-local job = nil          -- the in-flight job (one at a time: one window, one CMD bus)
+local job = nil          -- the in-flight job (one at a time: one CMD bus; its chunks use one or two windows)
 local gen = nil          -- our GEN counter, re-seeded from gmem on first use
 local job_id = nil       -- our JOB counter, re-seeded from gmem on first use
-local stats = { jobs = 0, chunks = 0, failed = 0, aborted = 0 }
+local stats = { jobs = 0, chunks = 0, failed = 0, aborted = 0, unechoed = 0 }   -- unechoed: aborts ended by their deadline
 M.stats = stats
 
 local function now() return reaper.time_precise() end
@@ -105,7 +112,7 @@ local function gr(i) return reaper.gmem_read(i) or 0 end
 local function gw(i, v) reaper.gmem_write(i, v) end
 
 function M.init(G)
-  G_CMD, G_LOCK, G_INSTANCE = G.CMD, G.LOCK, G.INSTANCE
+  G_CMD, G_INSTANCE = G.CMD, G.INSTANCE
   G_PATH, G_PATH_LEN, G_PATH_MAX = G.GS_BROWSER_PATH, G.GS_BROWSER_PATH_LEN, G.GS_BROWSER_PATH_MAX or 259
   G_BPAD, G_BLAYER = G.GS_BROWSE_PAD, G.GS_BROWSE_LAYER
   SLOT_SIZE, LAYER_SIZE = G.SLOT_SIZE or 4000000, G.LAYER_SIZE or 4000000
@@ -222,6 +229,19 @@ local function publish_chunk(j, c)
   stats.chunks = stats.chunks + 1
 end
 
+-- The player's read position and LOOP flag, as THIS job's player last published them. PRV_RD / PRV_JOB /
+-- PRV_LOOP are single header cells that EVERY Swing instance's @block rewrites with its own player's state
+-- (swing_padpcm_tick has no instance gate), so with two Swings a read names the other instance's job half
+-- the time. That is not "the player has not started": keep the last values read under THIS job's id (j.rd,
+-- j.loop) and use them until the next match; a position a few blocks old is conservative (less room, never
+-- more). Before any match the player has not started: the whole ring is free (sweep SCR114).
+local function prv_sync(j)
+  if math.floor(gr(HDR + O.PRV_JOB)) == j.id then
+    j.rd = math.floor(gr(HDR + O.PRV_RD))
+    j.loop = math.floor(gr(HDR + O.PRV_LOOP)) > 0
+  end
+end
+
 -- Describe the next chunk of the stream (FIRST / LAST / FAILED / ABORT flags as the job says), publish it
 -- into the next window in sequence and queue it as outstanding. The caller checked a window is free
 -- (#j.out < j.nwin) and, for a ring preview, that the ring has room for it (ring_fits).
@@ -241,7 +261,9 @@ local function publish_next(j)
       -- no LAST; the next chunk is frame 0 of the next pass with OFF still climbing. Capped at 2^30 cells
       -- so the JSFX's |0 casts stay exact (~3 h at 96 k). A file that fits loops in the JSFX itself.
       local long = j.ring > 0 and j.frames * 2 > j.ring
-      local loop_on = math.floor(gr(HDR + O.PRV_LOOP)) > 0
+      prv_sync(j)
+      local loop_on = j.loop
+      if loop_on == nil then loop_on = math.floor(gr(HDR + O.PRV_LOOP)) > 0 end   -- no match yet: the raw cell
       if long and loop_on and (c.pass + 2) * j.frames * 2 < 1073741824 then
         j.pub_pass = c.pass + 1; j.pub_pos = 0
       else
@@ -359,7 +381,8 @@ end
 local function ring_fits(j)
   if (j.ring or 0) == 0 then return true end
   local n = math.min(FRAMES_PER_CHUNK, j.frames - j.pub_pos)
-  local rd = (math.floor(gr(HDR + O.PRV_JOB)) == j.id) and math.floor(gr(HDR + O.PRV_RD)) or 0
+  prv_sync(j)
+  local rd = j.rd or 0
   local off = (j.pub_pass * j.frames + j.pub_pos) * 2
   return off + n * 2 - rd <= j.ring
 end
@@ -368,17 +391,21 @@ end
 -- outstanding are forgotten: the ABORT goes into the next window in sequence, and the JSFX, which consumes the
 -- windows in sequence, reaches it after whatever it was copying (an ABORT carries no payload, so a window the
 -- JSFX is reading is never overwritten under it).
-function M.abort(why)
+function M.abort(why, superseded)
   local j = job
   if not j then return end
   if j.aborting then return end
   j.aborting = true
   j.out = {}
   j.why = why
+  -- superseded = the user's own newer act (M.consume_cmd): no console line if the ABORT goes unechoed, and the newer
+  -- request waits M.SUPERSEDE_WAIT for the echo, not the full second
+  j.superseded = superseded
+  j.abort_wait = superseded and M.SUPERSEDE_WAIT or 1.0
   stats.aborted = stats.aborted + 1
   scratch_close(j)
   publish_next(j)
-  j.abort_deadline = now() + 1.0
+  j.abort_deadline = now() + j.abort_wait
 end
 
 local function finish_job(j)
@@ -386,10 +413,11 @@ local function finish_job(j)
   job = nil
 end
 
--- The bridge's CMD dispatch calls this every tick with the current CMD. Consumes CMD 69
--- (preview) when the JSFX speaks the protocol, nothing is blocking, and no job is in flight.
--- The CMD itself stays on the bus until the JSFX acks it at LAST (every producer already
--- gates on CMD == 0). Returns true when it started a job this tick.
+-- The bridge's CMD dispatch calls this every tick with the current CMD. Consumes CMD 63 (drop),
+-- 64 (layer) and 69 (preview) when the JSFX speaks the protocol, nothing is blocking, and no job
+-- is in flight. The CMD itself stays on the bus until the JSFX acks it: at LAST, or at FIRST for
+-- a ring preview (every producer already gates on CMD == 0). Returns true when it started a job
+-- this tick.
 function M.consume_cmd(cmd, blocked)
   if job then
     -- A ring preview (acked at FIRST, the bus free) is SUPERSEDED by any new PCM command -- the user's newer
@@ -398,7 +426,7 @@ function M.consume_cmd(cmd, blocked)
     -- CMD that started this job (job.acked, M.tick): until then the 69 on the bus IS this job's -- the first
     -- run of the ring rig (2026-10-14) aborted every long preview within 7 ms of its start for want of this.
     if job.kind == KIND.PREVIEW and (job.ring or 0) > 0 and job.acked and not job.aborting and not job.awaiting_ack then
-      M.abort("superseded by a newer request")
+      M.abort("superseded by a newer request", true)
     end
     return false
   end
@@ -430,7 +458,7 @@ function M.tick()
   -- A stopped audio engine has no @block to consume with: park, never time out.
   if reaper.Audio_IsRunning and not reaper.Audio_IsRunning() then
     for _, c in ipairs(j.out) do c.deadline = now() + 0.5 end
-    if j.abort_deadline then j.abort_deadline = now() + 1.0 end
+    if j.abort_deadline then j.abort_deadline = now() + (j.abort_wait or 1.0) end
     return
   end
   -- After the LAST chunk echoed, a pad job is still finishing on the JSFX side (zero tail,
@@ -453,13 +481,27 @@ function M.tick()
     finish_job(j)
     return
   end
+  -- A ring preview superseded while its LAST was already out -- a short file, one or two chunks, all published at once:
+  -- the ABORT went into the window AFTER the LAST, Swing finished copying the stream first (DONE = +job), and its
+  -- finished-work lock (abs(PP_DONE) == job, rk_swing_padpcm) then refuses that ABORT for good. Nothing echoed it, so the
+  -- newer preview waited out the whole abort deadline on nearly every arrow-key step through short files (the owner,
+  -- 2026-10-27: "TR-909 Kick 23.wav ... aborted -- superseded by a newer request, no consumer"). The stream DID finish:
+  -- end it the way a finished stream ends, on the ACKED match below (Swing's finish writes ACKED = job). Ring previews
+  -- only: a drop's stall abort keeps its deadline, untouched (pv_test.py).
+  if j.aborting and (j.ring or 0) > 0 and math.floor(gr(HDR + O.DONE)) == j.id then
+    j.awaiting_ack = true
+    j.ack_deadline = now() + 10.0
+  end
   if j.awaiting_ack then
     local c = math.floor(gr(G_CMD))
     if c ~= j.cmd or j.cmd == 0 or math.floor(gr(HDR + O.ACKED)) == j.id then
       finish_job(j)
     elseif now() > j.ack_deadline then
-      reaper.ShowConsoleMsg(("[Swing] PADPCM: job %d (%s) streamed but CMD %d was never acked -- releasing the bus\n"):format(j.id, j.path, j.cmd))
-      gw(G_CMD, 0)
+      -- Only a CMD still this job's is ours to release: once the JSFX acked it (j.acked -- a ring preview
+      -- acks at FIRST) the same number on the bus is the NEXT request (see the abort path below, SCR141).
+      reaper.ShowConsoleMsg(("[Swing] PADPCM: job %d (%s) streamed but CMD %d was never acked -- %s\n")
+        :format(j.id, j.path, j.cmd, j.acked and "the bus is the next request's, left alone" or "releasing the bus"))
+      if not j.acked then gw(G_CMD, 0) end
       finish_job(j)
     end
     return
@@ -485,9 +527,17 @@ function M.tick()
   end
   if j.aborting then
     if now() > j.abort_deadline then
-      -- nobody echoed even the ABORT: release the bus ourselves
-      if math.floor(gr(G_CMD)) == j.cmd and j.cmd > 0 then gw(G_CMD, 0) end
-      reaper.ShowConsoleMsg(("[Swing] PADPCM: job %d (%s) aborted -- %s, no consumer\n"):format(j.id, j.path, tostring(j.why)))
+      -- nobody echoed even the ABORT: release the bus ourselves -- but only while the CMD is still THIS
+      -- job's. A ring preview acked at FIRST, so the 69 on the bus is the newer click that superseded it:
+      -- zeroing that lost the click and said "no consumer" (sweep SCR141; the JSFX fail path guards the
+      -- same way with !_pp_acked).
+      if not j.acked and math.floor(gr(G_CMD)) == j.cmd and j.cmd > 0 then gw(G_CMD, 0) end
+      stats.unechoed = stats.unechoed + 1
+      -- a superseded preview is the user clicking on through the browser: the console popping open for it was
+      -- noise (the owner, 2026-10-27); every other unechoed abort still says so
+      if not j.superseded then
+        reaper.ShowConsoleMsg(("[Swing] PADPCM: job %d (%s) aborted -- %s, no consumer\n"):format(j.id, j.path, tostring(j.why)))
+      end
       finish_job(j)
     end
     return

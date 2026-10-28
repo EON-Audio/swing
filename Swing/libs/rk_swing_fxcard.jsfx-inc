@@ -4,7 +4,7 @@
 // Reference art: .fxcards/out/*.png  (the baked deck — draw AGAINST it)
 //
 // ── WHY DRAWN ───────────────────────────────────────────────────────────────
-// The deck also exists as 145 baked PNGs, and those are a fine reference, but
+// The sheet's cards also exist as baked PNGs, and those are a fine reference, but
 // they cannot be the shipping renderer for three reasons that are all about
 // SIZE:
 //
@@ -16,12 +16,12 @@
 //      "console chips = drawn not images".
 //   2. ReaKit's buffer convention gives slots 0..94 to `filename:` PNGs
 //      (95–126 are cache buffers, 127 is the knob blit — see
-//      .refs/jsfx_custom_gui_reference.md §7). 145 cards do not fit. With ~20
+//      .refs/jsfx_custom_gui_reference.md §7). The deck does not fit. With ~20
 //      visible and the list scrolling you get constant load-and-evict, and
 //      gfx_loadimg is a disk read plus a decode that must never run per frame.
 //      A drawn card costs zero slots.
-//   3. ~736 installed plugins have no card at all and need a drawn fallback
-//      regardless. Blitting the other 145 means maintaining two renderers.
+//   3. Installed plugins with no card at all need a drawn fallback regardless.
+//      Blitting the carded ones means maintaining two renderers.
 //
 // ── AND WHY IT IS SCALE-FREE, UNLIKE THE SOURCE ─────────────────────────────
 // ⚠️ The CSS these are ported from is NOT scale-free, and that is the single
@@ -143,16 +143,20 @@ FXC_MOTIF = 0;
 FXC_B1    = 1;   // panel gradient, top
 FXC_B2    = 2;   // panel gradient, bottom
 FXC_K     = 3;   // knob body
-FXC_K2    = 4;   // knob body, lower stop (0 = reuse K)
+FXC_K2    = 4;   // knob body, lower stop (-1 = reuse K; 0 is black)
 FXC_ACC   = 5;   // accent: top band, ring, module rail (-1 = none)
 FXC_PTR   = 6;   // pointer colour (-1 = no pointer)
 FXC_ECOL  = 7;   // secondary element colour
 FXC_ELEM  = 8;   // bitmask of FXC_E_*
 FXC_VAR   = 9;   // bitmask of FXC_V_*
 FXC_SL    = 10;  // slider-bar colour (-1 = default black wash)
-// curve-multi only: three band nodes, each a colour and a position. The sheet's
-// rule is that no two band-EQs ship the same node layout, so these are per-card
-// data, never defaults.
+// curve-multi: three band nodes, each a colour (C1..C3) and a position (N1..N3).
+// The sheet's rule is that no two band-EQs ship the same node layout, so these
+// are per-card data, never defaults. The COLOURS are read by other motifs too
+// (-1 = the motif's own default): the generator's ALIAS reuses them on GRAPH
+// (node / glow / box = C1 / C2 / C3) and PROLL (note colour = C1), and the
+// STEPPA and APEXEQ faces read them for their panel and band colours. Only
+// curve-multi reads the positions.
 FXC_C1    = 11;  FXC_N1X = 14;  FXC_N1Y = 15;
 FXC_C2    = 12;  FXC_N2X = 16;  FXC_N2Y = 17;
 FXC_C3    = 13;  FXC_N3X = 18;  FXC_N3Y = 19;
@@ -162,16 +166,25 @@ FXC_C3    = 13;  FXC_N3X = 18;  FXC_N3Y = 19;
 // readout moves to the LEFT side) and Decapitator, so dropping them -- which an
 // earlier version of the extractor did -- puts real parts in the wrong place.
 FXC_EX    = 20;  FXC_EY  = 21;  FXC_EW  = 22;  FXC_EH  = 23;
-FXC_REC   = 24;
+// The ELEM bit that OWNS the box above (0 = none). One box per card, so a card
+// with two placed elements (Decapitator: btns + jewel) would otherwise hand its
+// btns override to the jewel too -- a glowing disc over the button row (LIB222).
+FXC_EOWN  = 24;
+FXC_REC   = 25;
+_fxc_ga   = 1;   // the card's strength: the caller's gfx_a, captured by the two entry points (LIB25)
 
 // ── colour helpers ──────────────────────────────────────────────────────────
 // Colours are packed 0xRRGGBB, matching the recipe table and the bucket
 // palette in rk_swing_ui_fxview.jsfx-inc.
+// A literal colour at the card's strength: gfx_set with the caller's gfx_a
+// (captured on entry as _fxc_ga) multiplied in (LIB25).
+function _fxc_rgba(r, g, b, a) ( gfx_set(r, g, b, a * _fxc_ga); );
+
 function _fxc_set(c, a)
 (
   gfx_set(((c / 65536) | 0) / 255,
           (((c / 256) | 0) % 256) / 255,
-          (c % 256) / 255, a);
+          (c % 256) / 255, a * _fxc_ga);
 );
 
 // Mix toward black (t=1 -> black). Used for the moulded ring inside a knob and
@@ -182,7 +195,7 @@ function _fxc_shade(c, t, a)
   r = ((c / 65536) | 0) / 255;
   g = (((c / 256) | 0) % 256) / 255;
   b = (c % 256) / 255;
-  gfx_set(r * (1 - t), g * (1 - t), b * (1 - t), a);
+  gfx_set(r * (1 - t), g * (1 - t), b * (1 - t), a * _fxc_ga);
 );
 
 // Perceived brightness of a packed colour, 0..1.
@@ -222,7 +235,7 @@ function _fxc_panel(x, y, w, h, c1, c2)
   r2 = ((c2 / 65536) | 0) / 255;
   g2 = (((c2 / 256) | 0) % 256) / 255;
   b2 = (c2 % 256) / 255;
-  gfx_gradrect(x, y, w, h, r1, g1, b1, 1,
+  gfx_gradrect(x, y, w, h, r1, g1, b1, _fxc_ga,
                0, 0, 0, 0,
                (r2 - r1) / h, (g2 - g1) / h, (b2 - b1) / h, 0);
 );
@@ -396,8 +409,10 @@ function _fxc_meter(x, y, w, h, fill, c, bg)
   _fxc_set(c, 1);  gfx_rect(x, y + h * (1 - fill), w, h * fill);
 );
 
-// A jagged analyser silhouette, filled to the bottom of its box. Second
-// silhouette in the deck -- the `spectrum` motif's, distinct from `.an`'s.
+// A jagged analyser silhouette, filled to the bottom of its box: the `spectrum`
+// motif's, and the fallback card's readout (variant 3). It samples the SAME
+// _fxc_sky_y table as `.an`'s skyline, stretched over the first 15 of its 16
+// points (seg = t * 14), so an edit to that table moves both.
 function _fxc_spec(x, y, w, h, c, a)
   local(i, n, t, u, sx, sw, ty, seg, f)
 (
@@ -422,10 +437,10 @@ function _fxc_knob(cx, cy, r, kc, k2c, ptr, ring, ringc)
   local(rr)
 (
   ring > 0 ? (
-    ringc >= 0 ? _fxc_set(ringc, 0.9) : gfx_set(0, 0, 0, 0.4);
+    ringc >= 0 ? _fxc_set(ringc, 0.9) : _fxc_rgba(0, 0, 0, 0.4);
     gfx_circle(cx, cy, r + max(1, r * 0.11), 1, 1);
   ) : (
-    gfx_set(0, 0, 0, 0.38);
+    _fxc_rgba(0, 0, 0, 0.38);
     gfx_circle(cx, cy, r + max(1, r * 0.08), 1, 1);
   );
   _fxc_set(kc, 1);            gfx_circle(cx, cy, r, 1, 1);
@@ -433,7 +448,7 @@ function _fxc_knob(cx, cy, r, kc, k2c, ptr, ring, ringc)
   _fxc_set(k2c >= 0 ? k2c : kc, 1);
   gfx_circle(cx, cy, r * 0.62, 1, 1);
   // Specular. Low alpha and offset up-left, matching `circle at 38% 30%`.
-  gfx_set(1, 1, 1, 0.20);
+  _fxc_rgba(1, 1, 1, 0.20);
   gfx_circle(cx - r * 0.24, cy - r * 0.30, r * 0.40, 1, 1);
   ptr >= 0 ? (
     _fxc_set(ptr, 1);
@@ -444,9 +459,12 @@ function _fxc_knob(cx, cy, r, kc, k2c, ptr, ring, ringc)
 
 // ── secondary elements ──────────────────────────────────────────────────────
 function _fxc_elements(x, y, w, h, rec)
-  local(e, ec, i, bw, cx, cy, r, bx, by, bh, ox, oy, ow, oh)
+  local(e, ec, eo, i, bw, cx, cy, r, bx, by, bh, ox, oy, ow, oh)
 (
   e = rec[FXC_ELEM]; ec = rec[FXC_ECOL];
+  // The box override, read by the element that owns it alone (LIB222); the
+  // others see -1 and take their own defaults.
+  eo = rec[FXC_EOWN];
   ox = rec[FXC_EX]; oy = rec[FXC_EY]; ow = rec[FXC_EW]; oh = rec[FXC_EH];
 
   // Drawn first, so nodes and curves land on top of it.
@@ -460,7 +478,7 @@ function _fxc_elements(x, y, w, h, rec)
   e & FXC_E_GRILLE ? (                      // slotted grille, top third
     _fxc_shade(0x161310, 0, 0.45);
     gfx_rect(x + w * 0.08, y + h * 0.10, w * 0.84, h * 0.30);
-    gfx_set(0, 0, 0, 0.55);
+    _fxc_rgba(0, 0, 0, 0.55);
     i = 0; bw = max(2, w * 0.035);
     loop((w * 0.84 / bw) | 0,
       gfx_rect(x + w * 0.08 + i * bw, y + h * 0.10, max(1, bw * 0.4), h * 0.30);
@@ -479,27 +497,27 @@ function _fxc_elements(x, y, w, h, rec)
   );
   e & FXC_E_BTNS ? (                        // the 1176 ratio row
     _fxc_set(ec >= 0 ? ec : 0xc8c8c4, 1);
-    bx = x + w * (ox >= 0 ? ox : 0.69); by = y + h * (oy >= 0 ? oy : 0.82);
-    bw = w * (ow >= 0 ? ow : 0.24);     bh = max(2, h * (oh >= 0 ? oh : 0.08));
+    bx = x + w * (eo == FXC_E_BTNS && ox >= 0 ? ox : 0.69); by = y + h * (eo == FXC_E_BTNS && oy >= 0 ? oy : 0.82);
+    bw = w * (eo == FXC_E_BTNS && ow >= 0 ? ow : 0.24);     bh = max(2, h * (eo == FXC_E_BTNS && oh >= 0 ? oh : 0.08));
     i = 0;
     loop(4, gfx_rect(bx + i * bw * 0.29, by, max(2, bw * 0.17), bh); i += 1;);
   );
   e & FXC_E_ROCKERS ? (                     // Pultec rocker pair
     bx = x + w * 0.73; by = y + h * 0.12; bw = w * 0.20; bh = max(3, h * 0.10);
-    gfx_set(0, 0, 0, 0.40); gfx_rect(bx, by + bh * 0.42, bw, bh * 0.16);
+    _fxc_rgba(0, 0, 0, 0.40); gfx_rect(bx, by + bh * 0.42, bw, bh * 0.16);
     _fxc_set(0xe2ded2, 1);
     gfx_circle(bx + bw * 0.22, by + bh * 0.5, max(1.5, bh * 0.26), 1, 1);
     gfx_circle(bx + bw * 0.72, by + bh * 0.5, max(1.5, bh * 0.26), 1, 1);
   );
   e & FXC_E_JEWEL ? (                       // tube / lamp glow
     ec = ec >= 0 ? ec : 0xe0823a;
-    bw = w * (ow >= 0 ? ow : 0.08);         // square in PIXELS, so r is w-based
+    bw = w * (eo == FXC_E_JEWEL && ow >= 0 ? ow : 0.08);   // square in PIXELS, so r is w-based
     r = max(2, bw * 0.5);
-    cy = y + h * (oy >= 0 ? oy : 0.12) + r;
+    cy = y + h * (eo == FXC_E_JEWEL && oy >= 0 ? oy : 0.12) + r;
     i = 0;
     loop(e & FXC_E_SOLO ? 1 : 2,
       // EM> -1.8em at font-size 10px on a 144 card = -18px = 0.125 w
-      cx = x + w * (ox >= 0 ? ox : 0.82) + r - i * w * 0.125;
+      cx = x + w * (eo == FXC_E_JEWEL && ox >= 0 ? ox : 0.82) + r - i * w * 0.125;
       _fxc_set(ec, 0.22); gfx_circle(cx, cy, r * 2.1, 1, 1);
       _fxc_set(ec, 0.45); gfx_circle(cx, cy, r * 1.5, 1, 1);
       _fxc_set(ec, 1);    gfx_circle(cx, cy, r, 1, 1);
@@ -507,17 +525,17 @@ function _fxc_elements(x, y, w, h, rec)
     );
   );
   e & FXC_E_DISP ? (                        // small readout with a lit row
-    bx = x + w * (ox >= 0 ? ox : 0.68); by = y + h * (oy >= 0 ? oy : 0.26);
-    bw = w * (ow >= 0 ? ow : 0.26);     bh = h * (oh >= 0 ? oh : 0.17);
+    bx = x + w * (eo == FXC_E_DISP && ox >= 0 ? ox : 0.68); by = y + h * (eo == FXC_E_DISP && oy >= 0 ? oy : 0.26);
+    bw = w * (eo == FXC_E_DISP && ow >= 0 ? ow : 0.26);     bh = h * (eo == FXC_E_DISP && oh >= 0 ? oh : 0.17);
     _fxc_set(0x0a100c, 1); gfx_rect(bx, by, bw, bh);
-    gfx_set(1, 1, 1, 0.25);
+    _fxc_rgba(1, 1, 1, 0.25);
     gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
     gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
     _fxc_set(ec >= 0 ? ec : 0x5adc8c, 0.8);
     gfx_rect(bx + 1, by + bh * 0.44, bw - 2, max(1, bh * 0.10));
   );
   e & FXC_E_RINGS ? (                       // scribed rings around a knob row
-    gfx_set(1, 1, 1, 0.45);
+    _fxc_rgba(1, 1, 1, 0.45);
     i = 0;
     loop(4,
       gfx_circle(x + w * (0.18 + i * 0.153), y + h * 0.62,
@@ -547,10 +565,10 @@ function _fxc_vuface(cx, cy, rx, ry, bez)
   gfx_line(cx, cy + ry * 0.85, cx + rx * 0.45, cy - ry * 0.65, 1);
 );
 
-// A row of n small buttons, one of them lit. The 1176's ratio row and GainKit's
-// format row are the same object, and at the console's ~55 px chip a row of
-// blocks with one odd-coloured block survives shrinking far better than knobs
-// do -- which is the whole reason both cards lead with it.
+// A row of n small buttons, one of them lit: the Anvil face's ratio row and the
+// Apex EQ face's band-chip strip. At the console's ~55 px chip a row of blocks
+// with one odd-coloured block survives shrinking far better than knobs do --
+// which is the whole reason both cards carry one.
 function _fxc_btnrow(x, y, w, h, n, lit, c, litc)
   local(i, bw, gp)
 (
@@ -559,7 +577,7 @@ function _fxc_btnrow(x, y, w, h, n, lit, c, litc)
   loop(n,
     i == lit ? _fxc_set(litc, 1) : _fxc_set(c, 1);
     gfx_rect(x + i * (bw + gp), y, bw, h);
-    gfx_set(0, 0, 0, 0.30);
+    _fxc_rgba(0, 0, 0, 0.30);
     gfx_rect(x + i * (bw + gp), y, bw, max(1, h * 0.14));
     i += 1;
   );
@@ -596,7 +614,7 @@ function _fxc_motif(x, y, w, h, rec)
 m == FXC_M_FLAT3 ? (
     // Valhalla's language: flat circles, no moulding, no specular. Drawing them
     // as knobs would be wrong -- the flatness IS the brand.
-    gfx_set(0, 0, 0, 0.40); gfx_rect(x, y, w, h * 0.17);
+    _fxc_rgba(0, 0, 0, 0.40); gfx_rect(x, y, w, h * 0.17);
     k < 0 ? k = 0xf0e8dc;
     _fxc_set(k, 1);
     i = 0;
@@ -605,7 +623,7 @@ m == FXC_M_FLAT3 ? (
       gfx_circle(x + w * (0.24 + i * 0.22222), y + h * 0.56, w * 0.09, 1, 1);
       i += 1;
     );
-    gfx_set(1, 1, 1, 0.45);
+    _fxc_rgba(1, 1, 1, 0.45);
     bw = max(2, w * 0.042); i = 0;
     loop((w * 0.84 / (bw * 2.17)) | 0,
       gfx_rect(x + w * 0.08 + i * bw * 2.17, y + h * 0.88, bw, max(1, h * 0.04));
@@ -627,7 +645,7 @@ m == FXC_M_FLAT3 ? (
       );
     );
     t = _fxc_lum(rec[FXC_C3] >= 0 ? rec[FXC_C3] : 0x1c1e22) > 0.5;
-    t ? gfx_set(0.25, 0.28, 0.34, 0.45) : gfx_set(0.80, 0.84, 0.90, 0.30);
+    t ? _fxc_rgba(0.25, 0.28, 0.34, 0.45) : _fxc_rgba(0.80, 0.84, 0.90, 0.30);
     gfx_rect(bx, by + bh * 0.46, bw, max(1, bh * 0.025));
     rec[FXC_C1] >= 0 ? (
       _fxc_set(rec[FXC_C1], 1);
@@ -635,7 +653,7 @@ m == FXC_M_FLAT3 ? (
       gfx_circle(bx + bw * 0.50, by + bh * 0.32, max(1.5, w * 0.017), 1, 1);
       gfx_circle(bx + bw * 0.76, by + bh * 0.58, max(1.5, w * 0.017), 1, 1);
     );
-    gfx_set(0.5, 0.5, 0.5, 0.35);
+    _fxc_rgba(0.5, 0.5, 0.5, 0.35);
     gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
     gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
     _fxc_meter(x + w * 0.81, by, w * 0.09, bh, 0.55,
@@ -658,16 +676,16 @@ m == FXC_M_FLAT3 ? (
         _fxc_set(0xd8d4c8, 1); gfx_circle(cx, cy, r * 0.14, 1, 1);
       ) : (
         _fxc_set(0x23241f, 1); gfx_circle(cx, cy, r * 0.92, 1, 1);
-        gfx_set(0.85, 0.83, 0.78, 0.25); gfx_circle(cx, cy, r, 0, 1);
+        _fxc_rgba(0.85, 0.83, 0.78, 0.25); gfx_circle(cx, cy, r, 0, 1);
         _fxc_set(0xd8d4c8, 1); gfx_circle(cx, cy, r * 0.12, 1, 1);
       );
       i += 1;
     );
-    gfx_set(0.08, 0.08, 0.09, 0.85);
+    _fxc_rgba(0.08, 0.08, 0.09, 0.85);
     gfx_rect(x + w * 0.15, y + h * 0.56, w * 0.70, max(1, h * 0.030));
     _fxc_set(0xd8d4c8, 1);
     gfx_circle(x + w * 0.50, y + h * 0.60, max(1.5, w * 0.021), 1, 1);
-    gfx_set(0, 0, 0, 0.35); gfx_rect(x, y + h * 0.82, w, h * 0.18);
+    _fxc_rgba(0, 0, 0, 0.35); gfx_rect(x, y + h * 0.82, w, h * 0.18);
   ) :
 
   m == FXC_M_PROLL ? (
@@ -679,10 +697,10 @@ m == FXC_M_FLAT3 ? (
       i += 1;
     );
     bx = x + w * 0.11; bw = w * 0.89;
-    gfx_set(0.5, 0.5, 0.5, 0.15);
+    _fxc_rgba(0.5, 0.5, 0.5, 0.15);
     i = 0;
     loop(4, gfx_rect(bx, y + h * (0.23 + i * 0.23), bw, 1); i += 1;);
-    gfx_set(1, 1, 1, 0.30);
+    _fxc_rgba(1, 1, 1, 0.30);
     gfx_rect(bx + bw * 0.47, y, max(1, w * 0.010), h);
     k = rec[FXC_C1] >= 0 ? rec[FXC_C1] : 0x3ab0d8;       // note blocks
     _fxc_set(k, 1);
@@ -739,7 +757,7 @@ m == FXC_M_FLAT3 ? (
   ) :
 
   m == FXC_M_GEQ ? (
-    gfx_set(0, 0, 0, 0.40);                               // the slider bank
+    _fxc_rgba(0, 0, 0, 0.40);                               // the slider bank
     bx = x + w * 0.08; bw = w * 0.84; by = y + h * 0.12; bh = h * 0.76;
     i = 0;
     loop(9, gfx_rect(bx + bw * i * 0.107, by, max(1, bw * 0.030), bh); i += 1;);
@@ -756,8 +774,11 @@ m == FXC_M_FLAT3 ? (
 
   m == FXC_M_WAVE ? (
     _fxc_set(0x868b96, 0.9);                              // the loudness hump
-    // left 8%, width 70%, bottom -18% -- it runs off the card on purpose.
-    _fxc_domebox(x + w * 0.08, y + h * 0.30, w * 0.70, h * 0.88, h * 0.44);
+    // left 8%, width 70%, and the body STOPS at the card's bottom edge. The CSS
+    // ran it 18% past (overflow clipped); gfx has no clip, so that 90 %-alpha
+    // slab painted below the card -- behind the picker tile's name label, into
+    // the console's slot gap (LIB218). The dome itself is unchanged.
+    _fxc_domebox(x + w * 0.08, y + h * 0.30, w * 0.70, h * 0.70, h * 0.44);
     _fxc_set(acc >= 0 ? acc : 0xdc463c, 1);
     bw = max(2, w * 0.040); i = 0;
     loop((w * 0.84 / (bw * 3)) | 0,
@@ -783,7 +804,7 @@ m == FXC_M_FLAT3 ? (
     _fxc_meter(bx, by, bw * 0.44, bh, 0.55, 0x4ac06a, 0xf8f8f4);
     _fxc_meter(bx + bw * 0.56, by, bw * 0.44, bh, 0.30, 0xe0823a, 0xf8f8f4);
     _fxc_set(0xc04038, 1); gfx_rect(bx + bw * 0.56, by, bw * 0.44, max(1, bh * 0.06));
-    gfx_set(0.69, 0.69, 0.67, 1);
+    _fxc_rgba(0.69, 0.69, 0.67, 1);
     gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
     gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
   ) :
@@ -800,7 +821,7 @@ m == FXC_M_FLAT3 ? (
                max(2, bw * 0.10), bh * 0.74);
       i += 1;
     );
-    gfx_set(0.69, 0.69, 0.67, 1);
+    _fxc_rgba(0.69, 0.69, 0.67, 1);
     gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
     gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
     _fxc_rows(bx, y + h * 0.58, w * 0.80, h * 0.32, 2, 0x6e6e68, 0xbcbcb6);
@@ -811,7 +832,7 @@ m == FXC_M_FLAT3 ? (
     // land between pixels and the whole plot greys over, so the curve -- the
     // one thing that says EQ -- stops reading. Grid only where there is room.
     w >= 96 ? (
-      gfx_set(0, 0, 0, 0.06);                              // the plot grid
+      _fxc_rgba(0, 0, 0, 0.06);                              // the plot grid
       i = 0;
       loop(7, gfx_rect(x + w * (i * 0.14), y, 1, h * 0.68); i += 1;);
       i = 0;
@@ -841,14 +862,14 @@ m == FXC_M_FLAT3 ? (
     gfx_rect(x + w * 0.185, y + h * 0.59, w * 0.08, h * 0.07);
     bx = x + w * 0.32; bw = w * 0.62; by = y + h * 0.14; bh = h * 0.64;
     _fxc_set(0xf8f8f4, 1); gfx_rect(bx, by, bw, bh);       // the impulse list
-    gfx_set(0, 0, 0, 0.10);
+    _fxc_rgba(0, 0, 0, 0.10);
     i = 0;
     loop(4, gfx_rect(bx, by + bh * (0.14 + i * 0.28), bw, max(1, bh * 0.14)); i += 1;);
     _fxc_set(0x8a8a86, 1);
     i = 0;
     loop(3, gfx_rect(bx + bw * (0.10 + i * 0.36), by + bh * 0.86, bw * 0.22,
                      max(2, bh * 0.11)); i += 1;);
-    gfx_set(0.69, 0.69, 0.67, 1);
+    _fxc_rgba(0.69, 0.69, 0.67, 1);
     gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
     gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
   ) :
@@ -896,7 +917,7 @@ m == FXC_M_FLAT3 ? (
     // Same shape, opposite colour, so "full vs lite" reads without any text.
     u = rec[FXC_VAR] & FXC_V_V2;
     _fxc_set(u ? 0x3b3a34 : 0x2b2d31, 1); gfx_rect(x, y, w, h * 0.17);
-    gfx_set(0, 0, 0, 0.55);  gfx_rect(x, y + h * 0.17, w, max(1, h * 0.014));
+    _fxc_rgba(0, 0, 0, 0.55);  gfx_rect(x, y + h * 0.17, w, max(1, h * 0.014));
     _fxc_set(0xd9331e, 1);
     gfx_rect(x + w * 0.05, y + h * 0.045, w * 0.26, max(2, h * 0.070));
     bx = x + w * 0.05; bw = w * 0.90; by = y + h * 0.24; bh = h * 0.70;
@@ -918,7 +939,7 @@ m == FXC_M_FLAT3 ? (
       ) : (
         _fxc_set(_fxc_padcol(i), 1);
         gfx_rect(cx, cy, bw * 0.215, bh * 0.215);
-        gfx_set(1, 1, 1, 0.14);                // the pad's top bevel
+        _fxc_rgba(1, 1, 1, 0.14);                // the pad's top bevel
         gfx_rect(cx, cy, bw * 0.215, bh * 0.055);
       );
       i += 1;
@@ -958,7 +979,7 @@ m == FXC_M_FLAT3 ? (
           _fxc_set(_fxc_lanecol(i), 1);
           gfx_rect(cx, cy, w * 0.070, bh * 0.105);
         ) : (
-          gfx_set(0, 0, 0, 0.11);
+          _fxc_rgba(0, 0, 0, 0.11);
           gfx_rect(cx, cy, w * 0.070, bh * 0.105);
         );
         j += 1;
@@ -993,11 +1014,11 @@ m == FXC_M_FLAT3 ? (
     gfx_circle(cx, cy, h * 0.20, 1, 1);                  // glass
     // The coating's colour cast, then the flare: one bright bead up and left,
     // which is what makes a dark disc read as GLASS instead of as a hole.
-    gfx_set(0.20, 0.45, 0.62, 0.55);
+    _fxc_rgba(0.20, 0.45, 0.62, 0.55);
     gfx_circle(cx, cy, h * 0.165, 1, 1);
-    gfx_set(1, 1, 1, 0.85);
+    _fxc_rgba(1, 1, 1, 0.85);
     gfx_circle(cx - h * 0.085, cy - h * 0.085, max(1, h * 0.042), 1, 1);
-    gfx_set(1, 1, 1, 0.22);
+    _fxc_rgba(1, 1, 1, 0.22);
     gfx_circle(cx + h * 0.05, cy + h * 0.06, max(1, h * 0.028), 1, 1);
   ) :
 
@@ -1016,7 +1037,7 @@ m == FXC_M_FLAT3 ? (
     _fxc_set(0xe0823a, 1);
     gfx_rect(bx + bw * 0.04, by + bh * 0.64, bw * 0.11, bh * 0.30);
     gfx_rect(bx + bw * 0.85, by + bh * 0.64, bw * 0.11, bh * 0.30);
-    gfx_set(0.69, 0.69, 0.67, 1);
+    _fxc_rgba(0.69, 0.69, 0.67, 1);
     gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
     gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
     _fxc_rows(bx, y + h * 0.62, bw, h * 0.26, 1, 0x6e6e68, 0xbcbcb6);
@@ -1033,7 +1054,7 @@ m == FXC_M_FLAT3 ? (
       gfx_rect(bx, by + bh * (0.11 + i * 0.26), bw * 0.72, max(1, bh * 0.06));
       i += 1;
     );
-    gfx_set(0.69, 0.69, 0.67, 1);
+    _fxc_rgba(0.69, 0.69, 0.67, 1);
     gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
     gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
     _fxc_rows(x + w * 0.29, y + h * 0.14, w * 0.63, h * 0.72, 3,
@@ -1054,7 +1075,7 @@ m == FXC_M_FLAT3 ? (
                max(2, bw * 0.07), bh * t);
       i += 1;
     );
-    gfx_set(0.69, 0.69, 0.67, 1);
+    _fxc_rgba(0.69, 0.69, 0.67, 1);
     gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
     gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
     _fxc_rows(bx, y + h * 0.64, bw, h * 0.26, 2, 0x6e6e68, 0xbcbcb6);
@@ -1068,7 +1089,7 @@ m == FXC_M_FLAT3 ? (
     _fxc_set(0xf8f8f4, 1); gfx_rect(bx, by, bw, bh);
     _fxc_set(0x2aa8c8, 1);
     gfx_rect(bx + bw * 0.18, by + bh * 0.35, bw * 0.28, bh * 0.30);
-    gfx_set(0.69, 0.69, 0.67, 1);
+    _fxc_rgba(0.69, 0.69, 0.67, 1);
     gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
     gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
     _fxc_rows(bx, y + h * 0.54, bw, h * 0.34, 2, 0x6e6e68, 0xbcbcb6);
@@ -1079,7 +1100,7 @@ m == FXC_M_FLAT3 ? (
     // a wrong light-field guess.
     bx = x + w * 0.05; by = y + h * 0.08; bw = w * 0.56; bh = h * 0.84;
     _fxc_set(0x141418, 1); gfx_rect(bx, by, bw, bh);
-    gfx_set(0.59, 0.59, 0.59, 0.40);
+    _fxc_rgba(0.59, 0.59, 0.59, 0.40);
     gfx_rect(bx + bw * 0.5, by, 1, bh); gfx_rect(bx, by + bh * 0.5, bw, 1);
     _fxc_set(0xe8d43c, 1);
     gfx_circle(bx + bw * 0.30, by + bh * 0.28, max(1.5, w * 0.020), 1, 1);
@@ -1088,7 +1109,7 @@ m == FXC_M_FLAT3 ? (
     gfx_circle(bx + bw * 0.50, by + bh * 0.74, max(1.5, w * 0.020), 1, 1);
     _fxc_set(0xe8e8e4, 1);
     gfx_circle(bx + bw * 0.50, by + bh * 0.50, max(1.5, w * 0.020), 1, 1);
-    gfx_set(0.04, 0.04, 0.05, 1);
+    _fxc_rgba(0.04, 0.04, 0.05, 1);
     gfx_rect(bx, by, bw, 1); gfx_rect(bx, by + bh - 1, bw, 1);
     gfx_rect(bx, by, 1, bh); gfx_rect(bx + bw - 1, by, 1, bh);
     _fxc_set(0xc6c6c0, 1);
@@ -1135,7 +1156,7 @@ m == FXC_M_FLAT3 ? (
                    w * 0.30 * (1 + t * 0.55), h * 0.15 * (1 + t * 0.70));
       i += 1;
     );
-    gfx_set(0.55, 0.59, 0.63, 0.30);
+    _fxc_rgba(0.55, 0.59, 0.63, 0.30);
     gfx_rect(x + w * 0.13, y + h * 0.70, w * 0.74, 1);
     // ⭐ A solid stroke, not glow alone -- glow-only read as a BLANK card and
     // took out six designs before it was caught (recipes DB, blank-card audit).
@@ -1167,7 +1188,7 @@ m == FXC_M_FLAT3 ? (
   m == FXC_M_SLIDERS ? (
     rec[FXC_VAR] & FXC_V_V2 ? (
       bx = x + w * 0.18; bw = w * 0.64; by = y + h * 0.12; bh = h * 0.76;
-      gfx_set(0, 0, 0, 0.45);
+      _fxc_rgba(0, 0, 0, 0.45);
       i = 0;
       loop(3, gfx_rect(bx + bw * i * 0.44, by, max(2, bw * 0.12), bh); i += 1;);
       _fxc_set(0xecece8, 1);                   // fader caps
@@ -1177,7 +1198,7 @@ m == FXC_M_FLAT3 ? (
     ) : (
       // The generic-REAPER-UI motif: a wall of slider rows.
       bx = x + w * 0.10; bw = w * 0.80; by = y + h * 0.08; bh = h * 0.84;
-      rec[FXC_SL] >= 0 ? _fxc_set(rec[FXC_SL], 1) : gfx_set(0, 0, 0, 0.35);
+      rec[FXC_SL] >= 0 ? _fxc_set(rec[FXC_SL], 1) : _fxc_rgba(0, 0, 0, 0.35);
       i = 0;
       loop(6, gfx_rect(bx + bw * i * 0.18, by, max(1, bw * 0.06), bh); i += 1;);
     );
@@ -1191,7 +1212,7 @@ m == FXC_M_FLAT3 ? (
   ) :
 
   m == FXC_M_STRIP ? (
-    gfx_set(0, 0, 0, 0.28);                    // section dividers
+    _fxc_rgba(0, 0, 0, 0.28);                    // section dividers
     gfx_rect(x, y + h * 0.270, w, max(1, h * 0.015));
     gfx_rect(x, y + h * 0.570, w, max(1, h * 0.015));
     // EM> 1.55em at 9.5px on an 84-tall card = 14.725px = 0.17530 h
@@ -1201,7 +1222,7 @@ m == FXC_M_FLAT3 ? (
       i == 0 ? _fxc_set(0xc85a4a, 1) : i == 1 ? _fxc_set(0x4a78c8, 1) :
       i == 2 ? _fxc_set(0x58a860, 1) : _fxc_set(0xd0a848, 1);
       gfx_circle(x + w * 0.38, y + h * (0.19 + i * 0.17530), r, 1, 1);
-      gfx_set(0, 0, 0, 0.30);
+      _fxc_rgba(0, 0, 0, 0.30);
       gfx_circle(x + w * 0.38, y + h * (0.19 + i * 0.17530), r, 0, 1);
       i += 1;
     );
@@ -1214,7 +1235,7 @@ m == FXC_M_FLAT3 ? (
     // Contrast comes from the panel, not from data -- see _fxc_lum.
     t = _fxc_lum(rec[FXC_B1]) > 0.5;
     // (the skyline is drawn by FXC_E_AN in _fxc_elements, not here)
-    t ? gfx_set(0.23, 0.27, 0.34, 0.38) : gfx_set(0.84, 0.88, 0.92, 0.30);
+    t ? _fxc_rgba(0.23, 0.27, 0.34, 0.38) : _fxc_rgba(0.84, 0.88, 0.92, 0.30);
     gfx_rect(x, y + h * 0.444, w, max(1, h * 0.017));   // the 0 dB reference
     // Band fills: soft, wide, behind everything. Alpha falls off outward so
     // they read as glow rather than as stacked contour rings.
@@ -1240,7 +1261,7 @@ m == FXC_M_FLAT3 ? (
       cy = y + h * (i == 0 ? rec[FXC_N1Y] : i == 1 ? rec[FXC_N2Y] : rec[FXC_N3Y]);
       k = i == 0 ? rec[FXC_C1] : i == 1 ? rec[FXC_C2] : rec[FXC_C3];
       k < 0 ? k = 0x6ec96e;
-      t ? gfx_set(0.13, 0.15, 0.20, 0.85) : gfx_set(1, 1, 1, 0.95);
+      t ? _fxc_rgba(0.13, 0.15, 0.20, 0.85) : _fxc_rgba(1, 1, 1, 0.95);
       gfx_circle(cx, cy, max(2, w * 0.030), 1, 1);
       _fxc_set(k, 1);
       gfx_circle(cx, cy, max(1, w * 0.018), 1, 1);
@@ -1254,8 +1275,8 @@ m == FXC_M_FLAT3 ? (
     acc < 0 ? acc = 0x5a96dc;
     rec[FXC_VAR] & FXC_V_V2 ? (
       bx = x + w * 0.14; by = y + h * 0.14; bw = w * 0.72; bh = h * 0.72;
-      gfx_set(0, 0, 0, 0.50); gfx_rect(bx, by, bw, bh);
-      gfx_set(1, 1, 1, 0.09);
+      _fxc_rgba(0, 0, 0, 0.50); gfx_rect(bx, by, bw, bh);
+      _fxc_rgba(1, 1, 1, 0.09);
       i = 0;
       loop(4, gfx_rect(bx + bw * i * 0.26, by, bw * 0.26 * 0.7, bh); i += 1;);
       _fxc_set(acc, 1); gfx_rect(bx, by, bw, max(2, h * 0.035));
@@ -1264,7 +1285,7 @@ m == FXC_M_FLAT3 ? (
       i = 0;
       loop(2,
         by = y + h * (0.14 + i * 0.36667);
-        gfx_set(0, 0, 0, 0.35);
+        _fxc_rgba(0, 0, 0, 0.35);
         gfx_rect(x + w * 0.12, by, w * 0.76, h * 0.26);
         _fxc_set(acc, 1);
         gfx_rect(x + w * 0.12, by, max(2, w * 0.021), h * 0.26);
@@ -1279,7 +1300,7 @@ m == FXC_M_FLAT3 ? (
     // the card -- no other compressor in the deck has one, which is exactly why
     // Weld stops being a twin of Anvil the moment it is drawn.
     _fxc_set(0x4a5560, 1); gfx_rect(x, y, w, h * 0.15);
-    gfx_set(0, 0, 0, 0.45); gfx_rect(x, y + h * 0.15, w, max(1, h * 0.013));
+    _fxc_rgba(0, 0, 0, 0.45); gfx_rect(x, y + h * 0.15, w, max(1, h * 0.013));
     _fxc_set(0xd9331e, 1);
     gfx_rect(x + w * 0.05, y + h * 0.045, w * 0.26, max(2, h * 0.055));
     _fxc_vuface(x + w * 0.50, y + h * 0.36, w * 0.185, h * 0.145,
@@ -1335,7 +1356,7 @@ m == FXC_M_FLAT3 ? (
     );
     _fxc_knob(cx, cy, w * 0.135, k < 0 ? 0x8f82cc : k, k2,
               rec[FXC_PTR] >= 0 ? rec[FXC_PTR] : 0xf2f2ee, 0, -1);
-    gfx_set(0, 0, 0, 0.42);                    // the correlation strip
+    _fxc_rgba(0, 0, 0, 0.42);                    // the correlation strip
     gfx_rect(x + w * 0.10, y + h * 0.85, w * 0.80, h * 0.10);
     _fxc_set(0x4ad07a, 1);
     gfx_rect(x + w * 0.495, y + h * 0.85, max(2, w * 0.014), h * 0.10);
@@ -1367,12 +1388,12 @@ m == FXC_M_FLAT3 ? (
     bx = x + w * 0.03; by = y + h * 0.08; bw = w * 0.94; bh = h * 0.66;
     _fxc_set(rec[FXC_C3] >= 0 ? rec[FXC_C3] : 0x14161a, 1);
     gfx_rect(bx, by, bw, bh);
-    gfx_set(1, 1, 1, 0.07);
+    _fxc_rgba(1, 1, 1, 0.07);
     i = 1;
     loop(5, gfx_rect(bx + bw * i / 6, by, 1, bh); i += 1;);
     i = 1;
     loop(3, gfx_rect(bx, by + bh * i / 4, bw, 1); i += 1;);
-    gfx_set(1, 1, 1, 0.30);                    // the 0 dB reference
+    _fxc_rgba(1, 1, 1, 0.30);                    // the 0 dB reference
     gfx_rect(bx, by + bh * 0.50, bw, max(1, h * 0.010));
     n = max(20, (bw * 0.6) | 0);               // the curve
     i = 0;
@@ -1390,7 +1411,7 @@ m == FXC_M_FLAT3 ? (
       c = i == 0 ? (rec[FXC_C1] >= 0 ? rec[FXC_C1] : 0x50c8a0)
         : i == 1 ? (rec[FXC_C2] >= 0 ? rec[FXC_C2] : 0xe0b040)
         : 0xe06a6a;
-      gfx_set(0, 0, 0, 0.55);
+      _fxc_rgba(0, 0, 0, 0.55);
       gfx_circle(bx + bw * t, by + bh * u, max(2, h * 0.048), 1, 1);
       _fxc_set(c, 1);
       gfx_circle(bx + bw * t, by + bh * u, max(2, h * 0.036), 1, 1);
@@ -1408,16 +1429,16 @@ m == FXC_M_FLAT3 ? (
     loop(4,
       bx = x + w * (0.035 + i * 0.2375);
       bw = w * 0.215;
-      gfx_set(1, 1, 1, 0.16);  gfx_rect(bx, y + h * 0.10, bw, h * 0.82);
-      gfx_set(0, 0, 0, 0.16);  gfx_rect(bx, y + h * 0.10, bw, max(1, h * 0.014));
+      _fxc_rgba(1, 1, 1, 0.16);  gfx_rect(bx, y + h * 0.10, bw, h * 0.82);
+      _fxc_rgba(0, 0, 0, 0.16);  gfx_rect(bx, y + h * 0.10, bw, max(1, h * 0.014));
       c = i == 0 ? 0x2f5fbf : i == 1 ? 0x2f9e4f : i == 2 ? 0xc0392b : 0xb9bcc0;
       _fxc_set(c, 1);                          // the bay lamp
       gfx_circle(bx + bw * 0.20, y + h * 0.20, max(1, h * 0.035), 1, 1);
-      gfx_set(0, 0, 0, 0.30);                  // its label rule
+      _fxc_rgba(0, 0, 0, 0.30);                  // its label rule
       gfx_rect(bx + bw * 0.36, y + h * 0.185, bw * 0.50, max(1, h * 0.035));
       _fxc_knob(bx + bw * 0.50, y + h * 0.53, bw * 0.36, c, -1, 0xf2f2ee,
                 0, -1);
-      gfx_set(0, 0, 0, 0.34);                  // the value readout
+      _fxc_rgba(0, 0, 0, 0.34);                  // the value readout
       gfx_rect(bx + bw * 0.14, y + h * 0.80, bw * 0.72, h * 0.075);
       i += 1;
     );
@@ -1431,7 +1452,7 @@ m == FXC_M_FLAT3 ? (
     // what makes this read as auto-tune rather than as another spectrum.
     bx = x + w * 0.05; by = y + h * 0.10; bw = w * 0.90; bh = h * 0.44;
     _fxc_set(0x0a0b0d, 1); gfx_rect(bx, by, bw, bh);
-    gfx_set(1, 1, 1, 0.09);
+    _fxc_rgba(1, 1, 1, 0.09);
     i = 1;
     loop(4, gfx_rect(bx, by + bh * i / 5, bw, 1); i += 1;);
     n = 6;
@@ -1452,7 +1473,7 @@ m == FXC_M_FLAT3 ? (
     by = y + h * 0.60; bh = h * 0.32;          // the strobe bar row
     i = 0;
     loop(12,
-      gfx_set(1, 1, 1, 0.55);
+      _fxc_rgba(1, 1, 1, 0.55);
       cx = bx + bw * i / 12;
       bw / 12 > 3 ? (
         gfx_rect(cx, by, bw / 12 - max(1, w * 0.008), 1);
@@ -1475,7 +1496,7 @@ m == FXC_M_FLAT3 ? (
     // MIDI utility looking like two pitch correctors is the exact failure this
     // whole pass exists to remove.
     _fxc_set(0x2b2f36, 1); gfx_rect(x, y, w, h * 0.15);
-    gfx_set(0, 0, 0, 0.45); gfx_rect(x, y + h * 0.15, w, max(1, h * 0.012));
+    _fxc_rgba(0, 0, 0, 0.45); gfx_rect(x, y + h * 0.15, w, max(1, h * 0.012));
     _fxc_set(acc >= 0 ? acc : 0x1fa8c8, 1);
     gfx_rect(x + w * 0.05, y + h * 0.05, w * 0.30, max(2, h * 0.050));
     i = 0;
@@ -1501,7 +1522,7 @@ m == FXC_M_FLAT3 ? (
     );
     i = 1;
     loop(13,                                   // white-key rules
-      gfx_set(0, 0, 0, 0.32);
+      _fxc_rgba(0, 0, 0, 0.32);
       gfx_rect(bx + bw * i / 14, by, max(1, w * 0.005), bh);
       i += 1;
     );
@@ -1527,7 +1548,7 @@ m == FXC_M_FLAT3 ? (
     _fxc_set(0x3a3d42, 1); gfx_rect(x, y + h * 0.045, w, h * 0.105);
     i = 0;
     loop(4,                                    // the sync/mode chips
-      gfx_set(1, 1, 1, i == 1 ? 0.55 : 0.22);
+      _fxc_rgba(1, 1, 1, i == 1 ? 0.55 : 0.22);
       gfx_rect(x + w * (0.06 + i * 0.14), y + h * 0.065, w * 0.10, h * 0.065);
       i += 1;
     );
@@ -1568,23 +1589,23 @@ m == FXC_M_FLAT3 ? (
     acc >= 0 ? (                               // caption bar, category tinted
       _fxc_set(acc, 0.55); gfx_rect(x + w * 0.04, y + h * 0.06, w * 0.80, h * 0.13);
     ) : (
-      gfx_set(0, 0, 0, 0.13); gfx_rect(x + w * 0.04, y + h * 0.06, w * 0.80, h * 0.13);
+      _fxc_rgba(0, 0, 0, 0.13); gfx_rect(x + w * 0.04, y + h * 0.06, w * 0.80, h * 0.13);
     );
-    gfx_set(0, 0, 0, 0.30);
+    _fxc_rgba(0, 0, 0, 0.30);
     gfx_rect(x + w * 0.04, y + h * 0.19, w * 0.80, max(1, h * 0.014));
     n = rec[FXC_VAR] & FXC_V_V2 ? 5 : 4;
     t = rec[FXC_SL] >= 0 ? 0.46 : 0.62;        // rows stop above the strip
     i = 0;
     loop(n,
       by = y + h * (0.26 + i * (t / n));
-      gfx_set(0, 0, 0, 0.26);                  // the groove
+      _fxc_rgba(0, 0, 0, 0.26);                  // the groove
       gfx_rect(bx, by + h * 0.028, bw, max(1, h * 0.020));
       _fxc_set(k < 0 ? 0xb8bcc0 : k, 1);       // the handle
       gfx_rect(bx + bw * (0.16 + 0.17 * (i % 3)), by,
                max(3, w * 0.032), max(4, h * 0.078));
       i += 1;
     );
-    gfx_set(0, 0, 0, 0.55);                    // REAPER's meter column
+    _fxc_rgba(0, 0, 0, 0.55);                    // REAPER's meter column
     gfx_rect(x + w * 0.885, y + h * 0.06, w * 0.075, h * 0.88);
     _fxc_set(0x3ac07a, 0.85);
     gfx_rect(x + w * 0.897, y + h * 0.46, w * 0.051, h * 0.46);
@@ -1610,7 +1631,7 @@ m == FXC_M_FLAT3 ? (
     // px on a console chip the tail is still legible and nothing else is.
     c = acc >= 0 ? acc : 0x9a6ad0;
     bx = x + w * 0.08; bw = w * 0.84; by = y + h * 0.16; bh = h * 0.62;
-    gfx_set(0, 0, 0, 0.32);                    // the floor
+    _fxc_rgba(0, 0, 0, 0.32);                    // the floor
     gfx_rect(x + w * 0.05, by + bh, w * 0.90, max(1, h * 0.020));
     _fxc_set(c, 0.16);                         // room glow behind the tail
     _fxc_ellipse(bx + bw * 0.30, by + bh * 0.78, bw * 0.34, bh * 0.30);
@@ -1636,7 +1657,7 @@ m == FXC_M_FLAT3 ? (
     c = acc >= 0 ? acc : 0x2f6fd0;
     i = 0;
     loop(6,                                    // the lanes
-      gfx_set(1, 1, 1, (i % 2) ? 0.045 : 0.085);
+      _fxc_rgba(1, 1, 1, (i % 2) ? 0.045 : 0.085);
       gfx_rect(x + w * 0.22, y + h * (0.14 + i * 0.125), w * 0.72, h * 0.105);
       i += 1;
     );
@@ -1656,7 +1677,7 @@ m == FXC_M_FLAT3 ? (
     );
     _fxc_set(c, 1);                            // the note block
     gfx_rect(x + w * 0.05, y + h * 0.32, w * 0.13, h * 0.30);
-    gfx_set(0, 0, 0, 0.55);
+    _fxc_rgba(0, 0, 0, 0.55);
     gfx_rect(x + w * 0.075, y + h * 0.38, w * 0.055, h * 0.18);
   ) :
 
@@ -1691,7 +1712,7 @@ m == FXC_M_FLAT3 ? (
     _fxc_set(0xd8dce2, 1); gfx_rect(bx, by, bw, bh);
     i = 1;
     loop(11,                                   // plain white keys, no zones
-      gfx_set(0, 0, 0, 0.35);
+      _fxc_rgba(0, 0, 0, 0.35);
       gfx_rect(bx + bw * i / 12, by, max(1, w * 0.005), bh);
       i += 1;
     );
@@ -1706,6 +1727,13 @@ m == FXC_M_FLAT3 ? (
 function swing_fxcard_draw(x, y, w, h, rec)
   local(rad)
 (
+  // The caller's gfx_a on entry is the card's strength: the console insert
+  // chip, the LCD chain grid and the rack row dim a bypassed or offline plugin
+  // to 0.16-0.42 before calling, and every primitive in here sets its own
+  // alpha, so the card used to paint at full strength regardless (LIB25).
+  // _fxc_rgba / _fxc_set / _fxc_shade / _fxc_panel multiply it in; the
+  // ellipse scanners restore a colour they captured, already multiplied.
+  _fxc_ga = gfx_a;
   w > 3 && h > 3 ? (
     _fxc_panel(x, y, w, h,
                rec[FXC_B1],
@@ -1714,7 +1742,7 @@ function swing_fxcard_draw(x, y, w, h, rec)
     _fxc_elements(x, y, w, h, rec);
     // Seat the card: a dark edge all round, so a light face does not bleed
     // into a light list background.
-    gfx_set(0, 0, 0, 0.55);
+    _fxc_rgba(0, 0, 0, 0.55);
     gfx_rect(x, y, w, 1); gfx_rect(x, y + h - 1, w, 1);
     gfx_rect(x, y, 1, h); gfx_rect(x + w - 1, y, 1, h);
   );
@@ -1722,18 +1750,20 @@ function swing_fxcard_draw(x, y, w, h, rec)
 
 // The card for a plugin the deck has never heard of.
 //
-// ⚠️ NOT optional. The deck covers 145 recipes and a REAPER install carries
-// ~880 audio FX, so in a grid the majority of tiles have no art. Leaving those
-// blank would make the grid strictly worse than the list; this at least carries
+// ⚠️ NOT optional. The deck covers FXC_N_CARDS recipes, found by FXC_N_KEYS
+// name keys (rk_swing_fxcard_data), and any installed plugin whose name is not
+// among the keys has no art. Leaving those tiles blank would make the grid
+// strictly worse than the list; this at least carries
 // the category colour, which is the one fact we always know. Same 1.714:1 box
 // and the same seat as a real card, so a wall of mixed known/unknown still
 // reads as one grid.
 function swing_fxcard_blank(x, y, w, h, col, seed)
   local(v, i, n, r, cy2, bx, bw, lo, hi, mid)
 (
+  _fxc_ga = gfx_a;   // the caller's dim, as swing_fxcard_draw (LIB25)
   w > 3 && h > 3 ? (
     // FIVE faces instead of one, chosen by the plugin's own name hash. The old
-    // single fallback meant ~736 uncarded plugins drew the SAME tile, so a
+    // single fallback meant every uncarded plugin drew the SAME tile, so a
     // category read as a wall of clones and the grid told you nothing the list
     // did not. The variant is derived, so a plugin always wears the same face
     // and neighbours differ -- which is the entire job here.
@@ -1747,8 +1777,10 @@ function swing_fxcard_blank(x, y, w, h, col, seed)
     _fxc_shade(col, 0.78, 1); gfx_rect(x, y, w, h);
     _fxc_set(col, 0.85);      gfx_rect(x, y, w, max(2, h * 0.13));
     // a hairline in the accent, offset by the seed so even same-variant
-    // neighbours are not identical
-    _fxc_shade(col, 1.35, 0.55);
+    // neighbours are not identical. _fxc_shade_c (a multiplier, 1.35 = brighter):
+    // _fxc_shade with t = 1.35 mixed PAST black to negative RGB, which drew as a
+    // black line (LIB220).
+    _fxc_set(_fxc_shade_c(col, 1.35), 0.55);
     gfx_rect(x, y + max(2, h * 0.13), w * (0.35 + 0.12 * ((seed | 0) % 4)), 1);
 
     v == 0 ? (                                   // a wall of slider rows
@@ -1765,7 +1797,7 @@ function swing_fxcard_blank(x, y, w, h, col, seed)
       _fxc_knob(x + w * 0.70, cy2, r, mid, hi, 1, 0, -1);
     ) : v == 3 ? (                               // a readout over two knobs
       bx = x + w * 0.10; bw = w * 0.80;
-      _fxc_shade(col, 0.28, 1);
+      _fxc_set(_fxc_shade_c(col, 0.28), 1);   // a DARK readout, so the `hi` trace reads (LIB220; was 72 % of the colour)
       gfx_rect(bx, y + h * 0.26, bw, h * 0.28);
       _fxc_spec(bx + 2, y + h * 0.28, bw - 4, h * 0.24, hi, 0.75);
       r = h * 0.15; cy2 = y + h * 0.76;
@@ -1785,7 +1817,7 @@ function swing_fxcard_blank(x, y, w, h, col, seed)
       );
     );
 
-    gfx_set(0, 0, 0, 0.55);
+    _fxc_rgba(0, 0, 0, 0.55);
     gfx_rect(x, y, w, 1); gfx_rect(x, y + h - 1, w, 1);
     gfx_rect(x, y, 1, h); gfx_rect(x + w - 1, y, 1, h);
   );
@@ -1800,5 +1832,6 @@ function swing_fxcard_set(rec, motif, b1, b2, k, k2, acc)
   rec[FXC_PTR] = -1; rec[FXC_ECOL] = -1; rec[FXC_ELEM] = 0;
   rec[FXC_VAR] = 0;  rec[FXC_SL] = -1;
   rec[FXC_EX] = -1;  rec[FXC_EY] = -1; rec[FXC_EW] = -1; rec[FXC_EH] = -1;
+  rec[FXC_EOWN] = 0;
   rec[FXC_C1] = -1;  rec[FXC_C2] = -1; rec[FXC_C3] = -1;
 );

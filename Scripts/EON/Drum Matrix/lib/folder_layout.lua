@@ -41,31 +41,93 @@ local M = {}
 -- Parent discovery (shared with Swing_Kit_Bridge.find_folder_track logic)
 -- ────────────────────────────────────────────────────────────────────────
 
--- Return Swing's parent folder track (one above with I_FOLDERDEPTH == 1),
--- or nil if Swing isn't currently inside a folder.
+local function _pext(tr, key)
+  local _, v = reaper.GetSetMediaTrackInfo_String(tr, 'P_EXT:' .. key, '', false)
+  return v or ''
+end
+
+-- Is `par` (the folder right above Swing) a parent Swing built? Ownership, not position (A3b, 2026-10-26): position
+-- alone took a folder the user made ("Drums", Swing its first track) for Swing's parent -- the bridge renamed it
+-- "Swing — <kit>" and recoloured it, and EnsureSwingParentLayout rewrote its tracks' depths. The same rule as the
+-- bridge's eon_swing_parent_owned, cheapest proof first:
+--   * P_EXT:EON_SWING_PARENT -- every parent made from now on (EnsureParent below, the bridge's Multi-Out build);
+--     the bridge stamps it on an older parent that passes a test below;
+--   * the name "Swing — ..." -- the label the bridge writes on every name sync to the parent it found;
+--   * a track one of Swing's sends feeds, carrying P_EXT:EON_PAD_IDX (Swing's pad track), somewhere inside it;
+--   * one of Swing's tagged sub-folders directly inside it (EON_AUDIO_KIT_FOLDER, EON_DRUM_KIT_FOLDER).
+-- Each is something only Swing writes. Tracks compared by GUID.
+function M.IsSwingParent(par, swing_track)
+  if not par or not swing_track then return false end
+  if _pext(par, 'EON_SWING_PARENT') ~= '' then return true end
+  local _, nm = reaper.GetSetMediaTrackInfo_String(par, 'P_NAME', '', false)
+  if nm and nm:sub(1, #'Swing — ') == 'Swing — ' then return true end
+  local pg = reaper.GetTrackGUID(par)
+  if not pg or pg == '' then return false end
+  for s = 0, reaper.GetTrackNumSends(swing_track, 0) - 1 do
+    local d = reaper.GetTrackSendInfo_Value(swing_track, 0, s, 'P_DESTTRACK')
+    if not d and reaper.BR_GetMediaTrackSendInfo_Track then
+      d = reaper.BR_GetMediaTrackSendInfo_Track(swing_track, 0, s, 1)
+    end
+    if d and _pext(d, 'EON_PAD_IDX') ~= '' then
+      local p = reaper.GetParentTrack(d)
+      while p do
+        if reaper.GetTrackGUID(p) == pg then return true end
+        p = reaper.GetParentTrack(p)
+      end
+    end
+  end
+  local i = math.floor(reaper.GetMediaTrackInfo_Value(par, 'IP_TRACKNUMBER') + 0.5)   -- 0-based: the track after it
+  local depth, total = 1, reaper.CountTracks(0)
+  while i < total and depth > 0 do
+    local tr = reaper.GetTrack(0, i)
+    if not tr then break end
+    if _pext(tr, 'EON_AUDIO_KIT_FOLDER') ~= '' or _pext(tr, 'EON_DRUM_KIT_FOLDER') ~= '' then
+      local p = reaper.GetParentTrack(tr)
+      if p and reaper.GetTrackGUID(p) == pg then return true end
+    end
+    depth = depth + reaper.GetMediaTrackInfo_Value(tr, 'I_FOLDERDEPTH')
+    i = i + 1
+  end
+  return false
+end
+
+-- Return Swing's parent folder track: the folder Swing sits in (REAPER's own GetParentTrack) when Swing built it
+-- (M.IsSwingParent), or nil if Swing isn't inside a folder of its own (a folder the user made is not one).
+-- The folder it SITS IN, not the track directly above it (DM25, 2026-10-26): a user track dropped at the top of
+-- Swing's folder hid the parent from the old rule, so EnsureParent nested a second parent right above Swing
+-- inside the first; the old close then closed the new one and the old parent ran open over every track below.
+-- The walkers below already treat tracks before Swing as 'other'.
 function M.FindParent(swing_track)
   if not swing_track then return nil end
-  local sw_idx = math.floor(reaper.GetMediaTrackInfo_Value(swing_track, 'IP_TRACKNUMBER') + 0.5) - 1
-  if sw_idx < 1 then return nil end
-  local above = reaper.GetTrack(0, sw_idx - 1)
-  if not above then return nil end
-  local depth = reaper.GetMediaTrackInfo_Value(above, 'I_FOLDERDEPTH')
-  if depth == 1 then return above end
+  local par = reaper.GetParentTrack(swing_track)
+  if par and M.IsSwingParent(par, swing_track) then return par end
   return nil
 end
 
 -- Ensure Swing has a parent folder above it, creating one (unnamed) if
 -- missing. Returns the parent track. Used by EON_DM_Build when the user
 -- builds the Drum Matrix folder before ever clicking Multi-Out.
+-- A3b: the new parent is tagged P_EXT:EON_SWING_PARENT and closes on Swing (Swing's close grows by one): a folder
+-- of the user's that Swing sat in keeps its own end, and the parent no longer runs open to the project's end (the
+-- build's EndOfParentIndex put the MIDI folder after every track below). The MIDI folder built right after Swing
+-- is then pulled in by EnsureSwingParentLayout's re-absorb (its lanes are tagged).
 function M.EnsureParent(swing_track)
   if not swing_track then return nil end
   local existing = M.FindParent(swing_track)
-  if existing then return existing end
+  if existing then
+    if _pext(existing, 'EON_SWING_PARENT') == '' then   -- an older parent that passed on a proof
+      reaper.GetSetMediaTrackInfo_String(existing, 'P_EXT:EON_SWING_PARENT', '1', true)
+    end
+    return existing
+  end
   local sw_idx = math.floor(reaper.GetMediaTrackInfo_Value(swing_track, 'IP_TRACKNUMBER') + 0.5) - 1
   reaper.InsertTrackAtIndex(sw_idx, true)
   local parent = reaper.GetTrack(0, sw_idx)
   if parent then
     reaper.SetMediaTrackInfo_Value(parent, 'I_FOLDERDEPTH', 1)
+    reaper.GetSetMediaTrackInfo_String(parent, 'P_EXT:EON_SWING_PARENT', '1', true)
+    local sd = reaper.GetMediaTrackInfo_Value(swing_track, 'I_FOLDERDEPTH')
+    if sd <= 0 then reaper.SetMediaTrackInfo_Value(swing_track, 'I_FOLDERDEPTH', sd - 1) end
     -- Leave the parent name BLANK so the kit-named sub-folders below
     -- (`<kit>` audio, `EON DM <kit>`) carry the labelling.
     reaper.GetSetMediaTrackInfo_String(parent, 'P_NAME', '', true)
@@ -84,21 +146,22 @@ function M.FindDMSubfolder(swing_track)
   if not parent then return nil end
   local p_idx = math.floor(reaper.GetMediaTrackInfo_Value(parent, 'IP_TRACKNUMBER') + 0.5) - 1
   local total = reaper.CountTracks(0)
-  -- Walk parent contents (same stopping rule as _walk_parent_contents).
+  -- Walk parent contents (same stopping rule as _walk_parent_contents). Every track's depth counts, Swing's
+  -- included (DM217, 2026-10-26: Swing as the parent's only child closes it with -1, and leaving that out ran
+  -- the walk past the parent to the end of the project, where another group's stranded MIDI folder could be
+  -- returned, renamed and repainted); only the header test skips Swing.
   local depth = 1
   local i = p_idx + 1
   while i < total and depth > 0 do
     local tr = reaper.GetTrack(0, i)
     if not tr then break end
+    local d = reaper.GetMediaTrackInfo_Value(tr, 'I_FOLDERDEPTH')
     -- Only check tracks that ARE folder headers (depth >= 1 at parent level).
-    if tr ~= swing_track then
-      local d = reaper.GetMediaTrackInfo_Value(tr, 'I_FOLDERDEPTH')
-      if d >= 1 and depth == 1 then
-        local _, raw = reaper.GetSetMediaTrackInfo_String(tr, 'P_EXT:EON_DRUM_KIT_FOLDER', '', false)
-        if raw and raw ~= '' then return tr end
-      end
-      depth = depth + d
+    if tr ~= swing_track and d >= 1 and depth == 1 then
+      local _, raw = reaper.GetSetMediaTrackInfo_String(tr, 'P_EXT:EON_DRUM_KIT_FOLDER', '', false)
+      if raw and raw ~= '' then return tr end
     end
+    depth = depth + d
     i = i + 1
   end
   return nil
@@ -217,6 +280,11 @@ local function _walk_parent_contents(swing_track)
     if in_subfolder and cum_depth <= 1 then in_subfolder = false end
     i = i + 1
   end
+  -- Folders OUTSIDE the parent that the walked tracks also closed (A3b, 2026-10-26): Swing's parent inside a folder
+  -- of the user's whose last track is Swing's (-3 = sub + parent + the user's). The rewrite below sets the canonical
+  -- -2 and would drop that third close, leaving the user's folder open over every track below. The walk ending at
+  -- <= 0 is the parent's close; anything below 0 belongs outside. A walk that ran off the end (never closed) has none.
+  local outer = (cum_depth < 0) and cum_depth or 0
 
   -- Re-absorb tagged sub-folders stranded just PAST a premature parent-close.
   -- The main walk stops at the track that returns cumulative depth to <= 0 (the
@@ -232,10 +300,9 @@ local function _walk_parent_contents(swing_track)
     if not hdr or not _is_tagged_sub_header(hdr) then break end
     local _, dm_tag = reaper.GetSetMediaTrackInfo_String(hdr, 'P_EXT:EON_DRUM_KIT_FOLDER', '', false)
     local is_dm = dm_tag ~= nil and dm_tag ~= ''
-    entries[#entries + 1] = {
-      track = hdr, role = 'subfolder_header',
-      original_depth = reaper.GetMediaTrackInfo_Value(hdr, 'I_FOLDERDEPTH'),
-    }
+    local hd = reaper.GetMediaTrackInfo_Value(hdr, 'I_FOLDERDEPTH')
+    entries[#entries + 1] = { track = hdr, role = 'subfolder_header', original_depth = hd }
+    local net = hd   -- this sub's own net depth: 0 when it opens and closes itself, below 0 = outer closes too
     i = i + 1
     while i < total do
       local c = reaper.GetTrack(0, i)
@@ -252,11 +319,13 @@ local function _walk_parent_contents(swing_track)
         if cd >= 1 and not _is_bank_header(c) then break end
       end
       entries[#entries + 1] = { track = c, role = 'subfolder_child', original_depth = cd }
+      net = net + cd
       i = i + 1
     end
+    if net < 0 then outer = outer + net end   -- a sub left open (net > 0, the DM build's lanes at 0) closes nothing
   end
 
-  return parent, entries
+  return parent, entries, outer
 end
 
 -- ────────────────────────────────────────────────────────────────────────
@@ -269,8 +338,9 @@ end
 -- should EnsureParent first or accept the no-op).
 function M.EnsureSwingParentLayout(swing_track)
   if not swing_track then return false end
-  local parent, entries = _walk_parent_contents(swing_track)
+  local parent, entries, outer = _walk_parent_contents(swing_track)
   if not parent or not entries then return false end
+  outer = outer or 0
 
   -- Group consecutive subfolder_header + subfolder_child entries into
   -- one record each: { header_track, child_tracks = {...} }.
@@ -315,6 +385,13 @@ function M.EnsureSwingParentLayout(swing_track)
   -- first Swing return; a group with members opens (+1) and its last member closes it (-1), a group without stays a
   -- plain track. The sub's own close is ADDED to whatever its last child already closes. A sub without bank headers
   -- (the DM sub, a pre-step-2 Audio sub) comes out exactly as before.
+  -- The parent's close goes on the LAST track inside it (DM26, 2026-10-26): a user track placed after the final
+  -- sub's last child (a "Drum Bus" dragged to the end of Swing's folder) was zeroed by Pass 1 while that child
+  -- took -2, so the parent closed above the user's track and pushed it out to the top level. When the final sub's
+  -- last child is not the group's last track, the sub closes with -1 only and entries[#entries] takes the -1 the
+  -- no-sub branch below would give it.
+  local last_in_parent = entries[#entries] and entries[#entries].track
+  local parent_closed = false
   for sub_idx, s in ipairs(real_subs) do
     reaper.SetMediaTrackInfo_Value(s.header, 'I_FOLDERDEPTH', 1)
     local cur
@@ -333,19 +410,25 @@ function M.EnsureSwingParentLayout(swing_track)
     end
     if cur and cur.last then reaper.SetMediaTrackInfo_Value(cur.last, 'I_FOLDERDEPTH', -1) end
     local last = s.children[#s.children]
-    local is_final_sub = (sub_idx == #real_subs)
+    local closes_parent = (sub_idx == #real_subs) and (last == last_in_parent)
     local inner = reaper.GetMediaTrackInfo_Value(last, 'I_FOLDERDEPTH')
     if inner > 0 then inner = 0 end   -- a member-less bank header at the very end
-    reaper.SetMediaTrackInfo_Value(last, 'I_FOLDERDEPTH', inner + (is_final_sub and -2 or -1))
+    reaper.SetMediaTrackInfo_Value(last, 'I_FOLDERDEPTH', inner + (closes_parent and -2 or -1))
+    if closes_parent then parent_closed = true end
   end
 
-  -- Edge case: no real sub-folders. Parent contains only Swing (+ maybe
-  -- manual "other" tracks). The LAST track in the parent must close it
-  -- with -1, otherwise the parent never closes and any track inserted
-  -- below the parent later gets sucked into it.
-  if #real_subs == 0 and #entries > 0 then
-    local last_entry = entries[#entries]
-    reaper.SetMediaTrackInfo_Value(last_entry.track, 'I_FOLDERDEPTH', -1)
+  -- No real sub-folders (the parent holds only Swing, + maybe manual "other"
+  -- tracks), or a user track sits after the final sub (DM26): the LAST track
+  -- in the parent must close it with -1, otherwise the parent never closes
+  -- and any track inserted below the parent later gets sucked into it.
+  if not parent_closed and #entries > 0 then
+    reaper.SetMediaTrackInfo_Value(last_in_parent, 'I_FOLDERDEPTH', -1)
+  end
+
+  -- The folders outside the parent that the walked tracks closed (A3b) close on the group's last track again.
+  if outer < 0 and #entries > 0 then
+    local lt = entries[#entries].track
+    reaper.SetMediaTrackInfo_Value(lt, 'I_FOLDERDEPTH', reaper.GetMediaTrackInfo_Value(lt, 'I_FOLDERDEPTH') + outer)
   end
 
   reaper.PreventUIRefresh(-1)

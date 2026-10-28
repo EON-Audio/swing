@@ -1,8 +1,9 @@
 -- stepseq_sync.lua -- EON. Foundation layer for StepSeq <-> Drum Matrix "two views
 -- of one pattern" sync (see the plan). PHASE 0: data layer only — namespace, the
 -- pattern binding store, uid mint/resolve, the dm_rev/origin echo-suppression
--- store, and the gmem-band mirror. NOTHING here drives behaviour yet; it is the
--- scaffolding the bridge + later phases build on.
+-- store, and the gmem-band mirror. NOTHING loads this module today (no dofile or
+-- require anywhere; the live sync runs in Swing_Kit_Bridge.lua's courier). It is
+-- unused Phase-0 scaffolding that still ships with the scripts.
 --
 -- Identity model (the "binding triple"):
 --   * region_uid          -- a project-stable numeric id we MINT (REAPER region
@@ -32,8 +33,9 @@ local K_UIDSEQ   = 'uid_seq'    -- monotonic uid counter
 local K_REVS     = 'revs'       -- json: { [uid]= {rev, origin} } (echo suppression)
 local K_SIDECAR  = 'sidecar:'   -- prefix; per-uid extras blob (written in later phases)
 
--- gmem SYNC band — byte-exact mirror of EON_StepSeq.jsfx EON_SS_SYNC_*. The bridge
--- reads/writes these per paired Swing registry slot.
+-- gmem SYNC band — mirrors only the first nine of EON_StepSeq.jsfx's EON_SS_SYNC_*
+-- fields (0..8); fields 9..59 (SS_LISTLEN .. DMPUSH_ACK) are not listed here. The
+-- live map is the JSFX's, read by the bridge's courier per paired registry slot.
 M.GMEM = {
   SYNC_BASE   = 26030000,
   SYNC_STRIDE = 64,

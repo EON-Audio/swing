@@ -31,22 +31,29 @@ M.CATEGORIES = {
   'ride', 'crash', 'tom', 'rim', 'perc', 'other',
 }
 
--- Synonym table. Substring matches (case-insensitive). Order matters within a
--- key: more specific synonyms first so 'closed hh' beats the generic 'hh'.
+-- Synonym table. Matched as WHOLE WORDS of the normalised name (DM24, 2026-10-26): lower case, camelCase and
+-- letter<->digit joins split ('OpenHat' -> 'open hat', 'Kick01' -> 'kick 01'), '_' '-' '.' '/' as spaces, and a
+-- synonym must sit between word boundaries (a trailing 's' is allowed: 'Toms', 'Hats'). The old plain substring
+-- match filed 'Punch Kick 01' under closed_hat ('ch ' inside 'punch ') and 'Hat_Open' / 'OpenHat' under closed_hat
+-- (no open_hat entry matched, so the generic hat bucket won) -- Randomize Kit then wrote closed-hat patterns onto
+-- the kick and the open hat. Order matters within a key: more specific synonyms first.
 M.SYNONYMS = {
-  closed_hat = { 'closed hat', 'closed hh', 'chh', 'pedal hh', 'ch ', 'c.hat' },
-  open_hat   = { 'open hat',   'open hh',   'ohh', 'o.hat', 'oh '            },
-  kick       = { 'kick', 'kik', 'bd', 'bass drum', 'sub'                     },
-  snare      = { 'snare', 'snr', 'sn ', 'sd '                                },
-  hat        = { 'hat', 'hh', 'hi-hat', 'hihat'                              },  -- fallback bucket -> closed
-  clap       = { 'clap', 'cp '                                               },
-  ride       = { 'ride'                                                       },
-  crash      = { 'crash', 'cymbal', 'cym'                                    },
-  tom        = { 'tom'                                                        },
-  rim        = { 'rim', 'side stick', 'sidestick', 'ss '                     },
+  closed_hat = { 'closed hat', 'closed hh', 'closed hi hat', 'closed hats', 'hat closed', 'hh closed',
+                 'hi hat closed', 'closedhat', 'closedhh', 'chh', 'pedal hh', 'pedal hat', 'pedal hi hat',
+                 'ch', 'c hat', 'cl hat', 'cl hh'                                                        },
+  open_hat   = { 'open hat', 'open hh', 'open hi hat', 'open hats', 'hat open', 'hh open', 'hi hat open',
+                 'hats open', 'openhat', 'openhh', 'ohh', 'o hat', 'oh'                                  },
+  kick       = { 'kick', 'kik', 'kck', 'bd', 'bass drum', 'bassdrum', 'sub'                              },
+  snare      = { 'snare', 'snr', 'sn', 'sd'                                                              },
+  hat        = { 'hat', 'hh', 'hi hat', 'hihat'                                                          },  -- fallback bucket -> closed
+  clap       = { 'clap', 'cp'                                                                            },
+  ride       = { 'ride'                                                                                  },
+  crash      = { 'crash', 'cymbal', 'cym'                                                                },
+  tom        = { 'tom'                                                                                   },
+  rim        = { 'rim', 'rimshot', 'side stick', 'sidestick', 'ss'                                       },
   perc       = { 'cowbell', 'clave', 'shaker', 'maracas', 'tambourine',
                  'tamb', 'conga', 'bongo', 'cabasa', 'guiro', 'triangle',
-                 'block', 'agogo', 'cuica', 'vibraslap', 'whistle'           },
+                 'block', 'agogo', 'cuica', 'vibraslap', 'whistle'                                       },
 }
 
 -- Order in which we check synonyms for inference. Most specific first.
@@ -57,17 +64,36 @@ local CHECK_ORDER = {
   'clap', 'ride', 'crash', 'tom', 'rim', 'perc',
 }
 
-local function contains_ci(haystack, needle)
-  return string.find(string.lower(haystack), needle, 1, true) ~= nil
+-- ' word word ' -- the name (or a synonym) as space-padded lower-case words, so a synonym can be matched
+-- between word boundaries. camelCase and letter<->digit joins split, separators become spaces.
+local function normalise(s)
+  s = tostring(s or '')
+  s = s:gsub('(%l)(%u)', '%1 %2')          -- OpenHat -> Open Hat
+  s = s:gsub('(%a)(%d)', '%1 %2')          -- Kick01  -> Kick 01
+  s = s:gsub('(%d)(%a)', '%1 %2')          -- 808kick -> 808 kick
+  s = s:lower()
+  s = s:gsub('[_%-%./\\]', ' ')            -- Hat_Open, c.hat, hi-hat
+  s = s:gsub('%s+', ' ')
+  s = s:match('^%s*(.-)%s*$') or ''
+  return ' ' .. s .. ' '
+end
+
+-- Does the padded name hold the synonym as whole words (a plural 's' allowed on its last word)?
+local function has_word(padded, needle)
+  local n = normalise(needle)
+  if n == '  ' then return false end
+  return padded:find(n, 1, true) ~= nil
+      or padded:find(n:sub(1, -2) .. 's ', 1, true) ~= nil
 end
 
 function M.InferFromName(pad_name)
   if not pad_name or pad_name == '' then return 'other' end
+  local padded = normalise(pad_name)
   for _, category in ipairs(CHECK_ORDER) do
     local synonyms = M.SYNONYMS[category]
     if synonyms then
       for _, s in ipairs(synonyms) do
-        if contains_ci(pad_name, s) then
+        if has_word(padded, s) then
           -- 'hat' bucket maps to closed_hat (the most common interpretation).
           if category == 'hat' then return 'closed_hat' end
           return category

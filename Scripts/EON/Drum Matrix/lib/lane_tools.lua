@@ -23,15 +23,16 @@ do
   if ok and type(mod) == 'table' and mod.SwingTransformQN then coords = mod end
 end
 
--- Slots toolbar (#4) highlight-clear hook. Injected by eon_drum_matrix so the
--- SAME slots_strip instance (and its last_loaded_letter state) is notified —
--- we must NOT dofile slots_strip here (that would make a second copy with its
--- own state). Any lane-tools mutation diverges the pattern from the recalled
--- slot, so we drop the highlight.
-local _note_user_edit = nil
-function M.SetNoteUserEditHook(fn) _note_user_edit = fn end
-local function note_user_edit()
-  if _note_user_edit then _note_user_edit() end
+-- The project grid in QN. REAPER's division is in WHOLE notes; grid.lua owns
+-- the unit (audit DM14). No grid lib -> 0, which every op reads as "no grid".
+local grid
+do
+  local ok, mod = pcall(dofile, SCRIPT_DIR .. 'grid.lua')
+  if ok and type(mod) == 'table' and mod.ProjectDivQN then grid = mod end
+end
+local function project_grid_qn()
+  if not grid then return 0 end
+  return (grid.ProjectDivQN())
 end
 
 -- Status-bar helper for empty-lane no-ops so the user sees feedback when an
@@ -162,7 +163,6 @@ local function lane_range(lane_info)
   return p, p
 end
 M.LaneRange = lane_range
-M.StereoLivePitches = stereo_live_pitches   -- { [pad] = pitch } or nil when offline
 
 -- Is a StepSeq currently SYNCED to this lane's Swing? (Package 2: swing has one owner.
 -- While synced, the StepSeq's groove is what the item carries and what plays; the DM's
@@ -237,7 +237,6 @@ function M.ClearLane(lane)
     end
   end)
   reaper.Undo_EndBlock('EON DM: clear lane', -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
   if removed == 0 then status('EON DM: lane already empty') end
   return removed
@@ -260,7 +259,6 @@ function M.ClearAllLanes()
     end)
   end
   reaper.Undo_EndBlock('EON DM: clear all lanes', -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
   return total
 end
@@ -284,7 +282,6 @@ function M.ClearClip(lane)
     end
   end)
   reaper.Undo_EndBlock('EON DM: clear clip (all notes)', -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
   if removed == 0 then status('EON DM: clip already empty') end
   return removed
@@ -294,7 +291,7 @@ end
 -- Uses NEAREST snap (REAPER's convention for quantize).
 function M.QuantizeLane(lane)
   if not (lane and lane.track and lane.lane_info) then return 0 end
-  local _, grid_div_qn = reaper.GetSetProjectGrid(0, false)
+  local grid_div_qn = project_grid_qn()
   if not grid_div_qn or grid_div_qn == 0 then
     status('EON DM: no grid set — cannot quantize')
     return 0
@@ -332,7 +329,6 @@ function M.QuantizeLane(lane)
     moved = moved + take_moved
   end)
   reaper.Undo_EndBlock('EON DM: quantize lane', -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
   if moved == 0 then status('EON DM: nothing to quantize (lane empty or already on grid)') end
   return moved
@@ -346,7 +342,7 @@ function M.ApplySwingToLane(lane)
   if not (lane and lane.track and lane.lane_info) then return 0 end
   if not coords then status('EON DM: swing math unavailable'); return 0 end
   local sw = tonumber(lane.lane_info.swing_amount) or 0
-  local _, gdiv = reaper.GetSetProjectGrid(0, false)
+  local gdiv = project_grid_qn()
   if not gdiv or gdiv == 0 then status('EON DM: no grid set — cannot apply swing'); return 0 end
   -- Effective swing grid: a lane's own swing_subdiv overrides the project grid
   -- so Apply snaps/shifts on the SAME grid the lane's render + paint use.
@@ -380,7 +376,6 @@ function M.ApplySwingToLane(lane)
     moved = moved + take_moved
   end)
   reaper.Undo_EndBlock('EON DM: apply swing to lane', -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
   if moved == 0 then status('EON DM: nothing to swing (lane empty or already swung)') end
   return moved
@@ -420,7 +415,6 @@ function M.MirrorLane(lane)
     end
   end)
   reaper.Undo_EndBlock('EON DM: mirror lane', -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
   if moved == 0 then status('EON DM: nothing to mirror (lane empty)') end
   return moved
@@ -430,7 +424,7 @@ end
 -- direction: +1 = right, -1 = left. Honors the current project grid.
 function M.ShiftLane(lane, direction)
   if not (lane and lane.track and lane.lane_info) then return 0 end
-  local _, grid_div_qn = reaper.GetSetProjectGrid(0, false)
+  local grid_div_qn = project_grid_qn()
   if not grid_div_qn or grid_div_qn == 0 then return 0 end
   local moved = 0
   reaper.PreventUIRefresh(1)
@@ -460,10 +454,32 @@ function M.ShiftLane(lane, direction)
   reaper.Undo_EndBlock(
     string.format('EON DM: shift lane %s', direction > 0 and 'right' or 'left'),
     -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
   if moved == 0 then status('EON DM: nothing to shift (lane empty)') end
   return moved
+end
+
+local _settings_ok, _settings_lib = pcall(dofile, SCRIPT_DIR .. 'settings_store.lua')
+local _settings = (_settings_ok and _settings_lib) or nil
+
+local function _default_velocity()
+  if _settings and _settings.Get then
+    local v = _settings.Get('default_velocity') or 100
+    if v < 1 then v = 1 elseif v > 127 then v = 127 end
+    return v
+  end
+  return 100
+end
+
+-- The single-pitch inserters refuse the STEREO grid lane (DM27, 2026-10-26). Its range spans every live pad, so
+-- the clear half of Roll / Fill / Randomize wiped every pad's notes in the cell or item and the insert half wrote
+-- them all back at pad_pitch (the lowest pad): a Roll keybind on the Swing track turned kick+snare+hat into a kick
+-- roll. The stereo cog's Pad rows menu runs the same ops through a synthetic single-pitch lane per row
+-- (paint_mode), and preset_library.Apply refuses the whole lane the same way. Returns true when refused.
+local function refuse_stereo(lane, what)
+  if lane.lane_info.stereo ~= true then return false end
+  status('EON DM: ' .. what .. ' works per row on the stereo grid -- use the lane cog > Pad rows menu')
+  return true
 end
 
 -- Fill every Nth grid step inside the lane's items with a note at the lane's
@@ -472,20 +488,27 @@ end
 -- clear_first: bool — when true, remove existing notes on this lane before fill.
 function M.FillEveryN(lane, step_n, clear_first)
   if not (lane and lane.track and lane.lane_info) then return 0 end
+  if refuse_stereo(lane, 'Fill') then return 0 end
   if not step_n or step_n < 1 then step_n = 1 end
-  local _, grid_div_qn = reaper.GetSetProjectGrid(0, false)
+  local grid_div_qn = project_grid_qn()
   if not grid_div_qn or grid_div_qn == 0 then return 0 end
   local pitch = lane.lane_info.pad_pitch
+  local vel   = _default_velocity()   -- the Settings slider, as Roll / Randomize / painting use (DM219)
   local inserted = 0
   reaper.PreventUIRefresh(1)
   reaper.Undo_BeginBlock()
   each_midi_take_on_track(lane.track, function(item, take)
+    -- Per-TAKE edit flag (DM220): a take that was cleared and received no note still needs the HARD
+    -- CONTRACT's Sort + UpdateItemInProject; the old cumulative `inserted > 0` gate skipped it and the
+    -- arrange kept drawing the deleted notes -- the same counter bug ShiftLane fixed.
+    local changed = false
     if clear_first then
       local existing = collect_lane_notes(take, lane.lane_info)
       if #existing > 0 then
         local idxs = {}
         for _, e in ipairs(existing) do idxs[#idxs + 1] = e.idx end
         delete_notes_desc(take, idxs)
+        changed = true
       end
     end
     local item_start = reaper.GetMediaItemInfo_Value(item, 'D_POSITION')
@@ -504,11 +527,12 @@ function M.FillEveryN(lane, step_n, clear_first)
         local len_t = reaper.TimeMap_QNToTime(idx * effective_step_qn + grid_div_qn) - t
         local ppq_s = reaper.MIDI_GetPPQPosFromProjTime(take, t)
         local ppq_e = reaper.MIDI_GetPPQPosFromProjTime(take, t + len_t)
-        reaper.MIDI_InsertNote(take, false, false, ppq_s, ppq_e, 0, pitch, 100, true)
+        reaper.MIDI_InsertNote(take, false, false, ppq_s, ppq_e, 0, pitch, vel, true)
         inserted = inserted + 1
+        changed = true
       end
     end
-    if inserted > 0 then
+    if changed then
       reaper.MIDI_Sort(take)
       finalize_take(take)
     end
@@ -516,7 +540,6 @@ function M.FillEveryN(lane, step_n, clear_first)
   reaper.Undo_EndBlock(
     string.format('EON DM: fill every %d steps', step_n),
     -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
   if inserted == 0 then status('EON DM: nothing to fill (no items on lane?)') end
   return inserted
@@ -526,23 +549,12 @@ end
 -- Phase E: additional lane operations
 -- =============================================================================
 
-local _settings_ok, _settings_lib = pcall(dofile, SCRIPT_DIR .. 'settings_store.lua')
-local _settings = (_settings_ok and _settings_lib) or nil
-
-local function _default_velocity()
-  if _settings and _settings.Get then
-    local v = _settings.Get('default_velocity') or 100
-    if v < 1 then v = 1 elseif v > 127 then v = 127 end
-    return v
-  end
-  return 100
-end
-
 -- Insert `count` evenly-spaced notes inside the grid step containing `time`.
 function M.Roll(lane, time, count)
   if not (lane and lane.track and lane.lane_info) then return 0 end
+  if refuse_stereo(lane, 'Roll') then return 0 end
   if not count or count < 2 then count = 2 end
-  local _, grid_div_qn = reaper.GetSetProjectGrid(0, false)
+  local grid_div_qn = project_grid_qn()
   if not grid_div_qn or grid_div_qn == 0 then return 0 end
 
   local pitch = lane.lane_info.pad_pitch   -- roll sub-notes use the pad's root pitch
@@ -588,7 +600,6 @@ function M.Roll(lane, time, count)
     end
   end)
   reaper.Undo_EndBlock(string.format('EON DM: roll x%d', count), -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
   return inserted
 end
@@ -598,7 +609,6 @@ function M.AccentEveryN(lane, n, boost)
   if not (lane and lane.track and lane.lane_info) then return 0 end
   if not n or n < 1 then n = 4 end
   if not boost or boost == 0 then boost = 30 end
-  local pitch = lane.lane_info.pad_pitch
   local bumped = 0
   reaper.PreventUIRefresh(1)
   reaper.Undo_BeginBlock()
@@ -619,7 +629,6 @@ function M.AccentEveryN(lane, n, boost)
     end
   end)
   reaper.Undo_EndBlock(string.format('EON DM: accent every %d', n), -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
   return bumped
 end
@@ -632,7 +641,6 @@ function M.HumanizeLane(lane, time_ms, vel_amount)
   if not vel_amount and _settings then vel_amount = _settings.Get('humanize_vel_amount') end
   time_ms    = time_ms    or 5
   vel_amount = vel_amount or 10
-  local pitch = lane.lane_info.pad_pitch
   local touched = 0
   reaper.PreventUIRefresh(1)
   reaper.Undo_BeginBlock()
@@ -658,7 +666,6 @@ function M.HumanizeLane(lane, time_ms, vel_amount)
     end
   end)
   reaper.Undo_EndBlock('EON DM: humanize lane', -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
   return touched
 end
@@ -667,10 +674,11 @@ end
 -- pulled from settings (randomize_density_pct).
 function M.RandomizeLane(lane, density_pct)
   if not (lane and lane.track and lane.lane_info) then return 0 end
+  if refuse_stereo(lane, 'Randomize') then return 0 end
   if not density_pct and _settings then density_pct = _settings.Get('randomize_density_pct') end
   density_pct = density_pct or 25
   if density_pct < 0 then density_pct = 0 elseif density_pct > 100 then density_pct = 100 end
-  local _, grid_div_qn = reaper.GetSetProjectGrid(0, false)
+  local grid_div_qn = project_grid_qn()
   if not grid_div_qn or grid_div_qn == 0 then return 0 end
   local pitch = lane.lane_info.pad_pitch
   local vel   = _default_velocity()
@@ -678,11 +686,15 @@ function M.RandomizeLane(lane, density_pct)
   reaper.PreventUIRefresh(1)
   reaper.Undo_BeginBlock()
   each_midi_take_on_track(lane.track, function(item, take)
+    -- Per-TAKE edit flag, as FillEveryN (DM220): a take wiped with nothing rolled in still gets its
+    -- Sort + UpdateItemInProject.
+    local changed = false
     local notes = collect_lane_notes(take, lane.lane_info)
     if #notes > 0 then
       local idxs = {}
       for _, n in ipairs(notes) do idxs[#idxs + 1] = n.idx end
       delete_notes_desc(take, idxs)
+      changed = true
     end
     local item_start = reaper.GetMediaItemInfo_Value(item, 'D_POSITION')
     local item_len   = reaper.GetMediaItemInfo_Value(item, 'D_LENGTH')
@@ -700,86 +712,18 @@ function M.RandomizeLane(lane, density_pct)
           local ppq_e = reaper.MIDI_GetPPQPosFromProjTime(take, t + len_t)
           reaper.MIDI_InsertNote(take, false, false, ppq_s, ppq_e, 0, pitch, vel, true)
           inserted = inserted + 1
+          changed = true
         end
       end
     end
-    if inserted > 0 then
+    if changed then
       reaper.MIDI_Sort(take)
       finalize_take(take)
     end
   end)
   reaper.Undo_EndBlock(string.format('EON DM: randomize lane (%d%%)', density_pct), -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
   return inserted
-end
-
--- =============================================================================
--- Zoom: fit the arrange timeline to every item on every Drum Matrix lane.
--- Direct-API approach (no Main_OnCommand action-ID dependency, no item-
--- selection side effects): walk the lanes, find min start + max end across
--- all their items, then call reaper.GetSet_ArrangeView2 to set the visible
--- time range. Adds a small horizontal padding so notes don't sit flush
--- against the viewport edges.
---
--- NOTE: the Z key / Settings "Zoom to pattern" button / EON_DM_ZoomToPattern
--- action now zoom to the CURRENT pattern REGION (pattern_regions.ZoomToCurrent /
--- ZoomToSong) instead. This "fit all lane content" helper is kept as a utility
--- but is no longer wired to those entry points.
--- =============================================================================
-function M.ZoomToAllItemsOnDMLanes()
-  local lanes = M.GetLanes()
-  if #lanes == 0 then
-    status('EON DM: no drum lanes detected')
-    return 0
-  end
-
-  -- Walk every item on every lane track, accumulating the time bounds.
-  local min_start = math.huge
-  local max_end   = -math.huge
-  local item_count = 0
-  for _, lane in ipairs(lanes) do
-    if lane.track then
-      local n = reaper.CountTrackMediaItems(lane.track)
-      for i = 0, n - 1 do
-        local item = reaper.GetTrackMediaItem(lane.track, i)
-        -- MIDI only: a merged lane rides an audio track and carries audio items
-        -- by design, which would otherwise stretch the zoom to cover them.
-        -- No-op for classic and stereo lanes (MIDI is all they hold).
-        local tk = item and reaper.GetActiveTake(item)
-        if tk and reaper.TakeIsMIDI(tk) then
-          local pos = reaper.GetMediaItemInfo_Value(item, 'D_POSITION') or 0
-          local len = reaper.GetMediaItemInfo_Value(item, 'D_LENGTH')   or 0
-          if pos < min_start          then min_start = pos          end
-          if (pos + len) > max_end    then max_end   = pos + len    end
-          item_count = item_count + 1
-        end
-      end
-    end
-  end
-
-  if item_count == 0 then
-    status('EON DM: no items on drum lanes to zoom to')
-    return 0
-  end
-
-  -- Pad each side by 5% of the span (min 0.5s) so the items don't slam the
-  -- viewport edges. Clamp start ≥ 0 so we don't show pre-roll dead space
-  -- the user can't navigate into.
-  local span = max_end - min_start
-  if span <= 0 then span = 1.0 end           -- single zero-length item edge case
-  local pad  = math.max(span * 0.05, 0.5)
-  local view_start = math.max(0, min_start - pad)
-  local view_end   = max_end + pad
-
-  -- isSet=true tells REAPER to APPLY (not query) the view. The two zero
-  -- screen-pixel args mean "use the current arrange viewport width" —
-  -- REAPER computes pixels-per-second from the requested time range and
-  -- the live arrange pane width, so this works regardless of monitor size
-  -- or the user's current zoom level.
-  reaper.GetSet_ArrangeView2(0, true, 0, 0, view_start, view_end)
-  reaper.UpdateArrange()
-  return item_count
 end
 
 -- =============================================================================
@@ -813,6 +757,9 @@ end
 -- existing item contains t0, extend it toward t1 when needed; otherwise create
 -- a fresh item (color-matched to the source items so it blends in). Either way
 -- the coverage is clamped so we never overlap a following item on the lane.
+-- Returns item, take, covered_end: the project time the take's item runs to,
+-- so a caller can route notes past it (insert_routed) instead of writing them
+-- beyond the item where they never play (DM28, 2026-10-26).
 local function take_covering(track, t0, t1, color)
   local n = reaper.CountTrackMediaItems(track)
   local hit_item, hit_take, hit_s, hit_e = nil, nil, nil, nil
@@ -835,18 +782,55 @@ local function take_covering(track, t0, t1, color)
     if hit_e < want_end - 1e-6 then
       reaper.SetMediaItemInfo_Value(hit_item, 'D_LENGTH', want_end - hit_s)
     end
-    return hit_item, hit_take
+    return hit_item, hit_take, math.max(hit_e, want_end)
   end
   if want_end <= t0 + 1e-6 then want_end = t1 end   -- degenerate guard
   local item = reaper.CreateNewMIDIItemInProj(track, t0, want_end, false)
-  if not item then return nil, nil end
+  if not item then return nil, nil, nil end
   local take = reaper.GetActiveTake(item)
   if color and color ~= 0 then reaper.SetMediaItemInfo_Value(item, 'I_CUSTOMCOLOR', color) end
   if take then reaper.GetSetMediaItemTakeInfo_String(take, 'P_NAME', '', true) end
-  return item, take
+  return item, take, want_end
 end
 
--- Core (NO Undo block — wrapped by the public ops). Returns notes duplicated.
+-- The MIDI take whose item contains project time `t` on `track`, or nil. Never makes one.
+local function midi_take_at(track, t)
+  for i = 0, reaper.CountTrackMediaItems(track) - 1 do
+    local item = reaper.GetTrackMediaItem(track, i)
+    local take = reaper.GetActiveTake(item)
+    if take and reaper.TakeIsMIDI(take) then
+      local s = reaper.GetMediaItemInfo_Value(item, 'D_POSITION')
+      if t >= s - 1e-6 and t < s + reaper.GetMediaItemInfo_Value(item, 'D_LENGTH') - 1e-6 then return take end
+    end
+  end
+  return nil
+end
+
+-- Insert one note at project time [t_s, t_e) on `track`: into `dest` while it starts inside the span
+-- take_covering covered, else into whichever MIDI item on the lane contains it. take_covering clamps the
+-- destination at the next item's start, and the duplicate / stamp / sync-write loops then inserted every note
+-- by project time anyway, so the notes past that clamp landed beyond the item -- silent, invisible, and counted
+-- (DM28, 2026-10-26). `touched` collects every take written, so the caller sorts and finalizes each once.
+-- Returns true when written; false when no item on the lane holds the note (the caller counts it dropped).
+local function insert_routed(track, dest, covered_end, t_s, t_e, pitch, vel, touched)
+  local take = dest
+  if covered_end and t_s >= covered_end - 1e-6 then take = midi_take_at(track, t_s) end
+  if not take then return false end
+  local ppq_s = reaper.MIDI_GetPPQPosFromProjTime(take, t_s)
+  local ppq_e = reaper.MIDI_GetPPQPosFromProjTime(take, t_e)
+  reaper.MIDI_InsertNote(take, false, false, ppq_s, ppq_e, 0, pitch, vel, true)
+  touched[take] = true
+  return true
+end
+
+local function finalize_touched(touched)
+  for take in pairs(touched) do
+    reaper.MIDI_Sort(take)
+    finalize_take(take)
+  end
+end
+
+-- Core (NO Undo block — wrapped by the public ops). Returns notes duplicated, notes dropped (no item to land in).
 local function dup_bar_core(lane, src_time)
   if not (lane and lane.track and lane.lane_info) then return 0 end
   -- Source bar (meas) and destination bar (meas+1). Resolve bar boundaries with
@@ -877,20 +861,29 @@ local function dup_bar_core(lane, src_time)
       end
     end
   end)
-  if #src == 0 then return 0 end
+  if #src == 0 then return 0, 0 end
 
-  local _, dest = take_covering(lane.track, be, be2, color)
-  if not dest then return 0 end
+  local _, dest, covered_end = take_covering(lane.track, be, be2, color)
+  if not dest then return 0, 0 end
+  local touched, written, dropped = {}, 0, 0
   for _, s in ipairs(src) do
     local d_s = reaper.TimeMap_QNToTime(reaper.TimeMap_timeToQN(s.t_s) + qn_delta)
     local d_e = reaper.TimeMap_QNToTime(reaper.TimeMap_timeToQN(s.t_e) + qn_delta)
-    local ppq_s = reaper.MIDI_GetPPQPosFromProjTime(dest, d_s)
-    local ppq_e = reaper.MIDI_GetPPQPosFromProjTime(dest, d_e)
-    reaper.MIDI_InsertNote(dest, false, false, ppq_s, ppq_e, 0, s.pitch, s.vel, true)
+    if insert_routed(lane.track, dest, covered_end, d_s, d_e, s.pitch, s.vel, touched) then
+      written = written + 1
+    else
+      dropped = dropped + 1
+    end
   end
-  reaper.MIDI_Sort(dest)
-  finalize_take(dest)
-  return #src
+  finalize_touched(touched)
+  return written, dropped
+end
+
+-- The one status line for notes the duplicate / stamp ops could not place.
+local function status_dropped(dropped)
+  if dropped > 0 then
+    status(string.format('EON DM: %d note(s) not copied -- no item on the lane where they would land', dropped))
+  end
 end
 
 -- Duplicate the source bar forward one bar on a SINGLE lane. When stopped and
@@ -902,14 +895,14 @@ function M.DuplicateBarToNext(lane, src_time)
   src_time, playing = resolve_src(src_time)
   reaper.PreventUIRefresh(1)
   reaper.Undo_BeginBlock()
-  local n = dup_bar_core(lane, src_time)
+  local n, dropped = dup_bar_core(lane, src_time)
   if n > 0 and not playing then
     reaper.SetEditCurPos(next_bar_start(src_time), false, false)
   end
   reaper.Undo_EndBlock('EON DM: duplicate bar -> next', -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
-  if n == 0 then status('EON DM: no notes in this bar to duplicate') end
+  if n == 0 and dropped == 0 then status('EON DM: no notes in this bar to duplicate') end
+  status_dropped(dropped)
   return n
 end
 
@@ -922,17 +915,18 @@ function M.DuplicateBarAllLanes(src_time)
   if #lanes == 0 then status('EON DM: no drum lanes detected'); return 0 end
   reaper.PreventUIRefresh(1)
   reaper.Undo_BeginBlock()
-  local total = 0
+  local total, dropped = 0, 0
   for _, lane in ipairs(lanes) do
-    total = total + dup_bar_core(lane, src_time)
+    local n, d = dup_bar_core(lane, src_time)
+    total, dropped = total + n, dropped + d
   end
   if total > 0 and not playing then
     reaper.SetEditCurPos(next_bar_start(src_time), false, false)
   end
   reaper.Undo_EndBlock('EON DM: duplicate bar -> next (all lanes)', -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
-  if total == 0 then status('EON DM: no notes in this bar to duplicate') end
+  if total == 0 and dropped == 0 then status('EON DM: no notes in this bar to duplicate') end
+  status_dropped(dropped)
   return total
 end
 
@@ -944,14 +938,14 @@ end
 -- start falls in [src_t0, src_t1) to a destination starting at dest_t0. A
 -- generalization of dup_bar_core: the source/destination are explicit, and the
 -- offset is a tempo-aware QN delta so the copy lands musically correct across
--- tempo/meter changes. Returns the number of notes inserted.
+-- tempo/meter changes. Returns the number of notes inserted, and dropped.
 local function stamp_range_core(lane, src_t0, src_t1, dest_t0)
-  if not (lane and lane.track and lane.lane_info) then return 0 end
+  if not (lane and lane.track and lane.lane_info) then return 0, 0 end
   local q_s0   = reaper.TimeMap_timeToQN(src_t0)
   local q_s1   = reaper.TimeMap_timeToQN(src_t1)
   local q_d0   = reaper.TimeMap_timeToQN(dest_t0)
   local span_q = q_s1 - q_s0
-  if span_q <= 0 then return 0 end
+  if span_q <= 0 then return 0, 0 end
   local qn_delta = q_d0 - q_s0
   local dest_end = reaper.TimeMap_QNToTime(q_d0 + span_q)
 
@@ -970,20 +964,22 @@ local function stamp_range_core(lane, src_t0, src_t1, dest_t0)
       end
     end
   end)
-  if #src == 0 then return 0 end
+  if #src == 0 then return 0, 0 end
 
-  local _, dest = take_covering(lane.track, dest_t0, dest_end, color)
-  if not dest then return 0 end
+  local _, dest, covered_end = take_covering(lane.track, dest_t0, dest_end, color)
+  if not dest then return 0, 0 end
+  local touched, written, dropped = {}, 0, 0
   for _, s in ipairs(src) do
     local d_s = reaper.TimeMap_QNToTime(reaper.TimeMap_timeToQN(s.t_s) + qn_delta)
     local d_e = reaper.TimeMap_QNToTime(reaper.TimeMap_timeToQN(s.t_e) + qn_delta)
-    local ppq_s = reaper.MIDI_GetPPQPosFromProjTime(dest, d_s)
-    local ppq_e = reaper.MIDI_GetPPQPosFromProjTime(dest, d_e)
-    reaper.MIDI_InsertNote(dest, false, false, ppq_s, ppq_e, 0, s.pitch, s.vel, true)
+    if insert_routed(lane.track, dest, covered_end, d_s, d_e, s.pitch, s.vel, touched) then
+      written = written + 1
+    else
+      dropped = dropped + 1
+    end
   end
-  reaper.MIDI_Sort(dest)
-  finalize_take(dest)
-  return #src
+  finalize_touched(touched)
+  return written, dropped
 end
 
 -- Stamp the [src_t0, src_t1) range across EVERY drum lane to dest_t0, in ONE
@@ -999,9 +995,10 @@ function M.StampRangeAllLanes(src_t0, src_t1, dest_t0)
   if #lanes == 0 then status('EON DM: no drum lanes detected'); return 0 end
   reaper.PreventUIRefresh(1)
   reaper.Undo_BeginBlock()
-  local total = 0
+  local total, dropped = 0, 0
   for _, lane in ipairs(lanes) do
-    total = total + stamp_range_core(lane, src_t0, src_t1, dest_t0)
+    local n, d = stamp_range_core(lane, src_t0, src_t1, dest_t0)
+    total, dropped = total + n, dropped + d
   end
   if total > 0 and not playing then
     local span_q = reaper.TimeMap_timeToQN(src_t1) - reaper.TimeMap_timeToQN(src_t0)
@@ -1009,9 +1006,9 @@ function M.StampRangeAllLanes(src_t0, src_t1, dest_t0)
     reaper.SetEditCurPos(advance, false, false)
   end
   reaper.Undo_EndBlock('EON DM: stamp pattern', -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
-  if total == 0 then status('EON DM: pattern is empty — nothing to stamp') end
+  if total == 0 and dropped == 0 then status('EON DM: pattern is empty — nothing to stamp') end
+  status_dropped(dropped)
   return total
 end
 
@@ -1188,22 +1185,28 @@ function M.WriteRegion(t0, t1, blob)
   if not (t0 and t1) or t1 <= t0 or type(blob) ~= 'table' then return 0 end
   local lanes_blob = blob.lanes or {}
   local q0 = reaper.TimeMap_timeToQN(t0)
-  local written = 0
+  local written, dropped = 0, 0
 
-  -- Insert one blob note into `dest` at `pitch` (shared by both lane shapes).
-  local function insert_blob_note(dest, nn, pitch)
+  -- Insert one blob note at `pitch` into the lane (shared by both lane shapes): into `dest` while it starts
+  -- inside the span take_covering covered, else into the lane item that holds it (insert_routed, DM28).
+  local function insert_blob_note(track, dest, covered_end, touched, nn, pitch)
     local nq = q0 + (tonumber(nn.q) or 0)
     local nd = tonumber(nn.d) or 0
     if nd <= 0 then nd = 0.01 end                 -- minimum audible length
     local s_t = reaper.TimeMap_QNToTime(nq)
+    -- A note starting at or past the window's end is not this region's (DM221, 2026-10-26): the CC path
+    -- below already skips those; here only the END was clamped to t1, so such a note got end-before-start
+    -- geometry and sat inside the NEXT region's window.
+    if s_t >= t1 - 1e-6 then dropped = dropped + 1; return end
     local e_t = reaper.TimeMap_QNToTime(nq + nd)
     if e_t > t1 then e_t = t1 end
     local v = tonumber(nn.v) or 100
     if v < 1 then v = 1 elseif v > 127 then v = 127 end
-    local ppq_s = reaper.MIDI_GetPPQPosFromProjTime(dest, s_t)
-    local ppq_e = reaper.MIDI_GetPPQPosFromProjTime(dest, e_t)
-    reaper.MIDI_InsertNote(dest, false, false, ppq_s, ppq_e, 0, pitch, v, true)
-    written = written + 1
+    if insert_routed(track, dest, covered_end, s_t, e_t, pitch, v, touched) then
+      written = written + 1
+    else
+      dropped = dropped + 1
+    end
   end
 
   reaper.PreventUIRefresh(1)
@@ -1240,8 +1243,9 @@ function M.WriteRegion(t0, t1, blob)
         end
       end
       if any then
-        local _, dest = take_covering(lane.track, t0, t1, nil)
+        local _, dest, covered_end = take_covering(lane.track, t0, t1, nil)
         if dest then
+          local touched = { [dest] = true }
           for pad, rec in pairs(lanes_blob) do
             if type(rec) == 'table' and type(rec.notes) == 'table' then
               local padn = tonumber(pad)
@@ -1249,25 +1253,24 @@ function M.WriteRegion(t0, t1, blob)
                 or (type(rec.pad_pitch) == 'number' and rec.pad_pitch or nil)
               if pitch and pitch >= lo and pitch <= hi then
                 for _, nn in ipairs(rec.notes) do
-                  insert_blob_note(dest, nn, pitch)
+                  insert_blob_note(lane.track, dest, covered_end, touched, nn, pitch)
                 end
               end
             end
           end
-          reaper.MIDI_Sort(dest)
-          finalize_take(dest)
+          finalize_touched(touched)
         end
       end
     else
       local rec = li.pad_index and lanes_blob[li.pad_index] or nil
       if rec and type(rec.notes) == 'table' and #rec.notes > 0 then
-        local _, dest = take_covering(lane.track, t0, t1, nil)
+        local _, dest, covered_end = take_covering(lane.track, t0, t1, nil)
         if dest then
+          local touched = { [dest] = true }
           for _, nn in ipairs(rec.notes) do
-            insert_blob_note(dest, nn, li.pad_pitch)
+            insert_blob_note(lane.track, dest, covered_end, touched, nn, li.pad_pitch)
           end
-          reaper.MIDI_Sort(dest)
-          finalize_take(dest)
+          finalize_touched(touched)
         end
       end
     end
@@ -1310,9 +1313,11 @@ function M.WriteRegion(t0, t1, blob)
     end
   end
   reaper.Undo_EndBlock('EON DM: sync write region (StepSeq -> Drum Matrix)', -1)
-  note_user_edit()
   reaper.PreventUIRefresh(-1)
-  return written
+  if dropped > 0 then
+    status(string.format('EON DM: sync write left out %d note(s) past the region or outside its items', dropped))
+  end
+  return written, dropped
 end
 
 -- =============================================================================
@@ -1320,7 +1325,7 @@ end
 -- =============================================================================
 
 -- Resolve the Swing destination track from an existing lane's MIDI send. Each
--- lane is built with one send to the Swing JSFX track (EON_DM_Build line 369);
+-- lane is built with one send to the Swing JSFX track (EON_DM_Build, CreateTrackSend);
 -- P_DESTTRACK on send 0 hands back that track pointer directly.
 local function resolve_swing_track(lanes)
   for _, lane in ipairs(lanes) do
@@ -1382,9 +1387,9 @@ function M.CommitPatternToItem()
     local nit = reaper.CountTrackMediaItems(lane.track)
     for i = 0, nit - 1 do
       local item = reaper.GetTrackMediaItem(lane.track, i)
-      -- MIDI only — see ZoomToAllItemsOnDMLanes. An audio item on a merged lane
-      -- would widen the committed pattern span to cover audio that is not part
-      -- of the pattern at all.
+      -- MIDI only: a merged lane rides an audio track and carries audio items by
+      -- design, and an audio item would widen the committed pattern span to cover
+      -- audio that is not part of the pattern at all.
       local tk = item and reaper.GetActiveTake(item)
       if tk and reaper.TakeIsMIDI(tk) then
         local s = reaper.GetMediaItemInfo_Value(item, 'D_POSITION')

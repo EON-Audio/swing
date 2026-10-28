@@ -5,15 +5,6 @@
 
 @init
 
-// ─── Theme constants ───────────────────────────────────────────────────
-COL_THEME_RAINBOW  = 0;
-COL_THEME_MONO     = 1;
-COL_THEME_DRUMTYPE = 2;
-COL_THEME_DARK     = 3;
-COL_THEME_NEON     = 4;
-COL_THEME_PASTEL   = 5;
-COL_NUM_THEMES     = 6;
-
 // ─── Auto-color mode constants ─────────────────────────────────────────
 COL_AUTO_OFF       = 0;
 COL_AUTO_DRUMTYPE  = 1;
@@ -78,18 +69,17 @@ function swing_color_serialize() (
 // or 0.08 (Mono) when col_mono is on. Lightness is a fixed baseline.
 // Sets _sc_s and _sc_l like the old swing_color_get_theme_sl did, so
 // downstream code (swing_color_rebuild, render) works unchanged.
+// The baselines as pure functions: the rebuild (on @block too, LIB327) takes them into locals and never reads the
+// _sc_* globals the @gfx readers (Swing_ReaKit's col_dirty block) still take from the setter below.
+function swing_color_base_s() ( col_mono ? 0.08 : 0.75; );   // grayscale / baseline saturation (was Rainbow theme's S)
+function swing_color_base_l() ( col_mono ? 0.50 : 0.55; );   // baseline lightness (was Rainbow theme's L)
 function swing_color_get_theme_sl(tid)
 (
   // tid argument retained for legacy callers; ignored (kept to preserve
   // the existing call signature so we don't have to chase down every
   // call site this commit). col_mono and col_intensity drive everything.
-  col_mono ? (
-    _sc_s = 0.08;  // grayscale
-    _sc_l = 0.50;
-  ) : (
-    _sc_s = 0.75;  // baseline saturation (was Rainbow theme's S)
-    _sc_l = 0.55;  // baseline lightness  (was Rainbow theme's L)
-  );
+  _sc_s = swing_color_base_s();
+  _sc_l = swing_color_base_l();
 );
 
 // ─── Drum type hue from pad name (46-category vocabulary) ─────────────
@@ -101,7 +91,7 @@ function swing_color_get_theme_sl(tid)
 // The browser's CATEGORY_COLORS in the categorizer
 // uses the equivalent RGB for these same hues, so colors stay consistent
 // between the browser file list and the JSFX pad grid.
-function swing_color_drumtype_hue(pad_idx)
+function swing_color_drumtype_hue_s(pad_idx, _ct)
 local(_cn, _len, _i, _ch, _h)
 (
   _cn = get_cname_slot(pad_idx);
@@ -116,153 +106,165 @@ local(_cn, _len, _i, _ch, _h)
   // "digits -> space" str_setchar rule — the
   // Lua frontier patterns treat digits as word boundaries, so "HH1"/"CH2"
   // must word-match here too; no keyword contains a digit).
-  strcpy(#_ct_tmp, _cn);
+  strcpy(_ct, _cn);
   _i = 0; loop(_len,
-    _ch = str_getchar(#_ct_tmp, _i);
-    _ch >= 65 && _ch <= 90 ? str_setchar(#_ct_tmp, _i, _ch + 32) :
-    (_ch == 95 || _ch == 45 || _ch == 46 || _ch == 40 || _ch == 41) ? str_setchar(#_ct_tmp, _i, 32) :
-    (_ch >= 48 && _ch <= 57) ? str_setchar(#_ct_tmp, _i, 32);
+    _ch = str_getchar(_ct, _i);
+    _ch >= 65 && _ch <= 90 ? str_setchar(_ct, _i, _ch + 32) :
+    (_ch == 95 || _ch == 45 || _ch == 46 || _ch == 40 || _ch == 41) ? str_setchar(_ct, _i, 32) :
+    (_ch >= 48 && _ch <= 57) ? str_setchar(_ct, _i, 32);
     _i += 1;
   );
 
   // Default: "other" (hue 0.90 — pink, distinct from any category)
   _h = 0.90;
 
+  // ⭐ The glyph table's word rule (rk_cat_glyphs eon_wordm, the Lua's frontier rule for keywords of 3 chars or
+  // fewer): a short keyword matches as a WORD -- exact, "kw *", "* kw", "* kw *" -- never as a bare substring, so
+  // "Phantom Pad" is not a tom, "What" not a hat, "Prime Snare" not a rimshot; and the rows run in the table's
+  // order (snare before sidestick and rimshot) with its "sd". Until 2026-10-26 the colour and the icon of such a pad
+  // disagreed (LIB325). Written out per keyword: a pattern built into a scratch string would be one more cell
+  // shared between @gfx and the @block rebuild.
   // ── Drums (red zone) ──
-  match("*kick*", #_ct_tmp) || match("*kck*", #_ct_tmp) || match("*kik*", #_ct_tmp) ||
-  match("*bassdrum*", #_ct_tmp) || match("*bass drum*", #_ct_tmp) ||
+  match("*kick*", _ct) ||
+  match("kck", _ct) || match("kck *", _ct) || match("* kck", _ct) || match("* kck *", _ct) ||
+  match("kik", _ct) || match("kik *", _ct) || match("* kik", _ct) || match("* kik *", _ct) ||
+  match("*bassdrum*", _ct) || match("*bass drum*", _ct) ||
   // digits now normalize to spaces (above), so "808kick"/"909 kick" reduce
   // to "*kick*" and "808bd"/"909bd" reduce to a bare "bd" word — match it
   // (and "kk") the word-sim way, mirroring eon_wordm("bd")/("kk") in glyphs:
-  match("bd", #_ct_tmp) || match("bd *", #_ct_tmp) ||
-  match("* bd", #_ct_tmp) || match("* bd *", #_ct_tmp) ||
-  match("kk", #_ct_tmp) || match("kk *", #_ct_tmp) ||
-  match("* kk", #_ct_tmp) || match("* kk *", #_ct_tmp) ? (
+  match("bd", _ct) || match("bd *", _ct) ||
+  match("* bd", _ct) || match("* bd *", _ct) ||
+  match("kk", _ct) || match("kk *", _ct) ||
+  match("* kk", _ct) || match("* kk *", _ct) ? (
     _h = 0.00;  // kick — RED
   ) :
-  match("*sidestick*", #_ct_tmp) || match("*side stick*", #_ct_tmp) ||
-  match("*cross stick*", #_ct_tmp) || match("*crosstick*", #_ct_tmp) ||
-  match("*xstick*", #_ct_tmp) || match("*stick*", #_ct_tmp) ? (
-    _h = 0.08;  // sidestick (orange — between rimshot and snare)
-  ) :
-  match("*rimshot*", #_ct_tmp) || match("*rim shot*", #_ct_tmp) ||
-  match("*rim*", #_ct_tmp) ? (
-    _h = 0.06;  // rimshot (orange-red)
-  ) :
-  match("*snare*", #_ct_tmp) || match("*snr*", #_ct_tmp) ||
-  match("*clap snare*", #_ct_tmp) || match("*909snare*", #_ct_tmp) ||
-  match("*909 snare*", #_ct_tmp) ? (
+  match("*snare*", _ct) ||
+  match("snr", _ct) || match("snr *", _ct) || match("* snr", _ct) || match("* snr *", _ct) ||
+  match("sd", _ct) || match("sd *", _ct) || match("* sd", _ct) || match("* sd *", _ct) ? (
     _h = 0.12;  // snare — ORANGE
   ) :
-  match("*clap*", #_ct_tmp) || match("*clp*", #_ct_tmp) ||
-  match("*handclap*", #_ct_tmp) || match("*hand clap*", #_ct_tmp) ? (
+  match("*sidestick*", _ct) || match("*side stick*", _ct) ||
+  match("*cross stick*", _ct) || match("*crosstick*", _ct) ||
+  match("*xstick*", _ct) || match("*stick*", _ct) ? (
+    _h = 0.08;  // sidestick (orange — between rimshot and snare)
+  ) :
+  match("*rimshot*", _ct) || match("*rim shot*", _ct) ||
+  match("rim", _ct) || match("rim *", _ct) || match("* rim", _ct) || match("* rim *", _ct) ? (
+    _h = 0.06;  // rimshot (orange-red)
+  ) :
+  match("*clap*", _ct) ||
+  match("clp", _ct) || match("clp *", _ct) || match("* clp", _ct) || match("* clp *", _ct) ||
+  match("*handclap*", _ct) || match("*hand clap*", _ct) ? (
     _h = 0.30;  // clap — GREEN
   ) :
-  match("*snap*", #_ct_tmp) || match("*fingersnap*", #_ct_tmp) ||
-  match("*finger snap*", #_ct_tmp) ? (
+  match("*snap*", _ct) || match("*fingersnap*", _ct) ||
+  match("*finger snap*", _ct) ? (
     _h = 0.32;  // snap (green, clap family)
   ) :
 
   // ── Cymbals (gold zone) ──
-  match("*splash*", #_ct_tmp) ? (
+  match("*splash*", _ct) ? (
     _h = 0.20;  // splash (gold, cymbal family)
   ) :
-  match("*china*", #_ct_tmp) || match("*trash*", #_ct_tmp) ||
-  match("*stack*", #_ct_tmp) ? (
+  match("*china*", _ct) || match("*trash*", _ct) ||
+  match("*stack*", _ct) ? (
     _h = 0.22;  // china (gold, cymbal family — also trash/stack)
   ) :
-  match("*ride*", #_ct_tmp) ? (
+  match("*ride*", _ct) ? (
     _h = 0.17;  // ride (yellow)
   ) :
-  match("*crash*", #_ct_tmp) || match("*crsh*", #_ct_tmp) ? (
+  match("*crash*", _ct) || match("*crsh*", _ct) ? (
     _h = 0.19;  // crash (warm gold)
   ) :
-  match("*cymbal*", #_ct_tmp) || match("*cym*", #_ct_tmp) ? (
+  match("*cymbal*", _ct) ||
+  match("cym", _ct) || match("cym *", _ct) || match("* cym", _ct) || match("* cym *", _ct) ? (
     _h = 0.21;  // cymbal (gold)
   ) :
 
   // ── Brass (chartreuse) ──
-  match("*brass*", #_ct_tmp) || match("*trumpet*", #_ct_tmp) ||
-  match("*trombone*", #_ct_tmp) || match("*horn*", #_ct_tmp) ||
-  match("*tuba*", #_ct_tmp) || match("*flugelhorn*", #_ct_tmp) ||
-  match("*cornet*", #_ct_tmp) ? (
+  match("*brass*", _ct) || match("*trumpet*", _ct) ||
+  match("*trombone*", _ct) || match("*horn*", _ct) ||
+  match("*tuba*", _ct) || match("*flugelhorn*", _ct) ||
+  match("*cornet*", _ct) ? (
     _h = 0.23;  // brass (chartreuse)
   ) :
 
   // ── Hand percussion (yellow-green to green) ──
-  match("*cowbell*", #_ct_tmp) || match("*cow bell*", #_ct_tmp) ? (
+  match("*cowbell*", _ct) || match("*cow bell*", _ct) ? (
     _h = 0.25;  // cowbell (yellow-green)
   ) :
-  match("*clave*", #_ct_tmp) ? (
+  match("*clave*", _ct) ? (
     _h = 0.27;  // clave (lime)
   ) :
-  match("*tambourine*", #_ct_tmp) || match("*tamb*", #_ct_tmp) ||
-  match("*tambou*", #_ct_tmp) ? (
+  match("*tambourine*", _ct) || match("*tamb*", _ct) ||
+  match("*tambou*", _ct) ? (
     _h = 0.33;  // tambourine (green)
   ) :
-  match("*shaker*", #_ct_tmp) || match("*shake*", #_ct_tmp) ? (
+  match("*shaker*", _ct) || match("*shake*", _ct) ? (
     _h = 0.35;  // shaker (forest green)
   ) :
-  match("*maraca*", #_ct_tmp) ? (
+  match("*maraca*", _ct) ? (
     _h = 0.37;  // maraca (green)
   ) :
-  match("*conga*", #_ct_tmp) ? (
+  match("*conga*", _ct) ? (
     _h = 0.95;  // conga (pink-red)
   ) :
-  match("*bongo*", #_ct_tmp) ? (
+  match("*bongo*", _ct) ? (
     _h = 0.97;  // bongo (magenta-red)
   ) :
-  match("*tom*", #_ct_tmp) ? (
-    _h = 0.03;  // tom (red-orange) — late: *tom* matches "bottom", "phantom" etc.
+  match("tom", _ct) || match("tom *", _ct) || match("* tom", _ct) || match("* tom *", _ct) ||
+  match("*toms*", _ct) ? (
+    _h = 0.03;  // tom (red-orange) — a word, so "bottom" / "phantom" stay out (the plural stays a substring, as the Lua has it)
   ) :
   // ── Promoted world/hand percussion (2026-07-03; hues = CATEGORY_COLORS) ──
-  match("*triangle*", #_ct_tmp) ? (
+  match("*triangle*", _ct) ? (
     _h = 0.34;  // triangle (green, small-metal family)
   ) :
-  match("*woodblock*", #_ct_tmp) || match("*wood block*", #_ct_tmp) ||
-  match("*click*", #_ct_tmp) ? (
+  match("*woodblock*", _ct) || match("*wood block*", _ct) ||
+  match("*click*", _ct) ? (
     _h = 0.10;  // woodblock (warm wood)
   ) :
-  match("*cabasa*", #_ct_tmp) ? (
+  match("*cabasa*", _ct) ? (
     _h = 0.38;  // cabasa (green, shaker family)
   ) :
-  match("*guiro*", #_ct_tmp) ? (
+  match("*guiro*", _ct) ? (
     _h = 0.41;  // guiro (green)
   ) :
-  match("*timbale*", #_ct_tmp) ? (
+  match("*timbale*", _ct) ? (
     _h = 0.92;  // timbale (pink-red, latin family)
   ) :
-  match("*agogo*", #_ct_tmp) ? (
+  match("*agogo*", _ct) ? (
     _h = 0.26;  // agogo (yellow-green, bell family)
   ) :
-  match("*djembe*", #_ct_tmp) || match("*jembe*", #_ct_tmp) ? (
+  match("*djembe*", _ct) || match("*jembe*", _ct) ? (
     _h = 0.93;  // djembe (pink-red, latin family)
   ) :
-  match("*cajon*", #_ct_tmp) ? (
+  match("*cajon*", _ct) ? (
     _h = 0.99;  // cajon (red, bass-box)
   ) :
-  match("*vibraslap*", #_ct_tmp) || match("*vibra slap*", #_ct_tmp) ? (
+  match("*vibraslap*", _ct) || match("*vibra slap*", _ct) ? (
     _h = 0.50;  // vibraslap (cyan)
   ) :
-  match("*whistle*", #_ct_tmp) ? (
+  match("*whistle*", _ct) ? (
     _h = 0.61;  // whistle (blue)
   ) :
-  match("*perc*", #_ct_tmp) ? (
+  match("*perc*", _ct) ? (
     _h = 0.40;  // percussion (deep green — pure catch-all now)
   ) :
 
   // ── Strings family (teal-cyan) ──
-  match("*guitar*", #_ct_tmp) || match("*gtr*", #_ct_tmp) ||
-  match("*guit*", #_ct_tmp) || match("*strat*", #_ct_tmp) ||
-  match("*tele*", #_ct_tmp) || match("*les paul*", #_ct_tmp) ||
-  match("*nylon*", #_ct_tmp) || match("*ukulele*", #_ct_tmp) ? (
+  match("*guitar*", _ct) ||
+  match("gtr", _ct) || match("gtr *", _ct) || match("* gtr", _ct) || match("* gtr *", _ct) ||
+  match("*guit*", _ct) || match("*strat*", _ct) ||
+  match("*tele*", _ct) || match("*les paul*", _ct) ||
+  match("*nylon*", _ct) || match("*ukulele*", _ct) ? (
     _h = 0.43;  // guitar (teal)
   ) :
-  match("*strings*", #_ct_tmp) || match("*violin*", #_ct_tmp) ||
-  match("*viola*", #_ct_tmp) || match("*cello*", #_ct_tmp) ||
-  match("*contrabass*", #_ct_tmp) || match("*orchestral*", #_ct_tmp) ||
-  match("*ensemble*", #_ct_tmp) || match("*chamber*", #_ct_tmp) ||
-  match("*pizzicato*", #_ct_tmp) ? (
+  match("*strings*", _ct) || match("*violin*", _ct) ||
+  match("*viola*", _ct) || match("*cello*", _ct) ||
+  match("*contrabass*", _ct) || match("*orchestral*", _ct) ||
+  match("*ensemble*", _ct) || match("*chamber*", _ct) ||
+  match("*pizzicato*", _ct) ? (
     _h = 0.46;  // strings (cyan)
   ) :
 
@@ -270,110 +272,124 @@ local(_cn, _len, _i, _ch, _h)
   // ⭐ 2026-07-27 user rule (mirrors eon_filename_categorizer): generic
   // hi-hat names (hihat / hi hat / high hat / hh) hue as CLOSED; only bare
   // *hat* keeps the generic teal — and must never hue as open.
-  match("*closed hat*", #_ct_tmp) || match("*closedhat*", #_ct_tmp) ||
-  match("*closed*", #_ct_tmp) ||
-  match("*hat closed*", #_ct_tmp) || match("*pedal hat*", #_ct_tmp) ||
-  match("*pedalhat*", #_ct_tmp) ||
+  match("*closed hat*", _ct) || match("*closedhat*", _ct) ||
+  match("*closed*", _ct) ||
+  match("*hat closed*", _ct) || match("*pedal hat*", _ct) ||
+  match("*pedalhat*", _ct) ||
   // "ch"/"chh" — word-boundary simulation (JSFX match has no frontier
   // patterns): exact token, or "tok ..." / "... tok" / "... tok ..." forms.
-  match("ch", #_ct_tmp) || match("ch *", #_ct_tmp) ||
-  match("* ch", #_ct_tmp) || match("* ch *", #_ct_tmp) ||
-  match("chh", #_ct_tmp) || match("chh *", #_ct_tmp) ||
-  match("* chh", #_ct_tmp) || match("* chh *", #_ct_tmp) ? (
+  match("ch", _ct) || match("ch *", _ct) ||
+  match("* ch", _ct) || match("* ch *", _ct) ||
+  match("chh", _ct) || match("chh *", _ct) ||
+  match("* chh", _ct) || match("* chh *", _ct) ? (
     _h = 0.52;  // closed_hat — TEAL-CYAN
   ) :
-  match("*open hat*", #_ct_tmp) || match("*openhat*", #_ct_tmp) ||
-  match("*hat open*", #_ct_tmp) || match("*open*", #_ct_tmp) ||
+  match("*open hat*", _ct) || match("*openhat*", _ct) ||
+  match("*hat open*", _ct) || match("*open*", _ct) ||
   // "oh"/"ohh" — word-boundary simulation (same approach as "ch" above):
-  match("oh", #_ct_tmp) || match("oh *", #_ct_tmp) ||
-  match("* oh", #_ct_tmp) || match("* oh *", #_ct_tmp) ||
-  match("ohh", #_ct_tmp) || match("ohh *", #_ct_tmp) ||
-  match("* ohh", #_ct_tmp) || match("* ohh *", #_ct_tmp) ? (
+  match("oh", _ct) || match("oh *", _ct) ||
+  match("* oh", _ct) || match("* oh *", _ct) ||
+  match("ohh", _ct) || match("ohh *", _ct) ||
+  match("* ohh", _ct) || match("* ohh *", _ct) ? (
     _h = 0.72;  // open_hat — VIOLET
   ) :
-  match("*hihat*", #_ct_tmp) || match("*hi hat*", #_ct_tmp) ||
-  match("*high hat*", #_ct_tmp) || match("*highhat*", #_ct_tmp) ||
-  match("hh", #_ct_tmp) || match("hh *", #_ct_tmp) ||
-  match("* hh", #_ct_tmp) || match("* hh *", #_ct_tmp) ? (
+  match("*hihat*", _ct) || match("*hi hat*", _ct) ||
+  match("*high hat*", _ct) || match("*highhat*", _ct) ||
+  match("hh", _ct) || match("hh *", _ct) ||
+  match("* hh", _ct) || match("* hh *", _ct) ? (
     _h = 0.52;  // generic hi-hat name = closed articulation (user rule)
   ) :
-  match("*hat*", #_ct_tmp) ? (
-    _h = 0.49;  // bare "hat" — hihat generic (teal); the old unbounded
+  match("hat", _ct) || match("hat *", _ct) || match("* hat", _ct) || match("* hat *", _ct) ||
+  match("*hats*", _ct) ? (
+    _h = 0.49;  // the word "hat" (or "hats") — hihat generic (teal); the old unbounded
                 // "*hh*" is GONE (it mis-hued CHH/OHH against every other
                 // surface — 2026-07-27 audit).
   ) :
 
   // ── Keys (cyan-blue) ──
-  match("*piano*", #_ct_tmp) || match("*keys*", #_ct_tmp) ||
-  match("*keyboard*", #_ct_tmp) || match("*organ*", #_ct_tmp) ||
-  match("*rhodes*", #_ct_tmp) || match("*wurlitzer*", #_ct_tmp) ||
-  match("*epiano*", #_ct_tmp) || match("*e piano*", #_ct_tmp) ||
-  match("*clav*", #_ct_tmp) || match("*marimba*", #_ct_tmp) ||
-  match("*vibraphone*", #_ct_tmp) || match("*xylophone*", #_ct_tmp) ||
-  match("*glockenspiel*", #_ct_tmp) || match("*celesta*", #_ct_tmp) ||
-  match("*harp*", #_ct_tmp) || match("*mallet*", #_ct_tmp) ? (
+  match("*piano*", _ct) || match("*keys*", _ct) ||
+  match("*keyboard*", _ct) || match("*organ*", _ct) ||
+  match("*rhodes*", _ct) || match("*wurlitzer*", _ct) ||
+  match("*epiano*", _ct) || match("*e piano*", _ct) ||
+  match("*clav*", _ct) || match("*marimba*", _ct) ||
+  match("*vibraphone*", _ct) || match("*xylophone*", _ct) ||
+  match("*glockenspiel*", _ct) || match("*celesta*", _ct) ||
+  match("*harp*", _ct) || match("*mallet*", _ct) ? (
     _h = 0.55;  // keys (cyan-blue)
   ) :
 
   // ── Atmospheres (blue zone) ──
-  match("*pad*", #_ct_tmp) || match("*ambient*", #_ct_tmp) ||
-  match("*atmosphere*", #_ct_tmp) || match("*atmo*", #_ct_tmp) ||
-  match("*drone*", #_ct_tmp) || match("*texture*", #_ct_tmp) ||
-  match("*evolving*", #_ct_tmp) || match("*soundscape*", #_ct_tmp) ? (
+  match("pad", _ct) || match("pad *", _ct) || match("* pad", _ct) || match("* pad *", _ct) ||
+  match("*pads*", _ct) || match("*ambient*", _ct) ||
+  match("*atmosphere*", _ct) || match("*atmo*", _ct) ||
+  match("*drone*", _ct) || match("*texture*", _ct) ||
+  match("*evolving*", _ct) || match("*soundscape*", _ct) ? (
     _h = 0.58;  // pad (sky blue)
   ) :
-  match("*vocal*", #_ct_tmp) || match("*vox*", #_ct_tmp) ||
-  match("*voice*", #_ct_tmp) || match("*choir*", #_ct_tmp) ||
-  match("*acapella*", #_ct_tmp) || match("*a capella*", #_ct_tmp) ||
-  match("*singing*", #_ct_tmp) || match("*spoken*", #_ct_tmp) ||
-  match("*speech*", #_ct_tmp) || match("*adlib*", #_ct_tmp) ||
-  match("*chant*", #_ct_tmp) ? (
+  match("*vocal*", _ct) ||
+  match("vox", _ct) || match("vox *", _ct) || match("* vox", _ct) || match("* vox *", _ct) ||
+  match("*voice*", _ct) || match("*choir*", _ct) ||
+  match("*acapella*", _ct) || match("*a capella*", _ct) ||
+  match("*singing*", _ct) || match("*spoken*", _ct) ||
+  match("*speech*", _ct) || match("*adlib*", _ct) ||
+  match("*chant*", _ct) ? (
     _h = 0.62;  // vocal (blue)
   ) :
-  match("*synth*", #_ct_tmp) || match("*arp*", #_ct_tmp) ||
-  match("*pluck*", #_ct_tmp) || match("*stab*", #_ct_tmp) ||
-  match("*chord*", #_ct_tmp) || match("*saw*", #_ct_tmp) ||
-  match("*square*", #_ct_tmp) || match("*sine*", #_ct_tmp) ||
-  match("*supersaw*", #_ct_tmp) || match("*hoover*", #_ct_tmp) ? (
+  match("*synth*", _ct) ||
+  match("arp", _ct) || match("arp *", _ct) || match("* arp", _ct) || match("* arp *", _ct) ||
+  match("*arpeggio*", _ct) ||
+  match("*pluck*", _ct) || match("*stab*", _ct) ||
+  match("*chord*", _ct) ||
+  match("saw", _ct) || match("saw *", _ct) || match("* saw", _ct) || match("* saw *", _ct) ||
+  match("*square*", _ct) || match("*sine*", _ct) ||
+  match("*supersaw*", _ct) || match("*hoover*", _ct) ? (
     _h = 0.66;  // synth (indigo)
   ) :
 
   // ── Bass (purple) ──
-  match("*bass*", #_ct_tmp) || match("*sub*", #_ct_tmp) ||
-  match("*reese*", #_ct_tmp) ? (
+  match("*bass*", _ct) ||
+  match("sub", _ct) || match("sub *", _ct) || match("* sub", _ct) || match("* sub *", _ct) ||
+  match("*reese*", _ct) ? (
     _h = 0.76;  // bass (purple)
   ) :
 
   // ── Effects / loops (magenta-pink) ──
-  match("*sfx*", #_ct_tmp) || match("*effect*", #_ct_tmp) ||
-  match("*riser*", #_ct_tmp) || match("*impact*", #_ct_tmp) ||
-  match("*whoosh*", #_ct_tmp) || match("*sweep*", #_ct_tmp) ||
-  match("*noise*", #_ct_tmp) || match("*glitch*", #_ct_tmp) ||
-  match("*stutter*", #_ct_tmp) || match("*transition*", #_ct_tmp) ||
-  match("*reverse*", #_ct_tmp) || match("*buildup*", #_ct_tmp) ||
-  match("*build up*", #_ct_tmp) || match("*drop*", #_ct_tmp) ||
-  match("*explosion*", #_ct_tmp) || match("*boom*", #_ct_tmp) ||
-  match("*siren*", #_ct_tmp) || match("*foley*", #_ct_tmp) ||
-  match("*cinematic*", #_ct_tmp) ? (
+  match("sfx", _ct) || match("sfx *", _ct) || match("* sfx", _ct) || match("* sfx *", _ct) ||
+  match("*effect*", _ct) ||
+  match("*riser*", _ct) || match("*impact*", _ct) ||
+  match("*whoosh*", _ct) || match("*sweep*", _ct) ||
+  match("*noise*", _ct) || match("*glitch*", _ct) ||
+  match("*stutter*", _ct) || match("*transition*", _ct) ||
+  match("*reverse*", _ct) || match("*buildup*", _ct) ||
+  match("*build up*", _ct) || match("*drop*", _ct) ||
+  match("*explosion*", _ct) || match("*boom*", _ct) ||
+  match("*siren*", _ct) || match("*foley*", _ct) ||
+  match("*cinematic*", _ct) ? (
     _h = 0.82;  // fx (magenta)
   ) :
-  match("*loop*", #_ct_tmp) || match("*break*", #_ct_tmp) ||
-  match("*groove*", #_ct_tmp) || match("*pattern*", #_ct_tmp) ||
-  match("*beat*", #_ct_tmp) ? (
+  match("*loop*", _ct) || match("*break*", _ct) ||
+  match("*groove*", _ct) || match("*pattern*", _ct) ||
+  match("*beat*", _ct) ? (
     _h = 0.86;  // loop (pink)
   );
 
   _h;
 );
+// The scratch string is the CALLER's: @gfx's painters go through swing_color_drumtype_hue (#_ct_tmp), the
+// @block rebuild through its own (#_ct_blk, swing_color_rebuild_blk). One shared scratch was written by both
+// threads at once -- the window-closed mirror in @block rebuilds while @gfx's COLORS and MAPPING views match
+// per frame -- and a torn name gave a pad the wrong category's hue until the next colour event (LIB327).
+function swing_color_drumtype_hue(pad_idx) ( swing_color_drumtype_hue_s(pad_idx, #_ct_tmp); );
 
 // ─── Apply auto-color → col_auto_hue[] ─────────────────────────────────
-function swing_color_apply_auto(mode_id)
+// `_ct` = the matcher's scratch string, the rebuild's (LIB327: one per thread).
+function swing_color_apply_auto(mode_id, _ct)
 local(_i, _i_s)
 (
   _i = 0; loop(NUM_PADS,
     _i_s = swing_bp(_i);
     mode_id == COL_AUTO_DRUMTYPE ? (
-      col_auto_hue[_i] = swing_color_drumtype_hue(_i_s);
+      col_auto_hue[_i] = swing_color_drumtype_hue_s(_i_s, _ct);
     ) :
     mode_id == COL_AUTO_OUTPUT ? (
       col_auto_hue[_i] = swing_out_hue(_i_s);   // where it plays (a bank B-D pad: its bank's track or its own, Outputs step 3)
@@ -384,27 +400,6 @@ local(_i, _i_s)
       col_auto_hue[_i] = p_color[_i_s];
     );
     _i += 1;
-  );
-);
-
-// ─── Switch to MANUAL colors without changing what's on screen ─────────
-// A manual pad-color edit while auto-color is active flips the WHOLE kit
-// to manual mode. Seed every OTHER loaded pad's manual color from its
-// current auto hue FIRST, so only the edited pad visibly changes (user
-// report 2026-06-12: "changed the Sub color and all the other pads
-// changed"). exclude_pad = the pad being edited (its new color is applied
-// by the caller); no-op when already in manual mode.
-function swing_color_manualize(exclude_pad)
-local(_i, _i_s)
-(
-  col_auto_mode_id > 0 ? (
-    _i = 0;
-    loop(NUM_PADS,
-      _i_s = swing_bp(_i);
-      _i != swing_pad_tile(exclude_pad) && pad_is_playable(_i_s) ? p_color[_i_s] = col_auto_hue[_i];   // callers pass a tile or a slot (step 4d)
-      _i += 1;
-    );
-    col_auto_mode_id = 0;
   );
 );
 
@@ -428,15 +423,45 @@ local(_i, _i_s)
 // Pad Banks step 5c: `pad` is ABSOLUTE; col_auto_hue[] holds the bank on screen's sixteen tiles, so another bank's
 // pad (the mapping view's other-bank keys, 4d) derives its auto hue the way swing_color_apply_auto does -- it read
 // col_auto_hue[pad] past the buffer.
-function swing_color_auto_hue(pad) (
-  swing_pad_bank(pad) == bank_cur ? col_auto_hue[swing_pad_tile(pad)] :
-  col_auto_mode_id == COL_AUTO_DRUMTYPE ? swing_color_drumtype_hue(pad) :
-  col_auto_mode_id == COL_AUTO_OUTPUT ? swing_out_hue(pad) :
-  col_auto_mode_id == COL_AUTO_RAINBOW ? swing_pad_tile(pad) / 16.0 : p_color[pad];
+// Explicit branches, each a block (2026-10-26, sweep LIB1): the one value chain this was -- array
+// cells, calls with locals and an arithmetic leaf under one ?: -- runs in REAPER but crashes the
+// ysfx harness every offline test runs through, so nothing that reached it could be tested. Same
+// result in every branch.
+function swing_color_auto_hue(pad) local(_h) (
+  swing_pad_bank(pad) == bank_cur ? ( _h = col_auto_hue[swing_pad_tile(pad)]; ) :
+  col_auto_mode_id == COL_AUTO_DRUMTYPE ? ( _h = swing_color_drumtype_hue(pad); ) :
+  col_auto_mode_id == COL_AUTO_OUTPUT ? ( _h = swing_out_hue(pad); ) :
+  col_auto_mode_id == COL_AUTO_RAINBOW ? ( _h = swing_pad_tile(pad) / 16.0; ) : ( _h = p_color[pad]; );
+  _h;
 );
 function swing_color_pad_hue(pad) (
   pad < 0 || !pad_is_playable(pad) ? -2 :
   col_auto_mode_id > 0 ? swing_color_auto_hue(pad) : p_color[pad];
+);
+
+// ─── Switch to MANUAL colors without changing what's on screen ─────────
+// A manual pad-color edit while auto-color is active flips the WHOLE kit
+// to manual mode. Seed every OTHER loaded pad's manual color from its
+// current auto hue FIRST, so only the edited pad visibly changes (user
+// report 2026-06-12: "changed the Sub color and all the other pads
+// changed"). exclude_pad = the pad being edited (its new color is applied
+// by the caller); no-op when already in manual mode.
+// Every SLOT, not the sixteen tiles on screen: the mode flips for all four banks, so a bank B..D pad seeded from
+// nothing dropped from its auto hue to its raw p_color (the kit's value, or clear_pad's tile hue) the next time its
+// bank was shown -- the 2026-06-12 bug again, one bank over (LIB32). swing_color_auto_hue (above: EEL2 binds a call
+// at definition time) derives the other banks' hues the way swing_color_apply_auto does for the bank on screen.
+function swing_color_manualize(exclude_pad)
+local(_i, _x)
+(
+  col_auto_mode_id > 0 ? (
+    _x = swing_bp(swing_pad_tile(exclude_pad));   // callers pass a tile or a slot (step 4d): the tile's slot on screen
+    _i = 0;
+    loop(NUM_SLOTS,
+      _i != _x && pad_is_playable(_i) ? p_color[_i] = swing_color_auto_hue(_i);
+      _i += 1;
+    );
+    col_auto_mode_id = 0;
+  );
 );
 
 // hsl_to_rgb for a pad at a caller-chosen S/L, with the achromatic specials
@@ -449,20 +474,49 @@ function swing_color_pad_hsl(pad, s, l) local(_h) (
          : hsl_to_rgb(_h, s, l);
 );
 
-function swing_color_rebuild()
-local(_i, _h, _cb, _eff_s, _i_s)
+// hsl_to_rgb's maths (rk_drumkit_dsp) written into _dst[0..2] instead of the shared _hsl_r / _hsl_g / _hsl_b: the
+// rebuild runs on @block too (the window-closed mirror, Swing_ReaKit), while @gfx's painters call hsl_to_rgb every
+// frame, so a rebuild that read the globals back could take another hue's G and B for a pad, and col_dirty was
+// clear by then (LIB327). Keep in step with hsl_to_rgb.
+function swing_color_hsl_at(h, s, l, _dst)
+local(_c, _x, _m, _hp, _r1, _g1, _b1, _hp_mod2)
+(
+  _c = (1.0 - abs(2.0 * l - 1.0)) * s;
+  _hp = h * 6.0;
+  _hp_mod2 = _hp - floor(_hp * 0.5) * 2.0;
+  _x = _c * (1.0 - abs(_hp_mod2 - 1.0));
+  _r1 = 0; _g1 = 0; _b1 = 0;
+  _hp < 1 ? ( _r1 = _c; _g1 = _x; ) :
+  _hp < 2 ? ( _r1 = _x; _g1 = _c; ) :
+  _hp < 3 ? ( _g1 = _c; _b1 = _x; ) :
+  _hp < 4 ? ( _g1 = _x; _b1 = _c; ) :
+  _hp < 5 ? ( _r1 = _x; _b1 = _c; ) :
+             ( _r1 = _c; _b1 = _x; );
+  _m = l - _c * 0.5;
+  _dst[0] = _r1 + _m;
+  _dst[1] = _g1 + _m;
+  _dst[2] = _b1 + _m;
+);
+
+// `_ct` = the drum-type matcher's scratch string: #_ct_tmp on @gfx and @init (swing_color_rebuild), #_ct_blk on
+// @block (swing_color_rebuild_blk) -- the two run at once and a string torn between them named the wrong
+// category (LIB327).
+function swing_color_rebuild_s(_ct)
+local(_i, _h, _cb, _eff_s, _l, _i_s)
 (
   // Apply auto-color if active
-  col_auto_mode_id > 0 ? swing_color_apply_auto(col_auto_mode_id);
+  col_auto_mode_id > 0 ? swing_color_apply_auto(col_auto_mode_id, _ct);
 
-  // Get theme S/L
+  // Theme S/L: the setter for the @gfx readers of _sc_s / _sc_l (Swing_ReaKit's col_dirty block), the pure
+  // helpers for this rebuild's own use (locals: no shared cell read, LIB327).
   swing_color_get_theme_sl(col_theme_id);
-  _eff_s = _sc_s * col_intensity;
+  _eff_s = swing_color_base_s() * col_intensity;
+  _l = swing_color_base_l();
 
   // Publish effective S/L to gmem so the browser can match the JSFX
   // pad-face colors exactly (theme + intensity, not a fixed S=0.75/L=0.55).
   gmem[GS_COL_EFFECTIVE_S] = _eff_s;
-  gmem[GS_COL_EFFECTIVE_L] = _sc_l;
+  gmem[GS_COL_EFFECTIVE_L] = _l;
 
   _i = 0; loop(NUM_PADS,
     _i_s = swing_bp(_i);
@@ -487,14 +541,11 @@ local(_i, _h, _cb, _eff_s, _i_s)
         col_rgba_dim[_cb] = 0.44; col_rgba_dim[_cb+1] = 0.44; col_rgba_dim[_cb+2] = 0.45;
       );
     ) : (
-      // Normal HSL → RGB
-      hsl_to_rgb(_h, _eff_s, _sc_l);
-      col_rgba[_cb]     = _hsl_r;
-      col_rgba[_cb + 1] = _hsl_g;
-      col_rgba[_cb + 2] = _hsl_b;
-      col_rgba_dim[_cb]     = _hsl_r * 0.35 + 0.15;
-      col_rgba_dim[_cb + 1] = _hsl_g * 0.35 + 0.15;
-      col_rgba_dim[_cb + 2] = _hsl_b * 0.35 + 0.15;
+      // Normal HSL → RGB, straight into the pad's cells (no shared scratch: LIB327)
+      swing_color_hsl_at(_h, _eff_s, _l, col_rgba + _cb);
+      col_rgba_dim[_cb]     = col_rgba[_cb]     * 0.35 + 0.15;
+      col_rgba_dim[_cb + 1] = col_rgba[_cb + 1] * 0.35 + 0.15;
+      col_rgba_dim[_cb + 2] = col_rgba[_cb + 2] * 0.35 + 0.15;
     );
 
     _i += 1;
@@ -502,6 +553,8 @@ local(_i, _h, _cb, _eff_s, _i_s)
 
   col_dirty = 0;
 );
+function swing_color_rebuild()     ( swing_color_rebuild_s(#_ct_tmp); );   // @gfx and @init
+function swing_color_rebuild_blk() ( swing_color_rebuild_s(#_ct_blk); );   // @block's window-closed mirror (Swing_ReaKit)
 
 // ─── Color panel UI (inline below COLORS button) ──────────────────────
 function swing_color_draw_panel(_cp_x, _cp_y, _cp_w)
@@ -512,9 +565,9 @@ local(_row_h, _row_y, _ti, _tx, _tw_btn, _tw_m, _th_m, _lbl,
   _row_h = 24;
 
   // ── Row 1+2: AUTO-COLOR mode (4 buttons: Off / DrumType / Output / Rainbow) ──
-  // Themes and palettes were removed in v43 — the color system now has just
-  // these three concerns: auto-color mode (these rows), Mono toggle (Row 3),
-  // and intensity (Row 4).
+  // Themes and palettes were removed in v43. The panel draws, top to bottom:
+  // auto-color mode (these rows), MONO (Row 2), PAD FACE (Row 3), LANE TRACKS
+  // (Row 4) and Intensity (Row 5).
   _row_y = _cp_y + 4;
   rk_font(1, 8, 0);
   gfx_set(0.85, 0.92, 0.95, 1.0);
@@ -547,9 +600,12 @@ local(_row_h, _row_y, _ti, _tx, _tw_btn, _tw_m, _th_m, _lbl,
     gfx_y = _row_y + (14 - _th_m) * 0.5;
     gfx_drawstr(_mx_lbl);
 
+    // mark_dirty_kit: the mode, Mono and Intensity are serialized, so an edit here must raise the project-dirty flag
+    // and the kit's SAVE dot as the COLORS big view's own buttons do (rk_swing_ui_colors); until 2026-10-26 a
+    // session that changed only these closed without a save prompt and reopened in the old mode (LIB328).
     mx >= _tx && mx <= _tx + _tw_btn && my >= _row_y && my <= _row_y + 14 && lmb_down ? (
       col_auto_mode_id = _mi;
-      col_dirty = 1;
+      col_dirty = 1; mark_dirty_kit();
     );
 
     _mi += 1;
@@ -582,7 +638,7 @@ local(_row_h, _row_y, _ti, _tx, _tw_btn, _tw_m, _th_m, _lbl,
 
   mx >= _tx && mx <= _tx + _tw_btn && my >= _row_y && my <= _row_y + 14 && lmb_down ? (
     col_mono = !col_mono;
-    col_dirty = 1;
+    col_dirty = 1; mark_dirty_kit();   // serialized: see the mode buttons above (LIB328)
   );
 
   // ── Row 3: PAD FACE (waveform vs category icon in the pad centre) ──
@@ -699,7 +755,7 @@ local(_row_h, _row_y, _ti, _tx, _tw_btn, _tw_m, _th_m, _lbl,
   active_id == _slider_id ? ( LMB ? (
     col_intensity = max(0.0, min(1.0, (mx - _bar_x) / _bar_w));
     col_dirty = 1;
-  ) : active_id = -1; );
+  ) : ( active_id = -1; mark_dirty_kit(); ); );   // once, on the release, as the big view's hue bar does (LIB328)
   active_id == -1 && mx >= _bar_x - 2 && mx <= _bar_x + _bar_w + 2 &&
   my >= _row_y - 2 && my <= _row_y + _bar_h + 2 && lmb_down ? (
     active_id = _slider_id;

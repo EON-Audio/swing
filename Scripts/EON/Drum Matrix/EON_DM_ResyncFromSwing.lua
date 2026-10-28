@@ -4,9 +4,11 @@
 -- match without waiting for the overlay's automatic sync (or when the overlay
 -- isn't running at all). Bind to a key if you do this often.
 --
--- Mirrors EON_DM_Build's bridge-handshake timing: bump gmem[99]
--- (KIT_GMEM_BRIDGE_ALIVE) so the Swing JSFX republishes its pad metadata,
--- defer a few frames to let that land, then resync.
+-- Defers a few frames so a Swing that just changed has published its pad
+-- bands, then resyncs. It no longer stamps the bridge-alive cell (99): Swing
+-- publishes whatever that cell holds, and the stamp impersonated a bridge for
+-- 5 s (DM213, 2026-10-26: a real one refused to start, a fresh Swing posted
+-- its auto-load into silence).
 
 local r = reaper
 
@@ -14,16 +16,14 @@ local SCRIPT_DIR = debug.getinfo(1, 'S').source:match('^@?(.*[\\/])') or ''
 package.path = SCRIPT_DIR .. 'lib/?.lua;' .. package.path
 local swing_sync = dofile(SCRIPT_DIR .. 'lib/swing_sync.lua')
 
-local KIT_GMEM_BRIDGE_ALIVE = 99
 local MAX_FRAMES = 8
 
 r.gmem_attach('Swing_Media_Transfer')
-r.gmem_write(KIT_GMEM_BRIDGE_ALIVE, os.time())   -- ask Swing to republish
 
 local frames = 0
 local function wait_then_sync()
   frames = frames + 1
-  -- Give Swing a few frames to see the heartbeat and write fresh pad data.
+  -- Give Swing a few frames to write fresh pad data.
   if frames < MAX_FRAMES then
     r.defer(wait_then_sync)
     return

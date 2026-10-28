@@ -59,6 +59,13 @@ NUM_PADS            = 16;
 INST_PADNAME_BASE   = 26010000;
 INST_PADNAME_STRIDE = 512;   // 16 pads * 32
 INST_PADNAME_LEN    = 32;
+// The ALL-BANK name band (Swing_ReaKit.jsfx INST_IDENT64 / INST_PADNAME64, 2026-10-22; MUST match):
+// sixty-four pads, bank * 16 + pad, 32 chars each; the IDENT64 header's +0 is STAMP, 1 while this
+// Swing publishes it. The sixteen-pad band above carries the bank ON SCREEN; this one does not.
+INST_IDENT64_BASE     = 31540000;
+INST_IDENT64_STRIDE   = 528;
+INST_PADNAME64_BASE   = 31550000;
+INST_PADNAME64_STRIDE = 2048;
 // Strip CMD mailbox — Swing consumes this every block (the shipped strip-send
 // feature), applying (pad, pid, value) via swing_fx_apply. The viewer writes it
 // directly to set a pad's send, so editing needs no extra plumbing. MUST match
@@ -92,7 +99,8 @@ m_send   = freemem; freemem += NUM_PADS;
 m_peak   = freemem; freemem += NUM_PADS;
 m_hue    = freemem; freemem += NUM_PADS;
 m_glow   = freemem; freemem += NUM_PADS;
-// Control-deck state: local echo of the 12 bus params, per-param adopt
+// Control-deck state: local echo of the 14 bus params (12 levels + the 2 bus
+// enables at [12]/[13]), per-param adopt
 // hold-off deadlines, knob interact memory (16 slots each), fader memory
 // (lib-managed via slider_init, which returns the bumped pointer).
 bus_val  = freemem; freemem += 14;
@@ -103,6 +111,16 @@ dk_hold  = freemem; freemem += 14;
 bus_val[12] = 1; bus_val[13] = 1;
 dk_kmem  = freemem; freemem += 6 * 16;
 freemem  = slider_init(freemem, 6);
+// The verb deck's double-click resets go to Swing's KIT DEFAULTS (rk_swing_defaults), as the delay and
+// Weld knob decks' do: with none set the library resets to mid-travel, so HPF went to 250 Hz instead of
+// OFF, PRE to 125 ms, WIDTH and MIX to 50 % (LIB212). Deck position -> bus index: 0 PRE (3) · 1 SIZE (0)
+// · 2 DAMP (1) · 3 WIDTH (2) · 4 HPF (4) · 5 MIX (5); normalised by the same _hi the draw uses.
+sld_set_default(sld_base + 0 * 16, 0);     // PRE   0 ms   (/250)
+sld_set_default(sld_base + 1 * 16, 0.5);   // SIZE  0.5
+sld_set_default(sld_base + 2 * 16, 0.5);   // DAMP  0.5
+sld_set_default(sld_base + 3 * 16, 1.0);   // WIDTH 100 %
+sld_set_default(sld_base + 4 * 16, 0);     // HPF   OFF   (/500)
+sld_set_default(sld_base + 5 * 16, 0.4);   // MIX   40 %
 // Smash deck (bus 2): local echo + adopt hold-off for the EON Weld's params,
 // linked over the GS_BC_LINK band (row per registry slot; MUST match
 // EON_Weld.jsfx). +0 hb · +1..8 echo (thr,rat,atk,rel,knee,mkp,mix,byp) ·
@@ -146,7 +164,129 @@ function bc_commit(k, v) (
 // Drag state (persist across @gfx frames).
 drag_pad = -1;   // pad currently being dragged, -1 = none
 vcmd_seq = 0;    // edit counter, bumped per write (Swing's strip-CMD consume applies on change)
-plmb     = 0;    // previous left-mouse state for press-edge detection
+
+// ── Per-surface press latches ────────────────────────────────────────
+// ⚠⚠ VERBATIM from EON/ReaKit/rk_srf.jsfx-inc (the seven free effects; itself Swing_ReaKit.jsfx's
+// swing_srf_load / swing_srf_store, D-3, Audit D 2026-09-14 + 2026-09-15, plus rk_srf_in and
+// rk_srf_wheel, 2026-10-07/08). Ported here 2026-10-26 (sweep PLG16): this was the one interactive
+// Swing face without them, so shown in both the TCP and the MCP (window closed) the shared plmb
+// re-fired lmb_down every pass and one click on POWER or PING toggled it over and over. Keep in
+// step -- `diff` against the lib if either side is touched.
+//
+// Measured (REAPER 7.79): at most ONE window-or-embed surface of an instance
+// runs @gfx at a time, EXCEPT an instance embedded in BOTH the TCP and the MCP
+// with its window closed -- those two alternate pass for pass and BOTH report
+// gfx_ext_flags&1, which is why a `micro` split could never separate them.
+// Slot 0 is the window and the idle context (they never co-run, and the idle
+// canvas IS the window's); slots 1 and 2 are the two embeds, told apart by
+// canvas signature. An unhovered embed's pass is handed the OTHER embed's live
+// press -- still held, at its pointer, with its modifiers, and no edge either
+// way -- because ssl_knob_interact ends a drag on any pass that sees LMB 0 and
+// the knob mem is shared across surfaces. Bounded at half a second.
+//
+// CALLER CONTRACT: set is_embedded, mx/my, LMB and RMB from the real mouse,
+// then rk_srf_load(); take lmb_down/rmb_down off prev_LMB/prev_RMB and the
+// modifiers off _srf_cap (NOT mouse_cap); wheel = rk_srf_wheel() (and no
+// "mouse_wheel = 0" of the host's own); rk_srf_store() at the frame tail.
+// (EEL2 identifiers are case-insensitive: the lib's LMB IS this file's lmb.)
+function rk_srf_load()
+  local(_sg, _oth_plmb, _oth_prmb, _oth_mx, _oth_my, _oth_t, _oth_cap)
+(
+  // This pass's effective mouse_cap for the modifiers (the head reads CTRL,
+  // SHIFT and ALT from it): the real one, unless a foreign press is handed over.
+  _srf_cap = mouse_cap;
+  is_embedded ? (
+    _sg = gfx_w * 65536 + gfx_h;
+    _srf = _sg == _srf_sig1 ? 1 : _sg == _srf_sig2 ? 2 : 0;
+    _srf == 0 ? (
+      _srf = _srf_last_emb == 1 ? 2 : 1;
+      _srf == 1 ? ( _srf_sig1 = _sg; _srf_plmb1 = 0; _srf_prmb1 = 0; _srf_t1 = 0; _srf_cap1 = 0; )
+                : ( _srf_sig2 = _sg; _srf_plmb2 = 0; _srf_prmb2 = 0; _srf_t2 = 0; _srf_cap2 = 0; );
+    );
+    _srf_last_emb = _srf;
+    _srf_plmb0 = 0; _srf_prmb0 = 0;
+    _srf == 1 ? (
+      prev_LMB = _srf_plmb1; prev_RMB = _srf_prmb1;
+      _oth_plmb = _srf_plmb2; _oth_prmb = _srf_prmb2;
+      _oth_mx = _srf_mx2; _oth_my = _srf_my2; _oth_t = _srf_t2; _oth_cap = _srf_cap2;
+    ) : (
+      prev_LMB = _srf_plmb2; prev_RMB = _srf_prmb2;
+      _oth_plmb = _srf_plmb1; _oth_prmb = _srf_prmb1;
+      _oth_mx = _srf_mx1; _oth_my = _srf_my1; _oth_t = _srf_t1; _oth_cap = _srf_cap1;
+    );
+    (_oth_plmb || _oth_prmb) && time_precise() - _oth_t > 0.5 ? (
+      // The owner has not run for half a second: its press is over.
+      _srf == 1 ? ( _srf_plmb2 = 0; _srf_prmb2 = 0; ) : ( _srf_plmb1 = 0; _srf_prmb1 = 0; );
+      _oth_plmb = 0; _oth_prmb = 0;
+    );
+    _srf_foreign = (_oth_plmb || _oth_prmb) && !(mouse_cap & 3);
+    _srf_foreign ? (
+      lmb = _oth_plmb; RMB = _oth_prmb;             // (the lib writes LMB: this file spells it lmb)
+      prev_LMB = _oth_plmb; prev_RMB = _oth_prmb;   // held, and no edge either way
+      mx = _oth_mx; my = _oth_my;
+      _srf_cap = _oth_cap;                          // ...with its modifiers
+    );
+  ) : (
+    _srf = 0; _srf_foreign = 0;
+    prev_LMB = _srf_plmb0 || _srf_plmb1 || _srf_plmb2;
+    prev_RMB = _srf_prmb0 || _srf_prmb1 || _srf_prmb2;
+    _srf_plmb1 = 0; _srf_prmb1 = 0; _srf_plmb2 = 0; _srf_prmb2 = 0;
+  );
+);
+
+function rk_srf_store()
+(
+  _srf == 1 ? (
+    _srf_plmb1 = mouse_cap & 1; _srf_prmb1 = mouse_cap & 2;
+    _srf_foreign ? 0 : ( _srf_mx1 = mouse_x; _srf_my1 = mouse_y; _srf_t1 = time_precise(); _srf_cap1 = mouse_cap; );
+  ) : _srf == 2 ? (
+    _srf_plmb2 = mouse_cap & 1; _srf_prmb2 = mouse_cap & 2;
+    _srf_foreign ? 0 : ( _srf_mx2 = mouse_x; _srf_my2 = mouse_y; _srf_t2 = time_precise(); _srf_cap2 = mouse_cap; );
+  ) : (
+    _srf_plmb0 = mouse_cap & 1; _srf_prmb0 = mouse_cap & 2;
+  );
+  prev_LMB = mouse_cap & 1;
+  prev_RMB = mouse_cap & 2;
+);
+
+// Is the REAL pointer over this surface's canvas? (mouse_x / mouse_y as REAPER handed them to this pass, never the
+// handed-over or wheel-cached mx / my.) Only such a pass may clear or arm 0x200.
+function rk_srf_in()
+(
+  mouse_x >= 0 && mouse_x < gfx_w && mouse_y >= 0 && mouse_y < gfx_h;
+);
+
+// The wheel, per surface: this pass's notches (what the host used to read as mouse_wheel / 120), and _srf_hx / _srf_hy,
+// THIS surface's pointer on its last frame without a wheel (the embed wheel-fix's cache: a wheel frame's mouse_x / y can
+// be stale, wiki 4.5). MEASURED 2026-10-08 with real notches (SendInput, gk_input_run.py --wheelonly and its per-pass
+// ring): REAPER hands an embed the wheel only right after a click ON it -- before one no notch reached any pass, in one
+// strip or two (the "none in either strip" seen first was this rule). After a click, one plugin in two strips:
+// mouse_wheel is the INSTANCE's -- every notch over the TRACK-PANEL face (3 of 3) was found first by the MIXER face's
+// pass, its own pointer off its canvas; this code left it there and the track panel's next pass took it. Over the mixer
+// face its own pass found each notch first (3 of 3). The old read-and-zero would have spent those three notches on the
+// wrong surface, and one shared wheel-fix cache would have aimed a notch with the other surface's pointer. So a pass
+// takes the wheel only when its own cached pointer is on its own canvas (a window always does) and otherwise leaves
+// mouse_wheel for the other surface's pass, 0.3 s at most (then it is dropped, as a stray notch always was). The host
+// calls it once per pass, after rk_srf_load(), and stops zeroing mouse_wheel itself.
+function rk_srf_wheel() local(w)
+(
+  mouse_wheel == 0 ? (
+    _srf == 1 ? ( _srf_hx1 = mouse_x; _srf_hy1 = mouse_y; ) :
+    _srf == 2 ? ( _srf_hx2 = mouse_x; _srf_hy2 = mouse_y; ) : ( _srf_hx0 = mouse_x; _srf_hy0 = mouse_y; );
+    _srf_wt = 0;
+  );
+  _srf_hx = _srf == 1 ? _srf_hx1 : _srf == 2 ? _srf_hx2 : _srf_hx0;
+  _srf_hy = _srf == 1 ? _srf_hy1 : _srf == 2 ? _srf_hy2 : _srf_hy0;
+  w = 0;
+  mouse_wheel != 0 ? (
+    !is_embedded || (_srf_hx >= 0 && _srf_hx < gfx_w && _srf_hy >= 0 && _srf_hy < gfx_h) ? (
+      w = mouse_wheel / 120; mouse_wheel = 0; _srf_wt = 0;
+    ) : (
+      _srf_wt == 0 ? _srf_wt = time_precise() : time_precise() - _srf_wt > 0.3 ? ( mouse_wheel = 0; _srf_wt = 0; );
+    );
+  );
+  w;
+);
 
 // hue (0..1, or sentinel <0) → gfx_r/g/b at a fixed S/V (matches the pad-face look)
 function hue2rgb(h) local(i, f, p, q, t, s, v) (
@@ -173,9 +313,20 @@ function screw(cx, cy, r) (
 
 // Draw "NN Name" for pad i at the current gfx_x/gfx_y (number, then the live pad
 // name read char-by-char from the per-instance name band; number only if blank).
+// Where bank A pad i's name starts (sweep PLG3): the strip band these rows meter and edit is bank
+// A's, but the sixteen-pad name band carries the bank ON SCREEN -- with bank B shown a row read
+// "01 Clap" over the Kick's send. A Swing that stamps the all-bank band is read there (pads 0..15
+// = bank A); an older one falls back to the on-screen band, as before. (sw_plg_test.py calls it.)
+function rv_name_base(i) local(s) (
+  s = max(0, link_slot) | 0;
+  gmem[INST_IDENT64_BASE + s * INST_IDENT64_STRIDE] > 0.5
+    ? INST_PADNAME64_BASE + s * INST_PADNAME64_STRIDE + i * INST_PADNAME_LEN
+    : INST_PADNAME_BASE   + s * INST_PADNAME_STRIDE   + i * INST_PADNAME_LEN;
+);
+
 function draw_padlabel(i) local(c, ch, nb) (
   sprintf(#num, "%02d ", i + 1); gfx_drawstr(#num);
-  nb = INST_PADNAME_BASE + (max(0, link_slot) | 0) * INST_PADNAME_STRIDE + i * INST_PADNAME_LEN;
+  nb = rv_name_base(i);
   c = 0;
   loop(INST_PADNAME_LEN,
     ch = gmem[nb + c] | 0;
@@ -186,11 +337,19 @@ function draw_padlabel(i) local(c, ch, nb) (
 
 // Push one edit to Swing via the viewer mailbox with an explicit param id.
 // SEQ bumped LAST so Swing consumes exactly once.
-function vcmd_write_pid(pad, pidv, v) local(vb) (
+function vcmd_write_pid(pad, pidv, v) local(vb, rs) (
   vb = GS_STRIP_BASE + (max(0, link_slot) | 0) * GS_STRIP_STRIDE;
   gmem[vb + CMD_PAD] = pad;
   gmem[vb + CMD_PID] = pidv;
   gmem[vb + CMD_VAL] = v;
+  // Seed from the cell's RESIDENT seq on EVERY write (sweep PLG4), the way bc_write seeds its row:
+  // the Verb, Delay and Smash viewers and the strip-sync Lua all write this ONE cell, each counting
+  // from its own 0, so a second writer's first edit repeated the seq Swing had just consumed and
+  // was dropped (the POWER pill snapped back after its hold-off). Every writer runs on the UI
+  // thread, so read-then-write is one step. NaN fails both compares (our own count stands); a
+  // corrupt huge value is ignored so the counter cannot be driven to Inf.
+  rs = gmem[vb + CMD_SEQ];
+  rs > vcmd_seq && rs < 1000000000 ? vcmd_seq = rs;
   vcmd_seq += 1;
   gmem[vb + CMD_SEQ] = vcmd_seq;   // bump LAST → the live Swing strip-CMD consume applies it
 );
@@ -270,29 +429,34 @@ smash = rv_bus == 2;
 // END of @gfx only when the cursor is NOT over a draggable bar — so a drag is
 // handled inline here instead of popping the floating window (Drum Strip trick).
 mx = mouse_x; my = mouse_y; lmb = mouse_cap & 1;
-// Consume the wheel ONCE per frame (don't let it accumulate between frames while
-// the cursor is off the bars — that caused a big jump on the next hover).
-wheel = mouse_wheel; mouse_wheel = 0;
-// Clear 0x200 UNCONDITIONALLY (house pattern: Drum Strip:1590, Swing_ReaKit,
-// Weld post-2026-08-27): gfx_ext_flags is ONE variable shared by both @gfx
-// passes, so a micro-gated clear leaves the embed's end-of-frame re-arm
-// standing across the floating pass. The re-arm below stays micro-gated.
-// Not in an idle pass (& 2): idle leaves 0x200 as the last visible pass set it (house rule 4).
-!(gfx_ext_flags & 2) ? gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
+RMB = mouse_cap & 2;
+// ⭐⭐ PER-SURFACE PRESS LATCHES -- rk_srf_load() in @init owns them (sweep PLG16).
+is_embedded = micro;
+rk_srf_load();
+// The wheel per surface (rk_srf_wheel, after rk_srf_load), in the +-120-a-notch units this file
+// always used. It consumes a notch it takes, so nothing accumulates between frames while the
+// cursor is off the bars (the old big jump on the next hover); a notch found first by the OTHER
+// strip's pass is left for this one, 0.3 s at most.
+wheel = rk_srf_wheel() * 120;
+// Clear 0x200 on every visible pass whose canvas holds the REAL pointer (house pattern, with the
+// rk_srf_in gate the free effects carry): gfx_ext_flags is ONE variable shared by both @gfx
+// passes, so a micro-gated clear leaves the embed's end-of-frame re-arm standing across the
+// floating pass, and the strip NOT under the pointer must not arm for a click on the other one.
+// The re-arm below stays micro-gated. Not in an idle pass (& 2): idle leaves 0x200 as the last
+// visible pass set it (house rule 4).
+!(gfx_ext_flags & 2) && (!micro || rk_srf_in()) ? gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
 // Embedded wheel events arrive with a STALE/zero mouse position — every hover
-// test (rows AND deck knobs) misses on the wheel frame. Remember the cursor on
-// normal frames, reuse it on wheel frames (Drum Strip's user-verified fix).
-micro ? (
-  wheel == 0 ? ( rv_hmx = mx; rv_hmy = my; ) : ( mx = rv_hmx; my = rv_hmy; );
-);
+// test (rows AND deck knobs) misses on the wheel frame. On a wheel frame use THIS
+// surface's own last pointer (rk_srf_wheel's per-surface cache).
+micro && wheel != 0 ? ( mx = _srf_hx; my = _srf_hy; );
 over_bar = 0;
-!lmb ? drag_pad = -1;                   // release ends the drag
+!lmb ? drag_pad = -1;                   // release ends the drag (a foreign pass carries the owner's HELD button, so it cannot)
 // ── Deck frame globals (knobs_kbsg / sliders_kbsg caller contract) ─────────
 // EEL2 identifiers are case-insensitive: the libs' LMB *is* this file's lmb —
 // do not add a separate LMB line.
-lmb_down = lmb && !plmb;
-CTRL  = mouse_cap & 4;
-SHIFT = mouse_cap & 8;
+lmb_down = lmb && !prev_LMB;
+CTRL  = _srf_cap & 4;
+SHIFT = _srf_cap & 8;
 dt = min(time_precise() - dk_lt, 0.05); dk_lt = time_precise();
 hv_speed = 11;
 frame_wheel = 0;    // armed inside the deck block once its rect is known
@@ -467,8 +631,10 @@ listh = dh - floor(24 * sc);
       // ── Drag to edit this pad's send to the bus ──
       _inrow = my >= yy && my < yy + rowh;
       _inrow ? over_bar = 1;                              // whole row interactive (embed gating)
-      (_inrow && mx >= bx && lmb && !plmb) ? drag_pad = i;   // press on the bar/value area starts a drag
-      (drag_pad == i && lmb && linked) ? (
+      // !_srf_foreign on the press and the drag: a foreign pass is handed the OWNER's held button
+      // and pointer but measures them against THIS pass's row geometry (Tone's EQ nodes, Macros' bars).
+      (_inrow && mx >= bx && lmb_down && !_srf_foreign) ? drag_pad = i;   // press on the bar/value area starts a drag
+      (drag_pad == i && lmb && linked && !_srf_foreign) ? (
         _nv = max(0, min(1, (mx - bx) / bw));
         _nv != m_send[i] ? ( m_send[i] = _nv; vcmd_write(i, _nv); );  // optimistic + push
       );
@@ -572,7 +738,9 @@ show_deck ? (
       _fc = dx + floor((_di + 0.5) * dk_pitch);
       _fx = _fc - floor(dk_fw * 0.5);
       _nrm = max(0, min(1, bus_val[_k] / _hi));
-      _nv  = sld_vgroove_interact(sld_base + _di * 16, _fx, dk_fy, dk_fw, dk_fh, _nrm);
+      // sliders_kbsg does not read _srf_foreign (knobs_kbsg does): skip the interact on a foreign
+      // pass, or the owner's held press would advance this fader's shared drag state.
+      _nv  = _srf_foreign ? _nrm : sld_vgroove_interact(sld_base + _di * 16, _fx, dk_fy, dk_fw, dk_fh, _nrm);
       _nv != _nrm ? dk_commit(_k, _nv * _hi);
       sld_vgroove_draw(_fx, dk_fy, dk_fw, dk_fh,
                        max(0, min(1, bus_val[_k] / _hi)), sld_base + _di * 16);
@@ -647,7 +815,7 @@ show_deck ? (
         rk_knob_draw(14, _fc, dk_kcy, dk_r, max(0, min(1, _nrm)), 0, 1, _k == 5,
                      (dk_kmem + _di * 16)[0], phr, phg, phb, 0, 0.32, 0.33, 0.37);
         _k == 0 ? sprintf(#dk_val, "%.0fdB", bc_val[0]) :
-        _k == 1 ? ( bc_val[1] >= 20 ? strcpy(#dk_val, "LIM")
+        _k == 1 ? ( bc_val[1] >= 19.995 ? strcpy(#dk_val, "LIM")   // 19.995: the Weld's own test (PLG27)
                                     : sprintf(#dk_val, "%.1f:1", bc_val[1]) ) :
         _k == 2 ? sprintf(#dk_val, "%.1fms", bc_val[2]) :
         _k == 3 ? sprintf(#dk_val, "%.0fms", bc_val[3]) :
@@ -750,11 +918,13 @@ show_deck ? (
 // When embedded, leave 0x200 cleared over a bar or the deck so the gesture is
 // handled inline; elsewhere set it so a click opens the floating window
 // (Drum Strip pattern).
-micro && !over_bar && !over_deck && !dk_drag && drag_pad < 0 ? gfx_ext_flags |= 0x200;
+// Only the strip under the REAL pointer arms (rk_srf_in): the other strip's pass hovers nothing by
+// construction and would arm for a click it is not getting.
+micro && rk_srf_in() && !over_bar && !over_deck && !dk_drag && drag_pad < 0 ? gfx_ext_flags |= 0x200;
 // House rule 3 (wiki 4.5): window up -> arm 0x200 always. The flag only routes
 // clicks on the EMBED, which runs no @gfx pass while a window is open, so this
 // is the only pass that can set it; a click on the strip then closes the window.
 // An idle pass (& 2) leaves the flag alone.
 !micro && !(gfx_ext_flags & 2) ? gfx_ext_flags |= 0x200;
-plmb = lmb;
+rk_srf_store();   // the per-surface latches (prev_LMB for the next pass of THIS surface)
 

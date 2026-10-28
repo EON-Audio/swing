@@ -200,11 +200,6 @@ function anv_build_shapers()
   );
 );
 
-// Preamp residual lookup on the ACTIVE shaper. Linear interpolation over the
-// same +-ANV_VMAX range the cell's drain axis uses, so there is one range to
-// reason about. 2049 points measured: worst interpolation error 8e-9 V against
-// a signal that lives at 8 mV, and a 1 kHz tone reproduces the exact THD to
-// four decimals.
 // Line-amp input curve on the ACTIVE table.
 //
 // ⚠️ This one sits on the MAIN signal path, where the input reaches several
@@ -228,6 +223,11 @@ function anv_lamp(x, base)
   ));
 );
 
+// Preamp residual lookup on the ACTIVE shaper. Linear interpolation over the
+// same +-ANV_VMAX range the cell's drain axis uses, so there is one range to
+// reason about. 2049 points measured: worst interpolation error 8e-9 V against
+// a signal that lives at 8 mV, and a 1 kHz tone reproduces the exact THD to
+// four decimals.
 function anv_pshp(x, base)
   local(u, j, tu) (
   u = (x + ANV_VMAX)*ANV_IPSHDX;
@@ -338,7 +338,7 @@ function anv_dio_i(v, fr)
     ib = p1[0] + (p1[1] - p1[0])*tv;
     // di/dv, from the SAME four entries already loaded -- costs one lerp and
     // one multiply, and it is what lets the storage node be solved implicitly
-    // instead of stepped. See the update in anv_tick().
+    // instead of stepped. See the solve in anv_det().
     anv_dio_g = ((p0[1] - p0[0]) + ((p1[1] - p1[0]) - (p0[1] - p0[0]))*tr)*ANV_IDDV;
     ia + (ib - ia)*tr;
   );
@@ -514,10 +514,6 @@ function anv_hb_run(x, membase, cbase)
   v;
 );
 
-// One sample of the full circuit at the EFFECTIVE rate (1x or 2x). Inputs
-// already carry the Input-knob gain; results land in anv_w0/anv_w1 (unit
-// domain). Everything rate-dependent here reads anv_dte / anv_ix_envd /
-// anv_kchg / anv_kdis, set per oversample mode by anv_recalc().
 // ── voice crossfade ────────────────────────────────────────────────────
 // Swapping three transfer curves between one sample and the next is a step in
 // the transfer, and it clicks. Nobody swaps hardware revisions mid-note, so
@@ -564,9 +560,9 @@ function anv_lineamp(x) (
 );
 
 // ── THE DETECTOR, ONE INSTANCE PER CHANNEL ─────────────────────────────
-// STEREO LINK runs a SINGLE instance fed by the louder channel — which is what
-// a strapped pair does, and is bit-identical to what this file did before the
-// split. DUAL MONO runs two, each seeing only its own channel.
+// Both instances tick in both modes (see anv_tick). STEREO LINK feeds both the
+// louder channel — which is what a strapped pair does; DUAL MONO feeds each
+// only its own channel.
 // ⚠️⚠️ALL of the state had to move, not some of it: storage cap, gate voltage,
 // BOTH anode self-bias halves, the C22 speed-up node and the sidechain
 // high-pass. A half-split detector — independent caps sharing one self-bias,
@@ -737,6 +733,10 @@ function anv_det(tap)
   vg = ANV_VGREST + ANV_GDIV*vcap;
 );
 
+// One sample of the full circuit at the EFFECTIVE rate (1x or 2x). Inputs
+// already carry the Input-knob gain; results land in anv_w0/anv_w1 (unit
+// domain). Everything rate-dependent here reads anv_dte / anv_ix_envd /
+// anv_kchg / anv_kdis, set per oversample mode by anv_recalc().
 function anv_tick(x0, x1) (
   anv_vin0 = ixl.anv_ixf(x0*ANV_XSCALE)*ANV_IXUP;
   anv_vin1 = ixr.anv_ixf(x1*ANV_XSCALE)*ANV_IXUP;
@@ -1036,8 +1036,6 @@ anv_ingain_t  = pow(10, (ANV_REFDRIVE + anv_inatten)/20);
   anv_link = anv_sl_link > 0.5;
 );
 
-// ── GUI helpers ─────────────────────────────────────────────────────────
-
 
 // ── engine init: memory (through the importer's freemem), constants, tables,
 //    self-check, rest state, first recalc. Everything Anvil's own @init did
@@ -1154,10 +1152,10 @@ function anv_engine_init(mem_start) local(_m) (
   ANV_HBA[4] = 0.8922608180038789;   ANV_HBB[4] = 0.9315419599631839;
   ANV_HBA[5] = 0.962094548378084;    ANV_HBB[5] = 0.9878163707328971;
 
-  // ── build + verify (always BLACK first: the ground truth is BLACK's table;
-  //    anv_recalc() applies the BLUE rebuild afterwards if the voice asks) ──
+  // ── build + verify: BOTH voices' tables are built here and checked by
+  //    anv_selfcheck(); nothing rebuilds them later -- anv_recalc() only sets
+  //    the voice crossfade target anv_vxt ──
   anv_build_static();
-  ANV_T0 = anv_th(ANV_ABIAS/ANV_SATV);   // legacy rest value; anv_amp re-derives per sample
   ANV_SATLO = 0.2*ANV_SATV;
   ANV_IPSHDX = (ANV_PSH_N - 1)/(2*ANV_VMAX);
   ANV_IQ4DX  = (ANV_Q4_N - 1)/(2*ANV_Q4_VMAX);
@@ -1168,10 +1166,16 @@ function anv_engine_init(mem_start) local(_m) (
   anv_vxf = anv_vxt;            // the weight STARTS at the target
   anv_bypt = anv_sl_byp > 0.5 ? 1 : 0;   // bypass target + weight likewise
   anv_bypw = anv_bypt;
+  // The cell's REST gain per voice (vin = 0 at the Q-bias gate): ~0.892 Black, ~0.889
+  // Blue -- the 1.0 dB insertion loss ANV_VGREST is aligned to. The GR meter reads
+  // the cell gain RELATIVE to this rest, as the hardware's meter-zero trim does
+  // (LIB21); the reciprocals are kept so @sample multiplies.
+  anv_gr_irk = 1/max(0.000001, anv_cell_gp(0, ANV_VGREST, ANV_CELLK));
+  anv_gr_irb = 1/max(0.000001, anv_cell_gp(0, ANV_VGREST, ANV_CELLB));
   anv_selfcheck();
 
-  // runtime state. BOTH detectors, always — dr is live only in dual mono, but a
-  // dr.vg left at 0 would put channel 1 at the wrong gate the instant it is.
+  // runtime state. BOTH detectors, always: both tick in both modes and channel 1
+  // always reads dr.vg (anv_tick), so a dr.vg left at 0 would be a wrong gate.
   dl.vcap = 0; dl.vg = ANV_VGREST; dl.v22 = dl.sbp = dl.sbn = 0;
   dr.vcap = 0; dr.vg = ANV_VGREST; dr.v22 = dr.sbp = dr.sbn = 0;
   anv_link = anv_sl_link > 0.5;
@@ -1186,6 +1190,10 @@ function anv_engine_init(mem_start) local(_m) (
   anv_rc_req = 0;
   anv_atk_w = anv_sl_atk;       // wipers start WHERE THE KNOBS ARE, or the first
   anv_rel_w = anv_sl_rel;       // 40 ms of every session sweeps the timing network
+  // ...and the first @block seats them AGAIN, from the knobs the host has restored
+  // by then (@init runs before the saved sliders come back, and before Swing's
+  // push): see anv_seat_req in anv_engine_block (LIB214).
+  anv_seat_req = 1;
   anv_recalc();
   anv_ingain  = anv_ingain_t;   // seated, or the plugin fades in on load
   anv_outgain = anv_outgain_t;
@@ -1196,7 +1204,6 @@ function anv_engine_init(mem_start) local(_m) (
   anv_dioi    = anv_dioi_t;
   anv_schp_w  = anv_schp_wt;
 
-                                // (face and bezel are set at draw time)
   _m;   // next free address, the way cmp_init returns it
 );
 
@@ -1241,6 +1248,21 @@ function anv_engine_block() (
   // envelope, the self-bias states. Those ARE the modelled dynamics; a one-pole
   // on them would corrupt precisely what the model exists to reproduce. This is
   // the distinction between smoothing the control and smoothing the circuit.
+  // The first block after @init or a reset SEATS the wipers, the voice weight
+  // and every smoothed gain AT the knobs instead of sweeping to them. @init ran
+  // before the host restored the sliders (and before Swing's push), so its seat
+  // read anv_sl_* = 0: the wipers started at 0, outside the 1..7 travel, a Blue
+  // kit faded in from Black, and a hit in the first 40 ms got a slower-than-
+  // slowest attack (LIB214). One direct recalc, on this thread, as @init's.
+  anv_seat_req ? (
+    anv_seat_req = 0;
+    anv_atk_w = anv_sl_atk; anv_rel_w = anv_sl_rel;
+    anv_vxt = anv_sl_voice > 0.5; anv_vxf = anv_vxt;
+    anv_recalc();
+    anv_ingain  = anv_ingain_t;  anv_outgain = anv_outgain_t; anv_mixw = anv_mixw_t;
+    anv_drive   = anv_drive_t;   anv_bias    = anv_bias_t;
+    anv_dioi    = anv_dioi_t;    anv_schp_w  = anv_schp_wt;
+  );
   anv_atk_w != anv_sl_atk || anv_rel_w != anv_sl_rel ? (
     anv_pstep = ANV_POTRATE*samplesblock/ANV_SRSAFE;
     anv_atk_w += max(-anv_pstep, min(anv_pstep, anv_sl_atk - anv_atk_w));
@@ -1257,8 +1279,8 @@ function anv_engine_block() (
   // it must never perform one. Every control on the panel, and @slider with it,
   // sets anv_rc_req and stops there. Every coefficient in anv_recalc() -- the
   // gains, the whole attack/release network, anv_kchg/anv_kdis, the ratio drive
-  // and bias, the diode R coordinate, the sidechain biquad, and the three voice
-  // pointers -- is derived HERE, on the audio thread, between blocks.
+  // and bias, the diode R coordinate, the sidechain biquad, and the voice
+  // crossfade target anv_vxt -- is derived HERE, on the audio thread, between blocks.
   //
   // Until this landed the rule was written down but not kept: all eleven panel
   // controls called anv_recalc() straight from the GUI thread, so @sample could
@@ -1334,6 +1356,7 @@ function anv_engine_reset() (
   dl.shx1 = dl.shx2 = dl.shy1 = dl.shy2 = 0;
   dr.shx1 = dr.shx2 = dr.shy1 = dr.shy2 = 0;
   memset(ANV_OSM, 0, 8*24);
+  anv_seat_req = 1;   // the next @block seats the wipers and the weight at the knobs (LIB214)
 );
 
 // ── per sample: the circuit, then what leaves. anv_outL/R carry the exact
@@ -1399,12 +1422,13 @@ function anv_process(inL, inR) (
 
     // walk the blue weight toward its target, clamping on arrival at EITHER
     // end -- a reversal mid-walk is just a sign change here, no reset.
-    anv_vxf != anv_vxt ? (
-      anv_vxt > anv_vxf ? (
-        anv_vxf += ANV_VXSTEP; anv_vxf > anv_vxt ? anv_vxf = anv_vxt;
-      ) : (
-        anv_vxf -= ANV_VXSTEP; anv_vxf < anv_vxt ? anv_vxf = anv_vxt;
-      );
+    // !== (exact): EEL2's != has a 0.00001 dead zone (wiki 1.11), so the walk
+    // stopped ~1e-15 short of 0 or 1 at 96 kHz and the cell, preamp and line
+    // amp then blended BOTH voices' tables every sample until the next voice
+    // change (LIB215). The last step snaps.
+    anv_vxf !== anv_vxt ? (
+      abs(anv_vxt - anv_vxf) <= ANV_VXSTEP ? anv_vxf = anv_vxt :
+      anv_vxt > anv_vxf ? anv_vxf += ANV_VXSTEP : anv_vxf -= ANV_VXSTEP;
     );
 
     anv_in0 = inL*anv_ingain;
@@ -1487,9 +1511,9 @@ function anv_process(inL, inR) (
       // Same argument for the halfband banks. Unreachable while ANV_OS_ALLOW = 0,
       // included now so enabling 2x later cannot quietly reopen the hole.
       memset(ANV_OSM, 0, 8*24);
-      anv_recov += 1;   // diagnostic counter, healthy value 0. NOT surfaced on
-                        // the panel yet -- if this ever reads non-zero in the
-                        // wild we want to know, so it wants a home there.
+      anv_recov += 1;   // diagnostic counter, healthy value 0. EON_Anvil's face
+                        // shows it as an amber status LED; Swing's COMP page
+                        // does not show it.
     );
 
     // A build that failed its own self-test does not get to be audible. The
@@ -1524,7 +1548,13 @@ function anv_process(inL, inR) (
       // to this paragraph.
       anv_bypw += (anv_bypt - anv_bypw)*ANV_SMC;
       anv_bypw < 0.000001 ? anv_bypw = 0 : ( anv_bypw > 0.999999 ? anv_bypw = 1; );
-      anv_gr_lin = anv_bypt > 0.5 ? 1 : anv_grm;
+      // The needle reads the cell gain RELATIVE TO REST (the meter-zero trim): the
+      // raw cell rests at ~0.892 (the Q-bias 1 dB insertion loss), so it read
+      // -1 dB with no signal and Swing's idle gate (anv_gr_lin >= 0.999) never
+      // passed with Anvil in (LIB21). Reciprocals from @init, blended by the
+      // voice weight; one multiply, no divide.
+      anv_gr_lin = anv_bypt > 0.5 ? 1 : min(1, anv_grm*(anv_vxf <= 0 ? anv_gr_irk :
+                   anv_vxf >= 1 ? anv_gr_irb : anv_gr_irk + (anv_gr_irb - anv_gr_irk)*anv_vxf));
       anv_wetw = anv_mixw*(1 - anv_bypw);
       anv_outL = anv_dry0 + (anv_y0 - anv_dry0)*anv_wetw;
       anv_outR = anv_dry1 + (anv_y1 - anv_dry1)*anv_wetw;

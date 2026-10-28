@@ -118,7 +118,7 @@ function swing_panels_draw_eq() (
     _lcd_mid_y = _lcd_cy + _lcd_gh / 2;
     _lcd_yr    = _lcd_gh / 2 - 4;
     // Shift+click the graph opens the full-size EQ over the pad grid (compact
-    // page only; the node hit-test above is guarded !SHIFT so it won't drag).
+    // page only; the node hit-test below is guarded !SHIFT so it won't drag).
     big_view_id != VIEW_EQ && lmb_down && SHIFT && mx >= _lcd_cx && mx <= _lcd_cx + _lcd_cw && my >= _lcd_cy && my <= _lcd_cy + _lcd_ch ? (
       swing_bigview_open(VIEW_EQ);
       _ov_lmb_down = 0; _ov_rmb_down = 0; _ov_LMB = 0; _ov_RMB = 0; _ov_wheel = 0;
@@ -377,8 +377,9 @@ function swing_panels_draw_eq() (
             dist(mx, my, _lcd_hi_nx, _lcd_hi_ny) <= _lcd_nr + 4 ? 3 : 0;
       _meq_wq ? (
         _meq_wf = 1 + frame_wheel * (SHIFT ? 0.03 : 0.12);
-        // Explicit branches, not `c ? a = x : b = y` -- JSFX parses that
-        // ambiguously (rk_drumkit_dsp's recalc says the same).
+        // Explicit parenthesised branches, house style for reading; a bare
+        // `c ? a = x : b = y` would work too (wiki 01: assignments in ternary
+        // branches work).
         _meq_wq == 1 ? (
           meq_lo_bell ? ( gfx_eq_lo_bq = max(0.3, min(6, gfx_eq_lo_bq * _meq_wf)); )
                       : ( gfx_eq_lo_sq = max(0.3, min(6, gfx_eq_lo_sq * _meq_wf)); );
@@ -418,7 +419,7 @@ function swing_panels_draw_eq() (
       );
     );
 
-    // ── HPF / LPF knobs (bottom corners of EQ graph) ──
+    // ── HPF / LPF knobs (the strip's two ends, under the EQ graph) ──
     _meq_hpf_cx = _lcd_cx + _meq_kr + 4;
     _meq_hpf_cy = _lcd_cy + _lcd_ch - _meq_kr - 3;
     _meq_lpf_cx = _lcd_cx + _lcd_cw - _meq_kr - 4;
@@ -527,7 +528,10 @@ function swing_panels_draw_eq() (
     gfx_x = _byp_x + (_byp_w - tw) / 2; gfx_y = _byp_y + (_byp_h - th) / 2;
     gfx_drawstr(#_byp);
     mx >= _byp_x && mx <= _byp_x + _byp_w && my >= _byp_y && my <= _byp_y + _byp_h ? swing_tooltip_check(1110, "Bypass the entire master EQ section.");
-    lmb_down && mx >= _byp_x && mx <= _byp_x + _byp_w && my >= _byp_y && my <= _byp_y + _byp_h ? (
+    // The three pills take a PLAIN click that no node took this frame: a Shift+click opens the big
+    // view (above) and used to toggle a pill too, and a node whose hit circle reaches a pill
+    // started its drag and flipped the pill in the same frame (sweep LIB137).
+    lmb_down && !SHIFT && active_id == -1 && mx >= _byp_x && mx <= _byp_x + _byp_w && my >= _byp_y && my <= _byp_y + _byp_h ? (
       meq_bypass = !meq_bypass; mark_dirty_kit();
     );
 
@@ -545,7 +549,7 @@ function swing_panels_draw_eq() (
     gfx_x = _tgl_lo_x + (_tgl_w - tw) / 2; gfx_y = _tgl_lo_y + (_tgl_h - th) / 2;
     gfx_drawstr(#_tgl_lo);
     mx >= _tgl_lo_x && mx <= _tgl_lo_x + _tgl_w && my >= _tgl_lo_y && my <= _tgl_lo_y + _tgl_h ? swing_tooltip_check(1102, "Low band shape — SHELF boosts/cuts everything below the freq; BELL peaks around the freq.");
-    lmb_down && mx >= _tgl_lo_x && mx <= _tgl_lo_x + _tgl_w && my >= _tgl_lo_y && my <= _tgl_lo_y + _tgl_h ? (
+    lmb_down && !SHIFT && active_id == -1 && mx >= _tgl_lo_x && mx <= _tgl_lo_x + _tgl_w && my >= _tgl_lo_y && my <= _tgl_lo_y + _tgl_h ? (
       meq_lo_bell = !meq_lo_bell;
       recalc_master_eq(); mark_dirty_kit();
     );
@@ -560,7 +564,7 @@ function swing_panels_draw_eq() (
     gfx_x = _tgl_hi_x + (_tgl_w - tw) / 2; gfx_y = _tgl_hi_y + (_tgl_h - th) / 2;
     gfx_drawstr(#_tgl_hi);
     mx >= _tgl_hi_x && mx <= _tgl_hi_x + _tgl_w && my >= _tgl_hi_y && my <= _tgl_hi_y + _tgl_h ? swing_tooltip_check(1107, "High band shape — SHELF boosts/cuts everything above the freq; BELL peaks around the freq.");
-    lmb_down && mx >= _tgl_hi_x && mx <= _tgl_hi_x + _tgl_w && my >= _tgl_hi_y && my <= _tgl_hi_y + _tgl_h ? (
+    lmb_down && !SHIFT && active_id == -1 && mx >= _tgl_hi_x && mx <= _tgl_hi_x + _tgl_w && my >= _tgl_hi_y && my <= _tgl_hi_y + _tgl_h ? (
       meq_hi_bell = !meq_hi_bell;
       recalc_master_eq(); mark_dirty_kit();
     );
@@ -578,6 +582,12 @@ function swing_panels_draw_delay() (
     // ═══════════════════════════════════════════════════════════════════
     // DELAY — Params: DIV (tempo sync), FB, MIX, HPF, LPF, PING
     // ═══════════════════════════════════════════════════════════════════
+    // Every row's hit test is [ry, ry + row_h): the pixel row between two rows used to belong to
+    // both, so one click (or wheel notch) there acted on two controls (sweep LIB138; the reverb page
+    // too). And no row calls dly_recalc / rvb_recalc itself any more: @block's drift watcher
+    // (swing_block_sync_fx_params) performs both on the edit, as A-9a moved the other recalcs --
+    // run from here as well they overlapped the watcher's run and shared its function-static
+    // locals, so the HP could land at the LPF's corner until the next edit (sweep LIB139).
     1 ? (
       _fx_row_h = (_fx_avail_h / 7)|0;
 
@@ -596,8 +606,8 @@ function swing_panels_draw_delay() (
       gfx_measurestr(#_fxv, tw, th);
       gfx_x = _fx_bar_x + (_fx_bar_w - tw) / 2; gfx_y = _fx_ry; gfx_drawstr(#_fxv);
       rk_font(1, 9, 'b');
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1206, "Delay bus on/off. OFF rings the repeats out and keeps the division, feedback and mix exactly where you left them.");
-      lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? swing_tooltip_check(1206, "Delay bus on/off. OFF rings the repeats out and keeps the division, feedback and mix exactly where you left them.");
+      lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? (
         dly_on = !dly_on; mark_dirty_kit();
       );
 
@@ -621,7 +631,7 @@ function swing_panels_draw_delay() (
       gfx_x = _fx_bar_x + (_fx_bar_w - tw) / 2; gfx_y = _fx_ry; gfx_drawstr(#_dly_dn);
       rk_font(1, 9, 'b');
       // Left-click: cycle straight divisions, right-click: full menu
-      _in_sync = mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h;
+      _in_sync = mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h;
       _in_sync ? (dly_clamped ?
         swing_tooltip_check(1200, "This division is longer than the delay buffer at this tempo and sample rate, so the time is clamped and no longer in tempo. Pick a shorter division, raise the tempo, or work at a lower sample rate.") :
         swing_tooltip_check(1200, "Tempo-sync delay division. Left-click cycles straight; right-click for triplet/dotted; scroll for fine step."));
@@ -631,7 +641,7 @@ function swing_panels_draw_delay() (
         dly_div == 7  ? dly_div = 10 :
         dly_div == 10 ? dly_div = 13 :
         dly_div = 1;
-        dly_recalc(); mark_dirty_kit();
+        mark_dirty_kit();
       );
       // Right-click: delay sync division picker (migrated to popup).
       // Separator rows '||' don't consume a result index — '1/8' is at
@@ -648,7 +658,6 @@ function swing_panels_draw_delay() (
         ) : (
           dly_div = swing_popup_result - 1;
           dly_on = 1;             // picking a time you cannot hear is never meant
-          dly_recalc();
         );
         swing_popup_result = 0;
         mark_dirty_kit();
@@ -660,7 +669,7 @@ function swing_panels_draw_delay() (
         dly_div = dly_div + sign_of(frame_wheel);
         dly_div < 1 ? dly_div = RPT_NUM_DIVS;
         dly_div > RPT_NUM_DIVS ? dly_div = 1;
-        dly_recalc(); mark_dirty_kit();
+        mark_dirty_kit();
       );
 
       // Row 2: FEEDBACK
@@ -682,11 +691,11 @@ function swing_panels_draw_delay() (
         dly_fb = max(0, min(0.95, (mx - _fx_bar_x) / _fx_bar_w * 0.95));
         mark_dirty_kit();
       ) : active_id = -1; );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1201, "Delay feedback (0-95%). 0=single tap, 95%=dense self-feeding repeats. Drag or scroll.");
-      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? swing_tooltip_check(1201, "Delay feedback (0-95%). 0=single tap, 95%=dense self-feeding repeats. Drag or scroll.");
+      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? (
         active_id = 281;
       );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h && frame_wheel != 0 ? (
         dly_fb = max(0, min(0.95, dly_fb + frame_wheel * 0.02)); mark_dirty_kit();
       );
 
@@ -709,11 +718,11 @@ function swing_panels_draw_delay() (
         dly_mix = max(0, min(1, (mx - _fx_bar_x) / _fx_bar_w));
         mark_dirty_kit();
       ) : active_id = -1; );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1202, "Delay wet/dry blend (0=dry, 100%=full delay). Drag or scroll.");
-      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? swing_tooltip_check(1202, "Delay wet/dry blend (0=dry, 100%=full delay). Drag or scroll.");
+      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? (
         active_id = 280;
       );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h && frame_wheel != 0 ? (
         dly_mix = max(0, min(1, dly_mix + frame_wheel * 0.02)); mark_dirty_kit();
       );
 
@@ -728,7 +737,8 @@ function swing_panels_draw_delay() (
       gfx_set(0.25, 0.50, 0.75, 0.7);
       gfx_rect(_fx_bar_x, _fx_ry + 1, _fx_fill, _fx_row_h - 3);
       gfx_set(1, 1, 1, 1);
-      sprintf(#_fxv, "%.0f Hz", dly_hpf_hz);
+      // OFF where the engine is off (rk_delay: dly_hp_on = dly_hpf_hz > 25); it read "20 Hz" while off (sweep LIB140)
+      dly_hpf_hz <= 25 ? strcpy(#_fxv, "OFF") : sprintf(#_fxv, "%.0f Hz", dly_hpf_hz);
       rk_font(1, 9, swing_txt_wt(9, #_fxv));   // a value with a digit: regular (wiki 4.7)
       gfx_measurestr(#_fxv, tw, th);
       gfx_x = _fx_bar_x + (_fx_bar_w - tw) / 2; gfx_y = _fx_ry; gfx_drawstr(#_fxv);
@@ -737,17 +747,17 @@ function swing_panels_draw_delay() (
         _hpf_norm = max(0, min(1, (mx - _fx_bar_x) / _fx_bar_w));
         dly_hpf_hz = exp(log(20) + _hpf_norm * (log(2000) - log(20)));
         dly_hpf_hz = max(20, min(2000, dly_hpf_hz));
-        dly_recalc(); mark_dirty_kit();
+        mark_dirty_kit();
       ) : active_id = -1; );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1203, "High-pass filter on the delay signal (20-2000 Hz, log). Removes low-end mud from repeats.");
-      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? swing_tooltip_check(1203, "High-pass filter on the delay signal (20-2000 Hz, log). Removes low-end mud from repeats.");
+      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? (
         active_id = 284;
       );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h && frame_wheel != 0 ? (
         _hpf_norm = (log(max(20, dly_hpf_hz)) - log(20)) / (log(2000) - log(20));
         _hpf_norm = max(0, min(1, _hpf_norm + frame_wheel * 0.03));
         dly_hpf_hz = max(20, min(2000, exp(log(20) + _hpf_norm * (log(2000) - log(20)))));
-        dly_recalc(); mark_dirty_kit();
+        mark_dirty_kit();
       );
 
       // Row 5: LPF
@@ -770,17 +780,17 @@ function swing_panels_draw_delay() (
         _lpf_norm = max(0, min(1, (mx - _fx_bar_x) / _fx_bar_w));
         dly_lpf_hz = exp(log(1000) + _lpf_norm * (log(20000) - log(1000)));
         dly_lpf_hz = max(1000, min(20000, dly_lpf_hz));
-        dly_recalc(); mark_dirty_kit();
+        mark_dirty_kit();
       ) : active_id = -1; );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1204, "Low-pass filter on the delay signal (1k-20kHz, log). OFF above 19.5kHz. Tames bright repeats.");
-      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? swing_tooltip_check(1204, "Low-pass filter on the delay signal (1k-20kHz, log). OFF above 19.5kHz. Tames bright repeats.");
+      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? (
         active_id = 285;
       );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h && frame_wheel != 0 ? (
         _lpf_norm = (log(max(1000, dly_lpf_hz)) - log(1000)) / (log(20000) - log(1000));
         _lpf_norm = max(0, min(1, _lpf_norm + frame_wheel * 0.03));
         dly_lpf_hz = max(1000, min(20000, exp(log(1000) + _lpf_norm * (log(20000) - log(1000)))));
-        dly_recalc(); mark_dirty_kit();
+        mark_dirty_kit();
       );
 
       // Row 6: PING-PONG (toggle)
@@ -795,8 +805,8 @@ function swing_panels_draw_delay() (
       gfx_measurestr(#_fxv, tw, th);
       gfx_x = _fx_bar_x + (_fx_bar_w - tw) / 2; gfx_y = _fx_ry; gfx_drawstr(#_fxv);
       rk_font(1, 9, 'b');
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1205, "Ping-pong delay mode — alternates repeats between L and R channels for stereo motion.");
-      lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? swing_tooltip_check(1205, "Ping-pong delay mode — alternates repeats between L and R channels for stereo motion.");
+      lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? (
         dly_ping = !dly_ping; mark_dirty_kit();
       );
     );
@@ -831,8 +841,8 @@ function swing_panels_draw_reverb() (
       gfx_measurestr(#_fxv, tw, th);
       gfx_x = _fx_bar_x + (_fx_bar_w - tw) / 2; gfx_y = _fx_ry; gfx_drawstr(#_fxv);
       rk_font(1, 9, 'b');
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1306, "Reverb bus on/off. OFF lets the tail ring out and keeps size, damping and mix exactly where you left them.");
-      lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? swing_tooltip_check(1306, "Reverb bus on/off. OFF lets the tail ring out and keeps size, damping and mix exactly where you left them.");
+      lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? (
         rvb_on = !rvb_on; mark_dirty_kit();
       );
 
@@ -853,14 +863,14 @@ function swing_panels_draw_reverb() (
       rk_font(1, 9, 'b');
       active_id == 282 ? ( LMB ? (
         rvb_size = max(0, min(1, (mx - _fx_bar_x) / _fx_bar_w));
-        rvb_recalc(); mark_dirty_kit();
+        mark_dirty_kit();
       ) : active_id = -1; );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1300, "Reverb room size (0-100%). 0=tiny chamber, 100%=large hall. Drag or scroll.");
-      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? swing_tooltip_check(1300, "Reverb room size (0-100%). 0=tiny chamber, 100%=large hall. Drag or scroll.");
+      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? (
         active_id = 282;
       );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
-        rvb_size = max(0, min(1, rvb_size + frame_wheel * 0.02)); rvb_recalc(); mark_dirty_kit();
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h && frame_wheel != 0 ? (
+        rvb_size = max(0, min(1, rvb_size + frame_wheel * 0.02)); mark_dirty_kit();
       );
 
       // Row 2: DAMP
@@ -880,14 +890,14 @@ function swing_panels_draw_reverb() (
       rk_font(1, 9, 'b');
       active_id == 286 ? ( LMB ? (
         rvb_damp = max(0, min(1, (mx - _fx_bar_x) / _fx_bar_w));
-        rvb_recalc(); mark_dirty_kit();
+        mark_dirty_kit();
       ) : active_id = -1; );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1301, "Reverb high-frequency damping (0-100%). Higher values make the tail darker and shorter at the top end.");
-      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? swing_tooltip_check(1301, "Reverb high-frequency damping (0-100%). Higher values make the tail darker and shorter at the top end.");
+      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? (
         active_id = 286;
       );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
-        rvb_damp = max(0, min(1, rvb_damp + frame_wheel * 0.02)); rvb_recalc(); mark_dirty_kit();
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h && frame_wheel != 0 ? (
+        rvb_damp = max(0, min(1, rvb_damp + frame_wheel * 0.02)); mark_dirty_kit();
       );
 
       // Row 3: PRE (pre-delay 0-250ms)
@@ -907,14 +917,14 @@ function swing_panels_draw_reverb() (
       rk_font(1, 9, 'b');
       active_id == 288 ? ( LMB ? (
         rvb_predelay = max(0, min(250, ((mx - _fx_bar_x) / _fx_bar_w) * 250));
-        rvb_recalc(); mark_dirty_kit();
+        mark_dirty_kit();
       ) : active_id = -1; );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1302, "Pre-delay before reverb tail starts (0-250 ms). Keeps the dry transient clear.");
-      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? swing_tooltip_check(1302, "Pre-delay before reverb tail starts (0-250 ms). Keeps the dry transient clear.");
+      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? (
         active_id = 288;
       );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
-        rvb_predelay = max(0, min(250, rvb_predelay + frame_wheel * 5)); rvb_recalc(); mark_dirty_kit();
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h && frame_wheel != 0 ? (
+        rvb_predelay = max(0, min(250, rvb_predelay + frame_wheel * 5)); mark_dirty_kit();
       );
 
       // Row 4: HPF (0-500 Hz, 0 = off)
@@ -927,7 +937,7 @@ function swing_panels_draw_reverb() (
       gfx_set(0.45, 0.30, 0.75, 0.7);
       gfx_rect(_fx_bar_x, _fx_ry + 1, _fx_fill, _fx_row_h - 3);
       gfx_set(1, 1, 1, 1);
-      rvb_hpf < 1 ? (
+      rvb_hpf < 20 ? (   // the engine's own gate (rk_reverb: on from 20 Hz); "10 Hz" used to show while off (sweep LIB140)
         sprintf(#_fxv, "OFF");
       ) : (
         sprintf(#_fxv, "%.0f Hz", rvb_hpf);
@@ -938,14 +948,14 @@ function swing_panels_draw_reverb() (
       rk_font(1, 9, 'b');
       active_id == 289 ? ( LMB ? (
         rvb_hpf = max(0, min(500, ((mx - _fx_bar_x) / _fx_bar_w) * 500));
-        rvb_recalc(); mark_dirty_kit();
+        mark_dirty_kit();
       ) : active_id = -1; );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1303, "High-pass filter on the reverb send (0-500 Hz). Reduces low-end buildup. OFF below 1 Hz.");
-      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? swing_tooltip_check(1303, "High-pass filter on the reverb send (0-500 Hz). Reduces low-end buildup. OFF below 20 Hz.");
+      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? (
         active_id = 289;
       );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
-        rvb_hpf = max(0, min(500, rvb_hpf + frame_wheel * 10)); rvb_recalc(); mark_dirty_kit();
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h && frame_wheel != 0 ? (
+        rvb_hpf = max(0, min(500, rvb_hpf + frame_wheel * 10)); mark_dirty_kit();
       );
 
       // Row 5: MIX
@@ -967,11 +977,11 @@ function swing_panels_draw_reverb() (
         rvb_mix = max(0, min(1, (mx - _fx_bar_x) / _fx_bar_w));
         mark_dirty_kit();
       ) : active_id = -1; );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1304, "Reverb wet/dry blend (0=dry, 100%=full reverb). Drag or scroll.");
-      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? swing_tooltip_check(1304, "Reverb wet/dry blend (0=dry, 100%=full reverb). Drag or scroll.");
+      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? (
         active_id = 283;
       );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h && frame_wheel != 0 ? (
         rvb_mix = max(0, min(1, rvb_mix + frame_wheel * 0.02)); mark_dirty_kit();
       );
 
@@ -992,14 +1002,14 @@ function swing_panels_draw_reverb() (
       rk_font(1, 9, 'b');
       active_id == 287 ? ( LMB ? (
         rvb_width = max(0, min(1, (mx - _fx_bar_x) / _fx_bar_w));
-        rvb_recalc(); mark_dirty_kit();
+        mark_dirty_kit();
       ) : active_id = -1; );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? swing_tooltip_check(1305, "Stereo width of the reverb tail (0=mono, 100%=full stereo spread).");
-      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h ? (
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? swing_tooltip_check(1305, "Stereo width of the reverb tail (0=mono, 100%=full stereo spread).");
+      active_id == -1 && lmb_down && mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h ? (
         active_id = 287;
       );
-      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my <= _fx_ry + _fx_row_h && frame_wheel != 0 ? (
-        rvb_width = max(0, min(1, rvb_width + frame_wheel * 0.02)); rvb_recalc(); mark_dirty_kit();
+      mx >= _fx_bar_x && mx <= _fx_bar_x + _fx_bar_w && my >= _fx_ry && my < _fx_ry + _fx_row_h && frame_wheel != 0 ? (
+        rvb_width = max(0, min(1, rvb_width + frame_wheel * 0.02)); mark_dirty_kit();
       );
     );
 );
@@ -1099,7 +1109,10 @@ function swing_panels_anvil_knob(ki, cx, cy, kr, km) local(_nv, _r) (
     strcpy(#wface_lbl, "INPUT"); sprintf(#wface_val, "%+.1fdB", cmp_anv_in);
   ) :
   ki == 1 ? (
-    _nv = ssl_knob_interact(km, cx, cy, kr, cmp_anv_ratio, 0, 4, 3, 0);
+    // n_detents 5: a switch of five positions, so a wheel notch steps one position. With 0 a notch
+    // added 2 % of the range (0.08), the snap below took it straight back, and the knob never moved
+    // under the wheel (sweep LIB119). The drag keeps its snap.
+    _nv = ssl_knob_interact(km, cx, cy, kr, cmp_anv_ratio, 0, 4, 3, 5);
     _r = floor(_nv + 0.5);
     _r != cmp_anv_ratio ? ( cmp_anv_ratio = _r; swing_comp_anvil_push(); mark_dirty_kit(); );
     _cpc_dv = cmp_anv_ratio; _cpc_dmin = 0; _cpc_dmax = 4; _cpc_dsym = 0;
@@ -1292,7 +1305,7 @@ local(x, y, w, h, s, land, top, vu_r, vu_cx, vu_cy, vu_bot, vg, sep1, sep2, ky1,
     // Inert while the bus Weld is driving — same reason as the header chips.
     hv && lmb_down && !bcl_live ? ( cmp_voice = (cmp_voice + 1) % 3; mark_dirty_kit(); );
     // LIM chip: the master limiter in / out. Ceiling and release are in the
-    // big view (double-click the card); the card has no room for two knobs.
+    // big view (Shift+click the COMP tab); the card has no room for two knobs.
     bx += bw + floor(6 * s);
     hv = wface_btn_labeled(bx, by, bw, bh, gfx_lim_on, "LIM", "");
     hv ? swing_tooltip_check(1421, "Master limiter in / out -- the brickwall after the compressor. Ceiling and release live in the big view.");
@@ -1410,7 +1423,7 @@ local(x, y, w, h, s, land, top, vu_r, vu_cx, vu_cy, vu_bot, vg, sep1, sep2, ky1,
     sprintf(#wface_val, "%d ms", gfx_lim_rel);
     wface_readout(_lm_cx2, _lm_cy + _lm_kr + floor(2 * s), floor(60 * s), max(9, floor(11 * s)), wface_ac_r, wface_ac_g, wface_ac_b);
     // GR: the frame's deepest dip, right of the knobs
-    _lm_gr = 20 * log10(max(0.001, gfx_lim_gr));
+    _lm_gr = 20 * log10(max(0.001, gfx_lim_gr_seen));   // the frame's dip as @gfx found it, kept before the reset (sweep LIB141)
     sprintf(#wface_val, "%.1f dB", gfx_lim_on && _lm_gr < -0.05 ? _lm_gr : 0);
     wface_readout(x + w - floor(44 * s), _lm_cy - floor(6 * s), floor(56 * s), max(9, floor(12 * s)), 0.82, 0.68, 0.40);
     rk_font(5, max(7, floor(8 * s)), 'b');

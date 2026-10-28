@@ -507,12 +507,29 @@ end
 -- original colour as the contrast allows.
 --
 -- Only falls through to a flat ink when neither direction can get there at all.
+--
+-- Memoised on every input: a pure function, and the Browser asks it per visible
+-- file row per frame (widgets.ink inside the list clipper), where a colour that
+-- fails the ratio walks ~30 blends with two WCAG luminances each (sweep SCR140).
+-- Emptied when it grows past a few thousand entries (a palette's worth of
+-- colours is a few dozen).
+local ink_memo, ink_memo_n = {}, 0
+local ink_on_calc
 function T.ink_on(c, surfaces, minr)
   minr = minr or 4.5
   if type(surfaces) ~= "table" then surfaces = { surfaces } end
   if #surfaces == 0 then return c end
+  local key = tostring(c) .. "|" .. table.concat(surfaces, ",") .. "|" .. tostring(minr)
+  local hit = ink_memo[key]
+  if hit then return hit end
+  local out = ink_on_calc(c, surfaces, minr)
+  if ink_memo_n >= 4096 then ink_memo, ink_memo_n = {}, 0 end
+  ink_memo[key], ink_memo_n = out, ink_memo_n + 1
+  return out
+end
+ink_on_calc = function(c, surfaces, minr)
   if min_contrast(c, surfaces) >= minr then return c end
-  local best, best_ch, best_t
+  local best, best_sat, best_t
   for _, pole in ipairs({ 0x000000FF, 0xFFFFFFFF }) do
     for i = 1, 20 do
       local t = i * 0.05

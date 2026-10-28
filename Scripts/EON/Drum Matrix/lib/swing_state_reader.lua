@@ -227,6 +227,29 @@ function M.SlotPadCount(slot)
   return math.floor(reaper.gmem_read(REG_BASE + slot * REG_STRIDE + REG_OFF_PAD_COUNT) or 0)
 end
 
+-- How many Swings are live right now, by the registry: slots holding an id
+-- with a fresh heartbeat. The stereo lane label uses it to know whether the
+-- ONE shared kit-name band can be trusted (it is whichever kit loaded last).
+function M.LiveSwingCount()
+  if not attached then return 0 end
+  local now, n = reaper.time_precise(), 0
+  for slot = 0, REG_MAX - 1 do
+    local base = REG_BASE + slot * REG_STRIDE
+    if math.floor(reaper.gmem_read(base + REG_OFF_ID) or 0) > 0
+       and (now - (reaper.gmem_read(base + REG_OFF_HB) or 0)) <= REG_TIMEOUT then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+-- The instance's registry heartbeat (time_precise() as its @block last wrote it). swing_sync watches it move to
+-- know a @block has run since the bank cell changed (DM214: the cell is written by @gfx first, the bands follow).
+function M.SlotHeartbeat(slot)
+  if not attached or not slot then return 0 end
+  return reaper.gmem_read(REG_BASE + slot * REG_STRIDE + REG_OFF_HB) or 0
+end
+
 -- track-GUID → slot, cached. Lanes persist the Swing TRACK guid
 -- (EON_DM_Build writes swing_instance_guid = GetTrackGUID); we re-find that
 -- track, read its Swing FX's instance_id and scan the registry. The cache

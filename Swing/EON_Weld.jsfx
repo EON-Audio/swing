@@ -57,7 +57,6 @@ gfx_ext_retina == 0 ? gfx_ext_retina = 1;
 // 0x400 = suppress REAPER's hover tooltip over the MCP embed (7.79+).
 gfx_ext_flags |= 0x100 | 0x400;
 
-M_LN10_20 = 8.68588963806503655302257837833210;  // 20/ln(10)
 ebc_eps = pow(10, -9);
 
 // ── Comp link band ─────────────────────────────────────────────────────────
@@ -104,26 +103,31 @@ ebc_km_e = freemem; freemem += 8 * KS; // embed surface's own drag anchors
 _bc_grmin = 1;   // per-block deepest gain, reset after each publish
 gr_vu.rk_vu_init_gr();                // GR meter: fed linear gain, 1.0 = none
 
-// NaN canonicalization at the WRAPPER (external audit 2026-08-25): the
-// engine heals its own copies in cmp_recalc, but a poisoned ebc_* slider
-// keeps feeding the UI text, the serializer and the link echo — and the
-// link mailbox is an open ingress (a foreign gmem writer's NaN passes the
-// min/max clamps below, which are argument-order-dependent on NaN in
-// EEL2). Heal the sliders THEMSELVES to their defaults, then clamp-copy.
+// NaN canonicalization at the WRAPPER (external audit 2026-08-25): heal a
+// poisoned ebc_* slider to its default. It feeds the UI text, the serializer
+// and the link echo, and the link mailbox is an open ingress (a foreign gmem
+// writer's NaN passes the min/max clamps below: min / max of a NaN return NaN
+// in REAPER, wiki 7.8). The test is abs(x) >= 0 -- true for every number,
+// false for a NaN (wiki §1.8) -- written POSITIVE, `abs(x) >= 0 ? 0 : (heal)`:
+// EEL2's compiler folds `!(a >= b)` into `a < b`, and `NaN < 0` reads 1 in
+// REAPER but 0 in the ysfx harness, so the negated form is not one test on
+// both. Until 2026-10-27 it was x != x, which never fires on a NaN in EEL2:
+// measured NaN != NaN = 0 in REAPER (EON_Probe_NanSem, wiki §1.8) and in the
+// harness (fr_2_test.py, a genuine NaN).
 // Runs atop every ebc_recalc, so @slider, srate change and link consume
 // are all covered.
 function ebc_sanitize() (
-  ebc_thresh    != ebc_thresh    ? ebc_thresh    = -12;
-  ebc_ratio     != ebc_ratio     ? ebc_ratio     = 4;
-  ebc_attack    != ebc_attack    ? ebc_attack    = 10;
-  ebc_release   != ebc_release   ? ebc_release   = 200;
-  ebc_knee      != ebc_knee      ? ebc_knee      = 6;
-  ebc_makeup    != ebc_makeup    ? ebc_makeup    = 0;
-  ebc_mix       != ebc_mix       ? ebc_mix       = 1;
-  ebc_bypass    != ebc_bypass    ? ebc_bypass    = 0;
-  ebc_auto      != ebc_auto      ? ebc_auto      = 0;
-  ebc_dark      != ebc_dark      ? ebc_dark      = 0;
-  ebc_link_slot != ebc_link_slot ? ebc_link_slot = -1;
+  abs(ebc_thresh)     >= 0 ? 0 : ( ebc_thresh    = -12; );
+  abs(ebc_ratio)      >= 0 ? 0 : ( ebc_ratio     = 4; );
+  abs(ebc_attack)     >= 0 ? 0 : ( ebc_attack    = 10; );
+  abs(ebc_release)    >= 0 ? 0 : ( ebc_release   = 200; );
+  abs(ebc_knee)       >= 0 ? 0 : ( ebc_knee      = 6; );
+  abs(ebc_makeup)     >= 0 ? 0 : ( ebc_makeup    = 0; );
+  abs(ebc_mix)        >= 0 ? 0 : ( ebc_mix       = 1; );
+  abs(ebc_bypass)     >= 0 ? 0 : ( ebc_bypass    = 0; );
+  abs(ebc_auto)       >= 0 ? 0 : ( ebc_auto      = 0; );
+  abs(ebc_dark)       >= 0 ? 0 : ( ebc_dark      = 0; );
+  abs(ebc_link_slot)  >= 0 ? 0 : ( ebc_link_slot = -1; );
   // RANGE canonicalization on the sliders THEMSELVES (2026-08-28): the raw
   // ebc_* values feed the value windows, the link echo and serialization,
   // and a finite out-of-range value can really arrive — EON_76 shipped
@@ -258,6 +262,16 @@ function rk_srf_store()
   prev_RMB = mouse_cap & 2;
 );
 
+// The third part, VERBATIM from EON/ReaKit/rk_srf.jsfx-inc (sweep PLG26, 2026-10-26): is the REAL
+// pointer over this surface's canvas? (mouse_x / mouse_y as REAPER handed them to this pass, never the
+// handed-over or wheel-cached mx / my.) Only such a pass may clear or arm 0x200 -- shown in both the
+// TCP and the MCP, the strip NOT under the pointer hovers nothing and used to arm for a click it was
+// not getting. It gates the FLAG only; the input arbitration the note above forbids is not this.
+function rk_srf_in()
+(
+  mouse_x >= 0 && mouse_x < gfx_w && mouse_y >= 0 && mouse_y < gfx_h;
+);
+
 @slider
 // Requests only. Host-side automation, preset recall and TrackFX_SetParam land
 // here on whatever thread the host chose -- they must not derive coefficients
@@ -291,7 +305,7 @@ atomic_get(ebc_rc_rq) > 0.5 ? (
 // Sample-rate change → coefficients (attack/release/GR-smoother are srate-derived).
 srate != ebc_last_srate ? ( ebc_recalc(); ebc_last_srate = srate; );
 
-// ── Smash-return link (slot >= 0 only; the drum-bus instance never binds) ──
+// ── Comp link (slot >= 0 only: smash-return rows 0..15, audio-bus rows 32..47) ──
 // Slot change (including -1 -> slot) restarts seq adoption: the previous
 // row's consumed seq means nothing on the new row, and a stale mailbox
 // there must adopt, never fire (audit 2026-08-24).
@@ -307,16 +321,14 @@ ebc_link_slot >= 0 ? (
   // virgin row's seq is 0 and never fires (same discipline as Swing's strip CMD).
   _bc_seq = gmem[_bc_row + BC_OFF_SEQ];
   // Ingress validation (external audit 2026-08-25): the mailbox is foreign
-  // memory. A NaN seq reads as "different" every block (NaN != x is always
-  // true) and would re-fire this path at block rate — skip the row outright
-  // and let a healthy writer restore it. A finite seq with a NaN payload is
-  // CONSUMED (else the same corrupt command retries forever) but its
-  // payload is discarded — validated BEFORE any slider write or
-  // slider_automate(), so corruption can never reach the automation lane.
-  // (x != x is the suite's NaN test — EEL2's fuzzy compare fails on NaN,
-  // so != fires; auditor-blessed in cmp_recalc, wiki 07 for the cousin
-  // hazard.)
-  _bc_seq != _bc_seq ? 0 :
+  // memory. A NaN seq is skipped outright (as "seen" it would adopt the next
+  // real command without applying it); a finite seq with a NaN payload is
+  // CONSUMED (else the same corrupt command retries forever) but its payload
+  // is discarded before any slider write or slider_automate(). The test is
+  // abs(x) >= 0 in its POSITIVE form (see ebc_sanitize): until 2026-10-27
+  // these were x != x, which never fires on a NaN in EEL2, so a NaN value
+  // reached the slider.
+  abs(_bc_seq) >= 0 ? (
   ebc_cmd_inited ? (
     _bc_seq != ebc_cmd_last && _bc_seq != 0 ? (
       _bc_pr = gmem[_bc_row + BC_OFF_PARAM];
@@ -326,10 +338,12 @@ ebc_link_slot >= 0 ? (
       // we read the payload, the pair may straddle two transactions
       // (worst case: new param with the previous command's value for one
       // block). Skip WITHOUT consuming — next block reads the settled
-      // row and applies it once. A NaN re-read also lands here.
-      gmem[_bc_row + BC_OFF_SEQ] != _bc_seq ? 0 : (
+      // row and applies it once. A NaN re-read is skipped too (the abs test
+      // first: NaN == seq alone reads 1 in REAPER, wiki 07).
+      _bc_rr = gmem[_bc_row + BC_OFF_SEQ];
+      abs(_bc_rr) >= 0 && _bc_rr == _bc_seq ? (
       ebc_cmd_last = _bc_seq;
-      _bc_pr != _bc_pr || _bc_v != _bc_v ? 0 : (
+      abs(_bc_pr) >= 0 && abs(_bc_v) >= 0 ? (
         _bc_p = _bc_pr | 0;
         _bc_p == 1 ? ( ebc_thresh  = max(-40, min(0, _bc_v));    slider_automate(1); ) :
         _bc_p == 2 ? ( ebc_ratio   = max(1, min(20, _bc_v));     slider_automate(2); ) :
@@ -345,6 +359,7 @@ ebc_link_slot >= 0 ? (
       );
     ) : ( ebc_cmd_last = _bc_seq; );
   ) : ( ebc_cmd_last = _bc_seq; ebc_cmd_inited = 1; );
+  );
   // Publish the echo the viewer deck draws from + a heartbeat it health-checks.
   gmem[_bc_row + BC_OFF_ECHO]     = ebc_thresh;
   gmem[_bc_row + BC_OFF_ECHO + 1] = ebc_ratio;
@@ -425,8 +440,9 @@ wface_sc = sc;                                          // the face lib draws at
 // Floating vertical stretch — EXACT-FILL: distribute the remaining window
 // height into the section gaps so the stack always lands just above the brand
 // row (no dead bottom at any window size; element sizes stay on sc). Solved
-// from: brand_row = vu_bot + 244*sc*vg + kr(30sc) + bypass(24sc), where 244 =
-// the design gap budget (39+60+105+28+12). Computed after _vu_bot below.
+// from: H = vu_bot + 329*sc*vg + 112*sc (the fixed-size parts: knob radius,
+// bypass, bottom margin), where 329 = the design gap budget
+// (39+76+150+52+12). Computed after _vu_bot below.
 _vg = 1;
 mx = mouse_x; my = mouse_y;
 LMB = mouse_cap & 1;
@@ -439,18 +455,22 @@ RMB = mouse_cap & 2;
 is_embedded = micro;
 rk_srf_load();
 lmb_down = LMB && !prev_LMB;
-// Face sheet open (rk_vu_picker, called last): widgets drawn before it must
-// not see this click. Stash the press edge; the picker call restores it.
-// ⚠️Stashed ONLY while the sheet is open: closed, the picker takes what the
-// widgets leave, so a click the THEME panel swallowed cannot also open it
-// (GainKit's FOLLOW chip did, 2026-09-28; wiki 4.5).
-_ebc_pk_lmb = 0; !micro && gr_vu.pk_open ? ( _ebc_pk_lmb = lmb_down; lmb_down = 0; );
 rmb_down = RMB && !prev_RMB;
 CTRL  = _srf_cap & 4;
 SHIFT = _srf_cap & 8;
 dt = min(time_precise() - ebc_lt, 0.05); ebc_lt = time_precise();
 hv_speed = 11;
 frame_wheel = mouse_wheel / 120;
+// Face sheet open (rk_vu_picker, called last): widgets drawn before it must
+// not see this click. Stash the press edge; the picker call restores it.
+// ⚠️Stashed ONLY while the sheet is open: closed, the picker takes what the
+// widgets leave, so a click the THEME panel swallowed cannot also open it
+// (GainKit's FOLLOW chip did, 2026-09-28; wiki 4.5).
+// The right button and the wheel go with it (sweep PLG10, Anvil's finding, the same three lines
+// here): ssl_knob_interact resets on hover + rmb_down and turns on hover + frame_wheel, so under the
+// sheet a knob nobody could see turned or snapped. The picker uses neither: dropped, not stashed --
+// mouse_wheel too, or the notches would pile up for the first pass after the sheet closes.
+_ebc_pk_lmb = 0; !micro && gr_vu.pk_open ? ( _ebc_pk_lmb = lmb_down; lmb_down = 0; rmb_down = 0; frame_wheel = 0; mouse_wheel = 0; );
 // Did a notch arrive THIS pass? Read here, not at the tail: a hovered knob now
 // zeroes frame_wheel when it applies the notch (knobs_kbsg, 2026-10-14), and the
 // consume-once block at the tail used to test frame_wheel itself -- consumed
@@ -473,7 +493,9 @@ tau = 2 * $pi;
 // the latch; the re-arm stays micro-gated so the strip still passes dead-space
 // clicks to the track panel. (EEL2 has no unary ~, so clear via |= then -=.)
 // Not in an idle pass (& 2): idle leaves 0x200 as the last visible pass set it (house rule 4).
-!(gfx_ext_flags & 2) ? gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
+// ...and, embedded, only by the strip whose canvas holds the REAL pointer (rk_srf_in; PLG26): the
+// window pass still clears every time, so the latch above cannot re-form.
+!(gfx_ext_flags & 2) && (!micro || rk_srf_in()) ? gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
 // Embedded wheel events arrive with a STALE/zero mouse position, so every
 // hover test misses and the wheel does nothing. Remember the cursor on normal
 // frames, reuse it on wheel frames (Drum Strip's user-verified fix).
@@ -516,9 +538,8 @@ show_chrome ? (
 
 // ── Geometry ─────────────────────────────────────────────────────────────────
 // Floating = fixed rack stack (VU · GR window · sep · 2 knob rows · sep ·
-// bypass). Embedded = BOTTOM-UP budget: the knob grid anchors to the floor,
-// labels/bypass appear as height allows, and the VU takes whatever remains up
-// top (hidden when there is no honest room for a needle).
+// bypass). Embedded = VU FIRST: the needle always shows and is sized first,
+// then the knob grid fills what remains under it (see below).
 top = show_chrome ? floor(32 * sc) : floor(2 * sc);
 _vu_cx = W * 0.5;
 _grdb = ebc_gr_db();
@@ -526,8 +547,8 @@ _kp = W / 3;
 micro ? (
   // VU FIRST — the needle is the unit's face and always shows; the GR window
   // rides under it when there's slack; the knobs adapt to what remains:
-  // a 3x2 grid when tall, a single row of six minis when short (hover shows
-  // that knob's value — six always-on values collide at this pitch).
+  // a 3x2 grid, or 2x3 when the strip is narrow, with values only when the
+  // cells are tall enough and the bypass row only when H allows.
   _vu_show = 1;
   _vu_r  = max(24, floor(min(W / 2.8, H * 0.22)));
   _vu_cy = top + floor(2 * ret) + _vu_r * 1.4;
@@ -547,7 +568,6 @@ micro ? (
   _lb_show = 1;
   ebc_sep1 = -1; ebc_sep2 = -1;
 ) : (
-  ebc_krow = 0;
   _vu_show = 1; _gr_show = 1; _lb_show = 1; _bp_show = 1;
   _vu_r  = floor(96 * sc);
   _vu_cy = top + floor(8 * sc) + _vu_r * 1.4;
@@ -580,8 +600,9 @@ ebc_sep1 >= 0 ? wface_sep(0, ebc_sep1, W);
 // lean on slider_automate for this: REAPER never fires @slider for plugin-
 // initiated slider_automate, so without the flag the engine copies go stale
 // while the face displays the new values (root cause, proven 2026-08-27).
-// Floating: LED value window ABOVE each knob (clear of the knob arc), engraved
-// label below. Embedded: plain bright value text, short labels when tall.
+// Floating: engraved label ABOVE each knob, LED value window BELOW it (clear of
+// the knob arc). Embedded: plain bright value text below (hover-only when the
+// cell is squeezed), short labels above.
 ebc_hov = 0;
 
 _ki = 0;
@@ -610,7 +631,10 @@ loop(6,
     _nv != _lv ? ( ebc_ratio = exp(_nv); slider_automate(2); atomic_set(ebc_rc_rq, 1); );
     _dv = _nv; _dmin = 0; _dmax = 2.99573227355; _dsym = 0;
     strcpy(#wface_lbl, "RATIO");
-    ebc_ratio >= 20 ? strcpy(#wface_val, "LIM") : sprintf(#wface_val, "%.1f:1", ebc_ratio);
+    // 19.995, not 20 (sweep PLG27): the knob's top is 2.99573227355 in ln space, 4e-12 under ln 20,
+    // so exp() gives 19.99999999992 and EEL2's >= is exact -- turned fully up the face read
+    // "20.0:1" and never "LIM". Anything that prints 20.0 is the limiter position.
+    ebc_ratio >= 19.995 ? strcpy(#wface_val, "LIM") : sprintf(#wface_val, "%.1f:1", ebc_ratio);
   ) :
   _ki == 2 ? (
     _lv = log(max(0.1, ebc_attack));
@@ -745,7 +769,8 @@ show_chrome ? (
 );
 
 // ── End of frame: embed click-through re-arm + input latches ────────────────
-micro && !ebc_hov ? gfx_ext_flags |= 0x200;
+// Only the strip under the REAL pointer arms (rk_srf_in; PLG26).
+micro && rk_srf_in() && !ebc_hov ? gfx_ext_flags |= 0x200;
 // House rule 3 (wiki 4.5): window up -> arm 0x200 always. The flag only routes
 // clicks on the EMBED, which runs no @gfx pass while a window is open, so this
 // is the only pass that can set it; a click on the strip then closes the window.

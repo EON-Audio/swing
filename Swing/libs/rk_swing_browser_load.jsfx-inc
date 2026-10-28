@@ -28,14 +28,10 @@
 //
 // Undo coverage: the v2 internal undo (undo_begin_pad / undo_cap_end below)
 // captures audio + meta + names for every drop, so Swing's own UNDO restores
-// the whole pad. No REAPER undo point is minted for a drop -- the CMD 46 host
-// block this comment once described was retired -- so Ctrl+Z right after a
-// drop changes nothing (REAPER restores the previous point's snapshot, and
-// an FX whose chunk did not differ between snapshots is not reloaded). When
-// REAPER does reload this FX's chunk (undoing an older point that captured a
-// Swing change), @serialize restores names AND audio together; the old
-// "new sample with the old path label" limitation no longer exists.
-// Measured 2026-09-08: .dev_tests/EON_Probe_Undo_probe.lua, verdicts C + A2.
+// the whole pad. Since 2026-10-27 a landed load is also ONE REAPER undo point,
+// "Swing: sample on pad N" (counted here, asked for by the next @gfx pass:
+// swing_rup_tick), so Ctrl+Z right after a drop puts the old sample back --
+// @serialize restores names AND audio together from REAPER's stored copy.
 
 @init
 // Sliced loads (2026-09-07): the file read is pumped one bounded slice per
@@ -111,6 +107,10 @@ local(_ci, _cn, _cnl, _bt)
         (pad_has_audio(_bp_pad) ? 1 : 0);
     );
     mark_dirty_pad(_bp_pad);
+    // A sample landed on the pad from a browser (or a pad fill): counted here, the words first and the count LAST;
+    // the next @gfx pass (idle ones too) turns it into its REAPER undo point once the load settles (swing_rup_tick,
+    // 2026-10-27). Never part of a kit load (kit_busy defers 63).
+    rup_ld_pad = _bp_pad; rup_ld_lay = -1; rup_ld_n += 1;
     col_dirty = 1;  // Re-derive auto-color hue from new filename (CMD 63)
     // Immediate auto-color derive + gmem write so browser pads update on
     // the same @gfx cycle. Without this, the browser only sees the new
@@ -158,10 +158,10 @@ local(_bp_pad, _bp_len, _ci, _bp_need)
   // (@block + @gfx stall-fallback) check !_bl_inflight, so a handler that is
   // mid-disk-load on one thread can't be re-entered from the other.
   _bl_inflight = 1;
-  // Multi-instance gate: only respond if browser targets this instance
-  // (or no specific target is set). Without this, a second Swing instance
-  // would also load the sample, hijacking the user's intended target.
-  _is_browser_target() ? (
+  // A job in flight resumes BEFORE the target gate: the browser re-targeting or
+  // closing mid-load (closing writes INSTANCE = 0) used to strand it -- the pad
+  // part-loaded, CMD 63 never consumed, the shared bus blocked for every
+  // instance until a watchdog swept it (LIB24). Only a NEW job needs the gate.
   _bl_job_pending && _bl_job_cmd == 63 ? (
     // Resume: pump the load begun on an earlier block; complete when it lands.
     swing_ldr_step_pad(_bl_job_pad, #_browser_path) ? (
@@ -169,6 +169,10 @@ local(_bp_pad, _bp_len, _ci, _bp_need)
       swing_browser_load_pad_done(_bl_job_pad);
     );
   ) :
+  // Multi-instance gate: only respond if browser targets this instance
+  // (no target set = nobody responds). Without this, a second Swing instance
+  // would also load the sample, hijacking the user's intended target.
+  _is_browser_target() ? (
   // A level-204 Kit Bridge consumes CMD 63 itself and streams the decoded file
   // (EON_PADPCM, rk_swing_padpcm.jsfx-inc): the job begins on the stream's FIRST
   // chunk and resumes above. _bridge_state (decided once per block in
@@ -242,8 +246,8 @@ local(_bp_pad, _bp_len, _ci, _bp_need)
     gmem[GS_BROWSE_NAME_ADOPT] = 0;
     gmem[KIT_GMEM_CMD] = 0;
   );
-  );  // resume / start
-  );  // _is_browser_target gate
+  );  // start
+  );  // resume / _is_browser_target gate
   _bl_inflight = 0;
 );
 // ─── CMD 64 — per-layer sample load: completion half ────────────────────
@@ -267,6 +271,7 @@ local(_ci, _cn, _cnl, _bt)
         (pad_has_audio(_bp_pad) ? 1 : 0);
     );
     mark_dirty_pad(_bp_pad);
+    rup_ld_pad = _bp_pad; rup_ld_lay = _bp_layer; rup_ld_n += 1;   // a layer landed: its REAPER undo point (as CMD 63's)
     col_dirty = 1;  // Re-derive auto-color hue from new filename (CMD 64)
     // Immediate auto-color derive + gmem write (same rationale as CMD 63)
     swing_pad_bank(_bp_pad) == bank_cur ? (   // col_auto_hue[] and the META band are the bank on screen's (step 5c)
@@ -301,8 +306,7 @@ function swing_browser_load_layer()
 local(_bp_pad, _bp_layer, _bp_len, _ci)
 (
   _bl_inflight = 1;   // double-dispatch latch (see swing_browser_load_pad)
-  // Multi-instance gate (see swing_browser_load_pad)
-  _is_browser_target() ? (
+  // A job in flight resumes before the target gate (see swing_browser_load_pad, LIB24)
   _bl_job_pending && _bl_job_cmd == 64 ? (
     // Resume: pump the load begun on an earlier block; complete when it lands.
     swing_ldr_step_layer(_bl_job_pad, _bl_job_layer, #_browser_path) ? (
@@ -310,6 +314,8 @@ local(_bp_pad, _bp_layer, _bp_len, _ci)
       swing_browser_load_layer_done(_bl_job_pad, _bl_job_layer);
     );
   ) :
+  // Multi-instance gate (see swing_browser_load_pad)
+  _is_browser_target() ? (
   // A level-204 Kit Bridge streams CMD 64 too; the same three-way split as
   // swing_browser_load_pad (refuse an old bridge, read the file when there is none).
   _bridge_state == 2 ? ( 0; ) :
@@ -342,7 +348,7 @@ local(_bp_pad, _bp_layer, _bp_len, _ci)
     // so the bridge isn't stuck waiting on an in-flight command.
     gmem[KIT_GMEM_CMD] = 0;
   );
-  );  // resume / start
-  );  // _is_browser_target gate
+  );  // start
+  );  // resume / _is_browser_target gate
   _bl_inflight = 0;
 );

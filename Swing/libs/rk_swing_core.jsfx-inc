@@ -4,21 +4,16 @@
 
 @init
 
-// ─── Undo dirty markers ──────────────────────────────────────────────────
-// REAPER captures the FX chunk for undo only when a slider VALUE actually
-// changes, and coalesces rapid changes to the SAME slider into one undo
-// entry. Tukan/Saike give every parameter its own slider so cross-action
-// changes never coalesce.
-//
-// Swing keeps per-pad state in freemem arrays (not sliders), so we use
-// counter sliders as proxies:
-//   slider3        → global / master changes (mark_dirty())
-//   slider6..21    → per-pad changes (mark_dirty_pad(idx))
-//
-// "Mute pad 1, solo pad 3, raise pad 12 vol" → slider6, slider8, slider17
-// → 3 separate undo entries even when fast (different sliders never
-// coalesce). Within a single pad, fast changes still coalesce (a knob
-// drag = 1 entry, not 60), which is the desired DAW UX.
+// ─── Dirty markers ───────────────────────────────────────────────────────
+// Swing keeps per-pad state in freemem arrays (not sliders). These used to
+// bump hidden counter sliders (slider3 global, slider6..21 per pad) so REAPER
+// would capture an undo point per pad. Since Phase 1B an edit instead raises
+// gmem GS_PROJ_DIRTY, which the bridge turns into a project-dirty mark
+// (prompt-to-save) with NO REAPER undo point; per-pad edits also light the
+// kit's unsaved dot and queue Swing's own param undo (mark_dirty_pad). The
+// counter sliders stay declared; edits no longer move them. Since 2026-10-27
+// the REAPER undo point is asked for once, at the END of the gesture
+// (swing_rup_*, rk_drumkit_dsp), never by a mark.
 //
 // Defined at the top of rk_swing_core.jsfx-inc so it's available to all
 // libs imported after this one (which is everything else under libs/).
@@ -28,7 +23,16 @@ function mark_dirty() (
   // can't restore a stale Swing chunk). Save still works via @serialize. The
   // hidden counter sliders are left untouched (no @slider logic depends on
   // them — recalc is done by the per-pad callers directly).
+  // 2026-10-27: a plain mark_dirty is a view or preference change (the bank on screen, a panel, a console option, the
+  // sequencer's own settings) and asks for no REAPER undo point. An edit to what Swing PLAYS asks for one at its
+  // gesture's end: mark_dirty_kit, mark_dirty_play, mark_dirty_pad (swing_rup_*, rk_drumkit_dsp).
   gmem[GS_PROJ_DIRTY] = 1;
+);
+// A setting that changes how Swing plays but is not a kit key (the master DRIVE type, the repeat's grid and feel):
+// mark_dirty, and counted for its gesture's REAPER undo point like a kit edit (2026-10-27).
+function mark_dirty_play() (
+  mark_dirty();
+  !kit_busy && !_srz_udo_hold ? ( rup_kn += 1; );
 );
 
 // Pad Banks step 4a.1 (user, 2026-09-23): Tuned and Stretch are bank A's for now. The EON Extension's per-instance
@@ -109,11 +113,13 @@ function swing_spot_waiting(_sw_p) ( sp_row[_sw_p] < 0 && swing_spot_wants(_sw_p
 // the pad the LCD edits. Every sel_pad assignment that comes from a note, a companion or a landed pad goes
 // through here; a tile click already sits in bank_cur. A bank change is a view change: mark_dirty() so the
 // project registers it (bank_cur is serialized), never an undo boundary (spec 12).
+// 2026-10-27 (the owner: "a bank switch if it changes saved state" is an undo point): bank_cur is saved, so a switch
+// asks for a REAPER undo point -- a weak one, which a stronger request waiting with it names instead.
 function swing_select_pad(ap) local(_b) (
   sel_pad = ap;
   _b = (ap / NUM_PADS) | 0;
   _b != bank_cur ? (
-    bank_cur = _b; mark_dirty();
+    bank_cur = _b; mark_dirty(); swing_rup_want(RUP_K_BANK, _b, -1, -1, 0);
     _reg_my_slot >= 0 ? gmem[GS_INST_BANK_CUR + _reg_my_slot] = bank_cur;   // step 5a: at once (the @block publish heals)
   );
 );
@@ -136,6 +142,9 @@ function mark_dirty_kit() (
   // is legitimate but still worth a look: it means a rack was adopted.
   (!kit_busy && kit_dirty == 0) ? ( _kd_src = 1000 + _kd_site; _kd_t = time_precise(); );
   !kit_busy ? kit_dirty = 1;
+  // A gesture's kit edit, counted for its REAPER undo point (swing_rup_gend, 2026-10-27). A tagged site is never a
+  // gesture (the adopts, a clear, a swap, New Kit, the multi-out prep: each has its own point or none).
+  !kit_busy && !_srz_udo_hold && _kd_site == 0 ? ( rup_kn += 1; );
   _kd_site = 0;   // tag is consume-once; untagged (gesture) sites read 0
 );
 
@@ -161,9 +170,10 @@ function swing_map_set(t, n) local(ap) (
   swing_map_unlocked(ap) ? ( p_note[ap] = min(127, n + 16 * _mp_bank); p_note_lock[ap] = 2; );
 );
 
-// Per-pad dirty marker. pad_idx is 0-based; routes to slider(6 + pad_idx)
-// — slider6 = pad 1, slider21 = pad 16. Out-of-range falls through to
-// the global slider3 so accidental mis-callers don't crash.
+// Per-pad dirty marker. pad_idx is an absolute slot, 0..NUM_SLOTS-1: raises
+// the project-dirty signal, the kit's unsaved dot and the pad's param-undo
+// pend (below). Out of range falls through to mark_dirty() so accidental
+// mis-callers don't crash.
 function mark_dirty_pad(pad_idx)
 local(_sn)
 (
@@ -224,35 +234,8 @@ function get_idname_slot(idx) (
 // swap and UNDO each layered pad kept the other's layer files, and the next
 // reopen or kit save loaded the wrong samples. One copy now, so they cannot
 // drift. All three callers run in @gfx (#_swap_nm is this thread's scratch).
-function swing_pad_swap_strings(a, b) local(li, sa, sb) (
-  strcpy(#_swap_nm, get_cname_slot(a)); strcpy(get_cname_slot(a), get_cname_slot(b)); strcpy(get_cname_slot(b), #_swap_nm);
-  strcpy(#_swap_nm, get_name_slot(a));  strcpy(get_name_slot(a),  get_name_slot(b));  strcpy(get_name_slot(b),  #_swap_nm);
-  strcpy(#_swap_nm, get_path_slot(a));  strcpy(get_path_slot(a),  get_path_slot(b));  strcpy(get_path_slot(b),  #_swap_nm);
-  li = 0; loop(MAX_LAYERS,
-    sa = LPATH_STR_BASE + a * MAX_LAYERS + li;
-    sb = LPATH_STR_BASE + b * MAX_LAYERS + li;
-    strcpy(#_swap_nm, sa); strcpy(sa, sb); strcpy(sb, #_swap_nm);
-    li += 1;
-  );
-);
-
-// ─── Shared pad swap (audio + metadata + name/path + layer paths) ─────────
-// Bridge-aware: when the bridge is idle, posts a named "Swap pads" undo (the
-// swap then runs in swing_ui_process_undo when the bridge acks, _undo_pending
-// == 5); otherwise swaps inline and relies on mark_dirty's chunk-diff undo.
-// Shared by the pad grid drag-swap and the Mapping view's opt-in swap.
-function swing_do_pad_swap(a, b) (
-  a >= 0 && b >= 0 && a != b ? (
-    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 ? (
-      gmem[KIT_GMEM_UNDO_DESC] = 5; gmem[KIT_GMEM_CMD] = 46;
-      _undo_pending = 5; _undo_pad = a; _undo_pad2 = b;
-    ) : (
-      swap_pads(a, b);
-      swing_pad_swap_strings(a, b);
-      _kd_site = 3; mark_dirty_kit();
-    );
-  );
-);
+// (swing_pad_swap_strings and swing_do_pad_swap live below swing_pad_fail_recompute, which the swap's bookkeeping
+// calls -- EEL2 binds a call at definition time.)
 
 // ─── Command-undo: per-pad name/path backup ──────────────────────────────
 // The structural undo engine (rk_drumkit_dsp, imported EARLIER) can't call
@@ -268,7 +251,7 @@ function swing_do_pad_swap(a, b) (
 //   up before — a structural undo left stale layer paths behind, which then
 //   re-serialized via the ser_ver>=11 block. The two forward swaps swapped
 //   them; the header UNDO's swap-back did not until 2026-10-23, H15 -- every
-//   swap site now goes through swing_pad_swap_strings above.)
+//   swap site now goes through swing_pad_swap_strings, below swing_pad_fail_recompute.)
 function undo_pad_names_save(pad) local(h, i, n, d, li) (
   h = get_cname_slot(pad); d = udo_s2_name;
   n = min(strlen(h), 32);  i = 0; loop(n, d[i] = str_getchar(h, i); i += 1;); d[n] = 0;
@@ -375,7 +358,7 @@ function swing_preserve_names_restore(base) local(p, h, i, c, d) (
 // this pad's names too. Call this instead of udo_struct_begin_pad from core.
 function undo_begin_pad(pad) (
   udo_struct_begin_pad(pad);
-  (_udo_cap_depth == 1 && udo_s2_type == 1) ? undo_pad_names_save(pad);
+  (_udo_cap_depth == 1 && udo_s2_type == 1 && !_srz_udo_hold) ? undo_pad_names_save(pad);   // no capture in a read (udo_struct_begin_pad)
 );
 
 // (Kit-level undo needs no name backup here: it reloads the temp .swing the
@@ -408,7 +391,7 @@ function swing_slot_wipe(ap) local(_li) (
 //
 // Browser publishes the active instance ID into KIT_GMEM_INSTANCE on
 // session start, on instance picker selection, and clears it on close.
-// 0 means "no specific instance / single-instance mode" — any JSFX may act.
+// 0 means "no instance picked" — no JSFX acts (see below).
 function _is_browser_target() (
   // Strict: only true when the user has explicitly picked this instance.
   // The earlier permissive form (also true on INSTANCE==0) caused every
@@ -431,6 +414,34 @@ function _is_browser_target() (
 // gets it on the next block after LOCK clears.
 function swing_shared_bands_free() (
   gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id;
+);
+
+// The save / rename producers' bus test (bridge level 323, 2026-10-27, RR-1): CMD 0 AND no save in flight. Between
+// two bank dumps a Swing older than 3.0.20 leaves the bus at CMD 0 (a 3.0.20 one keeps the 93 there), and a save or
+// kit rename posted into that gap was overwritten by the saver's next CMD 1 -- or, if the bridge took it first, its
+// prompt's park was. A 323 bridge names the saver in GS_KIT_SAVE_OWNER for the whole save and frees it when a save
+// stops moving; below that level the test is CMD 0 alone, as before. Here, not in rk_swing_ui_state: the LCD's
+// kit-name click (rk_swing_lcd) is imported before it.
+function swing_save_bus_free() (
+  gmem[KIT_GMEM_CMD] == 0 && (gmem[GS_BRIDGE_LEVEL] < BRIDGE_LEVEL_SAVE_TXN || gmem[GS_KIT_SAVE_OWNER] == 0);
+);
+
+// This Swing's kit name into the bus's NAME cells (KIT_GMEM_NAMELEN + KIT_GMEM_NAME, 32 chars, zero tail), as the
+// payload of a CMD 12 or a rename's CMD 10 (RR-1, 2026-10-27). The bridge's SAVE (do_save_in_place) and its name form
+// read those cells as "the kit on screen", but they hold the LAST kit operation's name from ANY Swing (a load's, a
+// save's dump) and nothing after a REAPER restart: with two Swings, SAVE could write or offer the other one's name.
+// Written in the same evaluation as the command (payload first), so no other writer comes between.
+function swing_kitname_publish() local(_kn_l, _kn_i) (
+  _kn_l = min(strlen(#kit_name), 32);
+  gmem[KIT_GMEM_NAMELEN] = _kn_l;
+  _kn_i = 0; loop(32, gmem[KIT_GMEM_NAME + _kn_i] = _kn_i < _kn_l ? str_getchar(#kit_name, _kn_i) : 0; _kn_i += 1; );
+);
+// The kit-name click is a RENAME (the owner, 2026-10-27: SAVE shows the current kit, SAVE AS "My Kit"): from bridge
+// level 323 it hands the bridge its name and raises GS_KIT_SAVE_PREFILL before its CMD 10, and the name form starts
+// at the current name; every Save As route leaves the cell 0. Below 323 nothing is written (an older bridge never
+// reads or clears the cell, so a 1 left there would prefill the next Save As of a newer one).
+function swing_rename_prefill() (
+  gmem[GS_BRIDGE_LEVEL] >= BRIDGE_LEVEL_SAVE_TXN ? ( swing_kitname_publish(); gmem[GS_KIT_SAVE_PREFILL] = 1; );
 );
 
 // ─── Kit-import format detection ─────────────────────────────────────────
@@ -605,11 +616,48 @@ function swing_pad_fail_recompute(pad) local(_m, _bad, _anylp, _anyl, _li, _lx, 
   ) : (
     strlen(get_path_slot(pad)) > 0 && s_len[pad] <= 0 ? _bad = 1;
   );
-  _m = 2 ^ pad;
   _b = (pad / NUM_PADS) | 0; _m = 2 ^ (pad - _b * NUM_PADS);   // the bank's own mask, bank-relative bit (step 3b)
   _cur = swing_fail_mask(_b);
   swing_fail_mask_set(_b, _bad ? (_cur | _m) : ((_cur | _m) - _m));
   paths_gen += 1;
+);
+
+// The string half of a pad swap: cname, name, path and the layer paths. Every swap site runs swap_pads (the audio
+// and the tables, rk_drumkit_dsp) and then this, so the fail bits and paths_gen are recomputed HERE for both pads:
+// until 2026-10-26 no swap site did, the "samples missing" bit stayed on the old slot after the audio and the
+// paths had moved, and the bridge's per-slot path cache stayed keyed to the old generation (LIB329).
+function swing_pad_swap_strings(a, b) local(li, sa, sb) (
+  strcpy(#_swap_nm, get_cname_slot(a)); strcpy(get_cname_slot(a), get_cname_slot(b)); strcpy(get_cname_slot(b), #_swap_nm);
+  strcpy(#_swap_nm, get_name_slot(a));  strcpy(get_name_slot(a),  get_name_slot(b));  strcpy(get_name_slot(b),  #_swap_nm);
+  strcpy(#_swap_nm, get_path_slot(a));  strcpy(get_path_slot(a),  get_path_slot(b));  strcpy(get_path_slot(b),  #_swap_nm);
+  li = 0; loop(MAX_LAYERS,
+    sa = LPATH_STR_BASE + a * MAX_LAYERS + li;
+    sb = LPATH_STR_BASE + b * MAX_LAYERS + li;
+    strcpy(#_swap_nm, sa); strcpy(sa, sb); strcpy(sb, #_swap_nm);
+    li += 1;
+  );
+  swing_pad_fail_recompute(a);
+  swing_pad_fail_recompute(b);
+);
+
+// ─── Shared pad swap (audio + metadata + name/path + layer paths) ─────────
+// Bridge-aware: when the bridge is idle, posts the structural-op handshake
+// (CMD 46, UNDO_DESC 5; the swap then runs in swing_ui_process_undo when the
+// bridge acks, _undo_pending == 5); otherwise swaps inline. Either way the
+// undo is Swing's own structural swap entry (udo_struct_begin_swap) -- since
+// Phase 1B no REAPER undo point is made.
+// Shared by the pad grid drag-swap and the Mapping view's opt-in swap.
+function swing_do_pad_swap(a, b) (
+  a >= 0 && b >= 0 && a != b ? (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 ? (
+      gmem[KIT_GMEM_UNDO_DESC] = 5; gmem[KIT_GMEM_CMD] = 46;
+      _undo_pending = 5; _undo_pad = a; _undo_pad2 = b;
+    ) : (
+      swap_pads(a, b);
+      swing_pad_swap_strings(a, b);
+      _kd_site = 3; mark_dirty_kit();
+    );
+  );
 );
 
 // ─── Clear a single layer slot ──────────────────────────────────────────
@@ -682,13 +730,15 @@ function clear_pad(i) local(li) (
   fx_sat_drv[i] = 0; fx_drv_mode[i] = 0;
   fx_bc_rate[i] = 0; fx_bc_bits[i] = 16;
   fx_snd_dly[i] = 0; fx_snd_rvb[i] = 0; fx_snd_smash[i] = 0;
-  s_skip[i] = 0; p_reverse[i] = 0; p_swapLR[i] = 0; p_stereo[i] = 0; p_oneshot[i] = -1; p_choke[i] = 0;
+  s_skip[i] = 0; p_reverse[i] = 0; p_swapLR[i] = 0; p_stereo[i] = 0; wv_monoch[i] = 0; p_oneshot[i] = -1; p_choke[i] = 0;
   p_rng_lo[i] = 0; p_rng_hi[i] = 0;  // clear chromatic range → single-note pad
   p_gain[i] = 1.0; p_pan[i] = 0; p_tune[i] = 0; p_sample_offset[i] = 0;
   p_mute[i] = 0; p_solo[i] = 0;
-  p_color[i] = i / 16.0;  // default: evenly-spaced hue, matches @init in
-                          // Swing_ReaKit.jsfx:423. Was 0 (= hue red), which
-                          // made every pad/mixer strip red after Clear Kit.
+  p_color[i] = (i % NUM_PADS) / 16.0;  // default: the TILE's evenly-spaced hue, the same sixteen in every bank, as
+                          // @init (rk_swing_defaults) and Reset Colors have it. Was i / 16 with the absolute slot:
+                          // every bank B..D pad a load cleared got a hue of 1.0..3.94, which hsl_to_rgb paints
+                          // in its last sector (pink) once auto colour is off, and the kit file kept it (LIB330).
+                          // Before that it was 0 (= hue red), which made every pad/mixer strip red after Clear Kit.
   // NOTE: ps_* (SYN slot) is deliberately NOT reset here. clear_pad is called
   // by LOAD paths too (CMD-63 swing_browser_load_pad, kit-import empty-pad
   // clears in rk_swing_ui_state) and the user-ratified clear-semantics table
@@ -698,6 +748,35 @@ function clear_pad(i) local(li) (
   swing_pad_fail_recompute(i);  // P4 step 3: paths wiped → fail bit clears (intentional removal)
   _kd_site = 2; mark_dirty_kit();
   undo_cap_end();
+);
+
+// ─── Clear Layer as the user means it ──────────────────────────────────
+// A plain pad (p_layer_cnt 0, which every single-file load makes since 2026-09-08) has no layers: its layer 0 IS
+// the sample, so "Clear Layer" there removes the sample, with its name, path and category label, and keeps the
+// pad's FX and mix (Clear Pad's job). A layered pad clears the layer. ONE copy for the editor's direct path and
+// the bridge's acked path (rk_swing_ui_state, _undo_pending 3): the acked path ran clear_layer alone, which only
+// zeroed the already-empty l_len[pad * 4], so with the bridge alive -- the normal state -- the sample stayed and
+// an undo entry "Clear Layer" was recorded for nothing (LIB314). The plain clear here does what the editor's
+// fallback did, plus clear_layer's bookkeeping: the undo bracket, the freed region, the bake anchor, the source
+// generation, the fail bit.
+function clear_layer_eff(pad_idx, layer_idx) local(_l0) (
+  p_layer_cnt[pad_idx] > 0 ? clear_layer(pad_idx, layer_idx) :
+  layer_idx == 0 ? (
+    undo_begin_pad(pad_idx);
+    _l0 = pad_idx * MAX_LAYERS;
+    s_len[pad_idx] = 0; s_start[pad_idx] = 0; s_end[pad_idx] = 1.0;
+    swing_pad_bank(pad_idx) == bank_cur ? gmem[KIT_GMEM_AUDIOLEN + swing_pad_tile(pad_idx)] = 0;
+    s_sr[pad_idx] = 0; s_norm[pad_idx] = 0; s_norm_gain[pad_idx] = 1.0;
+    s_dirty[pad_idx] = 1;
+    strcpy(get_name_slot(pad_idx), "");
+    strcpy(get_path_slot(pad_idx), "");
+    strcpy(get_cname_slot(pad_idx), "");
+    sp_baked_tune[_l0] = 0; ov_cap[_l0] = 0;
+    sp_src_gen[pad_idx] += 1;
+    !_clr_skip_audio ? swing_region_free(pad_idx, 0);
+    swing_pad_fail_recompute(pad_idx);
+    undo_cap_end();
+  );
 );
 
 // Explicit user "Clear Pad" / "Clear Kit" / "New Kit" gestures say "ALL layers
@@ -718,7 +797,6 @@ function clear_pad_syn(i) local() (
 // says what a next load can actually have, not a sum of content lengths. Every pad still
 // caps at SLOT_SIZE on its own; the per-pad edge is the trim mark below. When banks land the
 // kit bar narrows to the active bank and the strip carries the instrument's.
-function swing_mem_used_cells() ( alloc_live; );
 function swing_mem_free_secs() ( swing_alloc_free_secs(); );
 // Step 4b (Pad Banks): what one BANK holds -- any playable pad, and the seconds its regions hold at each
 // region's stored rate (main + layers; the pool's grant, so the sum of the four is what the pool has given).
@@ -740,16 +818,26 @@ function swing_banktabs_shown() ( !dock_face || big_view_id == VIEW_NONE; );
 function swing_banktabs_under_editor() (
   overlay_pad >= 0 && !kmac_ed_open && rng_ov_pad < 0 && cat_ov_pad < 0 && pk_ov_pad < 0 && big_view_id == VIEW_NONE;
 );
+// Does the strip PAINT before the dispatch (under the modal) this frame? Under the pad editor (above), and under the
+// pickers and the macro editor -- the dispatch's first branches: the range, category and note pickers and the macro
+// editor each dim the window from y = 28 and centre their panel there, and the strip's click is already inert under
+// them (swing_banktabs_input), but the strip painted AFTER them, undimmed over the dim and over their panels (the
+// owner, 2026-10-27: the LCD category pill's glyph picker "partly hides behind the bank buttons"). The click pass
+// keeps swing_banktabs_under_editor: only the editor's panel rect is carved out of a live strip.
+function swing_banktabs_paint_first() (
+  swing_banktabs_under_editor() || kmac_ed_open || rng_ov_pad >= 0 || cat_ov_pad >= 0 || pk_ov_pad >= 0;
+);
 // The bank strip's select (Pad Banks step 4b; here since 4d so the MAP presets and the bank actions reach it):
 // the selection moves to the same tile in the new bank, an open pad editor closes, mark_dirty (bank_cur is
-// serialized) -- never an undo boundary (spec 12).
+// serialized) -- and, since 2026-10-27 (the owner: "a bank switch if it changes saved state"), a REAPER undo point of
+// its own, a weak one: New Kit's switch to bank A, a MAP preset's, a multi-out build's ride in their own points.
 function swing_banktabs_select(b) (
   b >= 0 && b < NUM_BANKS && b != bank_cur ? (
     bank_cur = b;
     sel_pad = b * NUM_PADS + (sel_pad % NUM_PADS);   // the same tile, in the new bank
     overlay_pad = -1;                                // a pad editor open on the old bank closes
     cat_ov_pad = -1; rng_ov_pad = -1; pk_ov_pad = -1;   // ...and so do the pickers (they read the bands at the tile)
-    mark_dirty();
+    mark_dirty(); swing_rup_want(RUP_K_BANK, b, -1, -1, 0);
     _reg_my_slot >= 0 ? gmem[GS_INST_BANK_CUR + _reg_my_slot] = bank_cur;   // step 5a: at once -- a build posted this frame reads it
   );
 );
@@ -1131,9 +1219,20 @@ function swing_ldr_file_cells(path_str) local(f, nch, fsr, n) (
   n;
 );
 
+// An IN-PLACE load (the fit kept the pad's region: no table write) must still abandon a compaction move of that
+// pad's region. A move is cancelled only by a table write (swing_region_set), and a move this job paused -- the tick
+// stands still while a loader lane is busy -- resumed after the finish and committed a copy whose head, copied
+// before the load, was the OLD audio: the pad played a splice (LIB34). Under the lock, as swing_pad_promote does.
+function swing_ldr_claim_region(pad) (
+  swing_alloc_lock();
+  alc_ap == pad ? swing_alloc_cancel_move();
+  swing_alloc_unlock();
+);
+
 // The fit succeeded: adopt the target and start reading. Shared by swing_ldr_begin and the
 // phase-6 resume (a job that waited for the compaction job to make room).
 function swing_ldr_accept(jb, pad, layer, path_str, f, nch, fsr) (
+  swing_ldr_claim_region(pad);
   swing_ldr_reset_target(jb, pad, layer, path_str);
   jb[LDR_F_HANDLE] = f;
   jb[LDR_F_NCH] = nch;
@@ -1252,6 +1351,7 @@ local(lidx)
     // between the two -- and then the pad is left as the clear left it, told on the LCD.
     (layer < 0 ? swing_pad_fit_main(pad, total, jb + LDR_F_DISP)
                : swing_pad_fit_layer(pad, layer, total, jb + LDR_F_DISP)) ? (
+      swing_ldr_claim_region(pad);             // an in-place fit abandons a paused move of this pad's region (LIB34)
       swing_ldr_reset_target(jb, pad, layer, path_str);
       jb[LDR_F_OPENED] = 1;
       jb[LDR_F_NCH] = 2;                       // the stream is always interleaved stereo
@@ -1716,6 +1816,10 @@ local(ph, f, nch, tbuf, cap, pos, left, m, n, i, src, v, peak, wfr, wil, nw, w, 
         f >= 0 ? file_close(f);
         jb[LDR_F_HANDLE] = -1;
         jb[LDR_F_REFUSED] = 1;
+        // NCH was kept for the resume above; a refusal must drop it, or finish runs the success bookkeeping
+        // with len 0 and EMPTIES the pad (or raises the layer count on an empty layer) that the refusal was
+        // meant to leave as it was (LIB35). begin's and begin_gmem's refusals never set it.
+        jb[LDR_F_NCH] = 0;
         jb[LDR_F_PHASE] = 4;
       );
       0;
@@ -1842,25 +1946,35 @@ function load_from_path(idx, path_str) (
 // Self-contained (no GUI dependency) so the RS5k importer can drive it over
 // the INCMD_LMODE channel after stacking layers via CMD 64.
 function swing_layer_set_mode(pad_idx, mode)
-local(_all_default, _ncnt, _base, _li)
+local(_all_default, _ncnt, _base, _li, _k)
 (
   pad_idx >= 0 && pad_idx < NUM_SLOTS ? (
     p_layer_mode[pad_idx] = max(0, min(3, mode));
     p_rr_idx[pad_idx] = 0;
     // Even vel-split ranges when entering Vel-Split, only if every layer still
     // has the default 0-1 range (don't stomp user/preset edits).
+    // Over the layers that HOLD AUDIO: an empty layer keeps clear_layer's / the load wipe's 1/MAX_LAYERS slice,
+    // so counting it refused the split for a pad with a gap layer and its upper layer never sounded (select_layer
+    // takes the first match with audio for every velocity) (LIB36). The overlay's layer-mode menu has the same
+    // test (rk_swing_ui_grid_overlay).
     mode == 1 && p_layer_cnt[pad_idx] > 1 ? (
-      _all_default = 1; _ncnt = p_layer_cnt[pad_idx];
-      _li = 0; loop(_ncnt,
+      _all_default = 1; _ncnt = 0;
+      _li = 0; loop(p_layer_cnt[pad_idx],
         _base = pad_idx * MAX_LAYERS + _li;
-        (l_vel_lo[_base] > 0.001 || l_vel_hi[_base] < 0.999) ? _all_default = 0;
+        l_len[_base] > 0 ? (
+          _ncnt += 1;
+          (l_vel_lo[_base] > 0.001 || l_vel_hi[_base] < 0.999) ? _all_default = 0;
+        );
         _li += 1;
       );
-      _all_default ? (
-        _li = 0; loop(_ncnt,
+      _all_default && _ncnt > 1 ? (
+        _k = 0; _li = 0; loop(p_layer_cnt[pad_idx],
           _base = pad_idx * MAX_LAYERS + _li;
-          l_vel_lo[_base] = _li / _ncnt;
-          l_vel_hi[_base] = (_li + 1) / _ncnt;
+          l_len[_base] > 0 ? (
+            l_vel_lo[_base] = _k / _ncnt;
+            l_vel_hi[_base] = (_k + 1) / _ncnt;
+            _k += 1;
+          );
           _li += 1;
         );
       );
@@ -1871,6 +1985,129 @@ local(_all_default, _ncnt, _base, _li)
 function load_layer_from_path(pad_idx, layer_idx, path_str) (
   pad_idx >= 0 && pad_idx < NUM_SLOTS && layer_idx >= 0 && layer_idx < MAX_LAYERS ?
     swing_ldr_run(ldr_job1, pad_idx, layer_idx, path_str);
+);
+
+// ─── The wave looks' cache: Outline and True peaks (2026-10-27) ──────────────────────────────────────
+// slider48 pad_wave_look: 0 Peak (the WV_RES cache below, the look before the THEME menu's PAD WAVE row), 1 Outline
+// (per pixel column the true peak as an outline, the mean |x| as a brighter body), 2 True peaks (per column the true
+// min to the true max). 1 and 2 draw from wvb_cache (Swing_ReaKit @init): WVB_BINS bins a slot, each with the max, min
+// and mean |x| of its span, per channel, RAW -- reverse and normalize apply when drawing, so a knob never rebuilds it.
+// Everything here runs in @gfx (build_wv_cache's caller, swing_ui_misc_cmds, and the pass that draws), so the drawing
+// can never meet a half-written bin; a build that spans passes is not ready until wvb_have takes its generation, LAST.
+function swing_wvb_look() ( max(0, min(2, (pad_wave_look + 0.5) | 0)); );
+function swing_wvb_ready(s) ( wvb_want[s] > 0 && wvb_have[s] == wvb_want[s]; );
+// The look slot s draws in NOW: Outline / True peaks once its bins are in, else 0 = Peak, the WV_RES draw (a slot still
+// building shows Peak for those passes). Every drawing site branches on this one answer.
+function swing_wvb_use(s) local(_l) ( _l = swing_wvb_look(); _l > 0 && swing_wvb_ready(s) ? _l : 0; );
+// The normalize gain of the audio the cache holds, as it stands now (build_wv_cache's choice, read at draw time).
+function swing_wvb_gain(s) local(_l) (
+  _l = wvb_key[s * WVB_KEYN + 1];
+  _l < 0 ? ( s_norm[s] ? s_norm_gain[s] : 1.0 )
+         : ( l_norm[s * MAX_LAYERS + _l] ? l_norm_gain[s * MAX_LAYERS + _l] : 1.0 );
+);
+// Column j of `cols` across slot s's channel c, folded from the bins: wvb_cmx / wvb_cmn = the true max / min, wvb_cme
+// = the mean |x| (raw: the caller scales). rv mirrors the column (a reversed pad; the bins are forward). No drawing,
+// so the harness can hold it to the audio (wvb_test.py).
+// ⚠ The + 0.000000001: EEL2 reads (106 + 1) * 512 / 107 as 511.99999999999994 (measured in the harness: a computed
+// numerator is divided by a reciprocal multiply), so the last column stopped one bin short and the sample's last bin
+// was never drawn. A boundary that is not a whole number sits at least 1 / cols from one, so the nudge moves nothing
+// else. (Peak's swing_grid_wv_span carries the same truncation; left as it is, the look is today's.)
+function swing_wvb_col(s, c, j, cols, rv) local(_base, _jj, _b0, _b1, _k, _sa) (
+  _base = wvb_cache + s * WVB_STRIDE + c * 3 * WVB_BINS;
+  _jj = rv ? cols - 1 - j : j;
+  _b0 = (_jj * WVB_BINS / cols + 0.000000001) | 0;
+  _b1 = ((_jj + 1) * WVB_BINS / cols + 0.000000001) | 0;
+  _b1 <= _b0 ? _b1 = _b0 + 1;
+  wvb_cmx = -2; wvb_cmn = 2; _sa = 0; _k = _b0;
+  loop(_b1 - _b0,
+    _base[_k] > wvb_cmx ? wvb_cmx = _base[_k];
+    _base[WVB_BINS + _k] < wvb_cmn ? wvb_cmn = _base[WVB_BINS + _k];
+    _sa += _base[2 * WVB_BINS + _k];
+    _k += 1;
+  );
+  wvb_cme = _sa / (_b1 - _b0);
+);
+// build_wv_cache runs on EVERY s_dirty: a new sample, and a gain / ADSR / offset / reverse / normalize edit too. The
+// bins are a full pass over the audio (the gallery's same pass: 4.4-7.2 ms for a 10 s stereo loop in REAPER), so they
+// must not follow the knobs. This note gets
+// the source build_wv_cache just chose and compares its key -- the content length, the layer, and two sums of the RAW
+// samples at 512 fixed points taken in forward order (so reverse and normalize, applied at draw time, leave it alone)
+// -- with the key the slot was last asked to build from; a difference asks for a build (wvb_want += 1). Every route
+// that loads, swaps, clears, restores or undoes a sample reaches it through the s_dirty it already raises, so no route
+// has to know this cache exists. The key stands in for the audio: two samples of the same length whose 512 points all
+// match EXACTLY (!==, wiki 1.11) would keep the old bins -- not a case real audio meets. The buffer pointer is left out
+// on purpose: the allocator's compaction moves a region with its content (rk_swing_alloc).
+function swing_wvb_note(idx, buf, wlen, lay) local(_n, _i, _si, _vL, _vR, _s1, _s2, _k) (
+  _n = (wlen / 2) | 0;
+  _s1 = 0; _s2 = 0;
+  _i = 0; loop(512,
+    _si = (((_i + 0.5) * _n / 512) | 0) * 2;
+    _vL = buf[_si]; _vR = buf[_si + 1];
+    _s1 += (_vL + 0.618034 * _vR) * (_i + 1);
+    _s2 += (1.414214 * _vL - _vR) * (((_i * 37) % 101) + 1);
+    _i += 1;
+  );
+  _k = wvb_key + idx * WVB_KEYN;
+  (wvb_want[idx] < 1 || _k[0] !== wlen || _k[1] !== lay || _k[2] !== _s1 || _k[3] !== _s2) ? (
+    _k[0] = wlen; _k[1] = lay; _k[2] = _s1; _k[3] = _s2;
+    wvb_want[idx] += 1;
+  );
+);
+// One pass's share of the building: bins until `secs` (WVB_BUDGET) are spent -- one bin past it at most -- then it
+// returns; a job spans as many passes as it needs (a 45 s stereo layer is about 4.3 x the 10 s loop's work). The bank
+// on screen goes
+// first. The source is looked up again on every pass: the compaction (@block) moves a region and its content without a
+// word, so a job follows the pointer and starts over only when the LENGTH moved (new audio, whose note bumps want too).
+// A slot whose audio is gone is marked done: it draws no wave. wvb_job = slot + 1 (0 = none), and the job's state, are
+// @gfx's and live from one pass to the next.
+function swing_wvb_step(secs) local(_t0, _go, _k, _q, _s, _lay, _buf, _len, _n, _base, _b, _f0, _f1, _f, _vL, _vR,
+                                     _mxL, _mnL, _saL, _mxR, _mnR, _saR) (
+  _t0 = time_precise();
+  _go = 1;
+  while (_go) (
+    !wvb_job ? (
+      _s = -1; _k = 0;
+      while (_s < 0 && _k < NUM_SLOTS) (
+        _q = (bank_cur * NUM_PADS + _k) % NUM_SLOTS;
+        wvb_want[_q] != wvb_have[_q] ? _s = _q;
+        _k += 1;
+      );
+      _s >= 0 ? ( wvb_job = _s + 1; wvb_job_gen = wvb_want[_s]; wvb_job_bin = 0; wvb_job_len = -1; ) : ( _go = 0; );
+    );
+    wvb_job ? (
+      _s = wvb_job - 1;
+      wvb_want[_s] != wvb_job_gen ? ( wvb_job_gen = wvb_want[_s]; wvb_job_bin = 0; );   // asked again mid-build
+      _lay = wvb_key[_s * WVB_KEYN + 1];
+      _lay < 0 ? ( _buf = p_aptr[_s]; _len = s_len[_s]; )
+               : ( _buf = p_lptr[_s * MAX_LAYERS + _lay]; _len = l_len[_s * MAX_LAYERS + _lay]; );
+      _len != wvb_job_len ? ( wvb_job_len = _len; wvb_job_bin = 0; );
+      _n = (_len / 2) | 0;
+      _n < 1 ? (
+        wvb_have[_s] = wvb_job_gen; wvb_job = 0;
+      ) : (
+        _base = wvb_cache + _s * WVB_STRIDE;
+        while (_go && wvb_job_bin < WVB_BINS) (
+          _b = wvb_job_bin;
+          _f0 = (_b * _n / WVB_BINS) | 0;
+          _f1 = ((_b + 1) * _n / WVB_BINS) | 0;
+          _f1 <= _f0 ? _f1 = _f0 + 1;
+          _mxL = -2; _mnL = 2; _saL = 0; _mxR = -2; _mnR = 2; _saR = 0;
+          _f = _f0 * 2;
+          loop(_f1 - _f0,
+            _vL = _buf[_f]; _vR = _buf[_f + 1];
+            _vL > _mxL ? _mxL = _vL; _vL < _mnL ? _mnL = _vL; _saL += abs(_vL);
+            _vR > _mxR ? _mxR = _vR; _vR < _mnR ? _mnR = _vR; _saR += abs(_vR);
+            _f += 2;
+          );
+          _base[_b] = _mxL; _base[WVB_BINS + _b] = _mnL; _base[2 * WVB_BINS + _b] = _saL / (_f1 - _f0);
+          _base[3 * WVB_BINS + _b] = _mxR; _base[4 * WVB_BINS + _b] = _mnR; _base[5 * WVB_BINS + _b] = _saR / (_f1 - _f0);
+          wvb_job_bin += 1;
+          time_precise() - _t0 >= secs ? _go = 0;
+        );
+        wvb_job_bin >= WVB_BINS ? ( wvb_have[_s] = wvb_job_gen; wvb_job = 0; );   // ready: written LAST
+      );
+    );
+  );
 );
 
 // ─── Waveform cache builder ─────────────────────────────────────────────
@@ -1895,6 +2132,7 @@ function build_wv_cache(idx) local(buf, step, i, _wi, val, si, ptr, ptr_R, _wlen
     _wsg = s_norm[idx] ? s_norm_gain[idx] : 1.0;
   );
   _wlen > 0 ? (
+    swing_wvb_note(idx, buf, _wlen, p_layer_cnt[idx] > 0 ? _wli : -1);   // the wave looks' bins: a new sample only (above)
     ptr   = wv_cache   + idx * WV_RES;
     ptr_R = wv_cache_R + idx * WV_RES;
     step = (_wlen / 2) / WV_RES;
@@ -1976,11 +2214,16 @@ function build_wv_cache(idx) local(buf, step, i, _wi, val, si, ptr, ptr_R, _wlen
     );
 
     s_dirty[idx] = 0;
+    // A pad shown as mono by BALANCE (the channels differ, the quieter under 30 % of the louder: p_stereo 0 above) has
+    // its LOUDER channel fill the pad, as that check's note says; until 2026-10-27 every look drew L, the quiet one when
+    // R was the louder. wv_cache takes R then (Peak's draws, the editor's plain overview, read it as before), and
+    // wv_monoch says R to the reads that pick a channel themselves (the bins' mono lane, the editor's other views). A
+    // genuinely mono file (L = R: no _stereo_found) and a stereo pad keep 0 and today's cache exactly.
+    wv_monoch[idx] = (!p_stereo[idx] && _stereo_found && _eR > _eL) ? 1 : 0;
+    wv_monoch[idx] ? memcpy(ptr, ptr_R, WV_RES);
   );
 );
 
-// ─── Steal-fade park (A-2) ───────────────────────────────────────────────
-// A stolen voice is not cut: its state moves into one of the STEAL_FADES slots past
 // ─── The voice's block constants (phase V, Spec_Swing_Seq_View §16, 2026-10-14) ─────
 // What the @sample voice loop used to resolve from the pad and layer tables every sample:
 // the buffer pointer, the interleaved start / end positions (trim), and whether the voice
@@ -2016,6 +2259,8 @@ function swing_voice_prep(_vp_vi) local(_vp_si, _vp_lidx) (
   );
 );
 
+// ─── Steal-fade park (A-2) ───────────────────────────────────────────────
+// A stolen voice is not cut: its state moves into one of the STEAL_FADES slots past
 // the pool (MAX_VOICES .. V_SLOTS - 1), where @sample runs it in release under
 // steal_coeff (~5 ms) until it falls silent. ONE such slot used to serve every steal,
 // so two steals in one block (eighteen note-ons against sixteen voices) cut the first
@@ -2049,8 +2294,9 @@ function swing_voice_steal_park(_stl_vi) local(_stl_k, _stl_sf, _stl_best, _stl_
                                 v_syn_state + _stl_vi * RK_SYN_STATE_SIZE, RK_SYN_STATE_SIZE);
   _stl_sf + 1 > v_hi ? v_hi = _stl_sf + 1;   // step 2c: a fade slot sits past the pool; the @sample loop must reach it
   v_stage[_stl_sf] = 4;   // LAST -- audio thread gate
-  // park the stolen slot NOW: @sample (concurrent with @gfx trigger paths) must
-  // never observe a live voice mid-rewrite (sweep finding)
+  // park the stolen slot NOW so @sample never observes a live voice mid-rewrite
+  // (sweep finding). Every launch runs in @block since A-9b, in sequence with
+  // @sample, so this order is kept as a guard for any future off-thread caller.
   v_stage[_stl_vi] = 0; v_pos[_stl_vi] = -1; v_env[_stl_vi] = 0;
 );
 
@@ -2274,11 +2520,25 @@ function swing_pad_wake(_pw_pad) (
   pad_awake[_pw_pad] = 1;
   _pw_pad + 1 > pad_hi ? pad_hi = _pw_pad + 1;
 );
+// A pad a kit load is still filling (SQ-K, 2026-10-26: a kit changed while the step sequencer plays). The import's
+// state 2 adopts every pad's META of the pass at once -- lengths, rate, layers, tune, envelope -- while each pad's
+// audio arrives later, one pad after another (a VER-26 blob per bridge tick, a VER-201 file per few blocks). A hit in
+// between played the OLD buffer under the NEW lengths: the old sound cut short or at the wrong pitch, read past its
+// region into another pad's audio, or -- a pad that held no audio before -- read from cell 0 up (whatever the
+// variables there hold, at full level). Such a pad stays silent from state 2 until its audio has landed (state 3
+// clears its bit: rk_swing_ui_state); the walker, its MIDI-out mirror and every other pad keep going. @block's
+// alone (the import tick and every launch run there); the mask is read only while an import is past state 1, so any
+// way an import ends (state 4, an @init) opens it again.
+function swing_kit_pad_loading(_kl_p) (
+  kit_import_state >= 2 && kit_ld_pend > 0 && floor(_kl_p / NUM_PADS) == kit_ld_bank
+    && (floor(kit_ld_pend / (2 ^ (_kl_p - kit_ld_bank * NUM_PADS))) & 1);
+);
 function launch_voices_for_pad_ofs(_lv_pad, _lv_midi, _lv_vel, _lv_flash, _lv_ofs)
   local(_is_sum, _sum_cnt, _sum_cur, _active_cnt, _sel_layer, _skip_voice, vi, _lidx,
         _slen, _sstart, _send, _ssr, max_age, _oldest_vi, j, _delay, _end_i, _start_i,
         _pt_eff, _st_off, _sr_base_t, _new_rpos, _lv_spot, _bt_lidx, _tie_pg,
         _sel_syn, _syn_go, _syn_v, _syn_st, _has_smp, _comp_sum) (
+  !swing_kit_pad_loading(_lv_pad) ? (   // SQ-K: not while a kit load is filling this pad (above)
   // Banks step 2b: whatever this launch does (local voices, a SYN voice, the Stretch ring),
   // the pad may sound from this block on -- wake it before anything else.
   swing_pad_wake(_lv_pad);
@@ -2300,8 +2560,9 @@ function launch_voices_for_pad_ofs(_lv_pad, _lv_midi, _lv_vel, _lv_flash, _lv_of
   // Stretch pads went quiet. Falling through to the resident-buffer resampler is
   // exactly what the header promises when the Extension is not there; being
   // unreachable is the same thing from the player's side.
-  // ⭐ Swing_ReaKit.jsfx:4096 records fixing this identical shape in the @block
-  // heartbeat -- gated `_reg_my_slot >= 0`, so a vacated instance stayed silent.
+  // ⭐ Swing_ReaKit.jsfx's "@block re-claim" note records fixing this identical
+  // shape in the @block heartbeat -- gated `_reg_my_slot >= 0`, so a vacated
+  // instance stayed silent.
   // Same gate, same silence, one function over, and it went unlooked-for.
   // ... and not while the pad's source change is still being handed to the Extension (swing_pitch_held: from the
   // change until SP_HOLD_TICKS heartbeats after the bridge's answer, §5A.3): the hit takes the local path below and
@@ -2512,8 +2773,10 @@ function launch_voices_for_pad_ofs(_lv_pad, _lv_midi, _lv_vel, _lv_flash, _lv_of
           v_sg[vi] = _tie_pg * (s_norm[_lv_pad] ? s_norm_gain[_lv_pad] : 1.0);
         );
         swing_voice_prep(vi);   // block constants: the buffer pointer, the trim bounds, the sum gate (slot / layer / stfb are set above)
-        // v_stage MUST be set last — audio thread uses it as the gate condition.
-        // Setting it before v_env/v_sg causes a race where @sample reads stale values.
+        // v_stage MUST be set last — @sample uses it as the gate condition. Every
+        // launch runs in @block since A-9b, in sequence with @sample, so the order
+        // is a guard for any future off-thread caller (one would let @sample read
+        // stale v_env/v_sg).
         v_gen[vi] += 1;   // a new voice: a note-off queued for this slot's last one must not release it
         vi + 1 > v_hi ? v_hi = vi + 1;   // step 2c: the @sample loop must reach this slot before the gate opens
         v_stage[vi] = 1;
@@ -2562,11 +2825,13 @@ function launch_voices_for_pad_ofs(_lv_pad, _lv_midi, _lv_vel, _lv_flash, _lv_of
   pad_flash[_lv_pad] = _lv_flash;
   swing_voice_choke_at(_lv_pad, _lv_ofs);   // duplicate-kill + choke group, local voices and Stretch pads (A-7), at the hit's sample
   );  // end of Mode != Stretch branch (Step 3b launch_voices divert)
+  );  // end of the SQ-K kit-load gate
 );
 
 // Every caller that wants a hit NOW keeps the four-argument name. EEL2 has no
-// overloading, so the offset-aware version needs its own -- rather than touch
-// all 20 existing call sites to append a 0.
+// overloading, so the offset-aware version needs its own name (two callers
+// still use this one: the browser's pad trigger (GS_PAD_TRIGGER) in
+// Swing_ReaKit.jsfx and the UI-click consumer in rk_swing_block).
 function launch_voices_for_pad(_lv_pad, _lv_midi, _lv_vel, _lv_flash) (
   launch_voices_for_pad_ofs(_lv_pad, _lv_midi, _lv_vel, _lv_flash, 0);
 );

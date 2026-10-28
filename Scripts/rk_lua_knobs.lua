@@ -5,7 +5,8 @@
 -- into ReaImGui DrawList, so the Pad FX / Browser panels render the SAME knobs as
 -- the plugin. The JSFX is the SOURCE OF TRUTH: each K.<style> below is a near
 -- line-for-line transcription of the matching <style>_knob_draw EEL2 function.
--- When a JSFX knob changes, mirror the change here (line ranges noted per style).
+-- When a JSFX knob changes, mirror the change here (each style's header names its
+-- EEL2 function).
 --
 -- Only the VISUAL is ported. Interaction is uniform in the JSFX (ssl_knob_interact)
 -- and already handled by rk_lua_widgets w.knob, so it is NOT duplicated here.
@@ -61,9 +62,6 @@ function Pen:circle(cx, cy, r, fill)
 end
 function Pen:line(x1, y1, x2, y2, thick)
   ImGui.DrawList_AddLine(self.dl, x1, y1, x2, y2, self.col, thick or 1.0)
-end
-function Pen:triangle(x1, y1, x2, y2, x3, y3)
-  ImGui.DrawList_AddTriangleFilled(self.dl, x1, y1, x2, y2, x3, y3, self.col)
 end
 function Pen:quad(x1, y1, x2, y2, x3, y3, x4, y4)
   ImGui.DrawList_AddQuadFilled(self.dl, x1, y1, x2, y2, x3, y3, x4, y4, self.col)
@@ -406,7 +404,7 @@ function K.neve_alt(g, cx, cy, radius, value, vmin, vmax, hover_t, cr, cg, cb, n
   if n_det > 0 then neve_detents(g, cx, cy, radius, value, vmin, vmax, ht, ba, n_det) end
 end
 
--- MPC — mpc_knob_draw (lines 1109–1181). Background track arc + accent value arc,
+-- MPC — mpc_knob_draw. Background track arc + accent value arc,
 -- dark bevel shell, colour-tinted rubber dome cap, thick white indicator.
 function K.mpc(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg, cb, bgr, bgg, bgb)
   local ht = hover_t ^ 2
@@ -537,14 +535,15 @@ function K.pultec(g, cx, cy, radius, value, vmin, vmax, hover_t)
     g:line(cx + sin(ra) * radius * 0.86, cy - cos(ra) * radius * 0.86,
            cx + sin(ra) * radius * 0.99, cy - cos(ra) * radius * 0.99)
   end
-  -- Charcoal top disc, light drifting top-left
+  -- Charcoal top disc, light drifting top-left. The disc swells toward the side
+  -- wall on hover; the wall and the panel ticks stay put (1.6.0 sync; SCR137).
   for i = 0, 8 do
     local t = i / 8
     local sh = lerp(0.065, 0.235, t * t)
     g:set(sh, sh, sh + 0.008, 1)
-    g:circle(cx - radius * 0.08 * t, cy - radius * 0.10 * t, radius * 0.84 * (1 - t * 0.55), 1)
+    g:circle(cx - radius * 0.08 * t, cy - radius * 0.10 * t, radius * lerp(0.84, 0.90, ht) * (1 - t * 0.55), 1)
   end
-  g:set(1, 1, 1, 0.10); g:circle(cx, cy, radius * 0.84, 0)
+  g:set(1, 1, 1, lerp(0.10, 0.25, ht)); g:circle(cx, cy, radius * lerp(0.84, 0.90, ht), 0)
   -- Silver-white pointer w/ dark edging
   g:set(0, 0, 0, 0.45)
   pointer_quad(g, cx, cy, val_rad, radius * 0.14, radius * 0.82, radius * 0.055)
@@ -573,6 +572,7 @@ function K.pultec_cream(g, cx, cy, radius, value, vmin, vmax, hover_t)
     g:line(cx + sin(ta) * radius * 0.99, cy - cos(ta) * radius * 0.99,
            cx + sin(ta) * radius * 1.12, cy - cos(ta) * radius * 1.12)
   end
+  radius = radius * (1 + 0.06 * ht)   -- body swells on hover; the panel ticks stay put (1.6.0 sync; SCR137)
   -- Drop shadow + cream body (light drifting up)
   g:set(0, 0, 0, 0.35); g:circle(cx + 1.5, cy + 2.5, radius * 0.92, 1)
   for i = 0, 6 do
@@ -732,7 +732,7 @@ function K.serum(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg, 
   local scale = 260 / (vmax - vmin)
   local voffset = -vmin * 260 / (vmax - vmin) - 130
   local val_rad = (value * scale + voffset) * PI / 180
-  local body_r = radius * 0.80
+  local body_r = radius * lerp(0.80, 0.86, hover_t)   -- the body swells on hover (knobs_kbsg 1.6.0 sync; SCR137)
   local glow_a = lerp(0.75, 1.0, hover_t)
   for i = 0, 5 do
     local frac = i / 5
@@ -887,37 +887,74 @@ function K.jo(g, cx, cy, r, value, hover_t, cr, cg, cb)
   g:line(cx, dy, cx + sin(angle) * r, dy - cos(angle) * r, 1)
 end
 
--- Spice/sp (style 10) — sp_knob_draw. Takes a normalised value. Blue arc-fill ring +
--- 3-pass inner circle + perpendicular 60-line sweep needle.
-function K.sp(g, cx, cy, r, value, hover_t)
+-- Spice/sp (style 10) — sp_knob_draw (the 2026-09-20 redesign):
+-- real units; the role hue scaled by value heat and lifted toward white on hover; a
+-- dim track over the full travel; the value arc from the left (bipolar: from its
+-- anchor); a glow halo outside the ring; a panel-contrast inner ring with a hover
+-- pulse; the perpendicular sweep needle. Re-ported whole: the panel still drew the
+-- pre-redesign fixed-blue knob with no track, no halo, no role hue (sweep SCR138).
+function K.sp(g, cx, cy, r, value, vmin, vmax, is_sym, hover_t, cr, cg, cb, bgr, bgg, bgb)
   local ht = hover_t
-  local kr, kg, kb = lerp(0, 0.15, ht), lerp(0.5, 0.65, ht), 1.0
+  local vn = (value - vmin) / math.max(vmax - vmin, 0.0001)
+  -- Bipolar anchor: is_sym 1 = range midpoint; fractional 0<x<1 = normalized
+  -- anchor position (value-anchored sym, e.g. 12/18 for a -12..+6 dB knob)
+  local sym = (is_sym or 0) ~= 0
+  local anc = sym and ((is_sym < 1) and is_sym or 0.5) or 0
+  -- Value heat: how hot the knob runs (bipolar = distance off the anchor)
+  local heat = sym and math.min(1, math.abs(vn - anc) / math.max(math.max(anc, 1 - anc), 0.0001)) or vn
+  -- Role hue scaled by heat, then lifted toward white on hover
+  local kr, kg, kb = cr * lerp(0.55, 1.0, heat), cg * lerp(0.55, 1.0, heat), cb * lerp(0.55, 1.0, heat)
+  kr = kr + (1 - kr) * 0.25 * ht
+  kg = kg + (1 - kg) * 0.25 * ht
+  kb = kb + (1 - kb) * 0.25 * ht
+  -- Proportions from v6: margin=12, w=18, arc_fill=3, rad=0.6 (scaled to radius)
   local margin = r * 12 / 55
   local w = r * 18 / 55
-  local arc_fill = 5
+  local arc_fill = 3
   local knob_rad = 0.6
   local kas = -TAU * (1 + knob_rad / 2)
   local inner = r - w - margin
   local inner_pulse = lerp(0, 2, ht)
+  -- Arc span: unipolar fills from the left; bipolar from the anchor
+  local a_val = vn * TAU * knob_rad + kas
+  local a_ctr = anc * TAU * knob_rad + kas
+  local a_lo, a_hi
+  if sym then a_lo, a_hi = math.min(a_ctr, a_val), math.max(a_ctr, a_val)
+  else a_lo, a_hi = kas, a_val end
+  -- Background track (dim role hue) — full travel range, jog-style
   local arc_steps = floor(w * arc_fill)
+  local rw_ = r - w
+  local a_full = TAU * knob_rad + kas
+  g:set(cr * 0.15, cg * 0.15, cb * 0.15, 0.8)
+  for i = 0, arc_steps - 1 do g:arc(cx, cy, rw_ + i / arc_fill, kas, a_full) end
+  -- Active arc ring
   g:set(kr, kg, kb, 1)
-  for i = 0, arc_steps - 1 do
-    g:arc(cx, cy, r - w + (i / arc_fill), kas, value * TAU * knob_rad + kas)
+  for i = 0, arc_steps - 1 do g:arc(cx, cy, rw_ + i / arc_fill, a_lo, a_hi) end
+  -- Glow halo outside the ring — blooms with value heat and hover
+  local glow_a = lerp(0.05, 0.22, math.max(heat * 0.8, ht))
+  for j = 1, 4 do
+    g:set(kr, kg, kb, glow_a * (1 - j * 0.22))
+    g:arc(cx, cy, r + j, a_lo, a_hi, 1)
   end
+  -- Inner circle (3-pass outline + hover pulse), panel-contrast ink
+  local bg_luma = 0.299 * bgr + 0.587 * bgg + 0.114 * bgb
+  local ring = (bg_luma > 0.5) and 0.22 or 0.8
   local ir = inner + inner_pulse
-  g:set(0.8, 0.8, 0.8, 1)
+  g:set(ring, ring, ring, 1)
   g:circle(cx, cy, ir, 0); g:circle(cx, cy, ir - 0.5, 0); g:circle(cx, cy, ir - 1, 0)
-  local polar = (value * 1.01) * TAU * knob_rad + kas
+  -- Needle (perpendicular sweep; the pass count follows the needle width)
+  local polar = (vn * 1.01) * TAU * knob_rad + kas
   local xo_ = sin(polar + TAU / 2) * -1
   local yo_ = cos(polar + TAU / 2)
   g:set(kr, kg, kb, 1)
   local nthick = r * 0.15
-  local steps = 60
+  local steps = math.max(6, 2 * math.ceil(nthick * 1.5))
+  local ex_, ey_ = xo_ * (ir - 1), yo_ * (ir - 1)
   local s = -steps / 2
   while s <= steps / 2 do
     local off_x = s / steps * yo_ * nthick
     local off_y = -s / steps * xo_ * nthick
-    g:line(cx + off_x, cy + off_y, cx + off_x + xo_ * (ir - 1), cy + off_y + yo_ * (ir - 1))
+    g:line(cx + off_x, cy + off_y, cx + off_x + ex_, cy + off_y + ey_)
     s = s + 1
   end
 end
@@ -967,7 +1004,14 @@ end
 function K.jog(g, cx, cy, radius, value, vmin, vmax, hover_t, arc_r, arc_g, arc_b)
   local ht = hover_t ^ 2
   local or_ = radius
-  local ir_ = radius - 10
+  -- Inner disc: the fixed inset (radius - 10) is the original look down to the
+  -- r=25 design size; below about r=18 it collapses and the dot's orbit
+  -- (ir_ - 8) goes NEGATIVE, so the dot sat on the wrong side at Pad FX sizes
+  -- (radius 14..24). Whichever is larger keeps the original geometry where the
+  -- knob is actually drawn and switches to the scale-safe form only where the
+  -- old maths breaks down; each derived term below is clamped the same way
+  -- (knobs_kbsg jog_knob_draw, 2026-08-02; mirrored SCR139).
+  local ir_ = math.max(radius * 0.60, radius - 10)
   local base_b = lerp(0.0, 0.04, ht)
   local RAD130 = 130 * PI / 180
   local arc_w = math.max(3, radius * 0.14)
@@ -981,22 +1025,27 @@ function K.jog(g, cx, cy, radius, value, vmin, vmax, hover_t, arc_r, arc_g, arc_
   g:set(0.08 + base_b, 0.08 + base_b, 0.10 + base_b, 0.9); g:circle(cx, cy, or_ + 2, 1)
   g:set(0.30 + base_b, 0.30 + base_b, 0.32 + base_b, 1); g:circle(cx, cy, or_, 1)
   g:set(0.18 + base_b, 0.18 + base_b, 0.20 + base_b, 1); g:circle(cx, cy, or_ - 3, 1)
-  g:set(0.32 + base_b, 0.32 + base_b, 0.34 + base_b, 1); g:circle(cx, cy, ir_ - 2, 1)
-  g:set(0.30 + base_b, 0.30 + base_b, 0.32 + base_b, 1); g:circle(cx, cy, ir_ - 5, 1)
-  g:set(0.28 + base_b, 0.28 + base_b, 0.30 + base_b, 1); g:circle(cx, cy, ir_ - 8, 1)
-  g:set(0.42 + base_b, 0.42 + base_b, 0.44 + base_b, 0.3); g:circle(cx - 2, cy - 3, ir_ - 4, 0)
-  g:set(0.50 + base_b, 0.50 + base_b, 0.52 + base_b, 1); g:circle(cx, cy, 4, 1)
+  g:set(0.32 + base_b, 0.32 + base_b, 0.34 + base_b, 1); g:circle(cx, cy, math.max(ir_ * 0.87, ir_ - 2), 1)
+  g:set(0.30 + base_b, 0.30 + base_b, 0.32 + base_b, 1); g:circle(cx, cy, math.max(ir_ * 0.67, ir_ - 5), 1)
+  g:set(0.28 + base_b, 0.28 + base_b, 0.30 + base_b, 1); g:circle(cx, cy, math.max(ir_ * 0.47, ir_ - 8), 1)
+  g:set(0.42 + base_b, 0.42 + base_b, 0.44 + base_b, 0.3)
+  g:circle(cx - math.min(radius * 0.08, 2), cy - math.min(radius * 0.12, 3), math.max(ir_ * 0.73, ir_ - 4), 0)
+  -- Center dot: fixed 4px originally; the fraction takes over once 4px would dominate the face.
+  g:set(0.50 + base_b, 0.50 + base_b, 0.52 + base_b, 1); g:circle(cx, cy, math.min(radius * 0.16, 4), 1)
   for jt = 0, 11 do
     local ja = jt / 12.0 * 2.0 * PI
-    local tx1, ty1 = cx + cos(ja) * (or_ - 5), cy + sin(ja) * (or_ - 5)
-    local tx2, ty2 = cx + cos(ja) * (or_ - 1), cy + sin(ja) * (or_ - 1)
+    local tx1, ty1 = cx + cos(ja) * math.max(or_ * 0.80, or_ - 5), cy + sin(ja) * math.max(or_ * 0.80, or_ - 5)
+    local tx2, ty2 = cx + cos(ja) * math.max(or_ * 0.96, or_ - 1), cy + sin(ja) * math.max(or_ * 0.96, or_ - 1)
     g:set(0.15, 0.15, 0.17, 0.6); g:line(tx1 + 0.5, ty1 + 0.5, tx2 + 0.5, ty2 + 0.5)
     g:set(0.55 + base_b, 0.53 + base_b, 0.50 + base_b, 0.8)
     g:line(tx1, ty1, tx2, ty2); g:line(tx1 + 1, ty1, tx2 + 1, ty2)
   end
   val_rad = (-130 + val_norm * 260) * PI / 180
-  local ix, iy = cx + sin(val_rad) * (ir_ - 8), cy - cos(val_rad) * (ir_ - 8)
-  g:set(0.90 + ht * 0.1, 0.88 + ht * 0.1, 0.85 + ht * 0.1, 0.9); g:circle(ix, iy, 3, 1)
+  -- ir_ - 8 is the original orbit and the term that went negative at small radii; the fraction floors it
+  local orbit = math.max(ir_ * 0.47, ir_ - 8)
+  local ix, iy = cx + sin(val_rad) * orbit, cy - cos(val_rad) * orbit
+  g:set(0.90 + ht * 0.1, 0.88 + ht * 0.1, 0.85 + ht * 0.1, 0.9)
+  g:circle(ix, iy, math.min(math.max(1.5, radius * 0.12), 3), 1)
   if ht > 0.01 then
     g:set(arc_r, arc_g, arc_b, 0.2 * ht)
     g:circle(cx, cy, or_ + arc_w + 4, 0); g:circle(cx, cy, or_ + arc_w + 5, 0)
@@ -1127,7 +1176,7 @@ function K.draw(style, g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t,
   if style == 7  then return K.mpc(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg, cb, bgr, bgg, bgb) end
   if style == 8  then return K.jog(g, cx, cy, radius, value, vmin, vmax, hover_t, cr, cg, cb) end
   if style == 9  then return K.rainbow(g, cx, cy, radius, value, vmin, vmax, hover_t) end
-  if style == 10 then return K.sp(g, cx, cy, radius, (value - vmin) / math.max(1e-7, vmax - vmin), hover_t) end
+  if style == 10 then return K.sp(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg, cb, bgr, bgg, bgb) end
   if style == 11 then return K.encoder(g, cx, cy, radius / 1.38, value, vmin, vmax, hover_t, cr, cg, cb) end  -- collar reaches 1.38 R: fit the others' footprint
   if style == 12 then return K.pultec(g, cx, cy, radius, value, vmin, vmax, hover_t) end
   if style == 13 then return K.ableton(g, cx, cy, radius, value, vmin, vmax, is_sym, hover_t, cr, cg, cb, bgr, bgg, bgb) end

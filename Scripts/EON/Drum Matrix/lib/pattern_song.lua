@@ -260,11 +260,17 @@ end
 -- chain editing
 -- =============================================================================
 
+-- Every edit below tells the running song where each chain entry went (see
+-- chain_edited, defined with the playback driver): remap(old_pos) -> new_pos,
+-- or nil for an entry that is gone. Forward-declared; the driver fills it in.
+local chain_edited
+
 function M.SongAppend(idx)
   if not idx then return end
   local arr = read_song()
   arr[#arr + 1] = { r = idx, n = 1 }
   write_song(arr)
+  chain_edited(function(p) return p end)
 end
 
 -- Insert region `idx` into the chain BEFORE position `pos` (1-based; #chain + 1 = the end),
@@ -279,11 +285,15 @@ function M.SongInsertAt(idx, pos)
   if pos < 1 then pos = 1 elseif pos > #arr + 1 then pos = #arr + 1 end
   table.insert(arr, pos, { r = idx, n = 1 })
   write_song(arr)
+  chain_edited(function(p) if p >= pos then return p + 1 end return p end)
 end
 
 function M.SongRemoveAt(pos)
   local arr = read_song()
-  if pos >= 1 and pos <= #arr then table.remove(arr, pos); write_song(arr) end
+  if pos >= 1 and pos <= #arr then
+    table.remove(arr, pos); write_song(arr)
+    chain_edited(function(p) if p == pos then return nil elseif p > pos then return p - 1 end return p end)
+  end
 end
 
 -- Move the step at `pos` by `dir` (-1 left / +1 right), swapping with neighbor.
@@ -293,6 +303,7 @@ function M.SongMove(pos, dir)
   if pos >= 1 and pos <= #arr and j >= 1 and j <= #arr then
     arr[pos], arr[j] = arr[j], arr[pos]
     write_song(arr)
+    chain_edited(function(p) if p == pos then return j elseif p == j then return pos end return p end)
   end
 end
 
@@ -305,6 +316,15 @@ function M.SongReorder(from, to)
   local moved = table.remove(arr, from)
   table.insert(arr, to, moved)
   write_song(arr)
+  chain_edited(function(p)
+    if p == from then return to end
+    if from < to then
+      if p > from and p <= to then return p - 1 end
+    elseif p >= to and p < from then
+      return p + 1
+    end
+    return p
+  end)
 end
 
 function M.SongSetRepeats(pos, n)
@@ -312,6 +332,7 @@ function M.SongSetRepeats(pos, n)
   if pos >= 1 and pos <= #arr then
     arr[pos].n = math.max(1, math.min(64, math.floor(n or 1)))
     write_song(arr)
+    chain_edited(function(p) return p end)
   end
 end
 
@@ -323,7 +344,10 @@ function M.SongBumpRepeats(pos, delta)
   end
 end
 
-function M.SongClear() write_song({}) end
+function M.SongClear()
+  write_song({})
+  chain_edited(function() return nil end)   -- an empty chain stops the song
+end
 
 -- GetLoop / SetLoop / ToggleLoop live below the playback-driver locals they
 -- capture (playing / saved_rep). LOOP = REAPER's transport REPEAT now — one
@@ -335,12 +359,14 @@ function M.SongClear() write_song({}) end
 
 local playing  = false       -- song-mode engaged?
 local loop     = false        -- snapshot of GetLoop() taken at SongPlay
-local seq      = {}           -- flattened steps: { {idx, start, end_, entry}, ... }
+local seq      = {}           -- flattened steps: { {idx, start, end_, entry, rep}, ... }
 local step_i   = 1            -- index into seq of the region we believe is playing
 local last_pp  = 0            -- previous play position (wrap detection)
 local pending  = nil          -- "play next": a freshly built seq (arrangement
                               -- switch) that takes over at the CURRENT region's
                               -- boundary instead of restarting the transport
+local detached = nil          -- the step still sounding after its chain entry was
+                              -- removed mid-song (see chain_edited); nil otherwise
 local saved_ss  = nil         -- saved 'smoothseek' to restore on stop
 local saved_rep = nil         -- saved transport REPEAT state (forced OFF during song play)
 
@@ -385,13 +411,14 @@ end
 function M.ToggleLoop() M.SetLoop(not M.GetLoop()) end
 
 -- Flatten the chain into one step per repeat, carrying each step's source
--- chain-entry position (1-based) so the UI can highlight the playing entry.
+-- chain-entry position (1-based) so the UI can highlight the playing entry,
+-- and its repeat ordinal so a chain edit can find the same step again.
 local function build_seq()
   local out = {}
   for entry, e in ipairs(M.SongList()) do
     local reps = math.max(1, e.repeats or 1)
-    for _ = 1, reps do
-      out[#out + 1] = { idx = e.idx, start = e.region.start, end_ = e.region.end_, entry = entry }
+    for rep = 1, reps do
+      out[#out + 1] = { idx = e.idx, start = e.region.start, end_ = e.region.end_, entry = entry, rep = rep }
     end
   end
   return out
@@ -400,10 +427,59 @@ end
 function M.IsPlaying() return playing end
 
 -- Which chain-entry position is currently playing (for the now-playing glow),
--- or nil when not in song playback.
+-- or nil when not in song playback (or the playing entry was removed).
 function M.CurrentEntryPos()
-  if playing and seq[step_i] then return seq[step_i].entry end
+  if playing and not detached and seq[step_i] then return seq[step_i].entry end
   return nil
+end
+
+-- A chain edit while the song plays: rebuild the flattened seq from the edited
+-- chain and keep our place in it. remap(old_pos) says where chain entry old_pos
+-- went (nil = removed). The entry now playing stays the current step (same
+-- entry, same repeat -- or its last repeat when the count shrank); an entry
+-- that was removed finishes as a DETACHED step and the chain goes on from the
+-- entry that now stands where it stood; an empty chain stops. Before this only
+-- an arrangement switch touched the running seq: append / remove / move /
+-- repeats / clear left the old order playing and the now-playing glow on the
+-- wrong entry (audit DM114, 2026-10-26). An edit made while an arrangement
+-- switch is parked lands in the parked chain: that is the chain being edited.
+chain_edited = function(remap)
+  if not playing then return end
+  if pending then
+    pending = build_seq()
+    if #pending == 0 then M.SongStop() end
+    return
+  end
+  local cur = detached or seq[step_i]
+  local ns = build_seq()
+  if #ns == 0 then M.SongStop(); return end
+  local new_pos = (cur and cur.entry) and remap(cur.entry) or nil
+  if new_pos then
+    local found, last = nil, nil
+    for i, st in ipairs(ns) do
+      if st.entry == new_pos then
+        last = i
+        if st.rep == cur.rep then found = i end
+      end
+    end
+    found = found or last
+    if found then
+      seq, step_i, detached = ns, found, nil
+      return
+    end
+  end
+  -- The playing entry is gone: let it finish; the step after it is the first
+  -- step of the entry that followed it (now shifted down), or the chain's end.
+  local after_i = #ns + 1
+  if cur and cur.entry then
+    local nxt = remap(cur.entry + 1)
+    if nxt then
+      for i, st in ipairs(ns) do
+        if st.entry == nxt then after_i = i; break end
+      end
+    end
+  end
+  seq, step_i, detached = ns, after_i - 1, cur
 end
 
 -- "Play next" for arrangement switches: while a song plays, rebuild the
@@ -420,7 +496,7 @@ end
 
 function M.SongPlay()
   seq = build_seq()
-  pending = nil
+  pending, detached = nil, nil
   if #seq == 0 then status('EON DM: song is empty — add patterns first'); return false end
   loop = M.GetLoop()
   save_smoothseek()
@@ -438,7 +514,7 @@ end
 function M.SongStop()
   if not playing then return end
   playing = false
-  pending = nil
+  pending, detached = nil, nil
   restore_smoothseek()
   if (reaper.GetPlayState() & 1) == 1 then reaper.OnStopButton() end
   status('EON DM: song stopped')
@@ -457,7 +533,7 @@ end
 function M.SongDetach()
   if not playing then return false end
   playing = false
-  pending = nil
+  pending, detached = nil, nil
   if saved_ss ~= nil and reaper.SNM_SetIntConfigVar then
     reaper.SNM_SetIntConfigVar('smoothseek', saved_ss)
   end
@@ -484,7 +560,10 @@ function M.SongTick()
   loop = M.GetLoop()
 
   local pp  = reaper.GetPlayPosition()
-  local cur = seq[step_i]
+  -- A detached step (its chain entry was removed mid-song) is the one sounding
+  -- until its boundary; seq[step_i] is then the step BEFORE the one that follows.
+  local cur = detached or seq[step_i]
+  if not cur then M.SongStop(); return end
 
   -- Has the queued boundary seek FIRED since last frame?
   --   forward to a later region  -> pp >= cur.end_  (lands at next.start)
@@ -494,6 +573,7 @@ function M.SongTick()
   local same_rep_wrap = (pp < last_pp - 0.05)
 
   if left_current or same_rep_wrap then
+    detached = nil
     if pending then
       -- Arrangement handover: the boundary seek we queued pointed at the new
       -- chain's first region — adopt the new seq from its top.

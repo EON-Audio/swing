@@ -177,9 +177,12 @@ local NATIVES = {
   { key = "projbay_0", ident = "projbay_0", cmd = 41157, label = "Project Bay" },
 }
 
+-- Keys and values may carry an underscore: `%w+` could not, so the Project Bay
+-- native ("projbay_0=bottom") loaded back as natives["0"], its checkbox showed
+-- unticked and the next save dropped it (sweep SCR14).
 local function parse_pairs(s, numeric)
   local t = {}
-  for k, v in s:gmatch("(%w+)=(%w+)") do
+  for k, v in s:gmatch("([%w_]+)=([%w_%-%.]+)") do
     t[k] = numeric and tonumber(v) or v
   end
   return t
@@ -389,29 +392,44 @@ end
 -- "not visible" is a cheap and reliable "empty, safe to repurpose", and it is
 -- what keeps the edge-moving tier below from picking up a docker that holds
 -- the user's Mixer and carrying it to an edge they never asked about.
+--
+-- One survey per picker frame (ds_gen is bumped at the top of loop()): the
+-- cards asked for it seven times a frame -- the base plan, then a plan and a
+-- seating per template card -- and each ask is a walk over every window on
+-- the desktop plus sixty-four dock queries (sweep SCR121 / SCR125). Nothing
+-- moves between two asks in one frame; whatever moves a docker reads again
+-- next frame, as it already did.
+local ds_cache, ds_gen, ds_seen = nil, 0, -1
 local function docker_state()
+  if ds_cache and ds_seen == ds_gen then return ds_cache end
+  -- Without the JS API no docker's windows can be seen. Unknown is NOT empty:
+  -- every docker then reads as showing, so the move-edge tier and the free
+  -- search never hand out one holding the user's own windows (sweep SCR122).
+  local known = reaper.APIExists("JS_Window_ListFind")
   local st = {}
   for i = 0, 15 do
-    st[i] = { pos = POS_EDGE[reaper.DockGetPosition(i)], vis = false }
+    st[i] = { pos = POS_EDGE[reaper.DockGetPosition(i)], vis = not known }
   end
-  if not reaper.APIExists("JS_Window_ListFind") then return st end
-  local cnt, list = reaper.JS_Window_ListFind("REAPER_dock", true)
-  if cnt and cnt > 0 then
-    for tok in (list .. ","):gmatch("(.-),") do
-      local a = tonumber(tok)
-      local h = a and reaper.JS_Window_HandleFromAddress(a)
-      local idx = h and reaper.DockIsChildOfDock(h)
-      if idx and st[idx] then
-        st[idx].hwnd = h
-        st[idx].vis = reaper.JS_Window_IsVisible(h)
-        local ok, l, t, r, b = reaper.JS_Window_GetRect(h)
-        if ok then
-          st[idx].x, st[idx].y = l, t
-          st[idx].w, st[idx].h = r - l, b - t
+  if known then
+    local cnt, list = reaper.JS_Window_ListFind("REAPER_dock", true)
+    if cnt and cnt > 0 then
+      for tok in (list .. ","):gmatch("(.-),") do
+        local a = tonumber(tok)
+        local h = a and reaper.JS_Window_HandleFromAddress(a)
+        local idx = h and reaper.DockIsChildOfDock(h)
+        if idx and st[idx] then
+          st[idx].hwnd = h
+          st[idx].vis = reaper.JS_Window_IsVisible(h)
+          local ok, l, t, r, b = reaper.JS_Window_GetRect(h)
+          if ok then
+            st[idx].x, st[idx].y = l, t
+            st[idx].w, st[idx].h = r - l, b - t
+          end
         end
       end
     end
   end
+  ds_cache, ds_seen = st, ds_gen
   return st
 end
 
@@ -637,12 +655,14 @@ local function build_plan(spread, edges, order)
       -- ⭐ MEASURED 2026-08-27: re-docking APPENDS a pane to the end of its
       -- edge's row (Steppa moved docker 0 -> 5 and jumped from the middle of
       -- the bottom row to the far right, past a Pad FX that never moved). So
-      -- visible order = DOCKING order, and an ordered template gets it by
-      -- re-docking its panes one at a time in sequence.
-      -- ⚠️ Which means every ordered pane must genuinely MOVE. A pane handed
-      -- the docker it is already in would either no-op or, at best, be a bet
-      -- on unmeasured behaviour -- so an ordered pane is never assigned its
-      -- current docker, and the sequence is guaranteed to be real moves.
+      -- visible order = DOCKING order, and an ordered template first got its
+      -- order by re-docking its panes one at a time in sequence -- which needs
+      -- every ordered pane to genuinely MOVE, hence `avoid`: the searches below
+      -- skip an ordered pane's current docker (the share fallback does not).
+      -- ⚠️ BOTH mechanisms run today. seat_by_order (after this resolve) now
+      -- delivers the order on its own, by handing the dockers picked here to
+      -- an edge's panes in screen order, and plan_moves skips a pane seated
+      -- back in its own docker. `avoid` only changes WHICH dockers get picked.
       local avoid = order and home_idx[p.key] or nil
       for i = 0, 15 do
         if pos[i] == dfl and not claimed[i] and i ~= avoid then pick = i; break end
@@ -692,8 +712,13 @@ local function build_plan(spread, edges, order)
       -- REAPER's main dock and the likeliest to be holding something of
       -- theirs. A docker REAPER reports no edge for (floating) is skipped —
       -- those are not ours to reposition.
+      -- ⛔ Templates and Spread only, like the spread tier: those run the
+      -- sequencer, whose edge stage performs the push. A plain pick ships a
+      -- staged docker and runs nothing, so the card drew Pad FX on its edge
+      -- and the pick landed it on the docker's OWN edge (sweep SCR15). A
+      -- plain pick falls through to sharing or floating, as it always did.
       local move_edge = false
-      if not pick then
+      if not pick and (edges or spread) then
         for i = 1, 16 do
           local d = i % 16
           if pos[d] and empty[d] and not claimed[d] and d ~= avoid then
@@ -811,7 +836,7 @@ end
 -- defined below with the rest of the Spread machinery, but apply() needs them
 -- here. Lua locals are position-scoped -- the trap that silently broke the
 -- bridge relay -- so the names are claimed now and filled in there.
-local report, plan_moves
+local report, plan_moves, pane_running
 
 local function apply(choice)
   local L = LAYOUTS[choice]
@@ -821,14 +846,25 @@ local function apply(choice)
   local out, msg, queue, queue_stuck, sizing = {}, nil, nil, nil, nil
   if L.edges then
     -- TEMPLATE: it owns where its panes go, so it writes every carried pane's
-    -- restore slot itself and moves the ones already open. Nothing is left for
-    -- the Dock View pre-seed -- shipping a plan as well would have the two
-    -- writing different targets into the same key, last one wins.
+    -- restore slot itself and moves the ones already open.
     -- Dock SHAPE before pane PLACEMENT: changing dockposflags re-lays the
     -- whole docker frame, so moving panes first would only have them shuffled
     -- again underneath. (Dead on the current build -- see dockpos_get.)
     local shape = dockpos_apply(L.name, L.dockpos)
     local moves, stuck = plan_moves(L.panes, L.edges, L.order)
+    -- A carried pane that is CLOSED rides the plan the Dock View (launched
+    -- below) pre-seeds, to the SAME docker the sequencer has for it: it then
+    -- opens straight into that docker instead of at its old home and
+    -- re-docking a moment later (sweep SCR123). It keeps its step for the
+    -- edge push, which needs its window; the dock stage sends nothing to a
+    -- seeded pane. (The Dock View clears the Browser's one-shot stage before
+    -- writing its own, so the plan is the one write that survives.)
+    for _, m in ipairs(moves) do
+      if m.key and not pane_running(m.key) then
+        out[#out + 1] = m.key .. "=" .. m.idx
+        m.seeded = true
+      end
+    end
     -- REAPER's own windows go LAST, after every pane has landed. By then the
     -- panes' dockers are occupied, so the empty-docker search cannot hand a
     -- native a slot a pane was about to take.
@@ -889,7 +925,10 @@ end
 -- REAPER's own docker setting. We can put a pane in docker 4 -- whether docker
 -- 4 is at the bottom or the right is the user's. With fewer dockers than panes
 -- the resolver falls back to sharing, which is exactly what the cards draw.
-local function pane_running(key)
+-- ⚠️ `pane_running = function`, filling the forward declaration above apply()
+-- (which asks it which carried panes are closed): `local function` here would
+-- declare a SECOND local and leave apply's upvalue nil.
+pane_running = function(key)
   if key == "swing" or key == "steppa" then
     -- Per-kind liveness stamp, written every pane tick and zeroed in save_dock.
     local hb = tonumber(reaper.GetExtState(key == "swing" and "EON_SwingDock"
@@ -929,22 +968,6 @@ local function send_to_docker(key, idx, live)
   end
 end
 
--- Returns a report string for the footer. Says WHERE each pane went, because
--- "it did nothing" and "it moved things you cannot see moving" look identical
--- from the outside -- and on a rig whose dockers all share one screen edge the
--- second is the common case (2026-08-27).
--- Fills the forward declaration above apply(). Two callers: the Spread button
--- (no edges, the active layout's panes) and a template pick (the template's
--- edges and panes).
--- Work out the moves WITHOUT performing them. Two callers want different
--- things from the same answer: "Spread panes" fires them all at once (it only
--- cares that panes stop sharing, not what order they end up in), while an
--- ordered template has to walk them ONE AT A TIME -- because visible order is
--- docking order, and firing four requests together is a race between four
--- defer loops, which is no order at all.
--- ⚠️ `plan_moves = function`, filling the forward declaration above apply().
--- `local function` here would declare a SECOND local and leave the
--- forward-declared one nil -- the same trap that shipped `report` broken.
 -- ── seat the panes by declared order, without moving a single docker ────────
 --
 -- `order` used to be delivered by the APPEND sequence: re-dock the panes one
@@ -995,6 +1018,14 @@ local function seat_by_order(plan, order)
   return plan
 end
 
+-- Work out the moves WITHOUT performing them. Fills the forward declaration
+-- above apply(). Two callers: the Spread button (no edges, the active layout's
+-- panes) and a template pick (the template's edges, panes and order). Both hand
+-- the moves to the same sequencer, which walks them ONE AT A TIME (see apply()
+-- and spread_panes()).
+-- ⚠️ `plan_moves = function`, filling the forward declaration above apply().
+-- `local function` here would declare a SECOND local and leave the
+-- forward-declared one nil -- the same trap that shipped `report` broken.
 plan_moves = function(panes, edges, order)
   local plan = seat_by_order(build_plan(true, edges, order), order)
   local moves, stuck = {}, {}
@@ -1030,8 +1061,10 @@ plan_moves = function(panes, edges, order)
     end
   end
   -- ⚠️ ORDERED: walk the template's own order, not the layout's pane list.
-  -- The list is just "which panes", while the ORDER is the whole point -- and
-  -- a re-dock appends, so the sequence the requests go out in IS the row.
+  -- The list is just "which panes", while the ORDER is the whole point.
+  -- seat_by_order already gave each pane its docker in screen order; sending
+  -- the requests in declared order is kept from the append approach (a
+  -- re-dock appends to its edge's row).
   if order then
     local rank, seq = {}, {}
     local n = 0
@@ -1044,6 +1077,10 @@ plan_moves = function(panes, edges, order)
   return moves, stuck
 end
 
+-- Returns a report string for the footer. Says WHERE each pane went, because
+-- "it did nothing" and "it moved things you cannot see moving" look identical
+-- from the outside -- and on a rig whose dockers all share one screen edge the
+-- second is the common case (2026-08-27).
 -- One report line for both callers. Order matters: what MOVED is the answer to
 -- "did anything happen", and an unreachable edge is the answer to "why not".
 -- ⚠️ `report = function`, NOT `local function report`: this fills the forward
@@ -1060,6 +1097,17 @@ report = function(moved, stuck, idle)
   end
   if #parts == 0 then return idle end
   return table.concat(parts, "  ·  ")
+end
+
+-- The footer line when a sequence ends: what moved, what had no docker, and
+-- how many never confirmed. The count rides as a tail whenever anything else
+-- is said -- report() returns the stuck text alone when nothing moved, which
+-- used to drop it (sweep SCR127) -- and stands alone when nothing else is.
+local function seq_summary(done, stuck, late)
+  local lateword = (late > 0) and (late .. " did not confirm") or nil
+  local text = report(done, stuck, lateword or "already arranged")
+  if lateword and (#done > 0 or #stuck > 0) then text = text .. "  ·  " .. lateword end
+  return text
 end
 
 -- ── sizing pass ─────────────────────────────────────────────────────────────
@@ -1212,10 +1260,6 @@ local function size_report(depths, shares, panes)
   return "REAPER clamped: " .. table.concat(bad, ", ")
 end
 
--- Returns (msg, queue, stuck) exactly like apply(), and for the same reason:
--- a step is no longer only "re-dock", it may have to move that docker to
--- another edge afterwards, and that cannot be fired until the pane is in it.
--- So Spread rides the same sequencer instead of sending everything at once.
 -- ── which window each SHARED docker is showing ──────────────────────────────
 --
 -- Spread puts panes on dockers of their own; this is the other half, for the
@@ -1413,16 +1457,25 @@ local function strip_show()
         end
       end
       -- One-pixel nudge: cheaper and safer than re-deriving every pane rect.
+      -- SIZE only. The docker is a child of the main window, and
+      -- JS_Window_SetPosition places a child relative to its parent's client
+      -- area, so handing it the SCREEN rect from JS_Window_GetRect shifted the
+      -- docker right and down by the frame and menu height until REAPER's next
+      -- full re-layout (sweep SCR16; strip_hide converts its pane rects).
       local D = st[idx]
       if D.w and D.h then
-        reaper.JS_Window_SetPosition(dh, D.x, D.y, D.w, D.h - 1)
-        reaper.JS_Window_SetPosition(dh, D.x, D.y, D.w, D.h)
+        reaper.JS_Window_Resize(dh, D.w, D.h - 1)
+        reaper.JS_Window_Resize(dh, D.w, D.h)
       end
     end
   end
   return n > 0 and ("put %d strip(s) back"):format(n) or "no hidden strips"
 end
 
+-- Returns (msg, queue, stuck) exactly like apply(), and for the same reason:
+-- a step is no longer only "re-dock", it may have to move that docker to
+-- another edge afterwards, and that cannot be fired until the pane is in it.
+-- So Spread rides the same sequencer instead of sending everything at once.
 local function spread_panes()
   local panes = reaper.GetExtState("EON_DockView", "panes")
   if panes == "" then panes = LAYOUTS[1].panes end
@@ -1447,15 +1500,22 @@ end
 if not reaper.ImGui_GetBuiltinPath then
   local cur = reaper.GetExtState("EON_DockView", "layout")
   if cur == "" then cur = LAYOUTS[1].name end
-  local items = {}
+  -- The plain layouts only. A template's moves and sizes are walked by the
+  -- card picker's sequencer, and there is none here: listing it stored the
+  -- pick, launched the Dock View with an empty plan and placed nothing
+  -- (sweep SCR124).
+  local items, pick = {}, {}
   for i, L in ipairs(LAYOUTS) do
-    items[i] = (L.name == cur and "!" or "") .. L.name
+    if not L.edges then
+      items[#items + 1] = (L.name == cur and "!" or "") .. L.name
+      pick[#items] = i
+    end
   end
   local x, y = reaper.GetMousePosition()
   gfx.init("EON Dock Layout", 0, 0, 0, x, y)
   local choice = gfx.showmenu(table.concat(items, "|"))
   gfx.quit()
-  if choice and choice >= 1 then apply(choice) end
+  if choice and choice >= 1 and pick[choice] then apply(pick[choice]) end
   return
 end
 
@@ -1942,8 +2002,8 @@ local function draw_bay(dl, id, list, idx, edge)
 end
 
 -- Rebuilt every frame off live state, so moving something by hand in REAPER
--- makes the map follow. live_refresh throttles itself to 4Hz, which is what
--- keeps that cheap.
+-- makes the map follow. That stays cheap: docker_state() is the frame's one
+-- cached survey (the cards share it), and live_refresh throttles itself to 4Hz.
 local function draw_map()
   local st, occ = docker_state(), map_occupancy()
   local dl = ImGui.GetWindowDrawList(ctx)
@@ -1993,10 +2053,21 @@ local arrange_open = reaper.GetExtState("EON_DockView", "arrange_open") == "1"
 -- home is read from a file on a 1s throttle, so an ack can legitimately be
 -- slow. Better a beat of waiting than an order that gives up half way.
 local SEQ_STEP_TIMEOUT = 2.5
+-- Esc or the X pressed while a sequence or the sizing pass runs: the steps run
+-- from this loop, so stopping it mid-way left a template half placed with
+-- nothing said (sweep SCR126). The close is honoured once the queue is done.
+local close_req = false
 
 local function loop()
+  ds_gen = ds_gen + 1          -- a new frame: the docker survey is taken once for it
   if first then
-    ImGui.SetNextWindowPos(ctx, mx - 40, my - 20, ImGui.Cond_Once)
+    -- GetMousePosition is physical pixels; ImGui places windows in its own
+    -- (logical, per-monitor) units, so on a scaled monitor the raw numbers
+    -- opened the picker away from the cursor or off-screen (sweep SCR17; the
+    -- Drum Matrix overlay converts the same way).
+    local lx, ly = mx, my
+    if ImGui.PointConvertNative then lx, ly = ImGui.PointConvertNative(ctx, mx, my, false) end
+    ImGui.SetNextWindowPos(ctx, lx - 40, ly - 20, ImGui.Cond_Once)
     first = false
   end
   local flags = ImGui.WindowFlags_NoCollapse | ImGui.WindowFlags_AlwaysAutoResize
@@ -2312,23 +2383,35 @@ local function loop()
       local s    = seq.steps[seq.i]
       local what = (s.nat and s.nat.label) or s.key or "?"
       local dest = s.idx and ("docker " .. s.idx) or (s.edge or "?")
-      ImGui.TextDisabled(ctx, string.format("placing %d/%d: %s → %s",
-        seq.i, #seq.steps, what, dest))
+      ImGui.TextDisabled(ctx, string.format("placing %d/%d: %s → %s%s",
+        seq.i, #seq.steps, what, dest, close_req and "  ·  closes when done" or ""))
     elseif spread_msg and reaper.time_precise() - spread_msg_t < 6 then
       ImGui.TextDisabled(ctx, "spread: " .. spread_msg)
     end
     if ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then open = false end
     ImGui.End(ctx)
   end
+  -- A close while a queue runs waits for it (see close_req): the window stays
+  -- up, the footer says so, and the queue's end honours the close.
+  if not open and (seq or szq) then close_req, open = true, true end
+  -- One sequence at a time, for every way of starting one -- a pick, Spread, a
+  -- map drop: a second one replaced the first (its pending edge push and its
+  -- sizing pass dropped) or raced it for dockers (sweep SCR19). The native
+  -- drop already refused; now they all do, with the same message.
+  local BUSY = "still placing the last one — try again in a moment"
   if spread then
     spread = false
-    local msg, queue, stuck = spread_panes()
-    if queue then
-      seq = { steps = queue, i = 1, done = {}, late = 0, stuck = stuck }
+    if seq or szq then
+      spread_msg = BUSY
     else
-      spread_msg   = msg
-      spread_msg_t = reaper.time_precise()
+      local msg, queue, stuck = spread_panes()
+      if queue then
+        seq = { steps = queue, i = 1, done = {}, late = 0, stuck = stuck, from = "spread" }
+      else
+        spread_msg = msg
+      end
     end
+    spread_msg_t = reaper.time_precise()
   end
   if tabs_req then
     -- After End, like every other action here: it takes focus, and doing that
@@ -2343,26 +2426,40 @@ local function loop()
     local d = map_drop
     map_drop = nil
     local kind, key = d.what:match("^(%a+):(.+)$")
-    local idx = d.idx or (d.edge and free_docker_for(d.edge))
-    if not idx then
+    local idx = not (seq or szq) and (d.idx or (d.edge and free_docker_for(d.edge))) or nil
+    if seq or szq then
+      spread_msg = BUSY
+    elseif not idx then
       spread_msg = "no free docker on the " .. tostring(d.edge) ..
                    " edge — all sixteen are spoken for"
     elseif kind == "pane" then
-      send_to_docker(key, idx, true)
-      live_refresh(true)      -- the handle we had is gone; re-read before drawing
-      spread_msg = (MAP_PANE_LABEL[key] or key) .. " → docker " .. idx
+      if d.edge and pane_running(key) then
+        -- "+ new on <edge>": free_docker_for's second pass hands out an empty
+        -- docker on ANY edge (its comment expects the push to follow), so the
+        -- drop landed wherever that docker happened to be (sweep SCR18). The
+        -- step carries the wanted edge; the sequencer's edge stage pushes the
+        -- docker there once the pane is inside it, and the footer reports both.
+        -- A CLOSED pane has no window to aim the push with: it takes the slot
+        -- below, and the footer names the edge it will open on.
+        seq = { steps = { { key = key, idx = idx, edge = d.edge } },
+                i = 1, done = {}, late = 0, stuck = {}, from = "drop" }
+      else
+        send_to_docker(key, idx, true)
+        live_refresh(true)      -- the handle we had is gone; re-read before drawing
+        spread_msg = (MAP_PANE_LABEL[key] or key) .. " → docker " .. idx ..
+                     " (" .. (docker_edge(idx) or "floating") .. ")"
+      end
     elseif kind == "native" then
       local nat
       for _, n in ipairs(NATIVES) do if n.key == key then nat = n end end
       if not nat then
         spread_msg = "unknown window: " .. tostring(key)
-      elseif seq then
-        -- One sequence at a time; the second would race the first for dockers.
-        spread_msg = "still placing the last one — try again in a moment"
       else
+        -- An edge drop keeps the edge it asked for (the push follows); a bay
+        -- drop names the exact docker, whose edge is whatever it is.
         seq = { steps = { { kind = "native", nat = nat, idx = idx,
-                            edge = docker_edge(idx) } },
-                i = 1, done = {}, late = 0, stuck = {} }
+                            edge = d.edge or docker_edge(idx) } },
+                i = 1, done = {}, late = 0, stuck = {}, from = "drop" }
       end
     end
     spread_msg_t = reaper.time_precise()
@@ -2398,17 +2495,22 @@ local function loop()
     spread_msg_t = reaper.time_precise()
   end
   if picked then
-    local msg, queue, stuck, sizing = apply(picked)
+    local choice = picked
     picked = nil                 -- Keep open: stay a palette, arm the next pick
-    -- Templates MOVE things, so they owe the same account of themselves the
-    -- Spread button gives. A plain pick returns nil and says nothing.
-    if msg then spread_msg, spread_msg_t = msg, reaper.time_precise() end
-    if queue then
-      seq = { steps = queue, i = 1, done = {}, late = 0, stuck = stuck, sizing = sizing }
-    elseif sizing then
-      szq = { sz = sizing, i = 1, wait = SIZE_SETTLE }
-    elseif not keep then
-      return                     -- picked: stop deferring, window closes with us
+    if seq or szq then
+      spread_msg, spread_msg_t = BUSY, reaper.time_precise()
+    else
+      local msg, queue, stuck, sizing = apply(choice)
+      -- Templates MOVE things, so they owe the same account of themselves the
+      -- Spread button gives. A plain pick returns nil and says nothing.
+      if msg then spread_msg, spread_msg_t = msg, reaper.time_precise() end
+      if queue then
+        seq = { steps = queue, i = 1, done = {}, late = 0, stuck = stuck, sizing = sizing, from = "pick" }
+      elseif sizing then
+        szq = { sz = sizing, i = 1, wait = SIZE_SETTLE }
+      elseif not keep then
+        return                   -- picked: stop deferring, window closes with us
+      end
     end
   end
 
@@ -2431,19 +2533,19 @@ local function loop()
   if seq then
     local step = seq.steps[seq.i]
     if not step then
-      local tail = (#seq.done > 0 and seq.late > 0)
-        and ("  ·  " .. seq.late .. " did not confirm") or ""
-      spread_msg = report(seq.done, seq.stuck or {},
-        (seq.late > 0) and (seq.late .. " did not confirm") or "already arranged") .. tail
+      spread_msg = seq_summary(seq.done, seq.stuck or {}, seq.late)
       spread_msg_t = reaper.time_precise()
-      local sizing = seq.sizing
+      local sizing, from = seq.sizing, seq.from
       seq = nil
       -- The pick that started this was allowed to skip its close so the loop
       -- could keep running; honour it now -- unless the sizing pass still has
-      -- to run, in which case the close waits for that instead.
+      -- to run, in which case the close waits for that instead. Only a PICK
+      -- closes: Spread and a map drop never close the picker (their report
+      -- vanished with the window when this assumed every queue was a pick,
+      -- sweep SCR110). A close requested mid-queue is honoured here too.
       if sizing then
         szq = { sz = sizing, i = 1, wait = SIZE_SETTLE }
-      elseif not keep then
+      elseif close_req or (not keep and from == "pick") then
         return
       end
     elseif step.kind == "native" then
@@ -2489,7 +2591,9 @@ local function loop()
         end
       end
     elseif not step.stage then
-      send_to_docker(step.key, step.idx, pane_running(step.key))
+      -- A pane the pick seeded through the Dock View's plan is already on its
+      -- way into this docker: sending again would re-dock it onto itself.
+      if not step.seeded then send_to_docker(step.key, step.idx, pane_running(step.key)) end
       step.stage, step.t = "dock", reaper.time_precise()
     elseif step.stage == "dock" then
       -- Tested ONCE, at the hand-off: after an edge move a gfx pane rebuilds
@@ -2547,7 +2651,7 @@ local function loop()
         spread_msg_t = reaper.time_precise()
       end
       szq = nil
-      if not keep then return end
+      if close_req or not keep then return end   -- the sizing pass only ever follows a pick
     end
   end
 

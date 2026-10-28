@@ -10,19 +10,22 @@
 --   2. Detects whether a Drum Matrix folder already exists for this Swing
 --      instance (by matching swing_guid in P_EXT:EON_DRUM_KIT_FOLDER), and
 --      offers Replace / Add parallel / Cancel.
---   3. Inserts a folder track named after the live Swing kit, plus 16 child
+--   3. Inserts a folder track named "MIDI" (a parallel set: "MIDI Kit 2",
+--      "MIDI Kit 3", ...; the kit name rides Swing's parent folder), plus 16 child
 --      MIDI tracks named "01 <Pad>" ... "16 <Pad>", each colored on a rainbow
 --      hue, each with a MIDI send to the Swing track, each with a 4-bar dim
 --      MIDI item at the edit cursor.
 --   4. Writes P_EXT JSON tags so eon_drum_matrix.lua and helpers can find
 --      everything by GUID later.
 --
--- Defer-based timing fix (mirrors EON_DM_SeedLane.lua):
--- Swing JSFX only publishes pad metadata to gmem when gmem[99]
--- (KIT_GMEM_BRIDGE_ALIVE) is recent. Phase 1 runs immediately (validation,
--- guards, collision dialog, bump heartbeat), then defers to Phase 2 which
--- waits up to ~10 frames for gmem[1711] (GS_SWING_ALIVE) to tick before
--- reading pads and building.
+-- Defer-based timing (mirrors EON_DM_SeedLane.lua): Phase 1 runs immediately
+-- (validation, guards, collision dialog), then defers to Phase 2 which waits
+-- up to ~10 frames for the chosen instance's registry slot (or gmem[1711],
+-- GS_SWING_ALIVE, with one Swing) before reading pads and building. Swing
+-- publishes its pad bands whatever the bridge-alive cell (99) holds, so this
+-- script no longer stamps it (DM213, 2026-10-26: the stamp impersonated a
+-- bridge for 5 s -- a real one refused to start, a fresh Swing posted its
+-- auto-load into silence).
 
 local r = reaper
 
@@ -42,6 +45,8 @@ local safety   = dofile(SCRIPT_DIR .. 'lib/safety.lua')
 local folder_layout = dofile(SCRIPT_DIR .. 'lib/folder_layout.lua')
 -- Swing-FX detection + per-instance registry/identity reads (multi-Swing).
 local swing_state = dofile(SCRIPT_DIR .. 'lib/swing_state_reader.lua')
+-- The stereo -> lanes migration reads the stereo item the way REAPER plays it (merged_mirror.CollectItem).
+local mirror = dofile(SCRIPT_DIR .. 'lib/merged_mirror.lua')
 -- House dialog (ReaImGui, async) for the end-of-build notice; every use
 -- gates on available() and keeps ShowMessageBox as the fallback, so a
 -- missing ReaImGui or a missing module file costs nothing but the styling.
@@ -289,7 +294,20 @@ local function delete_kit_folder(folder_track)
     depth = depth + d
     i = i + 1
   end
-  -- Delete bottom-up.
+  -- Delete bottom-up, each with depth 0, the folder's own net close handed to the track above it first (S.12,
+  -- 2026-10-27): the API's DeleteTrack takes a track's I_FOLDERDEPTH away with it, so the last lane's close went
+  -- and Swing's parent ran open over the user's tracks below; EndOfParentIndex then put the new MIDI folder after
+  -- them and folder_layout kept them inside the parent. Zeroed bottom-up, a close before the open it closes (never
+  -- a transient over-close, wiki 6.20).
+  local net = 0
+  for k = #victims, 1, -1 do
+    local d = r.GetMediaTrackInfo_Value(victims[k], 'I_FOLDERDEPTH')
+    if d ~= 0 then net = net + d; r.SetMediaTrackInfo_Value(victims[k], 'I_FOLDERDEPTH', 0) end
+  end
+  local above = folder_idx >= 1 and r.GetTrack(0, folder_idx - 1)
+  if above and net < 0 then
+    r.SetMediaTrackInfo_Value(above, 'I_FOLDERDEPTH', r.GetMediaTrackInfo_Value(above, 'I_FOLDERDEPTH') + net)
+  end
   for k = #victims, 1, -1 do
     r.DeleteTrack(victims[k])
   end
@@ -303,7 +321,7 @@ local function kit_suffix_for_existing(existing_count)
 end
 
 -- ---------------------------------------------------------------------------
--- Phase 1: validate, attach gmem, bump heartbeat, defer to Phase 2
+-- Phase 1: validate, attach gmem, pick the instance, defer to Phase 2
 -- ---------------------------------------------------------------------------
 
 local swing_hits = find_swing_track()
@@ -376,6 +394,32 @@ do
   end
 end
 
+-- Merged drum tracks for this Swing feed it through a hidden trigger track; classic lanes' MIDI sends would
+-- trigger the same kit a second time (DM215, 2026-10-26 -- EON_DM_BuildMerged asks the same the other way round).
+-- Merged mode writes no EON_DRUM_KIT_FOLDER, so the folder check below cannot see it. Make the user choose.
+do
+  local merged = 0
+  for i = 0, r.CountTracks(0) - 1 do
+    local _, raw = r.GetSetMediaTrackInfo_String(r.GetTrack(0, i), 'P_EXT:EON_DRUM_LANE', '', false)
+    if raw and raw ~= '' then
+      local ok, lane = pcall(json.decode, raw)
+      if ok and type(lane) == 'table' and lane.merged == true
+         and lane.swing_instance_guid == swing_guid then
+        merged = merged + 1
+      end
+    end
+  end
+  if merged > 0 then
+    local resp = r.ShowMessageBox(
+      string.format('%d merged drum track(s) already feed this Swing through its hidden trigger track.\n\n' ..
+                    'Their trigger and the new lanes\' MIDI sends would BOTH trigger the same kit\n' ..
+                    '(double hits for any beat that lives in both).\n\n' ..
+                    'Build classic lanes anyway?', merged),
+      'EON DM Build', 4)   -- Yes/No
+    if resp ~= 6 then return end
+  end
+end
+
 -- Collision: are there already DM folder(s) for this Swing instance?
 local existing = find_existing_kit_folders(swing_guid)
 local replace_existing = false
@@ -400,7 +444,6 @@ if #existing > 0 then
 end
 
 r.gmem_attach('Swing_Media_Transfer')
-r.gmem_write(99, os.time())   -- bump KIT_GMEM_BRIDGE_ALIVE so JSFX publishes.
 
 local frames_waited = 0
 
@@ -466,6 +509,12 @@ local function do_build(slot)
   -- dropped, by design). Captured NOW, before the tag/items are touched. The
   -- lane items grow to cover the whole stereo span so no note is lost; the
   -- write + source-item delete happen after the lanes exist (below).
+  -- Read as REAPER PLAYS it (merged_mirror.CollectItem, DM21, 2026-10-26): a
+  -- play per loop period while inside the item (the bridge seeds 'Pattern 1'
+  -- as a 1-bar loop source: dragged to 8 bars it plays 8 times, and the old
+  -- one-pass read kept one bar then silence), clipped to the item, muted notes
+  -- carried over muted. A MUTED item is not migrated and not deleted: it stays
+  -- on the Swing track, muted, as the user left it.
   local lane_takes = {}
   local migrate_notes, build_t0, build_t1 = nil, cursor_time, item_end_t
   if clear_stereo_tag then
@@ -474,22 +523,17 @@ local function do_build(slot)
       local pd = pads[i]
       if pd and pd.pitch then pitch2pad[pd.pitch] = pitch2pad[pd.pitch] or i end
     end
-    local notes, tmin, tmax = {}, nil, nil
+    local plays = {}
     for ii = 0, r.CountTrackMediaItems(swing_track) - 1 do
-      local take = r.GetActiveTake(r.GetTrackMediaItem(swing_track, ii))
-      if take and r.TakeIsMIDI(take) then
-        local _, ncnt = r.MIDI_CountEvts(take)
-        for j = 0, ncnt - 1 do
-          local ok, _, _, ps, pe, _, pitch, vel = r.MIDI_GetNote(take, j)
-          local pad = ok and pitch2pad[pitch]
-          if pad then
-            local ts = r.MIDI_GetProjTimeFromPPQPos(take, ps)
-            local te = r.MIDI_GetProjTimeFromPPQPos(take, pe)
-            notes[#notes + 1] = { pad = pad, pitch = pitch, vel = vel, ts = ts, te = te }
-            if not tmin or ts < tmin then tmin = ts end
-            if not tmax or te > tmax then tmax = te end
-          end
-        end
+      mirror.CollectItem(r.GetTrackMediaItem(swing_track, ii), plays, true)
+    end
+    local notes, tmin, tmax = {}, nil, nil
+    for _, n in ipairs(plays) do
+      local pad = pitch2pad[n.pitch]
+      if pad then
+        notes[#notes + 1] = { pad = pad, pitch = n.pitch, vel = n.vel, ts = n.s, te = n.e, muted = n.muted }
+        if not tmin or n.s < tmin then tmin = n.s end
+        if not tmax or n.e > tmax then tmax = n.e end
       end
     end
     if #notes > 0 then
@@ -538,7 +582,7 @@ local function do_build(slot)
   -- Track name is the static functional label "MIDI" (the Swing bridge's
   -- update_folder_track_name also enforces this on every sync; the kit name
   -- rides the PARENT folder "Swing — <kit>"). kit_suffix distinguishes
-  -- parallel kit sets ("MIDI 2", ...).
+  -- parallel kit sets ("MIDI Kit 2", ...).
   r.InsertTrackAtIndex(folder_idx, true)
   local folder = r.GetTrack(0, folder_idx)
   local folder_name = 'MIDI' .. kit_suffix
@@ -628,14 +672,16 @@ local function do_build(slot)
         local ppq_s = r.MIDI_GetPPQPosFromProjTime(take, mn.ts)
         local ppq_e = r.MIDI_GetPPQPosFromProjTime(take, mn.te)
         if ppq_e <= ppq_s then ppq_e = ppq_s + 1 end
-        r.MIDI_InsertNote(take, false, false, ppq_s, ppq_e, 0, mn.pitch, mn.vel, true)
+        r.MIDI_InsertNote(take, false, mn.muted or false, ppq_s, ppq_e, 0, mn.pitch, mn.vel, true)
       end
     end
     for _, take in pairs(lane_takes) do r.MIDI_Sort(take) end
     for ii = r.CountTrackMediaItems(swing_track) - 1, 0, -1 do
       local item = r.GetTrackMediaItem(swing_track, ii)
       local take = r.GetActiveTake(item)
-      if take and r.TakeIsMIDI(take) then r.DeleteTrackMediaItem(swing_track, item) end
+      if take and r.TakeIsMIDI(take) and r.GetMediaItemInfo_Value(item, 'B_MUTE') ~= 1 then
+        r.DeleteTrackMediaItem(swing_track, item)
+      end
     end
   end
 

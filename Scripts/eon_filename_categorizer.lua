@@ -17,7 +17,7 @@ local categorizer = {}
 
 local CATEGORY_KEYWORDS = {
     kick = {
-        "kick", "kck", "kik", "kk", "bd", "bassdrum", "bass_drum", "bass drum",
+        "kick", "kck", "kik", "kk", "bd", "bassdrum", "bass drum",
         -- Compound 808/909 patterns only — bare "808" matched every TR-808
         -- file (claps, congas, cowbells, toms, rimshots) and pulled them
         -- all into kick by tie-break order. These compounds only fire
@@ -33,7 +33,7 @@ local CATEGORY_KEYWORDS = {
         -- catch the real cases.
     },
     clap = {
-        "clap", "clp", "handclap", "hand_clap", "hand clap"
+        "clap", "clp", "handclap", "hand clap"
     },
     -- Sidestick/cross-stick split from rimshot (different technique, sound
     -- and icon). CATEGORY_ORDER places sidestick BEFORE rimshot so explicit
@@ -43,7 +43,7 @@ local CATEGORY_KEYWORDS = {
         "xstick", "x stick", "stick"  -- bare "stick" = stick hit, not a rim
     },
     rimshot = {
-        "rimshot", "rim shot", "rim_shot", "rim"
+        "rimshot", "rim shot", "rim"
     },
     -- Finger snaps promoted out of the percussion catch-all — hugely common
     -- in modern beats and nothing like generic hand-perc.
@@ -104,11 +104,11 @@ local CATEGORY_KEYWORDS = {
     -- generic tom in CATEGORY_ORDER. Specific names also outscore generic
     -- ("Floor Tom" hits "floor tom" + "floor" = 4 vs tom's "tom" = 2).
     floor_tom = {
-        "floor tom", "floortom", "floor_tom", "floor",
+        "floor tom", "floortom", "floor",
         "low tom", "lowtom", "lo tom"
     },
     rack_tom = {
-        "rack tom", "racktom", "rack_tom", "rack",
+        "rack tom", "racktom", "rack",
         "hi tom", "hitom", "high tom", "mid tom", "midtom"
     },
     tom = {
@@ -175,8 +175,8 @@ local CATEGORY_KEYWORDS = {
         "perc", "percussion"
     },
     bass = {
-        "bass", "sub", "808bass", "subbass", "sub_bass", "sub bass",
-        "reese", "bass synth", "bassline", "bass_line"
+        "bass", "sub", "808bass", "subbass", "sub bass",
+        "reese", "bass synth", "bassline"
     },
     synth = {
         -- Bare "lead" removed: false-positives in "release", "leader".
@@ -218,13 +218,13 @@ local CATEGORY_KEYWORDS = {
     fx = {
         "fx", "sfx", "effect", "riser", "impact", "downlifter",
         "uplifter", "whoosh", "sweep", "noise", "glitch", "stutter",
-        "transition", "reverse", "buildup", "build up", "build_up",
+        "transition", "reverse", "buildup", "build up",
         "drop", "explosion", "boom", "siren", "alarm", "foley",
         "cinematic", "hit", "one shot"
     },
     loop = {
         "loop", "break", "breakbeat", "drum loop", "drumloop",
-        "drum_loop", "top loop", "toploop", "top_loop", "groove",
+        "top loop", "toploop", "groove",
         "pattern", "beat", "full loop", "construction"
     }
 }
@@ -312,16 +312,39 @@ local CATEGORY_ORDER = {
     "vocal", "fx", "loop"
 }
 
+-- Words that only CONTAIN a keyword: "track" holds rack (a multitrack stem
+-- "Track 05.wav" became a rack tom), "telephone" tele, "sharp" harp, "organic"
+-- organ, "override" ride. Blanked before matching. The 4+ char keywords stay
+-- plain substrings on purpose ("808kick" must still hit kick), so this list is
+-- the guard for the words seen to go wrong (sweep SCR129).
+local NOT_A_KEYWORD = {
+    track = true, tracks = true, telephone = true, sharp = true,
+    organic = true, override = true, overrides = true,
+    dropbox = true,   -- a folder name, not a "drop" (fx)
+}
+local function drop_non_keywords(s)
+    return (s:gsub("%a+", function(w) return NOT_A_KEYWORD[w] and "" or w end))
+end
+
 function categorizer.classify(filename, folder_path)
-    local name_lower = filename:lower():gsub("[_%-%.%(%)]", " ")
+    local name_lower = drop_non_keywords(filename:lower():gsub("[_%-%.%(%)]", " "))
+    -- The folder's LAST name only (the pack's category folder: "Kicks/01.wav"),
+    -- and at most ONE point per category (below). Callers pass the absolute
+    -- path, and scoring every ancestor at a point per keyword let "Breakbeat
+    -- Loops" (loop, break, breakbeat, beat = 4) outvote an explicit "Kick 01"
+    -- (2), and a user named Tom or a Dropbox folder categorise keyword-less
+    -- files. A folder biases a name; it never outvotes one -- the promise in
+    -- the header (sweep SCR113).
     local folder_lower = ""
     if folder_path then
-        folder_lower = folder_path:lower():gsub("[_%-%.%(%)]", " ")
+        local last = folder_path:match("([^/\\]+)[/\\]*$") or ""
+        folder_lower = drop_non_keywords(last:lower():gsub("[_%-%.%(%)]", " "))
     end
 
     local scores = {}
     for cat, keywords in pairs(CATEGORY_KEYWORDS) do
         scores[cat] = 0
+        local folder_any = false
         for _, kw in ipairs(keywords) do
             -- Short keywords (≤3 chars) are prone to substring false
             -- positives ("rim" → "primary", "tom" → "stomach"). Use
@@ -342,8 +365,9 @@ function categorizer.classify(filename, folder_path)
                 folder_hit = folder_lower:find(kw, 1, true) ~= nil
             end
             if name_hit   then scores[cat] = scores[cat] + 2 end
-            if folder_hit then scores[cat] = scores[cat] + 1 end
+            if folder_hit then folder_any = true end
         end
+        if folder_any then scores[cat] = scores[cat] + 1 end   -- capped: one point however many keywords hit
     end
 
     local best_cat = "other"
@@ -364,10 +388,6 @@ end
 
 function categorizer.get_category_order()
     return CATEGORY_ORDER
-end
-
-function categorizer.get_all_colors()
-    return CATEGORY_COLORS
 end
 
 return categorizer

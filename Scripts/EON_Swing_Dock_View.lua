@@ -204,8 +204,12 @@ for w in panes:gmatch("[^,]+") do want[w] = true end
 
 -- Hub setups: the dock panes can't be managed here (two captors fight), so
 -- the view there is always Browser + Pad FX, whatever the layout says.
-local want_dock    = (not hub_present) and (want.swing == true)
-local want_steppa  = (not hub_present) and (want.steppa == true)
+-- The docks' own gates, folded in the same way: EON_Swing_Dock and EON_Steppa_Dock refuse on another OS or
+-- without js_ReaScriptAPI, and a pane that can never open must not be WANTED -- the view never read all-open,
+-- so every press re-ran both docks (two refusal boxes) and the toggle could not close what it had opened.
+local docks_possible = reaper.GetOS():match("^Win") ~= nil and reaper.APIExists("JS_Window_SetParent")
+local want_dock    = (not hub_present) and docks_possible and (want.swing == true)
+local want_steppa  = (not hub_present) and docks_possible and (want.steppa == true)
 local want_browser = hub_present or (want.browser == true)
 local want_padfx   = hub_present or (want.padfx == true)
 

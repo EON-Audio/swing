@@ -174,14 +174,19 @@ local ctx = overlay.GetCtx()
 -- track_count is small (tens of tracks), so the linear pass costs nothing
 -- measurable next to the per-lane item walks the renderer already does.
 -- view_bottom_px is the arrange client-area height, approximated from
--- overlay.GetBounds() (B - T) in ImGui pixels.
-local function find_visible_range(track_count, view_bottom_px)
+-- overlay.GetBounds() (B - T) in ImGui pixels. `scale` is the DPI scale
+-- coords holds: I_TCPY / I_TCPH are PHYSICAL pixels and view_bottom_px is
+-- logical, so compared raw a 175 % screen culled the lower ~43 % of the
+-- arrange -- not drawn, not paintable (audit DM12, 2026-10-26). Same divide
+-- as coords.GetTrackY.
+local function find_visible_range(track_count, view_bottom_px, scale)
   local first, last = -1, -1
+  scale = (scale and scale > 0) and scale or 1
   for i = 0, track_count - 1 do
     local tr = r.GetTrack(0, i)
     if tr then
-      local ty = r.GetMediaTrackInfo_Value(tr, 'I_TCPY')
-      local th = r.GetMediaTrackInfo_Value(tr, 'I_TCPH')
+      local ty = r.GetMediaTrackInfo_Value(tr, 'I_TCPY') / scale
+      local th = r.GetMediaTrackInfo_Value(tr, 'I_TCPH') / scale
       -- On-screen iff the track has non-zero TCP height AND its band
       -- intersects [0, view_bottom_px]. Hidden tracks (th == 0) are skipped.
       if th and th > 0 and (ty + th) >= 0 and ty < view_bottom_px then
@@ -204,6 +209,30 @@ local function dim_item_color(pad_idx, slot)
   local G = math.floor(pg * 255 * f + 0.5)
   local B = math.floor(pb * 255 * f + 0.5)
   return r.ColorToNative(R, G, B) | 0x1000000
+end
+
+-- Settings cog window (top-right of the arrange; drawn at the end of
+-- MainLoopBody). ONE geometry for the window and for the paint-suppression
+-- test that mirrors it, so the two cannot drift: the old test stopped at the
+-- gear (52 px) while the window runs on to the red close button (78 px), and
+-- it also blocked a "tool-mode selector" rect that no window has drawn for a
+-- long time (audit DM123, 2026-10-26).
+local COG_BTN   = 44   -- settings button size (px)
+local COG_PAD   = 4
+local CLOSE_H   = 22   -- dedicated "close overlay" button height
+local COG_GAP   = 4
+local COG_WIN   = COG_BTN + COG_PAD * 2
+-- Tall enough to stack the gear button + a close button beneath it.
+local COG_WIN_H = COG_PAD * 2 + COG_BTN + COG_GAP + CLOSE_H
+-- Screen rect of the cog window: x, y, w, h.
+local function cog_window_rect(R, T)
+  return R - COG_WIN - 4, T + 4, COG_WIN, COG_WIN_H
+end
+-- True when (mx, my) lies inside the cog window.
+local function cog_window_hit(mx, my, R, T)
+  if not (mx and my and R and T) then return false end
+  local x, y, w, h = cog_window_rect(R, T)
+  return mx >= x and mx <= x + w and my >= y and my <= y + h
 end
 
 -- Per-lane menu button — a three-dot vertical "kebab", not a cog (name kept
@@ -315,8 +344,16 @@ local function draw_pad_label(dl, track, lane_info, coords, swing_state, L, mx, 
     if lane_info.stereo == true then
       -- Stereo lane spans the whole kit — label with the LIVE kit name when
       -- one is published ("808"), else the label stamped at build time.
-      -- Never pad 1's name.
-      name = (swing_state.GetKitName and swing_state.GetKitName()) or ''
+      -- Never pad 1's name. The published name is ONE shared band (no
+      -- per-instance kit name exists), so with two Swings live it is
+      -- whichever kit loaded last: then only the build-time label is honest
+      -- (audit DM122, 2026-10-26). A lane whose Swing cannot be resolved
+      -- (slot nil) keeps the shared name, as before.
+      name = ''
+      if swing_state.GetKitName
+         and (slot == nil or not swing_state.LiveSwingCount or swing_state.LiveSwingCount() <= 1) then
+        name = swing_state.GetKitName() or ''
+      end
       if name == '' then name = lane_info.pad_name or 'Drums' end
     else
       name = swing_state.GetPadName(lane_info.pad_index, slot)
@@ -445,7 +482,7 @@ local function MainLoopBody()
 
     local tc = r.CountTracks(0)
     local view_h_px = B - T   -- ImGui pixels, used as approximate culling bound
-    local first, last = find_visible_range(tc, view_h_px)
+    local first, last = find_visible_range(tc, view_h_px, coords.GetScale and coords.GetScale() or 1)
     if first < 0 or last < 0 then first, last = 0, tc - 1 end
 
     local mx, my = r.ImGui_GetMousePos(ctx)
@@ -510,24 +547,12 @@ local function MainLoopBody()
     -- lane has drawn — so it renders on top and only the last-hovered cell wins.
     renderer.EmitPendingTooltip(ctx)
 
-    -- Tell paint mode when the cursor is over the cog button or the open
-    -- settings window, so a click on that UI doesn't bleed through and paint a
-    -- stray cell in the lane behind it. (The lane-tools popup is handled inside
-    -- paint_mode itself.) The cog rect mirrors the settings-cog block below.
-    local ui_over = false
-    if L and T and R then
-      local cw = 44 + 4 * 2                    -- COG_BTN + COG_PAD*2 (see below)
-      local cx1, cy1 = R - cw - 4, T + 4
-      if mx and my and mx >= cx1 and mx <= cx1 + cw and my >= cy1 and my <= cy1 + cw then
-        ui_over = true
-      end
-      -- Tool Mode selector, stacked just below the cog (mirror its geometry).
-      local tw, th = 4 * 2 + 26 * 3 + 2 * 2, 4 * 2 + 26
-      local tx1, ty1 = R - tw - 4, T + 4 + 52 + 4
-      if mx and my and mx >= tx1 and mx <= tx1 + tw and my >= ty1 and my <= ty1 + th then
-        ui_over = true
-      end
-    end
+    -- Tell paint mode when the cursor is over the cog window (gear + the red
+    -- close button) or the open settings window, so a click on that UI
+    -- doesn't bleed through and paint a stray cell in the lane behind it. (The
+    -- lane-tools popup is handled inside paint_mode itself.) cog_window_hit is
+    -- the same geometry the settings-cog block below draws.
+    local ui_over = cog_window_hit(mx, my, R, T)
     if not ui_over and settings.IsWindowOpen() and settings_win.IsHovered and settings_win.IsHovered() then
       ui_over = true
     end
@@ -696,15 +721,11 @@ local function MainLoopBody()
   -- Separate window so it doesn't inherit the overlay's NoMouseInputs flag
   -- (clicks work regardless of paint mode). Sized big enough to spot easily.
   if L and T and R then
-    local COG_BTN  = 44   -- settings button size (px)
-    local COG_PAD  = 4
-    local CLOSE_H  = 22   -- dedicated "close overlay" button height
-    local COG_GAP  = 4
-    local COG_WIN  = COG_BTN + COG_PAD * 2
-    -- Tall enough to stack the gear button + a close button beneath it.
-    local COG_WIN_H = COG_PAD * 2 + COG_BTN + COG_GAP + CLOSE_H
-    reaper.ImGui_SetNextWindowPos(ctx, R - COG_WIN - 4, T + 4)
-    reaper.ImGui_SetNextWindowSize(ctx, COG_WIN, COG_WIN_H)
+    -- Geometry: COG_* and cog_window_rect above (shared with the paint-
+    -- suppression test).
+    local cog_x, cog_y, cog_w, cog_h = cog_window_rect(R, T)
+    reaper.ImGui_SetNextWindowPos(ctx, cog_x, cog_y)
+    reaper.ImGui_SetNextWindowSize(ctx, cog_w, cog_h)
     local cog_flags = reaper.ImGui_WindowFlags_NoTitleBar()
                     | reaper.ImGui_WindowFlags_NoResize()
                     | reaper.ImGui_WindowFlags_NoMove()

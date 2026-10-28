@@ -1,6 +1,10 @@
 desc:EON Tone
 //tags: EON ReaKit swing master eq saturation drive tone bus
-options:gfx_hz=60 gfx_idle no_meter gmem=Swing_Media_Transfer
+options:gfx_hz=60 no_meter gmem=Swing_Media_Transfer
+// No gfx_idle (sweep PLG25, 2026-10-26): Tone's @gfx has no mailbox work -- the Swing link runs
+// in @block -- and an idle pass (window closed, no embed showing, 13 passes/s) fell into the
+// floating branch and drew the whole face, two 8192-point FFTs included, for nobody. Without the
+// option a closed instance runs no @gfx at all; the `& 2` guards below stay, as the house shape.
 // EON Studios — EON Tone
 // Swing's master EQ and saturation as a plugin for the Audio bus in Multi-Out:
 // the five-band SVF EQ (HPF · LPF · low shelf/bell · mid bell · high
@@ -76,6 +80,15 @@ import libs/rk_thememenu_core.jsfx-inc
 
 @init
 
+// ⭐ ext_noinit = 1 (sweep PLG7, 2026-10-26): with neither this nor a @serialize, REAPER re-zeroed every
+// variable and re-ran this section on every play start, render start and enable (wiki 3.2, counted):
+// svf_init put all five filters back to unity, the drive smoother restarted at 0 and the link's own
+// state (its heartbeat, the adopted seq) was wiped -- so the first ~36 ms of every play went through a
+// half-applied EQ, which Swing's own chain (ext_noinit, a snap at @init) never did. srate is re-taken in
+// @block below, as Swing does. The one-shot _tn_prime (consumed in @block, after @slider has set the
+// targets) snaps the filters on load, so a saved curve is real from the first block there too.
+ext_noinit = 1;
+_tn_prime = 1;
 gfx_ext_retina == 0 ? gfx_ext_retina = 1;
 // ⚠ 0x100 is NOT what makes an embed work. REAPER sets bit 1 itself when a
 //   JSFX is embedded (6.30+); 0x100 only asks for the embed to be drawn
@@ -114,7 +127,7 @@ km_gfx_lpf = freemem; freemem += 16;   // ...and LPF
 // rk_spectrum is Justin Johnson's S2GFX engine -- MIT, and the same analyzer
 // ReEQ uses -- vendored in libs/ with its licence header intact. It bump-
 // allocates ~0.88M slots from here, sized for six inputs at a 32k FFT; Tone
-// uses one. Tone sets no maxmem, so it runs in REAPER's default 8M and this
+// uses two (the input trace and the output trace). Tone sets no maxmem, so it runs in REAPER's default 8M and this
 // fits with room to spare. (Swing does NOT have that room -- its headroom
 // budget sits under a 72M edge -- which is why this is Tone-only for now.)
 // Master EQ curve cache, Swing's (Swing_ReaKit.jsfx, "Master EQ page curve
@@ -151,6 +164,10 @@ svf_update_srate();
 // Drive-amount smoother: Swing's 4.5 ms, so a drag on the knob never steps.
 _sm_coeff   = 1.0 - exp(-1.0 / max(1, 0.0045 * srate));
 _sat_drv_sm = 0;
+// TUBE DC blocker pole, Swing's (Swing_ReaKit.jsfx @init): y = x - x1 + R*y1, ~5 Hz. Re-derived with
+// the smoother in @block when the rate moves. Sweep PLG9: the master drive moved here with the link
+// (Swing skips its own drive AND its blocker while tnl_live), so TUBE's DC reached the bus unblocked.
+_dc_r = exp(-2 * $pi * 5.0 / max(1, srate));
 
 // ─── Face state ─────────────────────────────────────────────────────────────
 DBL_CLICK_T   = 0.35;
@@ -261,6 +278,21 @@ function tn_band_fill(x0, y0, x1, y1)
 function tn_node_label(gain, q, qdef) (
   abs(q - qdef) > 0.005 ? sprintf(#_lv, "%+.0f dB Q%.1f", gain, q)
                         : sprintf(#_lv, "%+.0f dB", gain);
+);
+
+// The node under (x, y) within r: 1 = LOW, 2 = MID, 3 = HIGH, 0 = none -- the NEAREST, a tie to the band
+// drawn on top (HI over MID over LO). ONE rule for the hint, the click and the wheel (sweep PLG23): they
+// used to carry three -- last-wins, first-wins and MID-first -- so with two nodes stacked (LO and MID
+// can both sit at 300 Hz) the hint named a band the click did not drag.
+function tn_node_at(x, y, r) local(dl, dm, dh, best, k) (
+  dl = dist(x, y, _lcd_lo_nx, _lcd_lo_ny);
+  dm = dist(x, y, _lcd_md_nx, _lcd_md_ny);
+  dh = dist(x, y, _lcd_hi_nx, _lcd_hi_ny);
+  k = 0; best = r;
+  dl <= best ? ( best = dl; k = 1; );
+  dm <= best ? ( best = dm; k = 2; );
+  dh <= best ? ( best = dh; k = 3; );
+  k;
 );
 
 function tn_draw_eq(chrome) (
@@ -560,10 +592,12 @@ function tn_draw_eq(chrome) (
     gfx_set(EQC_HI_R, EQC_HI_G, EQC_HI_B, 1); gfx_circle(_lcd_hi_nx, _lcd_hi_ny, _lcd_nr, 1);
     gfx_set(0, 0, 0, 0.4); gfx_circle(_lcd_hi_nx, _lcd_hi_ny, _lcd_nr, 0);
 
-    // Node hover: a hint, and it keeps the embed's click (no pass-through)
-    dist(mx, my, _lcd_lo_nx, _lcd_lo_ny) <= _lcd_nr + 5 ? ( _tn_hov = 1; tn_hint("Low band node — drag up/down for gain (±12 dB), left/right for frequency (40–500 Hz). Double-click resets."); );
-    dist(mx, my, _lcd_md_nx, _lcd_md_ny) <= _lcd_nr + 5 ? ( _tn_hov = 1; tn_hint("Mid band node — drag up/down for gain (±12 dB), left/right for frequency (200 Hz–8 kHz). Double-click resets."); );
-    dist(mx, my, _lcd_hi_nx, _lcd_hi_ny) <= _lcd_nr + 5 ? ( _tn_hov = 1; tn_hint("High band node — drag up/down for gain (±12 dB), left/right for frequency (2–16 kHz). Double-click resets."); );
+    // Node hover: a hint, and it keeps the embed's click (no pass-through). tn_node_at picks the
+    // one node the click below will take (sweep PLG23).
+    _tn_nn = tn_node_at(mx, my, _lcd_nr + 5);
+    _tn_nn == 1 ? ( _tn_hov = 1; tn_hint("Low band node — drag up/down for gain (±12 dB), left/right for frequency (40–500 Hz). Double-click resets."); ) :
+    _tn_nn == 2 ? ( _tn_hov = 1; tn_hint("Mid band node — drag up/down for gain (±12 dB), left/right for frequency (200 Hz–8 kHz). Double-click resets."); ) :
+    _tn_nn == 3 ? ( _tn_hov = 1; tn_hint("High band node — drag up/down for gain (±12 dB), left/right for frequency (2–16 kHz). Double-click resets."); );
     active_id >= 230 && active_id <= 232 ? _tn_hov = 1;
 
     // ── Wheel over a node: that band's Q (ser_ver 75) ────────────────
@@ -576,13 +610,16 @@ function tn_draw_eq(chrome) (
     // !_srf_foreign as on every other interaction here: a second embed is
     // handed the owner's pointer, so it could 'hover' a node it is not under.
     frame_wheel != 0 && active_id == -1 && !_srf_foreign ? (
-      _tn_wq = dist(mx, my, _lcd_md_nx, _lcd_md_ny) <= _lcd_nr + 4 ? 2 :
-            dist(mx, my, _lcd_lo_nx, _lcd_lo_ny) <= _lcd_nr + 4 ? 1 :
-            dist(mx, my, _lcd_hi_nx, _lcd_hi_ny) <= _lcd_nr + 4 ? 3 : 0;
+      _tn_wq = tn_node_at(mx, my, _lcd_nr + 4);   // the same node the click takes (PLG23)
       _tn_wq ? (
-        _tn_wf = 1 + frame_wheel * (SHIFT ? 0.03 : 0.12);
-        // Explicit branches, not `c ? a = x : b = y` -- JSFX parses that
-        // ambiguously (rk_drumkit_dsp's recalc says the same).
+        // Geometric per notch (sweep PLG22): the linear 1 + n * 0.12 went to zero or below once nine
+        // notches landed in one pass (a free-spinning wheel, ~21 passes/s in a strip) and slammed Q
+        // to its 0.3 floor; pow(1.12, n) is the same 12 % step, compounded, and never <= 0. @gfx, so
+        // the pow is fine.
+        _tn_wf = pow(SHIFT ? 1.03 : 1.12, frame_wheel);
+        // Explicit parenthesised branches, house style for reading; a bare
+        // `c ? a = x : b = y` would work too (wiki 01: assignments in ternary
+        // branches work).
         _tn_wq == 1 ? (
           meq_lo_bell ? ( gfx_eq_lo_bq = max(0.3, min(6, gfx_eq_lo_bq * _tn_wf)); )
                       : ( gfx_eq_lo_sq = max(0.3, min(6, gfx_eq_lo_sq * _tn_wf)); );
@@ -600,10 +637,11 @@ function tn_draw_eq(chrome) (
     // Node hit detect (BEFORE the corner knobs so nodes win the click)
     active_id == -1 && lmb_down && mx >= _lcd_cx && mx <= _lcd_cx + _lcd_cw && my >= _lcd_cy && my <= _lcd_cy + _lcd_gh ? (
       meq_drag_my = my; meq_drag_mx = mx;
-      _hit_node = -1;
-      dist(mx, my, _lcd_lo_nx, _lcd_lo_ny) <= _lcd_nr + 5 ? ( _hit_node = 230; meq_drag_val_lo = gfx_eq_lo; meq_drag_freq_lo = gfx_eq_lo_freq; ) :
-      dist(mx, my, _lcd_md_nx, _lcd_md_ny) <= _lcd_nr + 5 ? ( _hit_node = 231; meq_drag_val_md = gfx_eq_mid; meq_drag_freq_md = gfx_eq_mid_freq; ) :
-      dist(mx, my, _lcd_hi_nx, _lcd_hi_ny) <= _lcd_nr + 5 ? ( _hit_node = 232; meq_drag_val_hi = gfx_eq_hi; meq_drag_freq_hi = gfx_eq_hi_freq; );
+      _tn_nn = tn_node_at(mx, my, _lcd_nr + 5);   // the node the hint named (PLG23)
+      _hit_node = _tn_nn ? 229 + _tn_nn : -1;
+      _hit_node == 230 ? ( meq_drag_val_lo = gfx_eq_lo; meq_drag_freq_lo = gfx_eq_lo_freq; ) :
+      _hit_node == 231 ? ( meq_drag_val_md = gfx_eq_mid; meq_drag_freq_md = gfx_eq_mid_freq; ) :
+      _hit_node == 232 ? ( meq_drag_val_hi = gfx_eq_hi; meq_drag_freq_hi = gfx_eq_hi_freq; );
       _hit_node >= 0 ? (
         _eq_now = time_precise();
         _dbl_click_id == _hit_node && (_eq_now - _dbl_click_time) < DBL_CLICK_T ? (
@@ -861,13 +899,55 @@ function rk_srf_store()
   prev_RMB = mouse_cap & 2;
 );
 
+// The third and fourth parts, VERBATIM from EON/ReaKit/rk_srf.jsfx-inc (the seven free effects, proven on
+// all of them with fx_dual_run.py --all; wiki 4.5). Sweep PLG24 / PLG26, 2026-10-26.
+// Is the REAL pointer over this surface's canvas? (mouse_x / mouse_y as REAPER handed them to this pass, never the
+// handed-over or wheel-cached mx / my.) Only such a pass may clear or arm 0x200.
+function rk_srf_in()
+(
+  mouse_x >= 0 && mouse_x < gfx_w && mouse_y >= 0 && mouse_y < gfx_h;
+);
+
+// The wheel, per surface: this pass's notches (what the host used to read as mouse_wheel / 120), and _srf_hx / _srf_hy,
+// THIS surface's pointer on its last frame without a wheel (the embed wheel-fix's cache: a wheel frame's mouse_x / y can
+// be stale, wiki 4.5). MEASURED 2026-10-08 with real notches (SendInput, gk_input_run.py --wheelonly and its per-pass
+// ring): REAPER hands an embed the wheel only right after a click ON it -- before one no notch reached any pass, in one
+// strip or two (the "none in either strip" seen first was this rule). After a click, one plugin in two strips:
+// mouse_wheel is the INSTANCE's -- every notch over the TRACK-PANEL face (3 of 3) was found first by the MIXER face's
+// pass, its own pointer off its canvas; this code left it there and the track panel's next pass took it. Over the mixer
+// face its own pass found each notch first (3 of 3). The old read-and-zero would have spent those three notches on the
+// wrong surface, and one shared wheel-fix cache would have aimed a notch with the other surface's pointer. So a pass
+// takes the wheel only when its own cached pointer is on its own canvas (a window always does) and otherwise leaves
+// mouse_wheel for the other surface's pass, 0.3 s at most (then it is dropped, as a stray notch always was). The host
+// calls it once per pass, after rk_srf_load(), and stops zeroing mouse_wheel itself.
+function rk_srf_wheel() local(w)
+(
+  mouse_wheel == 0 ? (
+    _srf == 1 ? ( _srf_hx1 = mouse_x; _srf_hy1 = mouse_y; ) :
+    _srf == 2 ? ( _srf_hx2 = mouse_x; _srf_hy2 = mouse_y; ) : ( _srf_hx0 = mouse_x; _srf_hy0 = mouse_y; );
+    _srf_wt = 0;
+  );
+  _srf_hx = _srf == 1 ? _srf_hx1 : _srf == 2 ? _srf_hx2 : _srf_hx0;
+  _srf_hy = _srf == 1 ? _srf_hy1 : _srf == 2 ? _srf_hy2 : _srf_hy0;
+  w = 0;
+  mouse_wheel != 0 ? (
+    !is_embedded || (_srf_hx >= 0 && _srf_hx < gfx_w && _srf_hy >= 0 && _srf_hy < gfx_h) ? (
+      w = mouse_wheel / 120; mouse_wheel = 0; _srf_wt = 0;
+    ) : (
+      _srf_wt == 0 ? _srf_wt = time_precise() : time_precise() - _srf_wt > 0.3 ? ( mouse_wheel = 0; _srf_wt = 0; );
+    );
+  );
+  w;
+);
+
 // ── Link to Swing's EQ + drive page ────────────────────────────────────────
 // MUST match Swing_ReaKit.jsfx TNL_* and rk_lua_core.lua GS_STRIP_OFF_TNL_*.
 // The record sits in the reserved tail of the instance's strip band; ONE Tone
 // belongs to one Swing, so the registry slot Lua pushes into slider14 is the
 // whole address — no role offset like the comp band needs for its two Welds.
-//   +0 heartbeat (bumped per @block, written LAST) · +1..13 echo in slider
-//   order · +14 cmd_seq (LAST) · +15 cmd_param 1..13 · +16 cmd_val
+//   +0 heartbeat (bumped per @block, written LAST) · +1..13 echo of params
+//   1..13 in slider order · +14 cmd_seq (LAST) · +15 cmd_param 1..18 · +16 cmd_val
+//   · +17..21 echo of params 14..18 (the master-EQ Q, TNL_OFF_ECHO_Q)
 // relative to TNL_OFF_HB.
 //
 // ⭐ This link does NOT lock the knobs, and that is the difference from EON
@@ -882,7 +962,6 @@ TNL_OFF_ECHO_Q  = 659;   // 659..663, params 14..18: master-EQ Q (Swing ser_ver 
 TNL_OFF_SEQ     = 656;
 TNL_OFF_PARAM   = 657;
 TNL_OFF_VAL     = 658;
-tn_linked       = 0;
 _tn_cmd_last    = 0;
 _tn_cmd_inited  = 0;
 _tn_last_slot   = -2;
@@ -921,7 +1000,24 @@ srate != _tn_srate_seen ? (
   _tn_srate_seen = srate;
   svf_update_srate();
   _sm_coeff = 1.0 - exp(-1.0 / max(1, 0.0045 * srate));
+  _dc_r = exp(-2 * $pi * 5.0 / max(1, srate));   // the TUBE blocker's pole follows the rate (PLG9)
   recalc_global_fx();
+);
+// The first block after @init (sweep PLG7): @slider has run by now -- on load it carries the saved
+// sliders, which @init never sees (wiki: @init runs BEFORE they are restored) -- so the targets the
+// recalc set are the real curve. Snap the five filters onto them and seat the drive smoother, the
+// pass Swing's own @init / @serialize makes ("recalc_global_fx + svf_snap re-establishes real curves"),
+// instead of gliding in from unity over ~36 ms. Here, on the audio thread: svf_snap writes the live
+// coefficients and @sample's svf_tick shares svf_calc_a's static `_g` (the Drum Strip's lesson).
+_tn_prime ? (
+  _tn_prime = 0;
+  recalc_global_fx();
+  _tn_i = 0;
+  loop(SVF_MST_COUNT,
+    svf_snap(svf_master + _tn_i * SVF_STEREO_SIZE);
+    _tn_i += 1;
+  );
+  _sat_drv_sm = gfx_sat_drv;
 );
 
 // ── Swing link: consume one edit, then publish what we hold ─────────────────
@@ -930,8 +1026,13 @@ srate != _tn_srate_seen ? (
 //   · ADOPT the first seq ever seen WITHOUT acting on it. gmem outlives a
 //     plugin reload and a project switch, so a mailbox left behind by an
 //     earlier session must not fire the moment this instance links.
-//   · A NaN seq reads as "different" every block and would re-fire at block
-//     rate, so skip the row outright and let a healthy writer restore it.
+//   · The mailbox is foreign memory. A NaN seq is skipped outright (adopted
+//     as "seen", it made `seq != last` read 0 for every later command, so the
+//     link went deaf until the slot changed), and a finite seq whose param or
+//     value is a NaN is CONSUMED but its payload discarded (min/max pass a
+//     NaN). The tests are abs(x) >= 0 in the POSITIVE form, Weld's fix of
+//     2026-10-27 ported (wiki 1.8); until then they were x != x, which never
+//     fires on a NaN in EEL2.
 //   · Re-read the seq AFTER the payload: the writer stores val, param, seq —
 //     seq LAST — from another plugin, so a pair read mid-write can straddle two
 //     commands. Skip WITHOUT consuming; the next block reads a settled row.
@@ -944,14 +1045,17 @@ tn_link_slot != _tn_last_slot ? ( _tn_cmd_inited = 0; _tn_last_slot = tn_link_sl
 tn_link_slot >= 0 ? (
   _tn_row = GS_STRIP_BASE + max(0, min(63, tn_link_slot | 0)) * GS_STRIP_STRIDE;
   _tn_seq = gmem[_tn_row + TNL_OFF_SEQ];
-  _tn_seq != _tn_seq ? 0 : (
+  abs(_tn_seq) >= 0 ? (
     _tn_cmd_inited ? (
       _tn_seq != _tn_cmd_last ? (
         _tn_pr = gmem[_tn_row + TNL_OFF_PARAM];
         _tn_v  = gmem[_tn_row + TNL_OFF_VAL];
-        gmem[_tn_row + TNL_OFF_SEQ] != _tn_seq ? 0 : (
+        // the seqlock re-read: a NaN is skipped too (the abs test first: NaN == seq
+        // alone reads 1 in REAPER)
+        _tn_rr = gmem[_tn_row + TNL_OFF_SEQ];
+        abs(_tn_rr) >= 0 && _tn_rr == _tn_seq ? (
           _tn_cmd_last = _tn_seq;
-          _tn_pr != _tn_pr || _tn_v != _tn_v ? 0 : (
+          abs(_tn_pr) >= 0 && abs(_tn_v) >= 0 ? (
             _tn_p = _tn_pr | 0;
             _tn_p ==  1 ? gfx_hpf_freq    = max(20, min(8000, _tn_v))    :
             _tn_p ==  2 ? gfx_lpf_freq    = max(200, min(20000, _tn_v))  :
@@ -998,8 +1102,7 @@ tn_link_slot >= 0 ? (
   gmem[_tn_row + TNL_OFF_ECHO_Q + 4] = tn_hi_bq;
   _tn_hb += 1;
   gmem[_tn_row + TNL_OFF_HB] = _tn_hb;   // LAST
-  tn_linked = 1;
-) : ( tn_linked = 0; );
+);
 
 @sample
 
@@ -1041,6 +1144,26 @@ _sat_drv_sm > 0.01 ? (
   drive_process(_gL * 8.0, _gR * 8.0, gfx_drv_mode | 0);
   _gL += (_doL - _gL) * _sat_drv_sm;
   _gR += (_doR - _gR) * _sat_drv_sm;
+  // TUBE is asymmetric and emits DC; see the per-pad blocker in rk_drumkit_fx.jsfx-inc for why the
+  // "HPF downstream" its curve comment promised does not exist. The same one-pole as Swing's master
+  // (Swing_ReaKit.jsfx @sample, VERBATIM; sweep PLG9): Swing skips its drive AND this while the link
+  // is live, so without it the curve's offset went on to the bus and the meters.
+  (gfx_drv_mode | 0) == 1 ? (
+    _mdc_yL = _gL - _mdc_x1L + _dc_r * _mdc_y1L;
+    _mdc_x1L = _gL; _mdc_y1L = _mdc_yL; _gL = _mdc_yL;
+    _mdc_yR = _gR - _mdc_x1R + _dc_r * _mdc_y1R;
+    _mdc_x1R = _gR; _mdc_y1R = _mdc_yR; _gR = _mdc_yR;
+  ) : (
+    // Same park-on-mode-change as the per-pad blocker: TUBE -> TAPE with the drive still up must
+    // not freeze this state for a later return to TUBE to resume off.
+    _mdc_x1L != 0 || _mdc_y1L != 0 || _mdc_x1R != 0 || _mdc_y1R != 0 ? (
+      _mdc_x1L = 0; _mdc_y1L = 0; _mdc_x1R = 0; _mdc_y1R = 0;
+    );
+  );
+) : (
+  _mdc_x1L != 0 || _mdc_y1L != 0 || _mdc_x1R != 0 || _mdc_y1R != 0 ? (
+    _mdc_x1L = 0; _mdc_y1L = 0; _mdc_x1R = 0; _mdc_y1R = 0;
+  );
 );
 
 spl0 = _gL; spl1 = _gR;
@@ -1070,7 +1193,11 @@ CTRL  = _srf_cap & 4;
 SHIFT = _srf_cap & 8;
 dt = min(time_precise() - _tn_lt, 0.05); _tn_lt = time_precise();
 hv_speed = 11;
-frame_wheel = mouse_wheel / 120;
+// The wheel per surface (rk_srf_wheel, after rk_srf_load; sweep PLG24): shown in both the TCP and
+// the MCP, mouse_wheel is the INSTANCE's and the other strip's pass finds a notch first; it takes
+// one only when its own last pointer is on its canvas, else leaves it for this strip's pass. It
+// zeroes mouse_wheel itself when it takes a notch, so the tail no longer does.
+frame_wheel = rk_srf_wheel();
 
 // ── THEME menu plumbing ──────────────────────────────────────────────────
 // swing_popup_tick reads the RAW buttons; the gate below silences the FACE
@@ -1083,16 +1210,17 @@ swing_popup_active ? ( lmb_down = 0; rmb_down = 0; LMB = 0; frame_wheel = 0; );
 // The knob style follows the suite's — what the KNOB row drives.
 _tn_kp = gmem[GS_THEME_KNOB_P] >= 1 ? (gmem[GS_THEME_KNOB_P] | 0) : 1;
 tau = 2 * $pi;
-// Clear 0x200 UNCONDITIONALLY (house pattern): gfx_ext_flags is ONE variable
-// shared by every @gfx pass of the instance (TCP + MCP embeds alternate; a window and
-// an embed never run together, wiki 4.5); the re-arm at the end stays micro-gated.
-// Not in an idle pass (& 2): idle leaves 0x200 as the last visible pass set it (house rule 4).
-!(gfx_ext_flags & 2) ? gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
-// Embedded wheel events arrive with a STALE mouse position; remember the
-// cursor on normal frames, reuse it on wheel frames.
-micro ? (
-  frame_wheel == 0 ? ( _tn_hmx = mx; _tn_hmy = my; ) : ( mx = _tn_hmx; my = _tn_hmy; );
-);
+// Clear 0x200 on every visible pass whose canvas holds the REAL pointer (house pattern, with the
+// free effects' rk_srf_in gate; sweep PLG26): gfx_ext_flags is ONE variable shared by every @gfx
+// pass of the instance (TCP + MCP embeds alternate; a window and an embed never run together,
+// wiki 4.5). The strip NOT under the pointer used to clear here and re-arm at its tail (_tn_hov 0
+// there), and REAPER read that for a click on the OTHER strip: a node click opened the window
+// about half the time. Now only the pass under the pointer touches the flag; a window pass always
+// does. Not in an idle pass (& 2): idle leaves 0x200 as the last visible pass set it (house rule 4).
+!(gfx_ext_flags & 2) && (!micro || rk_srf_in()) ? gfx_ext_flags = (gfx_ext_flags | 0x200) - 0x200;
+// Embedded wheel events arrive with a STALE mouse position: on a wheel frame use THIS surface's
+// own last pointer (rk_srf_wheel's per-surface cache, not one cache both strips wrote).
+micro && frame_wheel != 0 ? ( mx = _srf_hx; my = _srf_hy; );
 _tn_hov = 0;
 strcpy(#tn_hint, "");
 
@@ -1290,11 +1418,14 @@ micro ? (
 );
 
 // ── End of frame: embed click-through re-arm + input latches ────────────────
-micro && !_tn_hov ? gfx_ext_flags |= 0x200;
+// Only the strip under the REAL pointer arms (rk_srf_in; PLG26): the other strip's pass hovers
+// nothing by construction and used to arm for a click it was not getting.
+micro && rk_srf_in() && !_tn_hov ? gfx_ext_flags |= 0x200;
 // House rule 3 (wiki 4.5): window up -> arm 0x200 always. The flag only routes
 // clicks on the EMBED, which runs no @gfx pass while a window is open, so this
 // is the only pass that can set it; a click on the strip then closes the window.
 // An idle pass (& 2) leaves the flag alone.
 !micro && !(gfx_ext_flags & 2) ? gfx_ext_flags |= 0x200;
 rk_srf_store();
-mouse_wheel = 0;
+// (no `mouse_wheel = 0` here: rk_srf_wheel owns the wheel -- a notch this pass did not take stays
+// for the other surface's pass, 0.3 s at most)

@@ -1041,7 +1041,6 @@ function rk_vu_init(ref_db) (
   // average by pi/2 to recover the peak the reference is quoted in.
   this.ref = 10 ^ (ref_db / 20);
   this.ref_db = ref_db;
-  this.dt  = RKVU_DEC / max(srate, 1);
   this.lim = 10 ^ ((ref_db + 3) / 20);   // peak LED at +3 VU
   this.zeta = RKVU_ZETA; this.wn = RKVU_WN;
   this.legacy = 0;
@@ -1160,7 +1159,6 @@ function rk_vu_init_gr() (
   this.pos = 0; this.vel = 0; this.hold = 0; this.hold_t = 0;   // dB of reduction, 0 = rest
   this.acc = 0; this.cnt = 0; this.over = 0;
   this.ref = 1; this.lim = 2;              // LED never trips on a GR meter
-  this.dt  = RKVU_DEC / max(srate, 1);
   this.zeta = RKVU_ZETA; this.wn = RKVU_WN;
   this.legacy = 0;
   this.gr  = 1;                            // marks the instance as GR
@@ -1202,7 +1200,7 @@ function rk_vu_gain2db(g) local(k, m, t, t2, l) (
 //    separates every real number (true) from NaN (false). Do not "simplify"
 //    it to x != x — that passes the NaN straight through.
 //  - The step length is taken from the LIVE srate every step. rk_vu_init's
-//    this.dt went stale on a samplerate change in hosts that set
+//    old this.dt (since removed) went stale on a samplerate change in hosts that set
 //    ext_noinit = 1 (Swing, Weld, ExpressBus: wiki 3.2 — then @init never
 //    re-runs). MEASURED with the plugin loaded at 44.1 kHz and the device
 //    switched to 96 kHz: the needle reached 99 % in 138 ms instead of 300,
@@ -1402,7 +1400,6 @@ function rk_vu_draw(x, y, w, h, mode, theme, label) local(v, pk) (
   rkvu_lbl_font = 0;
 );
 
-// Two movements, two plates, one rect — stereo or mid/side.
 // One movement at a CENTRE and RADIUS, in the same box vu_kbsg's
 // mtr_vu_real_draw used (2.6r wide, 1.7r tall, centre 1.4r below the top).
 // A plugin that placed its meter that way changes one call and keeps its
@@ -1411,6 +1408,7 @@ function rk_vu_draw_at(cx, cy, r, mode, theme, label) (
   this.rk_vu_draw(cx - r * 1.3, cy - r * 1.4, r * 2.6, r * 1.7, mode, theme, label);
 );
 
+// Two movements, two plates, one rect — stereo or mid/side.
 function rk_vu_draw_pair(x, y, w, h, mode, theme,
                          posA, holdA, overA, labA,
                          posB, holdB, overB, labB) local(mw, gap) (
@@ -1438,7 +1436,7 @@ function rk_vu_draw_pair(x, y, w, h, mode, theme,
 // theme -1 applies its own palette every frame before drawing, as it should.
 function rk_vu_picker(x, y, w, h, cur)
 local(chosen, cols, rows, sw, sh, sx, sy, cw, ch, fw, fh, i, cx, cy, hit, hover,
-      hx, hy, hw, hh, tw, th) (
+      hx, hy, hw, hh, tw, th, _gr, _gn, _gi, _gdy, _ghw) (
   chosen = -1;
   // The cover to click is where THIS meter's face put it: a small face's
   // scale radius depends on its labels, and a GR instance carries GR labels.
@@ -1458,12 +1456,23 @@ local(chosen, cols, rows, sw, sh, sx, sy, cw, ch, fw, fh, i, cx, cy, hit, hover,
 
   !this.pk_open ? (
     hover ? ( gfx_set(1, 1, 1, 0.10);
-              rkvu_cy <= rkvu_fb ? gfx_circle(rkvu_cx, rkvu_cy, rkvu_r * 0.19, 1, 1)
-                                 : gfx_rect(hx, hy, hw, rkvu_fb - hy); );
+              rkvu_cy <= rkvu_fb ? (
+                // the cover's own shape (_rk_vu_cover): the dome's upper half, then down to the plate's edge. A
+                // full disc reached 0.13 oh below the pivot: a half-moon over the bezel and past the plate (LIB346)
+                _gr = rkvu_r * 0.19; _gn = max(1, ceil(_gr)); _gi = 0;
+                loop(_gn,
+                  _gdy = _gi / _gn * _gr; _ghw = sqrt(max(_gr * _gr - _gdy * _gdy, 0));
+                  gfx_rect(rkvu_cx - _ghw, rkvu_cy - _gdy, _ghw * 2, 1);
+                  _gi += 1;
+                );
+                gfx_rect(rkvu_cx - _gr, rkvu_cy, _gr * 2, max(rkvu_fy + rkvu_fh - rkvu_cy, 0));
+              ) : gfx_rect(hx, hy, hw, rkvu_fb - hy); );
     hover && lmb_down ? this.pk_open = 1;
   ) : (
     cols = 5; rows = ceil(RKVU_THEMES / cols);
-    sw = max(w, 380 * rkvu_sc); sh = max(h, 264 * rkvu_sc);
+    // never wider or taller than the window: the cards shrink instead. At its 380 logical px floor the sheet's
+    // fifth column started past Drum Strip's default 300 px window and four faces could not be picked (LIB322).
+    sw = min(gfx_w, max(w, 380 * rkvu_sc)); sh = min(gfx_h, max(h, 264 * rkvu_sc));
     sx = min(max(x, 0), max(gfx_w - sw, 0)); sy = min(max(y, 0), max(gfx_h - sh, 0));
     gfx_set(0, 0, 0, 0.72); gfx_rect(0, 0, gfx_w, gfx_h);
     gfx_set(0.10, 0.10, 0.11, 1); _rk_vu_rrect(sx, sy, sw, sh, 6 * rkvu_sc);

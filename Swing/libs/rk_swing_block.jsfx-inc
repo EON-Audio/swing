@@ -76,12 +76,25 @@ function swing_block_gt_release() local(_gc_i, _gc_v) (
 // Normal block gap ≈ samplesblock/srate (~1–6ms). Anything >50ms means the
 // engine paused (app switch, device reset). On resume, flush filter state
 // to prevent denormals/clicks from stale coefficients.
+// ⚠ A wall-clock gap is a pause only when the STREAM broke. The transport playing on from where the last block ended
+// is one continuous stream however long the host took between the two blocks: an offline render that stalls (the
+// disk, another plugin, the main thread) or a realtime hiccup. The flush fired there too and reset the limiter's
+// release, both comps and every filter in the middle of the sound -- a level step or a click in the rendered file, at
+// a moment set by the computer's timing, so two renders of one project differed (the SeqTime rig's intermittent RED
+// about 10.2 s in, wob 2026-10-26). Continuity is judged in the stream's own clock (play_position), not the wall's.
 function swing_block_gap_flush()
-local(_now, _gap, _fi, _bq_st)
+local(_now, _gap, _fi, _bq_st, _cont)
 (
   _now = time_precise();
   _gap = _now - _last_block_time;
   _last_block_time = _now;
+  // Continuous: playing now and at the last block, and the position moved forward by no more than eight blocks'
+  // worth (REAPER's play rates reach 4: room to spare). A start, a stop, a seek or a loop's wrap is not, and keeps
+  // the flush.
+  _cont = (play_state & 1) && _gap_play_prev && play_position > _gap_pp_prev
+          && play_position - _gap_pp_prev <= 8 * samplesblock / srate;
+  _gap_play_prev = play_state & 1;
+  _gap_pp_prev = play_position;
   // EON_DIAG gap classes (armed only; see EON_DIAG_* in Swing_ReaKit.jsfx):
   // pause = the > 50 ms engine-paused class below; stall = more than two
   // block periods but under that threshold. A proxy only under anticipative
@@ -90,8 +103,8 @@ local(_now, _gap, _fi, _bq_st)
     _gap > 0.05 ? diag_pause_n += 1 : (_gap > 2 * samplesblock / srate ? diag_stall_n += 1);
     _gap > diag_gap_max ? diag_gap_max = _gap;
   );
-  (_gap > 0.05 && _gap < 10) ? (
-    // Flush per-pad SVF integrator state (5 filters × 16 pads; coefficients kept)
+  (_gap > 0.05 && _gap < 10 && !_cont) ? (
+    // Flush per-pad SVF integrator state (SVF_PER_PAD = 6 filters × every slot; coefficients kept)
     _fi = 0; loop(NUM_SLOTS * SVF_PER_PAD,
       svf_flush_state(svf_pad + _fi * SVF_STEREO_SIZE);
       _fi += 1;
@@ -116,8 +129,10 @@ local(_now, _gap, _fi, _bq_st)
     );
     // Flush limiter envelope to unity (prevents stale GR from popping)
     gfx_lim_env = 1.0;
-    // Flush compressor envelope
-    cmp_env = 0;
+    // Flush the master comp: the circuit's state is its two capacitor voltages (cmp_v1 / cmp_v2) and the Anvil
+    // voice's own; `cmp_env = 0` was the OLD engine's cell, which nothing reads (rk_compressor: hosts call
+    // cmp_reset), so the bus comp resumed at its full charge while everything beside it was flushed (LIB324).
+    cmp_voice > 0 ? anv_engine_reset() : cmp_reset();
   );
 );
 
@@ -128,7 +143,7 @@ function swing_block_handle_srate_change()
 local(i)
 (
   srate != last_srate ? (
-    svf_update_srate();   // 30 ms ramp step is srate-derived
+    svf_update_srate();   // the coefficient glide (SVF_SMOOTH_MS one-pole) is srate-derived
     i = 0; loop(NUM_SLOTS, recalc_pad(i); recalc_fx(i); i += 1;);
     // Snap SVFs to the recomputed targets — an srate change must not ramp
     i = 0; loop(NUM_SLOTS * SVF_PER_PAD, svf_snap(svf_pad + i * SVF_STEREO_SIZE); i += 1;);
@@ -151,6 +166,9 @@ local(i)
     rvb_recalc();
     cmp_recalc();
     gfx_lim_rel_c = exp(-1.0 / max(1, gfx_lim_rel * 0.001 * srate));
+    // The browser's audition voice (rk_swing_ui_minibrowser / rk_swing_padpcm set _prv_rate once, when a preview is
+    // armed): a device switch mid-audition played the rest at the old speed and pitch (sweep BRW38, 2026-10-26).
+    _prv_sr > 0 ? _prv_rate = _prv_sr / srate;
     last_srate = srate;
   );
 );
@@ -191,6 +209,18 @@ function swing_block_sync_fx_params()
     _last_dly_hpf   = dly_hpf_hz;
     _last_dly_lpf   = dly_lpf_hz;
     _last_dly_ping  = dly_ping;
+  );
+
+  // Reverb -- the same watcher: the LCD's rows set the parameter and leave the recalc to this
+  // thread (sweep LIB139; rvb_recalc from @gfx raced rvb_tick and its own static locals).
+  (rvb_size != _last_rvb_size || rvb_damp != _last_rvb_damp || rvb_width != _last_rvb_width ||
+   rvb_predelay != _last_rvb_pre || rvb_hpf != _last_rvb_hpf) ? (
+    rvb_recalc();
+    _last_rvb_size  = rvb_size;
+    _last_rvb_damp  = rvb_damp;
+    _last_rvb_width = rvb_width;
+    _last_rvb_pre   = rvb_predelay;
+    _last_rvb_hpf   = rvb_hpf;
   );
 );
 
@@ -261,8 +291,8 @@ local(_n, _guard) (
 );
 
 // Fire every held, playable pad `_ofs` samples into this block. `_mingap` is the
-// grid-entry guard in samples -- 0 in free mode, where the roll starts at the pad
-// hit and so cannot flam against it.
+// grid-entry guard in samples. Only the global grid branch calls this; the
+// free-running branches run their own per-pad loops.
 function swing_rpt_fire_pads(_ofs, _mingap)
 local(i, blocked) (
   i = 0; loop(NUM_SLOTS,
@@ -276,7 +306,7 @@ local(i, blocked) (
 
 function swing_block_process_note_repeat()
 local(rpt_interval, rpt_threshold, _rpt_iters, i, blocked, _pp_interval, _pp_thr,
-      _rpt_ofs, _ofs_max, _grid, _sw, _pos0, _pos1, _n, _sp)
+      _rpt_ofs, _ofs_max, _grid, _sw, _pos0, _pos1, _n, _sp, _any_held)
 (
   // Renderer treats v_pos <= -9999 as "not a pending voice", so an offset can
   // never reach it. Real buffers are far below this.
@@ -284,10 +314,15 @@ local(rpt_interval, rpt_threshold, _rpt_iters, i, blocked, _pp_interval, _pp_thr
 
   // How long each pad has been held, for the grid-entry guard. Block resolution
   // is enough -- the guard is 30% of a step, not a timing decision.
+  _any_held = 0;
   i = 0; loop(NUM_SLOTS,
-    p_held[i] ? p_rpt_hold[i] += samplesblock : p_rpt_hold[i] = 0;
+    p_held[i] ? ( p_rpt_hold[i] += samplesblock; _any_held = 1; ) : ( p_rpt_hold[i] = 0; );
     i += 1;
   );
+  // The global free-run counter starts at the first hit, as the per-pad counters do (their "not held" reset
+  // below). It used to run on between hits, reset only by a RPT edit or the transport, so a pad struck when the
+  // counter sat near the threshold repeated within the next block -- a flam 3-15 ms after the strike (LIB31).
+  !_any_held ? ( rpt_counter = 0; rpt_swing_phase = 0; );
 
   // Grid sync needs a running transport to have a grid at all. Stopped, or
   // switched off, the roll free-runs from the pad hit exactly as it always did.

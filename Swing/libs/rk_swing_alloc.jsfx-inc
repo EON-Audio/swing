@@ -272,15 +272,15 @@ function swing_alloc_take_stage(need) local(_sz, _p) (
 // Free one region now (a real clear, or a kit import wiping a pad it is about to refill).
 // NOT for a load in flight: its old regions go onto the displaced list below and stay live
 // until finish, because the undo capture may still be reading them.
+// Out of the table FIRST, then the release: the release's settle reads the tables, and with the
+// region still in its table the top-most one never pulled alloc_top back (sweep LIB131; the same
+// order swing_ldr_abort keeps). Under one hold of the lock.
 function swing_region_free(ap, r) local(_p, _l) (
-  _l = swing_region_len(ap, r);
-  _l > 0 ? (
-    _p = swing_region_ptr(ap, r);
-    swing_alloc_lock();
-    swing_alloc_release_(_p, _l);
-    swing_alloc_unlock();
-  );
+  swing_alloc_lock();
+  _l = swing_region_len(ap, r); _p = swing_region_ptr(ap, r);
   swing_region_set(ap, r, -1, 0);
+  _l > 0 ? swing_alloc_release_(_p, _l);
+  swing_alloc_unlock();
 );
 function swing_pad_free_all(ap) local(_r) (
   _r = 0; loop(MAX_LAYERS + 1, swing_region_free(ap, _r); _r += 1;);
@@ -345,11 +345,12 @@ function swing_disp_any(dl) local(_r, _a) (
   _a = 0; _r = 0; loop(MAX_LAYERS + 1, dl[MAX_LAYERS + 1 + _r] > 0 ? _a = 1; _r += 1;);
   _a;
 );
-function swing_disp_free(dl) local(_r, _l) (
+function swing_disp_free(dl) local(_r, _l, _p) (
   swing_alloc_lock();
   _r = 0; loop(MAX_LAYERS + 1,
-    _l = dl[MAX_LAYERS + 1 + _r];
-    _l > 0 ? swing_alloc_release_(dl[_r], _l);
+    _l = dl[MAX_LAYERS + 1 + _r]; _p = dl[_r];
+    dl[MAX_LAYERS + 1 + _r] = 0; dl[_r] = 0;   // off the list FIRST: the release's settle reads it (sweep LIB131)
+    _l > 0 ? swing_alloc_release_(_p, _l);
     _r += 1;
   );
   swing_alloc_unlock();
@@ -453,28 +454,33 @@ function swing_pad_can_fit(ap, layer, need) local(_ok, _li, _sz) (
 // with swing_pad_regions_trim_missing). Regions never shrink on a reload, so the common undo
 // fits in place; the alloc here is the drop-onto-a-layered-pad case (its layers 1..3 were
 // freed at the drop's finish).
-function swing_pad_fit_restore(ap) local(_r, _need, _ok, _sz, _np, _plain, _l0) (
+// Every release here takes the region out of its table BEFORE the release (its settle reads the
+// tables; sweep LIB131), so a top-most region really does pull alloc_top back.
+function swing_pad_fit_restore(ap) local(_r, _need, _ok, _sz, _np, _plain, _l0, _p, _l) (
   _ok = 1; _l0 = ap * MAX_LAYERS;
   _plain = p_layer_cnt[ap] == 0;
   swing_alloc_lock();
   _plain ? (
     (s_len[ap] > 0 && p_alen[ap] < s_len[ap] && p_llen[_l0] >= s_len[ap]) ? (
-      p_alen[ap] > 0 ? swing_alloc_release_(p_aptr[ap], p_alen[ap]);
+      _p = p_aptr[ap]; _l = p_alen[ap];
       swing_region_set(ap, 0, p_lptr[_l0], p_llen[_l0]);
       swing_region_set(ap, 1, -1, 0);
+      _l > 0 ? swing_alloc_release_(_p, _l);
     );
   ) : (
     (l_len[_l0] > 0 && p_llen[_l0] < l_len[_l0] && p_alen[ap] >= l_len[_l0]) ? (
-      p_llen[_l0] > 0 ? swing_alloc_release_(p_lptr[_l0], p_llen[_l0]);
+      _p = p_lptr[_l0]; _l = p_llen[_l0];
       swing_region_set(ap, 1, p_aptr[ap], p_alen[ap]);
       swing_region_set(ap, 0, -1, 0);
+      _l > 0 ? swing_alloc_release_(_p, _l);
     );
   );
   _r = 0; loop(MAX_LAYERS + 1,
     _need = _r == 0 ? (_plain ? s_len[ap] : 0) : (_plain ? 0 : l_len[_l0 + _r - 1]);
     (_need <= 0 && swing_region_len(ap, _r) > 0) ? (
-      swing_alloc_release_(swing_region_ptr(ap, _r), swing_region_len(ap, _r));
+      _p = swing_region_ptr(ap, _r); _l = swing_region_len(ap, _r);
       swing_region_set(ap, _r, -1, 0);
+      swing_alloc_release_(_p, _l);
     );
     _r += 1;
   );
@@ -482,8 +488,9 @@ function swing_pad_fit_restore(ap) local(_r, _need, _ok, _sz, _np, _plain, _l0) 
     _need = _r == 0 ? (_plain ? s_len[ap] : 0) : (_plain ? 0 : l_len[_l0 + _r - 1]);
     (_need > 0 && swing_region_len(ap, _r) < _need) ? (
       // release first: a top-most region then grows in place instead of leaving a hole
-      swing_region_len(ap, _r) > 0 ? swing_alloc_release_(swing_region_ptr(ap, _r), swing_region_len(ap, _r));
+      _p = swing_region_ptr(ap, _r); _l = swing_region_len(ap, _r);
       swing_region_set(ap, _r, -1, 0);
+      _l > 0 ? swing_alloc_release_(_p, _l);
       _sz = swing_alloc_size(_need, swing_region_cap(_r));
       _np = swing_alloc_take_(_sz);
       _np >= 0 ? swing_region_set(ap, _r, _np, _sz) : ( _ok = 0; );
@@ -577,7 +584,16 @@ function swing_alloc_backing_recheck() local(_a, _first) (
 // moving region (every table write passes swing_region_set) abandons the move; the next tick
 // re-scans from the frontier. A region a loader job displaced (in a registered list, not in a
 // table) is PINNED: never moved, never moved into; the frontier steps over it.
+// EXCEPT when the hole is SHORTER than the region (sweep LIB13): then the destination overlaps
+// the source and the copy overwrites the source's head chunk by chunk -- a voice still reading
+// at the old pointer heard the audio jump `hole` cells ahead, then back at the commit, and an
+// undo capture or a save reading it stored the shifted audio. Such a move now completes inside
+// ONE tick: @sample runs after @block on the same thread, so no voice sees it half done, and the
+// windows the undo capture and @serialize read through shrink from the whole walk to the few ms
+// of one copy (a full 4 M-cell pad costs ~12 ms, once per such move). A hole at least as long as
+// the region keeps the chunked walk.
 ALLOC_MV_CHUNKS = 8;   // x SWAP_CHUNK cells per tick, ~0.4 ms of memcpy under the lock
+ALLOC_WALK_MAX = 64;   // regions already in place (or pinned) one tick steps past before it moves or returns (sweep LIB132)
 
 // CALLER HOLDS THE LOCK. The lowest pinned (displaced) region at or above the frontier across
 // one list; `best` carries the lowest start found so far, _al_pin_end its end.
@@ -614,7 +630,7 @@ function swing_alloc_next_region_() local(_ap, _r, _p, _l, _best, _pin) (
 );
 
 // One step. Returns 1 when nothing is left to pack (the request is cleared).
-function swing_alloc_compact_tick() local(_n, _k, _found, _done) (
+function swing_alloc_compact_tick() local(_n, _k, _found, _done, _step, _lap) (
   swing_alloc_lock();
   _done = !alc_req;
   (alc_req && !alc_hold &&
@@ -622,7 +638,15 @@ function swing_alloc_compact_tick() local(_n, _k, _found, _done) (
    !(ldr_job1[LDR_F_PHASE] > 0 && ldr_job1[LDR_F_PHASE] != 6)) ? (
     !alc_mv ? (
       alc_dst == alloc_base ? alc_top0 = alloc_top;   // a pass starts: remember where the top was
-      _found = swing_alloc_next_region_();
+      // The walk: past every region already in place, and every pinned one, in THIS tick (bounded),
+      // so the first real move starts in the tick that found it -- one region a tick cost a pass a
+      // block per packed region before its first hole, ~200 blocks while a load waited (sweep LIB132).
+      _step = 0; _found = swing_alloc_next_region_();
+      while (_step < ALLOC_WALK_MAX && ((_found == 1 && alc_src == alc_dst) || _found == 2)) (
+        _found == 1 ? alc_dst += alc_len;   // (a pinned region moved the frontier itself)
+        _found = swing_alloc_next_region_();
+        _step += 1;
+      );
       _found == 0 ? (
         // the pass is complete: the top falls to the frontier; a pass that reclaimed nothing
         // counts toward the stall guard (see swing_alloc_init)
@@ -637,8 +661,10 @@ function swing_alloc_compact_tick() local(_n, _k, _found, _done) (
     );
     alc_mv ? (
       (swing_region_ptr(alc_ap, alc_r) != alc_src || swing_region_len(alc_ap, alc_r) != alc_len) ? ( alc_mv = 0; ) : (
+        // a hole shorter than the region: the whole move in this tick (see the header)
+        _lap = alc_dst + alc_len > alc_src ? 1073741824 : ALLOC_MV_CHUNKS;
         _k = 0;
-        while (_k < ALLOC_MV_CHUNKS && alc_pos < alc_len) (
+        while (_k < _lap && alc_pos < alc_len) (
           _n = min(SWAP_CHUNK, alc_len - alc_pos);
           memcpy(_swap_tmp_buf, alc_src + alc_pos, _n);
           memcpy(alc_dst + alc_pos, _swap_tmp_buf, _n);

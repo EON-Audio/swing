@@ -94,6 +94,13 @@ local SLICE_COLORS_SEL = {
 
 local OVERVIEW_HEIGHT = 42  -- minimap height in pixels
 
+-- The decode is synchronous (one defer tick, the whole item in a Lua table, one double per frame): a ten-minute
+-- 48 kHz item is ~29 M slots (~460 MB) and a frozen REAPER for the whole read. Sixteen slices of a chop source
+-- never need more than this; a longer item is trimmed to its first CHOP_MAX_SEC seconds and the console says so.
+local CHOP_MAX_SEC = 120
+
+local BANK_NAMES = { "A", "B", "C", "D" }
+
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- STATE
 -- ═══════════════════════════════════════════════════════════════════════════════
@@ -101,7 +108,6 @@ local OVERVIEW_HEIGHT = 42  -- minimap height in pixels
 local ui = {
   ctx          = nil,
   is_open      = true,
-  window_flags = 0,
 }
 
 local audio = {
@@ -114,7 +120,6 @@ local audio = {
   num_channels = 1,
   item_name    = "",
   take         = nil,
-  item         = nil,
 }
 
 local slicer = {
@@ -127,7 +132,9 @@ local slicer = {
   selected     = -1,     -- index of selected slice (-1 = none)
   dragging     = -1,     -- index of marker being dragged (-1 = none)
   last_result_check = 0, -- time of last ExtState poll
-  start_pad    = 1,      -- first pad to assign slices to (1–16)
+  ext_pending  = false,  -- a C++ Extension answer is awaited (its own flag: slicer.state is the Lua fallback's)
+  start_pad    = 1,      -- first pad to assign slices to (1–16): the TILE inside the bank
+  bank         = -1,     -- pad bank the slices go to: 0..3 = A..D, -1 = the bank the target Swing shows
   bpm          = 0,      -- estimated BPM from onset analysis (0 = unknown)
 }
 
@@ -184,27 +191,35 @@ local function load_selected_item_audio()
   end
 
   local total_frames = math.floor(duration * sr + 0.5)
+  local max_frames = math.floor(CHOP_MAX_SEC * sr)
+  if total_frames > max_frames then
+    reaper.ShowConsoleMsg(("EON Choppa: the item is %.0f s long — only its first %d s are loaded for slicing\n")
+      :format(duration, CHOP_MAX_SEC))
+    total_frames = max_frames
+  end
   local block_frames = math.floor(sr / 10)  -- 100ms blocks
 
-  -- Read all audio into a flat array (mono downmix)
+  -- Read all audio into a flat array (mono downmix). ONE reaper.array serves every block, read in place: a fresh
+  -- new_array plus buf.table() per 100 ms block was a second copy of the whole item left to the collector.
   local all_samples = {}
   local offset = aa_start
   local frames_read = 0
+  local buf = reaper.new_array(block_frames * nch)
 
   while frames_read < total_frames do
     local to_read = math.min(block_frames, total_frames - frames_read)
-    local buf = reaper.new_array(to_read * nch)
     buf.clear()
 
     local ret = reaper.GetAudioAccessorSamples(aa, sr, nch, offset, to_read, buf)
     if ret == 1 or ret == 0 then
-      local arr = buf.table()
+      local n0 = #all_samples
       for f = 0, to_read - 1 do
         local sum = 0
+        local j = f * nch
         for ch = 1, nch do
-          sum = sum + (arr[f * nch + ch] or 0)
+          sum = sum + (buf[j + ch] or 0)
         end
-        all_samples[#all_samples + 1] = sum / nch
+        all_samples[n0 + f + 1] = sum / nch
       end
     else
       break
@@ -224,18 +239,20 @@ local function load_selected_item_audio()
   audio.num_frames  = #all_samples
   audio.num_channels = nch
   audio.item_name   = name or "(unnamed)"
-  audio.item        = item
   audio.take        = take
 
-  -- Generate peaks for waveform display (downsample to ~2000 points max)
+  -- Generate peaks for waveform display (downsample to ~2000 points max). Every peak owns its share of ALL the
+  -- frames: peak p covers floor((p-1)*n/count)+1 .. floor(p*n/count). A fixed floor(n/count) frames per peak
+  -- dropped up to 1999 trailing frames while the drawing stretched the peaks over the whole width, so the wave
+  -- and the slice markers (placed from n) disagreed -- by half the width on a file under 4000 frames.
   local peak_count = math.min(2000, audio.num_frames)
-  local samples_per_peak = math.max(1, math.floor(audio.num_frames / peak_count))
+  local n_frames = audio.num_frames
   audio.peaks_pos = {}
   audio.peaks_neg = {}
 
   for p = 1, peak_count do
-    local start_idx = (p - 1) * samples_per_peak + 1
-    local end_idx   = math.min(p * samples_per_peak, audio.num_frames)
+    local start_idx = math.floor((p - 1) * n_frames / peak_count) + 1
+    local end_idx   = math.floor(p * n_frames / peak_count)
     local hi, lo = -math.huge, math.huge
     for i = start_idx, end_idx do
       local s = all_samples[i] or 0
@@ -271,9 +288,14 @@ local function request_detection()
   reaper.SetExtState(EXTSTATE_SECTION, "state", "analyzing", false)
   slicer.state = "analyzing"
 
-  -- Fire the Extension action (logs to console, writes better C++ results)
+  -- Fire the Extension action (logs to console, writes better C++ results). Its answer is awaited on its OWN
+  -- flag: the Lua fallback below ends with slicer.state = "ready" inside this very call, so a poll gated on
+  -- state == "analyzing" returned every frame and the C++ slices (with Mode and the BPM) were never adopted.
+  -- The ExtState "state" was just set to "analyzing", so a stale "ready" from an earlier run cannot be taken.
   local cmd = reaper.NamedCommandLookup("_EON_CHOPPA_SLICE_ITEM")
+  slicer.ext_pending = false
   if cmd and cmd ~= 0 then
+    slicer.ext_pending = true
     reaper.Main_OnCommand(cmd, 0)
   end
 
@@ -293,7 +315,6 @@ local function do_lua_fallback_detection_impl()
   local sr = audio.sample_rate
   local samples = audio.samples
   local n = #samples
-  local min_gap = math.max(1, math.floor(slicer.sensitivity * 0.001 * sr))
 
   -- Simple energy envelope detection
   local window_ms = 10
@@ -394,10 +415,11 @@ local function poll_extension_results()
   if now - slicer.last_result_check < 0.05 then return end -- 20 Hz poll
   slicer.last_result_check = now
 
-  if slicer.state ~= "analyzing" then return end
+  if not slicer.ext_pending then return end   -- the Extension's flag, never slicer.state (see request_detection)
 
   local state = reaper.GetExtState(EXTSTATE_SECTION, "state")
   if state == "ready" then
+    slicer.ext_pending = false
     -- Read results
     local count = tonumber(reaper.GetExtState(EXTSTATE_SECTION, "slice_count")) or 0
     local pos_str = reaper.GetExtState(EXTSTATE_SECTION, "positions")
@@ -430,6 +452,7 @@ local function poll_extension_results()
     recalc_pad_assign()
 
   elseif state == "error" then
+    slicer.ext_pending = false
     slicer.state = "error"
   end
 end
@@ -732,7 +755,6 @@ local function draw_controls(ctx)
   ImGui.SameLine(ctx, 0, 20)
 
   -- Mode toggle
-  local mode_labels = { "Transient", "Spectral", "Spectral Flux" }
   ImGui.SetNextItemWidth(ctx, 140)
   local changed_mode, new_mode = ImGui.Combo(ctx, "Mode",
     slicer.mode, "Transient\0Spectral\0Spectral Flux\0")
@@ -770,6 +792,24 @@ local function draw_controls(ctx)
   if changed_sp then
     slicer.start_pad = new_sp
     recalc_pad_assign()
+  end
+
+  ImGui.SameLine(ctx, 0, 20)
+
+  -- Bank picker. The sixteen pads above are the TILES of one bank; CMD 63 takes an absolute pad (bank x 16 +
+  -- tile), and the old code sent tiles 0-15 -- bank A -- whatever bank the user was looking at, so the slices
+  -- landed out of sight. "Shown" = the bank the target Swing has on screen when Apply is clicked.
+  ImGui.SetNextItemWidth(ctx, 80)
+  local bank_label = slicer.bank < 0 and "Shown" or BANK_NAMES[slicer.bank + 1]
+  if ImGui.BeginCombo(ctx, "Bank", bank_label) then
+    for b = -1, 3 do
+      local lbl = b < 0 and "Shown" or BANK_NAMES[b + 1]
+      if ImGui.Selectable(ctx, lbl, slicer.bank == b) then slicer.bank = b end
+    end
+    ImGui.EndCombo(ctx)
+  end
+  if ImGui.IsItemHovered(ctx) then
+    ImGui.SetTooltip(ctx, "Pad bank the slices load into\n(Shown = the bank Swing is displaying)")
   end
 
   -- BPM display (from onset-based tempo estimation)
@@ -869,12 +909,15 @@ end
 -- chop pump) and post CMD 63 per pad. clear_pad + load + naming + undo
 -- (mark_dirty_pad) all happen JSFX-side; unassigned pads are never touched.
 -- On first project save the bridge migrates unsaved-store chop WAVs into the
--- project store (CMD-86 flow) via the manifest written below.
+-- project store (CMD-86 flow) by copying the whole chops/<guid> dir; the
+-- manifest written below is a bookkeeping record only, like the bridge's own.
 
 local push = {
-  queue   = {},     -- pending { pad=, path=, tries= } items
+  queue   = {},     -- pending { pad=, path=, tries= } items (pad = ABSOLUTE, bank x 16 + tile)
   active  = false,
   inst_id = 0,
+  slot    = nil,    -- the target's registry slot at Apply (its identity bands live there)
+  bank    = 0,      -- the bank the slices went to (0..3)
   sent    = 0,
   state   = "idle", -- per-item: post → wait → settle
   at      = 0,      -- time_precise stamp for wait/settle deadlines
@@ -994,6 +1037,16 @@ local function apply_to_swing_pads()
     return
   end
 
+  -- The bank the slices go to: the picker's, else the bank the target shows (GS_INST_BANK_CUR at its registry
+  -- slot; bank A when that cannot be told). Pads are ABSOLUTE on the CMD 63 bus (bank x 16 + tile) -- the old
+  -- code sent tiles 0-15, bank A, whatever bank the user had on screen, and never said where the slices went.
+  local slot = core.resolve_inst_slot(target_inst)
+  local bank = slicer.bank
+  if bank < 0 then
+    bank = slot and math.floor(reaper.gmem_read(G.GS_INST_BANK_CUR + slot) or 0) or 0
+  end
+  bank = math.max(0, math.min(3, bank))
+
   local base_name = audio.item_name:gsub("[^%w%-_ ]", "")
   if base_name == "" then base_name = "Choppa" end
   local fsbase = base_name:gsub("[^%w%-]", "_"):sub(1, 24)
@@ -1009,7 +1062,7 @@ local function apply_to_swing_pads()
     local slice_idx = pad_assign[pad_num]
     local slice = slice_idx and slicer.slices[slice_idx]
     if slice then
-      local pad_idx = pad_num - 1
+      local pad_idx = bank * G.NUM_PADS + (pad_num - 1)   -- absolute (step 4a): the picked bank's tile
       local ss = slice.pos + 1      -- 1-based Lua index
       local se = math.min(slice.endpos, audio.num_frames)
       local slen = se - ss + 1
@@ -1036,7 +1089,8 @@ local function apply_to_swing_pads()
   end
 
   -- Store housekeeping: LRU stamp for the 30-day sweep + (unsaved store
-  -- only) a manifest so the bridge's first-save migration finds the WAVs.
+  -- only) a manifest.lua listing the WAVs, mirroring the bridge's chop pump.
+  -- Nothing reads it today: the first-save migration copies the whole dir.
   local sf = io.open(dir .. "/.eon_stamp", "wb")
   if sf then sf:write(tostring(gen)); sf:close() end
   if unsaved then
@@ -1054,23 +1108,52 @@ local function apply_to_swing_pads()
   push.queue   = queue
   push.active  = true
   push.inst_id = target_inst
+  push.slot    = slot
+  push.bank    = bank
   push.sent    = 0
   push.state   = "post"
   push.at      = reaper.time_precise()
-  reaper.ShowConsoleMsg(("EON Choppa: sending %d slice(s) to Swing instance %d\n")
-    :format(#queue, target_inst))
+  reaper.ShowConsoleMsg(("EON Choppa: sending %d slice(s) to Swing instance %d, bank %s\n")
+    :format(#queue, target_inst, BANK_NAMES[bank + 1]))
+end
+
+-- Did the audio land on absolute pad `abs_pad` of the target? Read from the target's OWN identity bands at its
+-- registry slot, never the shared AUDIOLEN band: that one is rewritten by EVERY instance every block, from the
+-- bank it shows, so with the target on bank B (or a second Swing in the project) it described another pad --
+-- a landed load read "blank" and was re-sent three times with a false disk warning; a failed one read "sent".
+-- The all-bank band (IDENT64, STAMP = 1 while the instance publishes it) answers for any bank; an older Swing
+-- publishes only the shown bank's sixteen (IDENT), used when the target shows the pad's bank. nil = cannot tell.
+local function pad_landed(abs_pad)
+  local G = core.GMEM
+  local slot = push.slot
+  if not slot then return nil end
+  local f
+  local b64 = G.INST_IDENT64_BASE + slot * G.INST_IDENT64_INST_STRIDE
+  if (reaper.gmem_read(b64 + G.IDENT64_OFF_STAMP) or 0) > 0.5 then
+    f = reaper.gmem_read(b64 + G.INST_IDENT64_HDR + abs_pad * G.INST_IDENT_PAD_FIELDS + G.IDENT_OFF_AUDIO) or 0
+  else
+    local bank, tile = abs_pad // G.NUM_PADS, abs_pad % G.NUM_PADS
+    if math.floor(reaper.gmem_read(G.GS_INST_BANK_CUR + slot) or 0) ~= bank then return nil end
+    f = reaper.gmem_read(G.INST_IDENT_BASE + slot * G.INST_IDENT_INST_STRIDE
+                         + tile * G.INST_IDENT_PAD_FIELDS + G.IDENT_OFF_AUDIO) or 0
+  end
+  if f > 0.5 then return true end
+  if f < -0.5 then return false end
+  return nil
 end
 
 -- Per-tick driver for the CMD 63 queue (called from the main defer loop).
---   post   — stage path + pad and post CMD 63 (only when the bus is idle).
+--   post   — stage path + pad and post CMD 63 (only when the bus is idle
+--            and the bridge's LOCK is down).
 --   wait   — the JSFX consumed the load when CMD returns to 0.
---   settle — one beat for the @block AUDIOLEN republish, then verify the
---            audio landed. Transient file-open failures (AV/indexer holding
---            a just-written WAV) get up to 2 re-posts — same heal as the
---            bridge chop pump's verify phase.
+--   settle — one beat for the @block identity republish, then verify the
+--            audio landed (pad_landed). Transient file-open failures
+--            (AV/indexer holding a just-written WAV) get up to 2 re-posts —
+--            same heal as the bridge chop pump's verify phase; when the
+--            bands cannot be observed, the consumed CMD is trusted (as the
+--            chop pump does).
 -- CMD 63 consumes only on the browser-target instance, so INSTANCE is
--- pointed at the target before each post (also flips the AUDIOLEN mirror
--- to that instance, which the landed-check reads).
+-- pointed at the target before each post.
 local function pump_push()
   if not push.active then return end
   local G = core.GMEM
@@ -1079,13 +1162,17 @@ local function pump_push()
 
   if not item then
     push.active = false
-    reaper.ShowConsoleMsg(("EON Choppa: Sent %d slice(s) to Swing pads "
-      .. "(unassigned pads untouched)\n"):format(push.sent))
+    reaper.ShowConsoleMsg(("EON Choppa: Sent %d slice(s) to Swing bank %s pads "
+      .. "(unassigned pads untouched)\n"):format(push.sent, BANK_NAMES[push.bank + 1]))
     return
   end
 
   if push.state == "post" then
-    if math.floor(reaper.gmem_read(G.CMD) or 0) ~= 0 then
+    -- The bus idle AND the bridge's LOCK down, like every other CMD 63 poster (the Browser's load_sample_to_pad,
+    -- the bridge's eon_fb_load_to_pad): a 63 posted while a kit save or load holds LOCK is refused by the
+    -- bridge's loader, never consumed, and the aborted send left it on the bus.
+    if math.floor(reaper.gmem_read(G.CMD) or 0) ~= 0
+       or math.floor(reaper.gmem_read(G.LOCK) or 0) ~= 0 then
       if now - push.at > 5.0 then
         push.active = false
         reaper.ShowConsoleMsg("EON Choppa: Swing command bus busy — send aborted\n")
@@ -1098,6 +1185,9 @@ local function pump_push()
     end
     reaper.gmem_write(G.GS_BROWSER_PATH_LEN, #item.path)
     reaper.gmem_write(G.GS_BROWSE_PAD, item.pad)
+    -- This producer stages no display name: drop any armed name-adopt flag, or the handler keeps the pad's OLD
+    -- name instead of naming it from the file (the bridge's loader does the same before its CMD 63).
+    reaper.gmem_write(G.GS_BROWSE_NAME_ADOPT, 0)
     reaper.gmem_write(G.CMD, 63)
     push.state, push.at = "wait", now
 
@@ -1114,8 +1204,9 @@ local function pump_push()
 
   elseif push.state == "settle" then
     if now - push.at < 0.25 then return end
-    -- AUDIOLEN republish: >1 = real length, 1 = layered sentinel, 0 = blank
-    if math.floor(reaper.gmem_read(G.AUDIOLEN_BASE + item.pad) or 0) > 1 then
+    local landed = pad_landed(item.pad)
+    if landed or landed == nil then
+      -- landed, or nothing to read it from (no slot, an older Swing on another bank): the consumed CMD counts
       push.sent = push.sent + 1
       table.remove(push.queue, 1)
       push.state, push.at = "post", now
@@ -1136,11 +1227,16 @@ end
 local function apply_export_wavs()
   if slicer.count == 0 or not audio.loaded or not audio.take then return end
 
-  local retval, folder = reaper.JS_Dialog_BrowseForFolder and
-    reaper.JS_Dialog_BrowseForFolder("Select export folder", "") or false, ""
-
-  if not retval or folder == "" then
-    -- Fallback: use project path
+  -- The dialog's two returns, kept whole. `X and f() or false, ""` kept only f()'s FIRST value and bound folder
+  -- to "" every time, so the picked folder was ignored and a cancel (retval 0, truthy) still exported into the
+  -- project's Choppa_Export.
+  local folder
+  if reaper.JS_Dialog_BrowseForFolder then
+    local retval, picked = reaper.JS_Dialog_BrowseForFolder("Select export folder", "")
+    if retval ~= 1 or not picked or picked == "" then return end   -- cancelled: nothing is written
+    folder = picked
+  else
+    -- Fallback without js_ReaScriptAPI: the project path
     local proj_path = reaper.GetProjectPathEx(0)
     folder = proj_path .. core.sep .. "Choppa_Export"
     reaper.RecursiveCreateDirectory(folder, 0)

@@ -277,18 +277,28 @@ local function draw_lane_grid(dl, coords, lane_items, y1, y2, lane_info)
   -- first so the project bar/beat lines overdraw them. Only runs on lanes that
   -- actually set swing_subdiv, so the common default case pays zero cost.
   if lane_subdiv_mode and coords.IsSwingableDiv and coords.IsSwingableDiv(g_eff) then
+    -- Only the ticks on screen (DM225, 2026-10-26): every tick of every item on the lane was computed and
+    -- added to the draw list each frame -- a 64-bar item at 1/32 cost 2048 SwingTransformQN + QNToTime +
+    -- TimeToPixel + AddRectFilled per frame while zoomed into one bar. Items off the view are skipped and
+    -- the tick range is clamped to the view's QN with one cell of slack (a swung tick lands later than
+    -- its base); x_in_any_range still clips to the item.
+    local view_s, view_e = coords.GetVisibleTimeRange()
+    local vq0 = view_s and (reaper.TimeMap_timeToQN(view_s) - g_eff) or -math.huge
+    local vq1 = view_e and (reaper.TimeMap_timeToQN(view_e) + g_eff) or math.huge
     for _, it in ipairs(lane_items) do
-      local s_qn  = reaper.TimeMap_timeToQN(it.s)
-      local e_qn  = reaper.TimeMap_timeToQN(it.e)
-      local first = math.ceil(s_qn / g_eff - 1e-6)
-      local last  = math.floor(e_qn / g_eff + 1e-6)
-      for idx = first, last do
-        local base_qn = idx * g_eff
-        local sq      = (swing ~= 0) and coords.SwingTransformQN(base_qn, g_eff, swing) or base_qn
-        local xv      = coords.TimeToPixel(reaper.TimeMap_QNToTime(sq))
-        if x_in_any_range(xv) then
-          local lx, rx = line_rect_x(xv, 1)
-          fill_ex(dl, lx, y1, rx, y2, col_subbeat)
+      if not view_s or not view_e or (it.e >= view_s and it.s <= view_e) then
+        local s_qn  = math.max(reaper.TimeMap_timeToQN(it.s), vq0)
+        local e_qn  = math.min(reaper.TimeMap_timeToQN(it.e), vq1)
+        local first = math.ceil(s_qn / g_eff - 1e-6)
+        local last  = math.floor(e_qn / g_eff + 1e-6)
+        for idx = first, last do
+          local base_qn = idx * g_eff
+          local sq      = (swing ~= 0) and coords.SwingTransformQN(base_qn, g_eff, swing) or base_qn
+          local xv      = coords.TimeToPixel(reaper.TimeMap_QNToTime(sq))
+          if x_in_any_range(xv) then
+            local lx, rx = line_rect_x(xv, 1)
+            fill_ex(dl, lx, y1, rx, y2, col_subbeat)
+          end
         end
       end
     end
@@ -507,6 +517,60 @@ local function draw_row_banding(dl, x1, x2, item_top, lo, hi, sub_row_h, row_col
   end
 end
 
+-- Loop period of a looped MIDI item's take in its own PPQ; 0 when the item does
+-- not loop or the source length cannot be resolved (merged_mirror's rule).
+local function loop_period_ppq(item, take)
+  if reaper.GetMediaItemInfo_Value(item, 'B_LOOPSRC') ~= 1 then return 0 end
+  if not reaper.GetMediaItemTake_Source then return 0 end
+  local src = reaper.GetMediaItemTake_Source(take)
+  if not src then return 0 end
+  local slen, is_qn = reaper.GetMediaSourceLength(src)
+  if not slen or slen <= 0 or not is_qn then return 0 end
+  local qn0 = reaper.MIDI_GetProjQNFromPPQPos(take, 0)
+  local period = reaper.MIDI_GetPPQPosFromProjQN(take, qn0 + slen)
+  if not period or period <= 0 then return 0 end
+  return period
+end
+
+-- Every VISIBLE play of one note, as REAPER plays it (DM211 / DM226, 2026-10-26):
+-- a play per loop period while inside the item, a start before the item start
+-- skipped, an end clipped to the item end. Only plays that touch the item's
+-- visible window [view_lo, view_hi] (take PPQ, converted once per item) are
+-- mapped to time, so an off-screen note costs its MIDI_GetNote and nothing
+-- more. The old passes mapped every note's raw PPQ to time and then culled --
+-- three API calls per note on screen or not -- and, under the opaque lane
+-- background, a looped item showed only its first pass (the bridge seeds
+-- 'Pattern 1' as a 1-bar loop: dragged to 4 bars, bars 2-4 drew empty) while
+-- notes past a trimmed item's end still drew though silent.
+-- Fills `out` with start, end pairs; returns the count of values written.
+local MAX_PLAYS_PER_NOTE = 4096
+local function visible_plays(take, ppq_s, ppq_e, period, item_s, item_e, view_lo, view_hi, out)
+  local n = 0
+  if period <= 0 then
+    if ppq_e < view_lo or ppq_s > view_hi then return 0 end
+    local s = reaper.MIDI_GetProjTimeFromPPQPos(take, ppq_s)
+    if s < item_s - 1e-9 or s >= item_e then return 0 end
+    local e = reaper.MIDI_GetProjTimeFromPPQPos(take, ppq_e)
+    if e > item_e then e = item_e end
+    if e > s then out[1], out[2] = s, e; n = 2 end
+    return n
+  end
+  local r0 = math.max(0, math.ceil((view_lo - ppq_e) / period))
+  local r1 = math.floor((view_hi - ppq_s) / period)
+  if r1 - r0 > MAX_PLAYS_PER_NOTE then r1 = r0 + MAX_PLAYS_PER_NOTE end
+  for rep = r0, r1 do
+    local s = reaper.MIDI_GetProjTimeFromPPQPos(take, ppq_s + rep * period)
+    if s >= item_e then break end
+    if s >= item_s - 1e-9 then
+      local e = reaper.MIDI_GetProjTimeFromPPQPos(take, ppq_e + rep * period)
+      if e > item_e then e = item_e end
+      if e > s then out[n + 1], out[n + 2] = s, e; n = n + 2 end
+    end
+  end
+  return n
+end
+local PLAYS = {}   -- visible_plays' scratch: one table for every note of every frame
+
 -- Piano-roll cell pass for a multi-pitch lane (note_lo < note_hi). Mirrors the
 -- drum cell pass (velocity->alpha, selection outline, velocity strip) but draws
 -- per-item Y rects with one sub-row per pitch (ported from render_auto_zoom).
@@ -545,13 +609,17 @@ local function render_lane_piano(dl, coords, lane_items, lo, hi, view_start, vie
         end
 
         local take = it.take
+        local period = loop_period_ppq(it.item, take)
+        local vlo = reaper.MIDI_GetPPQPosFromProjTime(take, math.max(view_start, it.s))
+        local vhi = reaper.MIDI_GetPPQPosFromProjTime(take, math.min(view_end, it.e))
         local _, note_count = reaper.MIDI_CountEvts(take)
         for ni = 0, note_count - 1 do
           if notes_rendered >= MAX_NOTES_PER_LANE_PER_FRAME then break end
           local ok, _, _, ppq_s, ppq_e, _, pitch, vel = reaper.MIDI_GetNote(take, ni)
           if ok and pitch >= lo and pitch <= hi then
-            local n_start = reaper.MIDI_GetProjTimeFromPPQPos(take, ppq_s)
-            local n_end   = reaper.MIDI_GetProjTimeFromPPQPos(take, ppq_e)
+            local np = visible_plays(take, ppq_s, ppq_e, period, it.s, it.e, vlo, vhi, PLAYS)
+            for pk = 1, np, 2 do
+            local n_start, n_end = PLAYS[pk], PLAYS[pk + 1]
             if n_end >= view_start and n_start <= view_end then
               local cx1 = coords.Snap(coords.TimeToPixel(n_start))
               local cx2 = coords.Snap(coords.TimeToPixel(n_end))
@@ -603,6 +671,7 @@ local function render_lane_piano(dl, coords, lane_items, lo, hi, view_start, vie
                   fill_ex(dl, cx1, strip.y2 - bar_h, cx1 + bar_w, strip.y2, bar_fill)
                 end
               end
+            end
             end
           end
         end
@@ -796,6 +865,9 @@ function M.RenderLane(ctx, dl, track, lane_info, coords, swing_state)
     if item_end >= view_start and item_start <= view_end then
       local take = it.take
       if take then
+        local period = loop_period_ppq(it.item, take)
+        local vlo = reaper.MIDI_GetPPQPosFromProjTime(take, math.max(view_start, item_start))
+        local vhi = reaper.MIDI_GetPPQPosFromProjTime(take, math.min(view_end, item_end))
         local _, note_count = reaper.MIDI_CountEvts(take)
         for ni = 0, note_count - 1 do
           if notes_rendered_this_lane >= MAX_NOTES_PER_LANE_PER_FRAME then
@@ -811,9 +883,11 @@ function M.RenderLane(ctx, dl, track, lane_info, coords, swing_state)
           end
           local ok, _, _, ppq_s, ppq_e, _, pitch, vel = reaper.MIDI_GetNote(take, ni)
           if ok and pitch == target_pitch then
-            -- Cell width = the NOTE's actual MIDI duration (frozen at paint time).
-            local n_start = reaper.MIDI_GetProjTimeFromPPQPos(take, ppq_s)
-            local n_end   = reaper.MIDI_GetProjTimeFromPPQPos(take, ppq_e)
+            -- Cell width = the NOTE's actual MIDI duration (frozen at paint time);
+            -- one cell per visible play (loop repeats, clipped to the item).
+            local np = visible_plays(take, ppq_s, ppq_e, period, item_start, item_end, vlo, vhi, PLAYS)
+            for pk = 1, np, 2 do
+            local n_start, n_end = PLAYS[pk], PLAYS[pk + 1]
             if n_end >= view_start and n_start <= view_end then
               -- Round via shared coords.Snap so cell edges sit on the same
               -- pixel as the grid lines.
@@ -850,6 +924,7 @@ function M.RenderLane(ctx, dl, track, lane_info, coords, swing_state)
                 local bar_fill = rgba_u32(pad_r, pad_g, pad_b, 180)
                 fill_ex(dl, cx1, bar_y1, cx1 + bar_w, strip.y2, bar_fill)
               end
+            end
             end
           end
         end

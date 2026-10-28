@@ -180,9 +180,10 @@ octave_offset=-1; // Set this value as you prefer.
 // 0x400 = suppress REAPER's hover tooltip over the MCP embed (7.79+; older ignores).
 gfx_ext_retina == 0 ? gfx_ext_retina = 1;
 // 0x400 always; 0x100 follows the THEME menu's NAME BAR row (slider56),
-// default 0 = borderless. REAPER documents 0x100 as an @init decision, so the
-// restored value is applied here; the re-apply in the @gfx tail is what makes
-// the row take effect without a reload.
+// default 0 = borderless. REAPER documents 0x100 as an @init decision, but @init
+// runs before the saved sliders restore and only @slider sets ss_name_bar, so on a
+// load this line always lands on borderless. The re-apply in the @gfx tail is what
+// applies the saved row (first frame) and makes a change take effect without a reload.
 gfx_ext_flags |= 0x400;
 ss_name_bar ? ( gfx_ext_flags = (gfx_ext_flags | 0x100) - 0x100; ) : ( gfx_ext_flags |= 0x100; );
 
@@ -278,7 +279,6 @@ function color(n) (
   );
   colorscheme == 5 || colorscheme == 6 ? (
     n == 5 ? (setcolor(0,0,0,255););        // button txt pttn used, labels
-    n == 6 ? (setcolor(75,95,123,255););    // button txt pttn empty
     n == 6 ? (setcolor(95,95,113,255););    // button txt pttn empty
     n == 8 ? (setcolor(41,41,41,255););     // drum mode white key background
     n == 9 ? (setcolor(220,220,220,127););  // dm midi ch num txt, see thru black
@@ -594,7 +594,8 @@ function eon_lm_rowlbl(dest, r) (
     r == 12 ? "Accent every 2 (+30 vel)" : "Humanize velocity (+/-10)");
 );
 // eon_pm house context-menu row labels. Kinds: 1 = pattern tab, 2 = pager pill,
-// 3 = song-strip chip, 4 = song-strip background, 5 = grid picker.
+// 3 = song-strip chip, 4 = song-strip background, 5 = grid picker (the final else),
+// 6 = clear-pattern confirm, 7 = a timeline block on the song strip.
 function eon_pm_rowlbl(dest, kind, r) (
   strcpy(dest,
     kind == 1 ? (
@@ -718,10 +719,10 @@ GROOVE_NSLOTS       = 16;
 GROOVE_STRIDE       = 160;
 groove_slots        = nextslot1;            // 16 slots x 160
 nextslot1           = groove_slots        + 002560;
-groove_off_rt       = nextslot1;            // runtime per-lane/per-step tick offsets (max_numnotes x max_seqlength, padded)
-nextslot1           = groove_off_rt       + 003200;
+groove_off_rt       = nextslot1;            // runtime per-lane/per-step tick offsets (max_numnotes x max_seqlength = 49 x 128 in the 48x128 layout, padded)
+nextslot1           = groove_off_rt       + 006400;   // was 3200 = the 64-step layout only: in 128-step mode rows 25+ ran into the amp table (audit 2026-10-22 J11)
 groove_amp_rt       = nextslot1;            // runtime per-lane/per-step velocity multipliers (vel-amount pre-baked)
-nextslot1           = groove_amp_rt       + 003200;
+nextslot1           = groove_amp_rt       + 006400;   // ...and the amp table's rows 25+ into lane_groove / grv_snaps / lane_icon_override (serialized!)
 lane_groove         = nextslot1;            // per-lane groove slot id (0 = classic swing). Persisted; NOT cleared here.
 nextslot1           = lane_groove         + 000128;
 grv_snaps           = nextslot1;            // ladder-snap table: [i*4] = machine id, +1 display %, +2 slot, +3 strength
@@ -812,27 +813,20 @@ ms_tb_patcopy=ms_tb+ms_tb_r2+1;
 ms_tb_chain=ms_tb+ms_tb_r2+2;
 ms_tb_colorbutt=ms_tb+ms_tb_r2+3;
 ms_tb_r4=2^13; // toolbar row 4
-ms_tb_patshift=ms_tb+ms_tb_r4+1;
 ms_tb_button_noundo=ms_tb+ms_tb_r4+2;
-ms_tb_button=ms_tb+ms_tb_r4+3;
 ms_tb_swing=ms_tb+ms_tb_r4+4;
-ms_tb_rate=ms_tb+ms_tb_r4+5;
-ms_tb_midimode=ms_tb+ms_tb_r4+7;
 ms_tb_r5=2^14; // toolbar row 5
 ms_tb_button=ms_tb+ms_tb_r5+0;
 ms_tb_panic=ms_tb+ms_tb_r5+1;
 ms_tb_notelen=ms_tb+ms_tb_r5+3;
 ms_tb_patternlen=ms_tb+ms_tb_r5+4;
 ms_tb_numbeats=ms_tb+ms_tb_r5+5;
-ms_tb_move=ms_tb+ms_tb_r5+6;
 ms_tb_settings=ms_tb+ms_tb_r5+7;
 ms_tb_velo=ms_tb+ms_tb_r5+8;
 ms_tb_gridmenu=ms_tb+ms_tb_r5+9;  // EON grid-picker latch: owned by NO section, so the
                                   // frames after gfx_showmenu closes are inert until the
                                   // central release reset (old ms_tb_notelen reuse let the
                                   // Note-length section drag during menu dismissal)
-ms_tb_r6=2^15; // toolbar row 6
-ms_tb_pattmode=ms_tb+ms_tb_r6+0;
 ms_tb_r7=2^16; // EON P3b-4c: song-strip row (drag states keep the ms_tb bit so the
                // pattern-row branch stays engaged during a promote; r7 dispatches ours)
 ms_tb_songbtn       = ms_tb+ms_tb_r7+0;  // consumed click (PLAY/LOOP/toggle/menu)
@@ -863,8 +857,14 @@ ms_sub_channelchange=0; // substate for ms_rowtranpose and ms_el_ctrlchange
 // every @block (so band-gated lanes keep working with the GUI closed) and read
 // by @gfx for the pill display. Also derives eon_band_anysolo from the band's
 // 16 solo fields (the pad-side any_solo equivalent).
-function eon_e2_rebuild_map(slot) local(p, L, note_p, ib) (
+function eon_e2_rebuild_map(slot) local(p, L, note_p, ib, live) (
   ib = EON_ID_BASE + slot*EON_ID_STRIDE;
+  // J12 (fix round 2026-10-27): a lane takes its pad's note only while the paired Swing is ALIVE -- its
+  // registry slot's heartbeat no older than the registry's own timeout -- and only from a pad that Swing
+  // has published (AUDIO flag 1 / -1; 0 = never written). A project reopened with its Swing gone (or not
+  // up yet) reads note 0 from fresh gmem, and taking it pointed every lane at MIDI note 0, which the
+  // project then saved. Not alive or not published: the lane keeps its transpose (the last note it took).
+  live = (time_precise() - gmem[GS_INST_REG_BASE + slot*GS_INST_REG_STRIDE + GS_INST_REG_OFF_HEARTBEAT]) <= GS_INST_REG_TIMEOUT;
   L = 0; loop(max_numnotes, eon_lane_pad[L] = -1; L += 1;);
   eon_band_anysolo = 0;
   p = 0;
@@ -883,8 +883,14 @@ function eon_e2_rebuild_map(slot) local(p, L, note_p, ib) (
     // by lane index, so a lane may point at a note outside the visible grid.
     // Plain array writes (no slider_automate) -> no undo churn; re-derived
     // every @block so it self-heals after kit load / note edits.
+    // NOT gated on IDENT VER (the sweep's J12 tried it and was reverted, 2026-10-27): Swing bumps
+    // VER only when a pad's NAME changes, so an unnamed pad reads VER 0 forever while its NOTE is
+    // published every tick -- the gate left those lanes unmapped (G3Live H09/H10 played nothing on
+    // the kit's notes). The gate is `live` (above) + the AUDIO flag, which Swing writes for all 16
+    // pads every block beside the NOTE. The lane stays mapped either way (as before), so the pill
+    // and the M/S read the pad as they always did; only the note is held.
     (p < numnotes && note_p >= 0 && note_p <= 127) ? (
-      notetranspose[p] = note_p - basenote - p;
+      (live && abs(gmem[ib + p*EON_ID_FIELDS + EON_ID_AUDIO]) > 0.5) ? notetranspose[p] = note_p - basenote - p;
       eon_lane_pad[p]  = p;
     );
     gmem[ib + p*EON_ID_FIELDS + EON_ID_SOLO] > 0.5 ? eon_band_anysolo = 1;
@@ -1171,22 +1177,14 @@ any_solo=0;
 hl_state=0;
 hl_pattern=16; // Lowest 4 bits indicate the pattern number to highlight
 hl_mode=113;
-hl_playbeforestart=114;
-hl_startpos=115;
-hl_endpos=116;
 hl_notelen=117;
 hl_swing=118;
-hl_patshift=119;
 hl_panic=120;
 hl_patternlen=121;
 hl_numbeats=122;
 hl_colorbutt=123;
-hl_rate=124;
-hl_move=125;
 hl_velo=126;
-hl_midimode=127;
 hl_settings=128;
-hl_pattmode=129;
 last_hl_state=0;
 
 lastpreviewsel=-1;
@@ -1211,13 +1209,8 @@ ticks = 0;
 tpb = 128; // ticks per beat
 pianow=3*8+8;
 chw = 0; //MIDI channel column width
-// EON: reserved control strip at the right of each lane header.
-// 72 -> 126 when the VOL/PAN knobs landed. Budget at a typical 25px row:
-//   3 + M17 + 3 + S17 + 4 + VOL18 + 4 + PAN18 + 4 + swing35 + 3 = 126.
-// This widens pkw, so the step grid loses ~54px. Deliberately a FIXED width
-// rather than shrinking when the knobs LOD out: pkw is recomputed in five
-// places from this constant, and making it row_height-dependent would thrash
-// the whole header layout every time the window or lane count changed.
+// EON: reserved control strip at the right of each lane header. eon_ctrlw and pkw
+// are derived from the column mask by eon_colvis_apply() below; 126 = every column on.
 eon_ctrlw = 126;
 // Bootstrap the column mask to all-on. @init runs BEFORE @slider, so without this
 // the first derivation would see eon_colvis == 0, hide every column and compute
@@ -1246,7 +1239,6 @@ want_noteoff_nt = 0;
 ldraglen = -1;
 start_beatpos = 0;
 end_beatpos = -99; // if end_beatpos <= start_beatpos, then play infinitely
-recmask = 0xFFFFFFFF;
 notelen_p = 100;
 defnotelen = tpb;
 swing_p = 0;
@@ -1283,7 +1275,6 @@ nn[10] = strcpy(510, "A");
 nn[11] = strcpy(511, "B");
 #name_str="";
 notename_digit=0;
-nn_filename=1000; // string slot for notename file name
 lnotenames_file=-1;
 // EON -- Swing gmem slot map (Swing_Media_Transfer); mirrors rk_lua_core core.GMEM.
 // Read-only by the live note-name sync in @gfx; no writes to Swing's slots.
@@ -1368,8 +1359,17 @@ EON_SS_MSB_STRIDE = 80;        // [0]=heartbeat, [1]=anysolo, [2..17]=pad mute, 
 EON_ID_BASE       = 26000000;  // slot*EON_ID_STRIDE + pad*EON_ID_FIELDS + field
 EON_ID_STRIDE     = 128;       // 16 pads * 8 fields
 EON_ID_FIELDS     = 8;
+EON_ID_VER        = 0;         // == IDENT_OFF_VER  (moves only when the pad's NAME changes: NOT a "published" flag)
 EON_ID_HUE        = 1;         // == IDENT_OFF_HUE  (-2 sentinel = blank pad)
 EON_ID_NOTE       = 4;         // == IDENT_OFF_NOTE
+EON_ID_AUDIO      = 7;         // == IDENT_OFF_AUDIO (1 loaded, -1 blank, written every block; 0 = never published)
+// The paired Swing's instance-registry slot (== Swing GS_INST_REG_* / rk_lua_core core.GMEM): 16 slots x 4,
+// +1 = time_precise() stamped by Swing's @block (and its @gfx) while it runs. Readers call a slot alive while
+// the stamp is at most GS_INST_REG_TIMEOUT old -- the bridge, the Drum Matrix and Choppa all do.
+GS_INST_REG_BASE          = 2556;
+GS_INST_REG_STRIDE        = 4;
+GS_INST_REG_OFF_HEARTBEAT = 1;
+GS_INST_REG_TIMEOUT       = 3.0;
 // Kit-categories band (bridge-owned; Spec_Swing_Kit_Categories §7a). Per-pad
 // {VER, CAT, SRC, LOCK}; CAT = 46-vocab index (== rk_cat_glyphs ids), -1 =
 // uncategorised; VER==0 = never published -> consumers fall back to name match.
@@ -1546,15 +1546,17 @@ EON_SS_SYNC_SS_MAXLEN  = 58;
 // otherwise lose the first one (rig-caught 2026-09-03: pattern 1 never primed).
 EON_SS_SYNC_DMPUSH_ACK = 59;
 // Section map (bridge -> StepSeq), per slot: +0 GEN (bumped LAST), +1 COUNT, then per
-// region i: +2+i*3 start QN, +3+i*3 end QN, +4+i*3 pattern index (= ordinal-1, -1 when
-// past the pattern cap). 64 regions x 3 + 2 = 194 <= stride 256. Read into eon_map when
-// GEN changes; consumed by the engine's region switch (step 3) and the song ruler.
+// region i: +2+i*4 start QN, +3+i*4 end QN, +4+i*4 pattern index (= ordinal-1, -1 when
+// past the pattern cap), +5+i*4 packed region colour. 64 regions x 4 + 2 = 258 <
+// EON_SS_MAP_NAMEOFF 260; the names then run to 260 + 64 x 3 = 452 <= stride 512. Read
+// into eon_map when GEN changes; consumed by the engine's region switch (step 3) and the
+// song ruler.
 EON_SS_MAP_BASE        = 26160200;
 EON_SS_MAP_STRIDE      = 512;    // 4 cells per region since step 4 (+3 = packed region colour); 16 x 512 = 8192
 EON_SS_MAP_MAXRGN      = 64;
 EON_SS_MAP_NAMEOFF     = 260;  // strip polish: +260 + i*3 = region i's NAME, 3 cells x 4 seven-bit chars (eon_mapname)
-// Shared transfer buffer (single, owner-tagged) for one pattern's note grid. In
-// the verified-free gap above the SYNC band (..26031023), below INCMD (26100000).
+// Shared transfer buffer (single, owner-tagged) for one pattern's note grid: the XFER
+// v2 claim below (26171536..26196639, .refs/gmem_regions_supplement.tsv).
 // header [0]=owner_slot [1]=seq [2]=numpads [3]=numsteps [4]=steps_per_beat;
 // data: pad p, step s velocity at EON_SS_XFER_DATA + p*numsteps + s (0 = no note).
 // ── Package 2 (2026-09-03): XFER v2, one contiguous claim at 26171536, every plane
@@ -1574,21 +1576,21 @@ EON_SS_XFER_CCMETA = 26196632;   // +25096 (2B): per row: type+1 (0 = no row), c
 // P3b-5b RATCHET band (parallel to DATA): per cell p,s holds packed subdivision info
 // = sdnum | (subdivnotelist << 4). sdnum = getSubdivNum (0 = no subdiv); the cell plays
 // sdnum+1 evenly-spaced sub-hits across the step, bit k of the mask = sub-position k on.
-// The bridge expands a subdivided cell into N+1-spaced MIDI notes on export. Sits clear
-// of DATA (16 x max_seqlength=64 = 1024 -> ..26041031) and below INCMD (26100000).
+// The bridge expands a subdivided cell into N+1-spaced MIDI notes on export. Inside the
+// XFER v2 claim at +6152, right after LEN (16 x 128 cells).
 EON_SS_XFER_SUBDIV = 26177688;   // +6152 (XFER v2)
 // P3b-5b sub-hit VELOCITY band (parallel to SUBDIV, but 8 slots per cell): velocity
 // of sub-hit k at EON_SS_XFER_SUBVEL + (p*numsteps + s)*8 + k; 0 = unset -> the
-// consumer falls back to the cell velocity. 16 x max_seqlength=64 cells x 8 = 8192
-// -> ..26138191, above the SONGNAME band's end (..26128191); grep-verified free
-// (bundle + Extension repo) 2026-07-02.
+// consumer falls back to the cell velocity. 16 x 128 cells x 8 = 16384 at +8200 inside
+// the XFER v2 claim (..26196119), right after SUBDIV; the CC planes follow at +24584.
 EON_SS_XFER_SUBVEL = 26179736;   // +8200 (XFER v2), 16 x 128 x 8
 // EON Apply band (AP-1): the custom "apply preset to the ACTIVE pattern" path. Unlike
 // the sync XFER above (PAD-keyed, sync-gated), this is ROW-keyed (StepSeq-native rows,
 // like a native preset load) and consumed UNGATED so it works standalone. The bridge
 // stages one stored grid here + bumps applyreq_seq; the targeted instance drops it into
 // the active pattern. Single shared band, owner-tagged (one apply per user action).
-// Clear of SUBDIV (16 x max_seqlength=64 = ..26043023) and below INCMD (26100000).
+// Clear of the retired v1 XFER planes (..26043023) and of the v2 claim (26171536..),
+// below INCMD (26100000).
 // header [0]=target_slot [1]=applyreq_seq [2]=numrows [3]=numsteps [4]=steps_per_beat
 //        [5]=subdiv-list stamp (== [1] when the staging bridge also wrote the sparse
 //        SUBDIV list; an old bridge never writes [5] -> the list is ignored);
@@ -1639,6 +1641,7 @@ eon_sync_mode     = 0;         // set each frame from slider49; 0 = standalone (
 eon_sync_last_push = 0;        // last consumed dm_push (import edge-detect)
 eon_export_pending = 0;        // @gfx "Export -> DM" click -> @block serializes the grid once
 eon_export_seq     = 0;        // monotonic export-request seq (StepSeq -> bridge, EXPORTREQ)
+eon_export_rearm_t = 0;        // time of the last export / re-arm (the shared-buffer retry in @block, 0.1 s throttle)
 eon_seed_req_last  = 0;        // last seen SEED_REQ (bridge asks us to export-seed an empty region on engage)
 eon_preset_loaded  = 0;        // set by @serialize read (preset/project load) -> @block force-exports it to DM (StepSeq wins, no region clobber)
 // P3b-1 live SS->DM debounce/echo state (runtime only, not serialized):
@@ -1652,10 +1655,10 @@ eon_gfx_hold_t           = 0;  // Package 3: time_precise() of the last @gfx fra
 // ── OFFSCREEN GRID CACHE (@gfx) ──────────────────────────────────────────────
 // The step grid repaints numnotes x listlength cells every frame even when nothing
 // about it changed. It is now rendered once into image slot EON_GC_IMG and blitted
-// on subsequent frames. IMAGE SLOT OWNERSHIP: slot 0 belongs to eon_draw_vtext
-// (rotated label, force-resized on every call); none of the four imported incs
-// (rk_widgets / knobs_kbsg / rk_theme / rk_cat_glyphs) touch image slots at all, so
-// 32 is free -- verified by grep across the main file and all four incs.
+// on subsequent frames. IMAGE SLOT OWNERSHIP: this file uses no other slot (slot 0
+// is free since the unused eon_draw_vtext went); of the imported incs only knobs_kbsg
+// touches one (127, RK_SS_IMG, its supersampled knob), so 32 is free -- verified by
+// grep across the main file and every import.
 EON_GC_IMG      = 32;
 // ── DOCK FACE (see .docs/specs/Spec_Steppa_Dock_Mode.md) ───────────────────
 // ss_dock_face is DERIVED every @gfx frame from the canvas aspect + the slider52
@@ -2828,81 +2831,6 @@ local(ad_i, ad_p, ad_s, ad_L, ad_nl, ad_tl, ad_vl, ad_sd, ad_inv, ad_buf,
   eon_adapt_pend = 0;   // consumed (eon_adapt_last already tracked at arm)
 );
 
-function moveUpDown(dir) // 1 Up // 0 Down //
-(
-  step=0; endrowused=0;
-  loop(listlength,
-    dir?(notelist[step]>281474976710655 ? endrowused+=1;):(endrowused+=notelist[step]&1;);
-    step+=1; 
-  );
-  endrowused==0? (
-    step=0; 
-    loop(listlength,
-    notelist[step]=dir?(notelist[step]*2;):(notelist[step]/2;);
-    notetie[step]= dir?(notetie[step]*2;):(notetie[step]/2;);
-    dir?(row=max_numnotes;):(row=0;);
-    loop(max_numnotes,
-      sd_pos=0;
-    loop(max_subdivs,
-        sdlist[sdlist_p+row*max_seqlength*max_subdivs+step*max_subdivs+sd_pos] = sdlist[sdlist_p+
-      ((dir?(row-1):(row+1);)*max_seqlength*max_subdivs)+step*max_subdivs+sd_pos];
-        sd_pos+=1;
-      );  
-    velolist[step+(row*listlength)] = velolist[step+((dir?(row-1):(row+1);)*listlength)];
-      dir?(row-=1;):(row+=1;);
-    );
-    step+=1;
-    );
-  );       
-  dir?(memset(velolist, 0, listlength););    
-);
-
-function moveRightLeft(dir,ccs) // 1 Right // 0 Left // 
-(
-  y=dir?(-1):(1);
-  z=dir?(listlength-1):(0);
-  x=dir?(0):(listlength-1);
-  sparebuf[0] = notelist[z];
-  sparebuf_tie[0] = notetie[z]; 
-  ccs ? sparebuf_cc[0] = cclist[z];
-  step=z;
-  loop(listlength-dir,   
-    notelist[step] = notelist[step+y]; 
-    notetie[step] = notetie[step+y];
-    ccs ? cclist[step] = cclist[step+y];
-    dir?(step-=1;):(step+=1;);
-  );
-  notelist[x] = sparebuf[0];
-  notetie[x] = sparebuf_tie[0];
-  ccs ? cclist[x] = sparebuf_cc[0];
-  row=0;  
-  loop(max_numnotes,
-    step=z;
-    sparebuf2[0]=velolist[dir?((row+1)*listlength-1):(row*listlength);];
-    sd_pos=0;
-    loop(max_subdivs,
-      sparebuf3[sd_pos]=sdlist[sdlist_p+row*max_seqlength*max_subdivs+step*max_subdivs+sd_pos];
-      sd_pos+=1;
-    );  
-    loop(listlength-1,    
-      sd_pos=0;
-      loop(max_subdivs,
-        sdlist[sdlist_p+row*max_seqlength*max_subdivs+step*max_subdivs+sd_pos] = sdlist[sdlist_p+row*max_seqlength*max_subdivs+(step+y)*max_subdivs+sd_pos];
-        sd_pos+=1;
-      ); 
-      velolist[step+(row*listlength)] = velolist[step+(row*listlength)+y];
-      step+=y; 
-    );
-    velolist[dir?(row*listlength):(((row+1)*listlength)-1);]=sparebuf2[0];
-    sd_pos=0;
-    loop(max_subdivs,
-      sdlist[sdlist_p+row*max_seqlength*max_subdivs+x*max_subdivs+sd_pos] = sparebuf3[sd_pos];
-      sd_pos+=1;
-    );
-  row+=1;
-  );
-);
-
 function initialize48(pm)
 (
   //change number of patterns: initialize 48 patts ONLY, set max_seqlength
@@ -3017,7 +2945,7 @@ function rk_srf_store()
 @slider
 
 new_p=slider1|0;
-new_p!=p ? (_ui_patop ? _pend_pat = new_p : change_pattern(new_p));  // defer past @gfx pattern gestures
+new_p!=p ? (_ui_patop ? (_pend_pat = new_p; _pend_seqlen = -1;) : change_pattern(new_p));  // defer past @gfx pattern gestures; a length parked for the OLD pattern must not land on the new one
 basenote=slider2|0; 
 numnotes=slider4|0;
 rate=slider5;
@@ -3040,7 +2968,12 @@ lane_swing_inited==0 ? (lane_swing_loaded==0 ? memset(lane_swing, swing_p, max_n
 // EON: seed each pattern an auto hue (8 evenly-spaced) on first run / no-load; right-click overrides; persisted
 pattern_hue_inited==0 ? (pattern_hue_loaded==0 ? (eon_phi=0; loop(npatterns, pattern_hue[eon_phi]=(eon_phi==0 ? -1 : (eon_phi%8)/8); eon_phi+=1;);); pattern_hue_inited=1;);   // -1 = MPC cream (pattern 1)
 midi_trigger=slider10|0;
-prev_p==p ? ( // not changing pattern
+// _pend_pat < 0 (audit 2026-10-22 J1): a pattern change DEFERRED above leaves p alone, so this
+// branch used to run with slider3 still holding the OLD pattern's length and park it in
+// _pend_seqlen; @block then did change_pattern(new) + change_seqlen(old length), and the new
+// pattern silently took the old one's length. With a change pending, its length comes from
+// change_pattern itself (listlength_pat[new]); @block mirrors slider3 when p moves.
+prev_p==p && _pend_pat < 0 ? ( // not changing pattern
   newsz=slider3|0;
   _ui_patop ? _pend_seqlen = newsz : change_seqlen(newsz);  // defer past @gfx pattern gestures
   steps_per_beat=slider9|0;
@@ -3864,7 +3797,22 @@ eon_len_follow = 0;   // Match-rule indicator for @gfx (Len pill tick + tooltip)
     gmem[_ssb + EON_SS_SYNC_ORIGIN]    = 2;                                  // 2 = StepSeq
     gmem[_ssb + EON_SS_SYNC_DMREV]     = (gmem[_ssb + EON_SS_SYNC_DMREV]|0) + 1;
     eon_export_pending = 0;
+    eon_export_rearm_t = time_precise();
   );
+  // RE-ARM (audit 2026-10-22 J2): the transfer buffer is ONE band shared by every Steppa. Two
+  // synced instances exporting in the same bridge tick (both do on a project load) leave the
+  // owner cell holding the last writer's slot; the bridge's export_slot then fails the other
+  // every tick ("buffer not ours"), never acks it, and keeps that slot "exporting" -- which
+  // skips its pattern-switch and length re-imports until its grid happens to change again.
+  // While our last EXPORTREQ is unacked and the buffer belongs to someone else, serialize
+  // again (the bridge retries export_slot every tick until the write lands). Both cells are
+  // gmem, so a reloaded instance (its counter back at 0) judges the same way. Throttled to
+  // one re-arm per 0.1 s so a push the bridge just staged for ANOTHER slot gets its @block
+  // before we overwrite the buffer.
+  (!eon_export_pending
+   && (gmem[_ssb + EON_SS_SYNC_EXPORTREQ]|0) != (gmem[_ssb + EON_SS_SYNC_EXPORTACK]|0)
+   && (gmem[EON_SS_XFER_BASE]|0) != _eon_blk_ps
+   && time_precise() - eon_export_rearm_t > 0.1) ? eon_export_pending = 1;
 ) : (
   _eon_blk_ps >= 0 ? (
     gmem[EON_SS_SYNC_BASE + _eon_blk_ps*EON_SS_SYNC_STRIDE + EON_SS_SYNC_SS_SYNCON]  = 0;
@@ -4095,7 +4043,6 @@ loop((play_state&1) ? samplesblock : 1,
     curbeatpos_c=curbeatpos-chains_passed_full*(chain_beats / rate)-chain_preceding_beats;
     curbeatpos_c < 0 ? ( // Position outside current pattern. Produces unpredictable behaviour. May happen if a pattern in chain contains incomplete beat(s).
       curbeatpos_c=0;
-      debug_hits+=1;
     );
     beatpos=(play_state_i&1) ? (curbeatpos_c * eng_rateadj)%eng_listlength : -100;
     tickpos=(play_state_i&1) ? (curbeatpos_c * eng_rateadj * tpb)%(eng_listlength * tpb) : -100;
@@ -4243,8 +4190,6 @@ loop((play_state&1) ? samplesblock : 1,
       );
     ) : a = 0;
     
-    // a &= recmask; // - multiply for bitmask safety?
-                   //stops notes more than 32 above basenote being transmitted
     !(play_state_i&1) ? (
       ltiestate = 0; // clear all note ties if transport is stopped
       memset(sd_playstate, 0, max_numnotes*2); // clear all subdiv states
@@ -4339,7 +4284,6 @@ loop((play_state&1) ? samplesblock : 1,
       (a*=0.5) >=1 || noneed >= 1;
     );
     lbeatpos=beatpos;
-    recmask = 0xFFFFFFFF;
     ltiestate=tiestate;
   );
   cursplpos += 1;
@@ -4371,7 +4315,9 @@ loop(midi_buf_len,
           bp = beatpos; 
         ); 
         chain_rec_to_next ? ( // record note to next pattern in chain
-          rec_p = p+1 % chain;
+          rec_p = p < chain ? p+1 : 0;   // chain = the LAST index (the 3949 trigger rule); past it wrap to pattern 1.
+                                         // Was "p+1 % chain" = p + (1 % chain) (wiki 1.3): chain=1 wrote the note
+                                         // onto the same pattern, p==chain onto the slab past the chain.
           rec_p == 0 ? (
             rec_p_notelist=notelist_base;
             rec_p_velolist=velolist_base;
@@ -4394,7 +4340,6 @@ loop(midi_buf_len,
           );
           setVelo(npos*listlength+bp, vel); // Overwrite velocity
         );
-        recmask -= mask;
         chain_rec_to_next = 0;
       );
     );
@@ -4475,6 +4420,10 @@ dt = min(time_precise() - ss_last_t, 0.05);   // capped: a stalled GUI must not
 ss_last_t = time_precise();                   // jump hover_t a whole second
 hv_speed = 11;                                // house hover speed (Drum Strip parity)
 frame_wheel = mouse_wheel / 120;
+// A panel over the lane header (groove menu, icon picker, lane menu, pattern menu, the
+// Settings overlay) owns the pointer: the knobs under it must not take the wheel either
+// (audit 2026-10-22 J5; the lane-swing wheel below is gated the same way).
+(eon_gdd_open || eon_ico_open || eon_lm_open || eon_pm_open || settingsopen) ? frame_wheel = 0;
 
 // ── THEME menu plumbing ──────────────────────────────────────────────────
 // swing_popup_tick reads the RAW buttons, which is how an open list stays
@@ -4521,9 +4470,10 @@ _uip_prev = mouse_cap;
 // eon_pair_slot drives lane hue/name reads, eon_pair_manual the dropdown checkmark.
 eon_pair_slot   = (abs(slider48)|0) - 1;
 eon_pair_manual = slider48 < -0.5;
-// EON Sync Mode (Phase 0): read the toggle each frame. Read-only for now — no
-// path consumes eon_sync_mode yet, so standalone behaviour is unchanged. Future
-// sync code gates on (eon_sync_mode && eon_pair_slot >= 0).
+// EON Sync Mode: read the slider49 toggle each frame for the face -- eon_pat_sync (the
+// pattern row below) and the Sync rows read it. @block re-derives the same global every
+// block and gates the whole sync engine on it (export / import / length follow / the
+// section map), paired with a registry slot.
 eon_sync_mode   = slider49 > 0.5;
 // EON P3b-3b: region-mirroring pattern row. When Sync is ON + paired, the pattern buttons
 // mirror the Drum Matrix regions (one per region, hidden when none) instead of the fixed 8.
@@ -4541,7 +4491,10 @@ eon_pat_sync = eon_sync_mode && eon_pair_slot >= 0;
 // P3b-4f: outside sync the grid backdrop must not keep wearing a region tint
 // (eon_selrc is captured by the selected chip's draw, which stops running).
 !eon_pat_sync ? eon_selrc = 0;
-eon_npat_total = eon_pat_sync ? max(gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_DM_RGNCNT]|0, 1) : 8;
+// Capped at npatterns (audit 2026-10-22 J16): the bridge publishes the TRUE region count; a
+// chip past the last pattern selected a pattern change_pattern clamps away, never lit, and
+// past 128 its hue / has-notes reads left their claims. Regions beyond the cap stay in the DM.
+eon_npat_total = eon_pat_sync ? min(max(gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_DM_RGNCNT]|0, 1), npatterns) : 8;
 eon_pat_pages  = ((eon_npat_total + 7) / 8)|0;
 eon_pat_page   = min(max(eon_pat_page, 0), eon_pat_pages - 1);
 eon_pat_base   = eon_pat_sync ? eon_pat_page * 8 : 0;
@@ -4990,7 +4943,6 @@ function eon_song_geom() local(e, v, ord, rep, wsum, i, w, x, span0, span1, tot)
       eon_sg_ws[i] = max(4, (((eon_map[i*4+1] - eon_map[i*4])/eon_sg_span)*eon_sg_avail)|0);
       i += 1;
     );
-    eon_sg_cw = 0;
   ) : (
     // CHAIN: weight = section length (QN, from the map; one bar when unknown) x repeats.
     wsum = 0; e = 0;
@@ -5016,7 +4968,6 @@ function eon_song_geom() local(e, v, ord, rep, wsum, i, w, x, span0, span1, tot)
         e += 1;
       );
     );
-    eon_sg_cw  = eon_sg_len > 0 ? max(14, min(84, (eon_sg_avail/eon_sg_len)|0)) : busp;
   );
 );
 // Entry (chain) or region (timeline) under x, from the shared geometry; -1 = none.
@@ -5253,19 +5204,6 @@ function draw_mode_button(x,y,hl)
   );
 );
 
-function draw_patshift_button(x,y,hl)
-(
-  draw_button(x,y);
-  color(37);
-  gfx_x=x+4; gfx_y=y+5;
-  patternmode==0?(pat_shift == 0 ? (
-    gfx_printf("++");
-  ) : (
-    gfx_printf("--");
-  ););
-  hl ? draw_button_highlight(x,y);
-);
-
 function draw_panic_button(x,y,hl)
 (
   draw_button(x,y);
@@ -5275,73 +5213,6 @@ function draw_panic_button(x,y,hl)
   gfx_circle(x+12,y+8.5,6); 
   gfx_circle(x+12,y+8.5,6.5); 
   hl ? draw_button_highlight(x,y);
-);
-
-function draw_startmode_button(x,y,hl)
-(
-  draw_button(x,y);
-  color(37);
-  gfx_x=x+4; gfx_y=y+5;
-  play_before_start == 0 ? (
-    gfx_drawchar($' ');
-    gfx_x-=3;
-    gfx_drawchar($'|');
-    gfx_x-=2;
-    gfx_drawchar($'>');
-  ) : (
-    gfx_drawchar($'>');
-    gfx_x-=3;
-    gfx_drawchar($'|');
-    gfx_x-=2;
-    gfx_drawchar($'>');
-  );
-  hl ? draw_button_highlight(x,y);
-);
-
-function draw_position_display(x, y, hl, value)
-(
-  eon_btn_frame(x, y, 2);
-  
-  // Draw value
-  color(38);
-  gfx_x=x+6; gfx_y=y+5;
-  value < 0 && abs(value) >= 100 ? (
-    gfx_printf(" --- ");
-  ) : value < 0 && abs(value) >= 10 ? (
-    gfx_drawnumber(value,1);
-  ) : value < 0 ? (
-    gfx_drawnumber(value,2);
-  ) : value < 10 ? (
-    gfx_drawnumber(value,3);
-  ) : value < 100 ? (
-    gfx_drawnumber(value,2);
-  ) : value < 1000 ? (
-    gfx_drawnumber(value,1);
-  ) : (
-    gfx_x+=4;
-    gfx_drawnumber(value,0);
-  );
-  hl ? (
-    color(2);
-    gfx_x=x+2;gfx_y=y+1;
-    gfx_rectto(gfx_x+(busp*2-2),gfx_y+(tbrh-2));
-  );
-);
-
-function draw_slider(x,y,pos)
-(
-  eon_btn_frame(x, y, 6);
-  // value-fill bar (teal in EON), inset so it stays inside the rounded frame
-  colorscheme==10 ? (gfx_set(0, 0.62, 0.76, 0.5);) : (color(1); gfx_a=0.5;);
-  gfx_x=x+3;gfx_y=y+2;
-  gfx_rectto(gfx_x+(busp*6-4-1)*pos, gfx_y+(tbrh-4-1));
-);
-
-function draw_slider_highlight(x, y)
-(
-  color(2);
-  gfx_x=x+2;gfx_y=y+1;
-  gfx_rectto(gfx_x+(busp*6-2), gfx_y+(tbrh-2));
 );
 
 function draw_z_space_highlight(x, y, z)
@@ -5412,22 +5283,6 @@ function draw_patternlen_slider(x, y, hl) local(pw, ph, fw, frac, intens)
   gfx_x=x+8; gfx_y=y+5; gfx_printf("Len %d", listlength);
 );
 
-function draw_rate_slider(x, y, hl)
-(
-  draw_slider(x,y,rate/4);
-  color(38);
-  gfx_x=x+8; gfx_y=y+5;
-  gfx_printf("Rate");
-  rate > 0.125 ? (
-    gfx_x=x+108;
-    gfx_drawnumber(rate,2);
-  ) :(
-    gfx_x=x+100;
-    gfx_drawnumber(rate,3);
-  );
-  hl ? draw_slider_highlight(x,y);
-);
-
 function draw_numbeats_slider(x, y, hl) local(pw, ph, fw, frac, intens)
 (
   // EON: compact 4-cell pill -- short text + value, fill + colour intensity scale with the
@@ -5452,57 +5307,6 @@ function draw_numbeats_slider(x, y, hl) local(pw, ph, fw, frac, intens)
   gfx_printf("S/Bt %d", steps_per_beat);
 );
 
-function draw_colors_button(x,y,hl)
-(
-  eon_btn_frame(x, y, 4);
-  // Draw label:
-  color(38);
-  gfx_y=y+5;
-  gfx_x=x+6;
-  gfx_printf(colorschemename);
-  hl ? draw_z_space_highlight(x,y,4);
-);
-
-function draw_midimode_button(x,y,hl)
-(
-  eon_btn_frame(x, y, 6);
-  // Draw label:
-  color(38);
-  gfx_y=y+6;
-  gfx_x=x+9;
-  midi_trigger==0?label="Midi Off";
-  midi_trigger==1?label="Pattern Change";
-  midi_trigger==2?label="Transpose";
-  midi_trigger==3?label="Resync";
-  midi_trigger==4?label="Xpose + Resync";
-  midi_trigger==5?label="Resync Quantized";
-  midi_trigger==6?label="Xpose + Resync Q";		
-  gfx_printf(label);
-  hl ? draw_slider_highlight(x,y);
-);
-
-function draw_pattmode_button(x,y,hl)
-(
-  // Draw edges
-  color(1);
-  gfx_x=x+2;gfx_y=y+1;
-  gfx_lineto(gfx_x+(busp*8-2-1), gfx_y, 0);
-  gfx_lineto(gfx_x, gfx_y+(tbrh-2-1), 0);
-  gfx_lineto(gfx_x-(busp*8-2-1), gfx_y, 0);
-  gfx_lineto(gfx_x, gfx_y-(tbrh-2-1), 0);  
-  // Draw label:
-  color(38);
-  gfx_y=y+6;
-  gfx_x=x+9;
-  patternmode==0?label="96 Patterns/64 Steps";
-  patternmode==1?label="48 Patterns/128 Steps";
-  gfx_printf(label);
-  gfx_y=y+6;
-  gfx_x=x+195;
-  label2="<< Select 64/128 step mode: CLEARS ALL PATTERNS! Save First.";
-  gfx_printf(label2);
-  hl ? draw_z_space_highlight(x,y,8);
-);
 function draw_settings_button(x,y,hl)
 (
   colorscheme==10 ? (   // EON: vector cog on the cream housing
@@ -5556,23 +5360,6 @@ function draw_velo_display(x,y,hl)
   );
 );
 
-function draw_move_button(x,y,hl)
-(
-  eon_btn_frame(x, y, 2);
-  
-  // Draw label:
-  color(38);
-  gfx_y=y+5;
-  gfx_x=x+10;
-  gfx_printf("Move");
- 
-  hl ? (
-    color(2);
-    gfx_x=x+2;gfx_y=y+1;
-    gfx_rectto(gfx_x+(busp*2-2-1),gfx_y+(tbrh-2-1));
-  );
-);
-
 function isSharp(note) local(octavestart)
 (
   octavestart = note % 12; 
@@ -5596,42 +5383,6 @@ function getNotename(note, default_names)
     strcat(#name_str, sprintf(#, "%{notename_digit}d"));
   ) : ( // use notename extracted from file
     #name_str=notenames[note];
-  );
-);
-
-function draw_trigstart_display(x,y,hl)
-(
-  eon_btn_frame(x, y, 4);
-  
-  // Print label and value
-  color(38);
-  gfx_y=y+5;
-  gfx_x=x+6;
-  gfx_printf("Trig: ");
-  gfx_printf(getNotename(trig_note_start, 1));
-  
-  hl ? (
-    color(2);
-    gfx_x=x+2;gfx_y=y+1;
-    gfx_rectto(gfx_x+(busp*2-2-1),gfx_y+(tbrh-2-1));
-  );
-);
-
-function draw_basenote_display(x,y,hl)
-(
-  eon_btn_frame(x, y, 4);
-  
-  // Print label and value
-  color(38);
-  gfx_y=y+5;
-  gfx_x=x+6;
-  gfx_printf("Base: ");
-  gfx_printf(getNotename(basenote, 1));
-  
-  hl ? (
-    color(2);
-    gfx_x=x+2;gfx_y=y+1;
-    gfx_rectto(gfx_x+(busp*2-2-1),gfx_y+(tbrh-2-1));
   );
 );
 
@@ -5868,22 +5619,6 @@ function draw_drum_note(note) local(notepos, nt, trans, half_rh, scaled_tr, offs
   );
 );
 
-function eon_draw_vtext(slot, cx, cy, maxlen, lum) local(tw, th) (
-  // render the name horizontally into offscreen buffer 0, then blit it rotated -90 (reads bottom-to-top)
-  gfx_setfont(6, "Verdana", 9);
-  sprintf(#eon_kn, "%s", slot);
-  gfx_measurestr(#eon_kn, tw, th);
-  tw = min(tw, maxlen);
-  gfx_dest = 0;
-  gfx_setimgdim(0, 0, 0);              // force-clear by resizing
-  gfx_setimgdim(0, tw+4, th+2);
-  lum > 0.55 ? gfx_set(0.10,0.12,0.16,1) : gfx_set(0.98,0.99,1.0,1);
-  gfx_x=2; gfx_y=1; gfx_drawstr(#eon_kn);
-  gfx_dest = -1;                       // back to the main framebuffer
-  gfx_x = (cx - (tw+4)*0.5)|0; gfx_y = (cy - (th+2)*0.5)|0;
-  gfx_blit(0, 1, -1.5707963);
-);
-
 function eon_pad_rgb(nt) local(h) (   // sets gfx_r/g/b to the lane's Swing colour; returns 1 if a named pad
   h = eon_pad_hue_for_note(nt);
   (h > -5 && notenames[nt] != 0) ? (
@@ -6011,8 +5746,10 @@ function draw_tb_pianokeys(x, y) local(note, w, gap, in_range, in_trig_range, eo
     eon_ph = 2*tbrh - 1;
     eon_plo = max(0, basenote - 2);
     (eon_plo + eon_pn) > 127 ? (eon_plo = 127 - eon_pn);
-    trig_note_start < eon_plo ? (trig_note_start = eon_plo);
-    trig_note_start > (eon_plo + eon_pn - 8) ? (trig_note_start = eon_plo + eon_pn - 8);
+    // The trigger zone is drawn where slider11 put it, even when that lies outside this
+    // window. A draw never rewrites trig_note_start (audit 2026-10-22 J4: this view used to
+    // clamp it into the window every frame, with no slider mirror, so the MIDI trigger range
+    // @block honoured depended on which view was showing).
     eon_nw = 0; i = 0;
     loop(eon_pn, !isSharp(eon_plo+i) ? (eon_nw += 1); i += 1;);
     kw = (gfx_w - 4) / eon_nw;                 // white-key width
@@ -6682,11 +6419,15 @@ function ss_dk_preset_open() (
   gmem[EON_SS_BROWSER_SLOT]     = eon_pair_slot>=0 ? eon_pair_slot : 0;
   gmem[EON_SS_BROWSER_OPEN_REQ] = (gmem[EON_SS_BROWSER_OPEN_REQ]|0) + 1;
 );
+// Request counters are seeded from the gmem cell (the eon_song_cmd idiom, audit 2026-10-22
+// J6): an instance-local count restarts at 0 on reload and, on a cell shared by every Steppa,
+// can rewrite the value the bridge last saw -- the click then never edges. Payload first,
+// counter LAST (the bridge reads the counter, then the payload).
 function ss_dk_preset_nav(dir) local(_sl) (
-  eon_pnav_seq += 1;
   _sl = eon_pair_slot>=0 ? eon_pair_slot : 0;
-  gmem[EON_SS_PCTRL_BASE + _sl*EON_SS_PCTRL_STRIDE]     = eon_pnav_seq;
   gmem[EON_SS_PCTRL_BASE + _sl*EON_SS_PCTRL_STRIDE + 1] = dir;
+  eon_pnav_seq = max(eon_pnav_seq, gmem[EON_SS_PCTRL_BASE + _sl*EON_SS_PCTRL_STRIDE]|0) + 1;
+  gmem[EON_SS_PCTRL_BASE + _sl*EON_SS_PCTRL_STRIDE]     = eon_pnav_seq;
   refresh_tb = 1;
 );
 
@@ -6889,7 +6630,7 @@ function ss_dock_input() local(_i, _v, _lmb, _rmb, _cell) (
     ss_dk_over(ss_dk_fl_x,  ss_dk_fl_w)  ? ss_dk_tt = "Grid: Straight / Triplet" :
     ss_dk_over(ss_dk_sw_x,  ss_dk_sw_w)  ? ss_dk_tt = "Swing amount (drag / scroll)" :
     ss_dk_over(ss_dk_ps_x,  ss_dk_ps_w)  ? ss_dk_tt = "Presets: prev | browse | next" :
-    ss_dk_over(ss_dk_mo_x,  ss_dk_mo_w)  ? ss_dk_tt = "U velocity, Note length, View, CC lane, Sync" :
+    ss_dk_over(ss_dk_mo_x,  ss_dk_mo_w)  ? ss_dk_tt = "U velocity, Note length, View, CC lane, Sync, Zoom, Loop, Clear" :
     ss_dk_over(ss_dk_add_x, ss_dk_pat_w) ? ss_dk_tt = "New Drum Matrix region" :
     ss_dk_over(ss_dk_pg_x,  ss_dk_pat_w) ? ss_dk_tt = "Next page of regions" :
     ss_dk_over(ss_dk_dot_x - 4, 16)      ? ss_dk_tt = (eon_pair_slot >= 0 ? "Paired with Swing" : "Not paired") : 0;
@@ -7158,39 +6899,42 @@ lgfx_w != gfx_w || lgfx_h != gfx_h || llistlength != listlength || lnumnotes != 
 );
 
 // ═══════════════════════════════════════════════════════════════════════════
-// EON: live drum-map note-name sync from the active Swing kit.
-// Read-only on Swing's gmem (Swing_Media_Transfer): per pad p (0..15),
-//   MIDI note = gmem[100 + p*80 + 10],  name = ASCII 1-char/slot, 0-terminated
-//   at gmem[1720 + p*32 + i],  alive = gmem[1711] (GS_SWING_ALIVE).
-// Rebuilds notenames[] only when the kit's notes/names change, so pad renames
-// and kit loads relabel rows automatically. Falls through to the original
-// drum-map FILE load when no Swing instance is present (standalone use).
+// EON: live drum-map note-name sync from the PAIRED Swing's kit.
+// Read-only on Swing's gmem (Swing_Media_Transfer), per pad p (0..15) of the paired
+//   registry slot: MIDI note + hue from the IDENT band (EON_ID_BASE + slot*EON_ID_STRIDE
+//   + p*EON_ID_FIELDS), name = ASCII 1-char/slot, 0-terminated, from the IDNAME band
+//   (EON_IDNAME_BASE + slot*EON_IDNAME_STRIDE + p*32 + i); alive = gmem[1711] (GS_SWING_ALIVE).
+// Rebuilds notenames[] only when the kit's notes/names/hues change, so pad renames
+// and kit loads relabel rows automatically. Unpaired (or no Swing running), the block
+// after this one clears the names, so the rows show plain note names.
 // ═══════════════════════════════════════════════════════════════════════════
 eon_swing_alive = gmem[EON_SW_ALIVE] > 0;
 eon_publish_ms();   // EON: publish per-pad lane mute/solo to gmem for the Swing bridge to mirror onto tracks
 eon_sync_tick += 1;
-// Throttle the kit change-detect to ~every 5 frames (was every frame -> CPU). Still catches
-// kit loads from Swing OR the Browser within ~150ms. First sync / file->Swing handoff forced immediately.
+// Throttle the kit change-detect to every 3rd frame (was every frame -> CPU). Still catches
+// kit loads from Swing OR the Browser within ~150ms. First sync / unpaired->paired handoff forced immediately.
 // EON: pad NAMES + colours adopt the Swing kit only when PAIRED. On any pairing change,
 // force a name re-sync (sentinel) so the correct block below re-runs: paired -> kit names;
 // unpaired -> the GM-default block (which also re-sizes the header for plain note names).
 eon_pair_slot != eon_last_pair_ns ? (eon_last_pair_ns = eon_pair_slot; lnotenames_file = -99;);
 eon_swing_alive && mode==1 && eon_pair_slot >= 0 && (eon_sync_tick >= 3 || lnotenames_file != -1) ? (
   eon_sync_tick = 0;
-  // EON: when paired, read THIS instance's IDENT/PADNAME bands; else the shared META.
-  // Only the BASE (and the note/hue per-pad stride) differ -- name stride is 32 in both.
+  // EON: read THIS instance's IDENT/IDNAME bands. The shared-META halves of these
+  // ternaries never run here (the gate above needs a pair); sq_j_test J17 drives them
+  // unpaired. Only the BASE (and the note/hue per-pad stride) differ -- name stride is 32 in both.
   eon_md_note_b = eon_pair_slot >= 0 ? (EON_ID_BASE + eon_pair_slot*EON_ID_STRIDE + EON_ID_NOTE) : (EON_SW_META_BASE + EON_SW_NOTE_OFF);
   eon_md_hue_b  = eon_pair_slot >= 0 ? (EON_ID_BASE + eon_pair_slot*EON_ID_STRIDE + EON_ID_HUE)  : (EON_SW_META_BASE + EON_SW_HUE_OFF);
   eon_md_st     = eon_pair_slot >= 0 ? EON_ID_FIELDS : EON_SW_META_PP;
   eon_md_nm_b   = eon_pair_slot >= 0 ? (EON_IDNAME_BASE + eon_pair_slot*EON_IDNAME_STRIDE) : EON_SW_PADNAME_BASE;
-  // cheap change-detect: checksum each pad's note + first 16 name bytes + per-pad hue + theme S/L
+  // cheap change-detect: checksum each pad's note + the 31 name bytes the copy below reads + per-pad hue + theme S/L
+  // (31, not 20: a rename that only changed characters 21..31 never re-synced, audit 2026-10-22 J17)
   // rolling polynomial hash (mod a large prime) -- far less collision-prone than the old additive
   // sum, so kit changes that left the additive checksum unchanged are now reliably detected
   eon_sum = 0; eon_p = 0;
   loop(16,
     eon_sum = (eon_sum*131 + (gmem[eon_md_note_b + eon_p*eon_md_st]|0) + 1) % 2000000011;
     eon_ci = 0;
-    loop(20,
+    loop(31,
       eon_sum = (eon_sum*131 + (gmem[eon_md_nm_b + eon_p*EON_SW_PADNAME_LEN + eon_ci]|0) + 1) % 2000000011;
       eon_ci += 1;
     );
@@ -7199,7 +6943,7 @@ eon_swing_alive && mode==1 && eon_pair_slot >= 0 && (eon_sync_tick >= 3 || lnote
   );
   eon_sum = (eon_sum*131 + ((gmem[EON_SW_COL_S]*1000)|0)) % 2000000011;
   eon_sum = (eon_sum*131 + ((gmem[EON_SW_COL_L]*1000)|0)) % 2000000011; // theme sat / lightness
-  // rebuild when names changed, or when the FILE path last owned notenames[]
+  // rebuild when names changed, or when the unpaired block below last owned notenames[]
   (eon_sum != eon_last_sync_sum || lnotenames_file != -1) ? (
     eon_last_sync_sum = eon_sum;
     memset(notenames, 0, 128);
@@ -7242,27 +6986,8 @@ eon_swing_alive && mode==1 && eon_pair_slot >= 0 && (eon_sync_tick >= 3 || lnote
   
   memset(notenames, 0, 128); // clear old note names
   max_notename_length=4; // reset to default
-  notename_str = #;
-  nn_filename = #;
-  // handle = file_open("seqbaby_data/GM Kit.txt");
-  // drum-map file removed: empty filename -> file_open fails -> notenames stay cleared (GM names)
-  !((handle = file_open(nn_filename)) < 0) ? ( // file_open successful
-    nn_name=1; // collect note names to string slots starting from slot 1, slot 0 is always empty string
-    notename_name = #;
-    while(
-      str_len = file_string(handle,notename_str);
-      match("%-3{notename_note}d\t%{notename_name}s",notename_str) ? (
-        notename_note >= 0 && notename_note <= 127 ? (
-          strncpy(nn_name, notename_name, strlen(notename_name)-2);
-          notenames[notename_note]=nn_name;
-          strlen(nn_name) > max_notename_length ? max_notename_length = strlen(nn_name);
-          nn_name+=1;         
-        );
-      );
-      str_len > 0;
-    );
-    file_close(handle);
-  );
+  // No drum-map file any more: notenames stay cleared, so getNotename shows plain
+  // note names.
   pianow=max_notename_length*8+8;
   eon_colvis_apply();
   barlen = (gfx_w - pkw)/nbars; // Update barlen for bar line drawing
@@ -7407,7 +7132,11 @@ eon_kn_hov >= 0 ? refresh_pianokeys = 1;
 // eon_kn_hov (computed above) is -1 unless the cursor is actually on a knob, so
 // excluding it hands the wheel to the more specific target and leaves every
 // other pixel of the header behaving exactly as before.
-colorscheme==10 && mode==1 && mouse_wheel != 0 && eon_kn_hov < 0 && mouse_x >= 0 && mouse_x < pkw && mouse_y >= tbh && mouse_y < grid_bottom ? (
+// Panel guard (audit 2026-10-22 J5): the groove menu opens over the header's left column, the
+// icon picker and the lane menu sit on it too -- a notch rolled over any of them used to edit
+// the lane swing underneath while the panel stayed open.
+colorscheme==10 && mode==1 && mouse_wheel != 0 && eon_kn_hov < 0 && mouse_x >= 0 && mouse_x < pkw && mouse_y >= tbh && mouse_y < grid_bottom
+  && !eon_gdd_open && !eon_ico_open && !eon_lm_open && !eon_pm_open && !settingsopen ? (
   eon_sw_lane = numnotes-1-((((mouse_y-tbh)/(grid_bottom-tbh))*numnotes)|0);   // fresh lane (global y can be clobbered)
   (eon_sw_lane >= 0 && eon_sw_lane < numnotes) ? (
     lane_swing[eon_sw_lane] = max(0, min(100, lane_swing[eon_sw_lane] + (mouse_wheel>0 ? (mouse_cap&8 ? 1 : 5) : (mouse_cap&8 ? -1 : -5))));
@@ -7572,8 +7301,9 @@ eon_prdd_open && mstate==0 && mouse_cap==1 ? (
 
 // EON GROOVE menu: geometry + EARLY input (consumed like VIEW/PAIR). Opened by a lane
 // pill click (eon_gdd_lane = lane) or master pill right-click (eon_gdd_lane = -1).
-// Rows: builtins 0..7, then LOADED user slots 8..15, then (master only) a Vel-accent
-// row that click-cycles 0/25/50/75/100 and keeps the menu open.
+// Left-column rows: the 9 builtin shapes 0..8, the 7 user slots 9..15 (empty ones
+// included), then (master only) a Vel-accent row that click-cycles 0/25/50/75/100 and
+// keeps the menu open, then Import.
 eon_gdd_open ? (
   // TWO-COLUMN panel: left = shapes + ALL 7 user slots (empty ones greyed) + (master Vel
   // row) + Import; right = ladder snaps. Row index 9..15 == slot id directly.
@@ -7663,10 +7393,10 @@ eon_gdd_open && mstate==0 && mouse_cap==1 ? (
 
 // EON ICONS picker: geometry + EARLY input (consumed like GROOVE). Opened by a lane
 // icon-column click (eon_ico_lane). Layout: header (hovered name) + Auto row + an
-// 8x6 grid of the 46 category glyphs (last 2 cells dead). eon_ico_hov: -2 none,
-// -1 Auto, 0..45 category.
+// 8x6 grid: the 46 category glyphs, cell 46 = NONE, cell 47 dead. eon_ico_hov: -2 none,
+// -1 Auto, 0..45 category, PADCAT_NONE.
 eon_ico_open ? (
-  eon_ico_hh = 22; eon_ico_ah = 19; eon_ico_cell = 26; eon_ico_cols = 8;   // 8x6 = 46 categories + 2 dead cells
+  eon_ico_hh = 22; eon_ico_ah = 19; eon_ico_cell = 26; eon_ico_cols = 8;   // 8x6 = 46 categories + NONE + 1 dead cell
   eon_ico_w = eon_ico_cols*eon_ico_cell + 8;
   eon_ico_h = eon_ico_hh + eon_ico_ah + 6*eon_ico_cell + 8;
   eon_ico_x > gfx_w - eon_ico_w - 2 ? eon_ico_x = max(0, gfx_w - eon_ico_w - 2);
@@ -7698,7 +7428,7 @@ eon_ico_open && mstate==0 && mouse_cap==1 ? (
         gmem[EON_PADCAT_REQ + 2] = basenote + eon_ico_lane + notetranspose[eon_ico_lane];
         gmem[EON_PADCAT_REQ + 3] = -1;                       // Auto: re-infer from pad name
         gmem[EON_PADCAT_REQ + 4] = -1;                       // SRC hint: leave provenance alone
-        eon_ico_reqseq += 1; gmem[EON_PADCAT_REQ] = eon_ico_reqseq;   // seq LAST
+        eon_ico_reqseq = max(eon_ico_reqseq, gmem[EON_PADCAT_REQ]|0) + 1; gmem[EON_PADCAT_REQ] = eon_ico_reqseq;   // seq LAST
       );
       eon_apply_dirty = 1; eon_apply_settle = 0;             // debounced sliderchange -> undo point + serialize snapshot
       refresh_pianokeys = 1;
@@ -7710,7 +7440,7 @@ eon_ico_open && mstate==0 && mouse_cap==1 ? (
         gmem[EON_PADCAT_REQ + 2] = basenote + eon_ico_lane + notetranspose[eon_ico_lane];
         gmem[EON_PADCAT_REQ + 3] = eon_ico_hov;              // glyph id = category
         gmem[EON_PADCAT_REQ + 4] = -1;                       // SRC hint: leave provenance alone
-        eon_ico_reqseq += 1; gmem[EON_PADCAT_REQ] = eon_ico_reqseq;
+        eon_ico_reqseq = max(eon_ico_reqseq, gmem[EON_PADCAT_REQ]|0) + 1; gmem[EON_PADCAT_REQ] = eon_ico_reqseq;
       ) : (
         lane_icon_override[eon_ico_lane] = eon_ico_hov + 1;
       );
@@ -7727,7 +7457,7 @@ eon_ico_open && mstate==0 && mouse_cap==1 ? (
         gmem[EON_PADCAT_REQ + 2] = basenote + eon_ico_lane + notetranspose[eon_ico_lane];
         gmem[EON_PADCAT_REQ + 3] = PADCAT_NONE;              // explicit "no job"
         gmem[EON_PADCAT_REQ + 4] = -1;                       // SRC hint: leave provenance alone
-        eon_ico_reqseq += 1; gmem[EON_PADCAT_REQ] = eon_ico_reqseq;
+        eon_ico_reqseq = max(eon_ico_reqseq, gmem[EON_PADCAT_REQ]|0) + 1; gmem[EON_PADCAT_REQ] = eon_ico_reqseq;
       ) : (
         lane_icon_override[eon_ico_lane] = LANE_ICON_NONE;
       );
@@ -7833,7 +7563,10 @@ eon_pm_open && mstate==0 && (mouse_cap==1 || mouse_cap==2) ? (
   eon_pm_in_panel ? (
     (mouse_cap==1 && eon_pm_hrow >= 0) ? (
       eon_pm_b = EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE;
-      eon_pm_kind == 1 ? (
+      // Kinds 1 and 2 write the sync band: only while still paired (audit 2026-10-22 J18 --
+      // a pairing dropped under an open menu put the bumps at SYNC_BASE - 64; the same
+      // guard eon_song_cmd has).
+      eon_pm_kind == 1 ? ( eon_pair_slot >= 0 ? (
         // ordinal-payload-FIRST + counter-bump-LAST, same as the old menu.
         // Bumps are gmem READ-modify-write (this JSFX is the field's sole
         // writer): an instance-local counter restarts at 0 on project reload
@@ -7853,11 +7586,11 @@ eon_pm_open && mstate==0 && (mouse_cap==1 || mouse_cap==2) ? (
             gmem[eon_pm_b + EON_SS_SYNC_DEL_REQ] = (gmem[eon_pm_b + EON_SS_SYNC_DEL_REQ]|0) + 1;
           );
         );
-      ) :
+      ); ) :
       eon_pm_kind == 2 ? (
         eon_pm_hrow == 0 ? (eon_pat_page = (eon_pat_page + 1) % eon_pat_pages;) :
         eon_pm_hrow == 1 ? (eon_pat_page = (eon_pat_page + eon_pat_pages - 1) % eon_pat_pages;) : (
-          gmem[eon_pm_b + EON_SS_SYNC_NEW_REQ] = (gmem[eon_pm_b + EON_SS_SYNC_NEW_REQ]|0) + 1;
+          eon_pair_slot >= 0 ? gmem[eon_pm_b + EON_SS_SYNC_NEW_REQ] = (gmem[eon_pm_b + EON_SS_SYNC_NEW_REQ]|0) + 1;
         );
       ) :
       eon_pm_kind == 3 ? (
@@ -7999,10 +7732,11 @@ colorscheme==10 && !ss_dock_face && mouse_wheel != 0 && mouse_y >= 0 && mouse_y 
     mouse_x>=busp*4  && mouse_x<busp*8  ? (notelen_p = max(1,min(100, notelen_p + eon_wd*eon_ws)); defnotelen=(tpb*(notelen_p/100))|0; sliderchange(slider6=notelen_p); refresh_tb=1;) :
     mouse_x>=busp*8  && mouse_x<busp*12 ? (change_seqlen(max(1,min(max_seqlength, listlength + eon_wd))); sliderchange(slider3=listlength); refresh_tb=1;) :
     mouse_x>=busp*12 && mouse_x<busp*16 ? (steps_per_beat = max(1,min(max_steps_per_beat, steps_per_beat + eon_wd)); steps_per_beat_pat[p]=steps_per_beat; rateadj=steps_per_beat*rate; sliderchange(slider9=steps_per_beat); refresh_tb=1;) :
-    mouse_x>=eon_psx && mouse_x<eon_psx+eon_psw ? (   // AP-2 Preset strip: wheel -> nav request to bridge
-      eon_pnav_seq += 1; _psl = eon_pair_slot>=0 ? eon_pair_slot : 0;
-      gmem[EON_SS_PCTRL_BASE + _psl*EON_SS_PCTRL_STRIDE]     = eon_pnav_seq;
+    mouse_x>=eon_psx && mouse_x<eon_psx+eon_psw ? (   // AP-2 Preset strip: wheel -> nav request to bridge (payload first, counter seeded from gmem -- see ss_dk_preset_nav)
+      _psl = eon_pair_slot>=0 ? eon_pair_slot : 0;
       gmem[EON_SS_PCTRL_BASE + _psl*EON_SS_PCTRL_STRIDE + 1] = eon_wd;
+      eon_pnav_seq = max(eon_pnav_seq, gmem[EON_SS_PCTRL_BASE + _psl*EON_SS_PCTRL_STRIDE]|0) + 1;
+      gmem[EON_SS_PCTRL_BASE + _psl*EON_SS_PCTRL_STRIDE]     = eon_pnav_seq;
       refresh_tb=1;
     );
   );
@@ -8044,13 +7778,13 @@ colorscheme==10 && mstate==0 && mouse_cap==1 && mouse_y>=eon_pbh && mouse_y<eon_
 );
 // EON: SWING toggle button (top-right) -> toggle the paired Swing FX window (paired only).
 colorscheme==10 && mstate==0 && mouse_cap==1 && mouse_y>=eon_pbh && mouse_y<eon_pbh+tbrh && mouse_x>=eon_swb_x && mouse_x<eon_swb_x+eon_cmdb_w && eon_pair_slot>=0 ? (
-  eon_opensw_seq += 1;
+  eon_opensw_seq = max(eon_opensw_seq, gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_OPENSW_REQ]|0) + 1;   // seeded from gmem (see ss_dk_preset_nav)
   gmem[EON_SS_SYNC_BASE + eon_pair_slot*EON_SS_SYNC_STRIDE + EON_SS_SYNC_OPENSW_REQ] = eon_opensw_seq;
   mstate=ms_tb_button_noundo;
 );
 // EON: MATRIX toggle button (top-right) -> toggle the Drum Matrix overlay (global).
 colorscheme==10 && mstate==0 && mouse_cap==1 && mouse_y>=eon_pbh && mouse_y<eon_pbh+tbrh && mouse_x>=eon_mxb_x && mouse_x<eon_mxb_x+eon_cmdb_w ? (
-  eon_dmopen_seq += 1;
+  eon_dmopen_seq = max(eon_dmopen_seq, gmem[EON_SS_DM_OPEN_REQ]|0) + 1;   // ONE global cell for every Steppa: seeded from gmem, or B's click could rewrite the value A left and never edge
   gmem[EON_SS_DM_OPEN_REQ] = eon_dmopen_seq;
   mstate=ms_tb_button_noundo;
 );
@@ -8069,9 +7803,10 @@ colorscheme==10 && mstate==0 && mouse_cap==1 && mouse_y>=eon_r2 && mouse_y<eon_r
     gmem[EON_SS_BROWSER_SLOT]     = eon_pair_slot>=0 ? eon_pair_slot : 0;
     gmem[EON_SS_BROWSER_OPEN_REQ] = (gmem[EON_SS_BROWSER_OPEN_REQ]|0) + 1;
   ) : (
-    eon_pnav_seq += 1; _psl2 = eon_pair_slot>=0 ? eon_pair_slot : 0;
-    gmem[EON_SS_PCTRL_BASE + _psl2*EON_SS_PCTRL_STRIDE]     = eon_pnav_seq;
+    _psl2 = eon_pair_slot>=0 ? eon_pair_slot : 0;
     gmem[EON_SS_PCTRL_BASE + _psl2*EON_SS_PCTRL_STRIDE + 1] = mouse_x < eon_psx+(eon_psw/2) ? -1 : 1;
+    eon_pnav_seq = max(eon_pnav_seq, gmem[EON_SS_PCTRL_BASE + _psl2*EON_SS_PCTRL_STRIDE]|0) + 1;   // payload first, counter seeded from gmem (see ss_dk_preset_nav)
+    gmem[EON_SS_PCTRL_BASE + _psl2*EON_SS_PCTRL_STRIDE]     = eon_pnav_seq;
   );
   refresh_tb=1; mstate=ms_tb_button_noundo;
 );
@@ -8875,7 +8610,8 @@ colorscheme==10 && slider17 >= 1.5 && slider17 < 3.5 && mouse_x > 0 && mouse_y >
             want_noteoff_nt=1;
             ms_sub_channelchange ? ( // Change row MIDI channel
               new_chan = nt_channel_start + draglen;
-              new_chan < 0 ? new_chan = 16 - (new_chan % 16) : new_chan = new_chan % 16;
+              new_chan = new_chan - 16*floor(new_chan/16);   // 0..15 for either sign. EEL2 % drops the sign (wiki 1.10):
+                                                            // the old 16 - (new_chan % 16) gave 16 at -16/-32 = status 0xA0, a silent lane
               rowchannel[nt_note]= new_chan;
             ) : ( // Change row transpose (E-2.1: paired lanes are pad-bound, so
                   // transpose is owned by the binding; only allow when unpaired)
@@ -9049,27 +8785,6 @@ colorscheme==10 && slider17 >= 1.5 && slider17 < 3.5 && mouse_x > 0 && mouse_y >
       );
     refresh_tb=1;
     );
-    
-    // Shift + Left click on piano roll keys
-    (mouse_cap==(1|8)) ? (
-      mstate==0 ? ( // Click / Button down
-        mstate=ms_duplseq;
-        listlength*2 <= max_seqlength ? (
-          change_seqlen(listlength*2);
-          sliderchange(slider3=listlength);
-          memcpy(notelist+listlength/2, notelist, listlength/2); // Duplicate notes
-          memcpy(notetie+listlength/2, notetie, listlength/2); // Duplicate notetie
-          // Duplicate other note properties (velocity, start offset, subdivided notes)
-          y=0;
-          loop(max_numnotes,
-            memcpy(velolist+y*listlength+listlength/2, velolist+y*listlength, listlength/2);
-            memcpy(sdlist+sdlist_p+y*max_seqlength*max_subdivs+(listlength/2)*max_subdivs, sdlist+sdlist_p+y*max_seqlength*max_subdivs, (listlength/2)*max_subdivs);
-            y+=1;
-          );
-          memcpy(cclist+listlength/2, cclist, listlength/2); // Duplicate envelopes
-        );
-      );
-    );
   );
 
 ) : (
@@ -9179,7 +8894,12 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
   (mouse_cap==1|4) && !eon_pat_sync ? (
     mstate==0 ? ( // Click / Button down
       mstate=ms_tb_patcopy;
-      (button < 48) && (button+(pat_shift*48)) != p ? (
+      // button < eon_npat_vis (audit 2026-10-22 J8): the row draws 8 chips, but this hit-test
+      // spans x < 16*busp (the swing pill and the VIEW pill included; a modifier click falls
+      // through their own handlers), so the old < 48 / < npatterns bounds sent Ctrl / Alt /
+      // Ctrl+RMB / RMB clicks past chip 8 to patterns 8..15 that no chip can show. Same bound
+      // the plain click uses (9145).
+      (button < eon_npat_vis) && (button+(pat_shift*48)) != p ? (
         source_p = p;
         source_length = listlength;
         s_sdlist = sdlist_p;
@@ -9221,7 +8941,7 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
   (mouse_cap==1|16) && !eon_pat_sync ? (
     mstate==0 ? ( // Click / Button down
       mstate=ms_tb_chain;
-      button < npatterns ? (
+      button < eon_npat_vis ? (
       (chain==(button+(pat_shift*48)))?(
           chain=0;
       sliderchange(slider12=chain);
@@ -9241,7 +8961,7 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
   (mouse_cap==2|4) && !eon_pat_sync ? (
     mstate==0 ? ( // Click / Button down
       mstate=ms_tb_patclear;
-      button < npatterns ? (
+      button < eon_npat_vis ? (
         clear_pattern(button+(pat_shift*48));
         update_has_notes();
         refresh_tb=1;
@@ -9254,7 +8974,7 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
   (colorscheme==10 && mouse_cap==2 && !eon_pat_sync) ? (
     mstate==0 ? (
       mstate=ms_tb_button_noundo;
-      button < npatterns ? (
+      button < eon_npat_vis ? (
         pattern_hue[button] = pattern_hue[button] < 0 ? 0 : (pattern_hue[button] >= 0.916 ? -1 : ((((pattern_hue[button]*12 + 0.5)|0) + 1) % 12) / 12);   // cream <-> 12 hues
         refresh_tb=1;
       );
@@ -9437,189 +9157,6 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
     );
   );
 
-) : (0) ? ( // fourth toolbar row DISABLED (collapsed: Swing -> row 2; Rate/MIDI/Trig -> overlay)
-
-  button = (mouse_x / busp)|0;
-  
-  button == 99 ? ( // patshift handler removed (16 patterns, no banks)
-    (mouse_cap==1) ? (
-      mstate==0 ? ( // Click / Button down
-        patternmode==0?(
-        xtrapatts==0? (// initialize extra 48 patterns when first needed - save memory
-        memset(sparebuf,      0, npatterns*1024);
-        memset(sparebuf_tie,  0, npatterns*1024);
-        memset(sparebuf_cc,   0, npatterns*1024);
-        memset(sparebuf2,     0, npatterns*max_seqlength*max_numnotes);oldpat=p;
-        npatterns=96; sliderchange(slider47=npatterns);
-        notelist=0;
-        velolist=velolist_base;
-        i=0;
-        loop(48,
-          notelist+=listlength_pat[i];
-          velolist+=max_numnotes*listlength_pat[i];
-          i+=1;
-        );
-        notetie=notetie_base+notelist;
-        cclist=cclist_base+notelist;
-        notelist=notelist_base+notelist;
-        sdlist_p=49*max_numnotes*max_seqlength*max_subdivs;  
-        memset(notelist, 0, 3072);
-        memset(notetie,  0, 3072);
-        memset(cclist,   0, 3072); 
-        memset(velolist, 0, 3072*max_numnotes);   
-        memset(sdlist_p, 0, 3072*max_numnotes*max_subdivs);
-        memset(listlength_pat+48, 16, 48); 
-        memset(steps_per_beat_pat+48, 4, 48); 
-        listlength_all+=768;
-        update_has_notes();
-        refresh_tb=1;
-        xtrapatts=1;
-        sliderchange(slider46=xtrapatts);
-        change_pattern(oldpat);
-        );
-        mstate=ms_tb_patshift;
-        pat_shift = !pat_shift; // show next 48 patts
-        sliderchange(slider44=pat_shift);
-        refresh_tb=1;
-        );
-      );
-    );
-  mstate==0 ? hl_state=hl_patshift;
-  ) : button == 1 ? (
-    // Left click play_before_start button
-    (mouse_cap==1) ? (
-      mstate==0 ? ( // Click / Button down
-        mstate=ms_tb_button_noundo;
-    //mstate=ms_tb_patshift;
-        play_before_start = !play_before_start; // toggle play_before_start state
-        sliderchange(slider41=play_before_start);
-        refresh_tb=1;
-      );
-    );
-    mstate==0 ? hl_state=hl_playbeforestart;
-
-  ) : button == 2 || button == 3 ? (
-    // Left click Start beat position display
-    (mouse_cap==1) || (mouse_cap==2) ? (
-      mstate==0 ? ( // Click / Button down
-        ((mouse_cap==1) && beat_position != start_beatpos)||((mouse_cap==2) && start_beatpos != 0) ? (
-          mstate=ms_tb_button;
-          (mouse_cap==1) ? (
-            beat_position >= -99 && beat_position <= 9999 ? (
-              start_beatpos = beat_position; // set start beat position to current beat_position
-            );
-          ) : start_beatpos = 0; // reset to default
-          sliderchange(slider40=start_beatpos);
-          refresh_tb=1;
-        ) : (
-          mstate=ms_tb_button_noundo;
-        );
-      );
-    );
-    mstate==0 ? hl_state=hl_startpos;
-  ) : button == 4 || button == 5 ? (
-    // Left click Start beat position display
-    (mouse_cap==1) || (mouse_cap==2) ? (
-      mstate==0 ? ( // Click / Button down
-        ((mouse_cap==1) && beat_position != end_beatpos)||((mouse_cap==2) && end_beatpos != -99) ? (
-          mstate=ms_tb_button;
-          (mouse_cap==1) ? (
-            beat_position >= -99 && beat_position <= 9999 ? (
-              beat_position <= start_beatpos ? (
-                end_beatpos = -99; // -99 means "end position disabled" or play infinitely
-              ) : (
-                end_beatpos = beat_position; // set start beat position to current beat_position
-              );
-            );
-          ) : end_beatpos = -99; // reset to default
-          sliderchange(slider42=end_beatpos);
-          refresh_tb=1;
-        ) : (
-          mstate=ms_tb_button_noundo;
-        );
-      );
-    );
-    mstate==0 ? hl_state=hl_endpos;
-  ); 
-  
-    (button >= 6 && button <= 11 && mstate==0) || mstate==ms_tb_swing ? (
-    // Left click Swing slider
-	(mouse_cap==1)||(mouse_cap==2) ? (
-      (mouse_cap==1) ? (
-        zeropos=busp*6+1;
-        x=(100*((mouse_x-zeropos)/(busp*12-2-zeropos)))|0;
-        mstate==0 ? ( // Click / Button down
-          mstate=ms_tb_swing;
-          swing_p=x;
-        ) : (
-          x < 0 ? x=0;
-          x > 100 ? x=100;
-          swing_p=x;
-        );
-      );
-     (mouse_cap==2) ? (   
-        mstate==0 ? ( // Click / Button down
-          mstate=ms_tb_swing ;
-		  swing_p==100 ? (swing_p=0;) : (swing_p>=75 ? (swing_p=100;) : (swing_p>=50 ? (swing_p=75;
-		  ) : (swing_p>=25 ? (swing_p=50;) : (swing_p=25;)))))); 
-	  swing = ((tpb/2)*(swing_p/100))|0;
-      memset(lane_swing, swing_p, max_numnotes);   // EON: master Swing slider sets every lane
-      sliderchange(slider8=swing_p);
-      refresh_tb=1;
-      atomic_set(groove_dirty, 1);   // EON GROOVE: master strength -> all lanes -> rebuild table
-    );
-    mstate==0 ? hl_state=hl_swing;
-  );
-  
-  (button >= 18 && button <= 23 && mstate==0 && 0) ? (   // disabled: MIDI mode lives in the Settings overlay
-    // Midi Mode
-    (mouse_cap==1) || (mouse_cap==2) ? (
-      mstate==0 ? (
-        // Click / Button down
-        mstate=ms_tb_midimode;
-        (mouse_cap==1) ? (
-		  midi_trigger+=1; midi_trigger>6?(midi_trigger=0;);
-        ):(
-          midi_trigger-=1; midi_trigger<0?(midi_trigger=6;);
-        );
-        sliderchange(slider10=midi_trigger);
-        refresh_tb=1;
-      );
-    );
-  mstate==0 ? hl_state=hl_midimode;
-  );
-  
-  (button >= 12 && button <= 17 && mstate==0 && 0) || mstate==ms_tb_rate ? (   // disabled: Rate lives in the Settings overlay
-    // Change Rate
-    (mouse_cap==1)|| (mouse_cap==2) ? (
-	  (mouse_cap==1) ? (
-        zeropos=busp*12+1;
-        x=(16*((mouse_x-zeropos)/(busp*18-2-zeropos)))|0;
-        x=x/4;
-        mstate==0 ? ( // Click / Button down
-          mstate=ms_tb_rate;
-          rate=x;
-        ) : (
-          x < 0.125 ? x=0.125;
-          x > 4 ? x=4;
-          rate=x;
-        );
-      );
-	
-	(mouse_cap==2) ? (   
-      mstate==0 ? ( // Click / Button down
-        mstate=ms_tb_notelen;
-		rate==4 ? (rate=0.25;) : (rate>=2 ? (rate=4;) : (rate>=1 ? (rate=2;) : (rate>=0.5 ? (rate=1;
-		) : (rate>=0.25 ? (rate=0.5;) : (rate=0.25;))))))); 
-	  sliderchange(slider5=rate);
-      steps_per_beat_pat[p]=steps_per_beat;
-      rateadj = steps_per_beat * rate;
-      p <= chain ? update_chain_beats();
-      refresh_tb=1;
-	);
-  mstate==0 ? hl_state=hl_rate;
-  );
-  
 ) : (mouse_y > eon_r2 && mouse_y < eon_r2b && mouse_x > 0 && mstate==0 && !eon_vdd_in_panel && !eon_thdd_in_panel && !eon_prdd_in_panel) || (mstate&ms_tb_r5) ? ( // control row
 
   button = (mouse_x / busp)|0;
@@ -9662,12 +9199,12 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
 	(mouse_cap==1) ? (
       zeropos=busp*2+1;
       x=(128*((mouse_x-zeropos)/(busp*4-2-zeropos)))|0;
+      x < 0 ? x=0;       // clamp BEFORE the press/drag split: the press stored the raw edge value, -2..130 (audit 2026-10-22 J19; Note, Len, Grid, envelope alike)
+      x > 127 ? x=127;
       mstate==0 ? ( // Click / Button down
         mstate=ms_tb_velo;
         lastvelo=x;
       ) : (
-        x < 0 ? x=0;
-        x > 127 ? x=127;
         lastvelo=x;
       );
     );
@@ -9686,42 +9223,9 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
   // EON HIT-MAP REALIGN: the control row's DRAWN layout (mode 0 | panic 1 | velo 2-3 |
   // notelen 4-7 | len 8-11 | grid 12-15 | preset strip 16+) drifted from megababy's
   // original hit columns — hover lit the pill LEFT of the cursor and drags mapped to
-  // the wrong x-span. The MOVE block below is a GHOST: draw_move_button is never
-  // called, but its old 4-5 cells sat under the Note pill's left half (a bare click
-  // there silently rotated the pattern). Dead-ranged; rotate lives in the lane menu.
-  (button >= 999 && mstate==0) || mstate==ms_tb_move ? (
-  (mouse_cap==1||mouse_cap==1|4||mouse_cap==1|4|16||mouse_cap==1|16) ? ( 
-  //LEFT CLICK // --------------------- MOVE Right
-      mstate==0 ? (
-      (mouse_cap==1|4|16||mouse_cap==1|16) ? (z=0;):(z=1); //cc's move?
-        (mouse_cap==1|4||mouse_cap==1|4|16) ? (mstate=ms_tb_move;); //scroll or single click
-    moveRightLeft(1,z);
-      );
-    );
-  (mouse_cap==2||mouse_cap==2|4||mouse_cap==2|4|16||mouse_cap==2|16) ? ( 
-  //RIGHT CLICK // -------------------- MOVE Left
-      mstate==0 ? ( 
-    (mouse_cap==2|4|16||mouse_cap==2|16) ? (z=0;):(z=1); //cc's move?
-        (mouse_cap==2|4||mouse_cap==2|4|16) ? (mstate=ms_tb_move;);
-        moveRightLeft(0,z);
-      );
-    );
-    (mouse_cap==1|8||mouse_cap==1|4|8) ? ( 
-  //LEFT CLICK // ------------------ MOVE Up
-      mstate==0 ? ( 
-        (mouse_cap==1|4|8) ? (mstate=ms_tb_move;);
-    moveUpDown(1);
-      );
-    );
-  (mouse_cap==2|8||mouse_cap==2|4|8) ? (
-  //RIGHT CLICK // ----------------- MOVE Down
-      mstate==0 ? ( 
-        (mouse_cap==2|4|8) ? (mstate=ms_tb_move;);
-        moveUpDown(0);
-      );
-    );
-  mstate==0 ? (hl_state=hl_move;);
-  ); 
+  // the wrong x-span. The old MOVE block (no drawn button, but its 4-5 cells sat under
+  // the Note pill's left half: a bare click there silently rotated the pattern) is
+  // gone; rotate lives in the lane menu.
 
   (button >= 4 && button <= 7 && mstate==0) || mstate==ms_tb_notelen ? (
     // Left click Note length slider (hit/value span = drawn pill at busp*4..8)
@@ -9729,6 +9233,8 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
 	  (mouse_cap==1) ? (
         zeropos=busp*4+1;
         x=(100*((mouse_x-zeropos)/(busp*8-2-zeropos)))|0;
+        x < 0 ? x=0;       // clamp before the split (J19)
+        x > 100 ? x=100;
         mstate==0 ? ( // Click / Button down
           mstate=ms_tb_notelen;
           notelen_p=x;
@@ -9736,8 +9242,6 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
           sliderchange(slider6=notelen_p);
           refresh_tb=1;
         ) : (
-          x < 0 ? x=0;
-          x > 100 ? x=100;
           notelen_p=x;
           defnotelen = (tpb*(notelen_p/100))|0;
           sliderchange(slider6=notelen_p);
@@ -9765,12 +9269,12 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
    (mouse_cap==1) ? (
       zeropos=busp*8+1;
       x=1+(max_seqlength*((mouse_x-zeropos)/(busp*12-2-zeropos)))|0;
+      x < 2 ? x=2;       // clamp before the split (J19): a press at the pill's edges gave Len 0, 1 or max+1 (change_seqlen(65) ran past the 64-cell lane stride)
+      x > max_seqlength ? x=max_seqlength;
       mstate==0 ? ( // Click / Button down
         mstate=ms_tb_patternlen;
         listlength=x;
       ) : (
-        x < 2 ? x=2;
-        x > max_seqlength ? x=max_seqlength;
         listlength=x;
       );
     );
@@ -9801,13 +9305,13 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
 	  (mouse_cap==1) ? (
         zeropos=busp*12+1;
         x=1+(15*((mouse_x-zeropos)/(busp*16-2-zeropos)))|0;
+        x < 1 ? x=1;       // clamp before the split (J19): a press at the pill's left edge gave 0 steps/beat (eng_rateadj 0, update_chain_beats divides by it)
+        x > 16 ? x=16;
         mstate==0 ? ( // Click / Button down
           mstate=ms_tb_numbeats;
           steps_per_beat=x;
           refresh_tb=1;
         ) : (
-          x < 1 ? x=1;
-          x > 16 ? x=16;
          steps_per_beat=x;
         );
       );
@@ -9838,7 +9342,7 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
     mstate==0 ? hl_state=hl_numbeats;
   );
   
-  (button >= 99 && mstate==0) ? (   // EON: cog moved to the pattern-row corner (own click below); old control-row hit-test disabled
+  (button >= 99 && mstate==0 && 0) ? (   // EON: cog moved to the pattern-row corner (own click below); old control-row hit-test disabled -- "&& 0" like the other dead rows: a bare button >= 99 is REACHED past x = 99*busp on a wide window (audit 2026-10-22 J20)
     // Settings section
     (mouse_cap==1) || (mouse_cap==2) ? (
       mstate==0 ? (
@@ -9955,6 +9459,8 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
       x = (((mouse_x - pkw)/(gfx_w - pkw))*listlength)|0;
       x >= 0 && x < listlength ? (
         envval = ((gfx_h - mouse_y) / env_max_h)*127|0;
+        envval > 127 ? envval=127;   // clamp before the split (J19): the top row's press wrote 128|0x80, which reads back as value 0
+        envval < 0 ? envval=0;
         mstate==0 ? ( // Click / Button down
           mstate=ms_el_envdraw;
           cclist[x]=setCc(cclist[x], cc_to_adjust, envval | 0x80);
@@ -10028,7 +9534,7 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
           ldraglen = draglen;
           ms_sub_channelchange==0 ? (
             new_cc = cc_type_start + draglen;
-            new_cc < 0 ? new_cc = 128 - (new_cc % 128) : new_cc = new_cc % 128;
+            new_cc = new_cc - 128*floor(new_cc/128);   // 0..127 for either sign (EEL2 % drops the sign: 128 - (-128 % 128) was 128, a data byte out of range)
             cc_type[cc_to_adjust]=new_cc;
             cc_to_adjust == 0 ? sliderchange(slider20=cc_type[cc_to_adjust]);
             cc_to_adjust == 1 ? sliderchange(slider21=cc_type[cc_to_adjust]);
@@ -10036,7 +9542,7 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
             cc_to_adjust == 3 ? sliderchange(slider23=cc_type[cc_to_adjust]);
           ) : (
             new_cc = cc_chan_start + draglen;
-            new_cc < 0 ? new_cc = 16 - (new_cc % 16) : new_cc = new_cc % 16;
+            new_cc = new_cc - 16*floor(new_cc/16);     // 0..15 for either sign (the old wrap gave 16 at -16: 0xB0+16 = Program Change)
             cc_chan[cc_to_adjust]=new_cc;
             cc_to_adjust == 0 ? sliderchange(slider30=cc_chan[cc_to_adjust]);
             cc_to_adjust == 1 ? sliderchange(slider31=cc_chan[cc_to_adjust]);
@@ -10050,25 +9556,6 @@ mouse_x > 0 && mstate==0 && (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mous
       ms_sub_channelchange=0; 
     );
   );
-):(
-
-(mouse_x > 0 && mstate==0 && mouse_y > 5*tbrh && mouse_y < tbh && mouse_x < 8*busp) || (mstate&ms_tb_r6)) ? ( // Mouse on 6th row
-button = (mouse_x / busp)|0;
-  
-  button >= 99 ? ( // pattern-mode handler removed (16 patterns; was "CLEARS ALL")
-    // Step/Pattern Mode Button
-    (mouse_cap==1) ? (
-      mstate==0 ? ( // Click / Button down    
-		mstate=ms_tb_pattmode;
-		pm=patternmode;
-		pm=!pm;
-		sliderchange(slider45=pm);
-		initialize48(pm);
-		refresh_tb=1;
-      );
-    );
-    mstate==0 ? hl_state=hl_pattmode;
-  ); 
 );
 
 !(mouse_cap&3) ? (
@@ -10382,7 +9869,7 @@ loop(numnotes,
       gfx_x=tx; gfx_y=ly; gfx_rectto(tx+2,ty);
     );
     
-    sel && !(notetie[xpos-1]&mask) ? ( //Note exists and is not tied to previous note.
+    sel && !(xpos > 0 && (notetie[xpos-1]&mask)) ? ( //Note exists and is not tied to previous note (step 0: notetie[-1] is the previous pattern's last step, which the engine never ties across -- 4300)
       // Draw velocity bar
       num_sd ? (
         sd = 0;
@@ -10408,7 +9895,7 @@ loop(numnotes,
   notepos+=1;
 );
 
-// ── EON: grid-line structure (opt-in, slider49) ──────────────────────────────
+// ── EON: grid-line structure (slider50, default on) ──────────────────────────────
 // MUST be drawn HERE, after the cell loop. What reads as a "gridline" in this UI
 // is really the backdrop showing through the 1px gap between cell fills, so the
 // bar/octave lines further up get painted over by the cells -- anything drawn
@@ -10656,7 +10143,10 @@ refresh_tb || lgfx_w_tb != gfx_w || lgfx_h_tb != gfx_h || last_hl_state!=hl_stat
   );
   // EON: redraw the SELECTED pattern ENLARGED + on top (2nd pass), so it pops out of the row.
   // P3b-4: only when the selected ordinal actually lives on the visible page.
-  (eon_sel_onpage && p < eon_npat_vis) ? (eon_pat_big = 1; draw_pat_button(p, p, eon_pbh, 0); eon_pat_big = 0;);
+  // draw_pat_button takes the ON-PAGE index (it adds eon_pat_base itself); p is absolute in
+  // sync, so page 2+ never popped its chip (audit 2026-10-22 J22). Standalone: base 0, as before.
+  eon_pbig_i = p - eon_pat_base;
+  (eon_sel_onpage && eon_pbig_i >= 0 && eon_pbig_i < eon_npat_vis) ? (eon_pat_big = 1; draw_pat_button(eon_pbig_i, eon_pbig_i, eon_pbh, 0); eon_pat_big = 0;);
   // EON P3b-3b-2: "+" button after the last region -> create a new DM region/pattern.
   // P3b-4: eon_pat_addbtn = last page with a free slot (or exactly-8 total; the pager
   // needs slot 8 only when >8). The click handler watches button == eon_npat_vis.
@@ -10844,8 +10334,13 @@ colorscheme==10 ? (
   // runs in BOTH faces: the dock face gets tooltips for free, and the shared
   // frame tail stays shared (hiding it is how an input gate wedges).
   ss_dock_face ? ( eon_tt = ss_dk_tt; ) : (
-  // Toolbar button hover hints. x = busp*col, y = row*tbrh, single cell = busp wide.
-  (mouse_y >= 4*tbrh && mouse_y < 5*tbrh) ? (
+  // Toolbar button hover hints. The control row hangs off eon_r2..eon_r2b (its draws at
+  // draw_mode_button(busp*0, eon_r2, ..) and its hit-test "control row" branch do), not a
+  // fixed row: with the piano hidden the row sits at y 52-74 and the old 4*tbrh band put
+  // these hints over the song strip / the first lane (audit 2026-10-22 J23). The swing pill
+  // lives on the pattern row at eon_swpx; Rate / MIDI-trigger moved into the Settings
+  // overlay and the colour cycler is gone, so their row-3 / row-1 / row-5 hints went too.
+  (mouse_y >= eon_r2 && mouse_y < eon_r2b) ? (
     mouse_x >= busp*0  && mouse_x < busp*1  ? (eon_tt = "Toggle Drum-map / Piano-roll mode") :
     mouse_x >= busp*1  && mouse_x < busp*2  ? (eon_tt = "Panic: send all-notes-off") :
     mouse_x >= busp*2  && mouse_x < busp*4  ? (eon_tt = "Default note velocity (drag / scroll)") :
@@ -10855,13 +10350,8 @@ colorscheme==10 ? (
       : "Pattern length (steps)") :
     mouse_x >= busp*12 && mouse_x < busp*16 ? (eon_tt = "Grid: Straight/Triplet (right-click to pick; drag = raw steps per beat)") : 0;
   );
-  (mouse_y >= 3*tbrh && mouse_y < 4*tbrh) ? (
-    mouse_x >= busp*6  && mouse_x < busp*12 ? (eon_tt = "Swing amount") :
-    (settingsopen && mouse_x >= busp*12 && mouse_x < busp*18) ? (eon_tt = "Rate: playback speed vs host tempo") :
-    (settingsopen && mouse_x >= busp*18 && mouse_x < busp*24) ? (eon_tt = "MIDI-trigger mode (live pattern switching)") :
-    (settingsopen && mouse_x >= busp*24 && mouse_x < busp*26) ? (eon_tt = "MIDI-trigger note (= pattern 1)") : 0;
-  );
-  (mouse_y >= 1*tbrh && mouse_y < 2*tbrh && mouse_x >= busp*24 && mouse_x < busp*26) ? (eon_tt = "Cycle colour scheme");
+  (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mouse_x >= eon_swpx && mouse_x < eon_swpx+eon_swpw) ?
+    (eon_tt = "Swing amount (drag; right-click: groove menu)");
   // Wordmark band. Say only what a click will actually do right now: pop out
   // when the rig holds us, dock when the bridge can hear us, else menu only.
   eon_wm_hov ? (
@@ -10900,7 +10390,6 @@ colorscheme==10 ? (
     (eon_tt = "Zoom: fit the arrange to the selected pattern");
   (mouse_y >= eon_r2 && mouse_y < eon_r2b && mouse_x >= eon_cogb_x+busp*2 && mouse_x < eon_cogb_x+busp*3-3) ?
     (eon_tt = "Loop ALL patterns: loop-select every region + repeat on");
-  (settingsopen==1 && mouse_y >= 5*tbrh && mouse_y < 6*tbrh && mouse_x >= busp*0 && mouse_x < busp*1) ? (eon_tt = "Pattern layout: 96x64 / 48x128 steps");
   // P3b-4b: hovering a pattern button in sync mode -> tooltip = the region NAME.
   // Trusted only when the courier's NAMEPAGE matches our visible page (a page flip
   // invalidates the window until the bridge rewrites it -> no stale-page names).
@@ -10935,12 +10424,18 @@ colorscheme==10 ? (
   // plus a translucent ghost chip that rides the cursor.
   (mstate == ms_tb_songdrag_pat || mstate == ms_tb_songdrag_chip) ? (
     eon_song_geom();
-    (mouse_y >= eon_song_y-1 && mouse_y < eon_song_y+eon_song_h-2 && eon_sg_len > 0) ? (
-      eon_scaret = ((mouse_x - eon_sg_x0) / eon_sg_cw)|0;
-      eon_scaret < 0 ? eon_scaret = 0;
-      eon_scaret > eon_sg_len ? eon_scaret = eon_sg_len;
+    // Caret x from the SHARED geometry (eon_sg_xs/ws), where the drop handler lands it
+    // (audit 2026-10-22 J15: the old uniform pitch was 0 on the timeline face -- the
+    // default -- and wrong for the chain's variable-width chips). A chip drop goes to the
+    // hovered chip's slot (its left edge), else after the last chip; a pattern drop always
+    // APPENDS. The timeline face shows regions, not the chain: no caret there.
+    (mouse_y >= eon_song_y-1 && mouse_y < eon_song_y+eon_song_h-2 && eon_sg_len > 0 && !eon_sg_tl) ? (
+      eon_sce = mstate == ms_tb_songdrag_chip ? eon_sg_hit(mouse_x) : -1;
+      eon_scx = eon_sce >= 0 ? eon_sg_xs[eon_sce]
+              : (mstate == ms_tb_songdrag_chip && mouse_x < eon_sg_x0) ? eon_sg_xs[0]
+              : eon_sg_xs[eon_sg_len-1] + eon_sg_ws[eon_sg_len-1];
       gfx_set(0.99, 1.0, 1.0, 0.9);
-      gfx_rect(eon_sg_x0 + eon_scaret*eon_sg_cw - 2, eon_song_y - 2, 2, tbrh + 2);
+      gfx_rect(eon_scx - 2, eon_song_y - 2, 2, tbrh + 2);
     );
     gfx_set(1, 1, 1, 0.35);
     gfx_rect(mouse_x - 9, mouse_y - 8, 18, 16);
@@ -11291,7 +10786,7 @@ eon_pm_open ? (
     gfx_drawstr(#eon_pmt);
   ) :
   eon_pm_kind == 6 ? (
-    sprintf(#eon_pmt, "CLEAR P%d?", eon_pat_sync ? eon_pat_base + eon_pm_ord + 1 : eon_pm_ord + 1);
+    sprintf(#eon_pmt, "CLEAR P%d?", eon_pm_ord + 1);   // both openers pass p, ABSOLUTE in sync too (adding the page base named another pattern on page 2+)
     gfx_drawstr(#eon_pmt);
   ) : (
     gfx_drawstr(eon_pm_kind == 2 ? "PATTERNS" : eon_pm_kind == 4 ? "SONG" : "GRID");

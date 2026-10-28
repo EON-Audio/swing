@@ -31,11 +31,22 @@ if not (mirror and mirror.Sync) then
   return
 end
 
--- Bridge ownership check — same test the StepSeq courier uses (the bridge
--- writes os.time() to gmem[99] = KIT_GMEM_BRIDGE_ALIVE while it runs, 0 on
--- exit). Done before anything else so the toggle state is never touched.
+-- Bridge ownership check — same test the StepSeq courier uses. The bridge is
+-- alive when BOTH hold: it publishes what it can do in GS_BRIDGE_LEVEL (2636:
+-- only a bridge writes it, its atexit zeroes it) AND its BRIDGE_ALIVE stamp
+-- (99, os.time() every tick) is fresh -- the 5 s window the bridge's own guard
+-- uses. The old test, gmem[99] > 0, was also true after the overlay's own
+-- heartbeat or a Build / SeedLane / Resync stamped that cell, so this fallback
+-- refused to start exactly when it was needed (audit DM118, 2026-10-26).
+-- Done before anything else so the toggle state is never touched.
+local GS_BRIDGE_LEVEL = 2636
+local BRIDGE_ALIVE    = 99
+local function bridge_alive()
+  if (r.gmem_read(GS_BRIDGE_LEVEL) or 0) <= 0 then return false end
+  return (os.time() - (r.gmem_read(BRIDGE_ALIVE) or 0)) < 5
+end
 r.gmem_attach('Swing_Media_Transfer')
-if (r.gmem_read(99) or 0) > 0 then
+if bridge_alive() then
   r.ShowMessageBox(
     'The Swing Kit Bridge is running, and it already keeps merged mode\'s\n' ..
     'trigger track up to date. This standalone mirror is not needed.\n\n' ..
@@ -107,6 +118,9 @@ local function tick()
   if frame % TICK_FRAMES ~= 0 then r.defer(tick) return end
 
   if r.GetExtState(EXT, 'stop') == '1' then return end   -- atexit does cleanup
+  -- A bridge that started after us owns the mirror from now on: step aside
+  -- (atexit clears the toggle) rather than rebuild the same trigger twice a pass.
+  if bridge_alive() then return end
   r.SetExtState(EXT, 'run', tostring(r.time_precise()), false)
 
   local proj = r.EnumProjects(-1)

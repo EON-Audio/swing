@@ -78,14 +78,29 @@ function M.IsVisible(track)
   return reaper.GetMediaTrackInfo_Value(track, 'B_SHOWINTCP') == 1
 end
 
+-- Answer cache keyed on the project state count. Classify asks this for every
+-- visible non-lane track on every overlay frame, and an audio track with
+-- thousands of items was walked whole (3 API calls an item) each time (audit
+-- DM132, 2026-10-26). An item add / remove / take change is an undoable
+-- project change, which moves the count and drops the whole cache.
+local _midi_items_cache, _midi_items_state = {}, nil
+
 function M.HasMIDIItems(track)
+  local state = reaper.GetProjectStateChangeCount and reaper.GetProjectStateChangeCount(0)
+  if state ~= nil then
+    if state ~= _midi_items_state then _midi_items_cache, _midi_items_state = {}, state end
+    local hit = _midi_items_cache[track]
+    if hit ~= nil then return hit end
+  end
   local n = reaper.CountTrackMediaItems(track)
+  local found = false
   for i = 0, n - 1 do
     local item = reaper.GetTrackMediaItem(track, i)
     local take = reaper.GetActiveTake(item)
-    if take and reaper.TakeIsMIDI(take) then return true end
+    if take and reaper.TakeIsMIDI(take) then found = true; break end
   end
-  return false
+  if state ~= nil then _midi_items_cache[track] = found end
+  return found
 end
 
 -- Validate the decoded lane_info shape. Returns true if it's safe to use.
@@ -143,9 +158,17 @@ local function validate_lane_info(decoded, warn_key)
   -- a bad value is non-fatal: drop to nil (follow project) + warn-once so a
   -- hand-edited field can't reach the swing math. Allowed set mirrors the cog
   -- combo: 1/8, 1/16 (binary) and 1/8T, 1/16T (triplet).
+  -- The combo saved its triplets as 1/12 and 1/24 until 2026-10-27: REAPER's
+  -- WHOLE-note numbers, a 32nd / 64th triplet in QN (audit DM14). A saved one
+  -- is read as the triplet its label named (1/3, 1/6 QN); the tag keeps the old
+  -- number until the lane's tag is next written.
   local sd = decoded.swing_subdiv
+  if type(sd) == 'number' then
+    if     math.abs(sd - 1/12) < 1e-6 then sd = 1/3; decoded.swing_subdiv = sd
+    elseif math.abs(sd - 1/24) < 1e-6 then sd = 1/6; decoded.swing_subdiv = sd end
+  end
   if sd ~= nil and sd ~= 0 then
-    local ALLOWED = { 0.5, 0.25, 1/12, 1/24 }
+    local ALLOWED = { 0.5, 0.25, 1/3, 1/6 }
     local ok = type(sd) == 'number'
     if ok then
       ok = false
@@ -185,15 +208,21 @@ local function self_heal_pad_name(track, lane_info)
   -- Stereo-mode lane: the "track" IS the Swing track — its name is the user's
   -- (or the bridge's) business, never a pad_name source. Without this guard a
   -- renamed Swing track would rewrite pad_name whenever the FX is offline.
-  if lane_info.stereo == true then return end
+  -- Merged-mode lane: the track is one of Swing's multi-out AUDIO tracks, named
+  -- by the Kit Bridge ("03" for a blank or default pad) -- the same ownership,
+  -- so the same guard; without it a stale Swing copied "03" into pad_name and
+  -- swing_sync, which skips merged lanes, never put the pad's name back
+  -- (audit DM130, 2026-10-26).
+  if lane_info.stereo == true or lane_info.merged == true then return end
   -- P4 — neuter the REAPER→P_EXT reverse-sync while Swing owns identity.
   -- swing_sync.lua is the single forward path (Swing gmem → P_EXT + P_NAME).
-  -- If the user renames a lane track in the TCP while Swing is publishing,
-  -- the change is ephemeral: the next sync writes the kit's name back, so a
-  -- self-heal here would just open a tug-of-war and risk clobbering Swing's
-  -- live name with a stale TCP edit captured mid-frame. Rename pads from
-  -- the Swing UI instead. When Swing is absent (e.g. removed from the FX
-  -- chain), the self-heal re-enables automatically.
+  -- A TCP rename made while Swing is publishing is NOT undone by the next
+  -- sync by itself (swing_sync's lane_diff compares pad_name, pitch, colour
+  -- and icon, never P_NAME): it stands until the kit's digest next moves, and
+  -- a self-heal here would open a tug-of-war and risk clobbering Swing's live
+  -- name with a stale TCP edit captured mid-frame. Rename pads from the Swing
+  -- UI instead. When Swing is absent (e.g. removed from the FX chain), the
+  -- self-heal re-enables automatically.
   if is_swing_alive() then return end
   local _, track_name = reaper.GetSetMediaTrackInfo_String(track, 'P_NAME', '', false)
   if not track_name or track_name == '' then return end

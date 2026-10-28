@@ -239,6 +239,7 @@ local(i, sc)
   rvb_mod_dep  = mem_start; mem_start += RVB_N;  memset(rvb_mod_dep,  0, RVB_N);
   rvb_lfo_ph   = mem_start; mem_start += RVB_N;  memset(rvb_lfo_ph,   0, RVB_N);
   rvb_lfo_rate = mem_start; mem_start += RVB_N;  memset(rvb_lfo_rate, 0, RVB_N);
+  rvb_lfo_s    = mem_start; mem_start += RVB_N;  memset(rvb_lfo_s,    0, RVB_N);   // each line's LFO value, the last tick's (rvb_recalc reads it)
 
   // LFO rates 0.47 … 1.31 Hz, irregularly spaced so they never lock together,
   // and phases spread across the cycle. Every line modulates — the old tank
@@ -323,7 +324,6 @@ local(sz, i, scale, target, prev, total, gsum, gavg, dens)
       prev = _rvb_prime_at_or_below(RVB_MAX_DL - RVB_MOD_CAP - 4);
     rvb_loop_len[i] = prev;
     rvb_dl_len[i] = max(8, prev - rvb_tap_len[i]);
-    rvb_mod_len[i] = rvb_dl_len[i];
     total += prev;
     i += 1;
   );
@@ -346,6 +346,11 @@ local(sz, i, scale, target, prev, total, gsum, gavg, dens)
     gsum += rvb_gain[i];
     // Modulation depth in SAMPLES, capped so long lines never chorus.
     rvb_mod_dep[i] = min(RVB_MOD_CAP, rvb_dl_len[i] * RVB_MOD_FRAC);
+    // The live read length, WHERE THE LFO LEFT IT (the same formula as rvb_tick). It used to be
+    // reset to the unmodulated length here, so every Damp / Width / HPF / Pre-delay edit (and
+    // every undo) snapped all eight read pointers by up to 12 samples until the next tick moved
+    // them back: two jumps a frame while a wheel turned, heard as crackle in the tail (sweep LIB12).
+    rvb_mod_len[i] = max(8, rvb_dl_len[i] + rvb_lfo_s[i] * rvb_mod_dep[i]);
     i += 1;
   );
 
@@ -393,6 +398,7 @@ local(i, inc, p, t, s)
     t > 1 ? t = 2 - t;
     t < -1 ? t = -2 - t;
     s = t * (2 - abs(t));
+    rvb_lfo_s[i] = s;
     rvb_mod_len[i] = max(8, rvb_dl_len[i] + s * rvb_mod_dep[i]);
     // Tank allpass swings the OPPOSITE way on the same LFO, so the delay and its
     // own diffuser never move together — and proportionally much harder, which

@@ -493,8 +493,9 @@ end
 -- and found nothing". Only 5 means the user should go add sources.
 -- GLOBALS by necessity: the main chunk is at Lua's 200-local ceiling.
 EON_CHGMAP_BASE, EON_CHGMAP_STRIDE = 26004700, 32   -- = core.GMEM.INST_CHANGEMAP_*
-CHGMAP_OP_NONE, CHGMAP_OP_LOAD, CHGMAP_OP_FILL = 0, 1, 2
-CHGMAP_OP_REROLL_KIT, CHGMAP_OP_REROLL_PAD     = 3, 4
+-- Ops: 0 none, 1 load, 2 fill; the JSFX also labels 3 (reroll kit) and 4
+-- (reroll pad), which nothing publishes yet.
+CHGMAP_OP_LOAD, CHGMAP_OP_FILL = 1, 2
 eon_chgmap_seq = 0
 
 -- codes = { [0..15] = code }, counts = { chg, lock, custom, nomatch, surplus }
@@ -550,7 +551,8 @@ end
 -- first, add a fourth: id 4 reclaims slot 0). Go through the registry, which is
 -- the only thing that knows slot -> id.
 --
--- core.GMEM, not G: `local G = core.GMEM` is declared at ~2251 and Lua locals
+-- core.GMEM, not G: `local G = core.GMEM` is declared far below (the "gmem
+-- layout" section) and Lua locals
 -- are invisible above their declaration, so G here would index a nil global and
 -- throw — silently, since the restore below runs under pcall. Nothing new is
 -- hoisted to a main-chunk local either; this file sits near Lua's 200-local cap.
@@ -840,7 +842,9 @@ function eon_padcat_req_tick()
       end
       -- NONE is an ANSWER, so it skips the Auto branch below (which exists to
       -- turn "I don't know" into a guess). Everything else negative is Auto.
-      if cat < 0 and cat ~= EON_PADCAT_NONE and _bridge_categorizer then
+      -- pcat is THIS pad's answer: two pads on one note each infer from their own name (the request stays `cat`).
+      local pcat = cat
+      if pcat < 0 and pcat ~= EON_PADCAT_NONE and _bridge_categorizer then
         local nmb, chars = 26010000 + slot * 512 + pad * 32, {}
         for i = 0, 31 do
           local ch = math.floor((gr(nmb + i) or 0) + 0.5)
@@ -850,12 +854,12 @@ function eon_padcat_req_tick()
         local nm = table.concat(chars)
         if nm ~= "" then
           local c, conf = _bridge_categorizer.classify(nm)
-          cat = (conf and c ~= "other") and eon_padcat_index(c) or -1
+          pcat = (conf and c ~= "other") and eon_padcat_index(c) or -1
         end
       end
       local b = EON_PADCAT_BASE + slot * EON_PADCAT_STRIDE + pad * 4
       eon_padcat_ver = eon_padcat_ver + 1
-      gw(b + 1, cat)                                -- glyph id direct (Steppa sent vocab id)
+      gw(b + 1, pcat)                               -- glyph id direct (Steppa sent vocab id)
       if srch >= 0 then gw(b + 2, srch) end         -- SRC only when the writer asked
       gw(b + 0, eon_padcat_ver)                     -- VER LAST
     end
@@ -943,6 +947,20 @@ end
 eon_padcat_bf_done = {}
 eon_padcat_bf_tries = {}
 eon_padcat_bf_wait = {}   -- slot -> { hb, n }: a bank change's names are not published yet (eon_padcat_sync_bank)
+eon_padcat_bf_tr = {}     -- slot -> { id, tr }: the track found for that occupant, kept while a blank rack retries
+-- The retry window below runs every tick for up to 300 ticks; a full tracks x FX sweep each time is the cost of a
+-- fresh Swing in a big project. Reuse the track found for this (slot, id) while it still hosts that Swing.
+function eon_padcat_bf_track(s, id)
+  local c = eon_padcat_bf_tr[s]
+  if c and c.id == id and reaper.ValidatePtr2(0, c.tr, "MediaTrack*") then
+    for fx = 0, reaper.TrackFX_GetCount(c.tr) - 1 do
+      if math.floor(reaper.TrackFX_GetParam(c.tr, fx, 3) or 0) == id and core.is_swing_fx(c.tr, fx) then return c.tr end
+    end
+  end
+  local tr = eon_padcat_track_for_slot(s)
+  eon_padcat_bf_tr[s] = tr and { id = id, tr = tr } or nil
+  return tr
+end
 function eon_padcat_backfill_tick()
   if not _bridge_categorizer then return end
   local gr, gw = reaper.gmem_read, reaper.gmem_write
@@ -960,7 +978,7 @@ function eon_padcat_backfill_tick()
       eon_padcat_index("kick")                    -- ensure the name map is built
       -- A saved record beats inference, always. Covers the restore windows the
       -- startup one-shot misses (late slot claim, project switched mid-session).
-      local tr = eon_padcat_track_for_slot(s)
+      local tr = eon_padcat_bf_track(s, id)
       local rec = nil
       if tr then
         local r = eon_padcat_rec_get(tr, eon_padcat_seen[s] or 0)   -- step 5b: the bank the band holds
@@ -1670,8 +1688,8 @@ function eon_courier_tick()
     return nil
   end
 
-  -- Region list (sorted by start time), cached once per tick so every slot's pick and
-  -- the published region count agree on the same ordering.
+  -- Region list (sorted by start time). NOT cached: every call re-reads the link, walks the markers and sorts
+  -- (pattern_regions.List), so a New / Delete / Rename earlier in the same tick is seen by the next call.
   local function region_list()
     local pr = C.pattern_regions
     return (pr and pr.List and pr.List()) or {}
@@ -2403,7 +2421,10 @@ function eon_courier_tick()
       -- Wait for the StepSeq's ack of the previous push: the buffer is single and it
       -- consumes one push per audio block, so a second stage before the ack would
       -- overwrite the first (pattern 1 never primed in the first rig run).
-      local acked = math.floor((gr(b + F_DMPUSH_ACK) or 0) + 0.5) == (C.seq[slot] or 0)
+      -- A restarted bridge has no C.seq while the ACK cell still holds the last life's seq: seed from F_DMPUSH (the
+      -- last seq staged), so the gate compares like with like and the next stage continues the count.
+      if C.seq[slot] == nil then C.seq[slot] = math.floor((gr(b + F_DMPUSH) or 0) + 0.5) end
+      local acked = math.floor((gr(b + F_DMPUSH_ACK) or 0) + 0.5) == C.seq[slot]
       -- The off-screen change scan collects EVERY region's notes; on a busy edit it
       -- fired every tick. At most four scans a second per slot (audit 2026-09-03).
       C.scan_t = C.scan_t or {}
@@ -3405,12 +3426,6 @@ function eon_groove_browser_launch_tick()
   end
 end
 
--- Dock-rig layout relay: Swing's wordmark menu picked a layout and wrote its
--- 1-based index to GS_DOCK_LAYOUT_REQ (JSFX can't touch ExtState or actions —
--- same reason the theme picker rides GS_THEME_REQ). Stamp the pick into
--- ExtState and run EON Dock Layout.lua, which applies that layout without
--- showing its menu when a pick is staged. The script lives with the no-Hub
--- rig scripts, not the bundle Scripts dir; missing file = one console note.
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- EON_SWBROWSE — publisher for the in-JSFX mini file browser
 --
@@ -3680,15 +3695,16 @@ function eon_fb_scan_step()
       if core.SWBROWSE_EXT[ext] and #sc.files < eon_fb_MAXFILES then
         -- In subfolder mode the name alone is useless -- six kits each have a
         -- "Snare". Carry the path RELATIVE to where the walk started.
-        local rel = ""
+        local rel, relf = "", ""
         if sc.recurse and sc.path ~= sc.root then
           -- past the root AND its separator; a drive root (a drive letter's, or "/") already ends in one, and the old fixed +2 cut
           -- the first letter off every folder shown there (the audit, 2026-10-22)
           local last = sc.root:sub(-1)
           rel = sc.path:sub(#sc.root + ((last == "/" or last == eon_fb_bs) and 1 or 2))
+          relf = rel                                 -- the FULL relative folder: the sort key and the group (P1b)
           if #rel > 22 then rel = "~" .. rel:sub(#rel - 20) end
         end
-        sc.files[#sc.files + 1] = { name = fn, ext = ext, dir = sc.path, rel = rel }
+        sc.files[#sc.files + 1] = { name = fn, ext = ext, dir = sc.path, rel = rel, relf = relf }
       end
       sc.fi = sc.fi + 1
       budget = budget - 1
@@ -3706,10 +3722,14 @@ function eon_fb_scan_step()
   -- list came out in an order with no relation to the strings in it -- packs
   -- interleaved at random and the same folder's samples scattered down the
   -- page. Folder first, then name, is the order the eye is looking for.
+  -- ⚠️ By the FULL relative folder, then the name (P1b, 2026-10-27), never the cut display string: two folders sharing
+  -- their last 21 characters sorted as one and their files interleaved, and the groups below would merge them. And
+  -- folder-then-name as a PAIR: one joined string sorted the root's own files ("" folder) in among the subfolders'
+  -- by their names, which split the root's group in two around "Packs\...".
   table.sort(sc.files, function(a, b)
-    local ka = ((a.rel or "") ~= "") and (a.rel .. eon_fb_sep .. a.name) or a.name
-    local kb = ((b.rel or "") ~= "") and (b.rel .. eon_fb_sep .. b.name) or b.name
-    return ka:lower() < kb:lower()
+    local ra, rb = (a.relf or ""):lower(), (b.relf or ""):lower()
+    if ra ~= rb then return ra < rb end
+    return a.name:lower() < b.name:lower()
   end)
 
   local ent = {}
@@ -3725,7 +3745,8 @@ function eon_fb_scan_step()
     ent[#ent + 1] = {
       name = (fl.rel ~= nil and fl.rel ~= "") and (fl.rel .. eon_fb_sep .. fl.name) or fl.name,
       kind = 0, ext = fl.ext,
-      path = eon_fb_join(fl.dir or sc.root, fl.name) }
+      path = eon_fb_join(fl.dir or sc.root, fl.name),
+      fn = fl.name, dir = fl.dir or sc.root, relf = fl.relf or "" }   -- P1b: the bare name, its folder, its group key
   end
 
   -- Remember where we were, unless this move IS a back-step.
@@ -3740,6 +3761,13 @@ function eon_fb_scan_step()
   st.entries = ent
   st.ndirs   = (sc.recurse and 0 or #sc.dirs) + (eon_fb_parent(sc.root) and 1 or 0)
   st.gen     = st.gen + 1
+  -- P1b / P2 / P4 (2026-10-27): the listing's groups and their trimmed prefixes, once per listing; the categories
+  -- start over in their own budgeted pass (eon_fb_cat_step); a new folder shows every category; the deck's row and
+  -- the root-note job belong to the old listing.
+  st.groups  = eon_fb_groups(ent, sc.recurse, sc.root)
+  eon_fb_cat_reset(st)
+  st.catf, st.cpage = 0, 0
+  st.desc_ridx, st.rn = nil, nil
   eon_fb_refresh_fav(st)
   -- bit1 = nothing playable here. Counted from real CONTENT, not from #ent:
   -- every folder that HAS a parent carries a ".." row, so `#ent == 0` could
@@ -3748,6 +3776,85 @@ function eon_fb_scan_step()
   st.flags   = ((#sc.files == 0) and (sc.recurse or #sc.dirs == 0)) and 2 or 0
   if not eon_fb_parent(sc.root) then st.flags = st.flags + 4 end   -- bit2 at root
   eon_fb.scan = nil
+end
+
+-- ── P1b (2026-10-27, Spec_Swing_Mini_Browser_Next_Round §3): group labels and shorter names ──────────────────────
+-- The listing's files in groups: in subfolder mode one per FOLDER, keyed by the full folder path (e.dir) -- never by
+-- the cut display string, or two folders sharing their last 21 characters would merge; in one-folder mode one group,
+-- whose label shows only when a prefix was trimmed. Inside a group of three or more, the longest common prefix of the
+-- names' STEMS (the extension is never trimmed into) that ends on a word boundary (space, "_", "-", ".") is dropped
+-- from every row when every remainder keeps at least two characters (and the prefix is two or more); the label carries
+-- it. ent: the listing's entries in order (files are kind 0). Writes e.gi (the group) and e.trim (bytes cut from the
+-- name's front) on each file; returns the groups { dir, leaf, prefix, first, n, show }. A pure function (mb_test.py).
+EON_FB_BOUND = { [32] = true, [95] = true, [45] = true, [46] = true }   -- space _ - .
+function eon_fb_groups(ent, recurse, root)
+  local groups, cur = {}, nil
+  for i, e in ipairs(ent) do
+    if e.kind == 0 then
+      local key = recurse and (e.dir or "") or ""
+      if not cur or cur.dir ~= key then
+        cur = { dir = key, leaf = "", prefix = "", first = i, n = 0, show = false, rel = e.relf or "" }
+        groups[#groups + 1] = cur
+      end
+      cur.n = cur.n + 1
+      e.gi = #groups
+      e.trim = 0
+    end
+  end
+  for gi, g in ipairs(groups) do
+    -- the folder's name under the root (the root's own files: the root's last name); one-folder mode: none
+    if recurse then
+      g.leaf = (g.rel ~= "" and g.rel) or (root and (root:match("([^/" .. string.char(92) .. "]+)[/" .. string.char(92) .. "]*$") or root) or "")
+    end
+    -- a group's files are one run of the listing (sorted by the full folder, then the name): g.first .. g.last
+    g.last = g.first
+    while ent[g.last + 1] and ent[g.last + 1].gi == gi do g.last = g.last + 1 end
+    if g.n >= 3 then
+      local lcp = nil
+      for i = g.first, g.last do
+        local e = ent[i]
+        local stem = (e.fn or e.name):match("^(.*)%.[^.]*$") or (e.fn or e.name)
+        if lcp == nil then lcp = stem
+        else
+          local k = 0
+          local m = math.min(#lcp, #stem)
+          while k < m and lcp:byte(k + 1) == stem:byte(k + 1) do k = k + 1 end
+          lcp = lcp:sub(1, k)
+        end
+        if lcp == "" then break end
+      end
+      lcp = lcp or ""
+      -- back to the last word boundary inside it (the boundary character goes with the prefix)
+      local cut = 0
+      for k = #lcp, 1, -1 do if EON_FB_BOUND[lcp:byte(k)] then cut = k break end end
+      local pre = lcp:sub(1, cut)
+      if #pre >= 2 then
+        local ok = true
+        for i = g.first, g.last do
+          local e = ent[i]
+          local stem = (e.fn or e.name):match("^(.*)%.[^.]*$") or (e.fn or e.name)
+          if #stem - #pre < 2 then ok = false break end
+        end
+        if ok then
+          g.prefix = pre
+          for i = g.first, g.last do ent[i].trim = #pre end
+        end
+      end
+    end
+    g.show = recurse or g.prefix ~= ""
+  end
+  return groups
+end
+
+-- P2's category state for a new listing: nothing classified yet; the pass queues the listing's files.
+function eon_fb_cat_reset(st)
+  st.catq, st.catq_i, st.catn, st.cat_left, st.cat_tick = {}, 1, {}, 0, 0
+  for i, e in ipairs(st.entries or {}) do
+    if e.kind == 0 then
+      if e.cat == nil then st.catq[#st.catq + 1] = i; st.cat_left = st.cat_left + 1
+      else st.catn[e.cat] = (st.catn[e.cat] or 0) + 1 end
+    end
+  end
 end
 
 -- PLACES. Published as ordinary rows with kind 3, so the face needs no second
@@ -3791,6 +3898,7 @@ function eon_fb_places(st)
   end
   st.entries = ent
   st.ndirs   = #ent
+  st.groups  = nil; eon_fb_cat_reset(st); st.catf, st.cpage = 0, 0; st.desc_ridx, st.rn = nil, nil   -- P1b / P2 / P4: a list of places has none
   -- The folder we leave goes on the BACK history first: clearing cwd below skipped the scan's own push, so BACK could
   -- not return across a PLACES jump -- the case the verb was written for (the audit, 2026-10-22).
   if st.cwd then
@@ -3933,18 +4041,22 @@ function eon_fb_unfav(path)
   return true
 end
 
-function eon_fb_toggle_fav(st)
-  if not st.cwd then return false end
+-- `path`: a ROW's folder (verb 16, sweep BRW12 2026-10-26); the folder you are
+-- in (verb 11, the breadcrumb's star) when nil. st.fav -- the breadcrumb's
+-- star state -- moves only when the folder toggled IS the one you are in.
+function eon_fb_toggle_fav(st, path)
+  path = eon_fb_norm(path) or st.cwd
+  if not path then return false end
   local t = eon_fb_settings_read()
   t.favorites = t.favorites or {}
   local hit
   for i, fav in ipairs(t.favorites) do
-    if eon_fb_norm(fav.path) == st.cwd then hit = i break end
+    if eon_fb_norm(fav.path) == path then hit = i break end
   end
   if hit then
     table.remove(t.favorites, hit)
   else
-    t.favorites[#t.favorites + 1] = { path = st.cwd, name = eon_fb_leaf(st.cwd) }
+    t.favorites[#t.favorites + 1] = { path = path, name = eon_fb_leaf(path) }
   end
   local w = io.open(eon_fb_settings_path(), "w")
   if w then
@@ -3952,8 +4064,8 @@ function eon_fb_toggle_fav(st)
     w:write(string.char(10))
     w:close()
   end
-  st.fav = not hit
-  return st.fav
+  if path == st.cwd then st.fav = not hit end
+  return not hit
 end
 
 -- Recompute the cached star state. Called only when it can actually change:
@@ -3971,13 +4083,41 @@ function eon_fb_publish(slot, answering)
   local B  = core.SWBROWSE
   local st = eon_fb_slot(slot)
   local b  = B.BASE + slot * B.STRIDE
+  -- The face's format (P1b-P4, 2026-10-27; spec §10): FMT 2 = the group labels and the shorter names, the category
+  -- chips and dots, the path hash, the deck's ordinal. A face that has not written REQ_FMT (an older one, after an
+  -- update until REAPER reloads it) gets the FMT 1 shape: it would read a label row as a folder and try to enter it.
+  local fmt2 = math.floor(reaper.gmem_read(b + B.REQ_FMT) or 0) >= 2
   -- The filter builds a VIEW of indices, never a new entry list: a published
   -- row's handle must keep pointing into the REAL listing, or the moment a
   -- filter is on, clicking a row would load whatever happened to sit at that
   -- position unfiltered. (FR_RIDX is documented as exactly this.)
   st.view = nil
-  if st.filter and st.filter ~= "" then
-    local pat = st.filter:lower()
+  local pat = (st.filter and st.filter ~= "") and st.filter:lower() or nil
+  local catf = fmt2 and math.floor(st.catf or 0) or 0
+  local shown, nfiles, ord = 0, 0, 0
+  if fmt2 then
+    -- FMT 2: a view row is an entry index, or -(group) for a group's LABEL (P1b): inserted before the group's first
+    -- file in the view, so a label survives the filters only when a file under it does. The text filter and the
+    -- chip (P2) narrow the files together; folders and the parent row survive as they do for the text filter.
+    st.view = {}
+    local gshown, lastg = {}, nil
+    for i, e in ipairs(st.entries) do
+      if e.kind ~= 0 then
+        st.view[#st.view + 1] = i
+      else
+        nfiles = nfiles + 1
+        if (not pat or e.name:lower():find(pat, 1, true)) and (catf == 0 or e.cat == catf - 1) then
+          local g = st.groups and e.gi and st.groups[e.gi]
+          if g and g.show and lastg ~= e.gi then st.view[#st.view + 1] = -e.gi; lastg = e.gi end
+          if g then gshown[e.gi] = (gshown[e.gi] or 0) + 1 end
+          st.view[#st.view + 1] = i
+          shown = shown + 1
+          if st.desc_ridx and i == st.desc_ridx + 1 then ord = shown end
+        end
+      end
+    end
+    st.gshown = gshown
+  elseif pat then
     st.view = {}
     for i, e in ipairs(st.entries) do
       -- folders and the parent row always survive, or a filter would trap you
@@ -3999,11 +4139,34 @@ function eon_fb_publish(slot, answering)
   local seq = st.pub_seq * 2
   reaper.gmem_write(b + B.PUB_SEQ, seq - 1)        -- ODD = mid-write
 
+  st.page_ents = {}                                  -- the page's entries: the category pass takes them first (P2)
   for i = 0, n - 1 do
     local vi = st.view and st.view[off + i + 1] or (off + i + 1)
-    local e  = st.entries[vi]
     local p  = b + B.ROWS + i * B.REC
-    local nm = eon_fb_fold(e.name)
+    if vi < 0 then
+      -- a group LABEL (P1b): kind 5, RIDX -1 (never a listing entry: verb 8's run and every load go by the real
+      -- listing), SIZE_KB = its files in the view; the name cells = the trimmed prefix, char 31, the folder under the
+      -- root (either may be empty; the folder keeps its TAIL when the 48 cells run short)
+      local g = st.groups[-vi]
+      local pre, leaf = eon_fb_fold(g.prefix or ""), eon_fb_fold(g.leaf or "")
+      if #pre > B.FR_NAME_MAX - 1 then pre = pre:sub(1, B.FR_NAME_MAX - 1) end
+      local room = B.FR_NAME_MAX - #pre - 1
+      if #leaf > room then leaf = (room > 1) and ("~" .. leaf:sub(#leaf - room + 2)) or "" end
+      local nm = pre .. string.char(31) .. leaf
+      reaper.gmem_write(p + B.FR_LEN, #nm)
+      for c = 1, #nm do reaper.gmem_write(p + B.FR_NAME + c - 1, nm:byte(c)) end
+      reaper.gmem_write(p + B.FR_KIND, 5)
+      reaper.gmem_write(p + B.FR_EXT, 0)
+      reaper.gmem_write(p + B.FR_RIDX, -1)
+      reaper.gmem_write(p + B.FR_SIZE_KB, (st.gshown and st.gshown[-vi]) or 0)
+      reaper.gmem_write(p + B.FR_SR, 0); reaper.gmem_write(p + B.FR_CH, 0); reaper.gmem_write(p + B.FR_MS, 0)
+      reaper.gmem_write(p + B.FR_PLKIND, 0)
+      reaper.gmem_write(p + B.FR_CAT, 0); reaper.gmem_write(p + B.FR_PHASH, 0); reaper.gmem_write(p + B.FR_CCOL, 0)
+    else
+    local e  = st.entries[vi]
+    -- FMT 2 (P1b): a file row carries its own name, the group's prefix cut off its front (the label shows it); the
+    -- filter still matches the full name. FMT 1: the name as it always was (the cut folder in front in subfolder mode).
+    local nm = eon_fb_fold((fmt2 and e.kind == 0 and e.fn) and e.fn:sub((e.trim or 0) + 1) or e.name)
     local ln = math.min(B.FR_NAME_MAX, #nm)
     reaper.gmem_write(p + B.FR_LEN, ln)
     for c = 1, ln do reaper.gmem_write(p + B.FR_NAME + c - 1, nm:byte(c)) end
@@ -4018,6 +4181,16 @@ function eon_fb_publish(slot, answering)
     reaper.gmem_write(p + B.FR_CH, e.ch or 0)
     reaper.gmem_write(p + B.FR_MS, e.ms or 0)
     reaper.gmem_write(p + B.FR_PLKIND, e.plkind or 0)
+    if fmt2 then
+      -- P2: the category (glyph id + 1, 0 = none or not classified yet) and its colour; P3: the row's path as the
+      -- 52-bit number the face's pads are hashed to (eon_fb_path_hash), cached on the entry
+      if e.kind == 0 and e.h == nil then e.h = eon_fb_path_hash(e.path or "") end
+      reaper.gmem_write(p + B.FR_CAT, (e.cat and e.cat >= 0) and (e.cat + 1) or 0)
+      reaper.gmem_write(p + B.FR_PHASH, e.kind == 0 and e.h or 0)
+      reaper.gmem_write(p + B.FR_CCOL, e.catcol or 0)
+      if e.kind == 0 then st.page_ents[#st.page_ents + 1] = vi end
+    end
+    end
   end
   -- Blank the tail, or a shorter page leaves the previous page showing under it.
   for i = n, B.REC_MAX - 1 do
@@ -4048,12 +4221,159 @@ function eon_fb_publish(slot, answering)
   -- bit3 = this folder is a favourite, so the star can show its state
   -- bit3 from the CACHED flag. Calling the disk here would parse the settings
   -- file on every publish -- once per keystroke while filtering.
+  -- bit6 (FMT 2) = the categories are still being counted (P2's pass is running)
   reaper.gmem_write(b + B.FLAGS, (st.flags or 0) + (st.fav and 8 or 0)
-                    + ((st.hist and #st.hist > 0) and 32 or 0))
+                    + ((st.hist and #st.hist > 0) and 32 or 0)
+                    + ((fmt2 and (st.cat_left or 0) > 0) and 64 or 0))
+  if fmt2 then
+    -- P2: the CHIP TABLE -- the categories present in the listing, by count (ties by id), from the page the face asked
+    -- for (verb 17's REQ_RIDX): CAT_N, CAT_OFF, then six (id + 1) * 1,000,000 + count / packed colour pairs
+    local list = {}
+    for id, c in pairs(st.catn or {}) do if id >= 0 and c > 0 then list[#list + 1] = { id = id, c = c } end end
+    table.sort(list, function(a, z) if a.c ~= z.c then return a.c > z.c end return a.id < z.id end)
+    local p0 = math.max(0, math.min(#list, math.floor(st.cpage or 0)))
+    reaper.gmem_write(b + B.CAT_N, #list)
+    reaper.gmem_write(b + B.CAT_OFF, p0)
+    for k = 0, B.CAT_TAB_N - 1 do
+      local it = list[p0 + k + 1]
+      reaper.gmem_write(b + B.CAT_TAB + k * 2, it and ((it.id + 1) * 1000000 + it.c) or 0)
+      reaper.gmem_write(b + B.CAT_TAB + k * 2 + 1, it and ((st.catcol and st.catcol[it.id]) or 0) or 0)
+    end
+    reaper.gmem_write(b + B.CAT_ON, catf)            -- the chip lit: the filter this view was built with
+    reaper.gmem_write(b + B.FILES_SHOWN, shown)      -- P1b: files in the view (the footer, the deck's "of N")
+    reaper.gmem_write(b + B.FILES_ALL, nfiles)       -- files in the listing (the ALL chip)
+    reaper.gmem_write(b + B.DK_ORD, ord)             -- the deck's row: its place among the files shown (0 = not shown)
+    reaper.gmem_write(b + B.DK_RIDX, st.desc_ridx and (st.desc_ridx + 1) or 0)   -- ... and which row that is
+  end
   reaper.gmem_write(b + B.ANS_REQ, answering or 0)
   reaper.gmem_write(b + B.GEN,     st.gen)
-  reaper.gmem_write(b + B.FMT_VER, 1)
+  reaper.gmem_write(b + B.FMT_VER, fmt2 and 2 or 1)
   reaper.gmem_write(b + B.PUB_SEQ, seq)            -- EVEN, written LAST
+end
+
+-- P3 (2026-10-27, spec §5, option A): a path as ONE number, the face's swing_fb_path_hash to the bit. The path is
+-- normalized first, the same way on both sides: "\" -> "/", ASCII A-Z -> a-z (Windows paths ignore case), a run of
+-- separators -> one, a trailing separator dropped. Then two polynomial hashes, h1 = (h1 * 31 + c + 1) mod 67108859
+-- and h2 = (h2 * 37 + c + 1) mod 67108837 (both primes under 2^26: every intermediate stays under 2^32, exact in a
+-- double), joined as h1 * 2^26 + h2 + 1 (under 2^52: exact; 0 = no path). The face hashes each pad's own source path
+-- (all 64, and their layers) and tags a row whose number one of them has.
+function eon_fb_path_hash(p)
+  local h1, h2, n, pend = 7, 11, 0, false
+  for i = 1, #p do
+    local c = p:byte(i)
+    if c == 92 then c = 47 end
+    if c >= 65 and c <= 90 then c = c + 32 end
+    if c == 47 then
+      pend = true
+    else
+      if pend then h1 = (h1 * 31 + 48) % 67108859; h2 = (h2 * 37 + 48) % 67108837; n = n + 1; pend = false end
+      h1 = (h1 * 31 + c + 1) % 67108859; h2 = (h2 * 37 + c + 1) % 67108837; n = n + 1
+    end
+  end
+  if n == 0 then return 0 end
+  return h1 * 67108864 + h2 + 1
+end
+
+-- ── P2 (2026-10-27, spec §4 refreshed): the category pass ──────────────────────────────────────────────────────────
+-- One file through the categorizer the pads use (the same classify, the same frozen glyph ids): its category id
+-- (-1 = none) and colour (0xRRGGBB, the categorizer's own hues) cached on the entry and counted for the chips.
+function eon_fb_classify(st, e)
+  local id, col = -1, 0
+  if _bridge_categorizer then
+    local ok, c, conf = pcall(_bridge_categorizer.classify, e.fn or e.name or "", e.dir)
+    if ok and conf and c and c ~= "other" then
+      id = eon_padcat_index(c)
+      if id >= 0 then col = math.floor((_bridge_categorizer.get_category_color(c) or 0) / 256) end
+    end
+  end
+  e.cat, e.catcol = id, col
+  st.catn = st.catn or {}
+  st.catn[id] = (st.catn[id] or 0) + 1
+  st.catcol = st.catcol or {}
+  if id >= 0 then st.catcol[id] = col end
+  st.cat_left = math.max(0, (st.cat_left or 1) - 1)
+end
+
+-- Classify under a time budget a tick, across the slots: the rows of each slot's page first (their dots), then the
+-- listing in order. ~100 us a file (measured 2026-10-27), so inside the scan's 400-entry chunk it took 40-50 ms; here a
+-- 25,000-file tree is counted over a few seconds while the list is already usable. Republishes a slot when its page
+-- got its dots, every 20 ticks while counting (the chips grow; a chip filter's view fills in) and when the pass ends.
+EON_FB_CAT_BUDGET = 0.005
+function eon_fb_cat_step()
+  local t0 = reaper.time_precise()
+  for slot, st in pairs(eon_fb.slots) do
+    if st.catq and st.cat_left and st.cat_left > 0 and st.entries then
+      local pagehit = false
+      for _, vi in ipairs(st.page_ents or {}) do
+        local e = st.entries[vi]
+        if e and e.kind == 0 and e.cat == nil then eon_fb_classify(st, e); pagehit = true end
+      end
+      while st.catq_i <= #st.catq and reaper.time_precise() - t0 < EON_FB_CAT_BUDGET do
+        local e = st.entries[st.catq[st.catq_i]]
+        if e and e.kind == 0 and e.cat == nil then eon_fb_classify(st, e) end
+        st.catq_i = st.catq_i + 1
+      end
+      if st.catq_i > #st.catq then st.cat_left = 0 end
+      st.cat_tick = (st.cat_tick or 0) + 1
+      if pagehit or st.cat_left == 0 or st.cat_tick % 20 == 0 then
+        if st.active then eon_fb_publish(slot, st.req_seen) end
+      end
+      if reaper.time_precise() - t0 >= EON_FB_CAT_BUDGET then break end
+    end
+  end
+end
+
+-- ── P4 (2026-10-27, spec §6 refreshed): the root note of the row the deck describes ─────────────────────────────────
+-- Asked when a row is described (verbs 3, 5, 7, 12); run only for a selection that has stayed put EON_FB_RN_HOLD s;
+-- the file read (rk_root_note.read_file: a scratch track, 2 s of PCM) on one tick, the analysis on the next (~15 ms at
+-- 44.1 kHz, ~45 ms at 96 kHz, measured); never while a kit load holds LOCK (the pad detector's own rule). max_s is the
+-- pad detector's own (2 s): a shorter read could name another root for the file once it is on a pad. The answer goes
+-- out payload first and RN_RIDX LAST, with the listing's GEN, so the face shows it only for the row and listing it
+-- answers (00-rules: an answer names what it answers). Cached on the entry (e.rn: the MIDI note, -1 = no pitch).
+EON_FB_RN_HOLD = 0.35
+function eon_fb_rn_post(slot, ridx, gen, note, state)
+  local B = core.SWBROWSE
+  local b = B.BASE + slot * B.STRIDE
+  reaper.gmem_write(b + B.RN_NOTE, (note and note >= 0) and (note + 1) or 0)
+  reaper.gmem_write(b + B.RN_STATE, state)
+  reaper.gmem_write(b + B.RN_GEN, gen)
+  reaper.gmem_write(b + B.RN_RIDX, ridx + 1)          -- LAST
+end
+function eon_fb_rn_want(slot, st, ridx)
+  local e = st.entries and st.entries[ridx + 1]
+  if not e or e.kind ~= 0 or e.ext == "sfz" then st.rn = nil; return end
+  if e.rn ~= nil then st.rn = nil; eon_fb_rn_post(slot, ridx, st.gen, e.rn, 2); return end
+  st.rn = { ridx = ridx, gen = st.gen, path = e.path, t = reaper.time_precise(), stage = 0 }
+  eon_fb_rn_post(slot, ridx, st.gen, -1, 1)           -- running: the face shows nothing yet
+end
+function eon_fb_rn_step()
+  if not (eon_rootnote and eon_rootnote.mod) then return end
+  if math.floor(reaper.gmem_read(core.GMEM.LOCK) or 0) ~= 0 then return end
+  local now = reaper.time_precise()
+  for slot, st in pairs(eon_fb.slots) do
+    local j = st.rn
+    if j and j.gen == st.gen then
+      if j.stage == 0 and now - j.t >= EON_FB_RN_HOLD then
+        local ok, s, sr = pcall(eon_rootnote.mod.read_file, j.path)
+        if ok and s then j.samples, j.sr, j.stage = s, sr, 1
+        else
+          st.rn = nil
+          eon_fb_rn_post(slot, j.ridx, j.gen, -1, 3)   -- unreadable: failed, no pill
+        end
+        return                                         -- one read or one analysis a tick, across the slots
+      elseif j.stage == 1 then
+        local ok, r = pcall(eon_rootnote.mod.analyse, j.samples, j.sr)
+        local note = (ok and type(r) == "table" and r.show and r.note) and math.floor(r.note + 0.5) or -1
+        local e = st.entries[j.ridx + 1]
+        if e and e.path == j.path then e.rn = note end
+        st.rn = nil
+        eon_fb_rn_post(slot, j.ridx, j.gen, note, 2)
+        return
+      end
+    elseif j then
+      st.rn = nil                                      -- a job for a listing that is gone
+    end
+  end
 end
 
 -- Detail for ONE row. Doing this per row at publish time would open every file
@@ -4179,8 +4499,13 @@ function eon_fb_handle_req(slot)
   if verb == 6 then                                 -- show places
     eon_fb_places(st)
     st.off = 0
+  elseif verb == 17 then                            -- P2: the category filter (REQ_CATF: glyph id + 1, 0 = all) and the chip page (REQ_RIDX)
+    local cf = math.max(0, math.min(46, math.floor(reaper.gmem_read(b + B.REQ_CATF) or 0)))
+    if cf ~= (st.catf or 0) then st.off = 0 end
+    st.catf  = cf
+    st.cpage = math.max(0, ridx)
   elseif verb == 1 then                             -- enter folder, or a place
-    local e = st.entries[ridx + 1]
+    local e = ridx >= 0 and st.entries[ridx + 1]    -- RIDX -1 is a group label (P1b): never a listing entry
     if e and (e.kind == 1 or e.kind == 2 or e.kind == 3) then
       st.want = e.path; st.off = 0; st.places = false
     end
@@ -4206,6 +4531,7 @@ function eon_fb_handle_req(slot)
                      { { path = e.path, pad = -1, kind = 1, aud = eon_fb_mint_aud() } })
       eon_fb_describe(st, ridx)
       eon_fb_peaks(slot, e.path, e.ms)
+      st.desc_ridx = ridx; eon_fb_rn_want(slot, st, ridx)   -- the deck's row (P1b) and its root note (P4)
     end
   elseif verb == 11 then                            -- star / unstar this folder
     -- ⚠️ Swing_Browser_Settings.lua is REWRITTEN WHOLESALE by the big browser at
@@ -4215,7 +4541,23 @@ function eon_fb_handle_req(slot)
     -- not build anything on this file that has to survive.
     eon_fb_toggle_fav(st)
     eon_fb_places(st)                               -- reflect it immediately
+    eon_fb_tree_slot(slot).unrooted = nil           -- a star can root a folder that had none: the rail tries again
     st.off = 0
+  elseif verb == 16 then                            -- star / unstar a ROW's folder (sweep BRW12, 2026-10-26)
+    -- The row menu's "Star this folder" sent verb 11 with handle 0, which
+    -- toggled the folder you were STANDING IN -- so it starred, or unstarred,
+    -- the wrong folder and jumped to PLACES. A folder row (or a place, or
+    -- "..") is its own path, a file row its folder; the listing stays where it
+    -- is, and the rail picks the new root up when it is on.
+    local e = st.entries[ridx + 1]
+    local p = e and e.path
+    if p and e.kind == 0 then p = eon_fb_parent(p) end
+    if p then
+      eon_fb_toggle_fav(st, p)
+      local tr = eon_fb_tree_slot(slot)
+      tr.unrooted = nil
+      if tr.active and st.cwd then eon_fb_tree_root(tr, st.cwd) end
+    end
   elseif verb == 10 then                            -- toggle subfolder walking
     st.want = st.cwd; st.cwd = nil; st.off = 0     -- rescan the same place
   elseif verb == 9 then                             -- set the filter text
@@ -4286,7 +4628,7 @@ function eon_fb_handle_req(slot)
     end
     eon_fb_describe(st, ridx)
     local pe = st.entries[ridx + 1]
-    if pe and pe.kind == 0 then eon_fb_peaks(slot, pe.path, pe.ms) end
+    if pe and pe.kind == 0 then eon_fb_peaks(slot, pe.path, pe.ms); st.desc_ridx = ridx; eon_fb_rn_want(slot, st, ridx) end
   elseif verb == 4 then                             -- refresh the current folder
     -- Re-list from scratch. `want ~= cwd` is what starts a scan, so clear cwd
     -- rather than setting want to the same string, which would be a no-op.
@@ -4304,7 +4646,7 @@ function eon_fb_handle_req(slot)
   elseif verb == 5 then                             -- describe ONE row
     eon_fb_describe(st, ridx)
     local e = st.entries[ridx + 1]
-    if e and e.kind == 0 then eon_fb_peaks(slot, e.path, e.ms) end
+    if e and e.kind == 0 then eon_fb_peaks(slot, e.path, e.ms); st.desc_ridx = ridx; eon_fb_rn_want(slot, st, ridx) end
   elseif verb == 3 then                             -- load row onto a pad
     local e = st.entries[ridx + 1]
     local pad = math.floor(reaper.gmem_read(b + B.REQ_PAD) or -1)
@@ -4339,7 +4681,7 @@ function eon_fb_handle_req(slot)
     -- when it was simply never sent anything to draw. describe() must run first:
     -- peaks needs the duration it works out.
     local pe = st.entries[ridx + 1]
-    if pe and pe.kind == 0 then eon_fb_peaks(slot, pe.path, pe.ms) end
+    if pe and pe.kind == 0 then eon_fb_peaks(slot, pe.path, pe.ms); st.desc_ridx = ridx; eon_fb_rn_want(slot, st, ridx) end
   end
   return true
 end
@@ -5021,7 +5363,12 @@ function eon_fb_tree_tick(slot, st)
     -- Under no root we currently show: a drive that was not there when the rail
     -- was built (a stick just plugged in), or a newly starred folder. Rebuild
     -- the top level rather than leaving the folder unreachable.
-    eon_fb_tree_root(tr, st.cwd)
+    -- ONCE per such folder: one under no root even after the rebuild (a UNC share, A:/B:) rebuilt the whole
+    -- forest every tick -- settings read, ~24 drive probes, a full republish. tr.unrooted = that folder.
+    if tr.unrooted ~= st.cwd then
+      eon_fb_tree_root(tr, st.cwd)
+      tr.unrooted = (not eon_fb_tree_root_for(tr, st.cwd)) and st.cwd or nil
+    end
   elseif st.cwd and st.cwd ~= tr.last_cwd then
     -- Same drive, new folder: open the chain down to it using what the tree
     -- already holds. The rail FOLLOWS the list without being rebuilt.
@@ -5154,17 +5501,27 @@ function eon_fb_tick()
       if changed then eon_fb_publish(slot, st.req_seen) end
     end
   end
+  -- P2 / P4 (2026-10-27): the category pass under its time budget, then at most one root-note step (a read OR an
+  -- analysis), never under a kit load's LOCK (eon_fb_rn_step's own gate).
+  eon_fb_cat_step()
+  eon_fb_rn_step()
   -- A drag or a click queued this tick goes out this tick, and the stream starts in the same pass.
   if not posted then posted = eon_fb_drain() end
   if posted and eon_pcm_consume_now then eon_pcm_consume_now() end
 end
 
+-- Dock-rig layout relay: Swing's wordmark menu picked a layout and wrote its
+-- 1-based index to GS_DOCK_LAYOUT_REQ (JSFX can't touch ExtState or actions —
+-- same reason the theme picker rides GS_THEME_REQ). Stamp the pick into
+-- ExtState and run EON_Dock_Layout.lua, which applies that layout without
+-- showing its menu when a pick is staged. Missing file = one console note.
 function eon_dock_layout_tick()
   -- ⚠️ core.GMEM, not G: this function sits ABOVE the `local G = core.GMEM`
-  -- declaration (~:2910), so `G` here would be a nil GLOBAL and the pcall at
-  -- the call site would eat the error silently — which is exactly how this
-  -- shipped broken on 2026-08-25. Same trap the :500 comment documents; the
-  -- groove tick above dodges it with raw literals.
+  -- declaration (the "gmem layout" section), so `G` here would be a nil GLOBAL
+  -- and the pcall at the call site would eat the error silently — which is
+  -- exactly how this shipped broken on 2026-08-25. Same trap the comment above
+  -- eon_padcat_track_for_slot documents; the groove tick above dodges it with
+  -- raw literals.
   local DLR = core.GMEM.GS_DOCK_LAYOUT_REQ
   -- First sighting after a bridge (re)start: clear without acting, so a pick
   -- posted while no bridge was running can't apply minutes later out of the
@@ -5205,7 +5562,7 @@ end
 -- in which case the selection change alone makes the live pane swap over.
 -- Launching a second captor would have two scripts fighting over one float.
 function eon_redock_tick()
-  -- core.GMEM, not G: this sits ABOVE `local G = core.GMEM` (~:2910) -- the
+  -- core.GMEM, not G: this sits ABOVE `local G = core.GMEM` (gmem layout) -- the
   -- same position-scoping trap the layout tick above documents.
   local GM = core.GMEM
   if eon_redock_baselined == nil then
@@ -5268,11 +5625,13 @@ end
 local swing_kit_v5 = (function()
   local M = {}
 
-  -- Load ceilings, derived from what the sampler can actually hold rather than
-  -- from round numbers. The JSFX slab is NUM_PADS(16) x SLOT_SIZE(4,000,000
-  -- interleaved cells) = 64M cells, so a kit that needs more than that cannot
-  -- be played whatever the archive says. 192 MB covers that slab at 24-bit
-  -- plus container overhead; anything larger is refused before it is read.
+  -- Load ceilings: coarse guards against an archive that could only end in an
+  -- OOM, set at the paper bound NUM_PADS(16) x SLOT_SIZE(4,000,000 interleaved
+  -- cells) = 64M cells -- not the sampler's exact room. Within them the load
+  -- caps each pad buffer at the JSFX's slot (LAYER_SIZE / SLOT_SIZE), and the
+  -- packed fallback for an old JSFX cuts what does not fit the ~16.77M-cell
+  -- gmem window, with a notice (GMEM_AUDIO_MAX). 192 MB covers 64M cells at
+  -- 24-bit plus container overhead; a larger file is refused before it is read.
   local MAX_DECODED_CELLS = 64000000
   local MAX_ARCHIVE_BYTES = 192 * 1048576
 
@@ -5898,9 +6257,9 @@ local swing_kit_v5 = (function()
     if not f then return nil, nil, "load_kit: cannot open '" .. filepath .. "': " .. tostring(ferr) end
     -- The whole archive is read into one string and then decoded into tables
     -- (~16 bytes per sample), so refuse sizes that could only end in an OOM.
-    -- The cap is derived from what the SAMPLER can actually hold, not from a
-    -- round number: 16 pads x SLOT_SIZE (4M interleaved cells) = 64M cells, so
-    -- 192 MB covers a full kit even at 24-bit, plus container overhead. The old
+    -- The cap sits at the 16 pads x SLOT_SIZE (4M interleaved cells) = 64M-cell
+    -- paper bound (see the load ceilings above), so 192 MB covers that even at
+    -- 24-bit, plus container overhead. The old
     -- 1024 MB gate let a file four times larger than anything loadable reach
     -- the decoder, where the archive string, the entry strings and the decoded
     -- Lua sample tables are all live at once.
@@ -6166,21 +6525,11 @@ local EON_SS_ALIVE     = 2700  -- incrementing heartbeat (advancing = StepSeq GU
 local EON_SS_MUTE_BASE = 2710  -- per-pad mute  (pad 0..15)
 local EON_SS_SOLO_BASE = 2730  -- per-pad solo  (pad 0..15)
 local GS_PROJ_DIRTY = 2620  -- JSFX project-dirty signal (Phase 1B); literal slot matches Swing_ReaKit.jsfx
--- Audio-only reload flag (project-open sidecar / Undo audio-repair). When set,
--- the JSFX preserves its @serialize-restored live params instead of taking the
--- kit file's values. Set per-load in drive_load_queue; cleared by every other
--- load via load_swing_dispatch.
 -- JSFX-published per-pad pitch MODE band (0=Repitch, 1=Tuned, 2=Stretch). Read
 -- to decide which pads need their baked Tuned audio re-injected after a
 -- preserve reload overwrote the buffer with the kit's original samples.
 local STRETCH_MODE_TUNED = 1
 local STRETCH_MODE_STRETCH = 2
--- B1b — per-instance Tuned injection: route the pad-audio swap (CMD 65) to a
--- specific instance by writing its registry slot here, and read the per-slot
--- MODE band / instance registry to map instance<->slot and disambiguate reverts.
--- Per-instance identity band constants are read inside the consumer function
--- (function scope) via G.* — NOT as module-level locals, to stay under Lua's
--- 200-local-per-function limit on this large bridge main chunk.
 -- The audio band's REAL room, measured from AUDIO_BASE: it ends where the
 -- Stretch rings begin (AUDIO_DUMP_END), ~16.77M cells — not NUM_PADS *
 -- SLOT_SIZE (64M), the paper bound this used to be, four times the truth.
@@ -6195,9 +6544,8 @@ local GMEM_AUDIO_MAX = G.AUDIO_DUMP_END - G.AUDIO_BASE
 -- "EON_Swing_Pitch" namespace using the key "inst_<N>_pad_<M>_path". The
 -- Extension reads it on RENDER_REQ via GetExtState.
 --
--- This is called immediately after every existing
--- `SetExtState("Swing", "pad_path_<pad>", ...)` site (kit-load v2/v3/v4/v5,
--- browser drag-drop, kit-wide clear) so the Extension's view stays in
+-- This is called beside every kit-save breadcrumb write (eon_crumb_set /
+-- eon_crumb_clear: kit-load v2/v4/v5, chop, kit-wide clear) so the Extension's view stays in
 -- lockstep with the bridge's own breadcrumb storage. Passing an empty
 -- `path` clears the Extension's cache for that (inst, pad).
 --
@@ -6354,7 +6702,8 @@ local function publish_pitch_path(pad_idx, path, inst_id)
   -- :7717), plus invalidation (:7542) which must CLEAR rather than analyse.
   -- inst_id is already resolved above and the nil-inst DROP has already run.
   -- JSFX-side routes (browser CMD 63, drag-drop, Choppa) never reach here at
-  -- all; they are covered by the re-analysis mailbox the JSFX fires on load.
+  -- all; they are covered by the re-analysis mailbox the JSFX fires on load,
+  -- which carries the pad's path since level 320 (eon_rootnote_tick).
   if eon_rootnote_enqueue then
     if path and path ~= "" then
       eon_rootnote_enqueue(pad_idx, path, inst_id)
@@ -6362,6 +6711,68 @@ local function publish_pitch_path(pad_idx, path, inst_id)
       eon_rootnote_clear(pad_idx, inst_id)
     end
   end
+end
+
+-- ─── Kit-save path breadcrumbs: per Swing AND per bank (B4 / C3, 2026-10-26) ─────
+-- A loader that stages a kit's AUDIO (the blob routes: v4/v5 px/pp, v2) leaves the JSFX's path slots empty, so the
+-- next save falls back on the path the loader saw: the breadcrumb (session ExtState, never saved). It used to be ONE
+-- set of sixteen keys "Swing"/"pad_path_<pad>" for every Swing in the session, keyed by pad only: a pad with audio
+-- but no path in Swing B saved Swing A's last-loaded file for that pad number, the chop migration saw only the last
+-- chopper's paths, and a chop into bank B overwrote bank A's. The owner's decision: one set per instance id and bank,
+-- "pad_path_i<inst>_b<bank>_<pad>", cleared for the instance on every kit load (eon_crumb_load_begin, all four banks
+-- for a whole-kit load, the one bank for a load INTO it) and on New Kit (the kit-cover clear pend, which every
+-- swing_new_kit_full_reset raises). The old key is read only as a last resort, bank A, while at most ONE Swing is
+-- registered -- written by an older bridge earlier in this session it cannot then belong to another Swing -- and it
+-- is wiped by every bank-A load or clear. Globals: the main chunk is at Lua's 200-local ceiling.
+function eon_crumb_key(inst, bank, pad)
+  return ("pad_path_i%d_b%d_%d"):format(inst, bank, pad)
+end
+-- The instance a breadcrumb belongs to: the id given, else the one a kit load / save is for (LOCK, the routing
+-- slots, the sole instance: the attribution publish_pitch_path uses), else nil = write nothing, read no own key.
+function eon_crumb_inst(inst)
+  inst = math.floor(tonumber(inst) or 0)
+  if inst > 0 then return inst end
+  return resolve_pub_inst(nil)
+end
+function eon_crumb_set(inst, bank, pad, path)
+  inst = eon_crumb_inst(inst)
+  if not inst then return end
+  reaper.SetExtState("Swing", eon_crumb_key(inst, bank or 0, pad), path or "", false)
+end
+-- bank nil = all four banks (A..D, Swing's NUM_BANKS). A bank-A clear also wipes the old shared keys.
+function eon_crumb_clear(inst, bank)
+  inst = eon_crumb_inst(inst)
+  if inst then
+    for b = bank or 0, bank or 3 do
+      for pad = 0, G.NUM_PADS - 1 do reaper.SetExtState("Swing", eon_crumb_key(inst, b, pad), "", false) end
+    end
+  end
+  if (bank or 0) == 0 then
+    for pad = 0, G.NUM_PADS - 1 do reaper.SetExtState("Swing", "pad_path_" .. pad, "", false) end
+  end
+end
+function eon_crumb_get(inst, bank, pad)
+  bank = bank or 0
+  inst = eon_crumb_inst(inst)
+  if inst then
+    local v = reaper.GetExtState("Swing", eon_crumb_key(inst, bank, pad)) or ""
+    if v ~= "" then return v end
+  end
+  if bank ~= 0 then return "" end
+  local n = 0
+  for slot = 0, G.GS_INST_REG_MAX - 1 do
+    if math.floor(reaper.gmem_read(G.GS_INST_REG_BASE + slot * G.GS_INST_REG_STRIDE + G.GS_INST_REG_OFF_ID) or 0) ~= 0 then
+      n = n + 1
+    end
+  end
+  if n > 1 then return "" end   -- two Swings: an unkeyed crumb may be the other one's
+  return reaper.GetExtState("Swing", "pad_path_" .. pad) or ""
+end
+-- Every kit load (load_swing_dispatch_now, before the loader): a whole-kit load starts the instance's four banks
+-- empty, a load INTO a bank (step 4c) or a bank pass starts that bank empty. The loader then writes its pads.
+function eon_crumb_load_begin(pass)
+  local bank = (pass and pass.bank) or 0
+  if bank == 0 and not (pass and pass.into) then eon_crumb_clear(nil, nil) else eon_crumb_clear(nil, bank) end
 end
 
 -- ─── Stage 1: Drag-drop file-copy to escape OneDrive Files-On-Demand ─────
@@ -6465,7 +6876,15 @@ function _eon_store_stamp_write(dir)
   local f = io.open(dir .. "/.eon_stamp", "wb")
   if f then f:write(tostring(os.time())); f:close() end
 end
-function _eon_sweep_unsaved_store()
+function _eon_sweep_unsaved_store(deferred)
+  -- The main chunk calls this at bridge start (`pcall(_eon_sweep_unsaved_store)`), some 1,700 lines ABOVE
+  -- `function eon_load_report`, so that global is not assigned yet: the first aged dir's receipt threw, the pcall
+  -- swallowed it, and the rest of the sweep never ran.
+  -- Run once on the first defer cycle instead, when the whole chunk has been read (`deferred` = no second hop).
+  if not eon_load_report and not deferred then
+    reaper.defer(function() pcall(_eon_sweep_unsaved_store, true) end)
+    return 0
+  end
   local root = _eon_unsaved_store_root()
   local now = os.time()
   local swept = 0
@@ -6495,8 +6914,10 @@ function _eon_sweep_unsaved_store()
         -- Receipt for deleting user-adjacent files — but into the bounded
         -- session log, not the console: eon_load_report tees there and stays
         -- invisible unless load_debug is on (console-noise sweep 2026-08-05).
-        eon_load_report(("store: swept aged unsaved %s dir (%d days idle): %s")
-          :format(sub, math.floor((now - stamp) / 86400), dir))
+        if eon_load_report then
+          eon_load_report(("store: swept aged unsaved %s dir (%d days idle): %s")
+            :format(sub, math.floor((now - stamp) / 86400), dir))
+        end
       end
     end
   end
@@ -6744,9 +7165,10 @@ function _eon_fence_back(slot, pad, path)   -- GLOBAL
   return ch == 1 and sr == _eon_layer.fence_sr and frames ~= nil and F.sigs[frames] == true
 end
 
--- Temp-WAV path for a captured ORIGINAL layer source (stable name → the
--- Extension caches its decode by path string, so later baked overwrites of the
--- same name never re-decode; the original stays the bake source).
+-- Temp-WAV path for a captured ORIGINAL layer source. `seq`, when supplied,
+-- makes the name UNIQUE per publish, as for _eon_temp_audio_path: the Extension
+-- caches its decode by the path STRING, so a stable name would replay the OLD
+-- layer audio after a re-capture.
 -- GLOBAL (not local) — see the _eon_layer table comment: bridge is at the
 -- 200-local chunk limit, so the per-layer helpers are module-global like
 -- is_stepseq_fx. They still close over the main-chunk locals above.
@@ -6768,7 +7190,7 @@ function publish_layer_pitch_path(pad_idx, layer, path, inst_id)
   pt[layer] = path or ""
 end
 
--- Serialize captured s16 layer bytes to a stable temp WAV and retain it.
+-- Serialize captured s16 layer bytes to a per-publish temp WAV and retain it.
 function publish_layer_path_from_s16_bytes(pad_idx, layer, channels, sr, s16_bytes, inst_id)
   inst_id = resolve_pub_inst(inst_id)
   if not inst_id then return end
@@ -6789,6 +7211,27 @@ end
 -- load_swing_dispatch — every kit-load route ends up there. Declared at
 -- top of file so the lexical scope sees it before the function definition.
 local kit_sources = {}
+
+-- A REAPER undo / redo puts a Swing track's P_EXT:swing_kit_src back together with the Swing it restores -- a Ctrl+Z
+-- of a kit load (an undo point since 2026-10-27, eon_kitpt_*) brings the previous kit AND its record back. The
+-- in-memory twin here did not follow, so the sidecar went on copying the kit that was undone, and the next open's
+-- backstop reload (queue_sidecar_load_if_present) would have put its audio under the restored kit's settings. The
+-- track's record wins when the two differ: the bridge only ever writes them together, so a difference is REAPER's
+-- doing. Called by the health tick (eon_sidecar_ensure_ok) and the save (auto_save_all_sidecars) before they read
+-- the source. An emptied record (an undo across a chop into bank A) is left as it is. Returns true when it moved.
+-- GLOBALS (the 200-local ceiling).
+eon_kit_src_moved = {}   -- [guid] = true: the source moved and the sidecar has not been copied from it yet
+function eon_kit_src_follow(guid, tr)
+  if not guid or guid == "" or not (tr and reaper.ValidatePtr2(0, tr, "MediaTrack*")) then return false end
+  local _, p = reaper.GetSetMediaTrackInfo_String(tr, "P_EXT:swing_kit_src", "", false)
+  if p and p ~= "" and p ~= kit_sources[guid] and not eon_path_is_sidecar(p) then   -- never a backup as its own source
+    kit_sources[guid] = p
+    _kit_write_epoch = (_kit_write_epoch or 0) + 1   -- the save's copy cache (auto_save_all_sidecars) starts over
+    eon_kit_src_moved[guid] = true
+    return true
+  end
+  return false
+end
 
 -- (Kit-undo helpers live after is_swing_fx — they capture locals declared
 -- between here and there: pending_export, is_swing_fx.)
@@ -7489,8 +7932,12 @@ function eon_rootnote_clear(pad_idx, inst_id)
   RN.mod.clear(G, slot, pad_idx)
 end
 
--- Pad source path straight from the gmem AUDIO band (the JSFX publishes it
--- there). Duplicated from read_pad_path_from_gmem, which is a `local function`
+-- Pad source path from the gmem AUDIO band: the FALLBACK for a Swing older than
+-- the request's own paths (A2, 2026-10-26). Only the bridge's kit loader stages
+-- these cells (and CMD 65/66/67 overwrite them with sample data), so for a
+-- browser or drop load they hold the previous kit's path or nothing; a current
+-- Swing sends the path with the request instead (rk_root_note.poll_request).
+-- Duplicated from read_pad_path_from_gmem, which is a `local function`
 -- defined ~1800 lines BELOW this point — Lua has no hoisting, so it is simply
 -- not in scope here. This is the path the re-analysis mailbox needs, because
 -- JSFX-side loads (browser CMD 63, drag-drop) write NO pad_path_N ExtState
@@ -7521,11 +7968,14 @@ function eon_rootnote_tick()
     local first, last = req.pad, req.pad
     if req.pad < 0 then first, last = 0, G.NUM_PADS - 1 end
     for pad = first, last do
-      -- gmem AUDIO band, NOT the pad_path_N ExtState: JSFX-side loads (browser
-      -- CMD 63, native drag-drop, Choppa) never write that ExtState, so reading
-      -- it here found nothing for exactly the routes this mailbox exists to
-      -- rescue. The JSFX publishes the source path into gmem for every load.
-      local path = eon_rootnote_gmem_path(pad)
+      -- The path Swing sent WITH the request (A2, 2026-10-26; Swing writes it
+      -- while the bridge publishes level 320): the pad's own source path, set
+      -- by every load (browser CMD 63/64, native drop, kit). An older Swing
+      -- sends none (req.paths nil) and keeps the old read: the kit loader's
+      -- staging cells, which only a bridge kit load writes -- so a browser or
+      -- drop load there is still analysed from the previous kit's file.
+      local path
+      if req.paths then path = req.paths[pad] or "" else path = eon_rootnote_gmem_path(pad) end
       if path ~= "" then
         RN.q[#RN.q + 1] = { slot = req.slot, pad = pad, path = path }
       else
@@ -7692,7 +8142,7 @@ local function load_audio_to_pad(filepath, pad_idx, preserve_name)
   end
 
   -- Store path in ExtState for kit save (a user-facing load only: see above)
-  if not preserve_name then reaper.SetExtState("Swing", "pad_path_" .. pad_idx, filepath, false) end
+  if not preserve_name then eon_crumb_set(nil, 0, pad_idx, filepath) end   -- the LOCK holder's bank A (B4)
   -- Mirror to the Extension's temp location so the bake works even when
   -- the source is in OneDrive (Files-On-Demand placeholders can't be
   -- opened by dr_wav from a worker thread).
@@ -7794,7 +8244,9 @@ end
 -- User-perceived effect: "Tuned kinda works but then doesn't" — some knob
 -- landings swap in fine, others get skipped while the throttle was hot.
 -- Set to 0 — REAPER's CMD 65 swap is cheap (audio copy + 10ms crossfade for
--- click-mask). No rate limit needed.
+-- click-mask). No rate limit needed. At 0 the test below always passes; the
+-- constant and its table stay because EON_Probe_PitchA_run.ps1's "nodeliver"
+-- mutation raises this line to prove its probe can fail.
 local _eon_swap_throttle_ms = 0        -- (was 100) — every fresh bake swaps
 local _eon_last_swap_t = {}            -- [slot][pad] -> last-swap time_precise() seconds
 for s = 0, 15 do
@@ -8571,13 +9023,15 @@ local function find_swing_track()
 end
 
 -- ═════════════════════════════════════════════════════════════════════════════
--- KIT-LEVEL UNDO (disk-based)
--- Before a kit load / New Kit / Clear All, ask the JSFX to silently dump its
--- CURRENT live kit (CMD 83 → export state 11 → CMD 1), write it to a
--- per-instance temp .swing next to the auto-sidecars, ack with CMD 85
--- (LOCK-preserving). Orange UNDO on a kit op fires CMD 82 → reload that file.
--- Captures LIVE state (unsaved edits, scratch kits) — unlike a source-file
--- copy. 1-level: the file is overwritten on each kit op.
+-- KIT-LEVEL UNDO (disk-based) — PARKED since 2026-06-29: nothing calls
+-- start_kit_undo_dump (see the load_swing_dispatch wrapper for how to revive).
+-- Design: before a kit load / New Kit / Clear All, ask the JSFX to silently
+-- dump its CURRENT live kit (CMD 83 → export state 11 → CMD 84); the
+-- dispatcher's cmd == 84 branch writes it to a per-instance temp .swing next
+-- to the auto-sidecars and acks with CMD 85 (LOCK-preserving). Orange UNDO on
+-- a kit op fires CMD 82 → reload that file. Captures LIVE state (unsaved
+-- edits, scratch kits) — unlike a source-file copy. 1-level: the file is
+-- overwritten on each kit op.
 -- ═════════════════════════════════════════════════════════════════════════════
 local kit_undo_avail = {}   -- guid -> undo .swing path (armed after a dump)
 local kit_undo_job   = nil  -- in-flight dump: {phase, guid, inst, deadline, after}
@@ -8657,15 +9111,17 @@ local function start_kit_undo_dump(after)
                    after = after, deadline = reaper.time_precise() + 2.5 }
   -- LOCK = the target BEFORE the command: the JSFX's CMD-83 consumer is
   -- instance-gated (audit B-6, 2026-09-14), so an ungated 83 would be taken
-  -- by nobody and this job would only time out.
+  -- by nobody and this job would only time out. The save owner too (level 322,
+  -- eon_save_owner_tick): the dump's 93s and its 85 are this instance's.
   reaper.gmem_write(G.LOCK, inst or 0)
+  reaper.gmem_write(G.GS_KIT_SAVE_OWNER, inst or 0)
   reaper.gmem_write(G.CMD, 83)
 end
 
 -- Per-tick driver for the in-flight dump job. Phase 1: waiting for the JSFX
--- to stage + CMD=1 (the cmd==1 branch writes the file, acks CMD 85, flips us
--- to phase 2). Phase 2: waiting for the JSFX to consume the 85 (CMD back to
--- 0) so the follow-up load can't collide on the mailbox.
+-- to stage + CMD=84 (the dispatcher's cmd==84 branch writes the file, acks
+-- CMD 85, flips us to phase 2). Phase 2: waiting for the JSFX to consume the
+-- 85 (CMD back to 0) so the follow-up load can't collide on the mailbox.
 local function kit_undo_job_tick()
   if not kit_undo_job then return end
   local j = kit_undo_job
@@ -8677,6 +9133,7 @@ local function kit_undo_job_tick()
     if c == 84 then
       pending_export = nil
       kit_undo_job = nil
+      if j.inst and j.inst > 0 then reaper.gmem_write(G.GS_KIT_SAVE_OWNER, j.inst) end   -- the 85 is the dump's (level 322)
       reaper.gmem_write(G.CMD, 85)
       j.after(false)                                  -- no undo coverage, but clean
     elseif reaper.time_precise() > j.deadline then
@@ -8696,21 +9153,100 @@ local function kit_undo_job_tick()
   end
 end
 
+-- ── The save's owner (bridge level 322, 2026-10-27; sweep LIB121 / LIB122) ──
+-- A kit save is a conversation on the shared CMD bus: 10 / 12 / 15 / 19 / 21 from the saving Swing, the bridge's
+-- 11 (the name), the Swing's 1 (its dump) and, for each bank after the first, the bridge's 93 and the Swing's 1
+-- again, closed by 99 or 98. A dev export or a kit-undo dump runs 83, 84, 93 ..., 85. Swing's export states took
+-- every 11 / 93 / 98 / 99 / 85 they saw, so with two Swings one could answer the other's save (an instance whose
+-- window closed mid-save is left in state 10 or 3). LOCK cannot carry the saver through it: between two bank
+-- dumps the bus reads CMD 0 and the stale-LOCK self-heal clears LOCK, so every 93 after the first went out under
+-- LOCK 0 -- why the sweep's LOCK gate wedged each multi-bank save (EON_Probe_SeqKit, reverted at the merge).
+-- GS_KIT_SAVE_OWNER names the saver instead, and only this function, the dev-export pickup and the kit-undo
+-- start write it:
+--   * a save's first code (10 / 12 / 15 / 19 / 21) takes the LOCK the Swing posted it under;
+--   * CMD 1 / 84 (a dump has landed) puts back the owner the transaction recorded (pending_export.inst, a dev
+--     export's dev_lock, the kit-undo job's inst), in case a foreign command cleared it in the gap before the
+--     dump -- the 93 / 99 / 98 / 85 for that dump go out later in this same tick;
+--   * a save code still on the bus (11, 83, 85, 93, 97, 98, 99), or CMD 0 between two dumps, keeps it;
+--   * any other command, or an idle bus with no save in flight, clears it, so a Lua-posted op's orphan 99 (the
+--     Auto-Color Pads action's) reads owner 0 and an idle Swing still takes it.
+-- Called once per poll tick, after the dispatcher reads CMD and before it dispatches. GLOBAL (the main chunk is
+-- near Lua's 200-local ceiling); defined below pending_export and kit_undo_job, so both are its upvalues.
+EON_SAVE_START = { [10] = true, [12] = true, [15] = true, [19] = true, [21] = true }
+EON_SAVE_STEP  = { [11] = true, [83] = true, [85] = true, [93] = true, [97] = true, [98] = true, [99] = true }
+function eon_save_owner_tick(cmd)
+  local want
+  if EON_SAVE_START[cmd] then
+    want = math.floor(reaper.gmem_read(G.LOCK) or 0)
+  elseif cmd == 1 or cmd == 84 then
+    local pe = pending_export
+    want = pe and ((pe.inst or 0) > 0 and pe.inst or pe.dev_lock) or (kit_undo_job and kit_undo_job.inst) or nil
+    if want and want <= 0 then want = nil end
+  elseif not EON_SAVE_STEP[cmd] and (cmd ~= 0 or (not pending_export and not kit_undo_job)) then
+    want = 0
+  end
+  if want and math.floor(reaper.gmem_read(G.GS_KIT_SAVE_OWNER) or 0) ~= want then
+    reaper.gmem_write(G.GS_KIT_SAVE_OWNER, want)
+  end
+end
+
+-- ── A save that stops moving is dropped (bridge level 323, 2026-10-27, RR-1) ──
+-- pending_export is set when the name goes out (CMD 11) or a dev export / kit-undo dump starts (83), and only the
+-- final write cleared it. A saver that never answered -- its window closed while its export tick (@gfx only) waited
+-- on the 11 or a 93, or between two bank dumps -- left it set for the session: the stale-CMD watchdog stands down
+-- for a pending export, so the 11 / 93 sat for good, the owner cell kept naming the dead saver, and every producer
+-- (the load-queue pop included, which waits for a save in flight since this level) waited on it. A save MOVES at
+-- every dump the Swing hands over (CMD 1 / 84); EON_SAVE_DEAD_S with none -- and no dialog up -- ends it: the record
+-- goes, an 11 / 93 still waiting for the Swing becomes 98 (the owner cell still names the saver, so its export state
+-- resets if it wakes, and nobody else takes it), an 83 nobody took becomes 0; the owner cell clears the first tick
+-- the bus is idle (eon_save_owner_tick). Before the dispatcher reads CMD, so this tick's dispatch sees the 98.
+-- A kit-undo job runs its own deadline (kit_undo_job_tick). GLOBAL (the main chunk is near Lua's 200-local
+-- ceiling); defined below pending_export and kit_undo_job, so both are its upvalues.
+EON_SAVE_DEAD_S = 10
+function eon_save_dead_tick()
+  local pe = pending_export
+  if not pe or kit_undo_job then return end
+  local now = reaper.time_precise()
+  local c = math.floor(reaper.gmem_read(G.CMD) or 0)
+  if not pe.t or c == 1 or c == 84 or c == 97 or (eon_dlg and eon_dlg.busy and eon_dlg.busy()) then
+    pe.t = now   -- first sighting, a dump handed over, or the user's own time in a dialog
+    return
+  end
+  if now - pe.t < EON_SAVE_DEAD_S then return end
+  pending_export = nil
+  if c == 11 or c == 93 then
+    reaper.gmem_write(G.CMD, 98)
+  elseif c == 83 then
+    reaper.gmem_write(G.CMD, 0)
+  end
+  reaper.ShowConsoleMsg(("[Swing] save watchdog: the save for instance %d made no progress for %d s (CMD=%d) -- dropped%s\n")
+    :format(math.floor(pe.inst or pe.dev_lock or 0), EON_SAVE_DEAD_S, c, (c == 11 or c == 93) and " (98)" or ""))
+end
+
+-- ── The kit-name click is a rename (bridge level 323, 2026-10-27, RR-1; the owner's note) ──
+-- Clicking the kit name posts the same CMD 10 as SAVE AS, so its name form started at "My Kit" too. The owner: SAVE
+-- shows the current kit, SAVE AS "My Kit", and the rename click the current name. A Swing of level 323 says which
+-- route posted the 10 in GS_KIT_SAVE_PREFILL (1 = the kit-name click) and writes its own kit name into the NAME
+-- cells with it (NAME_BASE holds the last kit operation's name, from any Swing). Read and zeroed at EVERY save start
+-- (10 / 12 / 15), refused or not -- the GS_KIT_EXPORT_ONLY rule -- so a stale 1 can never prefill a later Save As.
+-- Leaves eon_save_prefill = { name, author, desc } (the kit's source file's credit line and description) for a
+-- rename's 10, else nil; do_export_name_prompt starts its form at it (its `prefill`, the SAVE fallback's road).
+-- GLOBAL (the main chunk is near Lua's 200-local ceiling).
+function eon_save_rename_prefill(cmd)
+  local flag = math.floor(reaper.gmem_read(G.GS_KIT_SAVE_PREFILL) or 0)
+  if flag ~= 0 then reaper.gmem_write(G.GS_KIT_SAVE_PREFILL, 0) end
+  eon_save_prefill = nil
+  if cmd ~= 10 or flag ~= 1 then return nil end
+  local name = (core.gmem_read_string(NAME_BASE, G.NAMELEN, 32) or ""):match("^%s*(.-)%s*$")
+  if name == "" then return nil end
+  local src = eon_kit_src_for_lock()
+  eon_save_prefill = { name = name, author = eon_kit_author_from_file(src), desc = eon_kit_meta_from_file(src, "desc") }
+  return eon_save_prefill
+end
+
 -- ═════════════════════════════════════════════════════════════════════════════
 -- FOLDER TRACK HELPERS
 -- ═════════════════════════════════════════════════════════════════════════════
-
--- Find the folder track that parents the Swing track (if multi-out was built)
-local function find_folder_track(swing_track)
-  if not swing_track then return nil end
-  local sw_idx = math.floor(reaper.GetMediaTrackInfo_Value(swing_track, "IP_TRACKNUMBER")) - 1
-  if sw_idx < 1 then return nil end
-  local above = reaper.GetTrack(0, sw_idx - 1)
-  if not above then return nil end
-  local depth = reaper.GetMediaTrackInfo_Value(above, "I_FOLDERDEPTH")
-  if depth == 1 then return above end
-  return nil
-end
 
 -- Find the audio multi-out SUB-folder track: the track immediately AFTER Swing
 -- with FOLDERDEPTH=1. This is the new layout — Swing's parent folder contains
@@ -8733,7 +9269,79 @@ local function find_audio_subfolder(swing_track)
   -- folder_layout.FindDMSubfolder identifies the MIDI sub structurally by tag).
   local _, dm = reaper.GetSetMediaTrackInfo_String(next_tr, "P_EXT:EON_DRUM_KIT_FOLDER", "", false)
   if dm and dm ~= "" then return nil end
-  return next_tr
+  -- Ownership, not position (2026-10-26): the build stamps P_EXT:EON_AUDIO_KIT_FOLDER on the sub it makes. An
+  -- untagged folder right after Swing is the user's own (a "Vocals" folder) -- adopting it renamed it "Audio",
+  -- painted it, and put the multi-outs inside it -- UNLESS one of Swing's sends lands inside it (directly or
+  -- through the "Bank A" folder): a sub built before the tag existed, still holding its pad tracks.
+  local _, au = reaper.GetSetMediaTrackInfo_String(next_tr, "P_EXT:EON_AUDIO_KIT_FOLDER", "", false)
+  if au and au ~= "" then return next_tr end
+  for s = 0, reaper.GetTrackNumSends(swing_track, 0) - 1 do
+    local dest = eon_send_dest(swing_track, s)   -- globals below; called only at run time
+    local par = dest and reaper.GetParentTrack(dest)
+    if par and par ~= next_tr and eon_pext(par, "EON_BANK_FOLDER") == "A" then par = reaper.GetParentTrack(par) end
+    if par == next_tr then return next_tr end
+  end
+  return nil
+end
+
+-- Find the folder track that parents the Swing track: the track right above it, opening a folder, AND Swing's own.
+-- Ownership, not position (A3b, 2026-10-26): position alone took a folder the user made ("Drums", Swing its first
+-- track) for Swing's parent -- renamed it "Swing — <kit>", recoloured it, put a Lens on it, and the layout pass
+-- rewrote its tracks' depths. Swing's own is a folder Swing can prove it built (eon_swing_parent_owned). Not one:
+-- nil, and a Multi-Out build makes Swing a parent of its own INSIDE the user's folder.
+local function find_folder_track(swing_track)
+  if not swing_track then return nil end
+  local sw_idx = math.floor(reaper.GetMediaTrackInfo_Value(swing_track, "IP_TRACKNUMBER")) - 1
+  if sw_idx < 1 then return nil end
+  local above = reaper.GetTrack(0, sw_idx - 1)
+  if not above then return nil end
+  local depth = reaper.GetMediaTrackInfo_Value(above, "I_FOLDERDEPTH")
+  if depth == 1 and eon_swing_parent_owned(above, swing_track) then return above end
+  return nil
+end
+-- Is `par` (the folder right above Swing) a parent Swing built? Proof, cheapest first:
+--   * P_EXT:EON_SWING_PARENT -- every parent made from now on carries it (the Multi-Out build here,
+--     folder_layout.EnsureParent for the Drum Matrix build) and update_folder_track_name stamps it on an older one
+--     that passes a test below, so the walks run once per old parent;
+--   * the name "Swing — ..." -- the label update_folder_track_name has written on every name sync to the parent it
+--     found (em dash, the bridge's own spelling; nobody types it);
+--   * a track one of Swing's sends feeds, carrying P_EXT:EON_PAD_IDX (Swing's pad track, every build since P4-2),
+--     somewhere inside it -- the oldest layout put the pad tracks straight under the parent, later ones in the
+--     Audio sub, through "Bank A";
+--   * one of Swing's tagged sub-folders directly inside it: the Audio sub (EON_AUDIO_KIT_FOLDER) or the Drum Matrix
+--     MIDI sub (EON_DRUM_KIT_FOLDER).
+-- Each is something only Swing writes. A user's folder the old positional rule already adopted passes them too (it
+-- was renamed and holds Swing's Audio sub); nothing can tell those apart now. Same rule as folder_layout.FindParent
+-- (the Drum Matrix build's copy). Tracks compared by GUID (wiki 6.9). Module GLOBAL: the 200-local ceiling.
+function eon_swing_parent_owned(par, swing_track)
+  if eon_pext(par, "EON_SWING_PARENT") ~= "" then return true end
+  local _, nm = reaper.GetSetMediaTrackInfo_String(par, "P_NAME", "", false)
+  if nm and nm:sub(1, #"Swing — ") == "Swing — " then return true end
+  local pg = reaper.GetTrackGUID(par)
+  if not pg or pg == "" then return false end
+  for s = 0, reaper.GetTrackNumSends(swing_track, 0) - 1 do
+    local d = eon_send_dest(swing_track, s)
+    if d and eon_pext(d, "EON_PAD_IDX") ~= "" then
+      local p = reaper.GetParentTrack(d)
+      while p do
+        if reaper.GetTrackGUID(p) == pg then return true end
+        p = reaper.GetParentTrack(p)
+      end
+    end
+  end
+  local i = math.floor(reaper.GetMediaTrackInfo_Value(par, "IP_TRACKNUMBER"))   -- 0-based: the track after it
+  local depth, total = 1, reaper.CountTracks(0)
+  while i < total and depth > 0 do
+    local tr = reaper.GetTrack(0, i)
+    if not tr then break end
+    if eon_pext(tr, "EON_AUDIO_KIT_FOLDER") ~= "" or eon_pext(tr, "EON_DRUM_KIT_FOLDER") ~= "" then
+      local p = reaper.GetParentTrack(tr)
+      if p and reaper.GetTrackGUID(p) == pg then return true end
+    end
+    depth = depth + reaper.GetMediaTrackInfo_Value(tr, "I_FOLDERDEPTH")
+    i = i + 1
+  end
+  return false
 end
 
 -- Paint the three SESSION-track identities — color + tinted EON glyph — on the
@@ -8821,8 +9429,13 @@ local function update_folder_track_name(swing_track, explicit_name)
   end
   -- Name the parent when Swing is in a folder (whether or not sub-folders
   -- exist yet — e.g. DM built before multi-out, or multi-out before DM).
+  -- Only a parent Swing proves it built (find_folder_track, A3b): a folder the user made is never renamed. An
+  -- older parent that passed on a proof gets the tag now, so the proof walks run once.
   local folder = find_folder_track(swing_track)
   if folder then
+    if eon_pext(folder, "EON_SWING_PARENT") == "" then
+      reaper.GetSetMediaTrackInfo_String(folder, "P_EXT:EON_SWING_PARENT", "1", true)
+    end
     reaper.GetSetMediaTrackInfo_String(folder, "P_NAME", parent_label, true)
   end
   -- Same pass paints the three session-track icons + colors (engine / audio /
@@ -9010,12 +9623,20 @@ function eon_kit_author_from_file(filepath)
   return eon_kit_meta_from_file(filepath, "author")
 end
 
-local function do_export_name_prompt()
+local function do_export_name_prompt(prefill)
   -- Pad Banks (step 4c): "Save bank X as kit" arrives as the same CMD 10 with GS_KIT_EXPORT_ONLY = X + 1. Read
   -- and zeroed HERE, whatever the prompt does next, so a cancelled bank save cannot pin a later plain save.
   local only_cell = math.floor(reaper.gmem_read(G.GS_KIT_EXPORT_ONLY) or 0)
   reaper.gmem_write(G.GS_KIT_EXPORT_ONLY, 0)
   local only_bank = (only_cell >= 1 and only_cell <= 4) and (only_cell - 1) or nil
+  -- What the form starts at (the owner, 2026-10-27: "save should show the current kit. save as should show the my
+  -- kit"). SAVE AS -- CMD 10 from SAVE AS, the LCD's kit name, a bank's "Save bank X as kit" -- passes nothing and
+  -- starts at "My Kit" with no author or description, as ever. SAVE deflected here by do_save_in_place (no kit file
+  -- yet, or a factory kit) passes `prefill` = { name, author, desc }: the kit on screen. An empty name starts at
+  -- "My Kit" too.
+  local pre_name   = (prefill and prefill.name and prefill.name ~= "") and prefill.name or "My Kit"
+  local pre_author = (prefill and prefill.author) or ""
+  local pre_desc   = (prefill and prefill.desc) or ""
   -- Everything downstream of the NAME prompt, so the prompt itself can be async.
   -- Reached from both the styled form (values arrive in a table) and the native
   -- GetUserInputs fallback (values arrive from the CSV split), so it trims its
@@ -9071,9 +9692,9 @@ local function do_export_name_prompt()
   local shown = eon_dlg and eon_dlg.available() and eon_dlg.open and eon_dlg.open({
     title = "Save Swing Kit", width = 420, ok_label = "Save",
     fields = {
-      { key = "name",   label = "Kit Name:",              value = "My Kit" },
-      { key = "author", label = "Author (optional):",     value = "" },
-      { key = "desc",   label = "Description (optional):", value = "" },
+      { key = "name",   label = "Kit Name:",              value = pre_name },
+      { key = "author", label = "Author (optional):",     value = pre_author },
+      { key = "desc",   label = "Description (optional):", value = pre_desc },
     },
     on_ok     = function(v) proceed(v.name, v.author, v.desc) end,
     on_cancel = function() reaper.gmem_write(G.CMD, 98) end,
@@ -9083,11 +9704,17 @@ local function do_export_name_prompt()
     return
   end
 
-  -- Native fallback (no ReaImGui) — unchanged behaviour, comma limit included.
+  -- Native fallback (no ReaImGui) — the same three fields, comma limit included (the answers come back as CSV).
+  -- Its defaults are CSV too: a prefilled value holding a comma (or a line break, which a description can hold) would
+  -- split or break the fields, so that value starts at the Save As default instead (eon_browse_save drops a
+  -- suggested path with a comma the same way).
+  local function csv_default(v, plain)
+    return (v:find(",", 1, true) or v:find("\n", 1, true) or v:find("\r", 1, true)) and plain or v
+  end
   local retval, csv = reaper.GetUserInputs(
     "Save Swing Kit", 3,
     "Kit Name:,Author (optional):,Description (optional):,extrawidth=220",
-    "My Kit,,"
+    csv_default(pre_name, "My Kit") .. "," .. csv_default(pre_author, "") .. "," .. csv_default(pre_desc, "")
   )
   if not retval then
     reaper.gmem_write(G.CMD, 98)
@@ -9122,19 +9749,26 @@ end
 local function do_save_in_place()
   local filepath = eon_kit_src_for_lock()
 
-  if not filepath or filepath == "" or eon_kit_is_factory(filepath) then
-    do_export_name_prompt()
-    return
-  end
-
   -- The kit name the file already carries. gmem NAME_BASE is the live display
   -- name (#kit_name, serialized JSFX-side), which is what the user sees in the
-  -- LCD and therefore what they expect to be saving.
+  -- LCD and therefore what they expect to be saving. Read before the deflection
+  -- below since 2026-10-27: the name form starts at it too.
   local kit_name = core.gmem_read_string(NAME_BASE, G.NAMELEN, 32) or ""
   kit_name = kit_name:match("^%s*(.-)%s*$")
-  if kit_name == "" then
-    kit_name = (filepath:match("([^/\\]+)%.[Ss][Ww][Ii][Nn][Gg]$") or "Kit")
+  if kit_name == "" and filepath and filepath ~= "" then
+    kit_name = (filepath:match("([^/\\]+)%.[Ss][Ww][Ii][Nn][Gg]$") or "")
   end
+
+  if not filepath or filepath == "" or eon_kit_is_factory(filepath) then
+    -- The name form, started at the kit on screen (the owner, 2026-10-27: "When i 'save a kit' its name should appear
+    -- instead of having to type it again"): the name the silent save below would write, and the source file's credit
+    -- line and description when there is a file (a factory kit's; none for a first save). No name at all starts at
+    -- "My Kit", as Save As always does (do_export_name_prompt).
+    do_export_name_prompt({ name = kit_name, author = eon_kit_author_from_file(filepath),
+                            desc = eon_kit_meta_from_file(filepath, "desc") })
+    return
+  end
+  if kit_name == "" then kit_name = "Kit" end
 
   local filename = filepath:match("([^/\\]+)%.[Ss][Ww][Ii][Nn][Gg]$") or kit_name
 
@@ -9147,6 +9781,9 @@ local function do_save_in_place()
     filename = filename
   }
 
+  -- Stage the name like the four sibling save paths: NAMELEN is PARAM3, which every CMD 65/66/67 delivery
+  -- overwrites with a sample count or rate, and the JSFX's CMD-11 consumer reads NAMELEN cells into #kit_name.
+  core.gmem_write_string(kit_name, NAME_BASE, G.NAMELEN, 32)
   reaper.gmem_write(G.CMD, 11)
 end
 
@@ -9287,116 +9924,6 @@ function rk_export.do_export_rs5k_browse()
   reaper.gmem_write(G.CMD, 11)  -- same per-pad dump the .swing / SFZ exports use
 end
 
-local function write_kit_v2(filepath, info)
-  local f = io.open(filepath, "w")
-  if not f then
-    eon_notice("Could not create file:\n" .. filepath)
-    reaper.gmem_write(G.CMD, 98)
-    return
-  end
-
-  local write_ok, write_err = pcall(function()
-  f:write("-- Swing Kit v2 — EON Studios — proprietary\n")
-  f:write("return {\n")
-  f:write('  version  = 2,\n')
-  f:write('  kit_name = ' .. core.lua_quote(info.kit_name or "") .. ',\n')
-  f:write('  author   = ' .. core.lua_quote(info.author or "") .. ',\n')
-  f:write('  created  = ' .. core.lua_quote(os.date("%Y-%m-%d")) .. ',\n')
-  f:write('  modified = ' .. core.lua_quote(os.date("%Y-%m-%d")) .. ',\n')
-  f:write('\n')
-
-  -- Global settings
-  f:write('  globals = {\n')
-  for i, name in ipairs(KIT_GLOBAL_KEYS) do
-    f:write('    ' .. name .. ' = ' .. reaper.gmem_read(KIT_GMEM_GLOBALS + i - 1) .. ',\n')
-  end
-  f:write('  },\n\n')
-
-  -- Per-pad data
-  f:write('  pads = {\n')
-  for pad = 0, G.NUM_PADS - 1 do
-    local base = G.META_BASE + pad * G.META_PP
-    -- Read path from ExtState (reliable source — gmem audio area may be overwritten)
-    local path = reaper.GetExtState("Swing", "pad_path_" .. pad) or ""
-
-    -- Read pad name
-    local name_base = G.PADNAME_BASE + pad * G.PADNAME_LEN
-    local name_chars = {}
-    for i = 0, G.PADNAME_LEN - 1 do
-      local c = math.floor(reaper.gmem_read(name_base + i))
-      if c > 0 then name_chars[#name_chars + 1] = string.char(c) end
-    end
-    local name = table.concat(name_chars)
-
-    f:write('    [' .. (pad + 1) .. '] = {\n')
-    f:write('      path   = ' .. core.lua_quote(path) .. ',\n')
-    f:write('      name   = ' .. core.lua_quote(name) .. ',\n')
-    f:write('      gain   = ' .. reaper.gmem_read(base + 0) .. ',\n')
-    f:write('      pan    = ' .. reaper.gmem_read(base + 1) .. ',\n')
-    f:write('      pitch  = ' .. reaper.gmem_read(base + 2) .. ',\n')
-    f:write('      attack = ' .. reaper.gmem_read(base + 3) .. ',\n')
-    f:write('      decay  = ' .. reaper.gmem_read(base + 4) .. ',\n')
-    f:write('      sustain = ' .. reaper.gmem_read(base + 5) .. ',\n')
-    f:write('      release = ' .. reaper.gmem_read(base + 6) .. ',\n')
-    f:write('      mute   = ' .. reaper.gmem_read(base + 7) .. ',\n')
-    f:write('      solo   = ' .. reaper.gmem_read(base + 8) .. ',\n')
-    f:write('      output = ' .. reaper.gmem_read(base + 9) .. ',\n')
-    f:write('      note   = ' .. reaper.gmem_read(base + 10) .. ',\n')
-    f:write('      note_lock = ' .. reaper.gmem_read(base + 11) .. ',\n')
-    f:write('      color  = ' .. reaper.gmem_read(base + 12) .. ',\n')
-    f:write('      choke  = ' .. reaper.gmem_read(base + 13) .. ',\n')
-    f:write('      oneshot = ' .. reaper.gmem_read(base + 14) .. ',\n')
-    f:write('      reverse = ' .. reaper.gmem_read(base + 15) .. ',\n')
-    f:write('      fx_hpf = ' .. reaper.gmem_read(base + 16) .. ',\n')
-    f:write('      fx_lpf = ' .. reaper.gmem_read(base + 17) .. ',\n')
-    f:write('      fx_eq_lo = ' .. reaper.gmem_read(base + 18) .. ',\n')
-    f:write('      fx_eq_mid = ' .. reaper.gmem_read(base + 19) .. ',\n')
-    f:write('      fx_eq_hi = ' .. reaper.gmem_read(base + 20) .. ',\n')
-    f:write('      fx_sat = ' .. reaper.gmem_read(base + 21) .. ',\n')
-    f:write('      fx_drv_mode = ' .. reaper.gmem_read(base + 22) .. ',\n')
-    f:write('      fx_bc_rate = ' .. reaper.gmem_read(base + 23) .. ',\n')
-    f:write('      fx_bc_bits = ' .. reaper.gmem_read(base + 24) .. ',\n')
-    f:write('      fx_snd_dly = ' .. reaper.gmem_read(base + 25) .. ',\n')
-    f:write('      fx_snd_rvb = ' .. reaper.gmem_read(base + 26) .. ',\n')
-    f:write('      fx_snd_smash = ' .. reaper.gmem_read(G.GS_PAD_SMASH_BASE + pad) .. ',\n')
-    f:write('      fx_eq_lo_freq = ' .. reaper.gmem_read(base + 27) .. ',\n')
-    f:write('      fx_eq_mid_freq = ' .. reaper.gmem_read(base + 28) .. ',\n')
-    f:write('      fx_eq_hi_freq = ' .. reaper.gmem_read(base + 29) .. ',\n')
-    f:write('      sum_tight = ' .. reaper.gmem_read(base + 30) .. ',\n')
-    f:write('      rpt_div = ' .. reaper.gmem_read(base + 31) .. ',\n')
-    f:write('      layer_cnt = ' .. reaper.gmem_read(base + 32) .. ',\n')
-    f:write('      layer_mode = ' .. reaper.gmem_read(base + 33) .. ',\n')
-    f:write('      s_len   = ' .. reaper.gmem_read(base + 34) .. ',\n')
-    f:write('      s_start = ' .. reaper.gmem_read(base + 35) .. ',\n')
-    f:write('      s_end   = ' .. reaper.gmem_read(base + 36) .. ',\n')
-    f:write('      s_sr    = ' .. reaper.gmem_read(base + 37) .. ',\n')
-    f:write('      s_norm  = ' .. reaper.gmem_read(base + 38) .. ',\n')
-    f:write('      s_norm_gain = ' .. reaper.gmem_read(base + 39) .. ',\n')
-    f:write('      sample_offset = ' .. reaper.gmem_read(G.GS_PAD_OFFSET_BASE + pad) .. ',\n')
-    f:write('    },\n')
-  end
-  f:write('  },\n')
-  f:write('}\n')
-  end) -- pcall write block
-  f:close()
-
-  if not write_ok then
-    eon_notice("Error writing kit file (disk full?):\n" .. tostring(write_err))
-    os.remove(filepath)
-    reaper.gmem_write(G.CMD, 98)
-    return
-  end
-
-  eon_export_ack_lock(info.inst)   -- the 99 must find LOCK = the saver (the walk lost it)
-  reaper.gmem_write(G.CMD, 99)
-  -- Signal browser to refresh kit list
-  reaper.SetExtState("Swing", "kit_saved", "1", false)
-  eon_notice(
-    'Kit saved (v2)!\n\n' ..
-    'Name: ' .. info.kit_name .. '\n' ..
-    'Location: ' .. filepath)
-end
-
 -- ═════════════════════════════════════════════════════════════════════════════
 -- SFZ EXPORT — write the current kit as a portable SFZ sample map.
 --
@@ -9447,7 +9974,8 @@ function rk_export.extract_kit_to_wavs(samples_dir, samples_subdir, mix_sum, inf
   -- returns the absolute path on success (nil on empty / overflow / IO fail).
   local function write_wav(off, count, sr, wav_name)
     local capped = count
-    if off + capped > GMEM_AUDIO_MAX then capped = math.max(0, GMEM_AUDIO_MAX - off) end
+    -- `off` counts from the dump's start, AUDIO_DUMP_OFFSET past AUDIO_BASE: the room left is that much less.
+    if off + capped > GMEM_AUDIO_MAX - AUDIO_DUMP_OFFSET then capped = math.max(0, GMEM_AUDIO_MAX - AUDIO_DUMP_OFFSET - off) end
     if capped <= 0 then return nil end
     if not dir_made then reaper.RecursiveCreateDirectory(samples_dir, 0); dir_made = true end
     local buf = {}
@@ -9468,7 +9996,7 @@ function rk_export.extract_kit_to_wavs(samples_dir, samples_subdir, mix_sum, inf
   local function write_mixed(infos, base_off, wav_name)
     local total = 0
     for _, L in ipairs(infos) do if L.len > total then total = L.len end end
-    if base_off + total > GMEM_AUDIO_MAX then total = math.max(0, GMEM_AUDIO_MAX - base_off) end
+    if base_off + total > GMEM_AUDIO_MAX - AUDIO_DUMP_OFFSET then total = math.max(0, GMEM_AUDIO_MAX - AUDIO_DUMP_OFFSET - base_off) end
     if total <= 0 then return nil end
     if not dir_made then reaper.RecursiveCreateDirectory(samples_dir, 0); dir_made = true end
     local acc = {}
@@ -9622,7 +10150,9 @@ function rk_export.write_kit_sfz(filepath, info)
       -- pitch (semitones) → transpose (integer) + tune (cents remainder)
       if r.pitch ~= 0 then
         local tr = (r.pitch >= 0) and math.floor(r.pitch) or math.ceil(r.pitch)
-        local cents = math.floor((r.pitch - tr) * 100 + (r.pitch >= 0 and 0.5 or -0.5))
+        -- rounded half AWAY from zero; floor(x - 0.5) was one cent low for every negative x (-2 st wrote tune=-1)
+        local cx = (r.pitch - tr) * 100
+        local cents = cx >= 0 and math.floor(cx + 0.5) or -math.floor(-cx + 0.5)
         if tr ~= 0 then f:write("transpose=" .. tr .. "\n") end
         if cents ~= 0 then f:write("tune=" .. cents .. "\n") end
       end
@@ -9637,7 +10167,8 @@ function rk_export.write_kit_sfz(filepath, info)
 
       -- pan (-1..1) → SFZ pan (-100..100)
       if r.pan ~= 0 then
-        local p = math.floor(r.pan * 100 + (r.pan >= 0 and 0.5 or -0.5))
+        local px = r.pan * 100   -- rounded as the cents above (pan -0.25 wrote -26)
+        local p = px >= 0 and math.floor(px + 0.5) or -math.floor(-px + 0.5)
         if p < -100 then p = -100 elseif p > 100 then p = 100 end
         if p ~= 0 then f:write("pan=" .. p .. "\n") end
       end
@@ -9864,113 +10395,6 @@ end
 -- reads zero on pads that hold audio. See .docs/wiki/05-memory-and-gmem.md §5.5.
 local AUDIO_DUMP_OFFSET = G.NUM_PADS * 260 + G.NUM_PADS * G.MAX_LAYERS * 260  -- 20800 for 16 pads × 4 layers
 
--- Stream a sample file to an already-open binary-mode file handle as
--- [interleaved_len:double][sr:double][int16 × interleaved_len] (stereo, L=R for mono).
--- Uses PCM_Source + AudioAccessor (same approach as load_audio_to_pad) but writes
--- directly to disk in chunks so we don't hold the full audio buffer in Lua memory.
---
--- max_frames (optional): cap source samples in *frames* (mono frame count, NOT
--- interleaved samples). Defaults to SLOT_SIZE/2 (matches v3 single-blob-per-pad
--- behaviour). v4 layered save passes LAYER_SIZE/2 so each layer fits in its
--- per-pad slot exactly the way the JSFX expects (see load_layer_from_path).
---
--- Returns (interleaved_len, sr). On failure, writes zero-length placeholder and returns 0, 0.
-local function stream_pcm_to_file(f, filepath, max_frames)
-  max_frames = max_frames or math.floor(G.SLOT_SIZE / 2)
-  if not filepath or filepath == "" then
-    f:write(pack_double(0)); f:write(pack_double(0))
-    return 0, 0
-  end
-  local src = reaper.PCM_Source_CreateFromFileEx(filepath, true)
-  if not src then
-    f:write(pack_double(0)); f:write(pack_double(0))
-    return 0, 0
-  end
-
-  local sr = eon_store_rate(reaper.GetMediaSourceSampleRate(src))   -- the storage-rate ceiling (Spec_Swing_Pad_Banks §5.5): frames, the accessor's rate and the published rate all follow it
-  local length = reaper.GetMediaSourceLength(src)
-  local nch = reaper.GetMediaSourceNumChannels(src)
-  if nch < 1 then nch = 1 end
-  local total_samples = math.floor(length * sr)
-  local num_samples = math.min(total_samples, max_frames)
-  if num_samples <= 0 then
-    reaper.PCM_Source_Destroy(src)
-    f:write(pack_double(0)); f:write(pack_double(0))
-    return 0, 0
-  end
-
-  local tr = acquire_scratch_track()
-  if not tr then
-    release_scratch_track(nil)
-    reaper.PCM_Source_Destroy(src)
-    f:write(pack_double(0)); f:write(pack_double(0))
-    return 0, 0
-  end
-
-  local temp_item = reaper.AddMediaItemToTrack(tr)
-  local temp_take = reaper.AddTakeToMediaItem(temp_item)
-  reaper.SetMediaItemTake_Source(temp_take, src)
-  reaper.SetMediaItemInfo_Value(temp_item, "D_LENGTH", length)
-
-  local aa = reaper.CreateTakeAudioAccessor(temp_take)
-  if not aa then
-    -- Take owns src after SetMediaItemTake_Source above; release_scratch
-    -- _track destroys the track which drops the take's source ref.
-    -- Calling PCM_Source_Destroy(src) here would be a use-after-free.
-    release_scratch_track(tr)
-    f:write(pack_double(0)); f:write(pack_double(0))
-    return 0, 0
-  end
-
-  -- interleaved stereo (mono duplicated L=R) — matches what gmem expects
-  local interleaved_len = num_samples * 2
-
-  -- Header for this pad
-  f:write(pack_double(interleaved_len))
-  f:write(pack_double(sr))
-
-  local chunk_size = math.min(num_samples, 250000)
-  local sample_buf = reaper.new_array(chunk_size * nch)
-  local samples_read = 0
-  local write_buf = {}
-
-  while samples_read < num_samples do
-    local to_read = math.min(chunk_size, num_samples - samples_read)
-    sample_buf.clear()
-    reaper.GetAudioAccessorSamples(aa, sr, nch, samples_read / sr, to_read, sample_buf)
-
-    for j = 0, to_read - 1 do
-      local val
-      if nch == 1 then
-        val = sample_buf[j + 1] or 0
-      else
-        val = 0
-        for ch = 0, nch - 1 do val = val + (sample_buf[j * nch + ch + 1] or 0) end
-        val = val / nch
-      end
-      -- Pack as interleaved stereo int16 (L, R)
-      local s = pack_s16(val)
-      write_buf[#write_buf + 1] = s
-      write_buf[#write_buf + 1] = s
-    end
-
-    -- Flush to disk periodically to avoid holding huge Lua tables
-    if #write_buf >= 20000 then
-      f:write(table.concat(write_buf))
-      write_buf = {}
-    end
-
-    samples_read = samples_read + to_read
-  end
-
-  if #write_buf > 0 then f:write(table.concat(write_buf)) end
-
-  reaper.DestroyAudioAccessor(aa)
-  release_scratch_track(tr)
-
-  return interleaved_len, sr
-end
-
 -- ═════════════════════════════════════════════════════════════════════════════
 -- v4 HYBRID SAVE — same as v3 plus per-pad multi-layer audio (velocity layers,
 -- round-robin, vel-split kits all round-trip cleanly).
@@ -9989,7 +10413,7 @@ end
 --         [l_len : 8B][l_sr : 8B][int16 PCM × l_len]
 --
 -- This tagged layout matches the JSFX's kit_import_state==3 copy loop
--- (rk_swing_ui_state.jsfx-inc lines 515-565) which reads EITHER s_len[pad]
+-- (rk_swing_ui_state.jsfx-inc, its "V1 binary audio copy") which reads EITHER s_len[pad]
 -- bytes OR sum(l_len[pad,layer]) bytes per pad — never both. Writing a
 -- pad-main blob ahead of layer blobs would shift the layered audio out of
 -- alignment and make the JSFX reproduce noise.
@@ -10101,7 +10525,8 @@ end
 -- Mirrors the audio walk in load_kit_v4 exactly, but skips the PCM instead of
 -- staging it. The VER-201 "pl" route returns before that walk ever runs, so
 -- without this it had no way to locate the tail and covers were invisible on
--- every shipping build (KIT_HS_CAP is 203, so pl is always the chosen route).
+-- every shipping build (each advertises KIT_HS_CAP >= 201, so pl is the route
+-- whenever the kit's sample paths resolve).
 --
 -- Returns nil, plus a reason naming the pad, if the binary section does not
 -- parse cleanly. The tail callers use only the first value and then behave
@@ -10703,7 +11128,7 @@ function eon_kit_absorb_tail(content, pos, filepath)
   -- by slot, not by path, but the JSFX reloads on a publish-seq change.
   eon_kit_cover_path = eon_kitcover_extract(
     eon_kit_cover_bytes,
-    filepath:match("([^/\\]+)%.[Ss][Ww][Ii][Nn][Gg]$") or "kit")
+    filepath:match("([^/\\]+)%.[Ss][Ww][Ii][Nn][Gg]$") or "kit", filepath)
 end
 
 -- Read a kit file's own cover straight off disk. The save-side safety net: it
@@ -10889,7 +11314,9 @@ function eon_lens_set_slot(tr, fx, slot)
   while p < reaper.TrackFX_GetNumParams(tr, fx) do
     local _, pn = reaper.TrackFX_GetParamName(tr, fx, p, "")
     if pn and pn:find("Linked registry slot", 1, true) then
-      if math.abs((reaper.TrackFX_GetParam(tr, fx, p) or -99) - slot) > 1e-6 then
+      -- not while REAPER can redo (eon_bg_hold, 2026-10-27): the write is an undo point of its own, and the Lens's
+      -- default coming back with an undo was re-written at once -- the point that emptied the redo list after a build
+      if math.abs((reaper.TrackFX_GetParam(tr, fx, p) or -99) - slot) > 1e-6 and not eon_bg_hold() then
         reaper.TrackFX_SetParam(tr, fx, p, slot)
       end
       return true
@@ -10982,7 +11409,11 @@ end
 -- dispatches on it, so a JPEG written as "cover_x.png" returns -1 and the tile
 -- silently falls back to the generated portrait — which is exactly what a
 -- .jpg cover did before this sniffed the magic bytes.
-function eon_kitcover_extract(bytes, stem)
+-- `key` (the kit's full path) adds a hash to the name: two kits with the same
+-- filename in different folders (or names that differ only in non-ASCII
+-- letters, all '_' here) shared ONE temp file, and a tile re-reading it showed
+-- the other kit's art (audit B3, 2026-10-26).
+function eon_kitcover_extract(bytes, stem, key)
   if not bytes or #bytes == 0 then return nil end
   local sep = package.config:sub(1, 1)
   local dir = _eon_temp_audio_dir()
@@ -10990,6 +11421,11 @@ function eon_kitcover_extract(bytes, stem)
   local ext = ".png"
   if bytes:sub(1, 3) == "\255\216\255" then ext = ".jpg" end          -- JPEG/JFIF
   local safe = ((stem or "kit"):gsub("[^%w%-_]", "_"))
+  if key and key ~= "" then
+    local h = 2166136261   -- FNV-1a, 32 bits
+    for i = 1, #key do h = ((h ~ key:byte(i)) * 16777619) & 0xFFFFFFFF end
+    safe = safe .. "_" .. string.format("%08x", h)
+  end
   local cp = dir .. sep .. "cover_" .. safe .. ext
   local ok = core.write_file_checked(cp, "wb", function(cf) cf:write(bytes) end)
   if not ok then return nil end
@@ -11040,6 +11476,11 @@ function eon_kitcover_poll_pending()
           eon_kit_cover_src_path  = nil
           eon_kit_cover_pend_slot = nil
           eon_kitcover_publish(slot, "")
+          -- B4: New Kit wiped every bank of this Swing: its kit-save breadcrumbs go with them (the slot's id;
+          -- no id = nothing of this Swing's to clear, and never the LOCK holder's, which may be another Swing).
+          local nk_id = math.floor(reaper.gmem_read(G.GS_INST_REG_BASE + slot * G.GS_INST_REG_STRIDE
+                                                    + G.GS_INST_REG_OFF_ID) or 0)
+          if nk_id > 0 then eon_crumb_clear(nk_id, nil) end
         end
       end
     end
@@ -11193,6 +11634,8 @@ end
 function eon_table_count(tb) local n = 0; for _ in pairs(tb or {}) do n = n + 1 end; return n end
 function eon_v4_build_lua(info, filepath, silent, dest_prior, banks_n, bank)
   -- 1. Collect paths + per-pad layer counts from gmem
+  -- The bank the bands hold: a record's, else a bank-only save's (4c), else bank A (the plan below reads the same).
+  local crumb_bank = bank or (info and info.only) or 0
   local pad_paths = {}
   local layer_paths = {}
   local layer_cnts  = {}
@@ -11218,8 +11661,8 @@ function eon_v4_build_lua(info, filepath, silent, dest_prior, banks_n, bank)
     pad_has_audio[pad] = _pad_slen > 0 or _pad_lcnt > 0
 
     local pp = read_pad_path_from_gmem(pad)
-    if pp == "" and (bank or 0) == 0 then   -- the ExtState breadcrumb is the visible bank's (step 3c)
-      pp = reaper.GetExtState("Swing", "pad_path_" .. pad) or ""
+    if pp == "" then   -- the saving Swing's breadcrumb for the bank the dump holds (B4: per instance + bank)
+      pp = eon_crumb_get(info and info.inst, crumb_bank, pad)
     end
 
     layer_paths[pad] = {}
@@ -11582,6 +12025,10 @@ local function write_kit_v4(filepath, info, silent)
     -- the vintage-kit story). Only refuse when there's neither audio nor
     -- an enabled synth anywhere.
     if not any_audio and G.SYN.any_enabled() then any_audio = true end
+    -- The bands above hold bank A only (the walk ends there); banks B..D are in info.bank_bodies, which
+    -- eon_bank_export_step fills only for a bank with content (eon_v4_bank_has_content). A kit with an empty
+    -- bank A and samples in B was refused on its second save (audit B1, 2026-10-26; the v5 writer reads v5_banks).
+    if not any_audio and next(info.bank_bodies or {}) ~= nil then any_audio = true end
     if not any_audio then
       local existing = io.open(filepath, "rb")
       if existing then
@@ -11629,7 +12076,7 @@ local function write_kit_v4(filepath, info, silent)
   -- state-11 gmem dump — the live audio the plugin is actually playing —
   -- never from the pads' disk SOURCE paths. Previously only the non-layered
   -- branch trusted the dump; the layered branch read each layer from its disk
-  -- source (stream_pcm_to_file). If those files had moved/been deleted (e.g.
+  -- source (stream_pcm_to_file, since removed). If those files had moved/been deleted (e.g.
   -- the 808 kit's samples relocated Documents→Desktop) the layered save wrote
   -- silent zero-blobs → a 27KB metadata-only "blank" kit. The dump is immune
   -- to moved sources, giving layered pads the same self-contained guarantee
@@ -11725,7 +12172,7 @@ local function write_kit_v4(filepath, info, silent)
     eon_kit_cover_bytes    = cover_bytes
     eon_kit_cover_src_path = filepath
     local stem = filepath:match("([^/\\]+)%.[Ss][Ww][Ii][Nn][Gg]$") or "kit"
-    eon_kit_cover_path = eon_kitcover_extract(cover_bytes, stem)
+    eon_kit_cover_path = eon_kitcover_extract(cover_bytes, stem, filepath)
     local ack = eon_kit_cover_pend_slot or eon_kit_cover_load_slot
     if ack then eon_kitcover_publish(ack, eon_kit_cover_path) end
     eon_kit_cover_pend_slot = nil
@@ -11789,8 +12236,8 @@ end
 -- (json / wav / zip / write_kit / load_kit helpers).
 
 -- ── Audio capture: PCM source on disk → int16 samples table ──────────────
--- Mirrors stream_pcm_to_file's behavior: averages multi-channel to mono and
--- duplicates as interleaved stereo (L=R). max_frames caps total mono frames.
+-- Averages multi-channel to mono and duplicates it as interleaved stereo
+-- (L=R). max_frames caps total mono frames.
 local function read_pcm_source_to_int16(filepath, max_frames)
   if not filepath or filepath == "" then return nil, 0 end
   local src = reaper.PCM_Source_CreateFromFileEx(filepath, true)
@@ -11855,15 +12302,6 @@ local function read_pcm_source_to_int16(filepath, max_frames)
   reaper.DestroyAudioAccessor(aa)
   release_scratch_track(tr)
   return samples, sr
-end
-
--- Helper: read a string of bytes for the first N from a file (magic detect).
-local function read_file_magic(filepath, n)
-  local f = io.open(filepath, "rb")
-  if not f then return nil end
-  local head = f:read(n or 8)
-  f:close()
-  return head
 end
 
 -- ── write_kit_v5 — produce a self-contained zip kit ──────────────────────
@@ -11984,8 +12422,8 @@ function eon_v5_capture_bank(info, bank)
   local layer_cnts  = {}
   for pad = 0, G.NUM_PADS - 1 do
     local pp = read_pad_path_from_gmem(pad)
-    if pp == "" and bank == 0 then
-      pp = reaper.GetExtState("Swing", "pad_path_" .. pad) or ""
+    if pp == "" then   -- the saving Swing's breadcrumb for this bank (B4); write_kit_v5 asks for 0 on a bank-only save
+      pp = eon_crumb_get(info and info.inst, (bank ~= 0 and bank) or (info and info.only) or 0, pad)
     end
     pad_paths[pad] = pp
     layer_paths[pad] = {}
@@ -12313,6 +12751,15 @@ function rk_export.do_export_write_file()
     return
   end
 
+  -- SFZ and RS5k read the same dump, so the same ceiling (GS_EXPORT_OVER, below) refuses them too: the dump is
+  -- partial from the blob that crossed it, and the WAVs past it would be silence or the cells of an older kit.
+  if (info.format == "sfz" or info.format == "rs5k") and math.floor(reaper.gmem_read(G.GS_EXPORT_OVER) or 0) ~= 0 then
+    eon_notice("This kit holds more audio than one export can carry (about 190 seconds in total).\nNothing was exported. Shorten or clear some pads and export again.")
+    reaper.gmem_write(G.CMD, 98)   -- the cancel ack, as the writers' own refusals send
+    pending_export = nil
+    return
+  end
+
   -- SFZ export reads the same per-pad dump but emits a sample map, not a kit
   -- file. Branch before any .swing version logic.
   if info.format == "sfz" then
@@ -12550,6 +12997,14 @@ local function load_swing_file(filepath, internal, pass)
 
   local file_npads
   file_npads, pos = unpack_double(content, pos)
+  -- Positive-form guard (NaN fails >= too): a negative count drove the "clear remaining pads" loop below
+  -- META_BASE / AUDIOLEN_BASE into another band's cells, a huge one wedged the defer loop, and a NaN was latched
+  -- as KIT_GMEM_NPADS (audit B5, 2026-10-26). The top stays a clamp, as before.
+  if not (file_npads >= 0) then
+    eon_notice("Invalid .swing file (bad pad count).")
+    reaper.gmem_write(G.CMD, 98)
+    return
+  end
   file_npads = math.min(math.floor(file_npads), G.NUM_PADS)
 
   reaper.gmem_write(G.KIT_GMEM_VER, file_ver)
@@ -12780,10 +13235,8 @@ local function load_kit_v2(filepath, internal, pass)
     end
     reaper.gmem_write(pbase + 1 + #staged, 0)  -- null term
 
-    -- Store path in ExtState for future re-saves
-    if path ~= "" then
-      reaper.SetExtState("Swing", "pad_path_" .. pad, path, false)
-    end
+    -- Store path in ExtState for future re-saves (this Swing's, this bank's: B4)
+    eon_crumb_set(nil, pbank, pad, path)
     publish_pitch_path(pbank * G.NUM_PADS + pad, path)   -- the absolute pad (§5A.6)
   end
   G.SYN.stage_kit(pads)   -- SYN slot: stage + raise adopt flag (no-op for pre-synth kits)
@@ -13054,9 +13507,10 @@ local function load_kit_v4(filepath, internal, pass)
     eon_padcat_from_load(pad, p.category, p.name, p.path, (pass and pass.bank) or 0)   -- categories §1; every bank's pass classifies into its bank (step 5b)
 
     -- Per-layer metadata (10 doubles per layer, stride 10 = v24+ layout).
-    -- We must zero ALL MAX_LAYERS slots first because the JSFX iterates
-    -- every layer slot (line 378 of rk_swing_ui_state.jsfx-inc) regardless
-    -- of layer_cnt — stale data from a prior kit would corrupt playback.
+    -- We must zero ALL MAX_LAYERS slots first: the JSFX's VER-201 per-layer
+    -- PATH import (rk_swing_ui_state.jsfx-inc) reads every slot's staged
+    -- length regardless of layer_cnt, and a prior kit's stale length there
+    -- reads as a lost delivery (its stage-gap check).
     for lj = 0, G.MAX_LAYERS - 1 do
       local lo = base + 40 + lj * 10
       for li = 0, 9 do
@@ -13090,9 +13544,7 @@ local function load_kit_v4(filepath, internal, pass)
     -- Breadcrumb path in ExtState (audio is baked, but useful for the user
     -- to remember where the source came from).
     local path = p.path or ""
-    if vis and path ~= "" then
-      reaper.SetExtState("Swing", "pad_path_" .. pad, path, false)
-    end
+    eon_crumb_set(nil, pbank, pad, path)   -- every bank's own set, this Swing's (B4; was bank A's only, shared)
     publish_pitch_path(pbank * G.NUM_PADS + pad, path)   -- the absolute pad (§5A.6)
   end
   G.SYN.stage_kit(pads)   -- SYN slot: stage + raise adopt flag (no-op for pre-synth kits)
@@ -13105,7 +13557,8 @@ local function load_kit_v4(filepath, internal, pass)
   --
   -- Audio writes go contiguously to AUDIO_BASE in (pad,blob) order. The
   -- JSFX's kit_import_state==3 copy loop consumes either s_len[pad] or
-  -- sum(l_len[pad,*]) per pad — see rk_swing_ui_state.jsfx-inc lines 515-565.
+  -- sum(l_len[pad,*]) per pad — see rk_swing_ui_state.jsfx-inc's "V1 binary
+  -- audio copy" loop.
   -- For the layered branch the JSFX iterates ALL MAX_LAYERS slots, but
   -- l_len=0 (zeroed above) means 0 bytes consumed for unused layers, so
   -- audio stays aligned.
@@ -13252,7 +13705,8 @@ local function load_kit_v4(filepath, internal, pass)
                                       sr = l_sr, bytes = l_bytes, first = (layer == 0) }
         end
       end
-      -- AUDIOLEN drives the JSFX progress counter (line 442) — it sums
+      -- AUDIOLEN drives the JSFX progress counter (kit_total_audio in
+      -- rk_swing_ui_state.jsfx-inc) — it sums
       -- per-pad totals to compute kit_total_audio. For layered pads we
       -- report the sum of all layer sizes.
       reaper.gmem_write(G.AUDIOLEN_BASE + pad, total_alen)
@@ -13308,7 +13762,7 @@ local function load_kit_v4(filepath, internal, pass)
     reaper.gmem_write(G.KIT_GMEM_VER, 26)        -- VER = 26: per-pad handshake protocol
     eon_bank_pass_arm(pass)   -- step 3b: GS_KIT_LOAD_BANK for this pass, before the latch
     reaper.gmem_write(G.CMD, 3)       -- meta ready; audio follows blob-by-blob
-    eon_pp_stream = { blobs = pp_blobs, idx = 0, t0 = os.clock() }
+    eon_pp_stream = { blobs = pp_blobs, idx = 0, t0 = reaper.time_precise() }
     -- (The report's console line is gated behind EON_Swing/load_debug inside
     -- eon_load_report — the "gate before release" this comment used to demand.
     -- The per-blob pad:layer:len table that was once built here was never
@@ -13356,12 +13810,17 @@ function eon_pp_publish_next()
   else
     len = math.min(b.len or 0, G.SLOT_SIZE)        -- window/resident-slot bound
     local bytes = b.bytes or ""
-    local p = 1
-    for j = 0, len - 1 do
-      local s
-      s, p = unpack_s16(bytes, p)
-      reaper.gmem_write(G.AUDIO_BASE + j, s)
+    -- Decoded 4096 samples per string.unpack (audit B6, 2026-10-26: one call per sample, up to 4M of them in
+    -- one tick), the values unpack_s16's; a sample past the end of a short blob is 0.0, as there.
+    local whole = math.min(len, #bytes // 2)
+    local j = 0
+    while j < whole do
+      local n = math.min(4096, whole - j)
+      local v = { string.unpack("<" .. ("i2"):rep(n), bytes, 1 + 2 * j) }
+      for k = 1, n do reaper.gmem_write(G.AUDIO_BASE + j + k - 1, v[k] / 32767.0) end
+      j = j + n
     end
+    for k = whole, len - 1 do reaper.gmem_write(G.AUDIO_BASE + k, 0.0) end
     reaper.gmem_write(G.HS_PAD, b.pad)
     reaper.gmem_write(G.HS_LAYER, b.layer or 0)
     reaper.gmem_write(G.HS_LEN, len)
@@ -13373,8 +13832,9 @@ function eon_pp_publish_next()
   -- Copy allowance: KIT_COPY_CHUNK (200k) per @block. Generous scale (len/1e6:
   -- a full 4M blob gets 4s) so even huge device blocks (4096 ≈ 93ms/block ≈
   -- 1.9s for 4M) never trip a mid-copy republish; a republish is idempotent
-  -- but restarts the blob's copy from zero.
-  st.deadline = os.clock() + 0.5 + len / 1000000
+  -- but restarts the blob's copy from zero. Wall time: os.clock() was process CPU time on macOS / Linux, which
+  -- runs faster than the clock on a busy REAPER and tripped mid-copy (audit B7, 2026-10-26).
+  st.deadline = reaper.time_precise() + 0.5 + len / 1000000
 end
 
 function eon_pp_pump()
@@ -13391,7 +13851,7 @@ function eon_pp_pump()
       st.skips = 0
       eon_pp_publish_next()
     end
-  elseif os.clock() > st.deadline then
+  elseif reaper.time_precise() > st.deadline then
     st.retries = (st.retries or 0) + 1
     if st.retries > 3 then
       local b = st.blobs[st.idx] or {}
@@ -13785,15 +14245,12 @@ function eon_chop_pump()
       eon_write_gmem_path(G.AUDIO_BASE + pad * 260, wv.path)
       write_default_pad_meta(pad, wv.ilen, st.sr, pad / 16.0,
                              st.kit_base .. " " .. (pad + 1))
-      -- breadcrumbs are now REAL disk sources (pre-P3 chop cleared these)
-      reaper.SetExtState("Swing", "pad_path_" .. pad, wv.path, false)
       publish_pitch_path((st.bank or 0) * G.NUM_PADS + pad, wv.path)   -- the absolute pad (§5A.6, step 3)
       used = used + 1
     else
       reaper.gmem_write(G.AUDIOLEN_BASE + pad, 0)
       local mb = G.META_BASE + pad * G.META_PP
       for j = 0, G.META_PP - 1 do reaper.gmem_write(mb + j, 0) end
-      reaper.SetExtState("Swing", "pad_path_" .. pad, "", false)
       publish_pitch_path((st.bank or 0) * G.NUM_PADS + pad, "")
     end
   end
@@ -13822,7 +14279,16 @@ function eon_chop_pump()
     return
   end
   -- Pad Banks step 5c: into the bank the instance showed when the chop was asked for (a fallback target: bank A).
-  eon_bank_pass_arm({ bank = (_chop_target == st.inst_id) and (st.bank or 0) or 0 })
+  local _chop_bank = (_chop_target == st.inst_id) and (st.bank or 0) or 0
+  -- The breadcrumbs are REAL disk sources (pre-P3 chop cleared these): the receiving Swing's, the bank the
+  -- slices land in (B4 / C3: the shared set made a second Swing's chop, or a chop into bank B, mask these).
+  for pad = 0, G.NUM_PADS - 1 do
+    eon_crumb_set(_chop_target, _chop_bank, pad, st.wavs[pad] and st.wavs[pad].path or "")
+  end
+  if _chop_bank == 0 then   -- the old shared keys: superseded for bank A
+    for pad = 0, G.NUM_PADS - 1 do reaper.SetExtState("Swing", "pad_path_" .. pad, "", false) end
+  end
+  eon_bank_pass_arm({ bank = _chop_bank })
   reaper.gmem_write(G.GS_PENDING_LOAD_INST, _chop_target)
   reaper.gmem_write(G.CMD, 3)              -- staged (latch was held since arming)
   reaper.gmem_write(G.GS_KIT_LOAD_REQ, 2)  -- stale-JSFX compat arm path
@@ -14023,9 +14489,7 @@ local function load_kit_v5(filepath, internal, pass)
 
     -- Breadcrumb (audio is baked, but path is informational)
     local path = p.path or ""
-    if vis and path ~= "" then
-      reaper.SetExtState("Swing", "pad_path_" .. pad, path, false)
-    end
+    eon_crumb_set(nil, pbank, pad, path)   -- every bank's own set, this Swing's (B4; was bank A's only, shared)
     publish_pitch_path(pbank * G.NUM_PADS + pad, path)   -- the absolute pad (§5A.6)
   end
 
@@ -14150,7 +14614,7 @@ local function load_kit_v5(filepath, internal, pass)
     reaper.gmem_write(G.KIT_GMEM_VER, 26)        -- VER = 26: per-pad handshake protocol
     eon_bank_pass_arm(pass)
     reaper.gmem_write(G.CMD, 3)       -- meta ready; audio follows blob-by-blob
-    eon_pp_stream = { blobs = pp_blobs, idx = 0, t0 = os.clock() }
+    eon_pp_stream = { blobs = pp_blobs, idx = 0, t0 = reaper.time_precise() }
     eon_load_report(("route=v5/v26/gmem-stream blobs=%d: %s"):format(#pp_blobs - 1, kit_name))
     eon_pp_publish_next()           -- stage the first blob this same tick
   else
@@ -14269,6 +14733,9 @@ local function load_swing_dispatch_now(filepath, internal, no_attrib, pass)
   -- than inheriting the previous kit's art. load_kit_v4 refills it from the tail.
   eon_kit_cover_bytes = nil
   eon_kit_cover_path  = nil
+  -- B4: the instance's kit-save breadcrumbs start empty for what this load replaces (every format, v1 too, which
+  -- writes none: the previous kit's paths must not outlive it).
+  eon_crumb_load_begin(pass)
 
   if fmt == "v5" then
     load_kit_v5(filepath, internal, pass)
@@ -14288,13 +14755,14 @@ local function load_swing_dispatch_now(filepath, internal, no_attrib, pass)
   -- gfx_loadimg) when the seq moves. Published even when there is no cover, so
   -- the JSFX clears a stale image instead of showing the last kit's art.
   --
-  -- eon_kit_cover_load_slot is only set when an instance EXPLICITLY asks for a
-  -- load (the CMD path, ~line 13963). A load nobody requested — above all the
-  -- sidecar reload on project open — leaves it nil, and eon_kitcover_publish
-  -- returns immediately on a nil slot. That is the whole of the "artwork is in
-  -- the kit file but the tile is blank after reopening" bug: the cover is read,
-  -- extracted to disk and then announced to nobody. Fall back to the live
-  -- instance so an unrequested load still reaches a tile.
+  -- eon_kit_cover_load_slot is set by the browser's kit-load request handler,
+  -- by CMD 22 (auto-load) and by drive_load_queue for every queued load. It
+  -- used to be set only when an instance EXPLICITLY asked for a load, so a load
+  -- nobody requested — above all the sidecar reload on project open — reached
+  -- eon_kitcover_publish with a nil slot, which returns immediately: the
+  -- "artwork is in the kit file but the tile is blank after reopening" bug.
+  -- A route that still arrives without a slot falls back to the live instance
+  -- below, so it too reaches a tile.
   local cover_slot = eon_kit_cover_load_slot
   if not cover_slot then
     -- Belt and braces for any route that reaches here without going through the
@@ -14601,7 +15069,7 @@ function eon_out_tracks(swing_track)
   local t = { pad = {}, pair = {}, npad = 0 }
   for s = 0, reaper.GetTrackNumSends(swing_track, 0) - 1 do
     local p = core.srcchan_pad(reaper.GetTrackSendInfo_Value(swing_track, 0, s, "I_SRCCHAN"))
-    local d = reaper.BR_GetMediaTrackSendInfo_Track(swing_track, 0, s, 1)
+    local d = eon_send_dest(swing_track, s)   -- REAPER's own P_DESTTRACK first: no SWS needed (the 1 s out tick)
     if d and p >= 0 then
       -- Swing's own tracks only: a pad track by core.swing_send_pad's test, a bank / split track by a tag naming
       -- this pair (core.swing_send_pair, the FX picker's rule too); a user's own send from these channels is no
@@ -14910,7 +15378,8 @@ function eon_track_losses(t, nm, sg, moving, dropped)
   if reaper.GetTrackNumSends(t, 0) > 0 then out[#out + 1] = nm .. " sends to another track" end
   if reaper.GetTrackNumSends(t, 1) > 0 then out[#out + 1] = nm .. " sends to a hardware output" end
   for r = 0, reaper.GetTrackNumSends(t, -1) - 1 do
-    local from = reaper.BR_GetMediaTrackSendInfo_Track(t, -1, r, 0)
+    local from = reaper.GetTrackSendInfo_Value(t, -1, r, "P_SRCTRACK")   -- REAPER's own; SWS only as the fallback
+    if not from and reaper.BR_GetMediaTrackSendInfo_Track then from = reaper.BR_GetMediaTrackSendInfo_Track(t, -1, r, 0) end
     if from and reaper.GetTrackGUID(from) ~= sg then
       out[#out + 1] = nm .. " receives from another track"
       break
@@ -14972,7 +15441,7 @@ end
 function eon_swing_sends(tr, doomed, ref_vol)
   local lines, by, count = {}, {}, {}
   for s = 0, reaper.GetTrackNumSends(tr, 0) - 1 do
-    local d = reaper.BR_GetMediaTrackSendInfo_Track(tr, 0, s, 1)
+    local d = eon_send_dest(tr, s)   -- no SWS needed
     local g = d and reaper.GetTrackGUID(d)
     if g and doomed[g] then
       local st = eon_send_state(tr, s, ref_vol)
@@ -15138,7 +15607,7 @@ function eon_out_follow(swing_track, slot, u, t, hold)
   if folder_layout then folder_layout.EnsureSwingParentLayout(swing_track) end
   reaper.PreventUIRefresh(-1)
   reaper.TrackList_AdjustWindows(false)
-  reaper.Undo_OnStateChangeEx2(0, "Swing: hand " .. table.concat(what, ", "), -1, -1)
+  if not EON_OUT_FOLLOW_QUIET then reaper.Undo_OnStateChangeEx2(0, "Swing: hand " .. table.concat(what, ", "), -1, -1) end
 end
 -- Move a split track into bank `bank`'s group: before the first Audio child ranked past that bank, else after the
 -- last child (taking over its folder close, as eon_out_insert does). The close it carried where it stood goes to the
@@ -15181,6 +15650,46 @@ function eon_out_move(swing_track, tr, bank)
   end
   reaper.SetTrackSelected(tr, false)
   for _, s in ipairs(sel) do if reaper.ValidatePtr2(0, s, "MediaTrack*") then reaper.SetTrackSelected(s, true) end end
+end
+-- Delete Swing's own tracks without leaving a folder close to REAPER (S.12, 2026-10-27). The API's DeleteTrack takes a
+-- track's I_FOLDERDEPTH away with it (FINDINGS_LOG 2026-10-10: Bank D's delete left Swing's folders open), so a Rebuild
+-- of the oldest layout left Swing's parent open over the user's My Bus at the end of the project, and folder_layout
+-- (DM26: a track after the last sub stays inside) made My Bus the parent's closer. So every track goes with depth 0:
+-- one that closes folders first hands its close to the track above it, zero first (wiki 6.20) -- a deleted track above
+-- takes it on in turn, highest index first; one that still opens a folder gives the open up together with one close of
+-- the track (kept) that closes it, that close first. A close that would land on `keep` (a Rebuild's Audio sub, which
+-- must stay a folder for the new tracks) is returned instead, for the caller's new last track; 0 when none.
+function eon_out_delete(list, keep)
+  local kg, carry = keep and reaper.GetTrackGUID(keep), 0
+  table.sort(list, function(a, b)
+    return reaper.GetMediaTrackInfo_Value(a, "IP_TRACKNUMBER") > reaper.GetMediaTrackInfo_Value(b, "IP_TRACKNUMBER")
+  end)
+  for _, tr in ipairs(list) do
+    if reaper.ValidatePtr2(0, tr, "MediaTrack*") then
+      local d = reaper.GetMediaTrackInfo_Value(tr, "I_FOLDERDEPTH")
+      local n = math.floor(reaper.GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"))   -- 1-based: GetTrack(0, n) is the next
+      local dep = d
+      while dep > 0 and n < reaper.CountTracks(0) do   -- an open: its kept closer closes one folder less
+        local t = reaper.GetTrack(0, n)
+        local td = reaper.GetMediaTrackInfo_Value(t, "I_FOLDERDEPTH")
+        dep = dep + td
+        if dep <= 0 then reaper.SetMediaTrackInfo_Value(t, "I_FOLDERDEPTH", td + d) end
+        n = n + 1
+      end
+      if d ~= 0 then reaper.SetMediaTrackInfo_Value(tr, "I_FOLDERDEPTH", 0) end
+      n = math.floor(reaper.GetMediaTrackInfo_Value(tr, "IP_TRACKNUMBER"))
+      if d < 0 then
+        local above = n >= 2 and reaper.GetTrack(0, n - 2)
+        if above and reaper.GetTrackGUID(above) ~= kg then
+          reaper.SetMediaTrackInfo_Value(above, "I_FOLDERDEPTH", reaper.GetMediaTrackInfo_Value(above, "I_FOLDERDEPTH") + d)
+        else
+          carry = carry + d
+        end
+      end
+      reaper.DeleteTrack(tr)
+    end
+  end
+  return carry
 end
 -- Tell Swing whose track each split pair has (OUT_TRK, slot + 1, 0 none): its "Own output" gives a pad its own
 -- track back first. Written only when a cell changes.
@@ -15309,6 +15818,8 @@ EON_OUT_UREQ_SEEN = {}   -- [Swing track] = OUT_UREQ at the last reading (a pers
 EON_OUT_PREV_P = {}      -- [Swing track] = the pair each slot played on at the last reading (to name a choice)
 function eon_out_tick()
   local now = reaper.time_precise()
+  -- a landed kit load's point (eon_kitpt_done) that no pass below has taken in 2.5 s (a load in flight): made alone
+  if eon_kitpt_close and now - eon_kitpt_close.t > 2.5 then eon_kitpt_close_now() end
   if now - (_eon_out_t or 0) < 1.0 then return end
   _eon_out_t = now
   if math.floor(reaper.gmem_read(G.CMD) or 0) ~= 0 then return end   -- a build or a load in flight: next time
@@ -15339,12 +15850,22 @@ function eon_out_tick()
       EON_OUT_UREQ_SEEN[sw.tr] = u.ureq
       pp = EON_OUT_PREV_P[sw.tr]; EON_OUT_PREV_P[sw.tr] = u.pair
     end
-    local hold_i = hold and not user_out
+    -- a landed kit load (eon_kitpt_done): its point is this instance's block below, so the tracks, strips and Wired
+    -- channels the new kit needs go in it and ONE Ctrl+Z puts the previous kit back with its tracks (K1, 2026-10-27).
+    -- A person's act: not held while REAPER can redo (its point ends the redo list, as any action does).
+    local kit = eon_kitpt_close and eon_kitpt_close.inst == sw.inst_id and eon_kitpt_close or nil
+    if kit then
+      eon_kitpt_close = nil
+      if kit.proj and kit.proj ~= tostring(reaper.EnumProjects(-1)) then kit = nil
+      elseif eon_kitpt_stale(kit) then kit = nil end   -- the user undid in the wait: dropped (eon_kitpt_stale)
+    end
+    local hold_i = hold and not user_out and not kit
     -- a person's choice: one undo block from here to the end of this instance's pass -- the nudge that makes REAPER
     -- read Swing's state again, the track the choice may need, the Wired channels -- closed as "Swing: add ..." or
-    -- "Swing: <pad>'s output" below (the hand-over's own point, eon_out_follow, runs after it)
+    -- "Swing: <pad>'s output" below (the hand-over's own point, eon_out_follow, runs after it); a kit load's the same,
+    -- closed as "Swing: Load Kit <name>"
     local blk, added = false, nil
-    if user_out then
+    if user_out or kit then
       reaper.Undo_BeginBlock2(0); blk = true; EON_OUT_BLK_OPEN = true   -- the global: the tick's pcall closes it on an error
       if not eon_out_poke(sw.tr, sw.fx) and dbg then reaper.ShowConsoleMsg("[Swing] output choice: no Dirty: Global parameter to nudge\n") end
     end
@@ -15386,6 +15907,15 @@ function eon_out_tick()
         if todo and not hold_i and #(eon_audio_children(sw.tr)) > 0 then
           reaper.PreventUIRefresh(1)
           local ok, res = xpcall(eon_out_ensure, debug.traceback, sw.tr, slot, { auto = true })
+          -- A split pad's new track gets its Drum Strip in the SAME point (2026-10-27, the owner's one-step rule): the
+          -- Strip Sync put it a second later as a point of its own ("Swing: EON Drum Strip on ..."), so undoing the
+          -- choice took two presses. Outside a person's block, a block of its own from here: the tracks just made
+          -- carry no point yet, so its point holds them and the strips (as the point below did for the tracks).
+          if ok and #res > 0 then
+            if not blk then reaper.Undo_BeginBlock2(0); EON_OUT_BLK_OPEN = true end
+            local oks, errs = xpcall(eon_write_now, debug.traceback, function() eon_strips_put(sw.tr, slot, sw.fx) end)
+            if not oks then reaper.ShowConsoleMsg("[Swing] output tracks (Drum Strips): " .. tostring(errs) .. "\n") end
+          end
           reaper.PreventUIRefresh(-1)
           reaper.TrackList_AdjustWindows(false)
           -- the undo point AFTER the change and only for one (this runs every second). An earlier note here said an
@@ -15394,19 +15924,26 @@ function eon_out_tick()
           -- work it saves, not for a point. It holds the person's choice too (the whole state): one point for the
           -- choice and its track.
           if ok and #res > 0 then
-            if blk then added = res else reaper.Undo_OnStateChangeEx2(0, "Swing: add " .. table.concat(res, ", "), -1, -1) end
+            if blk then added = res
+            else
+              EON_OUT_BLK_OPEN = false
+              reaper.Undo_EndBlock2(0, "Swing: add " .. table.concat(res, ", "), -1)
+            end
             t = eon_out_tracks(sw.tr)
           elseif not ok then
             reaper.ShowConsoleMsg("[Swing] output tracks: " .. tostring(res) .. "\n")
           end
         end
-        -- the person's block closes before the hand-over below (its own point)
-        if blk then
+        -- the person's block closes before the hand-over below (its own point); a kit load's stays open to the end of
+        -- this pass: a split track handed to the new kit's pad, and the bank tracks' new names, are the load's too
+        if blk and not kit then
           local what = added and ("Swing: add " .. table.concat(added, ", ")) or ("Swing: " .. eon_out_choice_lbl(pp, u))
           reaper.Undo_EndBlock2(0, what, -1); blk = false; EON_OUT_BLK_OPEN = false
           if dbg then reaper.ShowConsoleMsg(("[Swing] output choice: undo point %q; the top is now %q\n"):format(what, reaper.Undo_CanUndo2(0) or "")) end
         end
+        EON_OUT_FOLLOW_QUIET = blk   -- inside the kit's block: the hand-over makes no point of its own
         local okf, errf = xpcall(eon_out_follow, debug.traceback, sw.tr, slot, u, t, hold_i)
+        EON_OUT_FOLLOW_QUIET = false
         if not okf then reaper.ShowConsoleMsg("[Swing] output tracks: " .. tostring(errf) .. "\n") end
         eon_out_trk_publish(slot, t)
         local okc, errc = xpcall(eon_out_bank_colors, debug.traceback, sw.tr, slot, t)
@@ -15427,10 +15964,12 @@ function eon_out_tick()
         end
       end
     end
-    -- a person's choice on an instance without multi-out tracks (or short of its sixteen pads): the block closes here
+    -- a person's choice on an instance without multi-out tracks (or short of its sixteen pads), or a kit load's: the
+    -- block closes here
     if blk then
-      local what = "Swing: " .. eon_out_choice_lbl(pp, u)
+      local what = kit and eon_kitpt_label(kit) or ("Swing: " .. eon_out_choice_lbl(pp, u))
       reaper.Undo_EndBlock2(0, what, -1); blk = false; EON_OUT_BLK_OPEN = false
+      if kit then eon_kitpt_made = (eon_kitpt_made or 0) + 1 end
       if dbg then reaper.ShowConsoleMsg(("[Swing] output choice: undo point %q; the top is now %q\n"):format(what, reaper.Undo_CanUndo2(0) or "")) end
     end
   end
@@ -15737,6 +16276,228 @@ function eon_rack_legacy_own(t, mark)
   return keep
 end
 
+-- ═════════════════════════════════════════════════════════════════════════════
+-- ONE Ctrl+Z FOR A BUILD (Swing 3.0.20, 2026-10-27; the owner: a Multi-Out build, with all its strips, is ONE
+-- Ctrl+Z, redo rebuilds it, and the bridge's background writes never empty the redo list). Traced in the sandbox
+-- (EON_Probe_UndoMap E2 with every API write logged): the build's block closed, then the identity sweep wrote EON
+-- Tone's Link Slot and EON Lens's slot outside any block (REAPER makes an "Edit FX parameter" point of its own for
+-- each, a moment later, or folds them into whatever point comes next: wiki 6.21 / 6.23), and the Strip Sync put
+-- one Drum Strip per block, sixteen points. Undoing past the point that held the link writes put the plugins'
+-- defaults back; the sweep wrote them again at once, that new point emptied the redo list, and the Strip Sync --
+-- which inserts only while REAPER cannot redo -- put all sixteen strips back: 40 presses never reached the build.
+-- So the build makes, inside its own block, what its companions would make after it -- the Drum Strips
+-- (eon_strips_put), the FX Return viewers (eon_viewers_put), the links (the identity sweep and the StepSeq pairing,
+-- run once in the block) -- and they find nothing left to write. The Strip Sync adopts the strips by
+-- P_EXT:eon_strip_guid (the road a saved project takes) and still inserts what is missing (an older project), never
+-- while REAPER can redo. Globals: the main chunk sits at Lua's 200-local ceiling.
+
+-- The Drum Strip's parameter names by FX_PID. ⚠ MUST match EON_Swing_Strip_Sync.lua PID_TO_STRIP (um_test.py
+-- compares the two).
+EON_STRIP_PARAM = {
+  [G.FX_PID_HPF_FREQ]     = "HPF Freq (Hz)",
+  [G.FX_PID_LPF_FREQ]     = "LPF Freq (Hz)",
+  [G.FX_PID_RESO]         = "Filter Q",
+  [G.FX_PID_EQ_LO]        = "EQ Low Gain (dB)",
+  [G.FX_PID_EQ_LO_FREQ]   = "EQ Low Freq (Hz)",
+  [G.FX_PID_EQ_MID]       = "EQ Mid Gain (dB)",
+  [G.FX_PID_EQ_MID_FREQ]  = "EQ Mid Freq (Hz)",
+  [G.FX_PID_EQ_MID_Q]     = "EQ Mid Q",
+  [G.FX_PID_EQ_MID2]      = "EQ Hi-Mid Gain (dB)",
+  [G.FX_PID_EQ_MID2_FREQ] = "EQ Hi-Mid Freq (Hz)",
+  [G.FX_PID_EQ_MID2_Q]    = "EQ Hi-Mid Q",
+  [G.FX_PID_EQ_LO_Q]      = "EQ Low Q",
+  [G.FX_PID_EQ_HI_Q]      = "EQ High Q",
+  [G.FX_PID_EQ_HI]        = "EQ High Gain (dB)",
+  [G.FX_PID_EQ_HI_FREQ]   = "EQ High Freq (Hz)",
+  [G.FX_PID_CMP_AMT]      = "Comp Amount",
+  [G.FX_PID_CMP_MODE]     = "Comp Mode",
+  [G.FX_PID_BC_RATE]      = "Crush Rate",
+  [G.FX_PID_BC_BITS]      = "Crush Bits",
+  [G.FX_PID_SAT_DRV]      = "Drive",
+  [G.FX_PID_DRV_MODE]     = "Drive Mode",
+  [G.FX_PID_SND_DLY]      = "Delay Send",
+  [G.FX_PID_SND_RVB]      = "Reverb Send",
+  [G.FX_PID_SND_SMASH]    = "Smash Send",
+}
+
+-- A background write to one of Swing's own plugins (a link the identity sweep heals, the StepSeq pairing) waits while
+-- REAPER can redo: an API parameter write is an undo point of its own, and every new point throws the redo history
+-- away. It lands once the user acts again (nothing left to redo). EON_WRITE_NOW: the bridge is inside its own undo
+-- block (a build) or doing what the user just asked (a StepSeq pairing pick) -- the write goes into that point.
+function eon_bg_hold()
+  if EON_WRITE_NOW then return false end
+  local redo = reaper.Undo_CanRedo2 and reaper.Undo_CanRedo2(0)
+  return redo ~= nil and redo ~= ""
+end
+-- Run fn with nothing held (the flag put back whatever fn does; its error passes on).
+function eon_write_now(fn)
+  local was = EON_WRITE_NOW
+  EON_WRITE_NOW = true
+  local ok, err = pcall(fn)
+  EON_WRITE_NOW = was
+  if not ok then error(err, 0) end
+end
+
+-- A plugin's parameters by name, the leading '-' of a hidden JSFX slider either way (the Strip Sync's build_pmap).
+function eon_param_map(tr, fx)
+  local by = {}
+  for p = 0, reaper.TrackFX_GetNumParams(tr, fx) - 1 do
+    local _, pn = reaper.TrackFX_GetParamName(tr, fx, p, "")
+    if pn then by[pn] = p; by[(pn:gsub("^%-+", ""))] = p end
+  end
+  return by
+end
+
+-- The first parameter whose name contains `pat`, set to `val` when it differs: the Strip Sync's _set_param_named,
+-- so the two always write the same parameter.
+function eon_set_named(tr, fx, pat, val)
+  for p = 0, reaper.TrackFX_GetNumParams(tr, fx) - 1 do
+    local _, pn = reaper.TrackFX_GetParamName(tr, fx, p, "")
+    if pn and pn:find(pat) then
+      if math.abs((reaper.TrackFX_GetParam(tr, fx, p) or -1e9) - val) > 1e-6 then reaper.TrackFX_SetParam(tr, fx, p, val) end
+      return true
+    end
+  end
+  return false
+end
+
+-- A Drum Strip on every pad track (bank A) and split-pad track of the Swing on `swing_track` that has none, with
+-- Swing's values -- the Strip Sync's insert (ensure_strip) and its migration of a new strip, inside the CALLER's
+-- undo block. A strip the user took out stays out (P_EXT:eon_strip_user_removed, or a tracked strip gone: the Strip
+-- Sync's rule, marked the same way). Returns how many it put on.
+function eon_strips_put(swing_track, slot, hint_fx)
+  if not swing_track or not slot then return 0 end
+  local name = core.jsfx_addname("EON_Drum_Strip.jsfx", swing_track, hint_fx)
+  if not name then return 0 end
+  local band = G.GS_STRIP_BASE + slot * G.GS_STRIP_STRIDE
+  local sband = G.GS_SPLIT_BASE + slot * G.GS_SPLIT_STRIDE
+  local split_ok = (reaper.gmem_read(sband + G.GS_SPLIT_OFF_VER) or 0) >= 1
+  local tie_ok = (reaper.gmem_read(band + G.GS_STRIP_OFF_TIE_VER) or 0) >= 1
+  local n = 0
+  for s = 0, reaper.GetTrackNumSends(swing_track, 0) - 1 do
+    local key, dest = core.swing_send_pad(swing_track, s)
+    if key < 0 and split_ok then
+      key, dest = core.swing_send_pair(swing_track, s)
+      if key < G.GS_SPLIT_PAIR0 or key >= G.GS_SPLIT_PAIR0 + G.GS_SPLIT_N then key = -1 end
+    end
+    if key >= 0 and dest and eon_pext(dest, "eon_strip_user_removed") ~= "1"
+       and reaper.TrackFX_AddByName(dest, name, false, 0) < 0 then
+      if eon_pext(dest, "eon_strip_guid") ~= "" then
+        reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:eon_strip_user_removed", "1", true)
+      else
+        local fx = reaper.TrackFX_AddByName(dest, name, false, 1)
+        if fx >= 0 then
+          n = n + 1
+          core.fx_embed_mcp(dest, "EON_Drum_Strip")   -- house default: open embedded in the MCP
+          reaper.GetSetMediaTrackInfo_String(dest, "P_EXT:eon_strip_guid", reaper.TrackFX_GetFXGUID(dest, fx) or "", true)
+          -- Swing's values: bank A's pad record, or a split pair's (its owner's; none when nobody plays on it)
+          local rec
+          if key < G.NUM_PADS then
+            rec = band + G.GS_STRIP_PADS + key * G.GS_STRIP_PAD_STRIDE
+          elseif math.floor(reaper.gmem_read(sband + G.GS_SPLIT_OFF_OWNER + key - G.GS_SPLIT_PAIR0) or 0) >= 1 then
+            rec = sband + (key - G.GS_SPLIT_PAIR0) * G.GS_STRIP_PAD_STRIDE
+          end
+          if rec then
+            local by = eon_param_map(dest, fx)
+            for pid, pn in pairs(EON_STRIP_PARAM) do
+              if by[pn] then reaper.TrackFX_SetParam(dest, fx, by[pn], reaper.gmem_read(rec + pid)) end
+            end
+            -- the console tie: the fader and pan start where Swing's pad is (a blank pad, VOL -1, is left alone)
+            if tie_ok then
+              local bv = reaper.gmem_read(rec + G.GS_STRIP_PAD_OFF_VOL)
+              if bv >= 0 then
+                reaper.SetMediaTrackInfo_Value(dest, "D_VOL", bv)
+                reaper.SetMediaTrackInfo_Value(dest, "D_PAN", reaper.gmem_read(rec + G.GS_STRIP_PAD_OFF_PAN))
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  return n
+end
+
+-- The FX Return viewer on each of Swing's return tracks (Verb / Delay / Smash) and its links, and the Smash return's
+-- Weld link: the Strip Sync's push_return_viewers, inside the CALLER's undo block. A viewer the user took out stays
+-- out (P_EXT:eon_viewer_user_removed, or the tracked one gone).
+function eon_viewers_put(swing_track, slot, hint_fx)
+  if not swing_track or not slot then return end
+  local vname
+  for s = 0, reaper.GetTrackNumSends(swing_track, 0) - 1 do
+    local dt = eon_send_dest(swing_track, s)
+    local bus = dt and ((eon_pext(dt, "EON_VERB_RETURN") == "1") and 0 or ((eon_pext(dt, "EON_DELAY_RETURN") == "1") and 1
+                or ((eon_pext(dt, "EON_SMASH_RETURN") == "1") and 2 or nil)))
+    if bus then
+      local vfx = -1
+      for fx = 0, reaper.TrackFX_GetCount(dt) - 1 do
+        if core.fx_file(dt, fx) == "eon_fx_return_view.jsfx" then vfx = fx; break end
+      end
+      if vfx < 0 and eon_pext(dt, "eon_viewer_user_removed") ~= "1" and eon_pext(dt, "eon_viewer_guid") == "" then
+        vname = vname or core.jsfx_addname("EON_FX_Return_View.jsfx", swing_track, hint_fx)
+        if vname then
+          vfx = reaper.TrackFX_AddByName(dt, vname, false, 1)
+          if vfx >= 0 then core.fx_embed_mcp(dt, "EON_FX_Return_View") end
+        end
+      end
+      if vfx >= 0 then
+        local vg = reaper.TrackFX_GetFXGUID(dt, vfx) or ""
+        if vg ~= eon_pext(dt, "eon_viewer_guid") then reaper.GetSetMediaTrackInfo_String(dt, "P_EXT:eon_viewer_guid", vg, true) end
+        eon_set_named(dt, vfx, "Linked registry slot", slot)
+        eon_set_named(dt, vfx, "Bus", bus)
+      end
+      if bus == 2 then
+        for fx = 0, reaper.TrackFX_GetCount(dt) - 1 do
+          if core.fx_file(dt, fx) == "eon_weld.jsfx" then eon_set_named(dt, fx, "Link Slot", slot); break end
+        end
+      end
+    end
+  end
+end
+
+-- The end of a build / Update, inside its block: the strips, the viewers, and one pass of the identity sweep (its
+-- Lens / link sub-tick forced) and of the StepSeq pairing -- their first writes after a build land in this point,
+-- and their next passes find nothing to write. An error here is reported, never fails the build (the companions'
+-- own passes do the rest later, as before).
+function eon_build_settle(swing_track, swing_fx, slot)
+  local ok, err = pcall(eon_write_now, function()
+    eon_strips_put(swing_track, slot, swing_fx)
+    eon_viewers_put(swing_track, slot, swing_fx)
+    -- the sweep's ~1 Hz link sub-tick now; its stray-Lens strikes start over, so this extra pass can never be the
+    -- second strike that revokes a card (eon_lens_revoke_strays)
+    _eon_lens_scan_t = 0
+    _eon_lens_strikes = nil
+    refresh_multiout_identity_per_instance()
+    refresh_stepseq_pairing()
+  end)
+  if not ok then reaper.ShowConsoleMsg("[Swing] after the build (strips, links): " .. tostring(err) .. "\n") end
+end
+
+-- Post companion command `cmd` to Swing (instance `target`; 0 = any) and run fn once Swing has taken it (its @gfx
+-- clears the cell, a few ms); on_timeout instead after 3 s. G.CMD stays parked at 97 meanwhile, so the dispatcher
+-- cannot fire the op again. Wired -> Multi-Out (2026-10-27): Swing's switch to Multi-Out lands BEFORE the build's
+-- block opens, so the copy of Swing REAPER stores in that one point holds it, and a redo brings the whole switch back
+-- (wiki 6.23: a JSFX's own state reaches a point only when REAPER reads the plugin, and CMD 5 is Swing's own state).
+-- No answer in 3 s (2026-10-28, the release review): the command is WITHDRAWN while it is still pending (the cell
+-- first, so Swing cannot take it late -- a Swing switching to Multi-Out under a Wired that stayed on) and on_timeout
+-- runs instead of fn: the caller fails cleanly, before its block, with nothing changed.
+function eon_companion_then(cmd, target, fn, on_timeout)
+  if G.GS_COMPANION_TARGET then reaper.gmem_write(G.GS_COMPANION_TARGET, target or 0) end
+  reaper.gmem_write(G.GS_COMPANION_CMD, cmd)
+  reaper.gmem_write(G.CMD, 97)
+  local t0 = reaper.time_precise()
+  local function wait()
+    if (reaper.gmem_read(G.GS_COMPANION_CMD) or 0) == 0 then fn(); return end
+    if reaper.time_precise() - t0 < 3.0 then reaper.defer(wait); return end
+    if math.floor(reaper.gmem_read(G.GS_COMPANION_CMD) or 0) == cmd then
+      reaper.gmem_write(G.GS_COMPANION_CMD, 0)
+      if G.GS_COMPANION_TARGET then reaper.gmem_write(G.GS_COMPANION_TARGET, 0) end
+    end
+    if on_timeout then on_timeout() end
+  end
+  wait()
+end
+
 -- opts.fx_returns: true/false to force the FX-return-tracks decision, nil to
 -- decide automatically (preserve if return tracks already exist, else ask).
 function rk_ops.do_build_multiout(opts)
@@ -15765,7 +16526,9 @@ function rk_ops.do_build_multiout(opts)
   -- conversion instead: Wired off, this build, then the pad plugins moved onto
   -- their tracks. The conversion switches Wired off BEFORE it calls back in
   -- here, so this does not recurse; the caller's on_done rides through it.
-  if swing_fx then
+  -- (2026-10-27: the conversion now calls in with Wired still ON -- opts.wired_off -- and switches it off inside the
+  -- build's own block, proceed_build; so it is not handed back to itself.)
+  if swing_fx and not (opts and opts.wired_off) then
     for p = 0, reaper.TrackFX_GetNumParams(swing_track, swing_fx) - 1 do
       local ok, nm = reaper.TrackFX_GetParamName(swing_track, swing_fx, p, "")
       if ok and nm:find("Wired (", 1, true) then
@@ -15816,11 +16579,36 @@ function rk_ops.do_build_multiout(opts)
   -- existing tracks gets cmd 7 -- multi-out on, every output left as the user set it -- posted once the Rebuild /
   -- Update question below is answered (it used to get 5 before it was asked, and lost every pad the user had
   -- pointed at another's output); a cancel posts nothing. The test is the one the question itself uses.
-  local function post_adopt(cmd)
+  -- Wired -> Multi-Out (opts.wired_off, 2026-10-27): nothing changes before the user's yes -- the adopt is HELD
+  -- (adopt_held) and proceed_build posts it and waits for Swing to take it before its block opens
+  -- (eon_companion_then); a Cancel leaves Swing as it was. adopt_sent: it went out (a failed build takes it back).
+  local adopt_held, adopt_sent = nil, false
+  local function post_adopt_now(cmd)
     if G.GS_COMPANION_TARGET then reaper.gmem_write(G.GS_COMPANION_TARGET, c5tgt) end
     reaper.gmem_write(G.GS_COMPANION_CMD, cmd)
+    adopt_sent = true
   end
-  if reaper.GetTrackNumSends(swing_track, 0) < 16 then post_adopt(5) end
+  local function post_adopt(cmd)
+    if opts and opts.wired_off then adopt_held = cmd else post_adopt_now(cmd) end
+  end
+  -- Swing did not take a conversion's switch to Multi-Out within 3 s (eon_companion_then withdrew it): the conversion
+  -- stops before its block -- nothing changed, Wired still on, no undo point (2026-10-28, the release review: a block
+  -- run without that switch stored Swing with both modes off, and its redo brought the tracks back silent).
+  local function w2m_no_answer()
+    adopt_sent = false
+    reaper.gmem_write(G.CMD, 98)
+    eon_notice("Swing did not switch to Multi-Out within 3 seconds (is it busy loading a kit?), so nothing was " ..
+               "changed: Wired is still on and your pad plugins are where they were. Run Wired to Multi-Out again.",
+               "Wired to Multi-Out")
+    done(false)
+  end
+  -- "Tracks exist" = Swing's own pad sends (eon_out_tracks' ownership test), not a count of 16 sends: a kit with one
+  -- pad track deleted by hand (15 sends) was built again as a fresh kit beside the old tracks -- each pad on two
+  -- tracks of the same name (audit B2, 2026-10-26). The Rebuild / Update question below uses the same test. The old
+  -- count stays as a floor: a build older than the folder tag that core.swing_send_pad reads is still asked.
+  local had_outs = reaper.GetTrackNumSends(swing_track, 0) >= 16 or eon_out_tracks(swing_track).npad > 0
+  local fresh_adopt = not had_outs   -- B8: a fresh build's adopt is taken back if the build faults
+  if fresh_adopt then post_adopt(5) end
 
   -- Read pad names and colors from gmem (JSFX syncs these before sending CMD=40)
   local pad_names = {}
@@ -15866,7 +16654,7 @@ function rk_ops.do_build_multiout(opts)
     local v, d, sm = false, false, false
     local ns = reaper.GetTrackNumSends(swing_track, 0)
     for s = 0, ns - 1 do
-      local dt = reaper.BR_GetMediaTrackSendInfo_Track(swing_track, 0, s, 1)
+      local dt = eon_send_dest(swing_track, s)   -- no SWS needed
       if dt then
         local _, vt = reaper.GetSetMediaTrackInfo_String(dt, "P_EXT:EON_VERB_RETURN", "", false)
         local _, dd = reaper.GetSetMediaTrackInfo_String(dt, "P_EXT:EON_DELAY_RETURN", "", false)
@@ -15883,7 +16671,7 @@ function rk_ops.do_build_multiout(opts)
   -- be another project's -- the summary says so when it differs.
   local pre_smash_sel
   for s = 0, reaper.GetTrackNumSends(swing_track, 0) - 1 do
-    local d = reaper.BR_GetMediaTrackSendInfo_Track(swing_track, 0, s, 1)
+    local d = eon_send_dest(swing_track, s)   -- no SWS needed
     if d and eon_pext(d, "EON_SMASH_RETURN") ~= "" then pre_smash_sel = eon_rack_sel_of(d); break end
   end
   -- An existing EON Weld on the Audio submix parent (it survives a Rebuild) is
@@ -16019,12 +16807,20 @@ function rk_ops.do_build_multiout(opts)
       end
     end
     if not rack_fx_idx then return nil end
+    -- Each entry resolved once per build (audit B10, 2026-10-26): the open combo asked for every entry every frame,
+    -- and an absent `find` walked the whole installed-FX list each time. The hit (or false) is kept by entry.
+    rack_fx_idx.hit = rack_fx_idx.hit or {}
+    local hit = rack_fx_idx.hit[st]
+    if hit ~= nil then return hit end
+    hit = false
     for _, pat in ipairs(st.find) do
       for _, fx in ipairs(rack_fx_idx) do
-        if fx.lc:find(pat, 1, true) then return fx end
+        if fx.lc:find(pat, 1, true) then hit = fx; break end
       end
+      if hit then break end
     end
-    return false
+    rack_fx_idx.hit[st] = hit
+    return hit
   end
   local function rack_available(st)
     if not st.find then return true end          -- adds-based: assumed stock
@@ -16297,7 +17093,22 @@ function rk_ops.do_build_multiout(opts)
   local kept_foreign = {}   -- the user's own send destinations an Update / Rebuild left alone (named in the summary)
   local rebuild_sends = {}  -- Swing's sends a Rebuild reset: "<track> -- at -6.0 dB, muted" (named in the summary)
   local rebuilt = false     -- this build is a Rebuild (choice 6): the summary's comp-change line
-  if existing_sends >= 16 then
+  local rb_close            -- a Rebuild's: the closes its deleted tracks handed the Audio sub (eon_out_delete), for the new last track
+  local rb_delete           -- a Rebuild's delete of the old tracks, run inside the build's block (proceed_build)
+  local rb_check            -- ... and its guard, read again before that block opens
+  -- what the Rebuild's refusal tells the user to do (the guard below, and again in proceed_build)
+  local function rb_how()
+    -- "untouched" says the tracks only: Swing's own builder has already shown bank A and switched to MULTI before
+    -- the bridge runs (swing_panels_multiout_prep), so "nothing has been changed" was not true (Codex delta).
+    -- Inside Wired -> Multi-Out, Wired stays on until the build's own block (2026-10-27): nothing to switch back.
+    return (opts and opts.wired_off)
+      and ("Wired is still on and your pad plugins are where they were; the old tracks are untouched. Move or " ..
+           "remove what is listed and run Wired to Multi-Out again, or run it again and choose Update: it keeps " ..
+           "the old tracks as they are.")
+      or ("Move or remove them, or build again and choose Update: it keeps the tracks as they are. " ..
+          "The old tracks and everything on them are untouched.")
+  end
+  if had_outs then
     -- Collect existing send destination tracks keyed by PAD, not by raw channel:
     -- a send the user switched to mono carries a width code in I_SRCCHAN, so a
     -- raw key would be stored as 1030 and looked up below as 6, and that pad
@@ -16310,7 +17121,7 @@ function rk_ops.do_build_multiout(opts)
     -- send and its track stay, and the summary names it (Multi-Out to Wired's "three buckets").
     local send_dest, owned, foreign = {}, {}, {}
     for s = 0, existing_sends - 1 do
-      local dest_tr = reaper.BR_GetMediaTrackSendInfo_Track(swing_track, 0, s, 1)
+      local dest_tr = eon_send_dest(swing_track, s)   -- no SWS needed
       local g = dest_tr and reaper.GetTrackGUID(dest_tr)
       if dest_tr and g and g ~= "" then
         local pad = eon_child_pad_idx(swing_track, s, dest_tr)
@@ -16336,11 +17147,22 @@ function rk_ops.do_build_multiout(opts)
     )
 
     if choice == 7 then
-      -- UPDATE: refresh names and colors on existing send destinations
-      post_adopt(7)   -- multi-out on, every output as the user set it
+      -- UPDATE: refresh names and colors on existing send destinations; companion 7 = multi-out on, every output as
+      -- the user set it. The Update itself is run_update (its body below, as it was). In Wired -> Multi-Out it waits,
+      -- like the build's Yes (2026-10-28, the release review): 7 goes out, the block opens only once Swing has taken
+      -- it -- the block's first write on Swing (Wired off) is where REAPER stores Swing, and without the wait that copy
+      -- could hold neither mode, so a redo brought the tracks and the moved plugins back with no pad signal. No answer
+      -- in 3 s: w2m_no_answer, nothing changed, Wired on, no point.
+      local function run_update()
       reaper.Undo_BeginBlock()
       reaper.PreventUIRefresh(1)
       local updated = 0
+      local out_made = {}
+      -- Guarded like proceed_build (audit B9, 2026-10-26): a Lua error in here used to leave REAPER not repainting,
+      -- the undo block open and CMD at 40 -- the Rebuild / Update question popped again every tick.
+      local upd_ok, upd_fault = xpcall(function()
+      -- Wired -> Multi-Out: Wired off in this same block (opts.before_build), and the pad plugins' move at its end
+      if opts and opts.before_build then opts.before_build() end
       local _bwt = bridge_lane_policy(swing_track)  -- write_tracks: gate lane paint
       for i = 0, G.NUM_PADS - 1 do
         local dest_tr = send_dest[i]
@@ -16368,12 +17190,26 @@ function rk_ops.do_build_multiout(opts)
       reaper.GetSetMediaTrackInfo_String(swing_track, "P_NAME", "Swing", true)
       -- Pad Banks Outputs step 2: Update adds whatever is missing (decision 7) -- the Bank A folder (an existing
       -- project's sixteen move in), a bank track or a split pad's, one the user deleted included (decision 10).
-      local out_made = eon_out_ensure(swing_track, c5tgt > 0 and ss_resolve_slot(c5tgt) or nil, { folder = true })
+      out_made = eon_out_ensure(swing_track, c5tgt > 0 and ss_resolve_slot(c5tgt) or nil, { folder = true })
       -- Normalise folder depths in case the existing layout drifted (older
       -- builds may have used the legacy -2 close that ejected the DM folder).
       if folder_layout then folder_layout.EnsureSwingParentLayout(swing_track) end
+      -- what an Update adds gets its Drum Strip, viewer and links in this block too (eon_build_settle)
+      eon_build_settle(swing_track, swing_fx, c5tgt > 0 and ss_resolve_slot(c5tgt) or nil)
+      if opts and opts.in_block then opts.in_block() end
+      end, debug.traceback)   -- guarded Update
       reaper.PreventUIRefresh(-1)
       reaper.TrackList_AdjustWindows(false)
+      if not upd_ok then
+        upd_fault = tostring(upd_fault)
+        reaper.Undo_EndBlock("Swing: Update multi-out tracks (did not complete)", -1)
+        reaper.gmem_write(G.CMD, 98)
+        reaper.ShowConsoleMsg("[Swing] Multi-Out update failed:\n" .. upd_fault .. "\n")
+        eon_notice("The Multi-Out update did not complete.\n\n" .. (upd_fault:match("^[^\n]*") or upd_fault) .. "\n\n" ..
+                   "Undo (Ctrl+Z) takes back what it changed; the console has the full trace.")
+        done(false)
+        return
+      end
       reaper.Undo_EndBlock("Swing: Update multi-out track names & colors", -1)
       reaper.gmem_write(G.CMD, 99)
 
@@ -16390,6 +17226,14 @@ function rk_ops.do_build_multiout(opts)
       end
       eon_notice(summary)
       done(true)
+      end   -- run_update
+      if opts and opts.wired_off then
+        adopt_sent = true
+        eon_companion_then(7, c5tgt, run_update, w2m_no_answer)
+      else
+        post_adopt_now(7)
+        run_update()
+      end
       return
 
     elseif choice == 6 then
@@ -16402,15 +17246,8 @@ function rk_ops.do_build_multiout(opts)
         -- the bridge runs (swing_panels_multiout_prep), so "nothing has been changed" was not true (Codex delta).
         -- Inside Wired -> Multi-Out, Wired must go back on FIRST: with it off the conversion refuses ("not in Wired")
         -- and a plain build never moves the pad plugins (review 2026-10-13).
-        local how = (opts and opts.wired_off)
-          and ("The old tracks are untouched, but Wired is off (the conversion switched it off first) and your pad " ..
-               "plugins are still on the Swing track. Switch Wired back on before anything else. " .. EON_WIRED_RESET ..
-               " Then move or remove what is listed and run Wired to Multi-Out again, or run it again and choose " ..
-               "Update: it keeps the old tracks as they are.")
-          or ("Move or remove them, or build again and choose Update: it keeps the tracks as they are. " ..
-              "The old tracks and everything on them are untouched.")
         eon_notice("Not rebuilding -- these would be lost with the old tracks:\n\n  " .. table.concat(lose, "\n  ") ..
-                   "\n\n" .. how, "Rebuild Multi-Out")
+                   "\n\n" .. rb_how(), "Rebuild Multi-Out")
         reaper.gmem_write(G.CMD, 98)
         done(false)
         return
@@ -16428,12 +17265,25 @@ function rk_ops.do_build_multiout(opts)
         table.sort(rebuild_sends)
       end
       post_adopt(5)   -- the clean slate: every pad on its own output (a bank-track / split choice stays)
-      reaper.Undo_BeginBlock()
-      reaper.PreventUIRefresh(1)
+      -- ONE Ctrl+Z for a Rebuild (2026-10-27, the owner's rule for a build): the old tracks go INSIDE the build's own
+      -- undo block -- proceed_build runs rb_delete first, in its guarded body -- so one undo brings the old tracks
+      -- back and takes the new ones away, and redo does the whole Rebuild again (it was two points, "Remove old
+      -- multi-out tracks" and the build, with the build's question dialog able to sit between them). The old tracks
+      -- stay while that dialog is up. Read again: the tracks (one the user deleted meanwhile is gone from the list),
+      -- the guard (rb_check: something of the user's put on an old track meanwhile stops the Rebuild in
+      -- proceed_build, before its block opens -- nothing changed, nothing to undo), the sends.
+      rb_check = function()
+        for g, t in pairs(owned) do if not reaper.ValidatePtr2(0, t, "MediaTrack*") then owned[g] = nil end end
+        return eon_rebuild_blockers(swing_track, owned, eon_out_tracks(swing_track).folder_a)
+      end
+      rb_delete = function()
+      existing_sends = reaper.GetTrackNumSends(swing_track, 0)
+      local del_ok, del_fault = xpcall(function()   -- guarded like the Update above (audit B9)
       -- Remove Swing's own sends only (reverse order; each destination re-read, so the index never drifts)
       local folder_a = eon_out_tracks(swing_track).folder_a   -- found before the sends go (the Audio walk)
+      local au_keep = find_audio_subfolder(swing_track)         -- the same; it stays, the new tracks go in it
       for s = existing_sends - 1, 0, -1 do
-        local d = reaper.BR_GetMediaTrackSendInfo_Track(swing_track, 0, s, 1)
+        local d = eon_send_dest(swing_track, s)   -- no SWS needed
         local g = d and reaper.GetTrackGUID(d)
         if g and owned[g] then reaper.RemoveTrackSend(swing_track, 0, s) end
       end
@@ -16452,11 +17302,13 @@ function rk_ops.do_build_multiout(opts)
         return reaper.GetMediaTrackInfo_Value(a, "IP_TRACKNUMBER") >
                reaper.GetMediaTrackInfo_Value(b, "IP_TRACKNUMBER")
       end)
-      for _, tr in ipairs(tracks_to_delete) do
-        reaper.DeleteTrack(tr)
-      end
-      reaper.PreventUIRefresh(-1)
-      reaper.Undo_EndBlock("Swing: Remove old multi-out tracks", -1)
+      -- every close they carried is handed on first (S.12): to the track above, or -- what the Audio sub would take --
+      -- to the new last track (rb_close, proceed_build)
+      rb_close = eon_out_delete(tracks_to_delete, au_keep)
+      end, debug.traceback)   -- guarded delete
+      -- a fault here fails the build in its guard: "did not complete", and Undo brings back what the delete took
+      if not del_ok then error("the old tracks could not be removed: " .. tostring(del_fault), 0) end
+      end   -- rb_delete
       -- Fall through to create new tracks below
 
     else
@@ -16495,9 +17347,40 @@ function rk_ops.do_build_multiout(opts)
   local created = {}
   local smash_now   -- the comp the new Smash Return actually got (a picked chain that failed falls back to EON Weld)
   local out_made = {}   -- Outputs step 2: the bank / split / Bank A tracks made (the summary lists them)
+  -- A Rebuild whose old tracks took something of the user's while the build's question was up: refused here, before
+  -- the block opens (rb_check -- the Rebuild's guard read again; rb_delete runs inside the block below)
+  if rb_check then
+    local lose2 = rb_check()
+    if #lose2 > 0 then
+      eon_notice("Not rebuilding -- these would be lost with the old tracks:\n\n  " .. table.concat(lose2, "\n  ") ..
+                 "\n\n" .. rb_how(), "Rebuild Multi-Out")
+      reaper.gmem_write(G.CMD, 98)
+      done(false)
+      return
+    end
+  end
+  -- Wired -> Multi-Out: the user said yes. Swing's switch to Multi-Out goes out now, and the block below opens only
+  -- once Swing has taken it (eon_companion_then: back in here, then nothing held), so the one point it makes holds
+  -- Swing in Multi-Out and a redo brings the whole switch back. Nothing has changed before this line.
+  if adopt_held then
+    local cmd = adopt_held
+    adopt_held = nil
+    adopt_sent = true
+    eon_companion_then(cmd, c5tgt, function() proceed_build(want_returns, want_buscomp, want_stepseq, bus_sel, smash_sel) end,
+                       w2m_no_answer)
+    return
+  end
   reaper.Undo_BeginBlock()
   reaper.PreventUIRefresh(1)
   local built, fault = xpcall(function()
+
+  -- Wired -> Multi-Out: Wired off first, in this same block (opts.before_build, 2026-10-27: one Ctrl+Z for the switch)
+  if opts and opts.before_build then opts.before_build() end
+  -- A Rebuild: the old tracks go first, in this same block (rb_delete); Swing's place read again after them
+  if rb_delete then
+    rb_delete()
+    swing_idx = math.floor(reaper.GetMediaTrackInfo_Value(swing_track, "IP_TRACKNUMBER")) - 1
+  end
 
   -- Create parent folder track above Swing (skip if one already exists).
   -- Layout target (names applied by update_folder_track_name):
@@ -16512,6 +17395,12 @@ function rk_ops.do_build_multiout(opts)
     reaper.InsertTrackAtIndex(swing_idx, true)
     local folder_tr = reaper.GetTrack(0, swing_idx)
     reaper.SetMediaTrackInfo_Value(folder_tr, "I_FOLDERDEPTH", 1)
+    -- A3b (2026-10-26): the parent Swing makes is tagged -- only a tagged (or proven) folder is ever renamed,
+    -- recoloured or laid out as Swing's. It closes on Swing for now (Swing's close grows by one), so a folder of
+    -- the user's that Swing sat in keeps its own end; the Audio sub below takes the close over.
+    reaper.GetSetMediaTrackInfo_String(folder_tr, "P_EXT:EON_SWING_PARENT", "1", true)
+    local sd = reaper.GetMediaTrackInfo_Value(swing_track, "I_FOLDERDEPTH")
+    if sd <= 0 then reaper.SetMediaTrackInfo_Value(swing_track, "I_FOLDERDEPTH", sd - 1) end
     -- Swing track is now at swing_idx + 1
     swing_idx = swing_idx + 1
   end
@@ -16521,9 +17410,17 @@ function rk_ops.do_build_multiout(opts)
   -- Find or create the AUDIO sub-folder (immediately after Swing).
   local audio_sub = find_audio_subfolder(swing_track)
   local audio_sub_idx
+  local sw_close = 0   -- the folders Swing closed, moved onto the new Audio sub's last track (A3b)
   if audio_sub then
     audio_sub_idx = math.floor(reaper.GetMediaTrackInfo_Value(audio_sub, "IP_TRACKNUMBER")) - 1
+    -- A Rebuild emptied it: the closes its old tracks carried (its own included; 0 when a track of the user's left
+    -- inside still closes it) go on the new last track. The -1 there is the sub's own, so the rest rides sw_close.
+    if rb_close then sw_close = rb_close + 1 end
   else
+    -- A new sub goes right after Swing: if Swing closes folders (its parent, a folder of the user's), they close
+    -- after the sub now, or the sub and its tracks would land outside them.
+    sw_close = reaper.GetMediaTrackInfo_Value(swing_track, "I_FOLDERDEPTH")
+    if sw_close < 0 then reaper.SetMediaTrackInfo_Value(swing_track, "I_FOLDERDEPTH", 0) else sw_close = 0 end
     audio_sub_idx = swing_idx + 1
     reaper.InsertTrackAtIndex(audio_sub_idx, true)
     audio_sub = eon_mark_template_fx(reaper.GetTrack(0, audio_sub_idx))
@@ -16718,7 +17615,7 @@ function rk_ops.do_build_multiout(opts)
     -- arrangement (audio + DM siblings) when present; if it's absent this -1 is
     -- the canonical single-sub close. Was deleted in d417cfa, regressing both
     -- bare-Swing AND (via the depth-only walker) the DM-present case.
-    reaper.SetMediaTrackInfo_Value(created[#created], "I_FOLDERDEPTH", -1)
+    reaper.SetMediaTrackInfo_Value(created[#created], "I_FOLDERDEPTH", -1 + sw_close)   -- + what Swing closed (A3b)
   end
 
   -- Pad Banks Outputs step 2: the Bank A folder, and the bank B-D / split-pad tracks the kit needs right now.
@@ -16733,14 +17630,25 @@ function rk_ops.do_build_multiout(opts)
   -- already exists alongside — the reorganiser figures it out.
   if folder_layout then folder_layout.EnsureSwingParentLayout(swing_track) end
 
+  -- The Drum Strips, the return viewers and the links, in THIS block: the build with all its strips is one Ctrl+Z
+  -- (2026-10-27, eon_build_settle)
+  eon_build_settle(swing_track, swing_fx, c5tgt > 0 and ss_resolve_slot(c5tgt) or nil)
+  -- Wired -> Multi-Out: the move of the pad plugins onto their new tracks, in this same block (opts.in_block)
+  if opts and opts.in_block then opts.in_block() end
+
   end, debug.traceback)   -- guarded mutation
 
   reaper.PreventUIRefresh(-1)
   reaper.TrackList_AdjustWindows(false)
   if not built then
     fault = tostring(fault)
-    reaper.Undo_EndBlock("Swing: Build multi-out tracks (did not complete)", -1)
+    reaper.Undo_EndBlock((opts and opts.wired_off) and "Swing: Wired to Multi-Out (did not complete)"
+                         or "Swing: Build multi-out tracks (did not complete)", -1)
     reaper.gmem_write(G.CMD, 98)
+    -- A fresh build's adopt (cmd 5, posted before the build) is taken back: cmd 6 = leave multi-out. Without it Swing
+    -- stayed MULTI with no child tracks and every pad went silent (audit B8, 2026-10-26). A Rebuild keeps MULTI: its
+    -- old tracks come back with Undo.
+    if fresh_adopt and adopt_sent then post_adopt_now(6) end
     reaper.ShowConsoleMsg("[Swing] Multi-Out build failed:\n" .. fault .. "\n")
     eon_notice("The Multi-Out build did not complete, so it was not published.\n\n" ..
                (fault:match("^[^\n]*") or fault) .. "\n\n" ..
@@ -16749,7 +17657,8 @@ function rk_ops.do_build_multiout(opts)
     done(false)
     return
   end
-  reaper.Undo_EndBlock("Swing: Build " .. #created .. " multi-out tracks", -1)
+  -- the one point; a Wired -> Multi-Out conversion's is named for the switch (Wired off, the build, the move are in it)
+  reaper.Undo_EndBlock((opts and opts.wired_off) and "Swing: Wired to Multi-Out" or ("Swing: Build " .. #created .. " multi-out tracks"), -1)
 
   reaper.gmem_write(G.CMD, 99)
 
@@ -17156,9 +18065,12 @@ function rk_ops.do_build_multiout(opts)
           (sel.desc ~= "" and ("   " .. sel.desc) or ""))
       end
     end
+    -- Wired -> Multi-Out (opts.wired_off, 2026-10-27): the left button and the window's close CANCEL the switch --
+    -- nothing has changed yet (Wired on, no adopt sent, no undo point); untick the boxes for a build without extras.
+    local w2m = opts and opts.wired_off
     local shown = eon_dlg and eon_dlg.available() and eon_dlg.open and eon_dlg.open({
-      title = "Drum Bus Options", width = 680,
-      ok_label = "Build", cancel_label = "Skip",
+      title = w2m and "Wired to Multi-Out: Drum Bus Options" or "Drum Bus Options", width = 680,
+      ok_label = "Build", cancel_label = w2m and "Cancel" or "Skip",
       fields = {
         { key = "opts", label = "Add", kind = "checks",
           sub = "returns = Verb / Delay / Smash tracks; the comps below choose what lands where",
@@ -17200,12 +18112,20 @@ function rk_ops.do_build_multiout(opts)
         proceed_build(ex.fx_returns and true or false, ex.bus_comp and true or false,
                       ex.step_seq and true or false, rk_sel.bus, rk_sel.smash)
       end,
-      on_cancel = function() proceed_build(false, false, false) end,
+      on_cancel = w2m and function() reaper.gmem_write(G.CMD, 98); done(false) end
+                       or function() proceed_build(false, false, false) end,
     })
     if shown then
       reaper.gmem_write(G.CMD, 97)   -- park the mailbox while the dialog is up
     else
-      -- No ReaImGui: two native Yes/No questions, blocking as before.
+      -- No ReaImGui: two native Yes/No questions, blocking as before -- after the switch's own OK / Cancel
+      if w2m and reaper.ShowMessageBox("Switch Wired to Multi-Out?" .. string.char(10, 10) ..
+           "OK = build the Multi-Out tracks and move the pad plugins onto them (one undo step)" .. string.char(10) ..
+           "Cancel = keep Wired as it is", SCRIPT_NAME, 1) ~= 1 then
+        reaper.gmem_write(G.CMD, 98)
+        done(false)
+        return
+      end
       local c = reaper.ShowMessageBox(
         "Add FX return tracks?" .. string.char(10,10) ..
         "YES = create EON Verb / Delay / Smash Return tracks and route the wet to them" .. string.char(10) ..
@@ -17274,23 +18194,19 @@ function eon_fx_float_visible(tr, fx)
 end
 
 -- TOGGLE the paired Swing's floating FX window for `slot` (open if closed, close if open).
+-- The cached roster (C O-1), not a walk of every track x FX (audit B11, 2026-10-26).
 function eon_toggle_swing_for_slot(slot)
-  for tr in core.iter_all_tracks() do
-    local nfx = reaper.TrackFX_GetCount(tr)
-    local fx = 0
-    while fx < nfx do
-      if is_swing_fx(tr, fx)
-         and ss_resolve_slot(math.floor(reaper.TrackFX_GetParam(tr, fx, 3) or 0)) == slot then
-        if eon_fx_float_visible(tr, fx) then
-          reaper.TrackFX_Show(tr, fx, 2)
-          core.hub_notify("close", "swing", tr, fx)
-        else
-          reaper.TrackFX_Show(tr, fx, 3)
-          core.hub_notify("open", "swing", tr, fx)
-        end
-        return
+  for _, sw in ipairs(eon_swing_list(true)) do
+    local tr, fx = sw.tr, sw.fx
+    if ss_resolve_slot(sw.inst_id) == slot then
+      if eon_fx_float_visible(tr, fx) then
+        reaper.TrackFX_Show(tr, fx, 2)
+        core.hub_notify("close", "swing", tr, fx)
+      else
+        reaper.TrackFX_Show(tr, fx, 3)
+        core.hub_notify("open", "swing", tr, fx)
       end
-      fx = fx + 1
+      return
     end
   end
 end
@@ -17327,18 +18243,12 @@ function eon_ss_commands_tick()
   -- Throttled (~5 Hz): publish each slot's Swing-window open state (field 39) for the highlight.
   eon_ss_cmd_cnt = (eon_ss_cmd_cnt or 0) + 1
   if eon_ss_cmd_cnt % 6 == 0 then
+    -- The cached roster (C O-1), whose header names this publish: it walked every track x FX at 5 Hz (audit B11).
     local openset = {}
-    for tr in core.iter_all_tracks() do
-      local nfx = reaper.TrackFX_GetCount(tr)
-      local fx = 0
-      while fx < nfx do
-        if is_swing_fx(tr, fx) then
-          local sl = ss_resolve_slot(math.floor(reaper.TrackFX_GetParam(tr, fx, 3) or 0))
-          if sl and sl >= 0 and sl < 16 and eon_fx_float_visible(tr, fx) then
-            openset[sl] = true
-          end
-        end
-        fx = fx + 1
+    for _, sw in ipairs(eon_swing_list(true)) do
+      local sl = ss_resolve_slot(sw.inst_id)
+      if sl and sl >= 0 and sl < 16 and eon_fx_float_visible(sw.tr, sw.fx) then
+        openset[sl] = true
       end
     end
     for slot = 0, 15 do gw(26030000 + slot * 64 + 39, openset[slot] and 1 or 0) end
@@ -17835,14 +18745,8 @@ function rk_ops.chop_commit(take, source, sr, nch, total_samples,
     if target_id <= 0 then target_id = math.floor(reaper.gmem_read(G.INSTANCE) or 0) end
     local ttr = nil
     if target_id > 0 then
-      for tr in core.iter_all_tracks() do
-        for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
-          if is_swing_fx(tr, fx)
-             and math.floor(reaper.TrackFX_GetParam(tr, fx, 3) or 0) == target_id then
-            ttr = tr; break
-          end
-        end
-        if ttr then break end
+      for _, sw in ipairs(eon_swing_list(true)) do   -- the cached roster (C O-1; audit B11)
+        if sw.inst_id == target_id then ttr = sw.tr; break end
       end
     end
     if not ttr then ttr = find_swing_track() end
@@ -17929,8 +18833,8 @@ function rk_ops.chop_commit(take, source, sr, nch, total_samples,
   -- the bridge was rewritten to ignore ExtState for non-layered pads, and
   -- it still bakes wrong "path = ..." breadcrumbs into the kit's lua
   -- metadata. Clearing them keeps the saved kit file metadata honest.
+  eon_crumb_clear(nil, 0)   -- the LOCK holder's bank A (B4)
   for pad = 0, G.NUM_PADS - 1 do
-    reaper.SetExtState("Swing", "pad_path_" .. pad, "", false)
     publish_pitch_path(pad, "")   -- invalidate Extension's source cache too
   end
 
@@ -17943,10 +18847,6 @@ function rk_ops.chop_commit(take, source, sr, nch, total_samples,
   update_folder_track_name(find_swing_track())
   reaper.Undo_EndBlock("Swing: Chop to Pads (" .. (#slice_points - 1) .. " slices)", -1)
 end
-
--- ═════════════════════════════════════════════════════════════════════════════
--- AUTO-COLOR PADS (CMD 23)
--- ═════════════════════════════════════════════════════════════════════════════
 
 -- ═════════════════════════════════════════════════════════════════════════════
 -- WIRED (the EON Patchbay loopback) — CMD 41 toggles it on the focused Swing
@@ -18073,7 +18973,11 @@ function eon_wired_post_reorder(tr, sfx)
   end
 end
 
-function rk_ops.do_toggle_wired()
+-- in_block: the caller holds an undo block open and this goes into its point (Multi-Out -> Wired, 2026-10-27): no
+-- block of its own, opened or closed, on any path.
+function rk_ops.do_toggle_wired(in_block)
+  local undo_open = in_block and function() end or reaper.Undo_BeginBlock
+  local undo_close = in_block and function() end or function(nm) reaper.Undo_EndBlock(nm, -1) end
   local tr, fx = find_swing_track()
   if not tr then reaper.gmem_write(G.CMD, 0) return end
 
@@ -18087,7 +18991,7 @@ function rk_ops.do_toggle_wired()
   local on_now = (reaper.TrackFX_GetParam(tr, fx, p_on) or 0) >= 0.5
   local pb = eon_find_patchbay(tr)
 
-  reaper.Undo_BeginBlock()
+  undo_open()
   reaper.PreventUIRefresh(1)
   local undo_name
 
@@ -18101,7 +19005,7 @@ function rk_ops.do_toggle_wired()
     local slot = eon_reg_slot_of(inst_id)
     if slot < 0 then
       reaper.PreventUIRefresh(-1)
-      reaper.Undo_EndBlock("Swing: Wired (no registry slot)", -1)
+      undo_close("Swing: Wired (no registry slot)")
       reaper.ShowConsoleMsg("[EON] Swing has not claimed a registry slot yet -- " ..
                             "give it a moment with the transport running and try again.\n")
       reaper.gmem_write(G.CMD, 0) return
@@ -18122,7 +19026,7 @@ function rk_ops.do_toggle_wired()
       local name, _, why = core.jsfx_addname("EON_Patchbay.jsfx", tr, fx)
       if not name then
         reaper.PreventUIRefresh(-1)
-        reaper.Undo_EndBlock("Swing: Wired (Patchbay not found)", -1)
+        undo_close("Swing: Wired (Patchbay not found)")
         reaper.ShowConsoleMsg("[EON] Could not locate EON_Patchbay.jsfx: " ..
                               tostring(why) .. "\n")
         reaper.gmem_write(G.CMD, 0) return
@@ -18130,7 +19034,7 @@ function rk_ops.do_toggle_wired()
       pb = reaper.TrackFX_AddByName(tr, name, false, -1)
       if pb < 0 then
         reaper.PreventUIRefresh(-1)
-        reaper.Undo_EndBlock("Swing: Wired (add failed)", -1)
+        undo_close("Swing: Wired (add failed)")
         reaper.ShowConsoleMsg("[EON] REAPER refused to add " .. name .. "\n")
         reaper.gmem_write(G.CMD, 0) return
       end
@@ -18180,7 +19084,7 @@ function rk_ops.do_toggle_wired()
 
   reaper.PreventUIRefresh(-1)
   reaper.TrackList_AdjustWindows(false)
-  reaper.Undo_EndBlock(undo_name, -1)
+  undo_close(undo_name)
   reaper.gmem_write(G.CMD, 0)
 end
 
@@ -18451,31 +19355,34 @@ function rk_ops.do_wired_to_multiout(outer)
   -- there, the rest to the Bank A folder.
   local from_audio = eon_guid_set(tr, "EON_WIRED_AUDIO")
 
-  -- 2) Wired off. Its own undo step, because the build that follows owns its
-  --    own blocks and can park on a dialog. What follows the Patchbay is
-  --    recorded, as at a Wired OFF: if the build does not complete, switching
-  --    Wired back on keeps it after the Patchbay.
-  reaper.Undo_BeginBlock()
-  if pb >= 0 then eon_wired_post(tr, pb); reaper.TrackFX_Delete(tr, pb) end
-  if p_on >= 0 then reaper.TrackFX_SetParam(tr, fx, p_on, 0) end
-  reaper.Undo_EndBlock("Swing: Wired off (converting to Multi-Out)", -1)
-
-  -- 3) The normal Multi-Out build, then the move once it reports done.
-  -- The build records the bus comp it adds (P_EXT EON_BUS_FRESH on the Audio folder); an older record goes first, so
-  -- what the move below takes off is exactly what THIS build put there (Codex audit 2026-10-13: everything between EON
-  -- Tone and EON Output was taken off, the user's own plugins with it; its review: a snapshot taken here missed
-  -- what the user added while the build's dialog was up).
-  do local a0 = find_audio_subfolder(tr); if a0 then reaper.GetSetMediaTrackInfo_String(a0, "P_EXT:EON_BUS_FRESH", "", true) end end
-  rk_ops.do_build_multiout({ wired_off = true, on_done = function(ok)   -- wired_off: a refusal says so
-    if not ok then
-      eon_notice("The Multi-Out build did not complete, so nothing was moved.\n\n" ..
-                 "Wired is off and your pad plugins are still on the Swing track. Switch Wired back on to use " ..
-                 "them there again. " .. EON_WIRED_RESET,
-                 "Wired to Multi-Out")
-      if outer and outer.on_done then outer.on_done(false) end
-      return
+  -- ONE Ctrl+Z for the switch (2026-10-27, the owner): Wired stays on until the user says yes to the build's dialog;
+  -- then Wired off (2), the build with its strips and the move of the pad plugins (3) happen inside the build's ONE
+  -- undo block (opts.before_build first in it, opts.in_block last); a Cancel leaves everything as it was -- Wired on,
+  -- no adopt sent, no undo point. It was three points: "Wired off (converting to Multi-Out)", the build, "Wired to
+  -- Multi-Out (move pad plugins)".
+  -- 2) Wired off. What follows the Patchbay is recorded, as at a Wired OFF. Read again here: the build's dialog may
+  --    have been up a while. The build records the bus comp it adds (P_EXT EON_BUS_FRESH on the Audio folder); an
+  --    older record goes first, so what the move below takes off is exactly what THIS build put there (Codex audit
+  --    2026-10-13: everything between EON Tone and EON Output was taken off, the user's own plugins with it; its
+  --    review: a snapshot taken before the dialog missed what the user added while it was up).
+  local function wired_off_now()
+    local sfx = fx
+    if not core.is_swing_fx(tr, sfx) then
+      sfx = -1
+      for i = 0, reaper.TrackFX_GetCount(tr) - 1 do if core.is_swing_fx(tr, i) then sfx = i; break end end
     end
+    local pb2 = eon_find_patchbay(tr)
+    local pon2 = sfx >= 0 and eon_param_by_name(tr, sfx, "Wired (") or -1
+    if pb2 >= 0 then eon_wired_post(tr, pb2); reaper.TrackFX_Delete(tr, pb2) end
+    if pon2 >= 0 then reaper.TrackFX_SetParam(tr, sfx, pon2, 0) end
+    local a0 = find_audio_subfolder(tr)
+    if a0 then reaper.GetSetMediaTrackInfo_String(a0, "P_EXT:EON_BUS_FRESH", "", true) end
+  end
 
+  -- 3) The move, once the build has made the tracks: inside the build's block (opts.in_block). What it did is kept
+  --    here for the summary (on_done).
+  local outs, made, fresh_off, moved, lost, nmaster, npre, banks, auxs, naudio
+  local function move_now()
     -- ⚠⚠ THIS Swing's children ONLY. The first cut walked
     -- core.iter_all_tracks() and keyed on EON_PAD_IDX alone -- but EVERY
     -- Swing's Multi-Out rig tags its own children 0..15, so in a two-Swing
@@ -18501,21 +19408,19 @@ function rk_ops.do_wired_to_multiout(outer)
       end
     end
 
-    reaper.Undo_BeginBlock()
-    reaper.PreventUIRefresh(1)
     -- Step 5: the bank and split pairs' tracks (eon_out_tracks reads them off
     -- Swing's sends by their tags, as every lane reader does), any one a
     -- container needs that the build did not make, and the Bank A folder for
     -- the master inserts.
-    local outs = eon_out_tracks(tr)
-    local made = eon_w2m_tracks(tr, inst, plan, outs)
+    outs = eon_out_tracks(tr)
+    made = eon_w2m_tracks(tr, inst, plan, outs)
     local asub = find_audio_subfolder(tr)
     -- The Audio folder's own bus comp coming back (flag r): the build has just put a FRESH one on the folder (the bus
     -- comp is ticked by default, the saved choice), between EON Tone and EON Output. Take it off, or the kit is
     -- compressed twice (review 2026-10-12) -- only what this build added: not what the folder held before it (an
     -- Update or a Rebuild keeps the folder), nor the default track template's untouched plugins (Codex audit
     -- 2026-10-13).
-    local fresh_off = {}
+    fresh_off = {}
     if asub then
       local back_rack = false
       for _, item in ipairs(plan) do
@@ -18533,7 +19438,7 @@ function rk_ops.do_wired_to_multiout(outer)
         reaper.GetSetMediaTrackInfo_String(asub, "P_EXT:EON_BUS_FRESH", "", true)
       end
     end
-    local moved, lost, nmaster, npre, banks, auxs, naudio = 0, {}, 0, 0, {}, {}, 0
+    moved, lost, nmaster, npre, banks, auxs, naudio = 0, {}, 0, 0, {}, {}, 0
     for _, item in ipairs(plan) do
       local src = eon_fx_index_any(tr, item.guid)
       local dst
@@ -18550,6 +19455,11 @@ function rk_ops.do_wired_to_multiout(outer)
         elseif af:find("p", 1, true) then
           local o_at = eon_fx_index_of(asub, "eon_output.jsfx")
           if o_at >= 0 then n = o_at end
+        elseif dst ~= asub then
+          -- ahead of the Drum Strip: the build puts the strips on inside its own block now (eon_strips_put,
+          -- 2026-10-27), before this move; the Strip Sync used to append them after it -- the chain stays as it was
+          local ds = eon_fx_index_of(dst, "eon_drum_strip.jsfx")
+          if ds >= 0 then n = ds end
         end
         local nch0 = reaper.GetMediaTrackInfo_Value(dst, "I_NCHAN")
         reaper.TrackFX_CopyToTrack(tr, src, dst, n, true)
@@ -18592,9 +19502,23 @@ function rk_ops.do_wired_to_multiout(outer)
       end
       reaper.GetSetMediaTrackInfo_String(tr, "P_EXT:EON_WIRED_AUDIO", table.concat(keep, " "), true)
     end
-    reaper.PreventUIRefresh(-1)
-    reaper.TrackList_AdjustWindows(false)
-    reaper.Undo_EndBlock("Swing: Wired to Multi-Out (move pad plugins)", -1)
+  end   -- move_now
+
+  rk_ops.do_build_multiout({ wired_off = true, before_build = wired_off_now, in_block = move_now,
+                             on_done = function(ok)   -- wired_off: a refusal says so
+    if not ok then
+      -- Wired still on: nothing changed (a Cancel, or a refusal that said why itself). Off: the build failed inside
+      -- its block, and Ctrl+Z puts everything back.
+      local sfx = -1
+      for i = 0, reaper.TrackFX_GetCount(tr) - 1 do if core.is_swing_fx(tr, i) then sfx = i; break end end
+      if sfx >= 0 and not eon_wired_is_on(tr, sfx) then
+        eon_notice("The Multi-Out build did not complete, so nothing was moved.\n\n" ..
+                   "Ctrl+Z puts back what it changed: Wired on, the Patchbay and your pad plugins as they were.",
+                   "Wired to Multi-Out")
+      end
+      if outer and outer.on_done then outer.on_done(false) end
+      return
+    end
 
     local msg = string.format("Moved %d plugin%s onto the output tracks.",
                               moved, moved == 1 and "" or "s")
@@ -18699,6 +19623,9 @@ function rk_ops.do_macro_learn()
   local macro = math.floor(reaper.gmem_read(b + ML_REQ) or 0)
   if macro < 1 or macro > 8 then reaper.gmem_write(G.CMD, 0) return end
   local sig = ml_touch_sig()
+  -- One listener at a time: a LEARN still waiting on another band (another Swing's editor) is closed as timed out
+  -- before it is replaced -- left at 1, that editor read LISTEN.. for the rest of the session (audit C6, 2026-10-22).
+  if macro_learn and macro_learn.band ~= b then reaper.gmem_write(macro_learn.band + ML_STATE, 3) end
   macro_learn = { tr = tr, fx = fx, band = b, macro = macro,
                   base = sig and sig.key or "", t0 = reaper.time_precise() }
   ml_write_name(b, "")
@@ -18709,7 +19636,10 @@ end
 function eon_macro_learn_tick()
   local L = macro_learn
   if not L then return end
-  if not reaper.ValidatePtr2(0, L.tr, "MediaTrack*") then macro_learn = nil return end
+  if not reaper.ValidatePtr2(0, L.tr, "MediaTrack*") then
+    reaper.gmem_write(L.band + ML_STATE, 3)   -- the band's next owner must not inherit a LISTEN.. (audit C6)
+    macro_learn = nil return
+  end
   if reaper.time_precise() - L.t0 > ML_TIMEOUT then
     reaper.gmem_write(L.band + ML_STATE, 3)
     macro_learn = nil
@@ -18801,9 +19731,23 @@ function eon_is_swing_return(dest)
   return s ~= ""
 end
 
+-- Wired as do_toggle_wired leaves it when its ON branch completes: the switch up AND a Patchbay on the track.
+function eon_wired_is_on(tr, fx)
+  local p_on = eon_param_by_name(tr, fx, "Wired (")
+  return p_on >= 0 and (reaper.TrackFX_GetParam(tr, fx, p_on) or 0) >= 0.5 and eon_find_patchbay(tr) >= 0
+end
+
 function rk_ops.do_multiout_to_wired()
   local tr, fx = find_swing_track()
   if not tr then reaper.gmem_write(G.CMD, 0) return end
+  -- BR_* is SWS, preflighted at boot as a warning only. Unguarded, the send walk below threw on the first send,
+  -- CMD 44 (no stale-CMD fuse) stayed on the bus and every later command waited behind it (audit C1, 2026-10-22).
+  -- Nothing is resolved without it, so nothing can be collapsed: say so and free the mailbox.
+  if not reaper.BR_GetMediaTrackSendInfo_Track then
+    eon_notice("Multi-Out to Wired needs the SWS extension to find Swing's pad tracks. Nothing was changed.\n\n" ..
+               "Install SWS from ReaPack (Extensions) and restart REAPER.", "Multi-Out to Wired")
+    reaper.gmem_write(G.CMD, 0) return
+  end
 
   -- Multi-Out = sends from Swing to child tracks tagged with their pad.
   -- ⚠⚠ THREE buckets, never one. This used to collect EVERY destination into
@@ -19242,7 +20186,7 @@ function rk_ops.do_multiout_to_wired()
     return reaper.GetMediaTrackInfo_Value(a, "IP_TRACKNUMBER") >
            reaper.GetMediaTrackInfo_Value(b, "IP_TRACKNUMBER")
   end)
-  for _, d in ipairs(del) do reaper.DeleteTrack(d) end
+  eon_out_delete(del)   -- each close handed to the track above first: Swing's parent keeps its end (S.12)
 
   -- Swing back on the main mix; the reverb and delay fold inside again.
   reaper.SetMediaTrackInfo_Value(tr, "B_MAINSEND", 1)
@@ -19252,10 +20196,6 @@ function rk_ops.do_multiout_to_wired()
     folder_layout.EnsureSwingParentLayout(tr)
   end
 
-  reaper.PreventUIRefresh(-1)
-  reaper.TrackList_AdjustWindows(false)
-  reaper.Undo_EndBlock("Swing: Multi-Out to Wired", -1)
-
   -- Swing leaves multi-out (companion CMD 6, addressed to this instance) ...
   local inst_id = math.floor(reaper.TrackFX_GetParam(tr, fx, 3) or 0)
   if G.GS_COMPANION_TARGET then reaper.gmem_write(G.GS_COMPANION_TARGET, inst_id) end
@@ -19263,17 +20203,32 @@ function rk_ops.do_multiout_to_wired()
 
   -- ... and enters Wired with the tap on the bus. do_toggle_wired sees the
   -- switch off and no Patchbay, so it takes the ON branch: 38 channels, the
-  -- Patchbay appended LAST -- below every insert just moved -- and the switch.
+  -- Patchbay above the first Bank A / Audio folder plugin recorded in
+  -- EON_WIRED_POST just above (last when there are none), and the switch.
+  -- ONE Ctrl+Z (2026-10-27, the owner's rule for a build and the way back): the tap write and Wired ON land in this
+  -- conversion's block (do_toggle_wired(true) opens no block of its own). They were two more points after it -- the
+  -- tap an "Edit FX parameter" REAPER made for the bare write, Wired ON a block of its own.
   local p_tap = eon_param_by_name(tr, fx, "Wired tap point")
   if p_tap >= 0 then reaper.TrackFX_SetParam(tr, fx, p_tap, 1) end
-  rk_ops.do_toggle_wired()
+  local okw, errw = pcall(rk_ops.do_toggle_wired, true)
+  reaper.PreventUIRefresh(-1)
+  reaper.TrackList_AdjustWindows(false)
+  reaper.Undo_EndBlock("Swing: Multi-Out to Wired", -1)
+  if not okw then error(errw, 0) end
 
   local ntr = npads + (folder_a and 1 or 0) + (asub and 1 or 0)
   for _ in pairs(pairtr) do ntr = ntr + 1 end
+  -- do_toggle_wired returns nothing on its bails (no registry slot, Patchbay not found, the add refused): read the
+  -- outcome off the track, or the summary said "Wired is on" over a kit whose moved plugins hear nothing (audit C7).
   local msg = string.format(
-    "Moved %d plugin%s from %d track%s onto the Swing track and removed the tracks.\n" ..
-    "Wired is on, tap on the bus.",
+    "Moved %d plugin%s from %d track%s onto the Swing track and removed the tracks.\n",
     moved, moved == 1 and "" or "s", ntr, ntr == 1 and "" or "s")
+  if eon_wired_is_on(tr, fx) then
+    msg = msg .. "Wired is on, tap on the bus."
+  else
+    msg = msg .. "Wired could NOT be switched on (the ReaScript console says why), so the moved plugins hear " ..
+      "nothing yet. Switch Wired on from Swing's menu once that is fixed."
+  end
   if nmaster > 0 then
     msg = msg .. string.format("\n\n%d plugin%s from the Bank A folder now sit%s after the Patchbay, after Swing's " ..
       "master section: %s the whole kit -- every bank, the reverb and the delay included -- not only bank A.",
@@ -19363,8 +20318,10 @@ function rk_ops.do_multiout_to_wired()
   eon_notice(msg, "Multi-Out to Wired")
 end
 
+-- ═════════════════════════════════════════════════════════════════════════════
+-- AUTO-COLOR PADS (CMD 23, raised by the EON_Swing_AutoColorPads.lua action)
+-- ═════════════════════════════════════════════════════════════════════════════
 function rk_ops.do_auto_color()
-  local colored = 0
   for i = 0, G.NUM_PADS - 1 do
     -- Read pad name
     local chars = {}
@@ -19378,7 +20335,6 @@ function rk_ops.do_auto_color()
       if hue then
         -- Write color to metadata slot 12
         reaper.gmem_write(G.META_BASE + i * G.META_PP + 12, hue)
-        colored = colored + 1
       end
     end
   end
@@ -19655,7 +20611,11 @@ do
   --     script got a fresh non-canonical twin. Now proven to converge.
   -- 7 = the dock rig ships (EON_Swing_Dock / EON_Steppa_Dock / EON_Dock_Layout /
   --     EON_Swing_Dock_View / EON_Chain_Dock / EON_Dock_Debug), 2026-09-04.
-  local ACTIONS_VER = "7"
+  -- 8 = everything added since 7 and never registered on an updated install
+  --     (2026-10-26): Toggle Pad Inserts, the four Wired actions, Bank A-D /
+  --     Next / Prev, Open Step Sequencer view (EON_View_Seq), Floatter + its
+  --     export.
+  local ACTIONS_VER = "8"
   if reaper.GetExtState("EON_Actions", "registered_ver") ~= ACTIONS_VER then
     local _, bp = reaper.get_action_context()
     local bdir = bp and bp:match("^(.*)[/\\]")
@@ -19700,9 +20660,22 @@ end
 -- so the JSFX reads 0 and treats that as "too old to ask" — which is the honest
 -- answer, because a bridge that cannot say what it supports cannot be trusted to
 -- support anything new. 0 is also what atexit leaves behind.
-EON_BRIDGE_LEVEL = 319           -- 3.0.19. Bump on any release that adds a CMD.
+EON_BRIDGE_LEVEL = 323           -- 3.0.20. Bump on any release that adds a CMD.
+                                 -- 323 (2026-10-27, RR-1): a 99 or 98 keeps the LOCK of the op that raised it
+                                 -- (the post-dispatch release); the load-queue pop waits while a save is in flight; a
+                                 -- save that stops moving is dropped after EON_SAVE_DEAD_S (eon_save_dead_tick).
+                                 -- Swing keeps a 93 on the bus through its re-dump and gates import state 1's 99 / 98
+                                 -- from this level up (rk_swing_ui_state BRIDGE_LEVEL_SAVE_TXN).
+                                 -- 322 (2026-10-27, LIB121 / LIB122): the save's owner cell GS_KIT_SAVE_OWNER, held
+                                 -- through the whole save (eon_save_owner_tick); Swing's save consumers gate on it
+                                 -- from this level up (rk_swing_ui_state swing_save_mine).
+                                 -- 321 (2026-10-26, FU-T): the transport mailbox (SYNC band +61..+63, served every
+                                 -- tick whatever the bus; rk_seq_ui SEQ_UI_TR_LEVEL). CMD 95 stays for older Swings.
                                  -- 319 (2026-10-23): CMD 53 (PRINT SONG, off 97), song ops 16 / 17, SONG +5 / +6,
                                  -- the print owner cell, the printed spans in the map tail, the fixed link.
+                                 -- 320 (2026-10-26): the root-note request's paths (ROOTNOTE_REQ_PSEQ / _PATHS, A2).
+                                 -- 320 (2026-10-26, C3): the chop migration's CMD 86 bank selector (GS_MIGR_BANK,
+                                 -- written only to a JSFX at HS_CAP >= 207; 0 = the old adopt, so Swing needs no gate).
 local GS_BRIDGE_LEVEL = 2636     -- gmem cell (claimed 2026-09-09; 2635 = GS_EXT_MISSING)
 
 -- Every command code this build takes part in -- both the ones it HANDLES and
@@ -19738,9 +20711,9 @@ eon_padcat_adapt_seq = math.floor(reaper.gmem_read(EON_PADCAT_ADAPT) or 0)
 -- filesystem hiccup can never break startup.
 pcall(_eon_sweep_unsaved_store)
 
--- Ensure 32 channels on Swing track at bridge startup
+-- Ensure 32 channels on every Swing track: at bridge startup and on the
+-- heartbeat's periodic check.
 local function ensure_32ch()
-  local lock_id = math.floor(reaper.gmem_read(G.LOCK))
   for tr in core.iter_all_tracks() do
     for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
       if is_swing_fx(tr, fx) then
@@ -20190,9 +21163,10 @@ end
 -- bypasses CMD=52 (future code, edge cases, races), names go stale on
 -- multi-out tracks silently. This hash-debounced poll catches every
 -- pad-name change regardless of how it happened — same idea as
--- refresh_multiout_colors_if_changed (color version, line ~4609).
+-- refresh_multiout_colors_if_changed (the color version).
 --
--- Cost: 16 pads × 16 chars = 256 gmem reads + 16 hash ops per ~33ms.
+-- Cost: 16 pads × 32 chars (PADNAME_LEN) = up to 512 gmem reads and as many
+-- hash steps per ~33ms; each name stops at its first 0 byte.
 -- No-op early-out if hash matches last seen.
 
 local last_pad_name_hash = 0
@@ -20410,10 +21384,17 @@ function refresh_multiout_identity_per_instance()
           -- healed project costs one param write, ever. Stereo instances too:
           -- Wired is the stereo-mode feature, this sits before the sends gate.
           if lens_scan then
+            -- Swing's own parent is a Lens's home in EVERY output mode (2026-10-27). Registered only for Multi-Out
+            -- before, while the all-bank note-name walker below (2026-10-22) counts every slotted Swing as serviced,
+            -- so the revocation pass ran with a Wired or stereo Swing in the project and took its parent's card for a
+            -- stray: two strikes after Multi-Out -> Wired the card was revoked to standalone, an undo point of its own
+            -- on top of the conversion (UndoMap E6). Here the revocation pass links it instead (its home's slot).
+            local lp0 = find_folder_track(tr)
+            if lp0 then lens_parents[lp0] = slot end
             local pb = eon_find_patchbay(tr)
             if pb >= 0 then
               local p_li = eon_param_by_name(tr, pb, "Link Instance")
-              if p_li >= 0 and math.floor(reaper.TrackFX_GetParam(tr, pb, p_li) or 0) ~= inst_id then
+              if p_li >= 0 and math.floor(reaper.TrackFX_GetParam(tr, pb, p_li) or 0) ~= inst_id and not eon_bg_hold() then
                 reaper.TrackFX_SetParam(tr, pb, p_li, inst_id)
               end
             end
@@ -20472,7 +21453,7 @@ function refresh_multiout_identity_per_instance()
               -- already re-asserted elsewhere, which is why only this one drifted.
               if bo >= 0 then
                 local p_oi = eon_param_by_name(asub, bo, "Link Instance")
-                if p_oi >= 0 and math.floor(reaper.TrackFX_GetParam(asub, bo, p_oi) or 0) ~= inst_id then
+                if p_oi >= 0 and math.floor(reaper.TrackFX_GetParam(asub, bo, p_oi) or 0) ~= inst_id and not eon_bg_hold() then
                   reaper.TrackFX_SetParam(asub, bo, p_oi, inst_id)
                 end
               end
@@ -20489,14 +21470,16 @@ function refresh_multiout_identity_per_instance()
               end
               if bt >= 0 then
                 local p_ts = eon_param_by_name(asub, bt, "Link Slot")
-                if p_ts >= 0 and math.floor(reaper.TrackFX_GetParam(asub, bt, p_ts) or -1) ~= slot then
+                -- (each heal here waits while REAPER can redo: eon_bg_hold -- the Tone's re-written link was one of
+                -- the points that emptied the redo list after a build, 2026-10-27)
+                if p_ts >= 0 and math.floor(reaper.TrackFX_GetParam(asub, bt, p_ts) or -1) ~= slot and not eon_bg_hold() then
                   reaper.TrackFX_SetParam(asub, bt, p_ts, slot)
                 end
               end
               if bw >= 0 then
                 local want = slot + G.GS_BC_LINK_ROW_BUS
                 local p_ls = eon_param_by_name(asub, bw, "Link Slot")
-                if p_ls >= 0 and math.floor(reaper.TrackFX_GetParam(asub, bw, p_ls) or -1) ~= want then
+                if p_ls >= 0 and math.floor(reaper.TrackFX_GetParam(asub, bw, p_ls) or -1) ~= want and not eon_bg_hold() then
                   reaper.TrackFX_SetParam(asub, bw, p_ls, want)
                 end
                 -- Stamp the claim. Weld writes neither cell, so they outlive
@@ -20663,7 +21646,9 @@ function refresh_multiout_identity_per_instance()
           -- would take the tab click for a kit change: the loop runs zero times until bank A is back. Nothing
           -- is undone and nothing is lost -- an edit made meanwhile on either side is caught up then, its
           -- version still differing.
-          for s = 0, (eon_slot_bank(slot) == 0 and sends or 0) - 1 do
+          -- No SWS (BR_*): no send resolves, so the loop runs zero times -- unguarded it threw on every third
+          -- tick and cut the rest of the poll body short (audit C1's sibling site, 2026-10-26).
+          for s = 0, (eon_slot_bank(slot) == 0 and reaper.BR_GetMediaTrackSendInfo_Track and sends or 0) - 1 do
             -- P4-2: pad identity comes from the child's P_EXT tag (srcchan
             -- now encodes the pad's OUTPUT routing, which the mirror below
             -- retargets — it no longer identifies the pad).
@@ -20722,7 +21707,12 @@ function refresh_multiout_identity_per_instance()
                     if _lc_wt and cur_col ~= want_col then
                       reaper.SetMediaTrackInfo_Value(dest, "I_CUSTOMCOLOR", want_col)
                     end
-                    if not blank then cst.hue = hue ; cst.s = eff_s ; cst.l = eff_l end
+                    -- A blank pass forgets the band (audit C2, 2026-10-22): the pad that loads next is first sight
+                    -- again and snaps the track forward, even when it comes back with the hue it had before the
+                    -- clear (the same sample, or auto-colour by the same name) -- kept, that hue read as "band
+                    -- stable" and the blank track stayed uncoloured while the pad was coloured.
+                    if not blank then cst.hue = hue ; cst.s = eff_s ; cst.l = eff_l
+                    else cst.hue = nil ; cst.s = nil ; cst.l = nil end
                     if cst.push and (rejected or math.abs(hue - cst.push) <= 0.0025) then
                       cst.push = nil ; cst.push_t = nil
                     end
@@ -20785,7 +21775,11 @@ function refresh_multiout_identity_per_instance()
                         reaper.GetSetMediaTrackInfo_String(dest, "P_NAME", pname, true)
                         _lane_rename_touch()  -- mute the color-adopt gate: SWS re-colors on our rename
                       end
-                      if not blank then cst.nver = nver; cst.nname = pname end
+                      -- Blank: forget the name too (audit C2), or the same name loaded again (a VER that moved
+                      -- with pname == cst.nname) read as a bank round trip and the blank track's "01" went to
+                      -- the pad as a user rename.
+                      if not blank then cst.nver = nver; cst.nname = pname
+                      else cst.nver = nil; cst.nname = nil end
                       if cst.npush and (nm_rejected or pname == cst.npush) then
                         cst.npush = nil ; cst.npush_t = nil
                       end
@@ -20862,7 +21856,15 @@ function refresh_multiout_identity_per_instance()
                   local want_icon = ""
                   if not blank then
                     local tcol = reaper.GetMediaTrackInfo_Value(dest, "I_CUSTOMCOLOR")
-                    want_icon = bridge_icon_for_name(pname, tcol) or ""
+                    -- Resolved once per name + colour (audit C8, 2026-10-22): the categorizer's keyword scan ran
+                    -- for every pad on every pass (~10 Hz) while nothing changed. The guarded apply below still
+                    -- runs every pass, so a user's own icon is still left alone.
+                    local ik = pname .. "|" .. tostring(tcol)
+                    if cst.icon_key ~= ik then
+                      cst.icon_key = ik
+                      cst.icon_want = bridge_icon_for_name(pname, tcol) or ""
+                    end
+                    want_icon = cst.icon_want
                   end
                   if _bridge_icons and _bridge_icons.apply then
                     _bridge_icons.apply(dest, want_icon)
@@ -20989,6 +21991,10 @@ function refresh_stepseq_pairing()
           end
         end
         local cur = math.floor(reaper.TrackFX_GetParam(tr, ss_fx, pair_param) or 0)
+        -- Held while REAPER can redo (eon_bg_hold, 2026-10-27): a write here is an undo point, and one made right after
+        -- an undo empties the redo list (a pick in the PAIR dropdown is the user's own action: not held). Held, the
+        -- effective pairing below is the one in place.
+        if want and cur ~= want and eon_bg_hold() then want = nil end
         if want and cur ~= want then
           reaper.TrackFX_SetParam(tr, ss_fx, pair_param, want)
           -- FIRST pairing of a fresh StepSeq (cur == 0 -> paired). Saved projects
@@ -21128,7 +22134,7 @@ function handle_stepseq_picker_sel()
           if ss_resolve_slot(regid) == want_slot then
             reaper.GetSetMediaTrackInfo_String(sstr, "P_EXT:EON_SS_PAIR",
               reaper.TrackFX_GetFXGUID(tr, fx) .. "|" .. regid, true)
-            refresh_stepseq_pairing()
+            eon_write_now(refresh_stepseq_pairing)   -- the user's pick: never held
             return
           end
         end
@@ -21136,13 +22142,15 @@ function handle_stepseq_picker_sel()
       end
     end
   end
-  refresh_stepseq_pairing()
+  eon_write_now(refresh_stepseq_pairing)   -- the user's pick: never held
 end
 
 -- EON: BANDED StepSeq->Swing mute/solo mirror (identity refactor, final brick).
 -- A PAIRED StepSeq writes its lane M/S into its paired Swing's registry-slot band
--- (EON_StepSeq.jsfx eon_publish_ms): 26020000 + slot*40, [0]=heartbeat, [1]=anysolo,
--- [2..17]=per-pad mute, [18..33]=per-pad solo. Mirror each LIVE band onto that Swing's
+-- (EON_StepSeq.jsfx eon_publish_ms): 26020000 + slot*80, [0]=heartbeat, [1]=anysolo,
+-- [2..17]=per-pad mute, [18..33]=per-pad solo; [40..55] / [56..71] = the REVERSE
+-- pad-mute / pad-solo commands this bridge writes back after a TCP edit (0 none,
+-- 1 set OFF, 2 set ON). Mirror each LIVE band onto that Swing's
 -- own multi-out child tracks -- two StepSeq+Swing pairs no longer collide on the global
 -- 2710-2745 region (which stays, with eon_mirror_stepseq_ms, as the UNPAIRED fallback;
 -- once every StepSeq is paired its heartbeat stalls and that mirror goes quiet).
@@ -22044,14 +23052,15 @@ function eon_fill_tick()
 end
 
 -- Save sidecars by COPYING the source kit file each instance was loaded
--- from. Synchronous (file copy is fast for typical kits, even 200MB).
+-- from, one chunk per defer tick (see the per-save sidecar copies below);
+-- the exit drain, file_copy and eon_inst_compose run a job in one go.
 -- Avoids the gmem multi-window race entirely — we never read kit data
--- from gmem on save. Each instance has a recorded source path tracked
--- by record_kit_source() (called whenever a kit-load happens through
--- the bridge). If no source is recorded for an instance (fresh insert
--- with no kit, or a path we lost track of), the save is skipped — the
--- chunk's truncated fallback covers small kits, and the user can re-
--- load the kit manually to capture it for the next save.
+-- from gmem on save. Each instance's source path is recorded in
+-- kit_sources[guid] whenever a kit-load happens through the bridge. If no
+-- source is recorded for an instance (fresh insert with no kit, or a path
+-- we lost track of), the copy is skipped and the JSFX keeps embedding the
+-- kit in the project chunk (the health tick's sc_ok cell); the user can
+-- re-load the kit manually to capture it for the next save.
 -- Open + validate. Returns a JOB (handles + temp path) or nil, so the copy can
 -- run either in one go or a chunk at a time -- see eon_sc_step / eon_sc_close.
 function eon_sc_open(src_path, dst_path)
@@ -22567,6 +23576,7 @@ local function auto_save_all_sidecars()
   end
   local swings = enumerate_all_swings()
   for _, swing in ipairs(swings) do
+    eon_kit_src_follow(swing.guid, swing.tr)   -- an undone / redone kit load: the restored record (2026-10-27)
     local source_path = eon_backup_source(swing.guid, swing.tr)   -- banks audit N1: the instrument file while banks are mixed
     local dest_path = get_sidecar_path(swing.guid)
     local ok = false
@@ -22644,25 +23654,20 @@ local function auto_save_all_sidecars()
 end
 
 -- Queue a sidecar load for a freshly-detected instance. Tries (in order):
---   1. Project-folder sidecar (<projectpath>/Swing/swing_<inst>.swing)
---   2. Track ExtState (P_EXT:swing_kit_src) — last-seen kit path
---   3. Default 808_v2.swing — for fresh insertions on tracks with no kit
--- Silently skips if all three miss (e.g., fresh insert when 808_v2.swing is
--- also missing — user should never see that, but bridge stays sane).
---
--- Bridge-side 808 fallback exists because the JSFX-side auto-load 808
--- gating (`gmem[LOCK] == 0 && gmem[CMD] == 0 && bridge alive`) can fail
--- silently — if any condition is briefly false during JSFX init, the
--- _auto_load_attempted flag flips to 1 and the JSFX never retries. The
--- bridge has no such gating: if it sees an instance with no kit, it
--- pushes 808 directly via the same kit-load pipeline.
+--   1. Project-folder sidecar (<projectpath>/Swing/swing_<guidtoken>.swing)
+--   1-legacy. The pre-GUID integer-named sidecar (swing_<inst>.swing)
+--   2. The instrument backup's source, else the track ExtState
+--      (P_EXT:swing_kit_src) — last-seen kit path
+-- Silently skips if all miss. There is no bridge-side default-kit fallback
+-- (Path 3 below was removed): a truly fresh instance gets the shipped
+-- default through the JSFX's own auto-load (CMD 22).
 local function queue_sidecar_load_if_present(swing)
   -- "Hit" requires both: file exists AND has at least minimal valid kit
   -- structure (>= 16 bytes — magic 8 + lua_len 8 for v4, or magic
   -- double + format ver double for v1). 0-byte and tiny corrupted
   -- sidecars would otherwise pass the existence probe and then crash
   -- load_kit_v* with a dialog. Rejecting them here lets us fall
-  -- through to Path 2/3.
+  -- through to the next path.
   local function probe(path)
     if not path or path == "" then return false end
     local f = io.open(path, "rb"); if not f then return false end
@@ -22715,6 +23720,82 @@ local function queue_sidecar_load_if_present(swing)
   -- shipped default (Fischer 808). The dead p3 probe that lingered after the
   -- disable — one io.open per repair scan against a kit 3.0 no longer ships —
   -- is gone too.
+end
+
+-- A USER'S KIT LOAD AS ONE REAPER UNDO POINT (2026-10-27, the owner's decision 2). Made when the import has LANDED --
+-- the body pass and every bank pass that follows it, a retry included -- and named "Swing: Load Kit <name>": the
+-- "Dirty: Global" nudge inside the block makes REAPER read Swing (the new kit) together with the folder name and the
+-- lineage the done branch has just written. Ctrl+Z then puts back REAPER's copy from before the load -- the previous
+-- kit, its samples reloaded from their paths or taken from the audio the copy embeds -- and redo the new one. A load
+-- whose body never landed changed nothing and gets no point; one whose project went to a background tab gets none
+-- (the block would land in the wrong project). Sidecar / preserve reloads and the bank passes are not user loads and
+-- never start one (eon_kitpt_start is called from the user branch of the dispatch only). GLOBALS (the 200-local
+-- ceiling); the queue comes in as an argument (a local declared above, swapped per project tab).
+-- The point is made by the OUTPUT TICK's next pass (eon_out_tick, ~0.3 s after the landing), not here: the bank and
+-- split tracks the new kit needs on a Multi-Out build, their Drum Strips and Wired's channels go INSIDE it. Made here,
+-- they came a second later as a point of their own ("Swing: add Bank B: Bebop"), and Ctrl+Z took back only that track
+-- and left the new kit (UndoMap K1, 2026-10-27). eon_kitpt_close_now makes it alone when that pass cannot: a load in
+-- flight, the Swing gone, the next user load starting first.
+eon_kitpt = nil         -- { inst, path, name, bank, proj, landed }
+eon_kitpt_close = nil   -- a landed load waiting for its point: { inst, name, bank, proj, t }
+function eon_kitpt_start(item, kit_name, proj)
+  if eon_kitpt_close then eon_kitpt_close_now() end   -- the previous load's point first, before this one lands
+  local same = eon_kitpt and eon_kitpt.inst == item.inst_id and eon_kitpt.path == item.path
+  eon_kitpt = { inst = item.inst_id, path = item.path, name = kit_name, bank = (item.pass and item.pass.bank) or 0,
+                proj = proj, landed = (same and eon_kitpt.landed) and true or false, auto = item.auto }
+end
+function eon_kitpt_done(cl, ack_val, queue)
+  local kp = eon_kitpt
+  if not (kp and cl and cl.inst_id == kp.inst and cl.path == kp.path) then return end
+  if ack_val and ack_val > 0 and cl.epoch and ack_val == cl.epoch then kp.landed = true end
+  for _, it in ipairs(queue or {}) do
+    if it.inst_id == kp.inst and it.path == kp.path then return end   -- a retry or a bank pass of this load to come
+  end
+  eon_kitpt = nil
+  if not kp.landed then return end
+  if kp.proj and kp.proj ~= tostring(reaper.EnumProjects(-1)) then return end
+  if eon_kitpt_close then eon_kitpt_close_now() end
+  local now = reaper.time_precise()
+  eon_kitpt_close = { inst = kp.inst, name = kp.name, bank = kp.bank, proj = kp.proj, t = now, auto = kp.auto,
+                      redo0 = reaper.Undo_CanRedo2 and (reaper.Undo_CanRedo2(0) or "") or "" }
+  _eon_out_t = math.min(_eon_out_t or 0, now - 0.7)   -- the output tick's next pass in ~0.3 s (Swing publishes its use)
+end
+function eon_kitpt_label(kp)
+  if kp.auto then return ("Swing: set up (first kit %s)"):format(kp.name) end   -- a new instance's first kit
+  return ("Swing: Load Kit %s%s"):format(kp.name, kp.bank > 0 and (" into bank " .. string.char(65 + math.min(3, kp.bank))) or "")
+end
+-- The 3.0.20 release review (2026-10-28, #2): while the point waits, nothing may overtake it. A gesture's point, or a
+-- Ctrl+Z / redo typed in Swing's window (transport actions 7 / 8), makes it FIRST (eon_kitpt_flush): before, the
+-- gesture's point came first and both held the new kit, and a typed Ctrl+Z undid the step BEFORE the load. And a
+-- REAPER undo / redo from the main window in the wait (the redo list moved since the landing: eon_kitpt_stale) DROPS
+-- it -- a "Load Kit" point over a restored state would record that state and throw the user's redo list away.
+function eon_kitpt_stale(kp)
+  local rd = reaper.Undo_CanRedo2 and (reaper.Undo_CanRedo2(0) or "") or ""
+  return rd ~= "" and rd ~= (kp.redo0 or "")
+end
+function eon_kitpt_flush()
+  if not eon_kitpt_close then return end
+  _eon_out_t = 0
+  local ok = pcall(eon_out_tick)   -- the output pass takes it with the new kit's tracks, as it would have
+  if not ok and EON_OUT_BLK_OPEN then
+    EON_OUT_BLK_OPEN = false
+    pcall(reaper.Undo_EndBlock2, 0, "Swing: a pad's output (cut short by an error)", -1)
+  end
+  if eon_kitpt_close then eon_kitpt_close_now() end   -- that pass could not (a load in flight): alone
+end
+-- the point alone (no output pass took it)
+function eon_kitpt_close_now()
+  local kp = eon_kitpt_close
+  eon_kitpt_close = nil
+  if not kp then return end
+  if kp.proj and kp.proj ~= tostring(reaper.EnumProjects(-1)) then return end
+  if eon_kitpt_stale(kp) then return end   -- the user undid in the wait: dropped
+  local sw = eon_rup_swing_by_inst(kp.inst)
+  if not sw then return end
+  reaper.Undo_BeginBlock2(0)
+  pcall(eon_out_poke, sw.tr, sw.fx)   -- the block closes whatever the nudge does
+  reaper.Undo_EndBlock2(0, eon_kitpt_label(kp), -1)
+  eon_kitpt_made = (eon_kitpt_made or 0) + 1   -- read by the rigs
 end
 
 -- Drive the load queue: pop one item at a time, wait for completion before
@@ -23017,6 +24098,7 @@ local function drive_load_queue()
           eon_chgmap_publish_load(current_load.inst_id)
         end
       end
+      eon_kitpt_done(current_load, ack_val, pending_load_queue)   -- a user's kit load: its REAPER undo point once all of it landed
       current_load = nil
     else
       return  -- still in flight, wait
@@ -23046,6 +24128,19 @@ local function drive_load_queue()
     -- overwrites CMD); the flag drops the moment CMD is anything else, so
     -- a REAL failure-98 (JSFX abort, validation error) still holds the pop
     -- exactly as before.
+    -- SAVE IN FLIGHT (bridge level 323, 2026-10-27, RR-1): no load while a
+    -- save, a dev export or a kit-undo dump is in flight. Between two bank
+    -- dumps a Swing older than 3.0.20 leaves the bus at CMD 0 (a 3.0.20 one
+    -- keeps the 93 there), and a load popped into that gap staged into the
+    -- very bands the save was reading while the saver's next CMD 1 wrote over
+    -- its CMD 3. The owner cell is read too: on the tick after a save's 99 is
+    -- taken it still names the saver until eon_save_owner_tick clears it later
+    -- in that tick, and a load refused at once would send its 98 under it (an
+    -- armed importer of level 323 takes no 98 under another's owner). A save
+    -- that stops moving is dropped by eon_save_dead_tick, so this never waits
+    -- for good.
+    if pending_export or kit_undo_job
+       or math.floor(reaper.gmem_read(G.GS_KIT_SAVE_OWNER) or 0) ~= 0 then return end
     local cmd_now = math.floor(reaper.gmem_read(G.CMD) or 0)
     if cmd_now ~= 0 and not (cmd_now == 98 and eon_orphan_abort98) then return end
     -- Retry BACKOFF: a re-enqueued failure may carry a not-before time (AV
@@ -23070,6 +24165,12 @@ local function drive_load_queue()
     -- would then stomp freshly loaded pads). Fills run seconds; queued
     -- loads simply wait their turn.
     if eon_fill_state ~= nil then return end
+    -- A chop migration waiting on its CMD-86 ack: its ack (CMD 0) must not be taken for a free bus, or the load's
+    -- 3 lands before the pump reads the ack and the pump waits out its deadline over somebody else's command
+    -- (audit C4, 2026-10-22). A Clean sample store run holds the pop too: a kit loaded while it collects makes an
+    -- extraction dir no keep-set has seen yet, and the sweep deleted it (audit C10). Both end on their own.
+    if eon_migr_state ~= nil and eon_migr_state.phase == "wait" then return end
+    if eon_clean_state ~= nil then return end
     -- Phase 1 CLOBBER GUARD (kitpipe_storm run-8 catch, 2026-07-17):
     -- GS_KIT_LOAD_REQ is a shared-VALUE mailbox — 1 = incoming request,
     -- 2 = data-ready dispatch signal. Popping while an unconsumed 1 sits in
@@ -23289,17 +24390,18 @@ local function drive_load_queue()
       -- inline kit_req path gives an idle-pipeline load.
       local kit_name = item.path:match("([^/\\]+)%.swing$")
                     or item.path:match("([^/\\]+)$") or "kit"
-      reaper.Undo_BeginBlock()
+      -- 2026-10-27: the load's REAPER undo point is made when the import LANDS (eon_kitpt_done), not around this
+      -- hand-over. The block that sat here closed before the kit reached Swing, so it held the OLD Swing: Ctrl+Z on
+      -- it changed nothing, and later an unrelated Ctrl+Z landed on it holding the old kit (measured D1 / I3).
+      eon_kitpt_start(item, kit_name, current_load.proj)
       load_swing_dispatch(item.path, nil, true, item.pass or { bank = 0, user = true })   -- step 3b: bank A's user pass
-      reaper.Undo_EndBlock("Swing: Load Kit " .. kit_name, -1)
     end
-    -- Trigger the JSFX-side import gate. load_kit_v4 has just written
-    -- CMD=3 + meta + audio; without GS_KIT_LOAD_REQ=2 the JSFX never
-    -- enters kit_import_state=1, so the data sits in gmem unconsumed.
-    -- This mirrors the JSFX-driven CMD 22 path (which sets KIT_LOAD_REQ
-    -- =2 in the kit_req==1 poll branch) — without it, the bridge-side
-    -- 808 fallback never actually delivers, and fresh-insert auto-load
-    -- silently fails. Only signal "data ready" if load_kit_v* actually
+    -- Arm the JSFX-side import. load_kit_v* has just written CMD=3 + meta +
+    -- audio; a current JSFX arms on the GS_LOAD_EPOCH change written last
+    -- below, an older one on GS_KIT_LOAD_REQ=2 (kept as its compat path).
+    -- Without an arm the data sits in gmem unconsumed and no queued load
+    -- (the sidecar reload, CMD 22's auto-load, a deferred kit switch) ever
+    -- delivers. Only signal "data ready" if load_kit_v* actually
     -- wrote CMD=3; on validation/format failure CMD is 98 and we leave
     -- it alone so the JSFX-side error path runs.
     local post_cmd = math.floor(reaper.gmem_read(G.CMD) or 0)
@@ -23385,7 +24487,7 @@ end
 -- Kill-switch: ExtState EON_Bridge/seed_pattern = "0".
 -- Module-GLOBAL (main chunk is at Lua's 200-local ceiling — do not make this
 -- a chunk local).
-function _eon_stereo_setup_for_new_swing(swing)
+function _eon_stereo_setup_for_new_swing(swing, fold)
   if reaper.GetExtState("EON_Bridge", "seed_pattern") == "0" then return end
   local tr = swing.tr
   local _, seeded = reaper.GetSetMediaTrackInfo_String(tr, "P_EXT:EON_PATTERN_SEEDED", "", false)
@@ -23417,8 +24519,9 @@ function _eon_stereo_setup_for_new_swing(swing)
   if root < 0 or root > 112 then root = 36 end
   local lo, hi = root, root + 15
   -- Persistent defer scripts never get an automatic undo point — wrap the
-  -- setup explicitly so Ctrl+Z removes exactly what was added.
-  reaper.Undo_BeginBlock()
+  -- setup explicitly so Ctrl+Z removes exactly what was added. FOLDED (2026-10-28) at an insert: no block, the
+  -- first kit's point a moment later holds it ("Swing: set up (first kit ...)"), one step for the whole insert.
+  if not fold then reaper.Undo_BeginBlock() end
   -- Stereo grid lane tag: same shape EON_DM_BuildStereo writes. Hand-built
   -- JSON — the bridge carries no encoder and every field is a plain scalar.
   reaper.GetSetMediaTrackInfo_String(tr, "P_EXT:EON_DRUM_LANE", string.format(
@@ -23441,10 +24544,39 @@ function _eon_stereo_setup_for_new_swing(swing)
     reaper.SetMediaTrackInfo_Value(tr, "I_HEIGHTOVERRIDE", want_h)
     reaper.TrackList_AdjustWindows(false)
   end
-  reaper.Undo_EndBlock("Swing: stereo grid setup (pattern item + grid tag)", -1)
+  if not fold then reaper.Undo_EndBlock("Swing: stereo grid setup (pattern item + grid tag)", -1) end
+end
+-- The insert's two automatic steps as ONE (2026-10-28). A Swing seen for the first time waits up to 2 s for its own
+-- first-kit request (CMD 22, which only a fresh insert posts); with it, the grid setup runs FOLDED (no block) and the
+-- first kit's point holds both. Without one (an opened project's Swing), it runs as before, its own step. Either order:
+-- the request first marks the id, the first sight then folds at once. GLOBALS (the 200-local ceiling).
+eon_grid_due = {}    -- [inst_id] = { t = when to run it alone }
+eon_grid_fold = {}   -- [inst_id] = true: its first-kit request came before the first sight
+function eon_grid_first_sight(swing)
+  if eon_grid_fold[swing.inst_id] then
+    eon_grid_fold[swing.inst_id] = nil
+    _eon_stereo_setup_for_new_swing(swing, true)
+  else
+    eon_grid_due[swing.inst_id] = { t = reaper.time_precise() + 2.0 }
+  end
+end
+function eon_grid_fold_now(inst_id)
+  if not eon_grid_due[inst_id] then eon_grid_fold[inst_id] = true; return end
+  eon_grid_due[inst_id] = nil
+  local sw = eon_rup_swing_by_inst(inst_id)
+  if sw then _eon_stereo_setup_for_new_swing(sw, true) end
+end
+function eon_grid_due_tick()
+  local now = reaper.time_precise()
+  for id, d in pairs(eon_grid_due) do
+    if now >= d.t then
+      eon_grid_due[id] = nil
+      local sw = eon_rup_swing_by_inst(id)
+      if sw then _eon_stereo_setup_for_new_swing(sw) end
+    end
+  end
 end
 
--- Detect "project just saved" via IsProjectDirty 1→0 transition.
 -- ── P3 store lifecycle: recursive sample-tree copy (Save As) ──────────────
 -- Depth-capped; idempotent (skips same-size existing targets). Module-GLOBAL
 -- (200-local ceiling). Uses the same EnumerateFiles/Subdirectories APIs the
@@ -23482,12 +24614,24 @@ end
 
 -- ── P3 store lifecycle: migrate unsaved-store chops on first save ─────────
 -- Armed by poll_sidecar_events when a save lands with unsaved-store chop dirs
--- present. One instance per tick: copy that guidtok's chop WAVs into
+-- present. One instance at a time: copy that guidtok's chop WAVs into
 -- <proj>/Swing/samples/chops/<guidtok>/, then stage corrected paths (ONLY for
--- pads whose CURRENT staged pad cell points into that unsaved dir — the
--- prefix match keeps other instances' and superseded loads' cells untouched)
--- and post CMD 86 (JSFX adopts strings, no reload, acks CMD=0). Copies are
--- crash-nets even when no rewrite fires: old unsaved paths keep resolving.
+-- pads whose CURRENT path points into that unsaved dir — the prefix match
+-- keeps superseded loads' paths untouched) and post CMD 86 (JSFX adopts
+-- strings, no reload, acks CMD=0). Copies are crash-nets even when no rewrite
+-- fires: old unsaved paths keep resolving.
+-- ⚠ C3 (2026-10-26): the paths come from EACH INSTANCE, bank by bank. The
+-- kick-time snapshot of the shared "Swing"/"pad_path_N" breadcrumbs held only
+-- the last chopper's sixteen paths, so with two Swings chopping into the same
+-- pad number the other one kept its unsaved-store path (dead once the store is
+-- cleared or the project moves), and a chop into bank B masked bank A's while
+-- CMD 86 adopted into the bank on SCREEN. Now: CMD 87 (the rebase / relink /
+-- Clean publish) asks the instance for one bank's live paths (selector 1..4,
+-- HS_CAP >= 206), the rewrite is matched against its own unsaved dir, and CMD
+-- 86 carries the same bank (GS_MIGR_BANK, HS_CAP >= 207). A JSFX at 203..206
+-- gets one round on selector 0 for both (the bank on screen, bank A's layers:
+-- the two sides agree); below 203 (no CMD 87) the kick-time snapshot stays,
+-- read from that instance's own bank-A breadcrumbs.
 eon_migr_state = nil
 
 function eon_migrate_kick()
@@ -23508,21 +24652,97 @@ function eon_migrate_kick()
     end
   end
   if #work == 0 then return end
-  -- Snapshot the current pad source paths ONCE. Source of truth = the
-  -- per-pad ExtState breadcrumbs ("Swing"/"pad_path_N", written by every
-  -- staging route incl. the chop dispatch): stable session state, unlike
-  -- the gmem pad-path cells, which are the block_pitch PCM scratch bus and
-  -- can be stomped by the time the save event fires (observed: a healthy
-  -- session where the prefix match staged 0 because the snapshot read the
-  -- stomped bus). gmem cell kept as fallback for anything that staged
-  -- without writing the breadcrumb.
-  local snap = {}
-  for pad = 0, G.NUM_PADS - 1 do
-    local bc = reaper.GetExtState("Swing", "pad_path_" .. pad)
-    snap[pad] = (bc ~= "" and bc) or read_pad_path_from_gmem(pad)
+  -- A JSFX without CMD 87: snapshot each instance's paths ONCE, here. Its own
+  -- bank-A breadcrumbs (written by every staging route incl. the chop
+  -- dispatch) are stable session state, unlike the gmem pad-path cells, which
+  -- are the block_pitch PCM scratch bus and can be stomped by the time the save
+  -- event fires; the cell stays the fallback for a route that wrote no crumb.
+  if math.floor(reaper.gmem_read(G.HS_CAP) or 0) < 203 then
+    for _, it in ipairs(work) do
+      local snap = {}
+      for pad = 0, G.NUM_PADS - 1 do
+        local bc = eon_crumb_get(it.inst_id, 0, pad)
+        snap[pad] = (bc ~= "" and bc) or read_pad_path_from_gmem(pad)
+      end
+      it.snap = snap
+    end
   end
-  eon_migr_state = { work = work, i = 1, phase = "copy", deadline = 0, snap = snap }
+  eon_migr_state = { work = work, i = 1, phase = "copy", deadline = 0 }
   reaper.ShowConsoleMsg(("[Swing] migrating %d instance(s) of unsaved chops to project store\n"):format(#work))
+end
+
+-- The instance id to address, re-resolved at every dispatch (re-mint safety).
+function eon_migrate_live_id(item)
+  local live_id = item.inst_id
+  if item.tr and reaper.ValidatePtr2(0, item.tr, "MediaTrack*") then
+    local v = math.floor(reaper.TrackFX_GetParam(item.tr, item.fx, 3) or 0)
+    if v > 0 then live_id = v end
+  end
+  return live_id
+end
+
+-- Stage the rewrites of one round into the 86 cells: every pad-main path
+-- (get_pad(pad)) and layer path (get_layer(pad, L), optional) that lives under
+-- THIS instance's unsaved chop dir. Every cell is zeroed first (empty = "leave
+-- the slot alone" on the JSFX side). Returns the count staged.
+function eon_migrate_stage(item, dstdir, get_pad, get_layer, pad_cells, layer_cells)
+  for pad = 0, G.NUM_PADS - 1 do
+    eon_write_gmem_path(pad_cells + pad * 260, "")
+    for L = 0, G.MAX_LAYERS - 1 do
+      eon_write_gmem_path(layer_cells + (pad * G.MAX_LAYERS + L) * 260, "")
+    end
+  end
+  local src = item.src:gsub("\\", "/")
+  local staged = 0
+  local function one(cur, cell, pad)
+    if not cur or cur == "" or cur:gsub("\\", "/"):find(src, 1, true) ~= 1 then return end
+    local base = cur:match("([^/\\]+)$") or ""
+    local dst = dstdir .. "/" .. base
+    if #dst > 258 then
+      -- 260-cell protocol ceiling. eon_write_gmem_path silently maps
+      -- >258 to "" — which USED to count as staged and fail adoption
+      -- with no trace (bit the acceptance harness: its scratchpad
+      -- project dir pushed paths to 271 chars). Deep real-world dirs
+      -- (OneDrive nesting) can hit this too: be loud, don't count it.
+      reaper.ShowConsoleMsg(("[Swing] chop migration: pad %d path too long for rewrite (%d > 258 chars) — pad keeps its unsaved-store path\n")
+        :format(pad, #dst))
+    else
+      eon_write_gmem_path(cell, dst)
+      staged = staged + 1
+    end
+  end
+  for pad = 0, G.NUM_PADS - 1 do
+    one(get_pad(pad), pad_cells + pad * 260, pad)
+    if get_layer then
+      for L = 0, G.MAX_LAYERS - 1 do
+        one(get_layer(pad, L), layer_cells + (pad * G.MAX_LAYERS + L) * 260, pad)
+      end
+    end
+  end
+  return staged
+end
+
+-- Done with this round: the next bank of the instance, else the next instance.
+function eon_migrate_next(st)
+  local item = st.work[st.i]
+  st.wfor = nil
+  if st.sels and st.bi < #st.sels then
+    st.bi = st.bi + 1; st.phase = "pub"
+    if item then item.tries = 0 end
+  else
+    st.i = st.i + 1; st.phase = "copy"; st.sels = nil; st.bi = nil
+  end
+end
+
+-- This round failed: again (the same bank: a fresh publish + restage; the old
+-- route: copy + restage) up to three times, then give it up. True = a retry.
+function eon_migrate_retry(st)
+  local item = st.work[st.i]
+  item.tries = (item.tries or 0) + 1
+  st.wfor = nil
+  if item.tries < 3 then st.phase = st.sels and "pub" or "copy"; return true end
+  eon_migrate_next(st)
+  return false
 end
 
 function eon_migrate_pump()
@@ -23532,13 +24752,42 @@ function eon_migrate_pump()
   if not item then eon_migr_state = nil; return end
   local now = reaper.time_precise()
 
-  if st.phase == "copy" then
+  if st.phase == "copy" or st.phase == "pub" then
+    -- The dispatch below writes CMD 87 / 86 (and, before cap 202, the load band): only onto a free bus, as the
+    -- rebase's arm / pub phases do. Unguarded, a kit load popped in the gap after the previous item's ack had its
+    -- CMD 3 overwritten (audit C4, 2026-10-22). A Clean in progress owns the bus between its publishes too.
+    if math.floor(reaper.gmem_read(G.CMD) or 0) ~= 0 or current_load ~= nil
+       or eon_pp_stream ~= nil or eon_clean_state ~= nil then
+      return
+    end
     local projdir = select(2, reaper.EnumProjects(-1)):match("^(.*)[/\\]") or ""
     if projdir == "" then eon_migr_state = nil; return end
     local dstdir = projdir .. "/Swing/samples/chops/" .. item.tok
-    eon_copy_tree(item.src, dstdir, 3)   -- flat dir; depth headroom harmless
-    -- stage rewrites: pads whose staged cell path lives under item.src
-    local staged = 0
+    local cap = math.floor(reaper.gmem_read(G.HS_CAP) or 0)
+    if st.phase == "copy" then
+      eon_copy_tree(item.src, dstdir, 3)   -- flat dir; depth headroom harmless
+      if cap >= 203 then
+        -- C3: one CMD-87 publish + CMD-86 rewrite per bank of THIS instance.
+        st.sels = (cap >= 207) and { 1, 2, 3, 4 } or { 0 }
+        st.bi = 1; item.tries = 0
+        st.phase = "pub"
+      end
+    end
+    if st.phase == "pub" then
+      -- Nonce discipline as the rebase's: the ACK cell is shared by every CMD-87 producer.
+      eon_reb_nonce = (eon_reb_nonce or 0) + 1
+      st.nonce = eon_reb_nonce
+      st.sel = st.sels[st.bi]
+      reaper.gmem_write(G.REB_PUB_ACK, 0)
+      reaper.gmem_write(G.REB_PUB_BANK_ECHO, -1)
+      reaper.gmem_write(G.REB_PUB_BANK, st.sel)
+      reaper.gmem_write(G.REB_PUB_REQ, st.nonce)
+      reaper.gmem_write(G.GS_PENDING_LOAD_INST, eon_migrate_live_id(item))
+      reaper.gmem_write(G.CMD, 87)
+      st.wfor = 87; st.phase = "wait"; st.deadline = now + 2.0
+      return
+    end
+    -- A JSFX without CMD 87 (below 203): the kick-time snapshot of this instance.
     -- Dedicated staging band (MIGR_PAD_CELLS/MIGR_LAYER_CELLS) when the JSFX
     -- advertises cap >= 202. The legacy home — the KIT_GMEM_AUDIO 260-cell
     -- band — is a SCRATCH BUS (block_pitch streams pad PCM over it for
@@ -23546,53 +24795,55 @@ function eon_migrate_pump()
     -- payloads staged there were stomped before the CMD-86 consume read
     -- them, so the JSFX acked with zero adoptions and the rewrites never
     -- reached the chunk (chunk-decode proof 2026-07-12, 2/2 runs).
-    local mig202 = math.floor(reaper.gmem_read(G.HS_CAP) or 0) >= 202
+    local mig202 = cap >= 202
     local pad_cells = mig202 and G.MIGR_PAD_CELLS or G.AUDIO_BASE
     local layer_cells = mig202 and G.MIGR_LAYER_CELLS or (G.AUDIO_BASE + G.NUM_PADS * 260)
-    -- zero every cell first: empty cell = "leave slot alone" on the JSFX side
-    for pad = 0, G.NUM_PADS - 1 do
-      eon_write_gmem_path(pad_cells + pad * 260, "")
-      for L = 0, G.MAX_LAYERS - 1 do
-        eon_write_gmem_path(layer_cells + (pad * G.MAX_LAYERS + L) * 260, "")
-      end
-    end
-    -- st.snap = staged-cell contents captured at kick time (pre-zero); a pad
-    -- is rewritten only when its snapshot path lives under THIS instance's
-    -- unsaved chop dir.
-    for pad = 0, G.NUM_PADS - 1 do
-      local cur = st.snap and st.snap[pad]
-      if cur and cur ~= "" and cur:find(item.src, 1, true) == 1 then
-        local base = cur:match("([^/\\]+)$") or ""
-        local dst = dstdir .. "/" .. base
-        if #dst > 258 then
-          -- 260-cell protocol ceiling. eon_write_gmem_path silently maps
-          -- >258 to "" — which USED to count as staged and fail adoption
-          -- with no trace (bit the acceptance harness: its scratchpad
-          -- project dir pushed paths to 271 chars). Deep real-world dirs
-          -- (OneDrive nesting) can hit this too: be loud, don't count it.
-          reaper.ShowConsoleMsg(("[Swing] chop migration: pad %d path too long for rewrite (%d > 258 chars) — pad keeps its unsaved-store path\n")
-            :format(pad, #dst))
-        else
-          eon_write_gmem_path(pad_cells + pad * 260, dst)
-          staged = staged + 1
-        end
-      end
-    end
+    local snap = item.snap or st.snap or {}
+    local staged = eon_migrate_stage(item, dstdir, function(pad) return snap[pad] end, nil, pad_cells, layer_cells)
     if staged > 0 then
       st.staged = staged
       st.mig202 = mig202
       reaper.gmem_write(G.MIGR_ADOPTED, -1)  -- JSFX echoes the real count before its ack
-      -- re-resolve target id at dispatch (re-mint safety)
-      local live_id = item.inst_id
-      if item.tr and reaper.ValidatePtr2(0, item.tr, "MediaTrack*") then
-        local v = math.floor(reaper.TrackFX_GetParam(item.tr, item.fx, 3) or 0)
-        if v > 0 then live_id = v end
-      end
-      reaper.gmem_write(G.GS_PENDING_LOAD_INST, live_id)
+      reaper.gmem_write(G.GS_PENDING_LOAD_INST, eon_migrate_live_id(item))
       reaper.gmem_write(G.CMD, 86)
-      st.phase = "wait"; st.deadline = now + 2.0
+      st.wfor = 86; st.phase = "wait"; st.deadline = now + 2.0
     else
       st.i = st.i + 1   -- copies done; nothing to rewrite for this instance
+    end
+  elseif st.phase == "wait" and st.wfor == 87 then
+    -- Payload complete = the ACK echoes our nonce (written before the CMD ack).
+    if math.floor(reaper.gmem_read(G.REB_PUB_ACK) or 0) == st.nonce
+       and math.floor(reaper.gmem_read(G.CMD) or 0) == 0 then
+      local cap = math.floor(reaper.gmem_read(G.HS_CAP) or 0)
+      if cap >= 206 and math.floor(reaper.gmem_read(G.REB_PUB_BANK_ECHO) or -1) ~= st.sel then
+        eon_migrate_retry(st)   -- not the bank asked for: never rewrite from it
+        return
+      end
+      local projdir = select(2, reaper.EnumProjects(-1)):match("^(.*)[/\\]") or ""
+      if projdir == "" then eon_migr_state = nil; return end
+      local dstdir = projdir .. "/Swing/samples/chops/" .. item.tok
+      local staged = eon_migrate_stage(item, dstdir,
+        function(pad) return eon_read_gmem_path(G.REB_PAD_CELLS + pad * 260) end,
+        function(pad, L) return eon_read_gmem_path(G.REB_LAYER_CELLS + (pad * G.MAX_LAYERS + L) * 260) end,
+        G.MIGR_PAD_CELLS, G.MIGR_LAYER_CELLS)
+      if staged > 0 then
+        st.staged = staged
+        st.mig202 = true
+        reaper.gmem_write(G.MIGR_ADOPTED, -1)  -- JSFX echoes the real count before its ack
+        reaper.gmem_write(G.MIGR_BANK, cap >= 207 and st.sel or 0)   -- the bank the paths came from (one-shot)
+        reaper.gmem_write(G.GS_PENDING_LOAD_INST, eon_migrate_live_id(item))
+        reaper.gmem_write(G.CMD, 86)
+        st.wfor = 86; st.deadline = now + 2.0
+      else
+        eon_migrate_next(st)   -- nothing of this bank lives in the unsaved store
+      end
+    elseif now > st.deadline then
+      if math.floor(reaper.gmem_read(G.CMD) or 0) == 87 then reaper.gmem_write(G.CMD, 0) end   -- only OUR 87 (C4)
+      reaper.gmem_write(G.REB_PUB_BANK, 0)   -- not consumed: the next producer must not inherit it
+      if not eon_migrate_retry(st) then
+        reaper.ShowConsoleMsg("[Swing] chop migration: CMD-87 publish timeout for inst " ..
+          tostring(item.inst_id) .. " after retries (files copied; that bank's paths unchanged)\n")
+      end
     end
   elseif st.phase == "wait" then
     local c = math.floor(reaper.gmem_read(G.CMD) or -1)
@@ -23603,18 +24854,15 @@ function eon_migrate_pump()
       -- the pre-band bug shipped exactly that false "ack" for a week).
       local adopted = math.floor(reaper.gmem_read(G.MIGR_ADOPTED) or -1)
       if st.mig202 and adopted < (st.staged or 1) then
-        local item3 = st.work[st.i]
-        item3.tries = (item3.tries or 0) + 1
-        if item3.tries < 3 then
+        local tries = (item.tries or 0) + 1
+        if eon_migrate_retry(st) then
           reaper.SetExtState("EON_Bridge", "dbg_86_result",
-            ("short%d/%d-retry%d@%d"):format(adopted, st.staged or 0, item3.tries, os.time()), false)
-          st.phase = "copy"
+            ("short%d/%d-retry%d@%d"):format(adopted, st.staged or 0, tries, os.time()), false)
         else
           reaper.SetExtState("EON_Bridge", "dbg_86_result",
             ("SHORT%d/%d@%d"):format(adopted, st.staged or 0, os.time()), false)
           reaper.ShowConsoleMsg(("[Swing] chop migration: CMD-86 adopted %d of %d staged paths after retries\n")
             :format(math.max(adopted, 0), st.staged or 0))
-          st.i = st.i + 1; st.phase = "copy"
         end
       else
         -- Full adoption (or legacy build with no echo). The consume also set
@@ -23622,31 +24870,31 @@ function eon_migrate_pump()
         -- so the rewrites reach the next save.
         reaper.SetExtState("EON_Bridge", "dbg_86_result",
           ("ack%d/%d@%d"):format(math.max(adopted, 0), st.staged or 0, os.time()), false)
-        st.i = st.i + 1; st.phase = "copy"
+        eon_migrate_next(st)
       end
     elseif now > st.deadline then
       -- CMD must be cleared or drive_load_queue's pop condition (cmd==0)
-      -- wedges behind the orphaned 86.
-      reaper.gmem_write(G.CMD, 0)
+      -- wedges behind the orphaned 86 -- but only OUR 86, as every sibling
+      -- pump checks: a 3 or a JSFX command on the bus by now is someone
+      -- else's, and a 0 written over a load's 3 read as "import done" (audit C4).
+      if math.floor(reaper.gmem_read(G.CMD) or 0) == 86 then reaper.gmem_write(G.CMD, 0) end
+      if st.sel then reaper.gmem_write(G.MIGR_BANK, 0) end   -- not consumed: never left armed for a later 86
       -- Migration usually runs seconds after a project (re)open, and a
       -- reopened instance boots on a fresh counter id before re-identifying
       -- to its serialized id — during that window the JSFX gate
       -- (PENDING == instance_id) can never match and the dispatch times out
       -- (observed live: dbg_86_result=TIMEOUT with correct staging). Retry:
-      -- the copy phase is idempotent, re-stages the cells (they're a scratch
-      -- bus), and re-resolves the live id — by the 2nd try identity has
-      -- settled.
-      local item2 = st.work[st.i]
-      item2.tries = (item2.tries or 0) + 1
-      if item2.tries < 3 then
+      -- the publish / copy is idempotent, re-stages the cells (the old
+      -- route's are a scratch bus), and re-resolves the live id -- by the
+      -- 2nd try identity has settled.
+      local tries = (item.tries or 0) + 1
+      if eon_migrate_retry(st) then
         reaper.SetExtState("EON_Bridge", "dbg_86_result",
-          "retry" .. item2.tries .. "@" .. tostring(os.time()), false)
-        st.phase = "copy"
+          "retry" .. tries .. "@" .. tostring(os.time()), false)
       else
         reaper.SetExtState("EON_Bridge", "dbg_86_result", "TIMEOUT@" .. tostring(os.time()), false)
         reaper.ShowConsoleMsg("[Swing] chop migration: CMD-86 ack timeout for inst " ..
-          tostring(item2.inst_id) .. " after retries (files copied; paths unchanged)\n")
-        st.i = st.i + 1; st.phase = "copy"
+          tostring(item.inst_id) .. " after retries (files copied; paths unchanged)\n")
       end
     end
   end
@@ -23713,7 +24961,8 @@ function eon_rebase_pump()
   if (st.phase == "arm" or st.phase == "pub")
      and (math.floor(reaper.gmem_read(G.CMD) or 0) ~= 0
           or current_load ~= nil or #pending_load_queue > 0
-          or eon_migr_state ~= nil or eon_pp_stream ~= nil) then
+          or eon_migr_state ~= nil or eon_pp_stream ~= nil
+          or eon_clean_state ~= nil) then   -- a Clean owns CMD 87 + the REB band between its publishes (audit C10)
     return
   end
 
@@ -23991,11 +25240,15 @@ function eon_sidecar_ensure_ok(swing)
   if eon_backup_stale(swing.tr) then return false end
   local dest = get_sidecar_path(swing.guid)
   if not dest then return false end          -- unsaved project: no sidecar home
+  -- An undone or redone kit load moved the record (2026-10-27): the copy is refreshed from the restored source before
+  -- any verdict -- a size that happens to match would otherwise pass the stale copy.
+  eon_kit_src_follow(swing.guid, swing.tr)
+  local moved = eon_kit_src_moved[swing.guid]
   -- banks audit N1: the instrument file while the banks hold different kits (never fall back to the kit then:
   -- the kit file is not the instrument)
   local bsrc = eon_backup_src(swing.tr)
   local src = bsrc ~= "" and bsrc or kit_sources[swing.guid]
-  if eon_sidecar_plausible(dest) then
+  if eon_sidecar_plausible(dest) and not moved then
     -- Present -- but is it the CURRENT kit? A plausible recorded source of a
     -- different size means a kit landed since this copy was made and the
     -- project has not been saved yet. The JSFX writes a marker-only save on
@@ -24014,6 +25267,7 @@ function eon_sidecar_ensure_ok(swing)
     -- a named project (the refresh above), and ShowConsoleMsg would pop the
     -- console window at a customer each time.
     eon_load_report(("sidecar written: %s <- %s"):format(dest, src))
+    eon_kit_src_moved[swing.guid] = nil   -- the copy follows the restored source now
     return true
   end
   return false
@@ -24023,6 +25277,10 @@ function eon_health_tick()
   -- Kill switch for acceptance probes that need exclusive use of the CMD-87
   -- channel (ExtState EON_Bridge/health_tick = "0").
   if reaper.GetExtState("EON_Bridge", "health_tick") == "0" then return end
+  -- A Clean sample store run owns the CMD-87 channel while it collects. It used to say so by parking this ExtState
+  -- at "0" and restoring it at its finish, so a bridge that stopped mid-clean left the health tick off until REAPER
+  -- restarted (audit C9, 2026-10-22). The Lua state dies with the bridge.
+  if eon_clean_state ~= nil then return end
   -- Phase 4: LOADS OUTRANK HEALTH TELEMETRY. The load queue's pop gate
   -- waits for CMD==0, so a burst of health 87 publishes can starve a
   -- pending load of the shared CMD cell (caught as a ~1% strict-seq flake:
@@ -24118,17 +25376,22 @@ end
 -- which retires the banner by itself. GLOBALS (200-local ceiling).
 eon_relink_state = nil
 
--- Depth-capped recursive case-insensitive basename search. Collects each
--- directory's listing BEFORE recursing (EnumerateFiles keeps one cache per
--- path — don't interleave parent/child enumeration).
-function eon_relink_find(dir, base_lower, depth)
-  if depth > 6 then return nil end
+-- Depth-capped case-insensitive basename index of the chosen folder, walked ONCE per relink (audit C5, 2026-10-22:
+-- the pump searched the whole tree again for every dead path, up to 80 walks in one defer tick). Lowercased
+-- basename -> path, depth-first with a dir's files before its sub-dirs and the first hit kept: the file the old
+-- per-path search returned. Collects each directory's listing BEFORE recursing (EnumerateFiles keeps one cache
+-- per path -- don't interleave parent/child enumeration).
+function eon_relink_index(dir, depth, map)
+  map = map or {}
+  depth = depth or 0
+  if depth > 6 then return map end
   reaper.EnumerateFiles(dir, -1)
   local i = 0
   while true do
     local fn = reaper.EnumerateFiles(dir, i)
     if not fn then break end
-    if fn:lower() == base_lower then return dir .. "/" .. fn end
+    local k = fn:lower()
+    if not map[k] then map[k] = dir .. "/" .. fn end
     i = i + 1
   end
   local subs = {}
@@ -24140,11 +25403,8 @@ function eon_relink_find(dir, base_lower, depth)
     subs[#subs + 1] = sub
     i = i + 1
   end
-  for _, sub in ipairs(subs) do
-    local hit = eon_relink_find(dir .. "/" .. sub, base_lower, depth + 1)
-    if hit then return hit end
-  end
-  return nil
+  for _, sub in ipairs(subs) do eon_relink_index(dir .. "/" .. sub, depth + 1, map) end
+  return map
 end
 
 function eon_relink_kick(inst_id, folder)
@@ -24177,7 +25437,6 @@ function _eon_cln_parent(p) return (_eon_cln_norm(p):match("^(.*)/[^/]*$")) or "
 
 function _eon_clean_finish(st, msg)
   if st.waiting and math.floor(reaper.gmem_read(G.CMD) or 0) ~= 87 then reaper.gmem_write(G.REB_PUB_BANK, 0) end   -- never leave the selector armed
-  reaper.SetExtState("EON_Bridge", "health_tick", "", false)   -- restore the tick
   reaper.SetExtState("EON_Bridge", "clean_store_result", msg, false)
   reaper.ShowConsoleMsg("[EON store] clean: " .. msg .. "\n")
   if not st.noui then eon_notice("Clean sample store:\n\n" .. msg, "EON Swing") end
@@ -24234,7 +25493,8 @@ function eon_clean_store_kick()
   -- yielding a degenerate key that could never match the keep-set.
   local store_real = (projfn:match("(.*[/\\])") .. "Swing/samples"):gsub("\\", "/")
   local store = _eon_cln_norm(store_real)
-  reaper.SetExtState("EON_Bridge", "health_tick", "0", false)   -- own the CMD-87 channel
+  -- Owning the CMD-87 channel = eon_clean_state set: the health tick, the load pop, the migration, the rebase and
+  -- the relink all hold while it is (audits C9 / C10).
   eon_clean_state = { phase = "collect", noui = noui, store = store,
     store_real = store_real,
     swings = enumerate_all_swings(), si = 1, b = 1, keep = {}, nonce = 0,
@@ -24268,6 +25528,11 @@ function eon_clean_pump()
     -- into bank C lost its folder, a bank B chop lost its slices for good. Ask for bank st.b (1..4 = A..D) through
     -- the selector, check the JSFX says it honoured that bank, then the next bank; the next Swing after bank D.
     if not st.waiting then
+      -- this instance's path counter before its first publish: the sweep refuses if it moved (audit C10)
+      if st.b == 1 then
+        st.gens = st.gens or {}
+        st.gens[slot] = math.floor(reaper.gmem_read(G.REB_SLOT_BASE + slot * G.REB_SLOT_STRIDE) or 0)
+      end
       st.nonce = (eon_reb_nonce or 0) + 1; eon_reb_nonce = st.nonce
       reaper.gmem_write(G.REB_PUB_ACK, 0)
       reaper.gmem_write(G.REB_PUB_BANK_ECHO, -1)
@@ -24330,6 +25595,23 @@ function eon_clean_pump()
     st.phase = "sweep"; return
 
   elseif st.phase == "sweep" then
+    -- fail SAFE (audit C10, 2026-10-22): the keep-set is a snapshot taken one instance at a time over seconds. A
+    -- path that changed since (a load, a pad drop, a chop -- each moves the instance's path counter), a chop still
+    -- writing its slices, or a Swing that was not there when the collect began, may need a dir the snapshot never
+    -- saw: delete nothing.
+    local changed = current_load ~= nil or eon_pp_stream ~= nil or eon_chop_state ~= nil
+    for slot, g in pairs(st.gens or {}) do
+      if math.floor(reaper.gmem_read(G.REB_SLOT_BASE + slot * G.REB_SLOT_STRIDE) or 0) ~= g then changed = true end
+    end
+    local known = {}
+    for _, sw in ipairs(st.swings) do known[sw.inst_id] = true end
+    for _, sw in ipairs(enumerate_all_swings()) do
+      if not known[sw.inst_id] then changed = true end
+    end
+    if changed then
+      return _eon_clean_finish(st, "aborted: Swing's samples changed while the clean ran (a load, a chop or a new " ..
+        "Swing) — nothing deleted. Run it again.")
+    end
     local removed, kept = 0, 0
     for _, sub in ipairs({ "kits", "chops" }) do
       -- Real case for enumeration and removal; the clamp below still compares
@@ -24353,8 +25635,14 @@ function eon_clean_pump()
             files[#files + 1] = fn; k = k + 1
           end
           for _, fn in ipairs(files) do os.remove(dir .. "/" .. fn) end
-          removed = removed + 1
-          reaper.ShowConsoleMsg("[EON store] clean: reclaimed " .. dir .. "\n")
+          -- The dir itself goes too where os.remove can take an empty dir (POSIX rmdir semantics; on Windows it
+          -- may refuse, and the empty husk stays). An empty husk is no reclaim: counted, it was "reclaimed" again
+          -- by every later Clean (audit C11). Sub-dirs are still not walked.
+          os.remove(dir)
+          if #files > 0 then
+            removed = removed + 1
+            reaper.ShowConsoleMsg("[EON store] clean: reclaimed " .. dir .. "\n")
+          end
         else
           kept = kept + 1
         end
@@ -24373,7 +25661,8 @@ function eon_relink_pump()
   if st.phase == "pub"
      and (math.floor(reaper.gmem_read(G.CMD) or 0) ~= 0
           or current_load ~= nil or #pending_load_queue > 0
-          or eon_migr_state ~= nil or eon_rebase_state ~= nil or eon_pp_stream ~= nil) then
+          or eon_migr_state ~= nil or eon_rebase_state ~= nil or eon_pp_stream ~= nil
+          or eon_clean_state ~= nil) then   -- a Clean owns CMD 87 + the REB band between its publishes (audit C10)
     return
   end
 
@@ -24410,7 +25699,8 @@ function eon_relink_pump()
           local p = eon_read_gmem_path(src)
           if p ~= "" and not eon_file_exists(p) then
             local base = (p:match("([^/\\]+)$") or ""):lower()
-            local hit = base ~= "" and eon_relink_find(st.folder, base, 0) or nil
+            if base ~= "" and not st.index then st.index = eon_relink_index(st.folder) end   -- once (audit C5)
+            local hit = base ~= "" and st.index[base] or nil
             if hit and #hit <= 258 then
               local dst = (L < 0) and (G.MIGR_PAD_CELLS + pad * 260)
                                   or (G.MIGR_LAYER_CELLS + (pad * G.MAX_LAYERS + L) * 260)
@@ -24534,7 +25824,9 @@ local function poll_sidecar_events()
       local renamed = false
       if rec then
         local before = rec.swings or {}
-        renamed = (#before == #swings)
+        -- No Swings on either side proves nothing (audit C12): two Swing-less projects matched vacuously, so
+        -- opening another file into this tab ran as a Save As and copied the old folder's sample store over.
+        renamed = (#swings > 0 and #before == #swings)
         if renamed then
           for _, a in ipairs(before) do
             local hit = false
@@ -24622,9 +25914,10 @@ local function poll_sidecar_events()
       if reaper.GetExtState("EON_Bridge", "openload_reload") ~= "0" then  -- reload ON: large kits (909/808_v2) exceed the @serialize FX-chunk ceiling & truncate; sidecar reload is their ONLY recovery. Disable with ExtState "0".
         queue_sidecar_load_if_present(swing)
       end
-      _eon_stereo_setup_for_new_swing(swing)
+      eon_grid_first_sight(swing)
     end
   end
+  eon_grid_due_tick()
 
   -- ── Audio-repair trigger ────────────────────────────────────────────
   -- JSFX writes GS_AUDIO_REPAIR_REQ = its instance_id when it detects
@@ -24674,7 +25967,17 @@ local function poll_sidecar_events()
         ))
       end
       primed_instances[repair_inst] = true
-      queue_sidecar_load_if_present(repair_swing)
+      -- A whole-instrument load for this instance still WAITING in the queue (no bank `pass`: those fill one bank)
+      -- reloads every pad, so it repairs this one too: queue nothing more. Since 2026-10-27 every instance a restore
+      -- flagged posts its own request (one after the other; the JSFX's swing_ar_post), and a project whose big kits
+      -- all truncate on open already has each one's open-time sidecar load queued -- without this each would load
+      -- twice. A load already IN FLIGHT does not count: the restore may have landed in the middle of it. (A user's
+      -- kit waiting in the queue is no longer followed by the old sidecar over it either.)
+      local waiting = false
+      for _, it in ipairs(pending_load_queue) do
+        if it.inst_id == repair_inst and not it.pass then waiting = true; break end
+      end
+      if not waiting then queue_sidecar_load_if_present(repair_swing) end
     end
   end
 
@@ -24795,9 +26098,16 @@ local function poll_sidecar_events()
     -- export, a kit-undo dump, a migration and an OPEN DIALOG (eon_dlg.busy -- the
     -- styled forms park 97 while they are up and set pending_export only on OK)
     -- count as the channel legitimately owned.
+    -- 93 (level 323, RR-1): a 3.0.20 Swing keeps the "dump the next bank" on the
+    -- bus through its re-dump, so a bridge that restarted mid-walk left a 93 that
+    -- no pending export owns any more: it ends in 98 like the other parked codes
+    -- (a save of this bridge that stops moving is ended by eon_save_dead_tick).
     if current_load or eon_pp_stream or _eon_autoexport or _eon_layer.export
        or (eon_padpcm and eon_padpcm.busy())
-       or pending_export or kit_undo_job or eon_migr_state
+       or pending_export or kit_undo_job
+       -- a migration owns the bus only while it waits on its 86: between items it waits for a FREE bus (audit C4),
+       -- so standing the fuse down then would leave a stuck code and the migration waiting on each other for ever
+       or (eon_migr_state and eon_migr_state.phase == "wait")
        or (eon_dlg and eon_dlg.busy and eon_dlg.busy()) then
       _eon_cmd_wd.v = -1     -- channel legitimately owned; re-latch when free
     elseif cmd_now ~= _eon_cmd_wd.v then
@@ -24807,7 +26117,7 @@ local function poll_sidecar_events()
         or cmd_now == 63 or cmd_now == 64
         or cmd_now == 87 or cmd_now == 88 or cmd_now == 89
         or cmd_now == 98 or cmd_now == 99
-        or cmd_now == 97 or cmd_now == 11 or cmd_now == 85 or cmd_now == 86 then
+        or cmd_now == 97 or cmd_now == 11 or cmd_now == 85 or cmd_now == 86 or cmd_now == 93 then
       local held = reaper.time_precise() - _eon_cmd_wd.t
       if cmd_now == 3 and held > 15.0 then
         reaper.gmem_write(G.CMD, 98)
@@ -24822,7 +26132,7 @@ local function poll_sidecar_events()
         _eon_cmd_wd.v = -1
       elseif cmd_now ~= 3 and held > ((cmd_now == 98 or cmd_now == 99) and 5.0 or 10.0) then
         -- A parked code ends in 98, not 0: the JSFX that armed a state for it resets.
-        local parked = (cmd_now == 97 or cmd_now == 11 or cmd_now == 85 or cmd_now == 86)
+        local parked = (cmd_now == 97 or cmd_now == 11 or cmd_now == 85 or cmd_now == 86 or cmd_now == 93)
         reaper.gmem_write(G.CMD, parked and 98 or 0)
         -- A stale 63/64 may carry an armed name-adopt flag (fill staged it,
         -- no consumer took it). Drop it with the command, or the NEXT
@@ -24847,6 +26157,7 @@ end
 -- eon_fx_float_visible are globals; GS_BROWSER_OPEN / core are upvalues.
 _eon_tog   = nil
 _eon_tog_t = 0
+_eon_tog_ss = nil   -- the StepSeq FX the toolbar's lit state reads, cached by project state
 function eon_update_toggle_states()
   local now = reaper.time_precise()
   if now < _eon_tog_t then return end
@@ -24878,12 +26189,24 @@ function eon_update_toggle_states()
           local hb = tonumber(reaper.GetExtState("Swing", "padfx_heartbeat")) or 0
           return (os.time() - hb) < 3 and 1 or 0 end },
       { id = rid("EON_Swing_ToggleStepSeq.lua"), last = -1, get = function()
-          for tr in core.iter_all_tracks() do
-            local nfx, fx = reaper.TrackFX_GetCount(tr), 0
-            while fx < nfx do
-              if is_stepseq_fx(tr, fx) and eon_fx_float_visible(tr, fx) then return 1 end
-              fx = fx + 1
+          -- The StepSeq FX are found by a walk of every FX (a string call each) only when the project changes
+          -- (GetProjectStateChangeCount, the project, or 2 s on -- the Swing roster's rule); the 4 Hz check reads
+          -- just their floats (audit C13, 2026-10-22).
+          local proj, pcc, now = reaper.EnumProjects(-1), reaper.GetProjectStateChangeCount(0), reaper.time_precise()
+          local c = _eon_tog_ss
+          if not (c and c.proj == proj and c.pcc == pcc and now - c.t < 2.0) then
+            c = { proj = proj, pcc = pcc, t = now, list = {} }
+            for tr in core.iter_all_tracks() do
+              local nfx, fx = reaper.TrackFX_GetCount(tr), 0
+              while fx < nfx do
+                if is_stepseq_fx(tr, fx) then c.list[#c.list + 1] = { tr = tr, fx = fx } end
+                fx = fx + 1
+              end
             end
+            _eon_tog_ss = c
+          end
+          for _, e in ipairs(c.list) do
+            if reaper.ValidatePtr2(0, e.tr, "MediaTrack*") and eon_fx_float_visible(e.tr, e.fx) then return 1 end
           end
           return 0 end },
     }
@@ -24998,12 +26321,223 @@ function eon_pcm_consume_now()
   return false
 end
 
+-- STEP SEQUENCER transport presses (FU-T, 2026-10-26; the owner: "STOP always works, even mid-load"). Swing's toolbar
+-- (|< PLAY STOP, the loop icon without SONG) and its Space key post an action: 1 play, 2 stop, 3 toggle repeat,
+-- 4 record, 5 go to the project start, 6 play / stop. Two roads, one runner: CMD 95 on the kit bus (a Swing older than
+-- level 321, or one with no registry slot) and the TRANSPORT MAILBOX in each Swing's slot of the SYNC band
+-- (26030000 + slot x 64): +61 the press counter (bumped LAST), +62 / +63 the action of an even / odd press. The mailbox
+-- is served at the TOP of every tick, before the bus is read: a kit load holds CMD and LOCK for its whole length and a
+-- press on the bus would wait it out (it was dropped). Per slot, so two Swings pressing in one tick both run; the
+-- two-cell ring keeps two presses of one Swing in one tick; a longer stall (more than two) runs the LAST two, in order.
+-- A slot's first sighting (this bridge's start) is its baseline: nothing pressed before the bridge ran is replayed.
+-- GLOBALS (the 200-local ceiling).
+-- 7 / 8 (2026-10-27, the owner): REAPER's undo / redo, for Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y typed into Swing's window
+-- (with "send all keyboard input to plug-in" the keys reach Swing, not REAPER; Swing_ReaKit swing_rup_keys).
+EON_SEQ_TR_IDS = { [1] = 1007, [2] = 1016, [3] = 1068, [4] = 1013, [5] = 40042, [6] = 40044, [7] = 40029, [8] = 40030 }
+EON_SEQ_TR_BASE, EON_SEQ_TR_STRIDE, EON_SEQ_TR_SLOTS = 26030000, 64, 16   -- EON_SS_SYNC_BASE / _STRIDE, the 16 registry slots
+EON_SEQ_TR_REQ, EON_SEQ_TR_ACT = 61, 62                                     -- SEQ_UI_TR_REQ / SEQ_UI_TR_ACT (rk_seq_ui)
+function eon_seq_transport_run(act)
+  local id = EON_SEQ_TR_IDS[act]
+  if id and (act == 7 or act == 8) and eon_kitpt_close then eon_kitpt_flush() end   -- the waiting kit point first
+  if id then reaper.Main_OnCommand(id, 0) end
+  return id
+end
+function eon_seq_transport_tick()
+  eon_seq_tr_last = eon_seq_tr_last or {}
+  for slot = 0, EON_SEQ_TR_SLOTS - 1 do
+    local b = EON_SEQ_TR_BASE + slot * EON_SEQ_TR_STRIDE
+    local n = math.floor((reaper.gmem_read(b + EON_SEQ_TR_REQ) or 0) + 0.5)
+    local last = eon_seq_tr_last[slot]
+    eon_seq_tr_last[slot] = n
+    if last ~= nil and n ~= last then
+      if n < last then last = 0 end   -- the cell went back (a cleared band): count from 0
+      for k = math.max(last + 1, n - 1), n do
+        eon_seq_transport_run(math.floor((reaper.gmem_read(b + EON_SEQ_TR_ACT + k % 2) or 0) + 0.5))
+      end
+    end
+  end
+end
+
+-- SWING'S OWN EDITS AS REAPER UNDO POINTS (2026-10-27, the owner's decision 1: "Ctrl+Z also undoes Swing's own
+-- edits", one point per FINISHED gesture, named so the user knows what it was). Swing decides WHEN (rk_drumkit_dsp
+-- swing_rup_*: a gesture's end, a sample landed, a rename committed, a bank switch, Clear All / New Kit, its own UNDO /
+-- REDO) and posts the words into its row of the EON_RUP mailbox (Swing_ReaKit.jsfx EON_RUP_BASE, registry slot x 8:
+-- +0 SEQ bumped LAST, +1 KIND, +2 A, +3 B, +4 C, +5 how many fields changed, +6 requests merged; +7 SERVED, this
+-- bridge's echo of the SEQ it served). For a SEQ that moved: one undo block around the "Dirty: Global" nudge
+-- (eon_out_poke; wiki 6.23: REAPER reads Swing's state again, so its stored copy is current and the point is kept),
+-- named from the words. Served at the top of every tick, before the kit bus, like the transport mailbox: a load
+-- holding CMD must not hold a knob's point back. A slot's first sighting (this bridge's start) is the baseline:
+-- nothing posted before is replayed. GLOBALS (the 200-local ceiling).
+-- ⛔ NOT held while REAPER can redo (eon_bg_hold, the background heals' rule): every request here is a person's
+-- finished edit, and a new edit after a Ctrl+Z SHOULD end the redo list, as in any program -- held, the first edit
+-- after any undo would wait for ever (nothing else empties the list). What must never reach here -- a request born of
+-- REAPER restoring Swing, a build's or the Strip Sync's doings -- is kept out on Swing's side (_srz_udo_hold,
+-- swing_rup_restore_heal, the gesture's skip rules, swing_panels_multiout_prep; rk_drumkit_dsp swing_rup_*).
+EON_RUP_BASE, EON_RUP_STRIDE, EON_RUP_SLOTS = 26343000, 8, 16   -- EON_RUP_BASE / _STRIDE (Swing_ReaKit.jsfx)
+-- ALL flags (-1), as CMD 94 and the kit point: a point with fewer flags breaks REAPER's chain -- undoing a LATER
+-- all-flags block (a print, a build's names, a bank's tracks) restored Swing from the last all-flags state BEFORE the
+-- gesture, and the gesture was lost (UndoMap E4 / E5, 2026-10-27, when this was 2 = UNDO_STATE_FX)
+EON_RUP_FLAGS = -1
+EON_RUP_FIELD = { [0] = "VOL", "PAN", "TUNE", "ATTACK", "DECAY", "SUSTAIN", "RELEASE", "ADSR", "MUTE", "SOLO",
+  "OUTPUT", "NOTE", "NOTE LOCK", "COLOUR", "CHOKE", "ONE-SHOT", "REVERSE", "L/R SWAP", "SUM TIGHT", "REPEAT",
+  "LAYER MODE", "OFFSET", "START", "END", "NORMALIZE", "NORM GAIN", "SKIP", "HPF", "LPF", "RESO",
+  "EQ LOW", "EQ MID", "EQ HI-MID", "EQ HIGH", "EQ LOW FREQ", "EQ MID FREQ", "EQ HI-MID FREQ", "EQ HIGH FREQ",
+  "EQ LOW Q", "EQ MID Q", "EQ HI-MID Q", "EQ HIGH Q", "DRIVE", "DRIVE MODE", "CRUSH RATE", "CRUSH BITS",
+  "DELAY SEND", "REVERB SEND", "COMP", "COMP MODE", "PITCH MODE", "PITCH ALGO", "RANGE LOW", "RANGE HIGH",
+  "SYNTH ON", "SYNTH ENGINE", "SYNTH LEVEL", "SYNTH VEL LOW", "SYNTH VEL HIGH", "SYNTH RR",
+  "SYNTH MACRO 1", "SYNTH MACRO 2", "SYNTH MACRO 3", "SYNTH MACRO 4", "SYNTH MACRO 5", "SYNTH MACRO 6",
+  "SYNTH MACRO 7", "SYNTH MACRO 8", "SMASH SEND" }   -- udo_fs[k] (Swing_ReaKit.jsfx), k = 0..68
+EON_RUP_LFIELD = { [0] = "START", "END", "NORMALIZE", "NORM GAIN", "VEL LOW", "VEL HIGH", "RR ORDER", "GAIN" }   -- udo_fl
+-- "pad 5" for bank A (the owner's words), "pad B5" for the others: a slot 0..63
+function eon_rup_pad(s)
+  s = math.floor(s or -1)
+  if s < 0 then return "a pad" end
+  local b = math.floor(s / 16)
+  return "pad " .. (b > 0 and string.char(65 + b) or "") .. tostring(s % 16 + 1)
+end
+-- a field code (Swing's swing_rup_diff): k < 1000 a pad's own setting, 1000 + field * 10 + layer a layer's
+function eon_rup_field(k)
+  k = math.floor(k or -1)
+  if k < 0 then return nil end
+  if k >= 1000 then
+    local lf, l = math.floor((k - 1000) / 10), (k - 1000) % 10
+    return ("L%d %s"):format(l + 1, EON_RUP_LFIELD[lf] or "setting")
+  end
+  return EON_RUP_FIELD[k]
+end
+-- The point's words. kind: 1 a pad's settings (a pad, b / c its first two fields, f how many), 2 several pads (a how
+-- many), 3 kit settings, 4 a sample landed (a pad, b its layer or -1, f how many pads), 5 two pads swapped, 6 a pad
+-- cleared, 7 a layer cleared (b the layer), 8 Clear All (a 1 = all four banks), 9 New Kit (a 1 = random synth), 10 a
+-- pad renamed, 11 a bank shown (a), 12 a bank renamed, 13 / 14 Swing's own UNDO / REDO (b a field, -2 a sample, -3 a
+-- swap with c). n > 1: requests merged into this one point.
+function eon_rup_name(kind, a, b, c, f, n)
+  kind, a, b, c, f, n = math.floor(kind or 0), math.floor(a or -1), math.floor(b or -1), math.floor(c or -1),
+                        math.floor(f or 0), math.floor(n or 1)
+  local function pad_words(p, k1, k2, nk)
+    local w = eon_rup_pad(p)
+    local f1, f2 = eon_rup_field(k1), eon_rup_field(k2)
+    if f1 and f2 and k2 == 7 and k1 >= 3 and k1 <= 6 then f2 = nil; nk = 1 end   -- ADSR = the "touched" flag of A/D/S/R
+    if f1 and f2 and k1 == 7 and k2 >= 3 and k2 <= 6 then f1, f2, nk = f2, nil, 1 end
+    if not f1 then return w .. " settings" end
+    if nk <= 1 or not f2 then return w .. " " .. f1 end
+    if nk == 2 then return w .. " " .. f1 .. " + " .. f2 end
+    return ("%s %s + %d more"):format(w, f1, nk - 1)
+  end
+  local s
+  if kind == 1 then s = pad_words(a, b, c, f)
+  elseif kind == 2 then s = ("%d pads"):format(math.max(2, a))
+  elseif kind == 3 then s = "kit settings"
+  elseif kind == 4 then
+    if f > 1 then s = ("samples on %d pads from %s"):format(f, eon_rup_pad(a))
+    elseif b >= 0 then s = ("sample on %s layer %d"):format(eon_rup_pad(a), b + 1)
+    else s = "sample on " .. eon_rup_pad(a) end
+  elseif kind == 5 then s = ("swap %s and %s"):format(eon_rup_pad(a), eon_rup_pad(b))
+  elseif kind == 6 then s = "clear " .. eon_rup_pad(a)
+  elseif kind == 7 then s = ("clear %s layer %d"):format(eon_rup_pad(a), b + 1)
+  elseif kind == 8 then s = a == 1 and "Clear All (four banks)" or "Clear All"
+  elseif kind == 9 then s = a == 1 and "New Kit (random synth)" or "New Kit"
+  elseif kind == 10 then s = "rename " .. eon_rup_pad(a)
+  elseif kind == 11 then s = "show bank " .. string.char(65 + math.max(0, math.min(3, a)))
+  elseif kind == 12 then s = "rename bank " .. string.char(65 + math.max(0, math.min(3, a)))
+  elseif kind == 13 or kind == 14 then
+    local w = b == -2 and ("sample on " .. eon_rup_pad(a)) or b == -3 and ("swap %s and %s"):format(eon_rup_pad(a), eon_rup_pad(c))
+              or pad_words(a, b, c, f)
+    s = (kind == 13 and "UNDO (" or "REDO (") .. w .. ")"
+  else s = "edit" end
+  if n > 1 then s = s .. (" (+%d more)"):format(n - 1) end
+  return "Swing: " .. s
+end
+-- The Swing whose instance id is `id`, in the ACTIVE project (one in a background tab has no track here: nil)
+function eon_rup_swing_by_inst(id)
+  if not id or id <= 0 then return nil end
+  for _, sw in ipairs(eon_swing_list(false)) do
+    if sw.inst_id == id then return sw end
+  end
+  return nil
+end
+-- The console tie inside a gesture's point (2026-10-27, UndoMap E4). On a Multi-Out build the Strip Sync mirrors a
+-- pad's VOL / PAN onto its track's fader and pan a moment after Swing publishes them, and takes a fader that moved on
+-- its own for the user's move ("Track moved -> Swing follows", EON_Swing_Strip_Sync tie_channel). A gesture's point
+-- made before that mirror held Swing's NEW value beside the OLD fader; the mirror rode in the next point, so a Ctrl+Z
+-- of that next point (a print) put the old fader back -- Swing itself unchanged, not even reloaded -- and the tie
+-- wrote the old value into Swing: the gesture lost, now and then (whichever script ran first). The point mirrors the
+-- faders itself, as the build's eon_strips_put seeds them: every strip-bearing pad / split track whose fader or pan
+-- differs from Swing's band. The Strip Sync then sees its own value come back (one post of the same value).
+function eon_rup_tie(sw)
+  local slot = ss_resolve_slot(sw.inst_id)
+  if not slot then return end
+  local band = G.GS_STRIP_BASE + slot * G.GS_STRIP_STRIDE
+  if (reaper.gmem_read(band + G.GS_STRIP_OFF_TIE_VER) or 0) < 1 then return end   -- a Swing without the tie
+  local sband = G.GS_SPLIT_BASE + slot * G.GS_SPLIT_STRIDE
+  local split_ok = (reaper.gmem_read(sband + G.GS_SPLIT_OFF_VER) or 0) >= 1
+  local name = core.jsfx_addname("EON_Drum_Strip.jsfx", sw.tr, sw.fx)
+  if not name then return end
+  for s = 0, reaper.GetTrackNumSends(sw.tr, 0) - 1 do
+    local key, dest = core.swing_send_pad(sw.tr, s)
+    if key < 0 and split_ok then
+      key, dest = core.swing_send_pair(sw.tr, s)
+      if key < G.GS_SPLIT_PAIR0 or key >= G.GS_SPLIT_PAIR0 + G.GS_SPLIT_N then key = -1 end
+    end
+    if key >= 0 and dest and reaper.TrackFX_AddByName(dest, name, false, 0) >= 0 then   -- the Strip Sync's children
+      local rec
+      if key < G.NUM_PADS then
+        rec = band + G.GS_STRIP_PADS + key * G.GS_STRIP_PAD_STRIDE
+      elseif math.floor(reaper.gmem_read(sband + G.GS_SPLIT_OFF_OWNER + key - G.GS_SPLIT_PAIR0) or 0) >= 1 then
+        rec = sband + (key - G.GS_SPLIT_PAIR0) * G.GS_STRIP_PAD_STRIDE
+      end
+      local bv = rec and reaper.gmem_read(rec + G.GS_STRIP_PAD_OFF_VOL) or -1
+      if bv >= 0 then   -- a blank pad (VOL -1) is the user's business, as in the tie
+        local bp = reaper.gmem_read(rec + G.GS_STRIP_PAD_OFF_PAN)
+        if math.abs(reaper.GetMediaTrackInfo_Value(dest, "D_VOL") - bv) > 1e-4 then reaper.SetMediaTrackInfo_Value(dest, "D_VOL", bv) end
+        if math.abs(reaper.GetMediaTrackInfo_Value(dest, "D_PAN") - bp) > 1e-4 then reaper.SetMediaTrackInfo_Value(dest, "D_PAN", bp) end
+      end
+    end
+  end
+end
+function eon_rup_tick()
+  eon_rup_last = eon_rup_last or {}
+  for slot = 0, EON_RUP_SLOTS - 1 do
+    local b = EON_RUP_BASE + slot * EON_RUP_STRIDE
+    local n = math.floor((reaper.gmem_read(b) or 0) + 0.5)
+    local last = eon_rup_last[slot]
+    eon_rup_last[slot] = n
+    if last ~= nil and n ~= last and n > 0 then
+      local id = math.floor((reaper.gmem_read(core.GMEM.GS_INST_REG_BASE + slot * core.GMEM.GS_INST_REG_STRIDE
+                              + core.GMEM.GS_INST_REG_OFF_ID) or 0) + 0.5)
+      local sw = eon_rup_swing_by_inst(id)
+      if sw and eon_kitpt_close then eon_kitpt_flush() end   -- a kit load's point still waiting goes first
+      if sw then
+        local name = eon_rup_name(reaper.gmem_read(b + 1), reaper.gmem_read(b + 2), reaper.gmem_read(b + 3),
+                                  reaper.gmem_read(b + 4), reaper.gmem_read(b + 5), reaper.gmem_read(b + 6))
+        reaper.Undo_BeginBlock2(0)
+        local poked = pcall(eon_out_poke, sw.tr, sw.fx)   -- the block closes whatever the nudge does
+        pcall(eon_rup_tie, sw)                              -- the tied faders in the same point (above)
+        reaper.Undo_EndBlock2(0, name, EON_RUP_FLAGS)
+        if poked then reaper.gmem_write(b + 7, n) end
+      end
+    end
+  end
+end
+
 -- The per-tick body. GLOBAL (200-local-limit escape hatch, same as
 -- poll_layer_export) so the guarded loop below can call it without spending
 -- a top-level local. Everything that used to be poll() is in here unchanged;
 -- only the exit_req check and the re-arm moved out to the wrapper.
 function _eon_poll_body()
   eon_perf_tick_begin()                 -- perf profiler (no-op unless armed)
+  -- Swing's transport presses first, whatever the kit bus is doing (FU-T: a load must never swallow STOP)
+  eon_seq_tr_ok, eon_seq_tr_e = pcall(eon_seq_transport_tick)   -- globals, no new local (the eon_fb_ok idiom)
+  if not eon_seq_tr_ok and tostring(eon_seq_tr_e) ~= eon_seq_tr_err then
+    eon_seq_tr_err = tostring(eon_seq_tr_e)
+    reaper.ShowConsoleMsg("[Swing] transport mailbox: " .. eon_seq_tr_err .. "\n")
+  end
+  -- Swing's undo points next, whatever the kit bus is doing (2026-10-27; eon_rup_tick: the nudge inside each block
+  -- runs under a pcall of its own, so an error never leaves a block open).
+  eon_rup_ok, eon_rup_e = pcall(eon_rup_tick)
+  if not eon_rup_ok and tostring(eon_rup_e) ~= eon_rup_err then
+    eon_rup_err = tostring(eon_rup_e)
+    reaper.ShowConsoleMsg("[Swing] undo-point mailbox: " .. eon_rup_err .. "\n")
+  end
   eon_perf_mark("loader")
   -- EON Loader protocol v1 — file-based external sample loader
   loader_poll()
@@ -25131,30 +26665,44 @@ function _eon_poll_body()
     if req > 0 then
       local inst = math.floor(req / 32)
       local pad_idx = req - inst * 32 - 1
-      local sw_tr = nil
+      local sw_tr, sw_fx = nil, nil
       if inst > 0 then
         for _, sw in ipairs(enumerate_all_swings()) do
-          if sw.inst_id == inst then sw_tr = sw.tr; break end
+          if sw.inst_id == inst then sw_tr, sw_fx = sw.tr, sw.fx; break end
         end
       else
-        sw_tr = find_swing_track()
+        sw_tr, sw_fx = find_swing_track()
       end
+      -- The face sends the tile (0..15) of the bank on screen. Bank A: that pad's own track. Bank B..D (audit C14,
+      -- the owner's decision 2026-10-26; it selected bank A's track of the same tile, then nothing): the pad's own
+      -- split-out track when it has one -- the split pair (22..31) Swing's strip band names this slot the owner of
+      -- (OUT_OWN), its track found by its tag through Swing's sends -- else the bank's own track (pair 19 + bank,
+      -- the one Multi-Out makes, P_EXT:EON_BANK_TRACK). An older Swing publishes no OUT block: the bank's track.
       if sw_tr and pad_idx >= 0 and pad_idx < G.NUM_PADS then
-        local num_sends = reaper.GetTrackNumSends(sw_tr, 0)
-        local found = false
-        for si = 0, num_sends - 1 do
-          local send_pad = core.swing_send_pad(sw_tr, si)   -- Swing's own pad tracks only (2026-10-10)
-          if send_pad == pad_idx then
-            local dest_tr = reaper.BR_GetMediaTrackSendInfo_Track(sw_tr, 0, si, 1)
-            if dest_tr then
-              reaper.SetOnlyTrackSelected(dest_tr)
-              reaper.Main_OnCommand(40913, 0)  -- Track: Vertical scroll selected tracks into view
-              found = true
-            end
-            break
+        local bank = eon_fx_bank(sw_tr, sw_fx)
+        local dest_tr
+        if bank == 0 then
+          for si = 0, reaper.GetTrackNumSends(sw_tr, 0) - 1 do
+            local send_pad, d = core.swing_send_pad(sw_tr, si)   -- Swing's own pad tracks only (2026-10-10)
+            if send_pad == pad_idx then dest_tr = d; break end
           end
+        elseif bank >= 1 and bank <= 3 then
+          local t = eon_out_tracks(sw_tr)
+          local iid = inst > 0 and inst or math.floor(reaper.TrackFX_GetParam(sw_tr, sw_fx or 0, 3) or 0)
+          local u = iid > 0 and eon_out_use(ss_resolve_slot(iid)) or nil
+          local s = bank * G.NUM_PADS + pad_idx
+          if u then
+            for p = EON_OUT_SPLIT_PAIR, EON_OUT_PAIRS - 1 do
+              if u.own[p] == s and t.pair[p] then dest_tr = t.pair[p]; break end
+            end
+          end
+          dest_tr = dest_tr or t.pair[EON_OUT_BANK_PAIR + bank - 1]
         end
-        -- silent no-op if no multi-out track exists for this pad
+        if dest_tr then
+          reaper.SetOnlyTrackSelected(dest_tr)
+          reaper.Main_OnCommand(40913, 0)  -- Track: Vertical scroll selected tracks into view
+        end
+        -- silent no-op if no output track exists for this pad
       end
       reaper.gmem_write(G.GS_PAD_TRACK_SELECT, 0)  -- consume request
     end
@@ -25266,6 +26814,7 @@ function _eon_poll_body()
     end
     pending_export.dev_lock = tgt
     reaper.gmem_write(G.LOCK, tgt)
+    reaper.gmem_write(G.GS_KIT_SAVE_OWNER, tgt)   -- level 322: the walk's 93s and the 85 are the target's (eon_save_owner_tick)
     reaper.gmem_write(G.CMD, 83)
   end
 
@@ -25349,7 +26898,9 @@ function _eon_poll_body()
     reaper.gmem_write(G.GS_KIT_LOAD_MODE, 0)
   end
 
+  eon_save_dead_tick()       -- level 323: a save that stopped moving frees the bus (before CMD is read)
   local cmd = math.floor(reaper.gmem_read(G.CMD))
+  eon_save_owner_tick(cmd)   -- level 322: who the save codes this tick answers (before any handler below posts one)
 
   -- EON_PADPCM: when the JSFX speaks level 204 the bridge consumes CMD 69 (the
   -- preview) itself -- reads the path bus, decodes, streams -- and the CMD stays
@@ -25402,6 +26953,7 @@ function _eon_poll_body()
 
   -- Kit ops
   if cmd == 10 or cmd == 12 or cmd == 15 then
+    eon_save_rename_prefill(cmd)   -- level 323: the kit-name click's flag, read and zeroed here whatever follows
     -- Phase 3 save guard (bridge belt-and-suspenders): refuse while any load
     -- owns the pipeline. The JSFX button gates check the gmem cells, but only
     -- the bridge sees its own queue/current_load; a save racing a load can
@@ -25418,7 +26970,7 @@ function _eon_poll_body()
       reaper.gmem_write(G.GS_KIT_EXPORT_ONLY, 0)
       reaper.gmem_write(G.CMD, 98)
     elseif cmd == 10 then
-      do_export_name_prompt()
+      do_export_name_prompt(eon_save_prefill)   -- a rename starts at the kit's name; Save As (nil) at "My Kit"
     elseif cmd == 12 then
       do_save_in_place()
     else
@@ -25621,7 +27173,12 @@ function _eon_poll_body()
         if queued then
           eon_load_report(("auto-kit for inst=%d already queued -- not queued twice"):format(want_id))
         else
-          local item = { path = kit_path, preserve = false, inst_id = want_id }
+          -- auto: a new instance's FIRST kit (the insert, a new project's default). Its point is the insert's ONE
+          -- step, "Swing: set up (first kit ...)", and the stereo grid setup rides in it (eon_grid_*; 2026-10-28,
+          -- the owner: two steps nobody asked for). Not NO point: measured, the first Ctrl+Z after an insert then went
+          -- back to REAPER's "Add FX" state -- Swing empty, the pattern item gone (InsertCost, first_undo).
+          local item = { path = kit_path, preserve = false, inst_id = want_id, auto = true }
+          eon_grid_fold_now(want_id)
           for _, swing in ipairs(enumerate_all_swings()) do
             if swing.inst_id == want_id then
               item.tr, item.fx, item.guid = swing.tr, swing.fx, swing.guid
@@ -26151,10 +27708,10 @@ function _eon_poll_body()
   -- STEP SEQUENCER (P0a, 2026-10-20): the panel's transport buttons. PARAM1: 1 play, 2 stop, 3 toggle repeat,
   -- 4 record, 5 go to the project start, 6 play / stop (the panel's Space key). The plugin cannot drive the
   -- transport itself; without the bridge the buttons show the state and the hint says why.
+  -- 2026-10-26 (FU-T): a Swing of level 321 sends its presses through the transport mailbox instead (served at the
+  -- top of every tick, eon_seq_transport_tick); this road stays for an older Swing and one with no registry slot.
   elseif cmd == 95 then
-    local act = math.floor(reaper.gmem_read(G.PARAM1) or 0)
-    local id = ({ [1] = 1007, [2] = 1016, [3] = 1068, [4] = 1013, [5] = 40042, [6] = 40044 })[act]
-    if id then reaper.Main_OnCommand(id, 0) end
+    eon_seq_transport_run(math.floor(reaper.gmem_read(G.PARAM1) or 0))
     reaper.gmem_write(G.LOCK, 0)
     reaper.gmem_write(G.CMD, 0)
 
@@ -26214,8 +27771,9 @@ function _eon_poll_body()
   elseif cmd == 50 then
     -- Rename pad via REAPER's native text input dialog
     local pad_idx = math.floor(reaper.gmem_read(G.PARAM1))
-    -- See cmd 61 note: `goto cmd_done` instead of bare `return` so a bad
-    -- pad_idx doesn't kill the defer-driven poll loop.
+    -- A bad pad_idx: `goto cmd_done` skips to the tail below the dispatcher
+    -- (a bare `return` would skip that tail; the body runs under poll()'s
+    -- xpcall, so neither can stop the defer loop).
     if pad_idx < 0 or pad_idx >= G.NUM_PADS then reaper.gmem_write(G.CMD, 0); goto cmd_done end
     -- Read current name from gmem PADNAME area
     local cur_name = ""
@@ -26225,7 +27783,7 @@ function _eon_poll_body()
     end
     local retval, new_name = reaper.GetUserInputs(
       string.format("Rename Pad %d", pad_idx + 1), 1,
-      "Pad Name (max 16 chars):,extrawidth=160",
+      ("Pad Name (max %d chars):,extrawidth=160"):format(G.PADNAME_LEN),
       cur_name
     )
     if retval and new_name ~= nil then
@@ -26277,7 +27835,7 @@ function _eon_poll_body()
   end
 
   -- Skip target for `goto cmd_done` from inside cmd handlers that need to
-  -- bail early without killing the defer poll loop. Falls through to the
+  -- bail early. Falls through to the
   -- lock-release / undo-leak / heartbeat / defer tail below.
   ::cmd_done::
 
@@ -26319,7 +27877,27 @@ function _eon_poll_body()
     -- the 99, so the first idle instance to run adopted the saver's staged
     -- pad names and colours. If the saver is gone, the CMD watchdog clears
     -- the 99 in 5 s and the stale-LOCK self-heal then clears LOCK.
-    if final == 0 or final == 98 or (final == 99 and cmd ~= 1) then
+    -- Level 323 (2026-10-27, RR-1; sweep LIB122's build half): EVERY 99 keeps
+    -- LOCK, not only a save's. A build's 99 (CMD 40 / 74 / 92, posted under
+    -- LOCK = the Swing that armed import state 1 for it) went out with LOCK
+    -- released in the same tick, so an idle second Swing's CMD-99 consumer
+    -- took it and adopted the builder's Multi-Out names and colours from the
+    -- shared bands, and the builder stayed kit_busy in state 1. And a save's
+    -- 99 that sat a tick lost LOCK here on that next tick (cmd 99, not 1), so
+    -- a Swing older than the owner cell took it. A Lua-posted op keeps the
+    -- LOCK its poster gave it (the focused Swing, the Song Starter's new one;
+    -- 0 = none, and any idle Swing takes it as before). The consumers clear
+    -- LOCK; a 99 nobody takes ends in the watchdog's 0 above, which releases
+    -- it here, or in the stale-LOCK self-heal.
+    -- And every 98 (RR-1's second pass): a build's or a load's FAILURE went
+    -- out with LOCK released too, so another Swing armed in import state 1
+    -- for its OWN queued load took it and aborted. Every 98 consumer clears
+    -- LOCK itself (Swing's import state 1 and export states 10 / 3, Lite's
+    -- states 1 / 10 / 12, an older Swing's ungated ones), the Lua-post
+    -- tracker releases a Lua op's 98 with LOCK, the pop clears an unarmed
+    -- load's refusal; one nobody takes ends in the 5 s watchdog's 0 (this
+    -- release, or the stale-LOCK self-heal the tick after the CMD watchdog).
+    if final == 0 then
       reaper.gmem_write(G.LOCK, 0)
     end
   end
@@ -26410,7 +27988,8 @@ function _eon_poll_body()
 
   -- STEP SEQ button lit state: per-instance "this track's StepSeq float window
   -- is open", published into the StepSeq courier band (26030000 + slot*64,
-  -- field 52; 53 = OPT_AA "Auto-adapt patterns" settings mirror, 54..63 free)
+  -- field 52; 53 = OPT_AA "Auto-adapt patterns" settings mirror; 61..63 = Swing's transport mailbox, FU-T;
+  -- the rest of the map: .refs/swing_gmem_bridge_protocol.md)
   -- keyed by each Swing's registry slot; the Swing button reads its own slot's
   -- cell. Every other tick — the float-window visibility checks are cheap but
   -- not free.

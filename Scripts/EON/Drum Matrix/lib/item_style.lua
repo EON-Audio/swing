@@ -25,6 +25,15 @@ end
 
 local DIM_FACTOR = 0.18
 
+-- The project DimAll dimmed, so RestoreAll acts on it whatever tab is current at exit (DM218, 2026-10-26:
+-- both walked project 0 = the current tab, so an overlay started in tab A and stopped in tab B cleared B's
+-- lane item colours and left A's near-black, saved with the project). A closed tab restores nothing.
+local _proj = nil
+local function live_proj()
+  if _proj and reaper.ValidatePtr and not reaper.ValidatePtr(_proj, 'ReaProject*') then return nil end
+  return _proj or 0
+end
+
 local function dim_color_native(pad_r, pad_g, pad_b)
   local R = math.floor(pad_r * 255 * DIM_FACTOR + 0.5)
   local G = math.floor(pad_g * 255 * DIM_FACTOR + 0.5)
@@ -45,11 +54,13 @@ end
 
 function M.DimAll(swing_state)
   if not swing_state then return 0, 0 end
-  local track_count   = reaper.CountTracks(0)
+  _proj = reaper.EnumProjects and reaper.EnumProjects(-1) or nil
+  local proj = live_proj()
+  local track_count   = reaper.CountTracks(proj)
   local items_touched = 0
   local lanes_touched = 0
   for ti = 0, track_count - 1 do
-    local track = reaper.GetTrack(0, ti)
+    local track = reaper.GetTrack(proj, ti)
     local pad_idx, lane = get_lane_pad_index(track)
     if pad_idx then
       local slot = swing_state.SlotForLane and swing_state.SlotForLane(lane) or nil
@@ -75,10 +86,12 @@ function M.DimAll(swing_state)
 end
 
 function M.RestoreAll()
-  local track_count   = reaper.CountTracks(0)
+  local proj = live_proj()
+  if proj == nil then return 0 end   -- the dimmed project's tab was closed: nothing of ours is left to restore
+  local track_count   = reaper.CountTracks(proj)
   local items_touched = 0
   for ti = 0, track_count - 1 do
-    local track = reaper.GetTrack(0, ti)
+    local track = reaper.GetTrack(proj, ti)
     local pad_idx = get_lane_pad_index(track)
     if pad_idx then
       local item_count = reaper.CountTrackMediaItems(track)

@@ -138,6 +138,25 @@ local function send_dest(swing_track, s)
   return nil
 end
 
+-- Is `dest` one of Swing's own pad tracks? The ownership test core.swing_send_pad gained on 2026-10-10, mirrored
+-- here (DM22, 2026-10-26): a channel alone is topology -- REAPER's default for a hand-made send is channels 1-2,
+-- so a user's own send from Swing to a reverb bus read as pad 1, and the bus was tagged, seeded and resized as a
+-- merged lane while the real pad-1 track was skipped (with no multi-out at all, the bus alone passed the guard).
+-- The P_EXT:EON_PAD_IDX tag every build stamps, or, for a track built before the tag, a destination inside
+-- Swing's Audio sub (P_EXT:EON_AUDIO_KIT_FOLDER), directly or through the "Bank A" folder (P_EXT:EON_BANK_FOLDER).
+local function owned_pad_track(dest)
+  local _, tag = r.GetSetMediaTrackInfo_String(dest, 'P_EXT:EON_PAD_IDX', '', false)
+  if tag and tag ~= '' then return true end
+  local par = r.GetParentTrack(dest)
+  if par then
+    local _, bf = r.GetSetMediaTrackInfo_String(par, 'P_EXT:EON_BANK_FOLDER', '', false)
+    if bf == 'A' then par = r.GetParentTrack(par) end
+  end
+  if not par then return false end
+  local _, af = r.GetSetMediaTrackInfo_String(par, 'P_EXT:EON_AUDIO_KIT_FOLDER', '', false)
+  return af ~= nil and af ~= ''
+end
+
 -- pad_tracks[1..16] = MediaTrack, plus the count found.
 local function find_pad_tracks(swing_track)
   local out, n = {}, 0
@@ -145,7 +164,7 @@ local function find_pad_tracks(swing_track)
     local pad = srcchan_pad(r.GetTrackSendInfo_Value(swing_track, 0, s, 'I_SRCCHAN'))
     if pad >= 0 and pad < NUM_PADS then
       local dest = send_dest(swing_track, s)
-      if dest and not out[pad + 1] then
+      if dest and owned_pad_track(dest) and not out[pad + 1] then
         out[pad + 1] = dest
         n = n + 1
       end
@@ -251,8 +270,38 @@ do
   end
 end
 
+-- Stereo-grid coexistence, EON_DM_Build's rule (DM23, 2026-10-26): the bridge tags every fresh Swing stereo
+-- and seeds 'Pattern 1'; this build left that tag and item live beside the merged lanes, so the overlay showed
+-- the stereo grid AND sixteen merged lanes for one kit, and every beat in Pattern 1 played beside the trigger
+-- track. An EMPTY stereo pattern is cleared silently; one with notes is MOVED onto the pad tracks after a Yes.
+local clear_stereo_tag = false
+do
+  local _, stereo_raw = r.GetSetMediaTrackInfo_String(swing_track, 'P_EXT:EON_DRUM_LANE', '', false)
+  if stereo_raw and stereo_raw ~= '' then
+    local has_notes = false
+    for i = 0, r.CountTrackMediaItems(swing_track) - 1 do
+      local take = r.GetActiveTake(r.GetTrackMediaItem(swing_track, i))
+      if take and r.TakeIsMIDI(take) then
+        local _, ncnt = r.MIDI_CountEvts(take)
+        if ncnt > 0 then has_notes = true break end
+      end
+    end
+    if has_notes then
+      local resp = r.ShowMessageBox(
+        'This Swing is in stereo-grid mode and its pattern has notes.\n\n' ..
+        'Merged mode will MOVE the pattern onto the pad tracks\' own items and\n' ..
+        'remove the stereo MIDI item from the Swing track (notes at pitches that\n' ..
+        'are not live pads are dropped).\n\nContinue?',
+        'EON DM Build Merged', 4)   -- Yes/No
+      if resp ~= 6 then return end
+    end
+    clear_stereo_tag = true
+  end
+end
+
 r.gmem_attach('Swing_Media_Transfer')
-r.gmem_write(99, os.time())   -- bump KIT_GMEM_BRIDGE_ALIVE so the JSFX publishes
+-- No bridge-alive stamp here (DM213): Swing publishes its pad bands whatever cell 99 holds, and the stamp
+-- impersonated a bridge for 5 s (a real one refused to start, a fresh Swing posted its auto-load into silence).
 
 local frames_waited = 0
 
@@ -261,10 +310,18 @@ local frames_waited = 0
 -- ---------------------------------------------------------------------------
 
 local function read_pads(slot)
+  -- The legacy shared block is only the chosen Swing's when ONE Swing exists (only the browser-target
+  -- instance publishes it). Several Swings and the chosen one unresolved: skip it, as EON_DM_Build does,
+  -- and lay the pads out from the root note (DM216, 2026-10-26: another kit's pitches went into merged lane
+  -- tags that swing_sync never re-syncs, so notes painted there fired the wrong pads until a rerun).
+  local shared_ok = (slot ~= nil) or (#swing_hits == 1)
+  if not shared_ok then
+    safety.ConsoleWarn('Build Merged: chosen Swing not registered yet and several Swings are live -- pads laid out from the root note; rerun once it is live to take its names and notes.')
+  end
   local pads = {}
   for i = 1, NUM_PADS do
-    local name  = swing_state.GetPadName(i, slot) or ''
-    local pitch = swing_state.GetPadPitch(i, slot)
+    local name  = shared_ok and (swing_state.GetPadName(i, slot) or '') or ''
+    local pitch = shared_ok and swing_state.GetPadPitch(i, slot) or nil
     if not pitch or pitch < 0 or pitch > 127 then
       -- Fall back to the kit root note (slider1 = param 0) laid out chromatically.
       local root = math.floor(r.TrackFX_GetParam(swing_track, chosen.fx, 0) or 36)
@@ -294,10 +351,45 @@ local function do_build(slot)
   local cursor_qn = r.TimeMap_timeToQN(cursor_time)
   local item_end_t = r.TimeMap_QNToTime(cursor_qn + 16)   -- 4 bars
 
+  -- STEREO -> MERGED migration (capture pass), EON_DM_Build's: every play of the stereo item as REAPER plays it
+  -- (merged_mirror.CollectItem: loop repeats, item bounds, mutes kept), keyed to THIS build's pads; captured
+  -- now, before the tag or the items are touched. A pad's notes go into the item this build seeds (widened to
+  -- cover them) or, on a track that already has MIDI, into a new item over their span. A muted stereo item is
+  -- left on the Swing track as it is.
+  local migrate, mig_t0, mig_t1 = nil, cursor_time, item_end_t
+  if clear_stereo_tag then
+    local pitch2pad = {}
+    for i = 1, NUM_PADS do
+      local pd = pads[i]
+      if pd and pd.pitch then pitch2pad[pd.pitch] = pitch2pad[pd.pitch] or i end
+    end
+    local plays, notes = {}, {}
+    for ii = 0, r.CountTrackMediaItems(swing_track) - 1 do
+      mirror.CollectItem(r.GetTrackMediaItem(swing_track, ii), plays, true)
+    end
+    for _, n in ipairs(plays) do
+      local pad = pitch2pad[n.pitch]
+      if pad then
+        notes[#notes + 1] = { pad = pad, pitch = n.pitch, vel = n.vel, ts = n.s, te = n.e, muted = n.muted }
+        if n.s < mig_t0 then mig_t0 = n.s end
+        if n.e > mig_t1 then mig_t1 = n.e end
+      end
+    end
+    if #notes > 0 then migrate = notes end
+  end
+  local mig_pads = {}
+  if migrate then for _, mn in ipairs(migrate) do mig_pads[mn.pad] = true end end
+
   r.Undo_BeginBlock()
   r.PreventUIRefresh(1)
 
+  -- Stereo-grid handoff confirmed in Phase 1: the Swing track stops being a lane.
+  if clear_stereo_tag then
+    r.GetSetMediaTrackInfo_String(swing_track, 'P_EXT:EON_DRUM_LANE', '', true)
+  end
+
   local tagged, seeded = 0, 0
+  local pad_takes = {}
   for pad_idx = 1, NUM_PADS do
     local tr = pad_tracks[pad_idx]
     if tr then
@@ -327,13 +419,18 @@ local function do_build(slot)
         local take = r.GetActiveTake(r.GetTrackMediaItem(tr, i))
         if take and r.TakeIsMIDI(take) then has_midi = true break end
       end
-      if not has_midi then
-        local item = r.CreateNewMIDIItemInProj(tr, cursor_time, item_end_t, false)
+      if not has_midi or mig_pads[pad_idx] then
+        local t0, t1 = cursor_time, item_end_t
+        if mig_pads[pad_idx] then t0, t1 = mig_t0, mig_t1 end   -- room for every migrated note
+        local item = r.CreateNewMIDIItemInProj(tr, t0, t1, false)
         if item then
           r.SetMediaItemInfo_Value(item, 'I_CUSTOMCOLOR', dim_color_for_pad(pad_idx))
           local take = r.GetActiveTake(item)
-          if take then r.GetSetMediaItemTakeInfo_String(take, 'P_NAME', '', true) end
-          seeded = seeded + 1
+          if take then
+            r.GetSetMediaItemTakeInfo_String(take, 'P_NAME', '', true)
+            pad_takes[pad_idx] = take
+          end
+          if not has_midi then seeded = seeded + 1 end
         end
       end
 
@@ -349,6 +446,29 @@ local function do_build(slot)
       -- Room for the pattern lane; multi-out tracks are built at 28 px.
       if (r.GetMediaTrackInfo_Value(tr, 'I_HEIGHTOVERRIDE') or 0) < 54 then
         r.SetMediaTrackInfo_Value(tr, 'I_HEIGHTOVERRIDE', 54)
+      end
+    end
+  end
+
+  -- STEREO -> MERGED migration (write pass): each captured note onto its pad's item at the same project
+  -- time, muted ones muted, then the unmuted stereo MIDI items leave the Swing track so the pattern plays
+  -- through the trigger track only. Inside this build's one Undo block, like EON_DM_Build's.
+  if migrate then
+    for _, mn in ipairs(migrate) do
+      local take = pad_takes[mn.pad]
+      if take then
+        local ppq_s = r.MIDI_GetPPQPosFromProjTime(take, mn.ts)
+        local ppq_e = r.MIDI_GetPPQPosFromProjTime(take, mn.te)
+        if ppq_e <= ppq_s then ppq_e = ppq_s + 1 end
+        r.MIDI_InsertNote(take, false, mn.muted or false, ppq_s, ppq_e, 0, mn.pitch, mn.vel, true)
+      end
+    end
+    for _, take in pairs(pad_takes) do r.MIDI_Sort(take) end
+    for ii = r.CountTrackMediaItems(swing_track) - 1, 0, -1 do
+      local item = r.GetTrackMediaItem(swing_track, ii)
+      local take = r.GetActiveTake(item)
+      if take and r.TakeIsMIDI(take) and r.GetMediaItemInfo_Value(item, 'B_MUTE') ~= 1 then
+        r.DeleteTrackMediaItem(swing_track, item)
       end
     end
   end

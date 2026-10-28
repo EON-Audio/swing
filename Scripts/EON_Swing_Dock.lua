@@ -61,6 +61,10 @@ end
 local dock_hwnd                 -- this script's own gfx window
 local tgt_track, tgt_fx         -- instance the dock currently follows
 local tgt_guid                  -- its FX GUID (dedupe key; track pointers recycle)
+local tgt_proj                  -- the project it lives in: a track in a BACKGROUND tab fails ValidatePtr2(0, ..)
+local tgt_inst                  -- its Swing instance id (param 3): which mini browser's keyboard is ours
+local capture_failed = {}       -- GUID -> true: no float or no canvas came (offline, failed to compile); the
+                                -- project scan passes it over until a selection picks it again
 local wrapper, canvas           -- REAPER's float and the jsfx_gfx child inside it
 local wait_float, wait_canvas = 0, 0
 local shown_w, shown_h = -1, -1
@@ -80,6 +84,12 @@ local canvas_parent                  -- the canvas's own parent inside the float
 local function track_alive(tr)
   return tr and reaper.ValidatePtr2(0, tr, "MediaTrack*")
 end
+-- The HELD track, in the project it was captured in (0 = the active project only). After a tab switch the
+-- held Swing is in a background tab: track_alive says gone, so the dock lets go -- but letting go must still
+-- clear its "EON Rig Docked" and close its float THERE, or the instance comes back wearing the dock face.
+local function target_alive(tr)
+  return tr and reaper.ValidatePtr2(tgt_proj or 0, tr, "MediaTrack*")
+end
 
 -- FX identity via the JSFX file ident, not the display name: rename-proof
 -- (an instance the user renamed "808" keeps being followed) and
@@ -98,11 +108,17 @@ local function is_swing_fx(tr, i)
   return (ok2 and name and name:lower():find(FX_MATCH, 1, true)) and true or false
 end
 
--- First Swing on the track, or nil.
-local function find_swing(tr)
+-- First Swing on the track, or nil. An OFFLINE one has no canvas to show and is passed over; `skip` (a GUID
+-- set) passes over instances whose capture already timed out -- with neither, an offline Swing was adopted
+-- by the project scan every ~2 s for ever: its float popping up and vanishing, the rig flag flipping, and a
+-- later online Swing never shown.
+local function find_swing(tr, skip)
   if not tr then return nil end
   for i = 0, reaper.TrackFX_GetCount(tr) - 1 do
-    if is_swing_fx(tr, i) then return i end
+    if is_swing_fx(tr, i) and not reaper.TrackFX_GetOffline(tr, i)
+       and not (skip and skip[reaper.TrackFX_GetFXGUID(tr, i)]) then
+      return i
+    end
   end
   return nil
 end
@@ -128,11 +144,11 @@ end
 -- selection takes over.
 local function find_first_swing()
   local m = reaper.GetMasterTrack(0)
-  local fx = find_swing(m)
+  local fx = find_swing(m, capture_failed)
   if fx then return m, fx end
   for i = 0, reaper.CountTracks(0) - 1 do
     local tr = reaper.GetTrack(0, i)
-    fx = find_swing(tr)
+    fx = find_swing(tr, capture_failed)
     if fx then return tr, fx end
   end
 end
@@ -225,6 +241,7 @@ local pop_base       = nil
 -- back to the canvas if this script took it. MUST match rk_swing_ui_minibrowser.jsfx-inc FB_DOCK_*.
 local SWB_BASE, SWB_STRIDE, SWB_SLOTS = 26607616, 4096, 16
 local FB_DOCK_KEYS, FB_DOCK_KW, FB_DOCK_KR, FB_DOCK_KRING, FB_DOCK_KRING_N = 47, 48, 49, 50, 8
+local FB_REQ_INST = 39   -- the band's owner: that face's instance_id (minibrowser FB_REQ_INST)
 local key_focus_taken = false
 -- One-shot diagnostic trace: SetExtState(EXT, "debug", "1") in a ReaScript
 -- console (or EON menu), reproduce, read the console. "0"/unset = silent.
@@ -264,7 +281,7 @@ end
 -- write dirties the project, and the dock re-acquires on every selection change.
 local function rig_flag(tr, fx, guid, on)
   if not (tr and fx and guid) then return end
-  if not reaper.ValidatePtr2(0, tr, "MediaTrack*") then return end
+  if not target_alive(tr) then return end   -- the held project's, so a background tab's flag clears too
   local p = rig_param(tr, fx, guid)
   if p < 0 then return end          -- older build without the slider: no-op
   local want = on and 1 or 0
@@ -279,11 +296,19 @@ local function release()
     reaper.JS_Window_Show(wrapper, "HIDE")
   end
   dbg("release fx=" .. tostring(tgt_fx))
+  -- Act on the FX at tgt_fx only while it is still the one we captured. When the GUID guard found it gone
+  -- (deleted, or moved off the track) the index names whatever slid into that slot, and the old code zeroed
+  -- THAT plugin's "EON Rig Docked" (rig_param's answer is cached by OUR guid) and closed its float.
+  if tgt_fx and tgt_guid and target_alive(tgt_track)
+     and reaper.TrackFX_GetFXGUID(tgt_track, tgt_fx) ~= tgt_guid then
+    dbg("release: fx index no longer ours -- flag and float left alone")
+    tgt_fx = nil
+  end
   rig_flag(tgt_track, tgt_fx, tgt_guid, false)   -- before the nils below
-  if track_alive(tgt_track) and tgt_fx then
+  if target_alive(tgt_track) and tgt_fx then
     reaper.TrackFX_Show(tgt_track, tgt_fx, 2)
   end
-  tgt_track, tgt_fx, tgt_guid, wrapper, canvas = nil, nil, nil, nil, nil
+  tgt_track, tgt_fx, tgt_guid, tgt_proj, tgt_inst, wrapper, canvas = nil, nil, nil, nil, nil, nil, nil
   wait_float, wait_canvas, shown_w, shown_h = 0, 0, -1, -1
   canvas_dx, canvas_dy, canvas_w0, canvas_h0, canvas_parent = nil, nil, nil, nil, nil
 end
@@ -305,6 +330,9 @@ local function acquire(tr, fx)
   release()
   tgt_track, tgt_fx = tr, fx
   tgt_guid = reaper.TrackFX_GetFXGUID(tr, fx)
+  tgt_proj = reaper.EnumProjects(-1)
+  tgt_inst = math.floor(reaper.TrackFX_GetParam(tr, fx, 3) or 0)   -- instance_id (param 3, the bridge's rule)
+  if tgt_guid then capture_failed[tgt_guid] = nil end   -- picked again (a selection): another go at the capture
   rig_flag(tr, fx, tgt_guid, true)
   dbg("acquire fx=" .. tostring(fx))
   -- Chain view already on this FX: close it — the dock is taking the UI
@@ -326,7 +354,11 @@ local function tick_capture()
     wrapper = reaper.TrackFX_GetFloatingWindow(tgt_track, tgt_fx)
     if not wrapper then
       wait_float = wait_float - 1
-      if wait_float <= 0 then release() end
+      if wait_float <= 0 then
+        dbg("no float came: scan passes this instance over until it is selected")
+        if tgt_guid then capture_failed[tgt_guid] = true end
+        release()
+      end
       return
     end
     wait_canvas = CANVAS_WAIT_TICKS
@@ -335,7 +367,11 @@ local function tick_capture()
     canvas = find_canvas(wrapper)
     if not canvas then
       wait_canvas = wait_canvas - 1
-      if wait_canvas <= 0 then release() end  -- no canvas child = nothing safe to show
+      if wait_canvas <= 0 then           -- no canvas child = nothing safe to show
+        dbg("no canvas came: scan passes this instance over until it is selected")
+        if tgt_guid then capture_failed[tgt_guid] = true end
+        release()
+      end
       return
     end
     -- Save the canvas's home geometry (its parent, coords in that parent, size)
@@ -421,6 +457,61 @@ local function save_dock()
   reaper.SetExtState(EXT, "alive", "0", false)
 end
 
+-- Which mini browser slot holds the docked keyboard (FB_DOCK_* above), if any: its slot and mode (2 list, 3
+-- filter box). Only the slot whose band names OUR captured instance (FB_REQ_INST = its instance_id, written by
+-- the same @gfx): FB_DOCK_KEYS is written only while a face draws, so a Swing this pane released keeps its last
+-- 2 for ever (its @gfx stopped with the float), and the first such slot took every key meant for the Swing now
+-- docked -- typing in its browser did nothing, and Space in its filter box hit the transport.
+local function docked_key_slot()
+  if canvas and (tgt_inst or 0) <= 0 and target_alive(tgt_track) and tgt_fx then
+    tgt_inst = math.floor(reaper.TrackFX_GetParam(tgt_track, tgt_fx, 3) or 0)   -- a fresh insert's id lags
+  end
+  if not canvas or (tgt_inst or 0) <= 0 then return nil, 0 end
+  for s = 0, SWB_SLOTS - 1 do
+    local b = SWB_BASE + s * SWB_STRIDE
+    local m = math.floor(reaper.gmem_read(b + FB_DOCK_KEYS) or 0)
+    if m >= 2 and math.floor(reaper.gmem_read(b + FB_REQ_INST) or 0) == tgt_inst then
+      return s, m
+    end
+  end
+  return nil, 0
+end
+
+-- Live re-dock (EON Dock Layout's "Spread panes" sets EXT/dock_req to a REAPER docker index): move this window
+-- to that docker without closing it.
+--
+-- ⚠️ The canvas must be back inside REAPER's own float BEFORE the move. gfx.dock can hand us a different HWND,
+-- and REAPER NEVER reclaims a jsfx_gfx child left behind in a window it no longer owns -- that is the orphan
+-- that painted itself over the arrange on 2026-08-25. release() is exactly that hand-back and every other exit
+-- path already trusts it, so re-dock is release -> move -> re-adopt rather than anything bespoke.
+-- The instance we hold comes back after the move: re-acquired by its GUID, not by the selection or the
+-- project's first Swing (with Swing B held and an audio track selected, the pane came back showing A). Only
+-- when it is gone does the re-adopt ride the normal "holding nothing" adoption in tick_follow (last_sel and
+-- scan_cool cleared, so it happens on the very next tick).
+local function redock_to(idx)
+  dbg("re-dock -> docker " .. idx)
+  local keep_tr, keep_guid = tgt_track, tgt_guid
+  release()
+  gfx.dock(1 + idx * 256)
+  gfx.update()
+  -- gfx.dock may have rebuilt the window; re-find ours by title, and persist the target we ASKED for rather
+  -- than querying it straight back (the query can still report the pre-move state).
+  dock_hwnd = reaper.JS_Window_Find(WIN_TITLE, true) or dock_hwnd
+  reaper.SetExtState(EXT, "dockstate", tostring(1 + idx * 256), true)
+  local keep_fx = nil
+  if keep_guid and track_alive(keep_tr) then
+    for i = 0, reaper.TrackFX_GetCount(keep_tr) - 1 do
+      if reaper.TrackFX_GetFXGUID(keep_tr, i) == keep_guid then keep_fx = i break end
+    end
+  end
+  if keep_fx then
+    acquire(keep_tr, keep_fx)
+    last_sel = reaper.GetSelectedTrack2(0, 0, true)   -- the selection stands: not a new one to resolve
+  else
+    last_sel, scan_cool = nil, 0
+  end
+end
+
 local function loop()
   -- Heartbeat first, unconditionally: every early return below is still a
   -- tick in which this script is alive and holding what it holds.
@@ -466,32 +557,12 @@ local function loop()
     end
   end
   -- Live re-dock signal (EON Dock Layout's "Spread panes" sets EXT/dock_req to
-  -- a REAPER docker index): move this window to that docker without closing it.
-  --
-  -- ⚠️ The canvas must be back inside REAPER's own float BEFORE the move.
-  -- gfx.dock can hand us a different HWND, and REAPER NEVER reclaims a
-  -- jsfx_gfx child left behind in a window it no longer owns -- that is the
-  -- orphan that painted itself over the arrange on 2026-08-25. release() is
-  -- exactly that hand-back and every other exit path already trusts it, so
-  -- re-dock is release -> move -> re-adopt rather than anything bespoke.
-  -- Re-acquire rides the normal "holding nothing" adoption in tick_follow;
-  -- clearing last_sel + scan_cool makes it happen on the very next tick.
+  -- a REAPER docker index): redock_to above.
   local dock_req = reaper.GetExtState(EXT, "dock_req")
   if dock_req ~= "" then
     reaper.DeleteExtState(EXT, "dock_req", false)
     local idx = tonumber(dock_req)
-    if idx and idx >= 0 and idx <= 15 then
-      dbg("re-dock -> docker " .. idx)
-      release()
-      gfx.dock(1 + idx * 256)
-      gfx.update()
-      -- gfx.dock may have rebuilt the window; re-find ours by title, and
-      -- persist the target we ASKED for rather than querying it straight
-      -- back (the query can still report the pre-move state).
-      dock_hwnd = reaper.JS_Window_Find(WIN_TITLE, true) or dock_hwnd
-      reaper.SetExtState(EXT, "dockstate", tostring(1 + idx * 256), true)
-      last_sel, scan_cool = nil, 0
-    end
+    if idx and idx >= 0 and idx <= 15 then redock_to(idx) end
   end
   -- external close signal (the Dock View toggle sets EXT/close=1)
   if reaper.GetExtState(EXT, "close") == "1" then
@@ -572,11 +643,7 @@ local function loop()
     return
   end
   -- the docked keyboard (see FB_DOCK_* above): which browser slot holds it, if any
-  local kslot, kmode = nil, 0
-  for s = 0, SWB_SLOTS - 1 do
-    local m = math.floor(reaper.gmem_read(SWB_BASE + s * SWB_STRIDE + FB_DOCK_KEYS) or 0)
-    if m >= 2 then kslot, kmode = s, m; break end
-  end
+  local kslot, kmode = docked_key_slot()
   local focus = reaper.JS_Window_GetFocus and reaper.JS_Window_GetFocus()
   if kslot and canvas and focus == canvas then
     reaper.JS_Window_SetFocus(dock_hwnd); key_focus_taken = true
@@ -616,7 +683,9 @@ local function main()
     return
   end
 
-  pcall(function() reaper.set_action_options(1) end)  -- relaunch replaces the running instance
+  -- Flag 1 alone: running the action again while the dock is open ENDS it (the atexit below saves and releases)
+  -- and REAPER drops the new launch -- a toggle, not a restart (a restart would need 1|2, as Floatter uses).
+  pcall(function() reaper.set_action_options(1) end)
   reaper.SetExtState(EXT, "close", "0", false)  -- a stale signal must not kill a fresh launch
 
   reaper.atexit(function()

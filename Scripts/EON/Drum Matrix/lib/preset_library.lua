@@ -66,9 +66,11 @@ local STEP_DIV_QN = {
   ['1/16']  = 0.25,
   ['1/32']  = 0.125,
   ['1/64']  = 0.0625,
-  ['1/8T']  = 1/12,      -- 8th-note triplet (3 per quarter)
-  ['1/16T'] = 1/24,      -- 16th-note triplet (6 per quarter)
-  ['1/32T'] = 1/48,      -- 32nd-note triplet
+  -- The triplets were 1/12, 1/24, 1/48: whole-note numbers, 4x too short in QN
+  -- (the same mix-up as the project grid's, audit DM14).
+  ['1/8T']  = 1/3,       -- 8th-note triplet (3 per quarter)
+  ['1/16T'] = 1/6,       -- 16th-note triplet (6 per quarter)
+  ['1/32T'] = 1/12,      -- 32nd-note triplet (12 per quarter)
 }
 
 local function step_div_to_qn(s)
@@ -423,7 +425,11 @@ function M.Apply(lane, preset)
   -- Tile the pattern across the entire item duration. Standard drum-machine
   -- behavior — a 1-bar pattern repeats through a 4-bar item. The unified events
   -- list + cycle length cover both the grid `steps` and raw `notes` forms.
-  -- Stops when the next cycle would start past the item's end.
+  -- Stops when the next cycle would start past the item's end -- that is the
+  -- real exit; the count below only stops a cycle that never advances. It used
+  -- to be 256 cycles (DM224, 2026-10-26): a 1-QN hat preset on a 128-bar item
+  -- stopped at bar 65 after every old hat on the pitch had already been wiped.
+  local MAX_CYCLES = 1000000
   local events, cycle_len_qn = build_events(preset, div_qn)
   local inserted = 0
   if #events > 0 and cycle_len_qn > 0 then
@@ -447,7 +453,7 @@ function M.Apply(lane, preset)
         end
       end
       cycle = cycle + 1
-      if cycle > 256 then break end   -- safety against infinite loop
+      if cycle > MAX_CYCLES then break end   -- safety against infinite loop
     end
   end
   reaper.MIDI_Sort(take)

@@ -4,8 +4,9 @@
 -- Regenerate: python .dev_fxpicker/gen_recipe_table.py
 --
 -- Rung 1 of the FX Picker category ladder -- authoritative for known plugins.
--- ROWS are pre-sorted LONGEST KEY FIRST so the matcher takes the most
--- specific hit ("pro c 2" beats "pro c") with no runtime sorting.
+-- ROWS match EXACTLY on the normalised name (rk_lua_fxpicker.lua). They are
+-- pre-sorted LONGEST KEY FIRST; the order only decides which row wins when
+-- a name and its cut-at-"(" form both match.
 -- PATHS is an exact-match hash on a JSFX ident, lowercased with forward
 -- slashes -- a JSFX display name changes whenever its author edits the
 -- desc: line, but its path does not.
@@ -111,6 +112,7 @@ M.ROWS = {
   { "kramer master tape",            "tape",     "",           "fx",         "Kramer Master Tape" },
   { "lounge lizard ep 4",            "keys",     "",           "instrument", "Lounge Lizard EP-4" },
   { "ozone 11 maximizer",            "limit",    "",           "fx",         "Ozone 11 Maximizer" },
+  { "ozone 12 maximizer",            "limit",    "",           "fx",         "Ozone 12 Maximizer" },
   { "parallel aggressor",            "sat",      "",           "fx",         "Parallel Aggressor" },
   { "psp 608 multidelay",            "delay",    "",           "fx",         "PSP 608 MultiDelay" },
   { "roland dimension d",            "mod",      "",           "fx",         "Roland Dimension D" },
@@ -633,6 +635,7 @@ M.ROWS = {
   { "pro c 2",                       "comp",     "",           "fx",         "Pro-C 2" },
   { "pro l 2",                       "limit",    "",           "fx",         "Pro-L 2" },
   { "pro q 3",                       "eq",       "",           "fx",         "Pro-Q 3" },
+  { "pro q 4",                       "eq",       "",           "fx",         "Pro-Q 4" },
   { "pro r 2",                       "verb",     "",           "fx",         "Pro-R 2" },
   { "punch 2",                       "drums",    "",           "instrument", "Punch-2" },
   { "reacast",                       "util",     "",           "fx",         "ReaCast" },
@@ -642,6 +645,7 @@ M.ROWS = {
   { "reaverb",                       "verb",     "",           "fx",         "ReaVerb" },
   { "repitch",                       "pitch",    "",           "fx",         "RePitch" },
   { "repro 5",                       "synth",    "",           "instrument", "Repro-5" },
+  { "serum 2",                       "synth",    "",           "instrument", "Serum 2" },
   { "sga1566",                       "sat",      "tube",       "fx",         "SGA1566" },
   { "sigmund",                       "delay",    "",           "fx",         "Sigmund" },
   { "simplon",                       "filter",   "",           "fx",         "Simplon" },
@@ -847,6 +851,10 @@ M.PATHS = {
   ["docshadrach fxs/utilities/levelmatch_core.jsfx"] = { "util", "monitoring", "fx" },
   ["docshadrach fxs/utilities/nam_alignment_tool.jsfx"] = { "util", "", "fx" },
   ["docshadrach fxs/utilities/v-clamp.jsfx"] = { "util", "", "fx" },
+  ["eon/swing/eon_fx_return_view.jsfx"] = { "meter", "", "fx" },
+  ["eon/swing/eon_lens.jsfx"] = { "util", "", "fx" },
+  ["eon/swing/eon_stepseq.jsfx"] = { "midi", "", "midi" },
+  ["eon/swing/swing_reakit.jsfx"] = { "drums", "", "instrument" },
   ["eon_reakit_bundle/eon/eon_jsfx/fx/ddc_reakit.jsfx"] = { "comp", "", "fx" },
   ["eon_reakit_bundle/eon/eon_jsfx/fx/expressbus_reakit.jsfx"] = { "comp", "bus", "fx" },
   ["eon_reakit_bundle/eon/eon_jsfx/fx/spice.jsfx"] = { "summing", "", "fx" },

@@ -39,12 +39,6 @@ function M.ConsoleWarnOnce(key, msg)
   M.ConsoleWarn(msg)
 end
 
--- Reset the dedup table — call at script init so previous-session warnings
--- don't suppress fresh ones in a new run.
-function M.ResetWarnDedup()
-  _warned_at = {}
-end
-
 -- =============================================================================
 -- Pointer validation
 -- =============================================================================
@@ -53,18 +47,6 @@ function M.ValidateTrack(track)
   if not track then return false end
   if not reaper.ValidatePtr then return true end   -- old REAPER: best effort
   return reaper.ValidatePtr(track, 'MediaTrack*')
-end
-
-function M.ValidateTake(take)
-  if not take then return false end
-  if not reaper.ValidatePtr then return true end
-  return reaper.ValidatePtr(take, 'MediaItem_Take*')
-end
-
-function M.ValidateItem(item)
-  if not item then return false end
-  if not reaper.ValidatePtr then return true end
-  return reaper.ValidatePtr(item, 'MediaItem*')
 end
 
 -- =============================================================================

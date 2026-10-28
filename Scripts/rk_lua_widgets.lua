@@ -62,8 +62,6 @@ end
 
 w.colors = {
   accent         = 0xFF8C32FF,
-  accent_fill    = 0x40C8FFBB,
-  accent_edge    = 0x40C8FFDD,
   -- TK Media Browser-matched waveform color: deeper saturated blue at
   -- full opacity. Avoids the soft "bleed-through" look our older cyan
   -- @ 0xBB alpha had vs TK's solid waveform render.
@@ -74,7 +72,6 @@ w.colors = {
   status_err     = 0xCC4444FF,
   text_info      = 0xBBBBC0FF,
   text_dim       = 0x8C8C96FF,
-  text_muted     = 0x6C6C76FF,
   pad_empty      = 0x38383FFF,
   border_default = 0x414148FF,
   white          = 0xFFFFFFFF,
@@ -127,8 +124,10 @@ end
 -- the surfaces they will actually land on. See w.ink below.
 w._pal = nil
 
--- Draw text in its own colour with a thin black outline, so a vivid colour keeps
--- its full strength and still reads on a pale surface.
+-- Draw text in its own colour with a thin outline, so a vivid colour keeps its
+-- full strength and still reads on a pale surface. The default outline is a dark
+-- shade of the colour itself (each channel x 0.30) at alpha 0x59 (35%); a caller
+-- may pass its own. Both callers (the Browser's category dots) use the default.
 --
 -- ⚠ ALPHA is the dial here, not the offset. Redrawing a glyph at ±1px is a 1px
 -- dilation and that is the floor for this technique — you cannot outline thinner
@@ -137,14 +136,12 @@ w._pal = nil
 -- and even 0xA6 (65%) the corners compound to near-solid black and the label
 -- looks bold ("too much outline" / "too thick", user 2026-08-30, twice).
 --
--- At 0x40 (25%) a single pass is a faint edge and the compounded corners land
--- around 68%, which separates the glyph from a pale row without weight. If this
--- still reads heavy the next step is fewer passes, not a smaller offset.
+-- Those attempts, and the next at 0x40 (25%), were BLACK; black gave way to the
+-- colour's own shade (see the body). If this still reads heavy the next step is
+-- fewer passes, not a smaller offset.
 --
 -- Offsets are CARDINAL, never diagonal: a diagonal pushes 1.4px, not 1px.
 --
--- Black regardless of theme: on a light surface it is the whole point, and on a
--- dark one it simply disappears into the background and costs nothing.
 -- ⚠ The GLYPH is drawn by the real ImGui.Text, not by the draw list. Only the
 -- outline passes are manual. Drawing the main glyph with DrawList_AddText and
 -- then reserving space for it with Dummy skips the widget path's baseline
@@ -401,8 +398,17 @@ function w.draw_waveform(ctx, x, y, width, height, peaks, playback_ratio, opts)
     -- Window aggregation: when we have more peaks than pixels (TK-style
     -- high peakrate), take max-of-window per pixel so high-frequency
     -- detail isn't lost. When peaks ≈ pixels, behaves like the prior
-    -- 1-peak-per-pixel render.
-    local win = math.max(1, math.floor(step))
+    -- 1-peak-per-pixel render. The windows are CONTIGUOUS: pixel px owns
+    -- peaks floor(px*step)+1 .. floor((px+1)*step). A fixed floor(step)
+    -- wide window starting at floor(px*step)+1 left peaks unread between
+    -- windows whenever step was fractional (1.5x: peak 3 of every 3), so a
+    -- one-peak transient vanished at one width and came back at another.
+    local function win_end(px, i0)
+      local i1 = math.floor((px + 1) * step)
+      if i1 < i0 then i1 = i0 end
+      if i1 > peak_count then i1 = peak_count end
+      return i1
+    end
 
     -- Render uses absolute peak amplitude rendered SYMMETRICALLY around
     -- each centerline (matching TK / Sitala / Battery convention). This
@@ -417,7 +423,7 @@ function w.draw_waveform(ctx, x, y, width, height, peaks, playback_ratio, opts)
       local half_sc  = height * 0.20
       for px = 0, math.floor(width) - 1 do
         local i0 = math.floor(px * step) + 1
-        local i1 = math.min(peak_count, i0 + win - 1)
+        local i1 = win_end(px, i0)
         local ampL, ampR = 0, 0
         for ii = i0, i1 do
           local pk = peaks[ii]
@@ -446,7 +452,7 @@ function w.draw_waveform(ctx, x, y, width, height, peaks, playback_ratio, opts)
       local scale = height * 0.45
       for px = 0, math.floor(width) - 1 do
         local i0 = math.floor(px * step) + 1
-        local i1 = math.min(peak_count, i0 + win - 1)
+        local i1 = win_end(px, i0)
         local amp = 0
         for ii = i0, i1 do
           local pk = peaks[ii]
@@ -524,7 +530,8 @@ end
 ---   read_pad_name    function(pad_idx) -> string
 ---   pad_has_audio    function(pad_idx) -> bool
 ---   get_pad_color    function(pad_idx) -> uint32 RGBA
----   get_folder_name  function(path) -> string  (for tooltip)
+---   is_pad_muted       (optional) function(pad_idx) -> bool
+---   on_pad_right_click (optional) function(ctx, pad_idx)  draws the context-menu items
 function w.draw_pad_grid(ctx, opts)
   local avail_w = ImGui.GetContentRegionAvail(ctx)
   local spacing = 4
@@ -599,12 +606,8 @@ function w.draw_pad_grid(ctx, opts)
       if ImGui.Button(ctx, pad_label, pad_w, pad_h) then
         if opts.on_pad_click then opts.on_pad_click(p) end
       end
-      -- Tooltip on hover shows the full pad name. The button label is
-      -- truncated to 6 chars to fit the cell; users can see the full
-      -- name (e.g. "808_kick_punchy" instead of "808_ki") by hovering.
-      if name ~= "" and ImGui.IsItemHovered(ctx) then
-        ImGui.SetTooltip(ctx, name)
-      end
+      -- The full pad name rides the ONE tooltip below (two SetTooltip calls on
+      -- a hovered item keep only the last: a named empty pad read "(empty)").
       ImGui.PopStyleColor(ctx, 3)
 
       if is_target then
@@ -641,14 +644,13 @@ function w.draw_pad_grid(ctx, opts)
         end
       end
 
-      -- Tooltip
+      -- Tooltip: the tile's one tooltip -- the full pad name (the label is cut
+      -- to 6 chars, e.g. "808_kick_punchy" shows as "808_ki") and whether audio
+      -- is loaded, so a named empty pad reads "Pad 3: 808_kick_punchy (empty)".
       if ImGui.IsItemHovered(ctx) then
         local tip = "Pad " .. (p + 1)
-        if has_audio and name ~= "" then
-          tip = tip .. ": " .. name
-        else
-          tip = tip .. ": (empty)"
-        end
+        if name ~= "" then tip = tip .. ": " .. name end
+        if not has_audio then tip = tip .. " (empty)" end
         ImGui.SetTooltip(ctx, tip)
       end
     end
@@ -930,26 +932,6 @@ function w.mode_pill(ctx, id, labels, idx, width)
   ImGui.PopStyleColor(ctx, 2)
   if clicked then return true, (idx + 1) % #labels end
   return false, idx
-end
-
--- ═══════════════════════════════════════════════════════════════════════════════
--- BUTTON HELPERS
--- ═══════════════════════════════════════════════════════════════════════════════
-
---- Button that can be disabled. Returns true if clicked (and was enabled).
-function w.button(ctx, label, width, height, enabled)
-  if enabled == false then ImGui.BeginDisabled(ctx) end
-  local clicked = ImGui.Button(ctx, label, width or 0, height or 0)
-  if enabled == false then ImGui.EndDisabled(ctx) end
-  return clicked
-end
-
---- Button with a custom background color. Returns true if clicked.
-function w.colored_button(ctx, label, color, width, height)
-  ImGui.PushStyleColor(ctx, ImGui.Col_Button, color)
-  local clicked = ImGui.Button(ctx, label, width or 0, height or 0)
-  ImGui.PopStyleColor(ctx)
-  return clicked
 end
 
 return w

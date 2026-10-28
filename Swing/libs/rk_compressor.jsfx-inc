@@ -217,7 +217,7 @@ local(_i, _x, _g, _e)
      + abs(cmp_g_tbl[600] - CMP_CHK_G600);
   _e > 0.000000001 ? cmp_selfok = 0;
 
-  // Detent tables: ratio (9 solved points), attack (6 parts), release (4).
+  // Detent tables: attack (6 parts), release (4); the ratio has none (below).
   // Filled from the generated constants; interp in cmp_recalc is geometric
   // between neighbours so every hardware detent is exact.
   // (The 9-point fitted ratio-drive table is gone with the fit: the
@@ -244,7 +244,8 @@ local(_i, _x, _g, _e)
   // H2 gain-dependence m(GR): THAT 2181 figs 10/12 (provenance at the
   // generated constants). Uniform 5 dB grid over 0..60 dB GR, +1 guard
   // cell repeating the last value so the interp never reads past the end
-  // (_gr is capped at 60 before the lookup, so _ii tops out at 13*0).
+  // (the lookup's _net is capped at 60, so _ii tops out at 12 and the
+  // interp's _ii + 1 at the guard cell 13).
   CMP_H2M_N = 13;
   cmp_h2m_tbl = mem_start; mem_start += CMP_H2M_N + 1;
   cmp_h2m_tbl[0]  = CMP_H2M_0;  cmp_h2m_tbl[1]  = CMP_H2M_1;
@@ -297,20 +298,23 @@ local(_sr, _dt, _r, _p, _i, _t, _ra, _rr, _panel, _vf, _n, _k,
       _pp, _lk, _lv, _lf, _kf,
       _g1, _g2, _gl, _a1, _a2, _a, _m11, _m12, _m22)
 (
-  // Meant as a NaN self-heal for a corrupt serialized param (x != x). Measured on
-  // REAPER 7.79 (EON_Probe_NanSem, 2026-09-14, A-11): x != x reads 0 for a NaN in
-  // EEL2, so these lines never fire on one -- kept as the record of the ver-24
-  // defaults, not as protection. None is needed: a NaN parameter is inert, since
-  // EEL2 arithmetic flushes it to 0 on first use (a 0 coefficient, not a poisoned
-  // one) and min/max of a NaN return NaN whatever the argument order (wiki 7.8).
-  cmp_thresh  != cmp_thresh  ? cmp_thresh  = 0;
-  cmp_ratio   != cmp_ratio   ? cmp_ratio   = 4;
-  cmp_attack  != cmp_attack  ? cmp_attack  = 10;
-  cmp_release != cmp_release ? cmp_release = 100;
-  cmp_knee    != cmp_knee    ? cmp_knee    = 6;
-  cmp_makeup  != cmp_makeup  ? cmp_makeup  = 0;
-  cmp_mix     != cmp_mix     ? cmp_mix     = 1;
-  cmp_auto    != cmp_auto    ? cmp_auto    = 0;
+  // NaN self-heal: a NaN param goes back to its ver-24 default. Real ingresses in
+  // Swing: the kit loader's raw gmem reads (rk_swing_ui_state, cmp_* = gmem[_gb +
+  // 31..37]), a project saved with a NaN, and -- in REAPER until 2026-10-27 -- the
+  // comp link's first-sight adopt. A NaN param is not inert: by the NanSem table
+  // min/max pass it and exp() of a NaN stores 0, so in REAPER a NaN makeup sets
+  // cmp_makeup_lin to 0 and the wet path goes silent (the ysfx harness's min/max
+  // return the bound instead: +24 dB). The test is abs(x) >= 0 in its POSITIVE form
+  // (wiki 1.8). Until 2026-10-27 it was x != x, which never fires on a NaN in EEL2
+  // (EON_Probe_NanSem; rr_2_test.py).
+  abs(cmp_thresh)  >= 0 ? 0 : ( cmp_thresh  = 0; );
+  abs(cmp_ratio)   >= 0 ? 0 : ( cmp_ratio   = 4; );
+  abs(cmp_attack)  >= 0 ? 0 : ( cmp_attack  = 10; );
+  abs(cmp_release) >= 0 ? 0 : ( cmp_release = 100; );
+  abs(cmp_knee)    >= 0 ? 0 : ( cmp_knee    = 6; );
+  abs(cmp_makeup)  >= 0 ? 0 : ( cmp_makeup  = 0; );
+  abs(cmp_mix)     >= 0 ? 0 : ( cmp_mix     = 1; );
+  abs(cmp_auto)    >= 0 ? 0 : ( cmp_auto    = 0; );
   cmp_auto = cmp_auto >= 0.5 ? 1 : 0;   // canonical 0/1: truthiness must
                                         // not make 0.2 select Auto
 
@@ -318,9 +322,6 @@ local(_sr, _dt, _r, _p, _i, _t, _ra, _rr, _panel, _vf, _n, _k,
   _sr <= 0 ? ( _sr = 44100; );  // guard
   _dt = 1 / _sr;
 
-  // Ratio -> loop drive: geometric interp over the solved (ratio, drive)
-  // points. Below the first solved point the drive ramps to zero at 1:1
-  // (no loop gain = no compression). Above the last it holds.
   _r = max(1, min(20, cmp_ratio));
   // ratio -> the 82E26 ladder's detent axis: 2/4/10 at pos 0/1/2. K
   // interpolates geometrically (resistance ladder), Voff linearly (a DC

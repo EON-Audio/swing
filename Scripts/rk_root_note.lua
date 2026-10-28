@@ -15,11 +15,11 @@
 -- published paper: difference function -> cumulative mean normalised difference
 -- -> absolute threshold -> parabolic interpolation. No third-party code.
 --
--- ⚠️ SYNTH PADS DO NOT NEED THIS. rk_synthdrums.jsfx-inc knows its own settled
--- fundamental in closed form (kick :333, snare :395, tom :615), so a SYN pad's
--- root note is exact and free — call hz_to_note() on the synth value instead.
--- Hats/cymbals there expose only a filter cutoff (:509/:556), i.e. no
--- fundamental at all, and correctly display nothing.
+-- ⚠️ SYNTH PADS DO NOT NEED THIS. A SYN pad's root note comes straight from its
+-- engine parameters, inside the JSFX (swing_lcd_synth_hz in rk_swing_lcd.jsfx-inc,
+-- derived from the DD-101 engines in rk_synthdrums.jsfx-inc), so it is exact and
+-- free. Families with no fundamental (filter cutoff / noise only) correctly
+-- display nothing.
 --
 -- ── Design decisions, each measured 2026-08-01 (see the calibration rig) ──
 --
@@ -361,21 +361,13 @@ function M.analyse(samples, sr)
   }
 end
 
--- Formats a result for the LCD / browser column. Returns "F#1" or "—".
-function M.format(r, with_cents)
-  if not r or not r.show then return "—" end
-  local s = string.format("%s%d", r.name, r.octave)
-  if with_cents then s = s .. string.format(" %+.0f", r.cents) end
-  return s
-end
-
 -- ═══════════════════════════════════════════════════════════════════════════
 -- FILE I/O — needs REAPER. Reads REAL PCM via AudioAccessor, never GetPeaks:
 -- peak data is a rectified envelope whose harmonic content is a distortion of
 -- the signal, which is exactly what a pitch estimator must not be fed.
 -- ═══════════════════════════════════════════════════════════════════════════
 
--- Scratch-track pattern mirrors Swing_Kit_Bridge.lua:3260 — AudioAccessor
+-- Scratch-track pattern mirrors Swing_Kit_Bridge.lua's acquire_scratch_track — AudioAccessor
 -- needs an item, an item needs a track, and using the user's first track
 -- pollutes it and leaves a stray undo step. Insert at the END, then delete.
 local function acquire_scratch()
@@ -457,32 +449,39 @@ function M.read_file(path, max_s)
 end
 
 -- Convenience: path -> analysis result (or nil, err).
+--
+-- Memoised by path + size (+ modification time with js_ReaScriptAPI): Swing asks for ALL sixteen pads on every
+-- bank switch, and each ask was a scratch track, a 2 s decode and a YIN pass (~50 ms on the UI thread) for a
+-- file whose answer was already known -- four bank flips hitched the bridge for ~3 s. A failed read is not kept
+-- (a file still being written reads again next time). Bounded, oldest out; results are never mutated by callers.
+local DETECT_MEMO, DETECT_MEMO_ORDER, DETECT_MEMO_MAX = {}, {}, 256
+local function file_stamp(path)
+  if reaper.JS_File_Stat then
+    local rv, size, _, mtime = reaper.JS_File_Stat(path)
+    if rv == 0 then return tostring(size) .. "|" .. tostring(mtime) end
+  end
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local size = f:seek("end")
+  f:close()
+  return tostring(size)
+end
 function M.detect_file(path, max_s)
+  local stamp = path and file_stamp(path)
+  local key = stamp and (path .. "|" .. stamp .. "|" .. tostring(max_s or ""))
+  local hit = key and DETECT_MEMO[key]
+  if hit then return hit.r end
   local samples, sr = M.read_file(path, max_s)
   if not samples then return nil, sr end
-  return M.analyse(samples, sr)
-end
-
--- ═══════════════════════════════════════════════════════════════════════════
--- SYNTH PADS — exact, no detection. Mirrors rk_synthdrums.jsfx-inc.
--- Returns a result table shaped like analyse()'s, with conf = 1.
--- family: "kick" | "snare" | "tom".  Hats/cymbals have NO fundamental.
--- ═══════════════════════════════════════════════════════════════════════════
-
-function M.synth_root(family, mac0, tune)
-  mac0, tune = mac0 or 0.5, tune or 0.0
-  local base
-  if     family == "kick"  then base = 35.0  * 2 ^ ((mac0 - 0.5) * 1.5 + tune / 12)
-  elseif family == "snare" then base = 165.0 * 2 ^ ((mac0 - 0.5) * 1.2 + tune / 12)
-  elseif family == "tom"   then base = 95.0  * 2 ^ ((mac0 - 0.5) * 1.5 + tune / 12)
-  else return { show = false, why = "no fundamental (noise-based family)" } end
-
-  local nt = M.hz_to_note(base)
-  return {
-    f0 = base, conf = 1.0, show = true, mult = 1,
-    midi = nt.midi, note = nt.note, name = nt.name,
-    octave = nt.octave, cents = nt.cents, why = "synth (exact)",
-  }
+  local r = M.analyse(samples, sr)
+  if key and r then
+    if #DETECT_MEMO_ORDER >= DETECT_MEMO_MAX then
+      DETECT_MEMO[table.remove(DETECT_MEMO_ORDER, 1)] = nil
+    end
+    DETECT_MEMO[key] = { r = r }
+    DETECT_MEMO_ORDER[#DETECT_MEMO_ORDER + 1] = key
+  end
+  return r
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -509,9 +508,9 @@ local function rn_base(G, slot, pad)
   return G.ROOTNOTE_BASE + slot * G.ROOTNOTE_STRIDE + pad * G.ROOTNOTE_FIELDS
 end
 
--- Publish one pad. `r` is an analyse() / synth_root() result, or nil to say
--- "no root note here". `src` defaults to RN_SRC_DETECTED; pass RN_SRC_SYNTH
--- for analytic synth values.
+-- Publish one pad. `r` is an analyse() / detect_file() result, or nil to say
+-- "no root note here". `src` defaults to RN_SRC_DETECTED (synth pads never come
+-- through here: the JSFX computes their root itself).
 function M.publish(G, slot, pad, r, src)
   if not G or not slot or slot < 0 or not pad or pad < 0 then return false end
   local b    = rn_base(G, slot, pad)
@@ -532,34 +531,49 @@ function M.clear(G, slot, pad)
   return M.publish(G, slot, pad, nil)
 end
 
--- Read a published record back (probes, and any Lua-side consumer).
-function M.read(G, slot, pad)
-  if not G or not slot or slot < 0 then return nil end
-  local b = rn_base(G, slot, pad)
-  if (reaper.gmem_read(b + G.RN_OFF_VER) or 0) <= 0 then return nil end
-  local note = math.floor(reaper.gmem_read(b + G.RN_OFF_NOTE))
-  local conf = reaper.gmem_read(b + G.RN_OFF_CONF)
-  local src  = math.floor(reaper.gmem_read(b + G.RN_OFF_SRC))
-  if note < 0 then
-    return { show = false, conf = conf, src = src, why = "no root note" }
-  end
-  local name, octave = M.note_name(note)
-  return { show = true, note = note, name = name, octave = octave,
-           cents = reaper.gmem_read(b + G.RN_OFF_CENTS), conf = conf, src = src }
-end
-
 -- Consume the JSFX -> bridge re-analysis request. Edge-triggered on the seq
 -- cell, so the caller keeps the last seq it saw:
 --   local req; req, my_seq = rn.poll_request(G, my_seq)
 -- Returns nil when nothing new. req.pad == -1 means "every pad on that slot".
+-- req.paths (A2, 2026-10-26): { [tile] = path } for the tiles the request names, "" = the pad has no
+-- source, when the Swing that posted it sent its paths (PSEQ == seq); nil from an older Swing, whose
+-- caller keeps its old read. A request whose paths are being rewritten under us (PSEQ -1 now, or moved
+-- by the end of the read) is left for the next poll: the writer's own request follows with a new seq.
+local function read_req_path(base)
+  local n = math.floor(reaper.gmem_read(base) or 0)
+  if n <= 0 or n > 258 then return "" end
+  local t = {}
+  for i = 1, n do
+    t[i] = string.char(math.floor(reaper.gmem_read(base + i) or 0) % 256)
+  end
+  return table.concat(t)
+end
+
 function M.poll_request(G, last_seq)
   if not G then return nil, last_seq end
   local seq = reaper.gmem_read(G.ROOTNOTE_REQ) or 0
   if seq == (last_seq or 0) then return nil, last_seq or 0 end
-  return {
+  local req = {
     slot = math.floor(reaper.gmem_read(G.ROOTNOTE_REQ + 1) or -1),
     pad  = math.floor(reaper.gmem_read(G.ROOTNOTE_REQ + 2) or -1),
-  }, seq
+  }
+  if G.ROOTNOTE_REQ_PSEQ and G.ROOTNOTE_REQ_PATHS then
+    local ps = reaper.gmem_read(G.ROOTNOTE_REQ_PSEQ) or 0
+    if ps == -1 then return nil, last_seq or 0 end            -- paths in flight: next poll
+    local np = G.NUM_PADS or 16
+    if ps == seq and req.pad >= -1 and req.pad < np then
+      local first, last = req.pad, req.pad
+      if req.pad < 0 then first, last = 0, np - 1 end
+      req.paths = {}
+      for t = first, last do req.paths[t] = read_req_path(G.ROOTNOTE_REQ_PATHS + t * 260) end
+      -- Torn-read guard: another post began (PSEQ -1) or landed (PSEQ / seq moved) while we read.
+      if (reaper.gmem_read(G.ROOTNOTE_REQ_PSEQ) or 0) ~= seq
+         or (reaper.gmem_read(G.ROOTNOTE_REQ) or 0) ~= seq then
+        return nil, last_seq or 0
+      end
+    end
+  end
+  return req, seq
 end
 
 return M

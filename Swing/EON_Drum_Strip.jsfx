@@ -80,14 +80,15 @@ out_pin:right output
 @init
 
 // Embedded (TCP/MCP) view support — see _refs/jsfx_embedded_gui_research_v3.md.
-// Retina request (Saike idiom; REAPER bumps it >=1 on HiDPI) and borderless
+// Retina request (Saike idiom; REAPER bumps it >=1 on HiDPI) and the embed flags:
+// 0x100 = undecorated embed (REAPER 7.45+), set or cleared here by the NAME BAR
+// row and re-applied each visible @gfx pass; 0x400 = suppress REAPER's hover
+// tooltip over the MCP embed (7.79+; older ignores).
 // ⚠ 0x100 is NOT what makes an embed work. REAPER sets bit 1 itself when a
 //   JSFX is embedded (6.30+); 0x100 only asks for the embed to be drawn
 //   WITHOUT DECORATION (7.45+), and 0x400 suppresses REAPER's own tooltip
 //   over it (7.79+). Reading 0x100 as "embed support" is how the README came
 //   to tell users below 7.45 that nothing could embed at all.
-// embed (0x100 MUST be set in @init — no effect later; REAPER 7.45+). 0x400 =
-// suppress REAPER's hover tooltip over the MCP embed (7.79+; older ignores).
 gfx_ext_retina == 0 ? gfx_ext_retina = 1;
 // 0x400 always; 0x100 follows the NAME BAR row (gear panel), default 0 = borderless.
 gfx_ext_flags |= 0x400;
@@ -107,8 +108,8 @@ name_bar ? ( gfx_ext_flags = (gfx_ext_flags | 0x100) - 0x100; ) : ( gfx_ext_flag
 // StepSeq's EON_SS_PCTRL_BASE slot-0 NAV_SEQ bump-counter (same semantics —
 // a strip re-init faked a preset-nav event). MUST match rk_lua_core.lua
 // GS_STRIP_REINIT_PULSE.
-// ⚠ ONCE PER INSTANCE (2026-10-14). @init also re-runs on every play start and
-// every enable (wiki 3.2: no ext_noinit here), and a re-run cannot wipe a slider
+// ⚠ ONCE PER INSTANCE (2026-10-14). @init used to re-run on every play start and
+// every enable (wiki 3.2; the ext_noinit below ends that), and a re-run cannot wipe a slider
 // -- only a fresh instance can come up with a stale chunk. But every re-run
 // bumped this counter, so the sync's 8 s restore window opened at every play
 // start: a knob the user reset to its default in those seconds was put back to
@@ -117,6 +118,13 @@ name_bar ? ( gfx_ext_flags = (gfx_ext_flags | 0x100) - 0x100; ) : ( gfx_ext_flag
 // non-empty) and are zero in a fresh instance, so the flag tells the two apart:
 // the pulse now fires on load / fresh insert / project load / a true
 // re-instantiation, never on play start or enable. Rig: EON_Probe_StripPulse.
+// ⭐ ext_noinit = 1 (sweep PLG2, 2026-10-26): without it REAPER re-ran this section at every play
+// start, render start and enable -- svf_init put every filter's state back to zero under flowing
+// audio, the compressor envelope restarted, and the "later @init" soft-start below armed a 25 ms
+// fade over the first hit of every play and every render (a kick on the play cursor lost its
+// attack). Nothing here needs the re-run: @block re-takes srate (recalc + snap), and the house
+// (Swing, Weld, Return View, Lens, StepSeq) shields it the same way.
+ext_noinit = 1;
 GS_STRIP_REINIT_PULSE = 26090100;
 !strip_pulse_sent ? ( gmem[GS_STRIP_REINIT_PULSE] = gmem[GS_STRIP_REINIT_PULSE] + 1; strip_pulse_sent = 1; );
 
@@ -278,7 +286,6 @@ local(_mode, _amt, _atk_ms, _rel_ms, _ratio, _knee, _max_thresh, _thresh, _sr, _
   strip_cmp_thresh    = _thresh;        // @sample glides toward the threshold, the knee's width (hi - lo), the ratio (click fix 2026-10-14)
   strip_cmp_knee_lo   = _thresh - _knee * 0.5;
   strip_cmp_knee_hi   = _thresh + _knee * 0.5;
-  strip_cmp_knee_inv  = _knee > 0 ? 1 / (2 * _knee) : 0;
   strip_cmp_knee_lo_lin = exp((_thresh - _knee * 0.5) * 0.11512925465);
   // Auto-makeup at 1/4 of theoretical max GR (matches Swing)
   _makeup_db = -_thresh * (1 - 1 / _ratio) * 0.25;
@@ -518,18 +525,34 @@ local(_aL, _aR, _svf, _bc_hold,
     strip_drive(_aL * 8.0, _aR * 8.0, strip_drv_mode | 0);
     _aL += (_doL - _aL) * strip_sat_drv_s;
     _aR += (_doR - _aR) * strip_sat_drv_s;
+    // ⚠️ TUBE (mode 1) only -- Swing's per-pad blocker (rk_drumkit_fx.jsfx-inc), the same one-pole
+    // but for the names (sweep PLG9): the curve is asymmetric by design and emits DC, there is no
+    // HPF after it, and in strip mode THIS is the stage that runs the pad's drive, so the offset
+    // went out to the child track unblocked. `|0` to match the dispatch two lines up; the park on
+    // leaving TUBE is Swing's too (resuming off stale x1/y1 is a thump).
+    (strip_drv_mode | 0) == 1 ? (
+      _dcy = _aL - strip_dc_x1L + strip_dc_r * strip_dc_y1L;
+      strip_dc_x1L = _aL; strip_dc_y1L = _dcy; _aL = _dcy;
+      _dcy = _aR - strip_dc_x1R + strip_dc_r * strip_dc_y1R;
+      strip_dc_x1R = _aR; strip_dc_y1R = _dcy; _aR = _dcy;
+    ) : (
+      strip_dc_x1L != 0 || strip_dc_y1L != 0 || strip_dc_x1R != 0 || strip_dc_y1R != 0 ? (
+        strip_dc_x1L = 0; strip_dc_y1L = 0; strip_dc_x1R = 0; strip_dc_y1R = 0;
+      );
+    );
+  ) : (
+    // Drive off: park the blocker, or re-engaging steps off stale state.
+    strip_dc_x1L != 0 || strip_dc_y1L != 0 || strip_dc_x1R != 0 || strip_dc_y1R != 0 ? (
+      strip_dc_x1L = 0; strip_dc_y1L = 0; strip_dc_x1R = 0; strip_dc_y1R = 0;
+    );
   );
 
   // Smooth the output trim too (raw level knob — the classic zipper source).
   strip_out_lin_s += (strip_out_lin - strip_out_lin_s) * strip_gain_sm_c;
-  // Re-engage soft-start: after a re-instantiation (audio-device close on
-  // minimize) the chain restarts with COLD filter integrator + compressor
-  // envelope state, and the sync re-engages the saved FX a moment later — on
-  // continuous track audio that spat a brief overload (comp makeup applied
-  // before the envelope establishes; filter settling). Fade the whole output in
-  // (linear, ~25 ms — see strip_ss_step) so the transient is faded, not clipped. strip_ss_gain is
-  // 1 in steady state (no cost beyond the compare); armed to 0 by a later @init
-  // only (play start, enable, device reopen). It is never re-armed by a slider.
+  // Re-engage soft-start hook: a linear ~25 ms fade-in (strip_ss_step) of the whole output, 1 in
+  // steady state (no cost beyond the compare). Nothing arms it since ext_noinit (sweep PLG2): it
+  // used to be armed by every @init re-run, i.e. every play start and render, and ate the first
+  // hit's attack. Kept for a cold re-engage that may yet need it; never re-armed by a slider.
   strip_ss_gain < 1.0 ? strip_ss_gain = min(1.0, strip_ss_gain + strip_ss_step);
   // Soft-clip the trimmed signal (tames filter/comp/drive overshoots → no 0 dBFS
   // overload), then apply the re-engage fade.
@@ -827,9 +850,10 @@ function strip_card(c, x, y, w, h) local(nk, k0, cell, ck, cy) (
   ck = 0; loop(nk, strip_knob(k0 + ck, x + cp + cell * (ck + 0.5), cy, kr, 0); ck += 1;);
 );
 
-// ── House dropdown (replaces the native gfx_showmenu on the VIEW / VU / KNOB
-// chips). Row labels by kind: 1 = view mode, 2 = VU face (row 0 = AUTO, then
-// styles 0..10 at row-1), 3 = knob style (row = id, 0..18; 9 = the Rainbow
+// ── House dropdown (replaces the native gfx_showmenu; opened from the gear
+// panel's KNOB / VU FACE / EMBED VIEW rows). Row labels by kind: 1 = view mode,
+// 2 = VU face (row 0 = AUTO, then rk_vu faces 0..19 at row-1), 3 = knob style
+// (row = id, 0..18; 9 = the Rainbow
 // Arc). Panel state ds_dd_*: interaction runs EARLY
 // (right after the frame mouse globals) so an open panel swallows the click
 // before the chip handlers can re-open it; painting runs LAST, over everything.
@@ -854,7 +878,7 @@ function ds_dd_lbl(dest, kind, r) (
 // Open at (ax, ay): row height = the chip height so the list reads as an
 // extension of the button; width measured from the widest label (font set
 // FIRST — gfx_measurestr fails silently under a stale font).
-function ds_dd_openat(kind, n, ax, ay, rh) local(_di, _dw, _dh) (
+function ds_dd_openat(kind, n, ax, ay, rh) local(_di, _dw, _dh, _cur) (
   ds_dd_open = 1; ds_dd_kind = kind; ds_dd_n = n;
   ds_dd_x = ax; ds_dd_y = ay; ds_dd_rh = rh;
   gfx_setfont(1, "Arial", _uf8, 'b');
@@ -868,7 +892,14 @@ function ds_dd_openat(kind, n, ax, ay, rh) local(_di, _dw, _dh) (
   ds_dd_w = (ds_dd_w + floor(28 * sc))|0;
   // Height + clamps HERE too so the OPEN frame paints correctly — the early
   // block has already run this frame and won't see the open until the next.
-  ds_dd_h = n * rh + 2;
+  // The list SCROLLS (sweep PLG12): it shows the rows that fit the canvas (ds_dd_vis) from row
+  // ds_dd_scr, opens with the current item in view, and the wheel over it moves the window. The
+  // VU FACE list is 21 rows and the KNOB list 19 -- taller than a short floating window, and the
+  // rows past the bottom edge could not be picked at all (the rk_theme list already scrolls).
+  ds_dd_vis = max(1, min(n, floor((gfx_h - 4) / rh)));
+  _cur = kind == 1 ? (strip_view_mode | 0) : kind == 2 ? ((strip_vu_style | 0) + 1) : (gmem[GS_THEME_KNOB_P] | 0);
+  ds_dd_scr = max(0, min(n - ds_dd_vis, _cur - floor(ds_dd_vis / 2)));
+  ds_dd_h = ds_dd_vis * rh + 2;
   ds_dd_x + ds_dd_w > gfx_w - 2 ? ds_dd_x = max(0, gfx_w - 2 - ds_dd_w);
   ds_dd_y + ds_dd_h > gfx_h - 2 ? ds_dd_y = max(0, gfx_h - 2 - ds_dd_h);
 );
@@ -906,6 +937,9 @@ strip_vu_seen ? 0 : ( strip_vu_style = -1; strip_vu_seen = 1; );
 // Legacy (v3 gate): the old two-row header's expand state. The header is one row
 // now; the value is still read/written so the written @serialize gate stays intact.
 strip_hdr_seen ? 0 : ( strip_hdr_open = 0; strip_hdr_seen = 1; );
+// TUBE DC blocker pole, Swing's (~5 Hz; sweep PLG9). Audio-thread sections only (here and the
+// @block rate watcher), not strip_recalc, which @gfx's knob handlers also call.
+strip_dc_r = exp(-2 * $pi * 5.0 / max(1, srate));
 strip_recalc();
 // Snap the smoothed output gains to their targets on load (no fade-in).
 strip_out_lin_s = strip_out_lin;
@@ -920,12 +954,14 @@ _ini_i = 0; loop(STRIP_NUM_SVF,   // _ini_i not `i` — see the svf_init loop ab
 );
 strip_svf_glide();   // (one-pole fallback coeff; unused while smooth2 mode is on)
 svf_set_smooth2_ms(STRIP_SMOOTH_MS);   // use the 2nd-order smoother (see STRIP_SMOOTH_MS)
-// Re-engage soft-start arming. The FIRST @init (fresh load) keeps the snap above
-// (no fade-in, as before). A LATER @init → arm the output fade (strip_ss_gain 0→1
-// in @sample) so the cold-state re-engage transient is masked. A later @init is
-// NOT only the audio-device close on minimize: without ext_noinit REAPER re-runs
-// @init on EVERY play start and every enable (wiki §3.2, measured), so this fade
-// runs then too — harmless, ~25 ms.
+// Re-engage soft-start: NOT armed any more (sweep PLG2, 2026-10-26). The fade (strip_ss_gain 0 -> 1
+// in @sample) was armed by every "later @init", and with no ext_noinit that was every play start,
+// render start and enable: a hit on the play cursor had its first 25 ms attenuated, in every
+// render. It was written for a re-instantiation (the audio-device close on minimize) -- but that
+// is a FRESH instance, whose globals are zero, and it never got the fade (strip_init_seen was 0).
+// Under ext_noinit this section runs once per instance. The ramp in @sample stays as the hook
+// (one compare a sample) with nothing arming it; svf_init + svf_snap above and the compressor
+// prime (strip_process) cover a cold start.
 // ⛔ 2026-10-03: the 8 s "strip_ss_until" window that also zeroed strip_ss_gain on
 // ANY @slider is gone. It was armed by every play start, so automation, the GUI's
 // hidden view/dirty sliders, or a sync push in the first 8 s of playback cut the
@@ -933,8 +969,7 @@ svf_set_smooth2_ms(STRIP_SMOOTH_MS);   // use the 2nd-order smoother (see STRIP_
 // flagged all 32 sliders with the same 0.48 step). The restore it guarded is
 // covered at source: the filters glide (rk_svf 2nd-order smoother) and the
 // compressor envelope is primed (strip_process).
-strip_ss_gain = strip_init_seen ? 0.0 : 1.0;
-strip_init_seen = 1;
+strip_ss_gain = 1.0;
 
 // ── Per-surface press latches ────────────────────────────────────────
 // ⚠⚠ VERBATIM from Swing_ReaKit.jsfx (swing_srf_load / swing_srf_store, D-3,
@@ -1019,6 +1054,14 @@ function rk_srf_store()
 @slider
 // (No soft-start re-arm here any more: see the arming note in @init, 2026-10-03.)
 strip_recalc();
+// The curve cache's key (sweep PLG15): the @gfx EQ curve is built from the SVF TARGETS strip_recalc
+// writes, but its cache was keyed on the slider values alone -- a remote write (TrackFX_SetParam
+// from the sync, automation) lands on the main thread, so @gfx could see the new slider before
+// this thread had run the recalc, bake the OLD targets under the NEW key and keep that curve until
+// some other filter param moved. The key carries this count too, so the frame after the recalc
+// rebuilds. Bumped HERE (the audio thread), not inside strip_recalc: @gfx's own knob handlers call
+// that too, and they change the slider in the same frame, which the key already sees.
+strip_rc_gen += 1;
 
 @block
 // ⚠️ Loop counters here are `_blk_i`, NOT the global `i`. @block runs CONCURRENT
@@ -1033,6 +1076,7 @@ srate != strip_last_srate ? (
   svf_update_srate();
   strip_svf_glide();
   svf_set_smooth2_ms(STRIP_SMOOTH_MS);   // re-apply the smoother coeff at the new srate
+  strip_dc_r = exp(-2 * $pi * 5.0 / max(1, srate));   // the TUBE blocker's pole follows the rate (PLG9)
   strip_recalc();
   _blk_i = 0; loop(STRIP_NUM_SVF, svf_snap(strip_svf + _blk_i * SVF_STEREO_SIZE); _blk_i += 1;);
   strip_last_srate = srate;
@@ -1094,7 +1138,6 @@ lmb_down = LMB && !prev_LMB;
 // ⚠️Stashed ONLY while the sheet is open: closed, the picker takes what the
 // widgets leave, so a click the THEME panel swallowed cannot also open it
 // (GainKit's FOLLOW chip did, 2026-09-28; wiki 4.5).
-_svu_pk_lmb = 0; !micro_view && strip_vu.pk_open ? ( _svu_pk_lmb = lmb_down; lmb_down = 0; );
 rmb_down = RMB && !prev_RMB;
 CTRL  = _srf_cap & 4;
 SHIFT = _srf_cap & 8;
@@ -1102,6 +1145,10 @@ dt = min(time_precise() - sk_last_t, 0.05);
 sk_last_t = time_precise();
 hv_speed = 11;
 frame_wheel = mouse_wheel / 120;
+// The right button and the wheel go with the stashed click (sweep PLG10, Anvil's finding, the same
+// three lines here): the sheet (380 x 264 at least) lies over knobs and nodes, and ssl_knob_interact
+// resets on hover + rmb_down and turns on hover + frame_wheel. The picker uses neither: dropped.
+_svu_pk_lmb = 0; !micro_view && strip_vu.pk_open ? ( _svu_pk_lmb = lmb_down; lmb_down = 0; rmb_down = 0; frame_wheel = 0; );
 
 // ── EON theme band + GUI scale (before the early handlers, which need sc) ──
 // JSFX can't SetExtState -> the gear menu writes GS_THEME_REQ / GS_THEME_KNOB_REQ;
@@ -1125,7 +1172,7 @@ hdr_h  = micro_view ? 0 : floor(24 * max(1, sc));
 gear_s = floor(16 * max(1, sc));
 gear_x = gfx_w - gear_s - floor(5 * sc); gear_y = floor((hdr_h - gear_s) * 0.5);
 // Gear panel (the set-and-forget selectors): THEME · KNOB · VU FACE · EMBED VIEW ·
-// SYNC ALL, one row each, hanging under the gear. Geometry each frame so a resize
+// SYNC ALL · NAME BAR, one row each, hanging under the gear. Geometry each frame so a resize
 // can't strand it; state gp_open persists across frames only.
 gp_n = 6; gp_rh = floor(18 * max(1, sc)); gp_w = floor(200 * sc);
 gp_x = max(2, gfx_w - gp_w - floor(4 * sc)); gp_y = hdr_h + 2; gp_h = gp_n * gp_rh + 2;
@@ -1144,13 +1191,18 @@ gp_x = max(2, gfx_w - gp_w - floor(4 * sc)); gp_y = hdr_h + 2; gp_h = gp_n * gp_
 // to configure that embed. rkth precedent: theme-picker state is simply
 // untouched in embed passes.
 !micro_view && ds_dd_open ? (
-  ds_dd_h = ds_dd_n * ds_dd_rh + 2;
+  // the window's own height may have changed since the open: re-fit the visible rows (PLG12)
+  ds_dd_vis = max(1, min(ds_dd_n, floor((gfx_h - 4) / ds_dd_rh)));
+  ds_dd_scr = max(0, min(ds_dd_n - ds_dd_vis, ds_dd_scr));
+  ds_dd_h = ds_dd_vis * ds_dd_rh + 2;
   ds_dd_x + ds_dd_w > gfx_w - 2 ? ds_dd_x = max(0, gfx_w - 2 - ds_dd_w);
   ds_dd_y + ds_dd_h > gfx_h - 2 ? ds_dd_y = max(0, gfx_h - 2 - ds_dd_h);
   ds_dd_in = mx >= ds_dd_x && mx < ds_dd_x + ds_dd_w && my >= ds_dd_y && my < ds_dd_y + ds_dd_h;
-  ds_dd_hrow = ds_dd_in ? ((my - ds_dd_y - 1) / ds_dd_rh)|0 : -1;
-  ds_dd_hrow >= ds_dd_n ? ds_dd_hrow = -1;
-  ds_dd_in ? ( frame_wheel = 0; mouse_wheel = 0; );   // wheel dead over the panel
+  // the wheel over the panel scrolls it (a notch up = the window up a row); consumed either way
+  ds_dd_in && frame_wheel != 0 ? ds_dd_scr = max(0, min(ds_dd_n - ds_dd_vis, floor(ds_dd_scr - frame_wheel + 0.5)));
+  ds_dd_hrow = ds_dd_in ? (((my - ds_dd_y - 1) / ds_dd_rh)|0) + ds_dd_scr : -1;
+  (ds_dd_hrow >= ds_dd_n || ds_dd_hrow >= ds_dd_scr + ds_dd_vis) ? ds_dd_hrow = -1;
+  ds_dd_in ? ( frame_wheel = 0; mouse_wheel = 0; );
   lmb_down ? (
     (ds_dd_in && ds_dd_hrow >= 0) ? (
       ds_dd_kind == 1 ? (
@@ -1178,8 +1230,9 @@ micro_view ? ( frame_wheel == 0 ? ( _hov_mx = mx; _hov_my = my; ) : ( mx = _hov_
 // ── Gear panel interaction (floating only): AFTER the house dropdown, so an open
 // list swallows first. Row 0 hosts the shared THEME picker: rk_theme's list opens
 // under the row and paints last (rkth_overlay_draw). Rows 1-3 open the house
-// dropdown (knob / VU face / embed view); row 4 latches ">ALL" (SYNC). Hover-wheel
-// on any row cycles its value, as the old header chips did. A click outside the
+// dropdown (knob / VU face / embed view); row 4 latches ">ALL" (SYNC); row 5
+// toggles NAME BAR. Hover-wheel on every row except SYNC ALL cycles its value, as
+// the old header chips did. A click outside the
 // panel, its lists and the gear closes everything and is swallowed.
 !micro_view && gp_open ? (
   gp_in = mx >= gp_x && mx < gp_x + gp_w && my >= gp_y && my < gp_y + gp_h;
@@ -1602,7 +1655,7 @@ strip_lpf < 19500 ? (
 _pq_n = eq_dw - 2;
 _cv_live = _pq_n > STRIP_CV_MAX;   // wider than the cache → evaluate live (rare)
 !_cv_live && (
-  _pq_n != strip_cv_n || srate != strip_cv_sr ||
+  _pq_n != strip_cv_n || srate != strip_cv_sr || strip_rc_gen != strip_cv_gen ||   // the recalc count (PLG15)
   strip_hpf != strip_cv_p0 || strip_lpf != strip_cv_p1 || strip_reso != strip_cv_p2 ||
   strip_eq_lo != strip_cv_p3 || strip_eq_lo_freq != strip_cv_p4 || strip_eq_lo_q != strip_cv_p5 ||
   strip_eq_mid != strip_cv_p6 || strip_eq_mid_freq != strip_cv_p7 || strip_eq_mid_q != strip_cv_p8 ||
@@ -1621,7 +1674,7 @@ _cv_live = _pq_n > STRIP_CV_MAX;   // wider than the cache → evaluate live (ra
     strip_cv[_cv_i] = _pq_mag > 0.001 ? 20 * log10(_pq_mag) : -eq_dbr;
     _cv_i += 1;
   );
-  strip_cv_n = _pq_n; strip_cv_sr = srate;
+  strip_cv_n = _pq_n; strip_cv_sr = srate; strip_cv_gen = strip_rc_gen;
   strip_cv_p0 = strip_hpf; strip_cv_p1 = strip_lpf; strip_cv_p2 = strip_reso;
   strip_cv_p3 = strip_eq_lo; strip_cv_p4 = strip_eq_lo_freq; strip_cv_p5 = strip_eq_lo_q;
   strip_cv_p6 = strip_eq_mid; strip_cv_p7 = strip_eq_mid_freq; strip_cv_p8 = strip_eq_mid_q;
@@ -2043,9 +2096,9 @@ fullcol ? (   // embedded portrait only (the floating window runs the deck)
   _ddcur = ds_dd_kind == 1 ? (strip_view_mode | 0)
          : ds_dd_kind == 2 ? ((strip_vu_style | 0) + 1)
          : (gmem[GS_THEME_KNOB_P] | 0);
-  _ddr = 0;
-  loop(ds_dd_n,
-    _ddry = ds_dd_y + 1 + _ddr * ds_dd_rh;
+  _ddr = ds_dd_scr;   // the visible window only (PLG12)
+  loop(ds_dd_vis,
+    _ddry = ds_dd_y + 1 + (_ddr - ds_dd_scr) * ds_dd_rh;
     _ddhv = _ddr == ds_dd_hrow;
     _ddhv ? (
       _th_live ? setcolor_band(4, 255, 0.95) : gfx_set(0.95, 0.65, 0.15, 0.95);      // amber hover
@@ -2083,6 +2136,11 @@ micro_view && !_kn_hov && !_pill_hov && _nhov == 0 && sk_node_active == 0 ? gfx_
   _svu_pk_lmb ? lmb_down = _svu_pk_lmb;    // the stash, only when the sheet took the click
   _svu_pk = strip_vu.rk_vu_picker(vu_x, vu_y, vu_w, vu_h, zm_theme);
   _svu_pk >= 0 ? ( strip_vu_style = _svu_pk; strip_view_touch += 1; slider_automate(2^22); );
+) : (
+  // The dial did not draw this frame (a 1-col body too short for it, a width under 120, a
+  // sibling's '>ALL' into GRAPH): the picker cannot run, so a sheet left open would keep
+  // stashing every click and the whole window went dead (sweep PLG13). Close it.
+  !micro_view ? strip_vu.pk_open = 0;
 );
 strip_vu_pk = 0;
 
@@ -2093,8 +2151,8 @@ mouse_wheel = 0;
 @serialize
 // Persist the embedded VIEW mode as a plain global (Swing's embed_show_knobs
 // approach — NOT a slider). ser_ver gate for forward-compat. Fresh instances
-// default to 0 (graph only) via zero-init; no @init assignment (which would
-// reset the loaded value on a samplerate change).
+// default to 2 (Strip + VU), set in @init behind the strip_dv_seen guard so a
+// samplerate change never resets it; on load this read overrides that default.
 strip_ser_ver = 4;
 file_var(0, strip_ser_ver);
 file_var(0, strip_view_mode);

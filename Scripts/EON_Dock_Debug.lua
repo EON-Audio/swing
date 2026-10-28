@@ -6,7 +6,8 @@
 -- the same pane script fighting over one FX (the classic blink loop) show up as
 -- two different tags interleaving. Run again: silence.
 --
--- Installed with Swing: the bridge registers it in the Action List (EON_Register_Actions).
+-- Installed with Swing but NOT registered in the Action List: EON_Register_Actions
+-- skips every name containing "debug". Run it via Actions > New action > Load ReaScript.
 
 local on = reaper.GetExtState("EON_SwingDock", "debug") ~= "1"
 local v = on and "1" or "0"

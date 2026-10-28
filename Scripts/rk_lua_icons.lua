@@ -12,11 +12,13 @@
 --
 -- Resolution order (first hit wins)
 -- ─────────────────────────────────
---   1. <resource>/Effects/EON_ReaKit_Bundle/installer/src/Swing/icons/
---        <category>.png — your branded art. Drop a PNG named after the
---        category and it overrides REAPER's built-in for that one type.
---   2. <reaper-install>/Data/track_icons/<reaper-name>.png — the icons
---        REAPER ships. Mapped to our category names via BUILTIN_FILE.
+--   1. <category>.png in the bundle's icon folder, found RELATIVE to this
+--        script: ../Swing/icons, then icons, then ../icons (_bundle_icon_dirs).
+--        The bundle ships one for every categorizer category except `other`;
+--        a PNG named after a category overrides REAPER's built-in for it.
+--   2. REAPER's own track icons, mapped to our category names via
+--        BUILTIN_FILE: <resource>/Data/track_icons first, then
+--        <reaper-install>/InstallData/Data/track_icons.
 --   3. nil — track_reflect leaves P_ICON unchanged.
 --
 -- Result is cached per category (and the cache is module-local — once a
@@ -51,7 +53,7 @@ local BUILTIN_FILE = {
   splash        = "cymbal_small.png",     -- closest built-in (small cymbal)
   china         = "cymbal_large.png",     -- closest built-in (large cymbal)
   sidestick     = "snare_top.png",        -- same stand-in as rimshot
-  -- snap       = no REAPER built-in — bundle art can ship snap.png later
+  -- snap       = no REAPER built-in — bundle ships its own snap.png
   tom           = "tom.png",
   rack_tom      = "tom.png",              -- REAPER has no rack/floor split
   floor_tom     = "tom.png",              -- bundle art provides the variants
@@ -67,14 +69,15 @@ local BUILTIN_FILE = {
   perc          = "drumbox.png",          -- alias — DM lib/category.lua taxonomy
   -- Promoted world-perc categories. Closest REAPER built-ins where one
   -- exists; the rest (triangle/woodblock/guiro/agogo/vibraslap/whistle)
-  -- deliberately absent → nil until bundle art ships.
+  -- have none and are deliberately absent → only the bundle art covers them.
   cabasa        = "cabasa.png",
   djembe        = "congas.png",           -- closest hand-drum stand-in
   timbale       = "tom.png",
   cajon         = "drumbox.png",          -- literal box
   -- Melodic categories (categorizer emits these for non-drum lanes) — all
-  -- verified present in REAPER's track_icons 2026-06-11. Bundle art may
-  -- override any of them later; today only `bass` ships bundle art.
+  -- verified present in REAPER's track_icons 2026-06-11. The bundle ships
+  -- its own art for every one of them, which wins (step 1); these are the
+  -- fallback when the bundle folder is not found.
   bass          = "bass.png",
   synth         = "synth.png",
   pad           = "pads.png",

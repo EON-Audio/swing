@@ -126,7 +126,8 @@ end
 -- use, rather than a display name that changes with the desc: line.
 local function add_swing(tr)
   if not tr then return nil end
-  -- -1 = instantiate if not already present. AddByName reports success even
+  -- -1 = always add a new instance (the track is new, so there is nothing to
+  -- find; the StepSeq insert below queries with 0 first). AddByName reports success even
   -- when the JSFX failed to COMPILE, so a non-negative return here means "the
   -- file was found", not "the plugin is healthy".
   -- ⚠️ This used to guess two literals: "Swing_ReaKit" (matches no registered
@@ -292,15 +293,58 @@ function M.build(opts)
     end
     -- gmem cells, mirrored from rk_lua_core GMEM (inlined, the
     -- eon_action_target posture — this module must not depend on the bridge).
-    local GS_KIT_LOAD_REQ, GS_LOAD_WANT = 1444, 26090340
+    local GS_KIT_LOAD_REQ, GS_LOAD_WANT, BRIDGE_ALIVE = 1444, 26090340, 99
     -- `fx` is an INDEX and the retry window is seconds long — re-resolve
     -- through the FX GUID each tick so an FX inserted above it mid-arm can't
     -- make us read a stranger's param 3 (garbage iid -> LOCK misroute).
     local fx_guid = reaper.TrackFX_GetFXGUID(tr, fx)
     local phase = kit_path and "kit_post" or "build"
     local deadline = reaper.time_precise() + 12.0
+    -- The project this build belongs to. Another tab in front stops its
+    -- audio, so nothing below can land (the id is claimed in @block): wait
+    -- it out with the clocks paused, instead of standing down silently the
+    -- way an active-project ValidatePtr2(0, ...) did (sweep SCR118).
+    local proj = reaper.EnumProjects(-1)
+    local paused = nil
+    -- Float Swing and the step sequencer: ONCE, as soon as the instance has
+    -- its id. They used to live inside the kit request, which skipped both
+    -- when the default kit file was missing or the request never went out
+    -- (sweep SCR117).
+    -- CMD-22 parity: the auto-load pops Swing open on a fresh insert; a
+    -- windowless AddByName is closed by definition. Float Swing is an option
+    -- (nil = the historic float). Step sequencer (opt-in): find-or-insert
+    -- above Swing so its MIDI feeds the sampler, embedded-first in the MCP —
+    -- never floated.
+    local opened = false
+    local function open_once(rfx)
+      opened = true
+      if opts.float_swing ~= false then
+        reaper.TrackFX_Show(tr, rfx, 3)
+        if core.hub_notify then core.hub_notify("open", "swing", tr, rfx) end
+      end
+      if opts.step_seq then
+        local sq = core.jsfx_addname("EON_StepSeq.jsfx")
+        if sq then
+          local si = reaper.TrackFX_AddByName(tr, sq, false, 0)
+          if si < 0 then
+            si = reaper.TrackFX_AddByName(tr, sq, false, -1)
+            if si and si >= 0 then
+              if si > rfx then reaper.TrackFX_CopyToTrack(tr, si, tr, rfx, true) end
+              core.fx_embed_mcp(tr, "EON_StepSeq")
+            end
+          end
+        end
+      end
+    end
     local function arm()
-      if not reaper.ValidatePtr2(0, tr, "MediaTrack*") then return end
+      if not reaper.ValidatePtr2(proj, tr, "MediaTrack*") then return end   -- our track is gone: stand down
+      local now = reaper.time_precise()
+      if reaper.EnumProjects(-1) ~= proj then
+        paused = paused or now
+        reaper.defer(arm)
+        return
+      end
+      if paused then deadline = deadline + (now - paused); paused = nil end
       local rfx = fx
       if fx_guid then
         rfx = -1
@@ -310,12 +354,16 @@ function M.build(opts)
         if rfx < 0 then return end   -- our Swing was deleted: stand down
       end
       local iid = math.floor(reaper.TrackFX_GetParam(tr, rfx, 3) or 0)  -- slider4 = instance_id
+      if iid > 0 and not opened then open_once(rfx) end
 
       if phase == "kit_post" then
-        if reaper.time_precise() > deadline then
+        if now > deadline then
           -- Could not even request the kit (id never claimed / REQ never
-          -- freed) — fall through to the build; the JSFX auto-load remains.
-          phase = "kit_wait"; deadline = 0
+          -- freed): nothing to wait for, straight to the build; the JSFX
+          -- auto-load remains.
+          reaper.ShowConsoleMsg("[EON] New Song: the default kit could not be requested " ..
+            "(the Swing claimed no id, or the request channel stayed busy) -- building anyway\n")
+          phase = "build"; deadline = now + 12.0
         elseif iid > 0 then
           reaper.gmem_attach("Swing_Media_Transfer")
           if math.floor(reaper.gmem_read(GS_KIT_LOAD_REQ) or 0) == 0 then
@@ -323,32 +371,7 @@ function M.build(opts)
             reaper.gmem_write(GS_LOAD_WANT, iid)  -- WANT only; PENDING is the
             -- bridge→JSFX delivery binding and must never be stomped from here
             reaper.gmem_write(GS_KIT_LOAD_REQ, 1)
-            -- CMD-22 parity: the auto-load pops Swing open on a fresh insert;
-            -- a windowless AddByName is closed by definition. Float Swing is
-            -- now an option (nil = the historic float).
-            if opts.float_swing ~= false then
-              reaper.TrackFX_Show(tr, rfx, 3)
-              if core.hub_notify then core.hub_notify("open", "swing", tr, rfx) end
-            end
-            -- Step sequencer (opt-in): find-or-insert above Swing so its MIDI
-            -- feeds the sampler, embedded-first in the MCP — never floated.
-            if opts.step_seq then
-              local sq = core.jsfx_addname("EON_StepSeq.jsfx")
-              if sq then
-                local si = reaper.TrackFX_AddByName(tr, sq, false, 0)
-                if si < 0 then
-                  si = reaper.TrackFX_AddByName(tr, sq, false, -1)
-                  if si and si >= 0 then
-                    if si > rfx then
-                      reaper.TrackFX_CopyToTrack(tr, si, tr, rfx, true)
-                      rfx = rfx + 1   -- Swing shifted down one slot
-                    end
-                    core.fx_embed_mcp(tr, "EON_StepSeq")
-                  end
-                end
-              end
-            end
-            phase = "kit_wait"; deadline = reaper.time_precise() + 8.0
+            phase = "kit_wait"; deadline = now + 8.0
           end
         end
       elseif phase == "kit_wait" then
@@ -363,10 +386,26 @@ function M.build(opts)
           phase = "build"; deadline = reaper.time_precise() + 12.0
         end
       elseif phase == "build" then
-        if not (build_code and target) then return end   -- kit-only run: done
-        if reaper.time_precise() > deadline then
+        if not (build_code and target) then
+          -- kit-only run: done once the float / step sequencer went out (or the id never came)
+          if not opened and now <= deadline then reaper.defer(arm) end
+          return
+        end
+        if now > deadline then
           reaper.ShowConsoleMsg("[EON] New Song: bridge build (cmd " .. build_code ..
-            ") was never posted -- is the Swing Kit Bridge running?\n")
+            ") was never posted -- the command bus stayed busy\n")
+          return
+        end
+        -- A bridge that was never started leaves the bus idle, so post_locked
+        -- would post into nothing and report success, and the warning the
+        -- comment above the build promises never printed (sweep SCR119). Its
+        -- heartbeat is os.time() every tick, 0 at exit; the bridge's own test.
+        reaper.gmem_attach("Swing_Media_Transfer")
+        local hb = math.floor(reaper.gmem_read(BRIDGE_ALIVE) or 0)
+        if hb <= 0 or (os.time() - hb) >= 5 then
+          reaper.ShowConsoleMsg("[EON] New Song: bridge build (cmd " .. build_code ..
+            ") not posted -- the Swing Kit Bridge is not running. Start it (EON menu), " ..
+            "then run the build from there.\n")
           return
         end
         if iid > 0 and target.post_locked and target.post_locked(iid, build_code) then
@@ -478,14 +517,25 @@ function M.save_template(t)
   end
   if not replaced then list[#list + 1] = row end
 
-  local f, err = io.open(user_templates_path(), "w")
+  -- A temp file, every write checked, then renamed over the old one. "w" in
+  -- place emptied the file FIRST, so a failed write (disk full, a dropped
+  -- share, an AV lock) wiped every saved template and still returned true
+  -- (sweep SCR120; the house pattern, wiki 6.14).
+  local path = user_templates_path()
+  local tmp = path .. ".tmp"
+  local f, err = io.open(tmp, "w")
   if not f then return false, tostring(err) end
   for _, e in ipairs(list) do
     -- %.10g so a whole-number tempo writes "120", not "120.0".
-    f:write(string.format("%s\t%.10g\t%.10g\t%s\n",
-                          e.name, e.bpm, e.bars, e.sections))
+    local ok, werr = f:write(string.format("%s\t%.10g\t%.10g\t%s\n",
+                                           e.name, e.bpm, e.bars, e.sections))
+    if not ok then f:close(); os.remove(tmp); return false, tostring(werr) end
   end
-  f:close()
+  local ok, cerr = f:close()
+  if not ok then os.remove(tmp); return false, tostring(cerr) end
+  os.remove(path)
+  local rok, rerr = os.rename(tmp, path)
+  if not rok then return false, tostring(rerr) end
   return true
 end
 

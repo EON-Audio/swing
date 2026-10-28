@@ -162,14 +162,23 @@ function M.Digest(lanes)
         -- the rate stretches them in PROJECT time while the hash stays put, and
         -- changing it with 'preserve length' on leaves D_LENGTH alone too. Without
         -- it a re-rated lane plays one timing and the trigger track another.
-        parts[#parts + 1] = string.format('%s|%.6f|%.6f|%.0f|%.0f|%.4f|%.6f',
+        -- The item's start and end in QN, too (DM29, 2026-10-26): on a Time-timebase
+        -- item a tempo edit moves the notes (beat-based) in project time while
+        -- D_POSITION, D_LENGTH and the hash all stand still, and the trigger's copy
+        -- (laid out in PPQ from its own start) drifted off the lanes until the next
+        -- unrelated edit forced a rebuild.
+        local pos = reaper.GetMediaItemInfo_Value(item, 'D_POSITION')
+        local len = reaper.GetMediaItemInfo_Value(item, 'D_LENGTH')
+        parts[#parts + 1] = string.format('%s|%.6f|%.6f|%.0f|%.0f|%.4f|%.6f|%.4f|%.4f',
           hash or '?',
-          reaper.GetMediaItemInfo_Value(item, 'D_POSITION'),
-          reaper.GetMediaItemInfo_Value(item, 'D_LENGTH'),
+          pos,
+          len,
           reaper.GetMediaItemInfo_Value(item, 'B_MUTE'),
           reaper.GetMediaItemInfo_Value(item, 'B_LOOPSRC'),
           reaper.GetMediaItemTakeInfo_Value(take, 'D_STARTOFFS'),
-          reaper.GetMediaItemTakeInfo_Value(take, 'D_PLAYRATE'))
+          reaper.GetMediaItemTakeInfo_Value(take, 'D_PLAYRATE'),
+          reaper.TimeMap2_timeToQN(0, pos),
+          reaper.TimeMap2_timeToQN(0, pos + len))
       end
     end
   end
@@ -202,7 +211,9 @@ end
 -- whole MIDI stream to Swing unfiltered, so foreign pitches and per-note
 -- channels behaved exactly this way. Forcing everything to lane.pad_pitch here
 -- would silently break the DM's foreign-note support.
-local function collect_item(item, out)
+-- `keep_muted` (EON_DM_Build's stereo migration, DM21): muted notes are kept, flagged `muted`, so the
+-- migration can carry them over as muted instead of dropping them with the item it deletes.
+local function collect_item(item, out, keep_muted)
   if reaper.GetMediaItemInfo_Value(item, 'B_MUTE') == 1 then return end
   local take = reaper.GetActiveTake(item)
   if not take or not reaper.TakeIsMIDI(take) then return end
@@ -215,7 +226,7 @@ local function collect_item(item, out)
   local _, ncnt = reaper.MIDI_CountEvts(take)
   for i = 0, (ncnt or 0) - 1 do
     local ok, _, muted, sppq, eppq, chan, pitch, vel = reaper.MIDI_GetNote(take, i)
-    if ok and not muted then
+    if ok and (keep_muted or not muted) then
       local rep = 0
       repeat
         local s = reaper.MIDI_GetProjTimeFromPPQPos(take, sppq + rep * period)
@@ -225,7 +236,7 @@ local function collect_item(item, out)
         if s >= pos - 1e-9 then
           if e > iend then e = iend end
           if e > s then
-            out[#out + 1] = { s = s, e = e, ch = chan, pitch = pitch, vel = vel }
+            out[#out + 1] = { s = s, e = e, ch = chan, pitch = pitch, vel = vel, muted = muted or false }
           end
         end
         rep = rep + 1
@@ -233,6 +244,9 @@ local function collect_item(item, out)
     end
   end
 end
+-- Exposed for the stereo -> lanes migrations (EON_DM_Build, EON_DM_BuildMerged): every play of one item's
+-- notes in project time -- loop repeats, item bounds and mutes as REAPER honours them.
+M.CollectItem = collect_item
 
 -- Every playable note across every merged lane, in absolute project time.
 function M.Collect(lanes)
@@ -343,8 +357,22 @@ end
 -- output is regenerated from it anyway.
 function M.Sync(swing_guid, force)
   local lanes = M.MergedLanes(swing_guid)
-  if #lanes == 0 then return false end
   local trigger = M.FindTrigger(swing_guid)
+  if #lanes == 0 then
+    -- No merged lanes left (the drum tracks deleted, or a classic Build replaced them) but the hidden
+    -- trigger still holds the last pattern (DM210, 2026-10-26): it went on playing every old hit into
+    -- Swing -- a ghost pattern the user cannot see, or double hits beside new classic lanes. Empty it
+    -- once; the hidden track itself stays (harmless, and the next Build Merged reuses it).
+    if trigger and reaper.CountTrackMediaItems(trigger) > 0 then
+      reaper.PreventUIRefresh(1)
+      local ok = M.Rebuild(trigger, {})
+      reaper.PreventUIRefresh(-1)
+      last_digest[swing_guid] = nil
+      if ok then reaper.UpdateArrange() end
+      return ok
+    end
+    return false
+  end
   if not trigger then return false end
 
   local lane_digest = M.Digest(lanes)
@@ -363,18 +391,21 @@ function M.Sync(swing_guid, force)
   return ok
 end
 
--- Every Swing instance that currently has merged lanes built. Returns a list of
--- swing_guid strings (deduped, project order).
+-- Every Swing instance that currently has merged lanes built, or a hidden trigger track left behind (so the
+-- tick's Sync can empty an orphaned trigger, DM210). Returns a list of swing_guid strings (deduped, project order).
 function M.MergedInstances()
   local seen, out = {}, {}
   for i = 0, reaper.CountTracks(0) - 1 do
-    local lane = decode_ext(reaper.GetTrack(0, i), M.LANE_EXT)
-    if lane and lane.merged == true then
-      local g = lane.swing_instance_guid
-      if g and g ~= '' and not seen[g] then
-        seen[g] = true
-        out[#out + 1] = g
-      end
+    local tr = reaper.GetTrack(0, i)
+    local lane = decode_ext(tr, M.LANE_EXT)
+    local g = lane and lane.merged == true and lane.swing_instance_guid
+    if not g then
+      local t = decode_ext(tr, M.TRIGGER_EXT)
+      g = t and t.swing_guid
+    end
+    if g and g ~= '' and not seen[g] then
+      seen[g] = true
+      out[#out + 1] = g
     end
   end
   return out

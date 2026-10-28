@@ -5,7 +5,7 @@
 @init
 
 function swing_ui_process_undo()
-local(_ki, _cj, _cn, _cnl, gi, _sw_a, _sw_b, _swli, gi_s, _ki_s)  // localized 2026-07-09: @gfx writes to these globals raced the @block kit-import loop (its _ki=16 exit value wrote PHANTOM PAD 16 = pad 0 via array adjacency). _undo_* stay global (cross-section mailbox).
+local(_ki, _cj, _cn, _cnl, gi, _sw_a, _sw_b, _swli, gi_s, _ki_s, _cab)  // localized 2026-07-09: @gfx writes to these globals raced the @block kit-import loop (its _ki=16 exit value wrote PHANTOM PAD 16 = pad 0 via array adjacency). _undo_* stay global (cross-section mailbox).
 (
 _undo_pending > 0 && gmem[KIT_GMEM_UNDO_ACK] == 1 ? (
   // Phase 2: record the right structural entry for this deferred op.
@@ -15,6 +15,7 @@ _undo_pending > 0 && gmem[KIT_GMEM_UNDO_ACK] == 1 ? (
   // Back up this pad's NAME too (the engine's begin can't reach get_*_slot;
   // this @gfx-side path can). Restored via _udo_name_req in @gfx on undo.
   (_undo_pending == 2 || _undo_pending == 3) ? undo_pad_names_save(_undo_pad);
+  _cab = _undo_clear_banks;   // the REAPER point's words below (the branch zeroes the flag)
   _undo_pending == 1 ? (
     // CLEAR ALL — pads only. Kit name + FX chain preserved (vs. NEW which
     // wipes everything via _undo_pending == 6 → swing_new_kit_full_reset).
@@ -32,7 +33,7 @@ _undo_pending > 0 && gmem[KIT_GMEM_UNDO_ACK] == 1 ? (
     swing_new_kit_full_reset();
   ) : _undo_pending == 3 ? (
     _undo_pad >= 0 && _undo_pad < NUM_SLOTS && _undo_layer >= 0 && _undo_layer < MAX_LAYERS ? (   // a slot (step 4a)
-      clear_layer(_undo_pad, _undo_layer);
+      clear_layer_eff(_undo_pad, _undo_layer);   // a plain pad's layer 0 is its sample (rk_swing_core, LIB314)
       // Clearing a layer changes the effective RR sequence; reset cursor
       // so the next hit starts at position 1. Mirrors the synchronous
       // path in rk_swing_ui_grid_overlay.jsfx-inc / overlay_fx.
@@ -61,6 +62,12 @@ _undo_pending > 0 && gmem[KIT_GMEM_UNDO_ACK] == 1 ? (
     );
     _ki += 1;
   );
+  // The op's REAPER undo point (2026-10-27, the owner's decisions 1 and 2): Clear All, a pad or a layer cleared, two
+  // pads swapped. New Kit asks in swing_new_kit_full_reset. Ctrl+Z brings back what was there (REAPER's stored copy).
+  _undo_pending == 1 ? swing_rup_want(RUP_K_CLEARALL, _cab, -1, -1, 0)
+  : _undo_pending == 2 ? swing_rup_want(RUP_K_CLEARPAD, _undo_pad, -1, -1, 0)
+  : _undo_pending == 3 ? swing_rup_want(RUP_K_CLEARLAYER, _undo_pad, _undo_layer, -1, 0)
+  : _undo_pending == 5 ? swing_rup_want(RUP_K_SWAP, _undo_pad, _undo_pad2, -1, 0);
   undo_cap_end();  // Phase 2: close the whole-kit capture for this structural op
   gmem[KIT_GMEM_UNDO_ACK] = 0;
   gmem[KIT_GMEM_CMD] = 48;  // tell bridge to close Undo_EndBlock
@@ -77,12 +84,20 @@ _undo_pending > 0 && gmem[KIT_GMEM_UNDO_ACK] == 1 ? (
 // ran this frame (with the view still closed), so the _ov_* copies are STALE —
 // a leftover _ov_lmb_down=1 would make the view's click-outside-to-close fire
 // on its own open frame. The gate repopulates them from the next frame.
+// Leaving the Mapping view ends its bulk LEARN: the view arms pads only while drawn, and a
+// learn left on with a pad armed in midi_learn_pad made the next MIDI note re-note that pad in
+// @block and swallow the hit, with no banner left to say so (sweep LIB116). The pad editor's
+// own LEARN button (midi_learn_pad without _mv_learn) is not touched.
+function swing_bigview_leave_() (
+  big_view_id == VIEW_MAPPING && _mv_learn ? ( _mv_learn = 0; midi_learn_pad = -1; );
+);
 function swing_bigview_open(id) (
+  id != big_view_id ? swing_bigview_leave_();
   big_view_id = id;
   _ov_lmb_down = 0; _ov_rmb_down = 0;
   _ov_LMB = 0; _ov_RMB = 0; _ov_wheel = 0;
 );
-function swing_bigview_close() ( big_view_id = VIEW_NONE; );
+function swing_bigview_close() ( swing_bigview_leave_(); big_view_id = VIEW_NONE; );
 
 // SYNTH view opener (rk_swing_ui_synthview.jsfx-inc). Lives HERE so the
 // earlier-imported grid_pads chip/Alt-click sites resolve it at def-time.
@@ -93,7 +108,16 @@ function swing_bigview_close() ( big_view_id = VIEW_NONE; );
 // placed below (it has no bottom slot). pfx_req is applied by the side slot's draw, after the width request has gone out.
 // The USER's face (the small-things round): the rack face the compact switch draws while a panel under the pads leaves
 // too little room keeps the full face's bottom slot, so the editor placed below still lands there.
-function swing_panel_can_host() ( !is_embedded && (!dock_face_user || fx_place != 3); );
+// The bottom slot (the sequencer's gutter -- its handle -- and the panel under the pads; rk_seq_ui swing_seq_gate): the
+// full face's, and since 2026-10-27 also the rack face Auto picks from a floating window's shape (the owner: "When i
+// resize the floating window to compact the sequencer handle disappears i dont want that") -- and the rack face Auto
+// picks when the dock rig captures this Swing (the wordmark's dock; swing_fb_can_grow 0), so docking keeps what was open
+// (the owner, the same day: "if I have the sequencer, pad effects, and browser open, they all stay open once I click
+// dock"; until then the panel under the pads vanished while docked). The docked pane cannot grow: the pads give the
+// height (rk_seq_ui swing_seq_gate's squeeze). The user's own Rack pick (dock_face_mode 2) and the embeds keep no slot.
+// To give the Rack pick the slot too, drop both `dock_face_mode == 0 &&`.
+function swing_bot_slot() ( !is_embedded && (!dock_face_user || (dock_face_mode == 0 && swing_fb_can_grow())) || (!is_embedded && dock_face_mode == 0 && swing_dock_held()); );
+function swing_panel_can_host() ( swing_bot_slot() || (!is_embedded && fx_place != 3); );
 function swing_synthview_open(pad) (
   syn_view_pad = pad;
   swing_select_pad(pad);   // an absolute pad (step 4a)
@@ -186,6 +210,39 @@ swing_popup_active ? (
 );
 );
 
+// ── The save's owner (bridge level 322, 2026-10-27; sweep LIB121 / LIB122 with the bridge's half) ──────────────
+// The bus's save codes (11 the name, 93 the next bank, 99 done, 98 cancelled, 85 a silent dump's ack) said nothing
+// about whose save they answered, so with two Swings one could take the other's: an instance left in export state
+// 10 or 3 (its window closed mid-save -- this tick runs in @gfx only) took the next save's 11 and dumped ITS kit
+// under that name, or ate the 93 / 99 the real saver waited on and left it wedged. The sweep gated these on LOCK
+// and was reverted: the bridge loses LOCK between bank dumps (its stale-LOCK self-heal fires on the CMD-0 gap), so
+// every 93 went out under LOCK 0 and each multi-bank save wedged. A level-322 bridge names the saver in
+// GS_KIT_SAVE_OWNER for the whole save instead (Swing_Kit_Bridge eon_save_owner_tick). An older bridge never
+// writes it, so below that level these consumes take every code as before: a new Swing beside an old bridge
+// cannot wedge.
+function swing_save_mine() (
+  gmem[GS_BRIDGE_LEVEL] < BRIDGE_LEVEL_SAVE_OWNER || gmem[GS_KIT_SAVE_OWNER] == instance_id;
+);
+// The idle CMD-99 consumer (swing_ui_misc_cmds) takes no other instance's SAVE 99. Owner 0 = no save in flight:
+// a Lua-posted op's orphan 99 (the Auto-Color Pads action, CMD 23) still reaches an idle Swing, as it must.
+function swing_save_owner_free() (
+  gmem[GS_BRIDGE_LEVEL] < BRIDGE_LEVEL_SAVE_OWNER || gmem[GS_KIT_SAVE_OWNER] == 0 || gmem[GS_KIT_SAVE_OWNER] == instance_id;
+);
+EXPORT_ORPHAN_S = 10;   // seconds export state 10 / 3 waits on a bus that moved on without it (sweep LIB121)
+// Import state 1's 99 / 98 (bridge level 323, 2026-10-27, RR-1; sweep LIB122's build half). State 1 is armed by
+// this instance's own build or import (CMD 40 / 74 / 92 / 16 / 20 / 30) and by the LOAD button, and it took ANY 99 or
+// 98 as the end of its op: another Swing's build or save closing, or the bridge refusing another Swing's save (a 98
+// that names that saver), aborted this instance's armed load while the real requester stayed kit_busy. A 323 bridge
+// keeps LOCK = the requester on every 99 and 98 (it used to release it the tick a build's 99 or a build's / load's
+// failure 98 went out), so from that level either code is taken only under LOCK 0 or this instance's id,
+// and neither under another instance's save owner. Below 323 (LOCK released, no pop gate) both are taken as before.
+function swing_import_done_mine() (
+  gmem[GS_BRIDGE_LEVEL] < BRIDGE_LEVEL_SAVE_TXN || (
+    (gmem[GS_KIT_SAVE_OWNER] == 0 || gmem[GS_KIT_SAVE_OWNER] == instance_id) &&
+    (gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id)
+  );
+);
+
 function swing_ui_export_tick()
 local(_ki, _mb, _li_base, _lidx, _lj, _lo, _lpb, _pbase, _plen, _ci, _cj, _cn, _cnl,
       _knl, _gb, _j, _dump_off, _l_alen, _l_src, _lp, _lpl, _s_alen, _s_src, _tpath,
@@ -237,9 +294,25 @@ kit_export_state == 0 && !kit_busy && gmem[KIT_GMEM_CMD] == 11
   kit_busy = 1;
 );
 
+// States 10 and 3 wait on the bus and take only their own save's codes (swing_save_mine, above). They give up once
+// the bus has moved on without them: CMD read 0 with LOCK not ours for EXPORT_ORPHAN_S. Before: close the window
+// during the name prompt or the write, the bridge's fuse clears the unconsumed 11 / 99 to 0 and drops LOCK, and on
+// reopen the instance said "Saving Kit..." for good, kit_busy up (sweep LIB121). Between two bank dumps the bus also
+// reads 0, but the saver is in state 11 / 12 then, never here.
+// (explicit branches: `c ? (..) : x = 0` would assign to the conditional itself -- the EEL2 parse rk_drumkit_dsp warns of)
+((kit_export_state == 10 || kit_export_state == 3) && gmem[KIT_GMEM_CMD] == 0 && gmem[KIT_GMEM_LOCK] != instance_id) ? (
+  _ex_orph_t == 0 ? ( _ex_orph_t = time_precise(); );
+  time_precise() - _ex_orph_t >= EXPORT_ORPHAN_S ? (
+    kit_busy = _ex_is_dump ? _ex_undo_busy_prev : 0;   // a silent dump hands back the busy it found (the 85 path's rule)
+    kit_export_state = 0; _ex_is_dump = 0; kit_export_only = 0; _ex_orph_t = 0;
+  );
+) : (
+  _ex_orph_t = 0;
+);
+
 kit_export_state == 10 ? (
-  // Phase 1b: Wait for Lua to provide name (CMD=11) or cancel (CMD=98)
-  gmem[KIT_GMEM_CMD] == 11 ? (
+  // Phase 1b: Wait for Lua to provide name (CMD=11) or cancel (CMD=98) -- this instance's save only (swing_save_mine)
+  gmem[KIT_GMEM_CMD] == 11 && swing_save_mine() ? (
     // Name ready — read it back from gmem
     _knl = gmem[KIT_GMEM_NAMELEN] | 0;
     _knl = min(_knl, 32);
@@ -257,11 +330,11 @@ kit_export_state == 10 ? (
         str_setchar(#kit_name, _ki, gmem[KIT_GMEM_NAME + _ki] | 0);
         _ki += 1;
       );
-      str_setlen(#kit_name, _knl); kit_name_gmem_dirty = 1;
+      str_setlen(#kit_name, _knl);
     );
     kit_export_state = 11;  // proceed to metadata copy
   );
-  gmem[KIT_GMEM_CMD] == 98 ? ( kit_export_state = 0; kit_busy = 0; _ex_is_dump = 0; kit_export_only = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0; );
+  gmem[KIT_GMEM_CMD] == 98 && swing_save_mine() ? ( kit_export_state = 0; kit_busy = 0; _ex_is_dump = 0; kit_export_only = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0; );
 );
 
 kit_export_state == 11 ? (
@@ -350,7 +423,9 @@ kit_export_state == 11 ? (
     gmem[_mb + 9]  = p_output[_ka];
     gmem[_mb + 10] = p_note[_ka] - _ex_bank * NUM_PADS;   // step 3b: a kit stores notes RELATIVE to the bank's block (bank A: identity)
     gmem[_mb + 11] = p_note_lock[_ka];
-    gmem[_mb + 12] = (col_auto_mode_id > 0 && _ex_bank == 0) ? col_auto_hue[_ki] : p_color[_ka];   // the auto hues are the visible bank's
+    // the hue the pad WEARS, in any bank: col_auto_hue[] is the bank on screen's sixteen tiles, and writing it for
+    // bank A's pass stored the shown bank's hues as bank A's whenever B..D was on screen at the save (sweep LIB142)
+    gmem[_mb + 12] = col_auto_mode_id > 0 ? swing_color_auto_hue(_ka) : p_color[_ka];
     gmem[_mb + 13] = p_choke[_ka];
     gmem[_mb + 14] = p_oneshot[_ka];
     gmem[_mb + 15] = p_reverse[_ka];
@@ -644,21 +719,30 @@ kit_export_state == 3 ? (
   // @block; stamping that one would flash SAVED after every kit load.
   // A bank-only save (kit_export_only, audit S7) wrote one bank to its own file: the instrument is not saved, so
   // its dot stays and the SAVE button does not flash.
-  gmem[KIT_GMEM_CMD] == 99 ? (
+  // Every code below is taken only for this instance's save (swing_save_mine, above swing_ui_export_tick).
+  gmem[KIT_GMEM_CMD] == 99 && swing_save_mine() ? (
     kit_export_state = 0; kit_busy = 0; _ex_is_dump = 0;
     kit_export_only == 0 ? ( kit_dirty = 0; kit_saved_at = time_precise(); );
     kit_export_only = 0;
     gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0;
   );
-  gmem[KIT_GMEM_CMD] == 98 ? ( kit_export_state = 0; kit_busy = 0; _ex_is_dump = 0; kit_export_only = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0; );
+  gmem[KIT_GMEM_CMD] == 98 && swing_save_mine() ? ( kit_export_state = 0; kit_busy = 0; _ex_is_dump = 0; kit_export_only = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0; );
   // 85 = silent undo-dump ack: exit the export WITHOUT touching LOCK (a
   // pending kit-load may own it); restore kit_busy to its pre-dump value.
-  gmem[KIT_GMEM_CMD] == 85 ? ( kit_export_state = 0; kit_busy = _ex_undo_busy_prev; _ex_is_dump = 0; kit_export_only = 0; gmem[KIT_GMEM_CMD] = 0; );
+  gmem[KIT_GMEM_CMD] == 85 && swing_save_mine() ? ( kit_export_state = 0; kit_busy = _ex_undo_busy_prev; _ex_is_dump = 0; kit_export_only = 0; gmem[KIT_GMEM_CMD] = 0; );
   // 93 = dump another bank (Pad Banks step 3b, 2026-09-23): the bridge has read what the state-11 dump
   // just published and set GS_KIT_EXPORT_BANK to the next bank; re-enter state 11 inside the SAME save
-  // transaction (LOCK held, kit_busy up, _ex_is_dump kept), so the completion code stays 1 or 84 and the
-  // final 99 / 85 still closes it. An older bridge never sends 93.
-  gmem[KIT_GMEM_CMD] == 93 ? ( gmem[KIT_GMEM_CMD] = 0; kit_export_state = 11; );
+  // transaction (kit_busy up, _ex_is_dump kept), so the completion code stays 1 or 84 and the final 99 / 85
+  // still closes it. Below bridge level 323 LOCK is NOT held through it (the bridge's self-heal clears it on the
+  // CMD-0 gap this consume opens); the owner cell is. An older bridge never sends 93.
+  // From bridge level 323 (RR-1) the 93 STAYS on the bus until state 12 writes this dump's 1 / 84 over it: the CMD-0
+  // gap the consume opened let any other command land mid-save -- another Swing's, a Lua action's, the bridge's own
+  // queued load (CMD 3 staged into the bands this save reads) -- and state 12 then wrote the 1 over it and it was lost.
+  // A 323 bridge ends a 93 nobody answers (eon_save_dead_tick); below it the consume writes 0, as before.
+  gmem[KIT_GMEM_CMD] == 93 && swing_save_mine() ? (
+    gmem[GS_BRIDGE_LEVEL] < BRIDGE_LEVEL_SAVE_TXN ? ( gmem[KIT_GMEM_CMD] = 0; );
+    kit_export_state = 11;
+  );
 );
 );
 
@@ -896,6 +980,31 @@ function swing_kit_preserve_restore() local(_o, _ol) (
 // the one lock test every route of the load uses, so a lock pressed mid-load cannot split a pad's metadata from
 // its audio (see the latch in state 2).
 function swing_kit_lock_latched(t) ( (kit_lockskip_bits & (2 ^ t)) > 0; );
+// SQ-K (2026-10-26): a kit load's voice cut, scoped to the banks it changes (_kc_m: a bit per bank). Returns 1 when a
+// cut voice was sounding (the caller's crossfade gate). A kit load cut EVERY voice before: a load into bank B, and the
+// B..D passes of a whole kit, cut the bank A hits the step sequencer kept playing.
+function swing_kit_cut_voices(_kc_m) local(_kc_v, _kc_any) (
+  _kc_any = 0; _kc_v = 0;
+  loop(V_SLOTS,
+    (floor(_kc_m / (2 ^ floor(v_slot[_kc_v] / NUM_PADS))) & 1) ? (
+      (v_pos[_kc_v] >= 0 || v_stage[_kc_v] > 0) ? _kc_any = 1;
+      v_pos[_kc_v] = -1; v_env[_kc_v] = 0; v_stage[_kc_v] = 0;
+    );
+    _kc_v += 1;
+  );
+  _kc_any;
+);
+// SQ-K: a pad of the pass has its audio (a VER-26 stream moved on to the next pad, a VER-201 pass advanced past it):
+// its envelope and FX coefficients follow the META state 2 adopted -- state 4 recalcs them all again, but this pad
+// plays before then -- and it may sound again (swing_kit_pad_loading). _kl_a = the slot. A pad the pass did not
+// mark (locked, kept, another bank) is left alone.
+function swing_kit_pad_landed(_kl_a) local(_kl_b) (
+  _kl_b = _kl_a - kit_ld_bank * NUM_PADS;
+  _kl_b >= 0 && _kl_b < NUM_PADS && (floor(kit_ld_pend / (2 ^ _kl_b)) & 1) ? (
+    recalc_pad(_kl_a); recalc_fx(_kl_a);
+    kit_ld_pend -= 2 ^ _kl_b;
+  );
+);
 
 function swing_kit_packed_skip_locked() local(mb, lc, st, lj, n) (
   while (kit_copy_pad < NUM_PADS && kit_copy_layer == 0 && kit_copy_pos == 0 && swing_kit_lock_latched(kit_copy_pad)) (
@@ -918,7 +1027,7 @@ function swing_ui_import_tick()
 local(_ki, _mb, _li_base, _lidx, _lj, _lo, _lpb, _pbase, _plen, _ci, _cj, _cc, _cn, _cnl,
       _knl, _gb, _v201_lc, _v201_any, _v2_count, _xf_vi, _alen, _batch, _bj, _copied,
       _dgi, _dgp, _doff, _dst, _hbatch, _hdst, _hg, _hj, _hsrc, _layer_stride,
-      _remaining, _src_off, _was_preserve, _syb, _ka, _wb, _akb, _aki, _kv3, _hs_keep)
+      _remaining, _src_off, _was_preserve, _syb, _ka, _wb, _akb, _aki, _kv3, _hs_keep, _xf_k)
 // local() list added 2026-07-09: this @block state machine shared its scratch
 // globals (_ki etc.) with @gfx draw/undo/misc handlers running CONCURRENTLY on
 // the UI thread. A @gfx loop exiting with _ki=16 mid-pad made the import body
@@ -954,7 +1063,6 @@ kit_import_state == 1 ? (
    (gmem[GS_PENDING_LOAD_INST] == instance_id &&
     (gmem[GS_KIT_LOAD_REQ] == 2 || gmem[GS_LOAD_EPOCH] != kit_epoch_seen))) ? (
     kit_stage_ready = 0;
-    kit_load_epoch = gmem[GS_LOAD_EPOCH];  // delivered epoch (button-armed loads never captured one)
     gmem[GS_KIT_LOAD_REQ] == 2 ? gmem[GS_KIT_LOAD_REQ] = 0;  // never eat a fresh request (1)
     gmem[GS_PENDING_LOAD_INST] == instance_id ? gmem[GS_PENDING_LOAD_INST] = 0;  // consumed (gate parity)
     // Kit undo: the bridge already dumped the outgoing kit to the temp undo
@@ -979,16 +1087,17 @@ kit_import_state == 1 ? (
     );
   );
   // CMD=99 means Lua finished a non-import op (multi-out, auto-color)
-  // Both consumes abort an ARMED load (the gate captured kit_load_epoch) —
-  // echo -epoch so the bridge classifies the dispatch as failed instead of
+  // Both consumes abort an ARMED load — echo -epoch (the live one, as state 4
+  // does) so the bridge classifies the dispatch as failed instead of
   // inferring success from CMD leaving 3 (kit-load transaction band,
   // Phase 1 2026-07-17). Payload cells first, ack flag LAST.
   // kit_dirty stays lit through both: these consumes ABORT the armed load —
   // the previous kit, unsaved edits included, is still the live state. The
   // success clear is at the end of state 4.
-  gmem[KIT_GMEM_CMD] == 99 ? ( kit_stage_ready = 0; kit_import_state = 0; kit_busy = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0;
+  // From bridge level 323 only this instance's own 99 / 98 (swing_import_done_mine, above swing_ui_export_tick).
+  gmem[KIT_GMEM_CMD] == 99 && swing_import_done_mine() ? ( kit_stage_ready = 0; kit_import_state = 0; kit_busy = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0;
     gmem[GS_LOAD_ACK_INST] = instance_id; gmem[GS_LOAD_ACK_FAILBITS] = 0; gmem[GS_LOAD_ACK] = -gmem[GS_LOAD_EPOCH]; );  // live epoch (see state 4)
-  gmem[KIT_GMEM_CMD] == 98 ? ( kit_stage_ready = 0; kit_import_state = 0; kit_busy = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0;
+  gmem[KIT_GMEM_CMD] == 98 && swing_import_done_mine() ? ( kit_stage_ready = 0; kit_import_state = 0; kit_busy = 0; gmem[KIT_GMEM_LOCK] = 0; gmem[KIT_GMEM_CMD] = 0;
     gmem[GS_LOAD_ACK_INST] = instance_id; gmem[GS_LOAD_ACK_FAILBITS] = 0; gmem[GS_LOAD_ACK] = -gmem[GS_LOAD_EPOCH]; );  // live epoch (see state 4)
 );
 
@@ -1023,6 +1132,10 @@ kit_import_state == 2 ? (
                         !swing_pad_audio_blank(_ka);
     _ki += 1;
   );
+  // SQ-K (2026-10-26): the banks whose voices this pass cuts -- its own and the ones it wipes, a bit per bank. Every
+  // voice was cut before, so a load INTO bank B, or the B..D passes of a whole kit, cut the tails of the bank A pads
+  // the step sequencer (or a MIDI item) was playing -- pads this pass never touches.
+  kit_ld_kill = (2 ^ kit_load_bank) | kit_load_wipe;
   // Step 3b: the banks this pass empties first -- a plain LOAD of a kit that holds fewer banks than the
   // instrument (the bridge sets the mask on the kit's first pass; never on a sidecar / preserve reload).
   kit_load_wipe > 0 ? (
@@ -1147,6 +1260,11 @@ kit_import_state == 2 ? (
   // the next load. The packed routes are bank A only (the bridge's one-bank rule for old formats).
   kit_lockskip_bits = 0;
   _ki = 0; loop(NUM_PADS, swing_lcd_slot_locked(kit_load_bank * NUM_PADS + _ki) ? kit_lockskip_bits |= 2 ^ _ki; _ki += 1;);
+  // SQ-K (2026-10-26): the pads this pass fills -- every one the sweep below adopts (not locked, not kept) -- stay
+  // silent until their audio has landed (swing_kit_pad_loading, rk_swing_core; state 3 clears each bit as its pad
+  // lands, the end of the import the rest). The sweep gives them the NEW kit's lengths at once over the OLD audio.
+  kit_ld_bank = kit_load_bank; kit_ld_last = -1; kit_ld_pend = 0;
+  _ki = 0; loop(NUM_PADS, !swing_kit_lock_latched(_ki) && !kit_keep_pad[kit_load_bank * NUM_PADS + _ki] ? kit_ld_pend |= 2 ^ _ki; _ki += 1;);
   // Per-pad metadata
   _ki = 0; loop(NUM_PADS,   // this bank (step 3b): band index _ki, engine slot _ka
     _ka = kit_load_bank * NUM_PADS + _ki;
@@ -1406,7 +1524,8 @@ kit_import_state == 2 ? (
         _ki += 1;
       );
     );
-    kmac_force = 1;   // apply the authored mappings at the authored values
+    kmac_force_done = -1;   // apply the authored mappings at the authored values. @block's own way to ask: kmac_force
+                            // is @gfx's request count, and a second writer's += could swallow one of @gfx's (PL G10)
   ) : gmem[KMAC_KIT_BASE] > 0.5 ? (
     // A preserve-live reload keeps the project's macros (above), and drops the staged block here.
     // A pass into bank B..D staged a macro block too: a "load into bank X" is the file's bank A body, so the
@@ -1448,12 +1567,11 @@ kit_import_state == 2 ? (
   // Anti-pop: kill all voices + activate crossfade before touching audio buffers.
   // Gate on _xf_prev being non-silent — kit-load while idle (no audio playing)
   // would otherwise attenuate the first hit's transient (~20ms ramp from silence
-  // to new audio). Threshold -80dB rejects denormal/biquad ringtail residue.
-  _xf_vi = 0; loop(V_SLOTS,
-    v_pos[_xf_vi] = -1; v_env[_xf_vi] = 0; v_stage[_xf_vi] = 0;
-    _xf_vi += 1;
-  );
-  abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
+  // to new audio). Threshold 0.01 (-40 dB) rejects denormal/biquad ringtail residue.
+  // SQ-K: only the voices of the banks this pass changes (kit_ld_kill), and the crossfade only when one of them was
+  // sounding -- a pass that cut nothing must not fade the other banks' hits that keep playing.
+  _xf_k = swing_kit_cut_voices(kit_ld_kill);
+  _xf_k && swing_xf_prev_level() > 0.01 ? (
     _xf_pos = 0;
     _xf_len = swing_xf_len(0.020);  // 20ms crossfade (+ a block under Wired, A-5)
     _xf_active = 1;
@@ -1548,6 +1666,9 @@ kit_import_state == 3 ? (
             swing_disp_free(_al_dl_blk);
           );
           _hs_latch ? ( hs_cur_gen = _hg; hs_copy_pos = 0; );
+          // SQ-K: the bridge streams a pad's blobs back to back (load_kit_v4's pad loop), so a blob for ANOTHER pad
+          // means the last one's audio is all here; the kit-done sentinel ends the pass (state 4).
+          _hs_latch ? ( kit_ld_last >= 0 && kit_ld_last != hs_pad ? swing_kit_pad_landed(kit_ld_last); kit_ld_last = hs_pad; );
         );
       );
       kit_import_state == 3 && _hg == hs_cur_gen && !(hs_flags & 2) ? (
@@ -1597,11 +1718,8 @@ kit_import_state == 3 ? (
     // pass registration below turns kit_ldr_pass_pad to 0 on the first one.
     kit_copy_pad == 0 && kit_copy_retry == 0 && kit_ldr_pass_pad != 0 ? (
       kit_stage_gap_bits = 0;  // per-load: pads where kit META says audio but no path was staged
-      _xf_vi = 0; loop(V_SLOTS,
-        v_pos[_xf_vi] = -1; v_env[_xf_vi] = 0; v_stage[_xf_vi] = 0;
-        _xf_vi += 1;
-      );
-      abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
+      _xf_k = swing_kit_cut_voices(kit_ld_kill);   // SQ-K: this pass's banks only (state 2)
+      _xf_k && swing_xf_prev_level() > 0.01 ? (
         _xf_pos = 0;
         _xf_len = swing_xf_len(0.020);   // + a block under Wired (A-5)
         _xf_active = 1;
@@ -1758,6 +1876,7 @@ kit_import_state == 3 ? (
       ) : (
         kit_copy_retry = 0;
         kit_copy_pad += 1;
+        swing_kit_pad_landed(_ka);   // SQ-K: this pad's pass is over: it may sound again
       );
       );  // close the !kit_ldr_yield gate (sliced loads)
       );  // close the ② lock-gate else-branch (unlocked-pad adopt body)
@@ -1770,12 +1889,9 @@ kit_import_state == 3 ? (
   gmem[KIT_GMEM_VER] == 200 ? (
     // First frame: kill voices + clear all audio buffers
     kit_copy_pad == 0 ? (
-      _xf_vi = 0; loop(V_SLOTS,
-        v_pos[_xf_vi] = -1; v_env[_xf_vi] = 0; v_stage[_xf_vi] = 0;
-        _xf_vi += 1;
-      );
+      _xf_k = swing_kit_cut_voices(kit_ld_kill);   // SQ-K: this pass's banks only (state 2)
       // Gate threshold -40 dB (see kit_import_state == 2 above for rationale).
-      abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
+      _xf_k && swing_xf_prev_level() > 0.01 ? (
         _xf_pos = 0;
         _xf_len = swing_xf_len(0.020);   // + a block under Wired (A-5)
         _xf_active = 1;
@@ -1964,10 +2080,9 @@ kit_import_state == 4 ? (
   // this session (Pad Banks audit S4). That bank's own name is BKNAME, above.
   !kit_preserve_live && kit_load_bank == 0 ? (   // the instrument's name: bank A's pass commits it
     strcpy(#kit_name, #kit_name_pending);
-    kit_name_gmem_dirty = 1;
   );
   // Completion ack (kit-load transaction band, Phase 1 2026-07-17): echo
-  // the epoch captured at arm so the bridge KNOWS this import finished —
+  // the load's epoch (the LIVE one, below) so the bridge KNOWS this import finished —
   // and on which instance, with which pads failed (pad_fail_bits was just
   // recomputed per pad above). Payload cells first, ack flag LAST; the
   // bridge reads it on a later poll tick.
@@ -1992,7 +2107,8 @@ kit_import_state == 4 ? (
   kit_load_bank = 0; kit_load_wipe = 0;
   // Echo the LIVE epoch, not the one captured at arm time (2026-07-19). The
   // in-plugin LOAD button arms this instance DIRECTLY (kit_import_state=1 on
-  // click) instead of through the delivery gate, so kit_load_epoch was stale
+  // click) instead of through the delivery gate, so the epoch captured at arm
+  // (kit_load_epoch, since removed as nothing read it any more) was stale
   // for every button load: the ack never matched, the bridge fell back to
   // "CMD left 3 = success" — a branch that NEVER reads ACK_FAILBITS — so the
   // auto-retry on failed pads silently never fired and the user had to load
@@ -2037,8 +2153,17 @@ local(_ki, _cj, _cn, _cnl, _cc, _ki_s)  // localized 2026-07-09: raced the @bloc
 // broadcast refresh below. Before this gate the first idle @gfx to run took
 // ANY 99: another Swing adopted the saver's staged names and colours on all 16
 // pads, and the saver stayed wedged in export state 3 until a later 99.
+// The LOCK test alone did not hold (sweep LIB122): the bridge releases LOCK on
+// the tick after it writes the save's 99 if the saver has not taken it yet,
+// and a multi-bank save lost LOCK between its dumps, so a save's 99 often read
+// LOCK 0. A level-322 bridge names the save's owner for the whole save, and a
+// 99 under another instance's owner is never taken here
+// (swing_save_owner_free). An orphan 99 with no save in flight (owner 0, e.g.
+// the Auto-Color Pads action's CMD 23) still is: that consume is how its hues
+// reach the pads.
 !kit_busy && gmem[KIT_GMEM_CMD] == 99
-  && (gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id) ? (
+  && (gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id)
+  && swing_save_owner_free() ? (
   // Re-read pad names from gmem
   _ki = 0; loop(NUM_PADS,
     _ki_s = swing_bp(_ki);
@@ -2060,11 +2185,14 @@ local(_ki, _cj, _cn, _cnl, _cc, _ki_s)  // localized 2026-07-09: raced the @bloc
 );
 
 // Pad rename response: Lua bridge finished GetUserInputs (CMD 51).
+// ⚠️ Nothing in Swing raises CMD 50 any more: the pad-name click opens the
+// in-place editor (rk_swing_ui_grid_pads, since 2026-08-04), so this branch is
+// reached only if some other writer posts CMD 50 under THIS instance's LOCK.
+// Swing Lite still raises CMD 50, under its own LOCK.
 //
 // Multi-instance gate: only act if THIS instance owns the LOCK that
-// was acquired when the rename was issued (rk_swing_ui_grid_pads.jsfx-
-// inc's pad-name click handler takes LOCK = instance_id before writing
-// CMD 50 — the "acquire instance lock" line). Without
+// was acquired when the rename was issued (the CMD 50 writer takes
+// LOCK = its instance_id before writing the command). Without
 // this gate, a second Swing instance would also see CMD=51 and apply
 // the rename to ITS pad with the same index — silently overwriting
 // the other instance's pad name. Also: the unconditional LOCK clear
@@ -2145,7 +2273,7 @@ gmem[GS_THEME_ID] > 0 ? (
 );
 );
 
-// ── Pad-knob STYLE helpers (for the header KNOB selector next to THEME) ────
+// ── Pad-knob STYLE name (for the THEME menu's KNOB row) ────────────────────
 // Knob-style index → display name written into the global #_knob_name (EEL2
 // forbids #string params). Same IDs as knobs_kbsg rk_knob_draw / the Pad-FX list.
 function swing_ui_knob_name(_id) (
@@ -2170,15 +2298,6 @@ function swing_ui_knob_name(_id) (
   _id == 19 ? strcpy(#_knob_name, "Pultec Cr") :
   _id == 20 ? strcpy(#_knob_name, "Neve Alt")  :
   strcpy(#_knob_name, "Default");   // 0 / unknown
-);
-// Cycle to the next / previous style id (numeric order, wrap 20<->0). Style 9 is
-// the Rainbow Arc (EON's own, stateless) since 2026-09-22; it used to be the
-// mem-only BirdBird knob and was skipped here.
-function swing_ui_knob_next(_id) (
-  _id >= 20 ? 0 : _id + 1;
-);
-function swing_ui_knob_prev(_id) (
-  _id <= 0 ? 20 : _id - 1;
 );
 
 // ── Header caption for a value chip ────────────────────────────────────────
@@ -2327,6 +2446,9 @@ local(_hov, _rig_docked)
       dock_face_mode == 0 ? "^G " : "",
       dock_face_mode == 1 ? "^G " : "",
       dock_face_mode == 2 ? "^G " : "");
+    // The compact switch says so (the user, 2026-10-26: show it, marked automatic): a greyed note at the END, so the
+    // face rows (1-3) and the dock rows (5-8, a contract with EON Dock Layout.lua) keep their numbers.
+    face_room_compact ? strcat(#_view_menu, bot_panel == 1 ? "||#Rack face while the sequencer is below the pads" : "||#Rack face for now: the panel below needs the room");
     swing_popup_open(mx, my, #_view_menu, SP_POPUP_CALLER_VIEW_MODE);
     rmb_down = 0;
   );
@@ -2380,6 +2502,19 @@ function swing_theme_fold() (
   swing_popup_active &&
     (swing_popup_caller_id == SP_POPUP_CALLER_THEME || swing_popup_caller_id == SP_POPUP_CALLER_EMBED_MENU)
     ? swing_popup_close(-1);
+);
+// ONE liveness for the bridge, by its heartbeat's AGE: the bridge stamps os.time() at ~1 Hz
+// and the JSFX has no unix clock, so "stale" = the value has not MOVED for a while (== 0
+// alone never caught an uncleanly exited bridge: its last stamp stays). The header's dot
+// read `> 0` and the LCD banner this age, so the two disagreed: a crashed bridge kept a
+// green dot, a bridge held in a file dialog by this instance's own command got the banner
+// after 5 s (sweep LIB144). A command of ours in flight (kit_busy) earns a longer grace,
+// since a modal dialog blocks the bridge's loop for as long as the user keeps it open.
+// Idempotent within a frame: the second call sees no movement and the same age.
+function swing_bridge_hb_stale() local(_v) (
+  _v = gmem[KIT_GMEM_BRIDGE_ALIVE];
+  _v != _hb_seen ? ( _hb_seen = _v; _hb_seen_t = time_precise(); );
+  _v == 0 || (time_precise() - _hb_seen_t > (kit_busy ? 60 : 5));
 );
 function swing_ui_draw_header() (
   gfx_set(bg_r, bg_g, bg_b, 1); gfx_rect(0, 0, gfx_w, gfx_h);
@@ -2496,7 +2631,7 @@ function swing_ui_draw_header() (
     thm_anchor_w = _thm_bw; thm_anchor_h = _btn_h;
     _thm_lclick = !rkth_open && lmb_down && mx >= _thm_bx && mx <= _thm_bx + _thm_bw && my >= _btn_y && my <= _btn_y + _btn_h;
     rkth_input(_thm_bx, _btn_y, _thm_bw, _btn_h, mx, my, rkth_open ? lmb_down : 0, rmb_down, frame_wheel, _btn_h) ? ( lmb_down = 0; frame_wheel = 0; );
-    // Spend the click HERE, so swing_thm_input's click-outside-closes test (which
+    // Spend the click HERE, so thm_input's click-outside-closes test (which
     // runs later this frame) cannot immediately undo the open.
     _thm_lclick ? ( thm_open = 1 - thm_open; rkth_open = 0; lmb_down = 0; );
     rkth_draw_chip(11);
@@ -2545,9 +2680,9 @@ function swing_ui_draw_header() (
   // ── KNOB style selector: REMOVED from the header (the user, 2026-09-22) ──
   // "take knob out the main view now since its in the menu". The pad-knob style
   // is the THEME menu's KNOB row, which writes the same GS_THEME_KNOB_REQ this
-  // chip did. swing_ui_knob_name / _next / _prev stay — the menu row uses them.
+  // chip did. swing_ui_knob_name stays — the menu row uses it (the chip's
+  // _next / _prev cyclers and its _knob_capw caption width went, unused).
   // SP_POPUP_CALLER_KNOB_STYLE now has no opener and no consumer anywhere.
-  _knob_capw = 0;   // STRIPS anchored off this; it now anchors off THEME directly
 
   // ── STRIPS view selector — remote-controls the embedded VIEW of every EON Drum
   //    Strip on THIS Swing instance (multi-out only). Click / hover-wheel cycle
@@ -2793,7 +2928,8 @@ function swing_ui_draw_header() (
   );
 
   // ── Bridge status indicator (right side of header) ──
-  _bridge_alive = gmem[KIT_GMEM_BRIDGE_ALIVE] > 0;
+  _hb_stale = swing_bridge_hb_stale();   // the banner's test too (one liveness, sweep LIB144)
+  _bridge_alive = !_hb_stale;
   _ind_r = 4;  // dot radius
   _ind_x = gfx_w - 14;
   _ind_y = 14;
@@ -2885,7 +3021,7 @@ local(_pad_req, _knl, _ki, _cn, _cnl, _cj, _ki_s)
   // state, otherwise two instances' window sizes/colors/names race for
   // the same gmem slots and the browser flickers.
   //
-  // We deliberately do NOT use the *_gmem_dirty inner gates anymore: when
+  // We deliberately do NOT gate on dirty flags (the old *_gmem_dirty gates are gone): when
   // the user switches active instance via the browser picker, the new
   // active instance's dirty flags would be 0 (no kit-mutating event has
   // happened on it), so the browser title would keep showing the previous
@@ -2963,7 +3099,11 @@ local(_pad_req, _knl, _ki, _cn, _cnl, _cj, _ki_s)
     // adopted into p_color — kit colors lost, session-intermittent. The
     // reverse adopt moves with it so the pair keeps its adopt-then-flush
     // ordering and neither reads half-staged kit data mid-import.
-    col_auto_mode_id == 0 ? (
+    // The same two gates as the name adopt below (sweep LIB123): UNSLOTTED only
+    // (a slotted instance takes its colours through INCMD_COLOR in @block) and
+    // bank A only -- a bank switch runs in this same frame while META+12 still
+    // holds bank A's hues, and bank B's pads took them, serialized.
+    _reg_my_slot < 0 && bank_cur == 0 && col_auto_mode_id == 0 ? (
       _ki = 0; loop(NUM_PADS,
         _ki_s = swing_bp(_ki);
         _gh = gmem[KIT_GMEM_META + _ki * KIT_GMEM_META_PP + 12];
@@ -3104,7 +3244,9 @@ function swing_ui_calc_layout() local(_ui_w) (
 // closes" (the rack face: "Yes, the Rack face"). Squeezed under a panel, the full face put TOOLS and the master under it
 // ("really goofy"): swing_seq_gate floors only the right column (424 px at scale 1), the left one needs more.
 // The full face's height need: its LEFT column, the binding one -- the header, the LCD, the KIT / SOUND / PLAY / SAMPLES
-// / TOOLS sections and the master block with VOL at its floor radius: 623 px at scale 1 (721 for a full-size VOL).
+// / TOOLS sections and the master block with VOL at its FULL size and its MASTER VOL label under it: 737 px at scale 1.
+// (It was 623, VOL at its floor radius; the user, 2026-10-26, agreed: switch early rather than show a squeezed knob or a
+// cut label.) A narrow window caps VOL by width too, so there the need is generous: the face switches a little early.
 // Built from the numbers swing_panels_draw_controls and swing_panels_draw_master lay the column out with: KEEP IN STEP
 // with them. The COLORS panel's rows are left out on purpose: they exist only while the full face draws them, so
 // counting them would let the face it picks change the need it was picked by.
@@ -3114,19 +3256,26 @@ function swing_face_full_need_h() (
   + 5 * swing_px(15)                             // the five section labels (_hdr_h)
   + 9 * swing_px(28)                             // the button rows (_btn_h): KIT 2, SOUND 2, PLAY 1, SAMPLES 1, TOOLS 3
   + 4 * swing_px(4) + 4 * swing_px(8)            // the gaps between rows (_btn_gap: KIT, SOUND, TOOLS twice) and after sections (_sec_gap)
-  + 8 + 6 + 2 * swing_px(26) + swing_px(16);     // the master: its top gap and bottom margin, and VOL at its floor (_mvol_r's swing_px(26), plus 16)
+  + 8 + 6 + 2 * swing_px(75) + swing_px(16)      // the master: its top gap and bottom margin, and VOL at full size (_mvol_r's swing_px(75) cap, plus 16)
+  + swing_px(16);                                // the MASTER VOL label: drawn _mvol_r + 10 under the knob's centre, past the area's own margin
 );
 // face_room_compact, once per window pass (Swing_ReaKit.jsfx, after the user's face is chosen): ON while a panel is open
 // under the pads (_fr_bot: swing_seq_gate's _bot_on) and the room above it (_fr_room: ui_bot) is under the full face's
 // need; OFF when the panel closes, when the user's own face is the rack face (no bottom slot there), or when the room is
 // back by FACE_ROOM_MARGIN_B more than the need. The room does not depend on the face drawn (the gate reads
 // dock_face_user), so the switch cannot feed itself. Returns the flag.
-function swing_face_room(_fr_user, _fr_bot, _fr_room) local(_fr_need) (
+// The SEQUENCER below the pads (2026-10-27; the owner: "Compact always when the sequencer is at the bottom"): while it is
+// the panel shown there (bot_panel 1, set by swing_seq_gate earlier in the same pass) the flag is ON whatever the room;
+// the browser or the pad editor placed below keeps the room rule. FACE_SEQ_BOT_RACK 0 puts the sequencer back on the room
+// rule too.
+FACE_SEQ_BOT_RACK = 1;
+function swing_face_room(_fr_user, _fr_bot, _fr_room) local(_fr_need, _fr_seq) (
   _fr_need = swing_face_full_need_h();
+  _fr_seq = FACE_SEQ_BOT_RACK && _fr_bot && bot_panel == 1;
   face_room_compact ? (
-    (_fr_user || !_fr_bot || _fr_room >= _fr_need + swing_px(FACE_ROOM_MARGIN_B)) ? face_room_compact = 0;
+    (_fr_user || !_fr_bot || (!_fr_seq && _fr_room >= _fr_need + swing_px(FACE_ROOM_MARGIN_B))) ? face_room_compact = 0;
   ) : (
-    (!_fr_user && _fr_bot && _fr_room < _fr_need) ? face_room_compact = 1;
+    (!_fr_user && _fr_bot && (_fr_seq || _fr_room < _fr_need)) ? face_room_compact = 1;
   );
   face_room_compact;
 );
@@ -3147,12 +3296,17 @@ function swing_rack_padfx() (
                                    : ( kit_bridge_warn = 1; );
 );
 
+// Not while this instance is busy or the bus is taken: the rack's MULTI chip is disabled under
+// kit_busy, but the "..." overflow reached this menu ungated, and a build posted over a load in
+// flight rewrote the staging bands with the outgoing kit and CMD 40 over the CMD 3 (sweep LIB124).
 function swing_rack_build() (
-  gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+  gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && !kit_busy && gmem[KIT_GMEM_CMD] == 0 ? (
     swing_popup_open(mx, my,
       "Build Stereo Grid (this track)|Build Drum Matrix (MIDI lanes)|Build Multi-Out (Audio)|Build Both (Audio + MIDI)",
       SP_POPUP_CALLER_DM_BUILD);
-  ) : ( kit_bridge_warn = 1; );
+  ) : (
+    gmem[KIT_GMEM_BRIDGE_ALIVE] <= 0 ? ( kit_bridge_warn = 1; );   // busy: nothing to say, the chip is dim
+  );
 );
 
 // ⚠️ CMD 45 toggles REAPER's MEDIA EXPLORER. It does not reveal the kit file in
@@ -3186,10 +3340,13 @@ function swing_rack_kitsview() (
 // gesture means the same thing in both faces. Same Phase-3 guard as that site —
 // also refuse while this instance is importing or a delivery is in flight, since
 // the state-11 dump reads the SHARED staging bands (chimera-file vector).
-function swing_rack_kitname() (
-  gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0
+// _rn = 1: the card's kit-name click, a RENAME -- the form starts at the current name (RR-1, bridge 323,
+// swing_rename_prefill); 0: the card menu's "Save As (name it)", which starts at "My Kit".
+function swing_rack_kitname(_rn) (
+  gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && swing_save_bus_free()   // CMD 0, no save in flight (RR-1, rk_swing_core)
     && !kit_busy && gmem[GS_KIT_LOAD_REQ] != 2 ? (
     gmem[KIT_GMEM_LOCK] = instance_id;
+    _rn ? swing_rename_prefill();
     gmem[KIT_GMEM_CMD] = 10;
     // Armed in the same evaluation as the post (see the LCD kit-name click in
     // rk_swing_lcd.jsfx-inc for the wedge this prevents -- audit B-5).
@@ -3232,14 +3389,14 @@ local(_tw, _th, _bw, _ax, _hov)
 
 // ── Dock rack face header (Spec_Swing_Dock_Mode.md) ──────────────────────
 // The whole top row of the wide-aspect layout: body fill, slim charcoal bar,
-// SWING wordmark, kit card (cover tile + name + BPM), the LOAD/SAVE/SAVE AS/
-// MAP action chips, and the NOTES / OUT / LAYERS dropdown chips. Also owns
-// this face's layout globals — the pad grid fills everything under the bar,
-// full width (right_x/right_w/grid_top).
+// SWING wordmark, kit card (cover tile + name + BPM) and the action chips.
+// The NOTES / OUT / LAYERS dropdown chips left this row (2026-08-25/26, see
+// below). Also owns this face's layout globals — the pad grid fills everything
+// under the bar, full width (right_x/right_w/grid_top).
 //
-// The chips and their panel are the SAME state the KIT tab drives (kdd_open;
-// swing_kdd_chip toggles, swing_chgmap_overlay_draw paints), so a panel
-// opened here and one opened on the KIT tab are one thing. Open-panel input
+// The dropdown panel is the SAME state the KIT tab drives (kdd_open;
+// swing_kdd_chip toggles it there, swing_chgmap_overlay_draw paints), so a
+// panel the full UI left open still paints on this face. Open-panel input
 // is taken HERE for the same reason swing_chgmap_draw takes it on the KIT
 // tab: the pads draw after this and would otherwise eat the click.
 function swing_ui_draw_rack_header()
@@ -3358,7 +3515,7 @@ local(_fs, _tw, _th, _bh, _by, _bx, _cx, _cy, _ch, _cw, _cw_full, _cw_name,
   _abx = _bx;
   // Same save guard as the full-UI SAVE button — the chimera-file vector:
   // never save while ANY load owns the shared staging pipeline.
-  _save_ok = !kit_busy && gmem[KIT_GMEM_CMD] == 0 && gmem[GS_KIT_LOAD_REQ] != 2;
+  _save_ok = !kit_busy && swing_save_bus_free() && gmem[GS_KIT_LOAD_REQ] != 2;   // RR-1: no save in flight either
   _acts ? (
     _ovw > 0 ? (
       _abx = swing_rack_act_chip("⋯", _abx, _by, _bh, 1) - 4;
@@ -3452,6 +3609,7 @@ local(_fs, _tw, _th, _bh, _by, _bx, _cx, _cy, _ch, _cw, _cw_full, _cw_name,
       // full-UI SAVE (rk_swing_ui_panels_controls).
       gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
         gmem[KIT_GMEM_LOCK] = instance_id;
+        swing_kitname_publish();   // RR-1: this Swing's name for the bridge's SAVE (rk_swing_core)
         gmem[KIT_GMEM_CMD]  = 12;
         kit_export_state = 10;
         kit_busy = 1;
@@ -3493,7 +3651,7 @@ local(_fs, _tw, _th, _bh, _by, _bx, _cx, _cy, _ch, _cw, _cw_full, _cw_name,
     _pr = swing_popup_result;
     swing_popup_result = 0;
     _pr == 1 ? swing_rack_kitsview() :
-    _pr == 2 ? swing_rack_kitname();
+    _pr == 2 ? swing_rack_kitname(0);   // Save As (name it): starts at "My Kit" (RR-1)
   );
 
   // Kit card — cover tile + kit name + project BPM, after the wordmark.
@@ -3554,7 +3712,7 @@ local(_fs, _tw, _th, _bh, _by, _bx, _cx, _cy, _ch, _cw, _cw_full, _cw_name,
       lmb_down ? (
         lmb_down = 0;
         _over_arw  ? swing_rack_kitmenu() :
-        _over_name ? swing_rack_kitname() : swing_rack_kitsview();
+        _over_name ? swing_rack_kitname(1) : swing_rack_kitsview();   // the name click: a rename (RR-1)
       );
       rmb_down ? ( rmb_down = 0; swing_rack_kitmenu(); );
     );
@@ -3722,7 +3880,9 @@ function swing_ui_draw_lcd_frame() (
     gfx_drawstr(#_kit_msg);
     // Progress bar (only show during audio copy phases)
     kit_total_audio > 0 ? (
-      _prog = kit_copied_audio / kit_total_audio;
+      // clamped: the total is the OUTGOING kit's lengths (layered pads count 1), so a bigger kit's
+      // count ran past it and the bar was drawn many times its width, across the pads (sweep LIB145)
+      _prog = max(0, min(1, kit_copied_audio / kit_total_audio));
     ) : _prog = 0;
     kit_export_state == 3 || kit_import_state == 1 ? _prog = 1;
     kit_export_state == 10 || kit_export_state == 1 ? _prog = 0;
@@ -3756,9 +3916,7 @@ function swing_ui_draw_lcd_frame() (
   // Bridge heartbeat AGE (2026-09-08): the bridge stamps os.time() at ~1 Hz.
   // The JSFX has no unix clock, so "stale" = the value has not MOVED for 5 s.
   // == 0 alone never caught an uncleanly exited bridge (its last stamp stays).
-  _hb_v = gmem[KIT_GMEM_BRIDGE_ALIVE];
-  _hb_v != _hb_seen ? ( _hb_seen = _hb_v; _hb_seen_t = time_precise(); );
-  _hb_stale = _hb_v == 0 || (time_precise() - _hb_seen_t > 5);
+  _hb_stale = swing_bridge_hb_stale();   // the header's dot reads the same (sweep LIB144)
   (kit_bridge_warn || _hb_stale) ? (
     swing_warning_overlay("Kit Bridge not running!",
                           "Run Swing_Kit_Bridge.lua in Actions",
@@ -3933,9 +4091,13 @@ function swing_ui_draw_lcd_frame() (
       ) : ( kit_bridge_warn = gmem[KIT_GMEM_BRIDGE_ALIVE] <= 0 ? 1 : kit_bridge_warn; );
     ) :
     _relink_resp == 2 ? (
+      // the same gates as item 1 and the LOAD button: a free bus, this instance idle, no other
+      // instance's LOCK -- it overwrote a save or load in flight (sweep LIB146)
       gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
-        gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_CMD] = 16;
-        kit_import_state = 1; kit_busy = 1;
+        (gmem[KIT_GMEM_CMD] == 0 && !kit_busy && swing_shared_bands_free()) ? (
+          gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_CMD] = 16;
+          kit_import_state = 1; kit_busy = 1;
+        );
       ) : ( kit_bridge_warn = 1; );
     ) : (
       _relink_dismissed = 1;

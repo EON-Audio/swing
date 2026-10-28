@@ -518,12 +518,27 @@ function M.StampCurrent(dest_t)
 end
 
 -- Jump to the pattern before/after the current one (wraps). dir = +1 or -1.
+-- "Current" is current_region()'s: the explicit one, else the one under the edit cursor (DM223,
+-- 2026-10-26: with no current pattern -- the Song Starter's adopted regions, a deleted current -- Next
+-- started from position 1 and landed on the SECOND pattern, Prev on the last). With nothing to go
+-- from, Next goes to the first pattern and Prev to the last.
 local function step(dir)
   local list = M.List()
   if #list == 0 then status('EON DM: no patterns yet'); return end
-  local pos, cur = 1, get_current()
+  local cur = get_current()
+  if cur == nil then
+    local pos = reaper.GetCursorPosition()
+    for _, r in ipairs(list) do
+      if pos >= r.start - 1e-6 and pos < r.end_ - 1e-6 then cur = r.idx; break end
+    end
+  end
+  local pos = nil
   for i, r in ipairs(list) do if r.idx == cur then pos = i; break end end
-  pos = ((pos - 1 + dir) % #list) + 1
+  if pos then
+    pos = ((pos - 1 + dir) % #list) + 1
+  else
+    pos = (dir > 0) and 1 or #list
+  end
   M.JumpTo(list[pos].idx)
 end
 

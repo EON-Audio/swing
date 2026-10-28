@@ -44,12 +44,10 @@ function swing_panels_section_hdr(_y, _hr, _hg, _hb) (
   gfx_rect(8 + _shw + 6, _y + 1 + (_shh * 0.5 | 0), left_w - 16 - _shw - 6, 1);
 );
 
-// Build the RPT division popup string with per-type colours — OFF = grey,
-// straight = blue, triplet = green, dotted = amber — and a "> " marker on the
-// active division (inactive items get a 2-space pad so the menu width doesn't
-// jitter as the marker moves). Result indices are unchanged (colours/markers
-// are just '^X' tags): 1=OFF, 2=1/4, 3=1/4 T, 4=1/4 D, 5=1/8, ... so the click
-// dispatch (repeat_div = result - 1) and hover-scroll both stay correct.
+// The RPT division popup (swing_panels_build_rpt_menu, below) is feel-first:
+// 1 = OFF, 2..6 = the straights, 7..11 = the triplets, 12..16 = the dotted
+// (1/4 .. 1/64 each), 17 = GRID SYNC, 18..21 = the feel rows. Colours and the
+// "> " marker are just '^X' tags and padding, so they never shift an index.
 // Map the feel-first RPT menu POSITION (1-based, = popup result) to the internal
 // repeat_div enum, and back. The enum (0=OFF; 1/2/3 = 1/4 straight/trip/dot;
 // 4/5/6 = 1/8; … 13/14/15 = 1/64) is FIXED — the rk_delay lookup depends on it —
@@ -156,11 +154,6 @@ local(_g, _rd, _bn)
   );
 );
 
-// Multi-out build PREP — flip to MULTI routing, auto-assign one channel per
-// pad, take the bridge LOCK, and publish pad names + effective hues to gmem
-// (do_build_multiout reads these before creating the destination tracks).
-// Shared by the STEREO/MULTI right-click builder and the MATRIX build menu so
-// the gmem publish format stays in lockstep. Caller sets KIT_GMEM_CMD after.
 // Raise a routing command for the BRIDGE from Swing's own window -- Wired on/off
 // (41), the Wired tap point (42), Wired -> Multi-Out (43), Multi-Out -> Wired
 // (44). Same gate as the multi-out builder: bridge alive, lock free or ours,
@@ -169,9 +162,17 @@ local(_g, _rd, _bn)
 // sends, and 41/42/44 end at CMD 0 -- a latched busy would freeze the window.
 function swing_panels_raise_bridge_cmd(_cmd) (
   gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
-    gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id ? (
+    // A bridge too old to know these commands (below BRIDGE_LEVEL_WIRED, the
+    // first level that publishes one) would neither run nor clear the command
+    // and the slot would sit blocked ~10 s: refuse and re-arm the "out of date"
+    // banner, as the WIRED button does -- here, so the STEREO/MULTI click, its
+    // menu and every other caller get the same refusal (LIB242).
+    gmem[GS_BRIDGE_LEVEL] < BRIDGE_LEVEL_WIRED ? (
+      _oldbr_dismissed = 0;
+    ) : gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id ? (
       gmem[KIT_GMEM_LOCK] = instance_id;
       gmem[KIT_GMEM_CMD] = _cmd;
+      rup_skip = 1;   // the bridge's command makes this press's REAPER undo point (2026-10-27): the gesture asks for none
     ) : (
       kit_bridge_warn = 2;   // bridge busy with another instance
     );
@@ -180,6 +181,13 @@ function swing_panels_raise_bridge_cmd(_cmd) (
   );
 );
 
+// Multi-out build PREP — flip to MULTI routing (bank A shown), take the bridge
+// LOCK, and publish pad names + effective hues to gmem (do_build_multiout reads
+// these before creating the destination tracks). No outputs are assigned here:
+// the bridge's adopt (companion CMD 5) resets them for a fresh build or a
+// Rebuild, and an Update (CMD 7) keeps them. Shared by every multi-out build
+// site (the left panel's menus and the rack's) so the gmem publish format stays
+// in lockstep. Caller sets KIT_GMEM_CMD after.
 function swing_panels_multiout_prep()
 local(_ki, _cj, _cn, _cnl, gi, gi_s, _ki_s)  // localized 2026-07-09: these globals raced the @block kit-import loop (phantom-pad-16 pad-0 poison)
 (
@@ -187,6 +195,10 @@ local(_ki, _cj, _cn, _cnl, gi, gi_s, _ki_s)  // localized 2026-07-09: these glob
   // handed to the bridge below, and every lane leg after the build, read bank A; and route every bank by
   // position, pad N of each bank to Out N -- the rule the bridge-initiated adopt (CMD 5) already follows.
   swing_banktabs_select(0);
+  // The build is the bridge's ONE undo point (2026-10-27): the switch to bank A just above asks for none of its own,
+  // and the press that started the build asks for none at its end either (swing_rup_*, rk_drumkit_dsp).
+  rup_want && rup_wpri <= 2 ? ( rup_want = 0; );
+  rup_skip = 1;
   multi_out = 1;
   // No output reset here (2026-10-10): this runs before the bridge knows whether the tracks exist. A fresh build or
   // a Rebuild gets the reset from the bridge's adopt (companion cmd 5); an Update gets cmd 7, which leaves every
@@ -279,7 +291,7 @@ function swing_panels_draw_controls() (
   _smp_hdr_y = _cy; _cy += _hdr_h;
   _smp_y = _cy; _cy += _btn_h + _sec_gap;
 
-  // TOOLS — STEP SEQ | PAD FX · MATRIX | PAINT · DM GRID (full)
+  // TOOLS — SEQ|STEPPA · PAD FX / STEREO|MULTI · WIRED / DM GRID | PAINT
   _tool_hdr_y = _cy; _cy += _hdr_h;
   _tool_a_y = _cy; _cy += _btn_h + _btn_gap;
   _tool_b_y = _cy; _cy += _btn_h + _btn_gap;
@@ -360,8 +372,9 @@ function swing_panels_draw_controls() (
   // REQ==2 in flight. The state-11 dump reads the SHARED META/AUDIO bands; a
   // save during someone else's load snapshots the in-flight kit's staging
   // under this kit's name (the chimera-file vector). kit_busy alone only saw
-  // THIS instance's import.
-  _in_save = !kit_busy && gmem[KIT_GMEM_CMD] == 0 && gmem[GS_KIT_LOAD_REQ] != 2
+  // THIS instance's import. swing_save_bus_free (rk_swing_core, RR-1): CMD 0 and, from bridge level 323, no other
+  // save in flight -- here, SAVE AS and the save menu's re-check below.
+  _in_save = !kit_busy && swing_save_bus_free() && gmem[GS_KIT_LOAD_REQ] != 2
           && mx >= _bk1_x && mx <= _bk1_x+_btn_w3 && my >= _bk0_y && my <= _bk0_y+_btn_h;
   // Unsaved-changes dot — top-right of the button. Deliberately kept amber now
   // that the button is green: it is an alert, and amber-on-green is the strongest
@@ -373,15 +386,12 @@ function swing_panels_draw_controls() (
     gfx_circle(_bk1_x + _btn_w3 - 6, _bk0_y + 5, 2.5, 1, 1);
   );
   _in_save ? (
-    // TEMP DIAGNOSTIC: while the dot is lit, the tooltip names the FIRST
-    // setter (1000 = kit-scoped edit, 1..16 = that pad) + seconds since
-    // instance start + how many times pads marked since. Remove with the
-    // _kd_* lines in rk_swing_core once the open-time false dirty is found.
-    kit_dirty ? (
-      sprintf(#_kd_tt, "SAVE — unsaved changes. [diag: src=%d t=%.1fs n=%d]",
-              _kd_src, _kd_t - _kd_t0, _kd_n);
-      swing_tooltip_check(10, #_kd_tt);
-    ) : swing_tooltip_check(10, "SAVE overwrites the kit you loaded — no dialog. Falls back to Save As for a kit you have not saved yet, or a factory kit (installer updates overwrite those). Right-click for browse-save / SFZ / RS5k export.");
+    // While the dot is lit the tooltip says so, then the SAVE help. (The
+    // "[diag: src=.. t=.. n=..]" tail that named the first setter shipped to
+    // customers in place of the help; the _kd_* recorder in rk_swing_core stays
+    // for a dev probe of the open-time false dirty -- LIB241.)
+    kit_dirty ? swing_tooltip_check(10, "SAVE — unsaved changes. Overwrites the kit you loaded — no dialog. Falls back to Save As for a kit you have not saved yet, or a factory kit (installer updates overwrite those). Right-click for browse-save / SFZ / RS5k export.")
+              : swing_tooltip_check(10, "SAVE overwrites the kit you loaded — no dialog. Falls back to Save As for a kit you have not saved yet, or a factory kit (installer updates overwrite those). Right-click for browse-save / SFZ / RS5k export.");
   );
   // LOCK + CMD must be written in the SAME @gfx evaluation. Bridge has a
   // stale-LOCK self-heal in poll_sidecar_events that clears LOCK whenever
@@ -397,6 +407,7 @@ function swing_panels_draw_controls() (
   _in_save && lmb_down ? (
     gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
       gmem[KIT_GMEM_LOCK] = instance_id;
+      swing_kitname_publish();   // RR-1: the bridge saves (or offers) THIS Swing's name, not the last kit op's
       gmem[KIT_GMEM_CMD]  = 12;
       kit_export_state = 10;
       kit_busy = 1;
@@ -425,7 +436,7 @@ function swing_panels_draw_controls() (
   gfx_measurestr("SAVE AS", tw, th);
   gfx_x = _bksa_x + (_btn_w3 - tw) / 2; gfx_y = _bk0_y + (_btn_h - th) / 2; gfx_drawstr("SAVE AS");
   // Same save guard as SAVE — see its comment for the chimera-file vector.
-  _in_svas = !kit_busy && gmem[KIT_GMEM_CMD] == 0 && gmem[GS_KIT_LOAD_REQ] != 2
+  _in_svas = !kit_busy && swing_save_bus_free() && gmem[GS_KIT_LOAD_REQ] != 2
           && mx >= _bksa_x && mx <= _bksa_x+_btn_w3 && my >= _bk0_y && my <= _bk0_y+_btn_h;
   // id 17: the low band is denser than it looks — 1-3, 10-16 and 18-30 are all
   // spoken for (17 is the only gap below 100, where the pad-face band 100+gi
@@ -460,7 +471,7 @@ function swing_panels_draw_controls() (
     // Phase 3: the popup result lands FRAMES after it opened — re-check the
     // save guard (a load may have started while the menu was up). Refused =
     // the same bridge-warn flash as a dead bridge; the user retries.
-    (kit_busy || gmem[KIT_GMEM_CMD] != 0 || gmem[GS_KIT_LOAD_REQ] == 2) ? (
+    (kit_busy || !swing_save_bus_free() || gmem[GS_KIT_LOAD_REQ] == 2) ? (
       kit_bridge_warn = 1;
       resp = 0;
     );
@@ -555,8 +566,20 @@ function swing_panels_draw_controls() (
   swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_LOAD_KIT ? (
     resp = swing_popup_result;
     swing_popup_result = 0;
+    // The result lands FRAMES after the menu opened (the SAVE menu's Phase 3
+    // rule): a load, a save or another instance's command may hold the bus by
+    // now, and CMD 16 written over another Swing's CMD 3 latch stranded that
+    // Swing kit_busy (LIB28). Refused = the busy flash; the user retries.
+    (kit_busy || gmem[KIT_GMEM_CMD] != 0 || gmem[GS_KIT_LOAD_REQ] == 2 ||
+     (gmem[KIT_GMEM_LOCK] != 0 && gmem[KIT_GMEM_LOCK] != instance_id)) ? (
+      kit_bridge_warn = 2;
+      resp = 0;
+    );
     resp == 1 ? ( gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_CMD] = 16; kit_import_state = 1; kit_busy = 1; );
-    resp == 2 ? ( gmem[KIT_GMEM_CMD] = 17; );  // file dialog → import_start (handled async by browser, no kit_busy)
+    // file dialog → import_start (handled async by browser, no kit_busy). The bridge hands CMD 17 on as
+    // CMD 60 (the browser, which targets gmem INSTANCE), so claim the target as BROWSE does, or the import
+    // filled the Swing the browser last pointed at (LIB210).
+    resp == 2 ? ( gmem[KIT_GMEM_INSTANCE] = instance_id; gmem[KIT_GMEM_CMD] = 17; );
     resp == 3 ? ( gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_CMD] = 20; kit_import_state = 1; kit_busy = 1; );
     resp == 4 ? ( gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_CMD] = 30; kit_import_state = 1; kit_busy = 1; );
   );
@@ -721,10 +744,10 @@ function swing_panels_draw_controls() (
     multi_out = !multi_out;
     multi_out ? (
       // Switching to MULTI: auto-assign 1 per pad
-      gi = 0; loop(NUM_PADS, gi_s = swing_bp(gi); swing_out_set(gi_s, gi); gi += 1;);   // counted only where a pad moved (swing_out_set)
+      gi = 0; loop(NUM_PADS, swing_out_set(gi, gi); gi += 1;);   // bank A's slots 0..15 whatever bank is shown, banks B-D (split-off pads) untouched (LIB29); counted only where a pad moved (swing_out_set)
     ) : (
       // Switching to STEREO: reset all to Out 1
-      gi = 0; loop(NUM_PADS, gi_s = swing_bp(gi); swing_out_set(gi_s, 0); gi += 1;);   // counted only where a pad moved (swing_out_set)
+      gi = 0; loop(NUM_PADS, swing_out_set(gi, 0); gi += 1;);   // bank A's slots 0..15 (LIB29); counted only where a pad moved (swing_out_set)
     );
     mark_dirty_kit();
   );
@@ -743,20 +766,20 @@ function swing_panels_draw_controls() (
     resp = swing_popup_result;
     swing_popup_result = 0;
     resp == 1 ? (
-      gi = 0; loop(NUM_PADS, gi_s = swing_bp(gi); swing_out_set(gi_s, gi); gi += 1;);   // counted only where a pad moved (swing_out_set)
+      gi = 0; loop(NUM_PADS, swing_out_set(gi, gi); gi += 1;);   // bank A's slots 0..15 whatever bank is shown, banks B-D (split-off pads) untouched (LIB29); counted only where a pad moved (swing_out_set)
       multi_out = 1; mark_dirty_kit();
     );
     resp == 2 ? (
-      gi = 0; loop(NUM_PADS, gi_s = swing_bp(gi); swing_out_set(gi_s, 0); gi += 1;);   // counted only where a pad moved (swing_out_set)
+      gi = 0; loop(NUM_PADS, swing_out_set(gi, 0); gi += 1;);   // bank A's slots 0..15 (LIB29); counted only where a pad moved (swing_out_set)
       multi_out = 0; mark_dirty_kit();
     );
     resp == 3 ? (
       gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
         // Acquire lock + sync pad data for multi-out builder. multiout_prep
-        // switches to MULTI routing + auto-assigns one channel per pad up
-        // front so the JSFX is already in multi-out mode by the time the bridge
-        // finishes creating the destination tracks (otherwise the user sees 16
-        // tracks created but Swing still summing to stereo Out 1).
+        // switches to MULTI routing up front so the JSFX is already in
+        // multi-out mode by the time the bridge finishes creating the
+        // destination tracks; the per-pad outputs come from the bridge's
+        // adopt (companion CMD 5), or are kept on an Update (CMD 7).
         gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id ? (
           swing_panels_multiout_prep();
           gmem[KIT_GMEM_CMD] = 40; kit_import_state = 1; kit_busy = 1;
@@ -1033,11 +1056,12 @@ function swing_panels_draw_controls() (
     // carries the current state so no checkmark support is needed.
     swing_panels_mapmenu_open(mx, my);
   );
-  // Hover-scroll: wheel over the open MAP menu cycles through the 8 main note
+  // Hover-scroll: wheel over the open MAP menu cycles through the 9 main note
   // maps and applies each live (the menu stays open). It REUSES the dispatch
   // below by setting swing_popup_result to the menu index that applies that map
-  // (0..7 → Chromatic/White/GM/Black/MPC-A/Maschine-A/Launchpad/Push). Wheel up
-  // = toward the top of the list.
+  // (note_map 0..8 → Chromatic/White/GM/Black/MPC and Maschine (the letter of
+  // the bank on screen)/Launchpad/Push/MPC Classic). Wheel up = toward the top
+  // of the list.
   swing_popup_wheel != 0 && swing_popup_caller_id == SP_POPUP_CALLER_MAP_PRESET ? (
     _nm = (note_map + (swing_popup_wheel > 0 ? -1 : 1) + 9) % 9;
     _nm == 0 ? swing_popup_result = 1  :
@@ -1141,7 +1165,7 @@ function swing_panels_draw_controls() (
     resp >= 1 && resp <= 15 ? (
       slider_automate(slider1); mark_dirty_kit();
     );
-    // --- Custom root (resp 15) — chains to a second popup ---
+    // --- Custom root (resp 16) — chains to a second popup ---
     // gfx_showmenu was synchronous so the original code opened the sub-menu
     // inline. Our popup is async — chain by opening a second popup with
     // a different caller ID; the MAP_ROOT poll block (below) applies the
@@ -1253,8 +1277,8 @@ function swing_panels_draw_controls() (
   );
   // Right-click: full menu with all divisions
   // Right-click: repeat-division picker (migrated to popup). Separators
-  // don't consume an index — 1=OFF, 2=1/4, ..., 5=1/8, ..., matching the
-  // repeat_div lookup table in rk_delay.jsfx-inc.
+  // don't consume an index; the feel-first positions map to the repeat_div
+  // enum (the rk_delay lookup's order) through swing_panels_rpt_pos2div.
   _in_rpt && rmb_down ? (
     swing_panels_build_rpt_menu();
     swing_popup_open(mx, my, #_rpt_menu, SP_POPUP_CALLER_RPT_DIV);
@@ -1263,7 +1287,9 @@ function swing_panels_draw_controls() (
     swing_popup_result == 17 ? (
       rpt_grid = !rpt_grid;     // trailing GRID SYNC toggle, not a division
       swing_popup_result = 0;
-      rpt_counter = 0; mark_dirty_kit();
+      // mark_dirty, not _kit: the kit file carries no rpt_grid / rpt_prob / rpt_hum / rpt_press
+      // (KIT_GLOBAL_KEYS), so the SAVE dot promised a save that could not keep them (LIB243)
+      rpt_counter = 0; mark_dirty_play();   // not a kit key, but how Swing plays: its gesture's REAPER undo point (2026-10-27)
     ) : swing_popup_result >= 18 && swing_popup_result <= 21 ? (
       // A feel row: hand straight on to the shared percentage ladder.
       _rpt_feel_which = swing_popup_result - 18;
@@ -1279,7 +1305,7 @@ function swing_panels_draw_controls() (
   swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_RPT_FEEL ? (
     swing_panels_feel_set(_rpt_feel_which, swing_panels_feel_pct(swing_popup_result) * 0.01);
     swing_popup_result = 0;
-    mark_dirty_kit();
+    _rpt_feel_which == 0 ? mark_dirty_kit() : mark_dirty_play();   // only SWING (swing_amt) is a kit key (LIB243); the rest play (2026-10-27)
   );
   swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_RPT_FEEL ? (
     swing_popup_result = 0;
@@ -1493,7 +1519,9 @@ function swing_panels_draw_controls() (
   _in_padfx && lmb_down ? pfx_req = (pfx_open && (fx_place == 3 ? bot_panel == 3 : side_front == 1)) ? 2 : 1;
   _in_padfx && rmb_down ? (
     gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
-      gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_CMD] = 71; );
+      // Swing_PadFX binds to gmem INSTANCE (the browser's target): claim it, as BROWSE does, or
+      // the window edited -- or, being a toggle, closed -- the Swing the browser last pointed at (LIB210)
+      gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_INSTANCE] = instance_id; gmem[KIT_GMEM_CMD] = 71; );
     ) : ( kit_bridge_warn = 1; );
   );
 
@@ -1646,7 +1674,8 @@ function swing_panels_draw_controls() (
   // GRID (full width, row C) — toggles the Drum Matrix grid overlay on/off.
   // Lit when the overlay is running (GS_DM_OVERLAY, published by the bridge from
   // the overlay's singleton lock). Click fires CMD 76 (open if closed / close if
-  // open). MATRIX builds the lanes; PAINT paints once the grid is up.
+  // open). MULTI (or STEREO for one track) builds the lanes; PAINT paints once
+  // the grid is up.
   // Row C is SPLIT (2026-09-09): GRID keeps the left half and PAINT joins it on
   // the right. They are one tool -- the grid is where you paint -- and PAINT had
   // been sitting a row above beside something unrelated, which is why it read as
@@ -1666,7 +1695,7 @@ function swing_panels_draw_controls() (
   gfx_measurestr("DM GRID", tw, th);
   gfx_x = _grid_x + (_tool_hw - tw) / 2; gfx_y = _tool_c_y + (_btn_h - th) / 2; gfx_drawstr("DM GRID");
   _in_grid = mx >= _grid_x && mx < _grid_x+_tool_hw && my >= _tool_c_y && my <= _tool_c_y+_btn_h;
-  _in_grid ? swing_tooltip_check(30, "Drum Matrix grid overlay on/off — opens the ReaImGui grid over the arrange view, or closes it. Lit = overlay running. (Build lanes with MATRIX, paint with PAINT beside it.)");
+  _in_grid ? swing_tooltip_check(30, "Drum Matrix grid overlay on/off — opens the ReaImGui grid over the arrange view, or closes it. Lit = overlay running. (Build lanes with MULTI, or STEREO for one track; paint with PAINT beside it.)");
   _in_grid && lmb_down ? (
     gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
       gmem[KIT_GMEM_CMD] == 0 ? ( gmem[KIT_GMEM_CMD] = 76; );
@@ -1691,7 +1720,7 @@ function swing_panels_draw_controls() (
   );
 
   // (Master anchor _btn7_y is set in the section layout preamble = _tool_c_y, so
-  // swing_panels_draw_master() flows below the PREFS row.)
+  // swing_panels_draw_master() flows below the TOOLS rows.)
 
 );
 
@@ -1807,14 +1836,23 @@ function swing_panels_draw_master() (
   gfx_set(_mdrv_r * 0.8, _mdrv_g * 0.8, _mdrv_b * 0.8, 0.85);
   gfx_rect(_drv_thumb_x + 4, _drv_thumb_y + (_drv_thumb_h / 2)|0, _drv_thumb_w - 8, 2);
 
-  // Drive interaction (vertical drag, ID 270)
+  // Drive interaction (vertical drag, ID 270). The thumb is drawn on a
+  // (H - thumb_h) travel, so the pointer maps onto the same travel from the
+  // thumb's centre: mapping it on H made a press on the thumb, without moving,
+  // jump the drive by thumb_h / 2H (0.04 at H = 150) and switch saturation on
+  // (LIB211).
   active_id == 270 ? ( LMB ? (
-    gfx_sat_drv = max(0, min(1.0, 1.0 - (my - _drv_y) / _drv_h));
+    gfx_sat_drv = max(0, min(1.0, 1.0 - (my - _drv_y - _drv_thumb_h * 0.5) / max(1, _drv_h - _drv_thumb_h)));
     mark_dirty_kit();
   ) : active_id = -1; );
 
   active_id == -1 && mx >= _drv_thumb_x - 4 && mx <= _drv_thumb_x + _drv_thumb_w + 4 && my >= _drv_y && my <= _drv_y + _drv_h && lmb_down ? (
-    active_id = 270;
+    // double-click resets to 0 (clean), as the tooltip has always said (LIB211); the second press starts no drag
+    time_precise() - _drv_dbl_t < RK_DBLCLICK_T ? (
+      gfx_sat_drv = 0; mark_dirty_kit(); _drv_dbl_t = 0;
+    ) : (
+      active_id = 270; _drv_dbl_t = time_precise();
+    );
   );
 
   // Tooltip: zone 3 = master DRIVE fader. Hover zone uses the same
@@ -1862,12 +1900,12 @@ function swing_panels_draw_master() (
   // Click cycles forward through the 5 types.
   _mpill_hit && lmb_down ? (
     gfx_drv_mode = (_mdm + 1) % 5;
-    mark_dirty();
+    mark_dirty_play();   // not a kit key; a sound change: its REAPER undo point (2026-10-27)
   );
   // Wheel scrolls type (up = next, down = previous).
   _mpill_hit && frame_wheel != 0 ? (
     gfx_drv_mode = (_mdm + (frame_wheel > 0 ? 1 : 4)) % 5;
-    mark_dirty();
+    mark_dirty_play();
   );
 
   // ── Master VOL jog wheel knob (centered in knob zone) ──

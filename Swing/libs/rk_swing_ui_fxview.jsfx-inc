@@ -3,10 +3,14 @@
 // Spec: .docs/specs/Spec_FX_Picker.md   Plan: .docs/specs/Plan_FX_Picker_P2.md
 // Engine (Lua, already built and REAPER-verified): Scripts/rk_lua_fxpicker.lua
 //
-// ⚠️ S1 — THE SHELL ONLY. Chrome, title, close, and the three empty columns.
-// No gmem, no plugin list, no chain. That is deliberate: the framework wiring
-// (view id, dispatch, the EON_VIEW_REQ ceiling, input takeover) is the part
-// that fails silently, so it gets proven on its own before any data moves.
+// What this file owns (it began as the S1 shell -- chrome, title, close, three
+// empty columns -- and grew): the picker's side of the gmem protocol with the
+// FX picker bridge (EON_FXPicker_Bridge.lua) -- the page request (FXP_REQ_*),
+// the search and filter cells, the action mailbox (FXP_ACT_*, one unacked verb
+// at a time) and the target (FXP_TGT_*) -- plus the seqlocked snapshots of the
+// published plugin page, the target chain and the banks table, and every face
+// that draws them: the list and grid, the banks rail, the chain, the CHAINS
+// (.RfxChain) browser, the FX tab (swing_fxview_lcd) and the rack.
 //
 // ── FULL-WINDOW, not the pad-grid rect ──────────────────────────────────────
 // Every other big view paints into grid_x/grid_y/grid_w/grid_h (476×614 at the
@@ -46,8 +50,7 @@ _fxv_rows = 0;
 _fxv_seen = -1;      // last PUB_SEQ consumed
 _fxv_req_seq = 0;
 _fxv_n = 0; _fxv_total = 0; _fxv_off = 0; _fxv_hb = 0;
-_fxv_hb_last = -1; _fxv_hb_t = 0; _fxv_live = 0; _fxv_live_last = 0;
-_fxv_asked = 0;      // have we asked for anything since the view opened
+_fxv_hb_last = -1; _fxv_hb_t = 0; _fxv_live = 0;
 FXV_ROW_H_B = 40;    // list row pitch; chip and text are sized off it
 FXV_ROW_H  = FXV_ROW_H_B;   // rescaled per frame in swing_fxview_layout()
 // The row's card. ⚠️ 1.714:1 is the deck's aspect and is NOT negotiable -- the
@@ -103,15 +106,18 @@ fxv_kf_inst = 0;
 // sample-rate change re-runs @init. Its default lives in the read backfill.
 _fxv_csel   = -1;    // focused chain slot; -1 = append instead of swap
 _fxv_aseq   = 0;     // last action posted
+_fxv_aslot  = -1;    // the registry slot _fxv_aseq counts in; -1 = re-seed from the band (PL H1)
 _fxv_await  = 0;     // frames since; re-assert if the ack is lost
 _fxv_qn     = 0;     // query length
 _fxv_creln  = 0;     // CHAINS: length of the folder path being browsed
 _fxv_chsel  = -1;    // CHAINS: the chain row selected, awaiting REPLACE
+_fxv_chdeep = 0;     // CHAINS: frames left on the "path too long" notice (PL H2)
 _fxv_qc     = 0;     // caret index
 _fxv_qfoc   = 0;     // 1 = the box is taking keys
 _fxv_qpost  = -1;    // frames since the query changed; -1 = settled
 _fxv_paste  = 0;     // countdown on the 'no clipboard' notice
 _fxv_sel    = -1;    // keyboard row selection; -1 = none yet
+_fxv_selmv  = 0;     // 1 = the keys moved _fxv_sel: the next frame scrolls it into view (PL H9)
 _fxv_bank   = -1;    // selected rail row; -1 = ALL
 _fxv_bn     = 0;     // banks published
 _fxv_bseen  = -1;    // last bank-table seq consumed
@@ -124,7 +130,25 @@ _fxv_bseen  = -1;    // last bank-table seq consumed
 // Re-asking twice a second is nothing and it heals itself.
 _fxv_lcd_ask = 0;    // frames until the LCD tab re-registers with the bridge
 
-// Returns the bumped pointer, matching every other *_init in the suite.
+// ── The category glyphs (37 marks, 0..36) ───────────────────────────────────
+// One mark per bucket, in M.BUCKETS order (0..21; 21 = no-guess, the empty
+// ring) -- the same order the bucket colours below use and the same the bridge
+// sends indices from -- then 22..36, the extra shapes noted inline.
+//
+// ⭐ EACH ONE IS A TRANSFER CURVE, A SHAPE, OR A DEVICE -- never a letter.
+// Letters at this size are unreadable and they would also be wrong: the rail is
+// already showing the category's NAME beside the glyph, so a glyph that spells
+// the name again says nothing the row did not already say. What earns the space
+// is the thing a category DOES: what it makes the signal look like.
+//
+// ⚠️ THE BUDGET IS ~12 px. The spec is explicit that every one must survive at
+// small size "with no text beside it", so they are built from 2-5 strokes and
+// nothing has interior detail. Everything derives from s, so the same recipe
+// draws in a 17 px rail seat and would draw at 40 px unchanged.
+//
+// ⚠️ Colour is the CALLER's -- gfx_set before calling. These only draw shape,
+// so one glyph can be a rail icon, a row pip and a card mark without three
+// copies deciding their own colour.
 // ⚠️ MOVED UP 2026-08-29. These two were defined at ~742/807 but first CALLED
 // at 521, and EEL2 resolves function names at PARSE time -- so the whole plugin
 // stopped compiling. `eon_ell`, which cat_glyph needs, comes from
@@ -213,7 +237,7 @@ function swing_fxview_blank_card(x, y, w, h, col, seed, bucket)
   );
 );
 
-
+// Returns the bumped pointer, matching every other *_init in the suite.
 function swing_fxview_init(mem_start)
 (
   _fxv_rows  = mem_start;
@@ -399,6 +423,12 @@ function swing_fxview_request(off, n)
     gmem[b + FXP_REQ_N]   = n;
     _fxv_req_seq += 1;
     gmem[b + FXP_REQ_SEQ] = _fxv_req_seq;    // LAST
+    // PL H16: ANY ask replaces the one published page -- the FX tab's one-row
+    // re-ask, the console's compact picker -- so the big view's "last asked"
+    // no longer names what is there. Forgotten here, at the one door every ask
+    // goes through; the big view's own asks set it again right after the call.
+    // Without it a reopened picker sat on one row and ghosts for 45 frames.
+    _fxv_reqoff = -1;
   );
 );
 
@@ -462,6 +492,10 @@ function swing_fxview_q_send_do()
   i = 0;
   loop(_fxv_creln, gmem[b + FXP_CHREL + i] = _fxv_crel[i]; i += 1;);
   _fxv_scroll = 0;
+  // PL H3/H6: the chosen chain is a ROW of the list this re-ask replaces. Kept,
+  // REPLACE WHOLE CHAIN stayed armed on whatever the new list holds at that row
+  // (a typed search, LIST then CHAINS) -- a chain nobody picked.
+  _fxv_chsel = -1;
   // ⚠️ POST THE REQUEST HERE. The first version only reset the window state and
   // let the need-test in draw() notice -- but the snapshot runs later in the
   // same frame, re-reads the STALE published page and restores _fxv_n, so
@@ -477,6 +511,19 @@ function swing_fxview_q_send_do()
 // is unchanged under its _do name.
 function swing_fxview_q_send() ( _reg_my_slot >= 0 ? swing_fxview_q_send_do(); );
 
+// PL H1 (2026-10-26): our action count CONTINUES the band's. gmem outlives the
+// instance and @init starts _fxv_aseq at 0, so a project reopened in the same
+// REAPER met ACK = the old count and every action was refused for 60 frames --
+// and an old count of exactly 1 made our first post (seq 1) equal the bridge's
+// last_act, so it was dropped as already run. Re-seeded whenever the band we
+// post into is not the one the count came from (@init, a new registry slot).
+function swing_fxview_aseq_sync(b) (
+  _fxv_aslot != _reg_my_slot ? (
+    _fxv_aseq = gmem[b + FXP_ACT_SEQ] | 0;
+    _fxv_aslot = _reg_my_slot;
+  );
+);
+
 // Post one mutation. Refuses while an earlier action is unacknowledged --
 // that is the whole point of the second mailbox. The 60-frame escape stops a
 // lost ack from wedging the picker forever.
@@ -484,6 +531,7 @@ function swing_fxview_act(verb, a, bnum)
   local(b)
 (
   b = EON_FXPICK_BASE + max(0, min(EON_FXPICK_SLOTS - 1, _reg_my_slot)) * EON_FXPICK_STRIDE;
+  _reg_my_slot >= 0 ? swing_fxview_aseq_sync(b);
   // C-5: no slot, no action -- a verb posted into slot 0's band ran on slot 0's chain.
   _reg_my_slot >= 0 && (gmem[b + FXP_ACT_ACK] == _fxv_aseq || _fxv_await > 60) ? (
     gmem[b + FXP_ACT_VERB] = verb;
@@ -541,8 +589,9 @@ function swing_fxview_snapshot()
     s2 = gmem[b + FXP_PUB_SEQ];
     s2 == s1 ? (
       // Resolve each row's card ONCE here, not per frame in the draw loop --
-      // 145 key compares x 31 rows x 60 fps would be 270k/sec for a value that
-      // only changes when the bridge publishes.
+      // a miss scans all FXC_N_KEYS pairs, and FXC_N_KEYS x 31 rows x 60 fps
+      // (~1.4M compares/sec at 758 keys) would buy a value that only changes
+      // when the bridge publishes.
       j = 0;
       loop(n,
         p = _fxv_rows + j * FXP_REC;
@@ -561,7 +610,11 @@ function swing_fxview_snapshot()
 function swing_fxview_crel_push(_rec) local(_p, _l, _i, _sep) (
   _p = _fxv_rows + _rec * FXP_REC;
   _l = min(40, _p[FXP_R_LEN] | 0);
-  _l > 0 && _fxv_creln + _l + 1 < FXP_CHREL_MAX ? (
+  // PL H2: the '/' is added only below the root, and the path may FILL the 40
+  // cells -- `creln + l + 1 < 40` refused a 39-character folder at the root.
+  // A path that will not fit is SAID (the CHAINS bar), never a dead click.
+  _l > 0 && _fxv_creln + (_fxv_creln > 0) + _l > FXP_CHREL_MAX ? _fxv_chdeep = 150;
+  _l > 0 && _fxv_creln + (_fxv_creln > 0) + _l <= FXP_CHREL_MAX ? (
     // ⚠️ FORWARD slash, translated by the bridge into the platform's own.
     // This was a hardcoded BACKSLASH, which is a Windows-only path: the engine
     // joins with package.config's separator, so on Mac the folder would simply
@@ -605,8 +658,43 @@ function swing_fxview_pick(_rec) local(_p) (
 );
 
 // One row: bucket dot, name, format tag.
+// The CHAINS kinds' own art in a 40 x 23 box at (ax, ay): a chain file draws
+// what is INSIDE it (up to four category pips and a count), a folder a folder
+// mark, so a folder never reads as a chain you could apply. Shared by the row
+// and the tile (PL H5: CHAINS draws as TILES -- `_fxv_mode ?` is true for 2 --
+// so this art sat in the row renderer, unreachable, and every chain and folder
+// was the same blank card).
+function swing_fxview_kind_art(ax, ay, p) local(j, _fxv_stk, _fxv_stc) (
+  (p[FXP_R_KIND] | 0) == FXK_CHAIN ? (
+    _fxv_stk = p[FXP_R_CHSTK];
+    gfx_set(0, 0, 0, 0.25); gfx_rect(ax, ay, 40, 23);
+    j = 0;
+    loop(4,
+      // Unpacked by DIVISION, matching how the bridge multiplied it in.
+      _fxv_stc = (_fxv_stk / (j == 0 ? 1 : j == 1 ? 32 :
+                              j == 2 ? 1024 : 32768)) | 0;
+      _fxv_stc = _fxv_stc - ((_fxv_stc / 32) | 0) * 32;
+      _fxv_stc < 22 ? (
+        swing_fxview_bucket_col(_fxv_stc);
+        gfx_rect(ax + 3 + j * 9, ay + 5, 7, 13);
+      );
+      j += 1;
+    );
+    rk_font(1, swing_fs(10), 'b');
+    gfx_set(0.70, 0.78, 0.84, 0.9);
+    gfx_x = ax + 2; gfx_y = ay;
+    gfx_drawnumber((_fxv_stk / 1048576) | 0, 0);
+  ) : (
+    gfx_set(0.62, 0.70, 0.78, 0.85);
+    gfx_rect(ax + 4, ay + 6, 32, 12);
+    gfx_rect(ax + 4, ay + 3, 14, 3);
+    gfx_set(0.10, 0.14, 0.20, 1);
+    gfx_rect(ax + 6, ay + 8, 28, 8);
+  );
+);
+
 function swing_fxview_row(rx, ry, rw, rec, hot)
-  local(p, len, i, j, tw, th, _fxv_stk, _fxv_stc)
+  local(p, len, i, j, tw, th, tx, cw)
 (
   p = _fxv_rows + rec * FXP_REC;
   len = min(40, p[FXP_R_LEN] | 0);
@@ -635,32 +723,8 @@ function swing_fxview_row(rx, ry, rw, rec, hot)
     // is inside it instead: up to four category pips and a count. REPLACE
     // WHOLE CHAIN overwrites what you have, so choosing from filenames
     // alone was choosing blind.
-    (p[FXP_R_KIND] | 0) == FXK_CHAIN ? (
-      _fxv_stk = p[FXP_R_CHSTK];
-      gfx_set(0, 0, 0, 0.25); gfx_rect(rx + 6, ry + 3, 40, 23);
-      j = 0;
-      loop(4,
-        // Unpacked by DIVISION, matching how the bridge multiplied it in.
-        _fxv_stc = (_fxv_stk / (j == 0 ? 1 : j == 1 ? 32 :
-                                j == 2 ? 1024 : 32768)) | 0;
-        _fxv_stc = _fxv_stc - ((_fxv_stc / 32) | 0) * 32;
-        _fxv_stc < 22 ? (
-          swing_fxview_bucket_col(_fxv_stc);
-          gfx_rect(rx + 9 + j * 9, ry + 8, 7, 13);
-        );
-        j += 1;
-      );
-      rk_font(1, swing_fs(10), 'b');
-      gfx_set(0.70, 0.78, 0.84, 0.9);
-      gfx_x = rx + 8; gfx_y = ry + 3;
-      gfx_drawnumber((_fxv_stk / 1048576) | 0, 0);
-    ) : (p[FXP_R_KIND] | 0) == FXK_FOLDER ? (
-      // A folder mark, so a folder never reads as a chain you could apply.
-      gfx_set(0.62, 0.70, 0.78, 0.85);
-      gfx_rect(rx + 10, ry + 9, 32, 12);
-      gfx_rect(rx + 10, ry + 6, 14, 3);
-      gfx_set(0.10, 0.14, 0.20, 1);
-      gfx_rect(rx + 12, ry + 11, 28, 8);
+    (p[FXP_R_KIND] | 0) == FXK_CHAIN || (p[FXP_R_KIND] | 0) == FXK_FOLDER ? (
+      swing_fxview_kind_art(rx + 6, ry + 3, p);
     ) : p[FXP_R_CARD] >= 0 ? (
       swing_fxcard_draw(rx + 6, ry + 3, FXV_CARD_W, FXV_CARD_H, p[FXP_R_CARD]);
     ) : (
@@ -681,7 +745,15 @@ function swing_fxview_row(rx, ry, rw, rec, hot)
     // held back for category + vendor + format tag -- so a long name stopped
     // early even with the vendor switched OFF and nothing there to protect.
     // With VEND off the reserve is the category and the tag alone.
-    _fxv_tail = fxv_vend_on ? 130 : 74;
+    // PL H12: design pixels, like every other reserve here -- the fonts scale,
+    // and an unscaled reserve let a 2x category run into the tag.
+    _fxv_tail = swing_px(fxv_vend_on ? 130 : 74);
+    // The format tag's seat, measured FIRST: the category and the vendor stop
+    // short of it rather than of a guessed reserve.
+    rk_font(1, swing_fs(13), 0);
+    strcpy(#fxv_s, swing_fxview_fmt_name(p[FXP_R_FMT] | 0));
+    gfx_measurestr(#fxv_s, tw, th);
+    tx = rx + rw - swing_px(10) - tw;
     rk_font(1, swing_fs(17), 0);
     gfx_set(0.86, 0.90, 0.95, 1);
     gfx_x = rx + FXV_CARD_W + 14; gfx_y = ry + ((FXV_ROW_H - 17) / 2) | 0;
@@ -702,20 +774,24 @@ function swing_fxview_row(rx, ry, rw, rec, hot)
     // what made the category look like a superscript instead of part of the
     // line. Push it down by the difference in cap height.
     gfx_y += 4;
-    strlen(#fxv_s) > 0 && gfx_x <= rx + rw - _fxv_tail ? (
+    // PL H12: the WHOLE word must end before the tag, not merely start before a
+    // reserve -- "   orchestral" started inside the 74 px and printed over VST3.
+    strcat(strcpy(#fxv_s2, "   "), #fxv_s);
+    gfx_measurestr(#fxv_s2, cw, i);
+    strlen(#fxv_s) > 0 && gfx_x + cw <= tx - swing_px(6) ? (
       swing_fxview_bucket_col(p[FXP_R_BUCKET] | 0);
       gfx_a = 0.9;
-      gfx_drawstr("   "); gfx_drawstr(#fxv_s);
+      gfx_drawstr(#fxv_s2);
       gfx_a = 1;
     );
     // Vendor last: it answers "whose is this", which only matters once you
     // know what it is -- so it is the first thing a narrow panel drops.
-    fxv_vend_on && (p[FXP_R_VLEN] | 0) > 0 && gfx_x <= rx + rw - 130 ? (
+    fxv_vend_on && (p[FXP_R_VLEN] | 0) > 0 && gfx_x <= rx + rw - swing_px(130) ? (
       gfx_set(0.55, 0.60, 0.68, 0.9);
       gfx_drawstr("  ·  ");
       j = 0;
       loop(min(FXP_VEND_MAX, p[FXP_R_VLEN] | 0),
-        gfx_x <= rx + rw - 52 ? gfx_drawchar(p[FXP_R_VEND + j] | 0);
+        gfx_x <= tx - swing_px(14) ? gfx_drawchar(p[FXP_R_VEND + j] | 0);
         j += 1;
       );
     );
@@ -723,8 +799,7 @@ function swing_fxview_row(rx, ry, rw, rec, hot)
     rk_font(1, swing_fs(13), 0);
     gfx_set(0.46, 0.52, 0.60, 1);
     strcpy(#fxv_s, swing_fxview_fmt_name(p[FXP_R_FMT] | 0));
-    gfx_measurestr(#fxv_s, tw, th);
-    gfx_x = rx + rw - 10 - tw; gfx_y = ry + ((FXV_ROW_H - th) / 2) | 0;
+    gfx_x = tx; gfx_y = ry + ((FXV_ROW_H - th) / 2) | 0;
     gfx_drawstr(#fxv_s);
   );
 );
@@ -734,11 +809,18 @@ function swing_fxview_row(rx, ry, rw, rec, hot)
 // (they are separate address spaces, and because local memory runs to ~72 MB a
 // gmem address is a VALID local one, so it fails silently).
 function swing_fxview_chain_snap()
-  local(b, s1, s2, i, n, p, src)
+  local(b, s1, s2, i, n, p, src, h)
 (
   b = EON_FXPICK_BASE + max(0, min(EON_FXPICK_SLOTS - 1, _reg_my_slot)) * EON_FXPICK_STRIDE;
   s1 = gmem[b + FXP_CH_SEQ];
-  (s1 == _fxv_cseen || (s1 % 2) == 1) ? (
+  // PL H13/H15 (C-5's last read): with no registry slot the clamp above is
+  // slot 0's band -- ANOTHER Swing's chain, track name and colour, drawn on the
+  // LCD, the rack and the big view as this one's. No slot, no chain; the pages
+  // say why. _fxv_cseen is reset so a slot won later snapshots at once.
+  _reg_my_slot < 0 ? (
+    _fxv_cn = 0; _fxv_tlen = 0; _fxv_tnum = 0; _fxv_tcol = -1; _fxv_cseen = -1;
+    0;
+  ) : (s1 == _fxv_cseen || (s1 % 2) == 1) ? (
     0;
   ) : (
     n = max(0, min(FXP_CHAIN_MAX, gmem[b + FXP_CH_N]));
@@ -750,18 +832,34 @@ function swing_fxview_chain_snap()
     src = b + FXP_CHAIN;
     i = 0;
     loop(n * FXP_CREC, _fxv_chain[i] = gmem[src + i]; i += 1;);
+    // PL H14: each entry's card hash, parked in its card word until the
+    // resolve below -- read INSIDE the seqlock like the rest of the chain.
+    i = 0;
+    loop(n, (_fxv_chain + i * FXP_CREC)[FXP_C_CARD] = gmem[src + FXP_CHAIN_MAX * FXP_CREC + i]; i += 1;);
     s2 = gmem[b + FXP_CH_SEQ];
     s2 == s1 ? (
       i = 0;
       loop(n,
         p = _fxv_chain + i * FXP_CREC;
+        // PL H14: the card deck is keyed on the name's first FORTY characters,
+        // and an entry carries twenty -- so "Apex_ReaKit - Flagsh..." and 176
+        // others never found their card here while the list showed it. The
+        // bridge publishes each entry's hash of the 40-character name in the
+        // words after the chain records (one per entry, 4064..4095); 0 there is
+        // an older bridge, which keeps the 20-character hash it always had.
+        h = p[FXP_C_CARD] | 0;
         p[FXP_C_CARD] = p[FXP_C_LEN] > 0 ?
-          swing_fxcard_lookup(
+          swing_fxcard_lookup(h > 0 ? h :
             swing_fxcard_hash(p + FXP_C_NAME, min(20, p[FXP_C_LEN]))) : -1;
         i += 1;
       );
       _fxv_cseen = s1; _fxv_cn = n; 1;
-    ) : 0;
+    ) : (
+      // Torn: the card words hold HASHES now, never card indices -- no card
+      // until the next whole publish (the copy above already tore this frame).
+      i = 0; loop(n, (_fxv_chain + i * FXP_CREC)[FXP_C_CARD] = -1; i += 1;);
+      0;
+    );
   );
 );
 
@@ -870,24 +968,6 @@ function swing_fxview_tnum_btn(bx, by) local(_hov) (
   _hov;
 );
 
-// ── The 22 category glyphs ──────────────────────────────────────────────────
-// One mark per bucket, in M.BUCKETS order -- the same order the colours above
-// use and the same the bridge sends indices from.
-//
-// ⭐ EACH ONE IS A TRANSFER CURVE, A SHAPE, OR A DEVICE -- never a letter.
-// Letters at this size are unreadable and they would also be wrong: the rail is
-// already showing the category's NAME beside the glyph, so a glyph that spells
-// the name again says nothing the row did not already say. What earns the space
-// is the thing a category DOES: what it makes the signal look like.
-//
-// ⚠️ THE BUDGET IS ~12 px. The spec is explicit that every one must survive at
-// small size "with no text beside it", so they are built from 2-5 strokes and
-// nothing has interior detail. Everything derives from s, so the same recipe
-// draws in a 17 px rail seat and would draw at 40 px unchanged.
-//
-// ⚠️ Colour is the CALLER's -- gfx_set before calling. These only draw shape,
-// so one glyph can be a rail icon, a row pip and a card mark without three
-// copies deciding their own colour.
 // A header toggle, sized to its OWN label.
 // ⚠️⚠️ THE THREE OF THESE CARRIED HARDCODED WIDTHS -- 26, 40, 42 -- guessed
 // against a 10 px font. The ladder went to 12 and the guesses did not, so the
@@ -1230,18 +1310,33 @@ function swing_fxview_ghost(gx0, gy0, gw0, gh0)
 
 // One grid tile: the card, then its name under it.
 function swing_fxview_tile(tx, ty, tw, th, rec, hot)
-  local(p, len, i, cw, ch)
+  local(p, len, i, cw, ch, k)
 (
   p = _fxv_rows + rec * FXP_REC;
   len = min(40, p[FXP_R_LEN] | 0);
   len > 0 ? (
     ch = th - 15;                              // 15 px reserved for the name
+    k = p[FXP_R_KIND] | 0;
+    // PL H5: the chain REPLACE WHOLE CHAIN would apply wears REPLACE's own red,
+    // so the tile marked and the chain replaced can never be two different ones.
+    _fxv_mode == 2 && k == FXK_CHAIN && (p[FXP_R_RIDX] | 0) == _fxv_chsel ? (
+      gfx_set(0.86, 0.35, 0.31, 0.95);
+      gfx_rect(tx - 4, ty - 4, tw + 8, ch + 8);
+    );
     hot ? (
       gfx_set(0.35, 0.55, 0.75, 0.85);
       gfx_rect(tx - 2, ty - 2, tw + 4, ch + 4);
-      lmb_down ? swing_fxview_pick(rec);
+      // A CLICK ALSO SELECTS, exactly as the row does (PL H5): the gold frame
+      // stayed on the last arrowed tile while the click chose another.
+      lmb_down ? ( _fxv_sel = _fxv_off + rec; swing_fxview_pick(rec); );
     );
-    p[FXP_R_CARD] >= 0 ?
+    k == FXK_CHAIN || k == FXK_FOLDER ? (
+      // A chain file or a folder has no card: a plain seat with the row's own
+      // art on it, never the blank card every plugin without art wears.
+      gfx_set(lcd_bg_r * 0.45, lcd_bg_g * 0.45, lcd_bg_b * 0.45, 1);
+      gfx_rect(tx, ty, tw, ch);
+      swing_fxview_kind_art(tx + ((tw - 40) / 2) | 0, ty + ((ch - 23) / 2) | 0, p);
+    ) : p[FXP_R_CARD] >= 0 ?
       swing_fxcard_draw(tx, ty, tw, ch, p[FXP_R_CARD]) :
       swing_fxview_blank_card(tx, ty, tw, ch,
                               swing_fxview_bucket_hex(p[FXP_R_BUCKET] | 0),
@@ -1408,7 +1503,8 @@ function swing_fxview_lcd()
     rk_font(1, swing_fs(10), 0);
     gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 0.45);
     gfx_x = _lcd_cx + 2; gfx_y = cy + 8;
-    gfx_drawstr(_fxv_cn > 0 ? "…" : "chain empty  —  BROWSE to add");
+    gfx_drawstr(_reg_my_slot < 0 ? "registry full  —  no FX slot for this Swing"   // PL H13
+              : _fxv_cn > 0 ? "…" : "chain empty  —  BROWSE to add");
   );
   i = 0;
   loop(n,
@@ -1455,9 +1551,9 @@ function swing_fxview_lcd()
         // near the top of @gfx and this page draws near the BOTTOM: on the
         // release frame the id was already -1 before the continuation below
         // could read it, so neither the float nor the reorder ever fired.
-        // ⚠️ 307, not 296 -- 296 is the pad overlay's layer-gain slider. Two
-        // owners for one id meant the overlay's drag could paint this page's
-        // drop marker.
+        // ⚠️ 307, not 296 -- 296 was the pad overlay's layer-gain slider (a
+        // knob with its own memory since 2026-10-27). Two owners for one id
+        // meant the overlay's drag could paint this page's drop marker.
         active_id = 307; _fxl_live = 1;
         _fxl_from = i; _fxl_x0 = mx; _fxl_on = 0;
       ) : swing_bigview_open(VIEW_FXPICK);
@@ -1577,7 +1673,8 @@ function swing_fxview_rack(rx, ry, rw, rh)
     rk_font(1, swing_fs(12), 0);
     gfx_set(lcd_bar_tx_r, lcd_bar_tx_g, lcd_bar_tx_b, 0.45);
     gfx_x = rx + 8; gfx_y = y0 + 10;
-    gfx_drawstr("chain empty  —  BROWSE to add one");
+    gfx_drawstr(_reg_my_slot < 0 ? "registry full  —  no FX slot for this Swing"   // PL H13
+                                 : "chain empty  —  BROWSE to add one");
   );
 
   i = 0;
@@ -1695,7 +1792,7 @@ function swing_fxview_rack(rx, ry, rw, rh)
 );
 
 function swing_fxview_draw()
-  local(tw, th, hov, out, ri, rows_vis, gx, gw, cw, ch, cols, grows, hv,
+  local(tw, th, hov, out, esc, ri, rows_vis, gx, gw, cw, ch, cols, grows, hv,
         wsz, woff, need, src)
 (
   // The overlay input snapshot, same contract as every other big view: the
@@ -1703,6 +1800,7 @@ function swing_fxview_draw()
   // grid underneath cannot see any of it.
   lmb_down = _ov_lmb_down; rmb_down = _ov_rmb_down;
   LMB = _ov_LMB; RMB = _ov_RMB; frame_wheel = _ov_wheel;
+  esc = 0;
 
   swing_fxview_layout();
 
@@ -1844,6 +1942,12 @@ function swing_fxview_draw()
     ) : (
       gfx_set(0.40, 0.45, 0.50, 0.8);
       gfx_x = fxv_up_x; gfx_y = fxv_up_y; gfx_drawstr("FXChains /");
+    );
+    // PL H2: a folder the path cannot hold says so, after the breadcrumb.
+    _fxv_chdeep > 0 ? (
+      gfx_set(0.85, 0.65, 0.35, 1);
+      gfx_drawstr("   path too long to open (40 characters)");
+      _fxv_chdeep -= 1;
     );
 
     // PILLS, and every width comes from gfx_measurestr rather than from a
@@ -2235,16 +2339,21 @@ function swing_fxview_draw()
     ) : gfx_drawstr(_fxv_cn > 0 ? "TRACK" : "no track");
     gfx_set(0.20, 0.24, 0.30, 1);
     gfx_rect(fxv_chain_x + 6, fxv_body_y + 22, fxv_chain_w - 12, 1);
+    // ⚠️ PL H8: the slots that FIT stop above SWAP and INSERT AFTER. The fit
+    // held back 30 px while the two buttons take the bottom 52 (+ the "+N more"
+    // line), so a long chain's last slot or the + seat sat ON SWAP and a SWAP
+    // click floated that slot instead. One fit, read by all three users.
+    _fxv_cfit = max(0, ((fxv_body_h - swing_px(106)) / FXV_SLOT_H) | 0);
     _fxv_cn > 0 ? (
       ri = 0;
-      loop(min(_fxv_cn, ((fxv_body_h - swing_px(30)) / FXV_SLOT_H) | 0),
+      loop(min(_fxv_cn, _fxv_cfit),
         swing_fxview_slot(fxv_chain_x + 6, fxv_body_y + 28 + ri * FXV_SLOT_H,
                           fxv_chain_w - 12, ri);
         ri += 1;
       );
       // "+N more" rather than silently truncating -- a chain that is longer
       // than the column must SAY so.
-      grows = ((fxv_body_h - swing_px(30)) / FXV_SLOT_H) | 0;
+      grows = _fxv_cfit;
       _fxv_cn > grows ? (
         rk_font(1, swing_fs(12), 0);
         gfx_set(0.45, 0.50, 0.58, 1);
@@ -2256,7 +2365,7 @@ function swing_fxview_draw()
       rk_font(1, swing_fs(12), 0);
       gfx_set(0.32, 0.36, 0.42, 1);
       gfx_x = fxv_chain_x + 8; gfx_y = fxv_body_y + 34;
-      gfx_drawstr("chain empty");
+      gfx_drawstr(_reg_my_slot < 0 ? "registry full" : "chain empty");   // PL H13
     );
 
     // ── the + slot at the END of the chain ──────────────────────────────
@@ -2274,7 +2383,7 @@ function swing_fxview_draw()
     // plugin outright -- FXA_INSERT with slot -1, which is append by the
     // action's own definition. With nothing selected it still clears the
     // focus, and now the box lighting up is the confirmation that it did.
-    grows = ((fxv_body_h - swing_px(30)) / FXV_SLOT_H) | 0;
+    grows = _fxv_cfit;
     _fxv_cn < grows ? (
       ri = fxv_body_y + 28 + _fxv_cn * FXV_SLOT_H;
       hv = mx >= fxv_chain_x + 6 && mx <= fxv_chain_x + fxv_chain_w - 6 &&
@@ -2315,32 +2424,33 @@ function swing_fxview_draw()
     // vanishes teaches nothing about why.
     hv = _fxv_sel >= 0 && _fxv_sel >= _fxv_off &&
          _fxv_sel < _fxv_off + _fxv_n;
-    ri = fxv_body_y + fxv_body_h - 52;
+    // Design pixels, like the fit above: the label's font scales (PL H8).
+    ri = fxv_body_y + fxv_body_h - swing_px(52);
     rk_font(1, swing_fs(12), 'b');
     grows = mx >= fxv_chain_x + 6 && mx <= fxv_chain_x + fxv_chain_w - 6 &&
-            my >= ri && my < ri + 22;
+            my >= ri && my < ri + swing_px(22);
     gfx_set(0.30, 0.52, 0.68, hv ? (grows ? 1 : 0.8) : 0.18);
-    gfx_rect(fxv_chain_x + 6, ri, fxv_chain_w - 12, 22);
+    gfx_rect(fxv_chain_x + 6, ri, fxv_chain_w - 12, swing_px(22));
     gfx_set(0.92, 0.96, 1, hv ? 1 : 0.35);
     strcpy(#fxv_s, _fxv_csel >= 0 ? "SWAP SLOT " : "SWAP");
     _fxv_csel >= 0 ? sprintf(#fxv_s, "SWAP SLOT %d", _fxv_csel + 1);
     gfx_measurestr(#fxv_s, tw, th);
-    gfx_x = fxv_chain_x + ((fxv_chain_w - tw) / 2) | 0; gfx_y = ri + 5;
+    gfx_x = fxv_chain_x + ((fxv_chain_w - tw) / 2) | 0; gfx_y = ri + swing_px(5);
     gfx_drawstr(#fxv_s);
     hv && grows && lmb_down && _fxv_csel >= 0 ? (
       swing_fxview_act(FXA_SWAP, _fxv_csel,
         (_fxv_rows + (_fxv_sel - _fxv_off) * FXP_REC)[FXP_R_RIDX] | 0);
     );
 
-    ri += 26;
+    ri += swing_px(26);
     grows = mx >= fxv_chain_x + 6 && mx <= fxv_chain_x + fxv_chain_w - 6 &&
-            my >= ri && my < ri + 22;
+            my >= ri && my < ri + swing_px(22);
     gfx_set(0.22, 0.30, 0.38, hv ? (grows ? 1 : 0.8) : 0.18);
-    gfx_rect(fxv_chain_x + 6, ri, fxv_chain_w - 12, 22);
+    gfx_rect(fxv_chain_x + 6, ri, fxv_chain_w - 12, swing_px(22));
     gfx_set(0.86, 0.90, 0.96, hv ? 1 : 0.35);
     strcpy(#fxv_s, "INSERT AFTER");
     gfx_measurestr(#fxv_s, tw, th);
-    gfx_x = fxv_chain_x + ((fxv_chain_w - tw) / 2) | 0; gfx_y = ri + 5;
+    gfx_x = fxv_chain_x + ((fxv_chain_w - tw) / 2) | 0; gfx_y = ri + swing_px(5);
     gfx_drawstr(#fxv_s);
     hv && grows && lmb_down ? (
       swing_fxview_act(FXA_INSERT, _fxv_csel,
@@ -2433,12 +2543,26 @@ function swing_fxview_draw()
   );
   // Auto-scroll to keep the selection visible. Done AFTER the wheel clamp so
   // a keyboard move always wins over where the wheel happened to leave things.
-  _fxv_sel >= 0 ? (
-    _fxv_sel = min(_fxv_sel, max(0, _fxv_total - 1));
+  // ⚠️ PL H9: ONLY on a frame after the keys MOVED the selection. A click
+  // selects too (the row and the tile), and run every frame this pulled the
+  // wheel back to the clicked row: past one click the list would not scroll.
+  _fxv_sel >= 0 ? _fxv_sel = min(_fxv_sel, max(0, _fxv_total - 1));
+  _fxv_sel >= 0 && _fxv_selmv ? (
     _fxv_sel < _fxv_scroll ? _fxv_scroll = _fxv_sel;
-    _fxv_sel >= _fxv_scroll + rows_vis ? _fxv_scroll = _fxv_sel - rows_vis + 1;
+    // PL H10: in the grid the first row that SHOWS the selection's row -- the
+    // row-snap below rounds down, and sel - rows_vis + 1 rounded down left an
+    // arrowed-to tile on the row under the view.
+    _fxv_sel >= _fxv_scroll + rows_vis ? _fxv_scroll = _fxv_mode
+      ? (((_fxv_sel / cols) | 0) - grows + 1) * cols
+      : _fxv_sel - rows_vis + 1;
   );
-  _fxv_scroll = max(0, min(_fxv_scroll, max(0, _fxv_total - rows_vis)));
+  _fxv_selmv = 0;
+  // PL H10: the grid's last scroll is the last whole ROW, rounded UP -- clamped
+  // to total - rows_vis and then snapped down, a last part row (total % 4 != 0)
+  // could never be reached.
+  _fxv_scroll = max(0, min(_fxv_scroll, _fxv_mode
+    ? (((max(0, _fxv_total - rows_vis) + cols - 1) / cols) | 0) * cols
+    : max(0, _fxv_total - rows_vis)));
   _fxv_mode ? _fxv_scroll = ((_fxv_scroll / cols) | 0) * cols;
 
   // Fetch a window twice the view, centred on it, so ordinary wheeling stays
@@ -2469,13 +2593,15 @@ function swing_fxview_draw()
         hv == 'up' || (hv == 9 && (mouse_cap & 8)) ? (
           _fxv_sel = _fxv_sel < 0 ? _fxv_scroll
                    : max(0, _fxv_sel - (_fxv_mode ? cols : 1));
+          _fxv_selmv = 1;
         ) : hv == 'down' || (hv == 9 && !(mouse_cap & 8)) ? (
           _fxv_sel = _fxv_sel < 0 ? _fxv_scroll
                    : min(_fxv_total - 1, _fxv_sel + (_fxv_mode ? cols : 1));
+          _fxv_selmv = 1;
         ) : _fxv_mode && !_fxv_qfoc && !_fxv_bqfoc && hv == 'left' ? (
-          _fxv_sel = max(0, (_fxv_sel < 0 ? _fxv_scroll : _fxv_sel) - 1);
+          _fxv_sel = max(0, (_fxv_sel < 0 ? _fxv_scroll : _fxv_sel) - 1); _fxv_selmv = 1;
         ) : _fxv_mode && !_fxv_qfoc && !_fxv_bqfoc && hv == 'rght' ? (
-          _fxv_sel = min(_fxv_total - 1, (_fxv_sel < 0 ? _fxv_scroll : _fxv_sel) + 1);
+          _fxv_sel = min(_fxv_total - 1, (_fxv_sel < 0 ? _fxv_scroll : _fxv_sel) + 1); _fxv_selmv = 1;
         ) : hv == 13 ? (
           // Enter acts on the SELECTED row, same verb a click would use.
           // Same one place a click goes, so Enter cannot mean something
@@ -2512,9 +2638,9 @@ function swing_fxview_draw()
         ) :
         _fxv_qfoc && hv == 27 ? (
           // ESC clears the query; a second ESC closes the view.
-          _fxv_qn > 0 ? swing_fxview_q_clear() : ( _fxv_qfoc = 0; out = 1; );
+          _fxv_qn > 0 ? swing_fxview_q_clear() : ( _fxv_qfoc = 0; esc = 1; );
         ) : !_fxv_qfoc && hv == 27 ? (
-          out = 1;
+          esc = 1;
         ) : _fxv_qfoc && hv == 8 ? (
           _fxv_qc > 0 ? ( swing_fxview_q_del(_fxv_qc - 1); _fxv_qc -= 1; );
         ) : _fxv_qfoc && hv == 'del' ? (
@@ -2558,15 +2684,9 @@ function swing_fxview_draw()
   // fresh heartbeat is measured against the previous one's timestamp.
   _fxv_hb != _fxv_hb_last ? ( _fxv_hb_last = _fxv_hb; _fxv_hb_t = time_precise(); );
   _fxv_live = _fxv_hb > 0 && (time_precise() - _fxv_hb_t) < 2.5;
-
-  // Offline -> online edge: ask again. The bridge is EDGE-TRIGGERED on REQ_SEQ
-  // and will never volunteer a page, so without this the view waits forever on
-  // a request that was answered before the restart. This is what makes "restart
-  // the bridge and the list returns" true rather than merely true-looking --
-  // the old rows are still in _fxv_rows, so a stale panel is indistinguishable
-  // from a working one until something actually changes.
-  _fxv_live && !_fxv_live_last ? _fxv_asked = 0;
-  _fxv_live_last = _fxv_live;
+  // A restarted bridge answers the standing request by itself: it is edge-
+  // triggered on REQ_SEQ against its own last-answered seq, which starts empty,
+  // so the nonzero REQ_SEQ this view left in its slot reads as new.
 
   // C-5: the snapshot above is slot 0's page while this instance has no slot; the
   // list is not drawn from it and the empty state names the cause.
@@ -2684,8 +2804,11 @@ function swing_fxview_draw()
   // strip of header. So the X is the gesture, and Escape is added at S7 with
   // the rest of the keyboard. A drag released outside must NOT close — hence
   // the active_id guard, matching swing_panels_draw_fx_big.
+  // ⚠️ PL H11: ESC has its OWN flag. The key loop set `out`, and the line
+  // below overwrote it with the header test before anything read it -- and
+  // the close needed a click besides -- so ESC never closed the picker.
   out = my < 28;
-  lmb_down && (hov || (out && active_id == -1)) ? (
+  esc || (lmb_down && (hov || (out && active_id == -1))) ? (
     swing_bigview_close();
     active_id = -1;
   );

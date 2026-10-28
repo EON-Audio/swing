@@ -29,6 +29,10 @@ S.prompt(function(opts)
   -- them unconditionally here would quietly ignore whatever the user ticked.
   if opts.midi_items  == nil then opts.midi_items  = true end
   if opts.build_lanes == nil then opts.build_lanes = true end
+  -- The same rule for the other two "Also build" boxes (the dialog defaults all four to true): the fallback
+  -- built lanes only, with no per-pad audio tracks and no StepSeq, while the header promises both.
+  if opts.multi_out   == nil then opts.multi_out   = true end
+  if opts.step_seq    == nil then opts.step_seq    = true end
   opts.target = T
   S.build(opts)
   -- The song exists now, so the dock view has something to build around.

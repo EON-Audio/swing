@@ -31,8 +31,9 @@
 //   came while we were copying the chunk was copied twice and put the window sequence one step off.
 //   FAILED / ABORT on a job that never began leaves every pad exactly as it was and acks the
 //   CMD; an ABORT mid-job drops the half-landed job (zero length, path kept).
-//   +15 JSFX_LEVEL: this build writes 204 every block. +16 BRIDGE_LEVEL: the bridge writes
-//   its level every tick and 0 at exit; the CMD 63/64/69 file paths in Swing_ReaKit.jsfx and
+//   +15 JSFX_LEVEL: this build writes 205 every block (EON_PADPCM_LEVEL; 204 = one window).
+//   +16 BRIDGE_LEVEL: the bridge writes its level every tick and 0 at exit; the CMD 63/64/69
+//   file paths in Swing_ReaKit.jsfx and
 //   rk_swing_browser_load run only while this reads < 204 (version skew: a ReaPack sync
 //   leaves the OLD bridge running until REAPER restarts).
 //
@@ -157,6 +158,7 @@ _pp_prv_sr = 0;      // its source rate
 _pp_prv_total = 0;   // its TOTAL (one pass of the file, cells)
 _pp_whead = 0;       // the ring index just past the last cell written (the next job's base goes 4 096 cells past it)
 _pp_acked = 0;       // this job acked its CMD at FIRST (a ring preview): finish / fail must not touch the bus again
+_pp_room_refused = 0; // begin refused this drop for ROOM ("instrument full" is armed): fail() must not add "couldn't read that file" over it
 // Bridge presence + capability for the load gates (2026-09-10, plan Phase B). Decided once
 // per block in swing_padpcm_tick and read by rk_swing_browser_load (CMD 63/64) and the
 // CMD-69 dispatch: 0 = no bridge, 1 = a bridge older than this JSFX, 2 = current. A global
@@ -253,7 +255,7 @@ function swing_padpcm_begin(job)
 local(_stg)
 (
   _pp_defer = 0;
-  _pp_dst = -1; _pp_cap = 0; _pp_cmd = 0; _pp_peak = 0; _pp_base = 0; _pp_acked = 0;
+  _pp_dst = -1; _pp_cap = 0; _pp_cmd = 0; _pp_peak = 0; _pp_base = 0; _pp_acked = 0; _pp_room_refused = 0;
   _pp_kind == PP_KIND_PREVIEW ? (
     _pp_job = job;
     // The mini browser's audition buffer: no pad, no undo, no kit state (that is the whole
@@ -347,7 +349,7 @@ local(_stg)
           // Room after packing (the check filed the request): decline exactly as kit_busy does
           // -- no job latched, the FIRST chunk left unlatched, the bridge waits on it and the
           // compaction tick runs meanwhile. No room at all: refuse.
-          alc_wait ? ( _pp_job = -1; _pp_defer = 1; ) : ( swing_alloc_refuse_note(_pp_pad); );
+          alc_wait ? ( _pp_job = -1; _pp_defer = 1; ) : ( swing_alloc_refuse_note(_pp_pad); _pp_room_refused = 1; );
         ) : (
         swing_padpcm_read_path();
         // Kill the pad's voices + 10 ms crossfade -- the start half of
@@ -435,7 +437,9 @@ local(_cmd)
       swing_ldr_abort(ldr_job0);
       _bl_job_pending = 0;
     ) : (
-      swing_padpcm_fail_notice();   // the old sample stays; say why for 4 s
+      // the old sample stays; say why for 4 s -- unless begin refused it for ROOM: the LCD's "couldn't read that
+      // file" rung sits above "instrument full", so this notice hid the true one for 4 s (LIB333)
+      !_pp_room_refused ? swing_padpcm_fail_notice();
     );
     _pp_kind == PP_KIND_DROP ? gmem[GS_BROWSE_NAME_ADOPT] = 0;
   );
@@ -514,8 +518,12 @@ local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim, _prv_cmd_now, _ri, _wse
   _prv_job_aud = gmem[EON_PADPCM_HDR + PP_AUD_ID] | 0;
   _prv_cmd_now && !_prv_cmd_seen && ((gmem[EON_PADPCM_HDR + PP_AUD_ISSUED] | 0) == 0 || _prv_job_aud > _prv_cancel_through) ? _prv_stopped = 0;
   _prv_cmd_seen = _prv_cmd_now;
+  // ...and only a CMD addressed to THIS instance (KIT_GMEM_INSTANCE): with two Swings, an idle A cleared B's CMD 63
+  // three seconds after it was posted while B was legitimately deferring behind its kit import or still loading;
+  // B's completion half then cleared whatever the producer had posted next, and that load was lost (LIB39). A CMD
+  // whose instance is gone is the bridge's own abort deadline's.
   (_c == 69 || _c == 63 || _c == 64) && _pp_job < 0 && _pp_gen_cur == 0 && !_pp_deferring &&
-  _bridge_state == 2 ? (
+  _bridge_state == 2 && (gmem[KIT_GMEM_INSTANCE] | 0) == (instance_id | 0) ? (
     _pp_idle_t == 0 ? _pp_idle_t = time_precise() :
     (time_precise() - _pp_idle_t > 3 ? ( gmem[KIT_GMEM_CMD] = 0; _pp_idle_t = 0; ));
   ) : ( _pp_idle_t = 0; );
@@ -542,6 +550,12 @@ local(_gen, _job, _n, _i, _src, _room, _v, _c, _w, _lim, _prv_cmd_now, _ri, _wse
       _pp_len = gmem[EON_PADPCM_HDR + (_wsel ? PP_LEN_B : PP_LEN)] | 0;
       _pp_total = gmem[EON_PADPCM_HDR + PP_TOTAL] | 0;
       _pp_fresh = _job != _pp_job;
+      // A new job's chunk: the early-ack flag is the LAST job's (a ring preview sets it at FIRST, and only begin
+      // clears it). A FIRST|FAILED chunk takes the fail branch below without begin, so with the flag inherited
+      // fail() left CMD 63 on the bus; the bridge finished the job, the next tick re-consumed the same CMD and
+      // failed it again every block, ~3 s until the bridge-dead guard cleared it -- the browser queue stalled
+      // (LIB38). A republished FIRST of the SAME preview job keeps it, as begin does.
+      _pp_fresh ? _pp_acked = 0;
       // ⚠️ A chunk that could not have come from rk_padpcm.lua is refused as a FAILED
       // one. The copy below guards the TOP of the destination (_room) and nothing
       // else: a negative OFF wrote below _pp_dst into whatever lives there, and a LEN

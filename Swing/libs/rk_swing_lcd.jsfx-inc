@@ -7,7 +7,6 @@
 
 LCD_BAR_H = 130;
 LCD_TAB_H = 22;
-LCD_CONTENT_H = 108;
 
 // ─── LCD bar colors ──────────────────────────────────────────────────────
 lcd_bar_bg_r = 0.05; lcd_bar_bg_g = 0.10; lcd_bar_bg_b = 0.14;
@@ -76,11 +75,19 @@ function swing_lcd_padcat_post_ex(pad, catid, srchint) (
   gmem[EON_PADCAT_REQ + 2] = gmem[INST_IDENT_BASE + _reg_my_slot*INST_IDENT_INST_STRIDE + swing_pad_tile(pad)*INST_IDENT_PAD_FIELDS + 4]|0;
   gmem[EON_PADCAT_REQ + 3] = catid;
   gmem[EON_PADCAT_REQ + 4] = srchint;
-  swing_padcat_reqseq += 1; gmem[EON_PADCAT_REQ] = swing_padcat_reqseq;   // seq LAST
+  // seq LAST -- the CELL is bumped, not a per-instance count: the mailbox is one cell for every Swing
+  // and Steppa, and the bridge drops a post whose seq equals the last it saw, so a second instance's
+  // first post (its count 1 over a cell already at 1) was lost (sweep LIB18; the kitcover PEND_SEQ idiom).
+  gmem[EON_PADCAT_REQ] = (gmem[EON_PADCAT_REQ] | 0) + 1;
   // Optimistic display until the bridge republishes (wheel feels instant).
   // NOT for -2: that's the lock toggle, not a category — the band never echoes
   // -2 back, so latching it would leave eff() reporting -2 for this pad forever.
-  catid != -2 ? ( swing_catpick_optpad = pad; swing_catpick_opt = catid; );
+  // NOT for -1 (Auto) either: the bridge answers Auto with the INFERRED id, never
+  // -1, so a latched -1 stayed until some other pad was posted and eff() said
+  // "uncategorised" over a kick the bridge had just published (sweep LIB19). Auto
+  // drops this pad's latch instead: the published value shows until the answer.
+  catid == -1 ? ( swing_catpick_optpad == pad ? swing_catpick_optpad = -1; )
+  : catid != -2 ? ( swing_catpick_optpad = pad; swing_catpick_opt = catid; );
 );
 function swing_lcd_padcat_post(pad, catid) (
   swing_lcd_padcat_post_ex(pad, catid, -1);
@@ -100,12 +107,23 @@ function swing_lcd_padcat_eff(pad) local(c) (
 );
 // wheel-cycle: a 47-position ring — the 46 categories plus NONE, so the wheel
 // can take a pad back to no category at all (position 0 = none, 1..46 = cat
-// 0..45). steps = frame_wheel|0.
+// 0..45). steps = the raw frame_wheel: one position per frame in its direction
+// (sign_of), as every other wheel site. The old frame_wheel|0 truncated a
+// sub-notch delta (a precision touchpad: |frame_wheel| < 1) to 0 and STILL
+// posted -- NONE onto a never-categorised pad, the same id again every frame
+// on a categorised one (sweep LIB111). A zero delta posts nothing.
 function swing_lcd_padcat_wheel(pad, steps) local(c) (
-  c = swing_lcd_padcat_eff(pad);
-  c = c < 0 ? 0 : c + 1;
-  c = ((c - steps) % 47 + 47) % 47;
-  swing_lcd_padcat_post(pad, c == 0 ? PADCAT_NONE : c - 1);
+  steps = sign_of(steps);
+  steps != 0 ? (
+    c = swing_lcd_padcat_eff(pad);
+    c = c < 0 ? 0 : c + 1;
+    // EEL2's % drops the sign (wiki 1.10): (-1) % 47 is 1, so the old
+    // ((c - steps) % 47 + 47) % 47 bounced from NONE to category 0 instead of
+    // wrapping to 45 (sweep LIB110). floor() wraps both ways.
+    c -= steps;
+    c = c - floor(c / 47) * 47;
+    swing_lcd_padcat_post(pad, c == 0 ? PADCAT_NONE : c - 1);
+  );
 );
 // A sample dropped STRAIGHT onto a pad (Explorer, Media Explorer, arrange) never
 // touches the browser, so nothing classified it and the pad kept the PREVIOUS
@@ -166,8 +184,8 @@ function swing_lcd_catmenu_open(px, py, pad) local(i) (
   swing_popup_open(px, py, #swing_catmenu, SP_POPUP_CALLER_PAD_CATEGORY);
 );
 
-// Mode/algo picker (Repitch / Tuned / Stretch), wrapped so the RANGE-pill
-// right-click and the manual-capture mailbox open the SAME menu from ONE
+// Mode/algo picker (Repitch / Tuned / Stretch), wrapped so the MODE stepper's
+// right-click and the manual-capture mailbox (EON_POPUP_REQ kind 4) open the SAME menu from ONE
 // string. Labels are display-only — selection is by 1-based index including
 // the disabled "#Mode" header — so the hint text cannot break routing.
 function swing_lcd_modemenu_open(px, py) (
@@ -188,34 +206,84 @@ swing_catpick_optpad = -1; swing_catpick_opt = -2;   // no optimistic value yet
 function swing_lcd_rootnote_base(pad) (
   EON_ROOTNOTE_BASE + _reg_my_slot * EON_ROOTNOTE_STRIDE + swing_pad_tile(pad) * EON_ROOTNOTE_FIELDS;   // bank-relative band (step 4a)
 );
-function swing_lcd_rootnote_published(pad) (
-  _reg_my_slot >= 0 && gmem[swing_lcd_rootnote_base(pad) + RN_OFF_VER] > 0;
+// The band is the bank on screen's, sixteen tiles, and a bank switch only ASKS for them anew (request -1,
+// Swing_ReaKit @block): until the bridge reaches a tile its record still holds the last bank's note, which
+// the PITCH pill showed for the new bank's sample -- for good when the request was lost (sweep LIB112).
+// So a request snapshots the VER of every tile it names, and a record whose VER has not moved since
+// counts as unpublished. The bridge bumps VER on every publish, a clear included (rk_root_note.lua).
+// NUM_PADS cells, the host's (swing_lcd_rn_init from Swing_ReaKit @init); written by the request's
+// thread (@block), read by @gfx: whole small integers.
+function swing_lcd_rn_init(mem) (
+  swing_lcd_rn_ver_snap = mem;
+  memset(swing_lcd_rn_ver_snap, 0, NUM_PADS);
+  mem + NUM_PADS;
+);
+function swing_lcd_rootnote_published(pad) local(_b) (
+  _b = swing_lcd_rootnote_base(pad);
+  _reg_my_slot >= 0 && gmem[_b + RN_OFF_VER] > 0
+    && gmem[_b + RN_OFF_VER] != swing_lcd_rn_ver_snap[swing_pad_tile(pad)];
 );
 // MIDI note, or -1 when nothing is published / the pad has no root note.
 function swing_lcd_rootnote_note(pad) (
   swing_lcd_rootnote_published(pad) ? gmem[swing_lcd_rootnote_base(pad) + RN_OFF_NOTE] | 0 : -1;
 );
-function swing_lcd_rootnote_cents(pad) (
-  swing_lcd_rootnote_published(pad) ? gmem[swing_lcd_rootnote_base(pad) + RN_OFF_CENTS] : 0;
-);
 // Ask the bridge to (re)analyse this instance: one pad, or -1 for all of them.
 // Pad Banks step 5a: the band (and so the request) is sixteen pads, the bank on screen's. A slot in that bank
 // is sent as its tile; a slot in another bank is not sent at all -- it is analysed when its bank is shown (the
 // bank edge asks for all). Sent absolute (4a's loaders), pad 19 named a row past this instance's band.
-function swing_lcd_rootnote_request(pad) local(_t) (
+// One tile's path into the request's path band (ROOTNOTE_REQ_PATHS): the pad's own source path, which every
+// load sets (swing_ldr_reset_target; a layer-0 load copies its layer path in) -- or, for a layered pad whose
+// main path is empty, its layer 0's. > 258 bytes cannot be staged (the GS_REB convention): len 0 = no path.
+function swing_lcd_rootnote_put_path(tile, ap) local(_sp, _n, _b, _i) (
+  _sp = get_path_slot(ap);
+  strlen(_sp) == 0 && p_layer_cnt[ap] > 0 ? _sp = LPATH_STR_BASE + ap * MAX_LAYERS;
+  _n = strlen(_sp);
+  _n > 258 ? _n = 0;
+  _b = ROOTNOTE_REQ_PATHS + tile * 260;
+  _i = 0;
+  loop(_n, gmem[_b + 1 + _i] = str_getchar(_sp, _i); _i += 1; );
+  gmem[_b + 1 + _n] = 0;
+  gmem[_b] = _n;
+);
+// A2 (2026-10-26): the request carries its paths when the running bridge reads them (level 320): PSEQ = -1,
+// the paths, PSEQ = this request's seq, then the seq LAST. The seq is unique per instance (count * 32 +
+// slot + 1), so two instances' requests never carry the same seq: the bridge's "new seq?" edge and its
+// PSEQ match cannot mistake one instance's request for another's.
+function swing_lcd_rootnote_request(pad) local(_t, _sq, _i) (
   _t = pad < 0 ? -1 : (swing_pad_bank(pad) == bank_cur ? swing_pad_tile(pad) : -2);
   _reg_my_slot >= 0 && _t > -2 ? (
+    // the tiles asked for show nothing until the bridge has answered (see swing_lcd_rootnote_published)
+    _t < 0 ? (
+      _i = 0;
+      loop(NUM_PADS, swing_lcd_rn_ver_snap[_i] = gmem[swing_lcd_rootnote_base(swing_bp(_i)) + RN_OFF_VER]; _i += 1; );
+    ) : (
+      swing_lcd_rn_ver_snap[_t] = gmem[swing_lcd_rootnote_base(pad) + RN_OFF_VER];
+    );
+    swing_lcd_rootnote_reqseq += 1;
+    _sq = swing_lcd_rootnote_reqseq * 32 + _reg_my_slot + 1;
+    gmem[GS_BRIDGE_LEVEL] >= BRIDGE_LEVEL_RN_PATHS ? (
+      gmem[ROOTNOTE_REQ_PSEQ] = -1;   // paths in flight
+      _t < 0 ? (
+        _i = 0;
+        loop(NUM_PADS, swing_lcd_rootnote_put_path(_i, swing_bp(_i)); _i += 1; );
+      ) : swing_lcd_rootnote_put_path(_t, pad);
+      gmem[ROOTNOTE_REQ_PSEQ] = _sq;  // the paths are whole, and belong to _sq
+    );
     gmem[EON_ROOTNOTE_REQ + 1] = _reg_my_slot;
     gmem[EON_ROOTNOTE_REQ + 2] = _t;
-    swing_lcd_rootnote_reqseq += 1;
-    gmem[EON_ROOTNOTE_REQ]     = swing_lcd_rootnote_reqseq;   // seq LAST
+    gmem[EON_ROOTNOTE_REQ]     = _sq;   // seq LAST
   );
 );
+// A native file drop (@gfx, rk_swing_ui_grid_pads / _overlay) asks through this count, never the mailbox
+// itself: swing_lcd_rootnote_reqseq keeps its writer in @block, which posts a -1 (the bank's sixteen pads,
+// each with its path) when the count moves. Written by @gfx only, read by @block only.
+swing_lcd_rn_drop_gen = 0;
+swing_lcd_rn_drop_seen = 0;
 // Display string, e.g. "F#1"; empty when there is nothing to show.
 // Cents are deliberately NOT appended: on a gliding source (an 808 still
 // falling through its pitch envelope) the cents value is window-dependent —
 // two kicks 17 cents apart measured as different note names. The NOTE is the
-// stable quantity; cents stay available via swing_lcd_rootnote_cents() for tooltips.
+// stable quantity; the bridge still publishes the cents (RN_OFF_CENTS).
 // Format ANY MIDI note as "F#1" into dst. Octave math deliberately matches the
 // MIDI-note pill further down, so the two readouts can never disagree.
 function swing_lcd_note_str(dst, n) local(pc) (
@@ -612,11 +680,8 @@ local(_num_tabs, _tab_w, _tab_h, _ti, _tab_x, _tab_mode, _is_active, _lbl, _tw_m
 
 // ─── KIT tab content ─────────────────────────────────────────────────────
 function swing_lcd_draw_kit(_cx, _cy, _cw, _ch)
-local(_btn_w, _btn_h, _btn_y, _tw_m, _th_m, _name_x, _name_y, _tile, _tile_s)
+local(_tw_m, _th_m, _name_x, _name_y, _tile, _tile_s)
 (
-  _btn_h = 16;
-  _btn_w = 38;
-
   // ── Cover tile ──
   // Square, full height of the content rect less a small margin. Everything else
   // shifts right by _tile; the chips do NOT move, because swing_chgmap_draw is
@@ -660,9 +725,11 @@ local(_btn_w, _btn_h, _btn_y, _tw_m, _th_m, _name_x, _name_y, _tile, _tile_s)
     // Phase 3 save guard: CMD==0 was already checked; also refuse while this
     // instance is importing or a data-ready delivery is in flight (the
     // state-11 dump reads the SHARED staging bands — chimera-file vector).
-    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0
+    // swing_save_bus_free: CMD 0 and, from bridge level 323, no save in flight (rk_swing_core; RR-1).
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && swing_save_bus_free()
       && !kit_busy && gmem[GS_KIT_LOAD_REQ] != 2 ? (
       gmem[KIT_GMEM_LOCK] = instance_id;
+      swing_rename_prefill();   // RR-1: a rename -- the form starts at the current name (bridge 323; rk_swing_core)
       gmem[KIT_GMEM_CMD] = 10;  // ask for name
       // ⚠ Arm the export state machine IN THE SAME EVALUATION as the post, as
       // the SAVE / SAVE AS handlers do. Until 2026-09-14 this click posted CMD
@@ -1025,7 +1092,7 @@ local(_name, _fname, _badge_x, _badge_y, _badge_r, _tw_m, _th_m,
     // misleads someone tuning to it, whereas a blank simply says "unknown".
     // Cents are omitted for the same reason — on a gliding source they are
     // window-dependent (two 808 kicks measured 17 cents apart landed on
-    // different note names); swing_lcd_rootnote_cents() has them if needed.
+    // different note names); the band still carries them (RN_OFF_CENTS).
     // ── Knob caption, or a VALUE PILL where a live number is more useful ──
     // PAN and PITCH swap their captions for pills. They replace the caption
     // rather than sitting beside it because row 3 leaves only ~20 px under the
@@ -1276,7 +1343,7 @@ local(_name, _fname, _badge_x, _badge_y, _badge_r, _tw_m, _th_m,
     // No pad_input_allowed() here: it's defined in rk_swing_ui_state (imported
     // AFTER this inc — def-time resolution) and the LCD bar isn't gated by it
     // anyway (RANGE pill precedent above).
-    frame_wheel != 0 ? swing_lcd_padcat_wheel(sel_pad, frame_wheel|0);
+    frame_wheel != 0 ? swing_lcd_padcat_wheel(sel_pad, frame_wheel);
     // Any click -> the §9c glyph-grid overlay. The 47-row text menu is retired
     // (it spanned the whole plugin to show words; the panel shows all 46
     // glyphs at once). swing_lcd_catmenu_open stays defined for future use.
@@ -1525,9 +1592,11 @@ local(_name, _fname, _badge_x, _badge_y, _badge_r, _tw_m, _th_m,
 // (spec §2), so an unmapped macro draws dim — empty must look empty.
 // Knob drags write the macro sliders directly (+ slider_automate touch);
 // the @block engine (kmac_tick in Swing_ReaKit) change-detects and applies
-// the mappings — this tab never applies anything itself. NO mark_dirty
-// anywhere here: macro motion is performance, not an edit (spec §3).
-// Snapshot dots / morph / MACRO ▸ editor land in later slices.
+// the mappings — this tab never applies anything itself. Knob motion,
+// RECALL and MORPH never mark_dirty: macro motion is performance, not an
+// edit (spec §3). Only structure edits mark the kit (mark_dirty_kit): a
+// snapshot CAPTURE or clear, and a macro rename's commit. The snapshot row
+// (SNAP dots, CAPTURE, MORPH) and the EDIT ▸ rail to the editor are below.
 
 // (swing_lcd_kmac_pal and the snapshot action helpers are defined near the
 // TOP of this file — swing_lcd_draw_pad's MACROS pill calls them, and EEL2
@@ -1593,8 +1662,7 @@ local(_mk_k, _mk_pitch, _mk_x, _mk_y, _mk_r, _mk_v, _mk_nv, _mk_mapped,
 
     // ── NAME PILL (the pad-name-pill idiom): identity-colour body that
     // brightens on an EASED hover, 1px border lifting with it, white ink
-    // over a shadow, caret tick = the edit affordance. CLICK opens the
-    // editor mid-rename (typing lives there — the strip is too small).
+    // over a shadow, caret tick = the edit affordance (click = rename, below).
     kmac_ren_k == _mk_k ? (
       strcpy(#kmac_val_lbl, #kmac_ren_buf);
       (time_precise() * 2) & 1 ? strcat(#kmac_val_lbl, "_");

@@ -2,6 +2,11 @@
 
 local M = {}
 
+-- The project grid's unit lives in grid.lua: REAPER's division is in WHOLE
+-- notes, every grid value below is in QN (grid.ProjectDivQN converts).
+local SCRIPT_DIR = debug.getinfo(1, 'S').source:match('^@?(.*[\\/])') or ''
+local grid = dofile(SCRIPT_DIR .. 'grid.lua')
+
 local LEFT, TOP, RIGHT, BOT = 0, 0, 0, 0
 local SCROLL_SIZE = 17
 local screen_scale = 1
@@ -11,6 +16,7 @@ local screen_scale = 1
 local view_start_t, view_end_t, view_inv_span = 0, 0, 0
 local grid_div_qn_cached = 0
 local grid_lines_cache   = {}    -- list of { x, tier }; tier = 1 bar / 2 beat / 3 sub-beat
+local grid_lines_key     = nil   -- the (view, grid, bounds, project state) the list was built for
 
 function M.SetBounds(l, t, r_, b, scroll)
   LEFT, TOP, RIGHT, BOT = l, t, r_, b
@@ -19,6 +25,12 @@ end
 
 function M.SetScale(s)
   screen_scale = (s and s > 0) and s or 1
+end
+
+-- The DPI scale SetScale holds (physical px / ImGui px), for callers that
+-- compare REAPER's physical I_TCPY / I_TCPH with ImGui bounds themselves.
+function M.GetScale()
+  return screen_scale
 end
 
 -- Universal integer-pixel snap. Use everywhere we hand a coordinate to ImGui
@@ -74,8 +86,17 @@ function M.BeginFrame()
   if pw <= 1 then return end
 
   -- Cache grid lines (one classification + pixel position per visible grid line).
-  local _, gdiv = reaper.GetSetProjectGrid(0, false)
-  grid_div_qn_cached = gdiv or 0
+  local gdiv = grid.ProjectDivQN()
+  grid_div_qn_cached = gdiv
+  -- Rebuild the list only when something it depends on moved: the view, the
+  -- grid, the window bounds, or the project (a tempo / time-signature edit
+  -- bumps the state count). It was rebuilt every frame -- two TimeMap calls
+  -- and a table per line, thousands a frame zoomed out over a song, while
+  -- nothing had changed (audit DM124, 2026-10-26).
+  local state = reaper.GetProjectStateChangeCount and reaper.GetProjectStateChangeCount(0) or 0
+  local key = string.format('%.9g|%.9g|%.9g|%.9g|%.9g|%s', s, e, grid_div_qn_cached, LEFT, RIGHT, tostring(state))
+  if key == grid_lines_key then return end
+  grid_lines_key     = key
   grid_lines_cache   = {}
   if not gdiv or gdiv == 0 then return end
   local s_qn = reaper.TimeMap_timeToQN(s)
@@ -129,7 +150,7 @@ function M.GetTrackY(track)
 end
 
 function M.SnapTimeToGrid(time)
-  local _, grid_div = reaper.GetSetProjectGrid(0, false)
+  local grid_div = grid.ProjectDivQN()
   if grid_div == 0 then return time end
   local beat = reaper.TimeMap_timeToQN(time)
   return reaper.TimeMap_QNToTime(math.floor(beat / grid_div + 0.5) * grid_div)
@@ -139,7 +160,7 @@ end
 -- step-sequencer click semantics: a click anywhere inside a cell lands in
 -- that cell, not the nearest grid line (which could be the next cell over).
 function M.SnapDownToCell(time)
-  local _, grid_div = reaper.GetSetProjectGrid(0, false)
+  local grid_div = grid.ProjectDivQN()
   if grid_div == 0 then return time end
   local beat = reaper.TimeMap_timeToQN(time)
   return reaper.TimeMap_QNToTime(math.floor(beat / grid_div) * grid_div)
@@ -147,7 +168,7 @@ end
 
 -- Duration (in seconds) of one grid step starting at `time`. Tempo-aware.
 function M.GetGridStep(time)
-  local _, grid_div = reaper.GetSetProjectGrid(0, false)
+  local grid_div = grid.ProjectDivQN()
   if grid_div == 0 then return 0 end
   local qn = reaper.TimeMap_timeToQN(time)
   return reaper.TimeMap_QNToTime(qn + grid_div) - time
@@ -157,14 +178,14 @@ end
 -- hover tooltip (#14). Returns e.g. "3.2.3" = bar 3, beat 2, sub-step 3.
 --
 -- Bars/beats are 1-based to match REAPER's own ruler. We lean on
--- TimeMap_QNToMeasures, which returns (measure_index_0based, qnMeasureStart,
+-- TimeMap_QNToMeasures, which returns (measure_index (1-based), qnMeasureStart,
 -- qnMeasureEnd) — same call the tier classifier in BeginFrame uses — so the
 -- bar start is meter-correct (handles 3/4, 7/8, mid-project meter changes)
 -- without a second GetMeasureInfo round-trip.
 --
 -- The sub-step count is derived from the current project grid division
 -- (grid_div_qn_cached, refreshed each frame in BeginFrame). When the grid is
--- a whole quarter-note or coarser (gdiv >= 1), there are no meaningful
+-- a whole beat or coarser (gdiv >= beat_qn), there are no meaningful
 -- sub-steps, so we emit just "bar.beat".
 function M.FormatBarBeat(time)
   local qn = reaper.TimeMap_timeToQN(time)
@@ -175,13 +196,21 @@ function M.FormatBarBeat(time)
   local meas = math.floor((meas_idx or 1))
   local qn_in_bar = qn - (bar_start_qn or 0)
   if qn_in_bar < 0 then qn_in_bar = 0 end
-  local beat = math.floor(qn_in_bar) + 1
-  local qn_in_beat = qn_in_bar - (beat - 1)
+  -- A beat is the meter's denominator note, as on REAPER's ruler: 6/8 counts
+  -- six eighths, 7/8 seven, not quarter notes (which disagreed with the ruler
+  -- in every x/8 meter -- audit DM125, 2026-10-26). beat_qn = one beat in QN.
+  local beat_qn = 1
+  if reaper.TimeMap_GetTimeSigAtTime then
+    local _, denom = reaper.TimeMap_GetTimeSigAtTime(0, time)
+    if denom and denom > 0 then beat_qn = 4 / denom end
+  end
+  local beat = math.floor(qn_in_bar / beat_qn + 1e-9) + 1
+  local qn_in_beat = qn_in_bar - (beat - 1) * beat_qn
   local gdiv = grid_div_qn_cached
-  if not gdiv or gdiv <= 0 or gdiv >= 1 then
+  if not gdiv or gdiv <= 0 or gdiv >= beat_qn then
     return string.format('%d.%d', meas, beat)
   end
-  local subs_per_beat = math.floor(1 / gdiv + 0.5)
+  local subs_per_beat = math.floor(beat_qn / gdiv + 0.5)
   local sub = math.floor(qn_in_beat / gdiv + 0.5) + 1
   if subs_per_beat > 0 and sub > subs_per_beat then sub = subs_per_beat end
   return string.format('%d.%d.%d', meas, beat, sub)
@@ -205,8 +234,10 @@ end
 -- Dotted / arbitrary grids are not swingable (no defensible pairing) and the UI
 -- disables the slider there. Tolerance match against fixed division sets is
 -- simpler and safer than a log2 test against float grid values.
-local SWING_DIVS   = { 1, 0.5, 0.25, 0.125, 0.0625, 0.03125 }
-local TRIPLET_DIVS = { 1/6, 1/12, 1/24 }   -- 1/4T, 1/8T, 1/16T (in QN)
+local SWING_DIVS   = { 1, 0.5, 0.25, 0.125, 0.0625, 0.03125 }   -- 1/4 .. 1/128 (QN)
+-- 1/4T, 1/8T, 1/16T in QN. They were { 1/6, 1/12, 1/24 }: REAPER's WHOLE-note
+-- numbers, matching only while the grid was read unconverted (audit DM14).
+local TRIPLET_DIVS = { 2/3, 1/3, 1/6 }
 
 local function in_div_set(g, set)
   if not g or g <= 0 then return false end

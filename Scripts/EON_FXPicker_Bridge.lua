@@ -43,6 +43,9 @@ local C_LEN, C_NAME, C_ON, C_FMT = 0, 1, 21, 22
 -- identically -- two different states, one appearance.
 local C_OFF = 23
 local CNAME_MAX = 20
+-- PL H14: one word per entry, the card hash of the 40-character name, in the
+-- 32 words the chain records leave free (3264 + 32*25 = 4064 .. 4095).
+local CHAIN_HASH = CHAIN + CHAIN_MAX * CREC
 local ACT_ACK, ACT_SEQ, ACT_VERB, ACT_A, ACT_B = 4, 72, 73, 74, 75
 local A_SWAP, A_INSERT, A_ENABLE, A_REMOVE, A_MOVE = 1, 2, 3, 4, 5
 local A_EMBED_TCP, A_EMBED_MCP, A_OFFLINE = 6, 7, 8
@@ -185,8 +188,22 @@ local IBUCKET_GLYPH = {
   ["orchestral"] = 33, ["world"] = 34, ["sfx"] = 35, ["other"] = 36,
 }
 
+-- ⚠️ ONE fallback chain for every site that turns a category word into a pip
+-- index: the rail, the rows, a chain file's peek and the console inserts.
+-- BUCKET_IX holds the 22 effect buckets only, so an instrument bucket ("drums",
+-- "keys") fell to 0 = comp at the console site and to the empty ring at the peek
+-- -- four sites, four fallbacks, one wrong (sweep BRW20, 2026-10-26).
+local function bucket_ix(c)
+  return BUCKET_IX[c] or IBUCKET_GLYPH[c] or (#fx.BUCKETS - 1)
+end
+
 local rows, banks = {}, {}          -- registry + the rail built from it
 local view, view_q = {}, nil        -- the filtered result set
+-- PL H4/H7 (2026-10-26): WHOSE query `view` was built from. It is one list for
+-- all sixteen slots and a pick names a ROW of it (R_RIDX), so an action is
+-- resolved only against the acting slot's own list -- re-built first when
+-- another Swing's ask (its FX tab re-asks twice a second) rebuilt it since.
+local view_slot = nil
 local view_bank = -1                -- selected rail row
 -- ⚠️ DECLARED HERE, above apply_query which assigns it. Lua binds an upvalue
 -- only if the local exists at compile time; written without this it would
@@ -218,7 +235,7 @@ local function fxpick_build_registry()
   -- set the filter actually offers.
   rows = fx.registry({ force = true,      -- force: a retry must not be served
                        kinds = { fx = true, instrument = true } })
-  view, view_q, view_bank, view_kf = rows, nil, -1, 2
+  view, view_q, view_bank, view_kf, view_slot = rows, nil, -1, 2, nil
   banks = { { name = "ALL PLUGINS", kind = 0 },
             { name = "RECENT",      kind = 1 } }
   for _, b in ipairs(fx.banks()) do
@@ -250,12 +267,9 @@ local function fxpick_build_registry()
     end
   end
   table.sort(order, function(a, b) return seen[a] > seen[b] end)
-  local bix = {}
-  for i, n in ipairs(fx.BUCKETS) do bix[n] = i - 1 end
   for _, c in ipairs(order) do
     banks[#banks + 1] = { name = c, kind = 3, cat = c,
-                          bucket = bix[c] or IBUCKET_GLYPH[c]
-                                   or (#fx.BUCKETS - 1), n = seen[c] }
+                          bucket = bucket_ix(c), n = seen[c] }
   end
   -- ⛔ KIND 4, NOT MERGED INTO KIND 3. REAPER's set is coarser and differently
   -- drawn (Dynamics, Tools, External); ours says what a plug-in does at the
@@ -329,6 +343,14 @@ local ch_rel = {}          -- per slot, the folder currently being listed
 -- ⚠️ This string comes out of SHARED gmem, so it is untrusted. The engine
 -- refuses anything that leaves FXChains (fx.chain_rel, called by every chain_*
 -- function), which is where the check has to live: that is what opens files.
+--
+-- ⚠️ PL H2 (2026-10-26): the face builds the path from the names it was SENT,
+-- and publish() sends ascii_fold(name) cut to NAME_MAX -- "Réverbs" arrives as
+-- "R??verbs", "Drums – Parallel" as "Drums - Parallel". Sent back verbatim that
+-- named no folder and the view came up empty with no error. Each part is
+-- matched back to the real folder, the same fold and cut applied to the real
+-- names; a path that matches nothing is used as sent, as before.
+local rel_fold = {}        -- the path as the face sent it -> the real one
 local function read_rel(b)
   local n = math.floor(reaper.gmem_read(b + CHREL_LEN) or 0)
   n = math.max(0, math.min(CHREL_MAX, n))
@@ -337,12 +359,25 @@ local function read_rel(b)
   for i = 0, n - 1 do
     t[#t + 1] = string.char(math.floor(reaper.gmem_read(b + CHREL + i) or 32) % 256)
   end
+  local s = table.concat(t)
+  if rel_fold[s] then return rel_fold[s] end
+  local cur = ""
+  for part in s:gmatch("[^/]+") do
+    local hit, fold
+    for _, d in ipairs(fx.chain_list(cur).dirs or {}) do
+      if d.name == part then hit = d.rel break end
+      if not fold and ascii_fold(d.name):sub(1, NAME_MAX) == part then fold = d.rel end
+    end
+    cur = hit or fold
+    if not cur then break end
+  end
+  if cur then rel_fold[s] = cur return cur end
   -- ⚠️ The face sends "/" always; translate to this platform's separator.
   -- The engine joins with package.config's, so a raw "/" would break the
   -- lookup on any host where that is not the separator -- and it would fail
   -- as an EMPTY folder rather than as an error.
   local sep = package.config and package.config:sub(1, 1) or "/"
-  return (table.concat(t):gsub("/", sep))
+  return (s:gsub("/", sep))
 end
 
 -- Look INSIDE a .RfxChain and report what it holds: up to four category
@@ -375,9 +410,14 @@ local function chain_peek(rel)
         -- A JS entry is a PATH; the basename is the only recognisable part.
         nm = nm:match("([^/\\]+)$") or nm
         nm = nm:gsub("%.jsfx$", ""):gsub("%.dll$", ""):gsub("%.vst3$", "")
+        -- A VST / VST3 / CLAP entry is the DECORATED chunk name, "VST3: ReaEQ
+        -- (Cockos)": the recipe lookup is an exact key match, so the format
+        -- prefix and the vendor group have to come off first, as category_fx
+        -- strips them for a live slot (sweep BRW18, 2026-10-26).
+        nm = (fx.parse_name(nm))
         out.n = out.n + 1
         if #out.cats < 4 then
-          out.cats[#out.cats + 1] = BUCKET_IX[fx.category(nm)] or 21
+          out.cats[#out.cats + 1] = bucket_ix(fx.category(nm))
         end
       end
     end
@@ -413,6 +453,9 @@ local function build_chain_view(rel)
 end
 
 local function apply_query(b, slot)
+  -- Set first: every return below leaves `view` as THIS slot's query's list
+  -- (rebuilt, or the cache hit of an identical query).
+  view_slot = slot
   local ql = math.floor(reaper.gmem_read(b + Q_LEN) or 0)
   ql = math.max(0, math.min(Q_MAX, ql))
   local t = {}
@@ -550,8 +593,7 @@ local function publish(slot, off, n, answering)
     -- sampler -- resolved to 21 here: a grey pip and, because the face's
     -- bucket_name also stopped at 20, no word beside it. The rail had
     -- already been taught IBUCKET_GLYPH; the LIST never was.
-    reaper.gmem_write(p + R_BUCKET, BUCKET_IX[r.cat] or IBUCKET_GLYPH[r.cat]
-                                    or (#fx.BUCKETS - 1))
+    reaper.gmem_write(p + R_BUCKET, bucket_ix(r.cat))
     -- r.kindix is set only by the chain builder. Chains continue the same
     -- 0..3 kind space (4 = chain file, 5 = folder) rather than overloading
     -- one of the plugin kinds, so the face can tell them apart by kind alone.
@@ -924,6 +966,11 @@ local function chain_save_write(tr, pad, v, slot, name, folder)
   -- The listing is now stale -- the new chain would not appear until the folder
   -- changed. Dropping the cache key rebuilds it on the next query.
   view_q = nil
+  -- And the PEEKS: a chain saved over an existing name kept the old file's
+  -- preview (its pips and count) until the bridge restarted. The key is built
+  -- with the platform separator and the save path with "/", so the whole table
+  -- goes rather than one entry (sweep BRW19, 2026-10-26).
+  ch_peek_cache = {}
 end
 
 local function chain_save_named(tr, pad, v, slot, name)
@@ -1023,6 +1070,7 @@ local function do_action(slot, verb, a, bnum)
     embed_fx(tr, ai, verb == A_EMBED_TCP)
     return
   elseif verb == A_CHAIN_APPLY or verb == A_CHAIN_SAVE then
+    if view_slot ~= slot then apply_query(BASE + slot * STRIDE, slot) end   -- PL H4: this slot's rows
     local row = view[a + 1]
     if verb == A_CHAIN_APPLY then
       -- Folders are navigated, not applied. The face already refuses to
@@ -1066,6 +1114,7 @@ local function do_action(slot, verb, a, bnum)
       if v then fx.view_move(tr, pad, a, bnum) else fx.move(tr, a, bnum) end
     end
   elseif verb == A_SWAP or verb == A_INSERT then
+    if view_slot ~= slot then apply_query(BASE + slot * STRIDE, slot) end   -- PL H4: this slot's rows
     local row = view[bnum + 1]
     if not row then return end
     -- ⚠️ The engine takes the DISPLAY NAME, not the row. row.disp is what
@@ -1155,6 +1204,35 @@ local function consume_target(slot)
   ch_fp[slot] = nil            -- force a republish for the new target
 end
 
+-- ⚠️ ABOVE publish_chain, which calls it (PL H14): a local function is an
+-- upvalue only for code compiled after it.
+-- Port of swing_fxcard_hash from rk_swing_fxcard_data.jsfx-inc, character for
+-- character. The face cannot compute it itself: it only receives a TRUNCATED
+-- name, and the card deck is keyed on the whole one -- so hashing 11 characters
+-- of "EON Drum Strip" finds nothing at all.
+--
+-- ⚠️ IF THAT FUNCTION EVER CHANGES, THIS MUST CHANGE WITH IT. Two copies of one
+-- hash is the cost of the split; they agree only because they were written to.
+-- Lowercase alphanumerics only, parenthesised sections skipped entirely (that
+-- is how "Pro-Q 3 (FabFilter)" and "Pro-Q 3" land on the same card).
+local function card_hash(name)
+  local h, depth = 0, 0
+  for i = 1, #name do
+    local c = name:byte(i)
+    if c == 40 then                       -- '('
+      depth = depth + 1
+    elseif c == 41 then                   -- ')'
+      if depth > 0 then depth = depth - 1 end
+    elseif depth == 0 then
+      if c >= 65 and c <= 90 then c = c + 32 end
+      if (c >= 48 and c <= 57) or (c >= 97 and c <= 122) then
+        h = (h * 131 + c) % 1000003
+      end
+    end
+  end
+  return h
+end
+
 local function publish_chain(slot)
   -- ⚠️ Resolve the pin BEFORE the fingerprint gate below, which returns early:
   -- latching has to happen on every tick, not only on ticks that republish.
@@ -1205,9 +1283,6 @@ local function publish_chain(slot)
     local ok, nm = reaper.GetSetMediaTrackInfo_String(tr, "P_NAME", "", false)
     tname = ascii_fold((ok and nm ~= "" and nm) or ("Track " .. tnum))
   end
-  -- Frozen is read HERE, on the republish path, which the fingerprint
-  -- already gates -- not per tick. The chunk of a loaded track is not small.
-  tgt_frozen[slot] = track_frozen(tr)
   tgt_none[slot]   = (tr == nil)
   local ch, v = {}, nil
   if tr then
@@ -1238,6 +1313,13 @@ local function publish_chain(slot)
   local fp = table.concat(parts, string.char(31))
   if fp == ch_fp[slot] then return end
   ch_fp[slot] = fp
+  -- Frozen is read HERE, below the fingerprint gate -- not per tick. The chunk
+  -- of a loaded track is not small, and this sat ABOVE the gate while its
+  -- comment said otherwise: a full GetTrackStateChunk per tick for every slot
+  -- that ever asked, ~30x/s (sweep BRW2, 2026-10-26). A freeze empties the live
+  -- chain, so the fingerprint moves and the flag is re-read; publish() sends
+  -- it with the next page.
+  tgt_frozen[slot] = track_frozen(tr)
 
   local b = BASE + slot * STRIDE
   local seq = (reaper.gmem_read(b + CH_SEQ) or 0)
@@ -1260,6 +1342,11 @@ local function publish_chain(slot)
     reaper.gmem_write(p + C_ON, e.enabled and 1 or 0)
     reaper.gmem_write(p + C_OFF, e.offline and 1 or 0)
     reaper.gmem_write(p + C_FMT, FMT_CODE[e.fmt] or 0)
+    -- PL H14: the card hash of the FORTY-character name, one word per entry
+    -- after the records (CHAIN_HASH). An entry carries only CNAME_MAX characters
+    -- and the deck is keyed on forty, so the face could not find 177 cards by
+    -- itself -- the console inserts' CI_HASH, for the same reason.
+    reaper.gmem_write(b + CHAIN_HASH + i - 1, card_hash(nm:sub(1, NAME_MAX)))
   end
   for i = n, CHAIN_MAX - 1 do
     reaper.gmem_write(b + CHAIN + i * CREC + C_LEN, 0)
@@ -1317,40 +1404,15 @@ end
 -- One pad's slot words. Category index drives the colour; enabled/offline are
 -- read back rather than assumed, because REAPER's own FX window can change
 -- them behind us at any moment.
--- Port of swing_fxcard_hash from rk_swing_fxcard_data.jsfx-inc, character for
--- character. The face cannot compute it itself: it only receives a TRUNCATED
--- name, and the card deck is keyed on the whole one -- so hashing 11 characters
--- of "EON Drum Strip" finds nothing at all.
---
--- ⚠️ IF THAT FUNCTION EVER CHANGES, THIS MUST CHANGE WITH IT. Two copies of one
--- hash is the cost of the split; they agree only because they were written to.
--- Lowercase alphanumerics only, parenthesised sections skipped entirely (that
--- is how "Pro-Q 3 (FabFilter)" and "Pro-Q 3" land on the same card).
-local function card_hash(name)
-  local h, depth = 0, 0
-  for i = 1, #name do
-    local c = name:byte(i)
-    if c == 40 then                       -- '('
-      depth = depth + 1
-    elseif c == 41 then                   -- ')'
-      if depth > 0 then depth = depth - 1 end
-    elseif depth == 0 then
-      if c >= 65 and c <= 90 then c = c + 32 end
-      if (c >= 48 and c <= 57) or (c >= 97 and c <= 122) then
-        h = (h * 131 + c) % 1000003
-      end
-    end
-  end
-  return h
-end
-
 local function ci_words(tr, ch)
   local out, nm, hs = {}, {}, {}
   for i = 1, math.min(CI_NSLOT, #ch) do
     local e = ch[i]
-    -- e.idx is the ABSOLUTE chain index: a view's entries are a subset of the
-    -- track's chain, so the category lookup must not use the list position.
-    local cat = BUCKET_IX[fx.category_fx(tr, e.idx)] or 0
+    -- e.cat is the bucket the engine resolved for this slot when it read the
+    -- chain (category_fx on e.idx, the ABSOLUTE chain index -- a view's entries
+    -- are a subset of the track's chain). It was resolved a second time here,
+    -- another two recipe scans per slot every half second (sweep BRW31).
+    local cat = bucket_ix(e.cat)
     out[i] = cat + (e.enabled and 0 or 64) + (e.offline and 128 or 0)
     -- e.name is ALREADY the shortened display name the picker list uses
     -- (fx.parse_name strips vendor and format). Truncating that beats
@@ -1361,7 +1423,11 @@ local function ci_words(tr, ch)
     -- `hkey(name[:40])` and the face hashes `min(40, len)` -- both because the
     -- published name field is 40 wide -- so hashing the FULL name here missed
     -- every plugin with a longer name than that.
-    hs[i] = card_hash((e.name or ""):sub(1, 40))
+    -- ⚠️ FOLDED FIRST, as publish() and publish_chain() hash it: the card table
+    -- is keyed on forty CHARACTERS and :sub counts BYTES, so a name with an
+    -- em dash (three bytes) was cut two characters short of its key and never
+    -- found its card in a mixer insert slot (sweep BRW21, 2026-10-26).
+    hs[i] = card_hash(ascii_fold(e.name or ""):sub(1, NAME_MAX))
   end
   return out, #ch, nm, hs
 end
@@ -1413,7 +1479,7 @@ local function publish_console_inserts()
             local stereo = nsend < 16
             local wired = false
             if stereo then
-              pads.swing_tr, pads.swing_fx = tr, fxi
+              pads.swing_tr = tr
               for i = 0, reaper.TrackFX_GetNumParams(tr, fxi) - 1 do
                 local ok, nm = reaper.TrackFX_GetParamName(tr, fxi, i, "")
                 if ok and nm:find("Wired (", 1, true) then

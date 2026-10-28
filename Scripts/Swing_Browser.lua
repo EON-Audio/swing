@@ -9,7 +9,8 @@
 --   Runs its own defer loop (independent from the bridge).
 --   Communicates with Swing JSFX via gmem for pad assignment.
 --   Reads active instance from ExtState to find the right gmem namespace.
---   Never acquires the instance lock — writes to gmem, bridge picks up CMD 61.
+--   Never acquires the instance lock — writes CMD 63 (load) / 64 (layer) to
+--   gmem; the Swing JSFX applies them itself (the bridge is not involved).
 --
 -- TYPE:   system
 -- SCOPE:  project_tracks
@@ -95,16 +96,6 @@ local G = core.GMEM
 -- OS shortcuts from core
 local sep = core.sep
 local is_windows = core.is_windows
-
--- Shell-safe quoting for os.execute / ExecProcess arguments
-local function shell_quote(s)
-  if not s then return '""' end
-  if is_windows then
-    return '"' .. s:gsub('"', '') .. '"'
-  else
-    return "'" .. s:gsub("'", "'\\''") .. "'"
-  end
-end
 
 -- Resolve a user-profile dir (Desktop / Downloads / Documents) with OneDrive
 -- folder-redirection awareness on Windows. When OneDrive is set up to manage
@@ -212,7 +203,7 @@ local waveform = {
 local ui = {
   ctx           = nil,   -- ImGui context
   is_open       = true,
-  target_pad    = 0,     -- 0-15
+  target_pad    = 0,     -- absolute pad 0..63 (bank*16 + tile)
   prev_target_pad = -1,  -- track pad changes from JSFX
   first_frame   = true,
   was_docked    = nil,    -- dock transition detection (nil = first frame, skip resolved)
@@ -425,10 +416,11 @@ end
 
 -- Find .swing file by kit name.
 -- Phase 2 (2026-07-17): the displayed name is now filename-canonical, so the
--- exact reconstruction below is normally right. The gmem name band is 32
--- chars though — a longer filename arrives TRUNCATED, so fall back to a
--- prefix match over the kits dir before giving up (first match wins; a
--- 32-char collision is on the user's naming).
+-- exact reconstruction below is normally right. The gmem name band is
+-- G.GS_KIT_NAME_LEN (16) chars though — a longer filename arrives TRUNCATED, so
+-- fall back to a prefix match over the kits dir before giving up (first match
+-- wins; a 16-char collision is on the user's naming). The test read 32 while
+-- the band was 16, so the fallback never ran (sweep BRW22, 2026-10-26).
 local function find_swing_file(kit_name)
   if not kit_name or kit_name == "" then return nil end
   local safe_name = kit_name:gsub('[<>:"/\\|%?%*]', '_')
@@ -436,7 +428,7 @@ local function find_swing_file(kit_name)
   local path = kits_dir .. sep .. safe_name .. ".swing"
   local f = io.open(path, "r")
   if f then f:close(); return path end
-  if #kit_name >= 32 then
+  if #kit_name >= G.GS_KIT_NAME_LEN then
     local i = 0
     while true do
       local fn = reaper.EnumerateFiles(kits_dir, i)
@@ -462,32 +454,6 @@ local function load_kit_database(filepath)
   local ok, data = core.run_bounded(chunk)
   if not ok or type(data) ~= "table" then return nil end
   return data
-end
-
--- Create a minimal .swing v2 file for a new kit
-local function create_kit_database(kit_name)
-  local safe_name = kit_name:gsub('[<>:"/\\|%?%*]', '_')
-  local kits_dir = get_kits_dir()
-  local filepath = kits_dir .. sep .. safe_name .. ".swing"
-  -- Don't overwrite existing files
-  local f = io.open(filepath, "r")
-  if f then f:close(); return filepath end
-  -- Create minimal v2 file
-  f = io.open(filepath, "w")
-  if not f then return nil end
-  f:write("-- Swing Kit v2 — EON Studios — proprietary\n")
-  f:write("return {\n")
-  f:write('  version  = 2,\n')
-  f:write('  kit_name = "' .. kit_name:gsub('\\', '\\\\'):gsub('"', '\\"') .. '",\n')
-  f:write('  author   = "",\n')
-  f:write('  created  = "' .. os.date("%Y-%m-%d") .. '",\n')
-  f:write('  modified = "' .. os.date("%Y-%m-%d") .. '",\n')
-  f:write('  globals  = {},\n')
-  f:write('  pads     = {},\n')
-  f:write('  cache    = {},\n')
-  f:write('}\n')
-  f:close()
-  return filepath
 end
 
 -- Save database back to .swing file (preserves all existing data, updates modified date)
@@ -609,9 +575,10 @@ local function on_kit_name_change(new_name)
   kit_db.data = nil
   kit_db.filepath = ""
   -- Persistent analysis cache (keyed by file path) survives kit changes —
-  -- BPM/key for kick.wav doesn't change because you switched kit. Only
-  -- discard the in-flight DSP queue.
-  analysis_queue = {}  -- discard pending analysis work
+  -- BPM/key for kick.wav doesn't change because you switched kit, and neither
+  -- does the queue of files still to analyse. (An `analysis_queue = {}` here
+  -- wrote a GLOBAL: the local is declared further down, so it never cleared
+  -- anything; dropped with sweep BRW4, 2026-10-26.)
 
   if new_name == "" then return end
 
@@ -635,7 +602,7 @@ local function on_kit_name_change(new_name)
     -- (binary file got "blank kit" on reopen because this empty v2 was loaded
     -- instead). The first real save now happens via JSFX → Kit Bridge →
     -- write_kit_v4. Until that fires, kit_db.data stays nil and
-    -- save_kit_database() bails (line 345), so nothing gets written prematurely.
+    -- save_kit_database() bails at its first check, so nothing gets written prematurely.
     kit_db.filepath = ""
     kit_db.data = nil
   end
@@ -825,6 +792,7 @@ local sort_entries
 local add_recent
 local analysis_cache             -- bound below from load_persistent_cache()
 local analysis_queue = {}
+local analysis_yield             -- fwd decl: detect_key (above the frame budget) yields through it (sweep BRW23)
 local load_sample_to_pad
 local load_layer_to_pad  -- fwd decl: process_import_queue (above its def) uses it
 
@@ -841,9 +809,15 @@ local cache_last_save = 0
 
 -- mtime via JS_ReaScriptAPI (soft dep). Returns nil if extension missing,
 -- so cache lookup degrades to "trust until file is re-cached" gracefully.
+-- ⚠️ The FOURTH return is modifiedTime (retval, size, accessedTime,
+-- modifiedTime, ...; the kit bridge reads the same one). The third, the ACCESS
+-- time, keyed this cache: a sample re-exported in place kept its old BPM / key
+-- for good where the access time never moves, and re-analysed after every
+-- preview where it does (sweep BRW3, 2026-10-26). Entries written under the
+-- old key mismatch once and re-analyse.
 local function get_file_mtime(filepath)
   if not reaper.JS_File_Stat then return nil end
-  local rv, _, mtime = reaper.JS_File_Stat(filepath)
+  local rv, _, _, mtime = reaper.JS_File_Stat(filepath)
   if rv == 0 then return mtime end
   return nil
 end
@@ -931,7 +905,7 @@ analysis_cache = load_persistent_cache()
 -- ═══════════════════════════════════════════════════════════════════════════════
 
 -- Analysis cache: path → {bpm=number|nil, key=string|nil, analyzed=bool}
--- (forward-declared above so on_kit_name_change can clear it)
+-- (forward-declared above)
 
 -- Note names for key display
 local NOTE_NAMES = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"}
@@ -985,7 +959,7 @@ local function detect_key(filepath)
   local got = reaper.PCM_Source_GetPeaks(src, pps, 0, 1, num_peaks, 0, buf)
   reaper.PCM_Source_Destroy(src)
 
-  local peak_count = math.min(got & 0xFFFFF, num_peaks)
+  local peak_count = math.min((got or 0) & 0xFFFFF, num_peaks)   -- nil = no peaks read (seen 2026-10-27)
   if peak_count < 512 then return nil end
 
   -- Extract max peaks (layout: [max0..max_n, min0..min_n])
@@ -998,31 +972,41 @@ local function detect_key(filepath)
   local chroma = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
   local fft_size = math.min(4096, #samples)
   local hop = math.floor(fft_size / 2)
+  -- The 48 (note, octave) coefficients once, not once per block: they depend
+  -- on the rate and the block size only (sweep BRW23). Same order as the
+  -- loops they replace, so the chroma sums land bit for bit where they did.
+  local goertzel = {}
+  for note = 0, 11 do
+    for oct = 2, 5 do
+      local midi = note + (oct + 1) * 12
+      local freq = 440.0 * 2 ^ ((midi - 69) / 12)
+      if freq < pps / 2 then
+        local k = freq / pps * fft_size
+        local w = 2 * math.pi * k / fft_size
+        goertzel[#goertzel + 1] = { note + 1, 2 * math.cos(w) }
+      end
+    end
+  end
 
   local block_start = 0
   local num_blocks = 0
   while block_start + fft_size <= #samples do
-    for note = 0, 11 do
-      for oct = 2, 5 do
-        local midi = note + (oct + 1) * 12
-        local freq = 440.0 * 2 ^ ((midi - 69) / 12)
-        if freq < pps / 2 then
-          local k = freq / pps * fft_size
-          local w = 2 * math.pi * k / fft_size
-          local coeff = 2 * math.cos(w)
-          local s0, s1, s2 = 0, 0, 0
-          for i = 1, fft_size do
-            s0 = (samples[block_start + i] or 0) + coeff * s1 - s2
-            s2 = s1
-            s1 = s0
-          end
-          local power = s1 * s1 + s2 * s2 - coeff * s1 * s2
-          chroma[note + 1] = chroma[note + 1] + math.abs(power)
-        end
+    for g = 1, #goertzel do
+      local bin, coeff = goertzel[g][1], goertzel[g][2]
+      local s0, s1, s2 = 0, 0, 0
+      for i = 1, fft_size do
+        s0 = samples[block_start + i] + coeff * s1 - s2
+        s2 = s1
+        s1 = s0
       end
+      local power = s1 * s1 + s2 * s2 - coeff * s1 * s2
+      chroma[bin] = chroma[bin] + math.abs(power)
     end
     block_start = block_start + hop
     num_blocks = num_blocks + 1
+    -- ~200 K Goertzel steps a block, fourteen blocks on a 4 s file: the frame
+    -- budget is honoured between blocks, not only between files (sweep BRW23)
+    analysis_yield()
   end
 
   if num_blocks == 0 then return nil end
@@ -1102,7 +1086,7 @@ local function detect_bpm(filepath)
   local got = reaper.PCM_Source_GetPeaks(src, env_sr, 0, 1, num_peaks, 0, buf)
   reaper.PCM_Source_Destroy(src)
 
-  local peak_count = math.min(got & 0xFFFFF, num_peaks)
+  local peak_count = math.min((got or 0) & 0xFFFFF, num_peaks)   -- nil = no peaks read (seen 2026-10-27)
   if peak_count < 100 then return nil end
 
   -- Extract max peaks (layout: [max0..max_n, min0..min_n])
@@ -1193,8 +1177,30 @@ local function process_metadata_queue()
 end
 
 -- Analysis queue for incremental per-frame processing
--- (forward-declared above so on_kit_name_change can clear it)
+-- (forward-declared above)
 local ANALYSIS_BUDGET_S = 0.008  -- §12.1: 8ms max per frame for analysis work
+
+-- One file's DSP pass runs as a COROUTINE (sweep BRW23, 2026-10-26): detect_key
+-- alone is ~2.7 M Lua steps on a 4 s file, 100-300 ms, and the budget was
+-- checked only after a whole file, so a folder of uncached loops ran the window
+-- at a few fps for a minute. an_co is the pass in flight, an_t0 the frame's
+-- start; a pass yields between detect_key's blocks once the budget is spent
+-- and resumes next frame. Outside a coroutine the yield is a no-op.
+local an_co, an_t0 = nil, 0
+analysis_yield = function()
+  if an_co and coroutine.isyieldable() and reaper.time_precise() - an_t0 > ANALYSIS_BUDGET_S then
+    coroutine.yield()
+  end
+end
+
+-- Files whose cheap layers (the cache, the embedded tags, the kit db) are still
+-- to be checked. A scan that finished used to run analyze_file for every entry
+-- in ONE frame -- a PCM-source open and up to 14 metadata reads per uncached
+-- file, ~3 s frozen on a 3000-sample folder, right after the scan itself had
+-- been throttled to avoid exactly that (sweep BRW4, 2026-10-26). Drained under
+-- the same budget as the DSP queue; `next` is the read cursor (a
+-- table.remove(1) over 20000 entries is quadratic).
+local tag_queue = { next = 1 }
 
 -- Does this REAPER build have the API the measurement core needs
 -- (PCM_Source_CreateFromFile / PCM_Source_GetPeaks / new_array)? Resolved once:
@@ -1334,14 +1340,43 @@ local function get_axes(filepath)
   return measure.derive(m)
 end
 
--- Process queued analysis (call once per frame)
+-- Drop every queued pass: the DSP queue, the tag queue and the pass in flight.
+-- The `queued` marks of the DSP queue's entries go with it -- they are what
+-- analyze_file tests before queueing an upgrade, and a bare `analysis_queue =
+-- {}` left them set, so a folder left mid-upgrade never got its metrics or
+-- its root note until a restart (found with sweep BRW4, 2026-10-26).
+local function drop_analysis_queue()
+  for _, p in ipairs(analysis_queue) do
+    local e = analysis_cache[p]
+    if e then e.queued = nil end
+  end
+  analysis_queue = {}
+  tag_queue = { next = 1 }
+  an_co = nil
+end
+
+-- Process queued analysis (call once per frame), under the frame budget: the
+-- tag queue first (cheap, and it feeds the DSP queue), then the DSP pass.
 local function process_analysis_queue()
   local budget_start = reaper.time_precise()
-  while #analysis_queue > 0 do
-    local path = table.remove(analysis_queue, 1)
-    -- run_analysis self-guards: it handles both the full first pass and the
-    -- metrics-only upgrade of an entry that is already marked analyzed.
-    run_analysis(path)
+  an_t0 = budget_start
+  while tag_queue.next <= #tag_queue do
+    local path = tag_queue[tag_queue.next]
+    tag_queue.next = tag_queue.next + 1
+    analyze_file(path)
+    if reaper.time_precise() - budget_start > ANALYSIS_BUDGET_S then return end
+  end
+  if tag_queue.next > 1 then tag_queue = { next = 1 } end
+  while an_co or #analysis_queue > 0 do
+    if not an_co then
+      local path = table.remove(analysis_queue, 1)
+      -- run_analysis self-guards: it handles both the full first pass and the
+      -- metrics-only upgrade of an entry that is already marked analyzed.
+      an_co = coroutine.create(function() run_analysis(path) end)
+    end
+    local ok, err = coroutine.resume(an_co)
+    if not ok then an_co = nil; error(err, 0) end   -- as the plain call raised
+    if coroutine.status(an_co) == "dead" then an_co = nil end
     -- §12.1: respect frame budget — bail before we block the UI thread
     if reaper.time_precise() - budget_start > ANALYSIS_BUDGET_S then break end
   end
@@ -1388,10 +1423,13 @@ local function process_scan_queue()
         sort_entries()
         file_mgr.current_path = st.root  -- always the root, not the deepest scanned dir
         file_mgr.needs_rescan = false
-        analysis_queue = {}
+        drop_analysis_queue()
+        -- Queued, not checked here: the cheap layers of 3000 entries are ~3 s
+        -- in one frame (sweep BRW4); process_analysis_queue drains them under
+        -- the frame budget.
         for _, e in ipairs(file_mgr.entries) do
           if not e.is_dir and is_native_audio(e.name) then
-            analyze_file(e.path)
+            tag_queue[#tag_queue + 1] = e.path
           end
         end
         file_mgr.scan_state = nil
@@ -2031,7 +2069,6 @@ local function import_execute()
     end
   end
 
-  -- Keep temp_dir alive until queue is drained
   import_state.active = false
   import_state.error = nil
 end
@@ -2275,7 +2312,7 @@ local function scan_directory(path)
   file_mgr.category_filter = nil  -- reset on navigation: counts change per folder
   search.query = ""
   metadata_queue = {}  -- clear stale entries from previous folder
-  analysis_queue = {}
+  drop_analysis_queue()
 
   -- Subdirectories: in normal (Tree) mode, enumerate immediately so the
   -- user can navigate into them. In Subfolders mode, skip — the scan
@@ -2761,16 +2798,23 @@ end
 local function generate_peaks(filepath, display_width)
   if not filepath or filepath == "" then return end
   local dw = display_width or 400
-  -- Cache valid if same file AND width hasn't changed significantly (>20% drift)
-  if waveform.cached_file == filepath and waveform.peak_count > 0
-     and math.abs(waveform.cached_width - dw) < dw * 0.2 then
+  -- Cache valid if same file AND width hasn't changed significantly (>20% drift).
+  -- A file that gave NO peaks (unreadable, under a millisecond, a click) is
+  -- cached too, for a second at a time: every early return below used to leave
+  -- cached_file blank, and the preview panel re-opened a PCM source for it on
+  -- every frame while its row stayed selected (sweep BRW24, 2026-10-26). The
+  -- retry at 1 Hz keeps a file still being written showing up by itself.
+  if waveform.cached_file == filepath
+     and math.abs(waveform.cached_width - dw) < dw * 0.2
+     and (waveform.peak_count > 0 or reaper.time_precise() - (waveform.failed_t or 0) < 1.0) then
     return
   end
 
   waveform.peaks = {}
   waveform.peak_count = 0
-  waveform.cached_file = ""
-  waveform.cached_width = 0
+  waveform.cached_file = filepath      -- the attempt is on record before any early return
+  waveform.cached_width = dw
+  waveform.failed_t = reaper.time_precise()
   waveform.src_length = 0
 
   local src = reaper.PCM_Source_CreateFromFileEx(filepath, true)
@@ -2830,7 +2874,7 @@ local function generate_peaks(filepath, display_width)
     buf.clear()
     local retval = reaper.PCM_Source_GetPeaks(src, peakrate, 0, 2, n_spls, 0, buf)
     reaper.PCM_Source_Destroy(src)
-    actual = math.min(retval & 0xFFFFF, n_spls)
+    actual = math.min((retval or 0) & 0xFFFFF, n_spls)   -- nil = no peaks read
     if actual < 2 then return end
 
     -- Per-channel block offsets (each block is n_spls long, regardless
@@ -2955,7 +2999,7 @@ local function generate_peaks(filepath, display_width)
     buf.clear()
     local retval = reaper.PCM_Source_GetPeaks(src, peakrate, 0, 1, n_spls, 0, buf)
     reaper.PCM_Source_Destroy(src)
-    actual = math.min(retval & 0xFFFFF, n_spls)
+    actual = math.min((retval or 0) & 0xFFFFF, n_spls)   -- nil = no peaks read
     if actual < 2 then return end
     local mn_ofs = n_spls
     local max_amp = 0
@@ -3130,12 +3174,15 @@ load_sample_to_pad = function(filepath, pad_idx)
   reaper.gmem_write(G.GS_BROWSE_PAD, pad_idx)
   reaper.gmem_write(G.CMD, 63)
 
-  -- Write BPM/Key analysis to gmem for LCD display
+  -- BPM / key to the legacy GS_PAD_BPM / GS_PAD_KEY bands. Nothing in the tree
+  -- reads them any more (the LCD asks for the per-instance root-note band
+  -- itself), so a file the queue has not reached is QUEUED, not analysed
+  -- inline: four decoder passes used to block the UI before the drop
+  -- registered (sweep BRW25, 2026-10-26). The bands are written from what is
+  -- known, as before.
   local a = get_analysis(filepath)
   if not a then
-    -- Run analysis inline for the loaded sample
     analyze_file(filepath)
-    run_analysis(filepath)
     a = analysis_cache[filepath]
   end
   if a and a.analyzed then
@@ -3300,7 +3347,6 @@ local xdrag = {
   stamp    = 0,      -- last stamp we published
   inst     = nil,    -- instance that claimed the broadcast
   pad      = -1,     -- pad that instance reports the cursor is over
-  pad_t    = 0,      -- when that claim arrived
   at       = nil,    -- "mode:x:y" the claim was given for; a still cursor
                      -- keeps the claim alive, a moved one invalidates it
 }
@@ -3330,7 +3376,7 @@ end
 function xdrag.abort()
   xdrag.clear()
   xdrag.active, xdrag.paths = false, nil
-  xdrag.inst, xdrag.pad, xdrag.pad_t, xdrag.at = nil, -1, 0, nil
+  xdrag.inst, xdrag.pad, xdrag.at = nil, -1, nil
 end
 
 -- The cursor's position in CLIENT pixels of the topmost jsfx_gfx surface,
@@ -3391,6 +3437,19 @@ function xdrag.hit()
   return nil
 end
 
+-- Where the cursor IS, as the held claim remembers it: "mode:x:y". A BLIND
+-- broadcast carries no coordinates (an embedded instance tests its own bounds),
+-- so its place is the SCREEN cursor -- with the constant 0:0 the "cursor moved"
+-- test below never fired over REAPER, and a release anywhere over it, with
+-- nothing lit, loaded the last pad that had been (sweep BRW6, 2026-10-26).
+function xdrag.where(mode, cx, cy)
+  if mode == G.EON_DRAG_MODE_BLIND then
+    local sx, sy = reaper.GetMousePosition()
+    return mode .. ":" .. sx .. ":" .. sy
+  end
+  return mode .. ":" .. cx .. ":" .. cy
+end
+
 -- Called at BeginDragDropSource: remember what is being dragged. That returns
 -- true on EVERY frame of the drag, not just the first, so this must be
 -- idempotent.
@@ -3402,7 +3461,7 @@ function xdrag.begin_drag(single_path, multi)
   end
   if #paths == 0 then paths = {single_path} end
   xdrag.active, xdrag.paths = true, paths
-  xdrag.inst, xdrag.pad, xdrag.pad_t = nil, -1, 0
+  xdrag.inst, xdrag.pad = nil, -1
 end
 
 -- Read whichever instance claimed the current broadcast. Exactly one should:
@@ -3496,7 +3555,7 @@ function xdrag.update()
       -- refusing the drop then would be the one case this whole mechanism has
       -- to get right.
       local m, cx, cy = xdrag.hit()
-      if m and xdrag.at == (m .. ":" .. cx .. ":" .. cy) then
+      if m and xdrag.at == xdrag.where(m, cx, cy) then
         inst, pad, code = xdrag.inst, xdrag.pad, xdrag.code
       end
     end
@@ -3521,10 +3580,10 @@ function xdrag.update()
 
   -- Read the claim BEFORE publishing this frame's coords, so the pad we hold
   -- always corresponds to a broadcast the instances have already answered.
-  local here = mode .. ":" .. cx .. ":" .. cy
+  local here = xdrag.where(mode, cx, cy)
   local inst, pad, code = xdrag.read_claim()
   if inst and pad then
-    xdrag.inst, xdrag.pad, xdrag.code, xdrag.pad_t = inst, pad, code, reaper.time_precise()
+    xdrag.inst, xdrag.pad, xdrag.code = inst, pad, code
     xdrag.at = here    -- remember WHERE this answer was given
   elseif xdrag.at and xdrag.at ~= here then
     -- The cursor has moved and nobody has answered for the new position yet.
@@ -3883,10 +3942,8 @@ local function draw_shortcuts_panel(ctx)
             end
           end
         end
-        if cat_counts["other"] and cat_counts["other"] > 0 then
-          -- "other" rendered last (already gets its turn in the order
-          -- iteration; this comment just documents the ordering choice)
-        end
+        -- "other" is not in the category order, so it gets no row here; its
+        -- files show only under All.
       end
     end
 
@@ -4463,6 +4520,16 @@ local function draw_file_table(ctx)
     end -- while ListClipper_Step
     ImGui.ListClipper_End(ui.clipper)
 
+    -- Click empty space = deselect all. INSIDE the table (sweep BRW28,
+    -- 2026-10-26): with ScrollY the body is its own child window, so after
+    -- EndTable a click on the blank rows was never "this window hovered" and
+    -- did nothing, while a click in a gap beside the Vol slider -- the pane
+    -- itself -- wiped a multi-selection.
+    if ImGui.IsWindowHovered(ctx) and ImGui.IsMouseClicked(ctx, 0)
+       and not ImGui.IsAnyItemHovered(ctx) then
+      clear_selection()
+    end
+
     ImGui.EndTable(ctx)
 
     -- Deferred deselect (Windows Explorer behavior):
@@ -4482,12 +4549,6 @@ local function draw_file_table(ctx)
         file_mgr.pending_deselect = 0
       end
     end
-
-    -- Click empty space = deselect all
-    if ImGui.IsWindowHovered(ctx) and ImGui.IsMouseClicked(ctx, 0)
-       and not ImGui.IsAnyItemHovered(ctx) then
-      clear_selection()
-    end
   end
 
   ImGui.PopStyleColor(ctx)  -- Col_Header (pushed before BeginTable, always popped)
@@ -4503,7 +4564,7 @@ local function draw_waveform(ctx, x, y, w, h)
   -- width changed. FFT is expensive — never compute every frame; cached
   -- result reused until next file selection or toggle invalidation.
   local spectral = nil
-  if settings.spectral_view and waveform.cached_file ~= "" then
+  if settings.spectral_view and waveform.cached_file ~= "" and waveform.peak_count > 0 then   -- a file with no peaks has no spectrum (sweep BRW24)
     if waveform.spectral_cached_file ~= waveform.cached_file
        or math.abs(waveform.spectral_cached_w - w) > w * 0.2 then
       waveform.spectral_data = calculate_spectral_data(waveform.cached_file, math.max(64, math.floor(w)))
@@ -4548,7 +4609,14 @@ local function draw_playback_bar(ctx)
     -- interleaved stereo in Swing_ReaKit.jsfx): 45 s at 44.1k, 20 s at 96k. Said here, in the
     -- browser's own warning colour, where the drop can still be avoided.
     if sel.duration and sel.duration > 0 then
-      local pad_cap = 2000000 / ((sel.sr and sel.sr > 0) and sel.sr or 44100)
+      -- At the rate it is STORED at: a file above the Store ceiling (48k by
+      -- default; 0 = Native, no ceiling) is converted as it loads (the kit
+      -- bridge's eon_store_rate), so a 30 s 96k file fits where its own rate
+      -- said it would not (sweep BRW29, 2026-10-26).
+      local sr = (sel.sr and sel.sr > 0) and sel.sr or 44100
+      local cap = tonumber(settings.store_rate_max) or 48000
+      if cap > 0 and sr > cap then sr = cap end
+      local pad_cap = 2000000 / sr
       if sel.duration > pad_cap then
         ImGui.SameLine(ctx)
         ImGui.PushStyleColor(ctx, ImGui.Col_Text, widgets.ink(0xFFAA44FF))
@@ -5070,7 +5138,7 @@ local SHORTCUTS = {
     {"O",            "Dock / Undock browser"},
   }},
   {section = "Misc", items = {
-    {"Esc",          "Clear search → clear filter → stop preview"},
+    {"Esc",          "Leave search → clear filter → stop preview"},
     {"? or F1",      "Show this dialog"},
   }},
 }
@@ -5231,9 +5299,9 @@ local function handle_keys(ctx)
     end
   end
 
-  -- Escape: clear search if focused, else clear category filter, else
-  -- stop preview. Layered behavior — first Esc gets you out of search,
-  -- second clears any active category filter, third stops audio.
+  -- Escape: layered — first Esc leaves the search box (ImGui handles that;
+  -- nothing here clears search.query), the next clears any active category
+  -- filter, the one after stops audio.
   if ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
     if input_active then
       -- ImGui handles input deactivation; nothing to do
@@ -5267,7 +5335,7 @@ local function handle_keys(ctx)
   -- Up/Down = change selection (only when search isn't focused)
   if not ImGui.IsAnyItemActive(ctx) then
     local entries = get_display_entries()
-    -- mods already captured at line 4102 (enclosing scope)
+    -- mods captured above in handle_keys
     if ImGui.IsKeyPressed(ctx, ImGui.Key_UpArrow) then
       local new_idx = math.max(1, file_mgr.selected_index - 1)
       file_mgr.selected_index = new_idx
@@ -5585,6 +5653,26 @@ local function frame()
   -- Update preview position
   preview_update()
 
+  -- Follow the SHARED target (sweep BRW8, 2026-10-26). The title, the pad
+  -- tiles and the pad actions read gmem INSTANCE, which the mini browser, Pad
+  -- FX and Choppa re-point; the loads wrote the browser's own active_inst_id
+  -- back, so what was shown was not where a double-click loaded. An id
+  -- another surface set is adopted when it is in the registry (by presence,
+  -- not heartbeat: heartbeats freeze with the audio device); the browser's
+  -- own writes are unchanged.
+  do
+    local gi = math.floor(reaper.gmem_read(G.INSTANCE) or 0)
+    if gi > 0 and gi ~= active_inst_id then
+      for s = 0, G.GS_INST_REG_MAX - 1 do
+        local base = G.GS_INST_REG_BASE + s * G.GS_INST_REG_STRIDE
+        if math.floor(reaper.gmem_read(base + G.GS_INST_REG_OFF_ID) or 0) == gi then
+          active_inst_id = gi
+          break
+        end
+      end
+    end
+  end
+
   -- Swing-presence gate (~1 Hz rescan): every Swing-coupled pane reads the
   -- shared gmem blob, which OUTLIVES the FX — after deleting the last Swing
   -- (or in a fresh project) the browser kept painting the previous
@@ -5597,8 +5685,10 @@ local function frame()
     if (ui.swing_check_t or 0) + 1.0 < now_t then
       ui.swing_check_t = now_t
       ui.swing_present = false
-      for ti = 0, reaper.CountTracks(0) - 1 do
-        local tr = reaper.GetTrack(0, ti)
+      -- The master track too (core's rule: a Swing there is a Swing; the title
+      -- scan and the loads already saw it, this gate alone did not -- sweep
+      -- BRW30, 2026-10-26).
+      for tr in core.iter_all_tracks() do
         for fx = 0, reaper.TrackFX_GetCount(tr) - 1 do
           if core.is_swing_fx(tr, fx) then   -- the plugin's file, never its shown name
             ui.swing_present = true
@@ -5630,16 +5720,28 @@ local function frame()
           if math.floor(reaper.gmem_read(G.INSTANCE) or 0) == stale_id then
             reaper.gmem_write(G.INSTANCE, 0)
           end
-          for s = 0, G.GS_INST_REG_MAX - 1 do
-            local base = G.GS_INST_REG_BASE + s * G.GS_INST_REG_STRIDE
-            local id        = math.floor(reaper.gmem_read(base + G.GS_INST_REG_OFF_ID) or 0)
-            local heartbeat =            reaper.gmem_read(base + G.GS_INST_REG_OFF_HEARTBEAT) or 0
-            if id > 0 and heartbeat > 0 and (now_t - heartbeat) < G.GS_INST_REG_TIMEOUT then
-              active_inst_id = id
-              reaper.gmem_write(G.INSTANCE, id)
-              break
-            end
-          end
+        end
+      end
+      -- No target while a Swing IS here: one just dropped above, or none was
+      -- ever picked -- opened by its hotkey, into an empty project, or with
+      -- the audio device closed so init's heartbeat test found nobody. The
+      -- re-pick used to live inside the branch above, so a browser that
+      -- started with no target never got one: INSTANCE stayed 0 and every
+      -- load went to an id no Swing has (sweep BRW7, 2026-10-26). What
+      -- another surface pointed INSTANCE at comes first, else the first alive
+      -- id, as init picks.
+      if active_inst_id == 0 and ui.swing_present then
+        local gi, pick = math.floor(reaper.gmem_read(G.INSTANCE) or 0), 0
+        for s = 0, G.GS_INST_REG_MAX - 1 do
+          local base = G.GS_INST_REG_BASE + s * G.GS_INST_REG_STRIDE
+          local id        = math.floor(reaper.gmem_read(base + G.GS_INST_REG_OFF_ID) or 0)
+          local heartbeat =            reaper.gmem_read(base + G.GS_INST_REG_OFF_HEARTBEAT) or 0
+          if id > 0 and id == gi then pick = id; break end
+          if pick == 0 and id > 0 and heartbeat > 0 and (now_t - heartbeat) < G.GS_INST_REG_TIMEOUT then pick = id end
+        end
+        if pick > 0 then
+          active_inst_id = pick
+          reaper.gmem_write(G.INSTANCE, pick)
         end
       end
     end

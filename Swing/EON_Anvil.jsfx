@@ -68,15 +68,17 @@ options:gfx_hz=60 gfx_idle no_meter
 // component: no gmem, no bridge calls, no companion script, plain stereo
 // pins. It loads on any track in any project whether or not Swing is
 // installed — vocals, bass, guitars, room mics, the lot. Swing is where it
-// LIVES, not what it needs. Its only imports are two shared ReaKit GUI libs
-// plus its own generated constants, so those three files are the whole
+// LIVES, not what it needs. Its imports are two shared ReaKit GUI libs
+// (knobs_kbsg, rk_vu) and its engine lib rk_anvil, which brings its own
+// generated constants (anvil_fitted): those four files are the whole
 // dependency set. Any future Swing integration (auto-insert, link deck,
 // theme-follow) must stay strictly ADDITIVE — it can never become required.
 //
-// Dev status: lives beside Swing for testing; NOT in any manifest (does
-// not ship — see JSFX_EXCLUDE in gen_manifest.py), not wired to Swing. The
-// rename landmine (the bus comp went EON Weld -> EON Weld 2026-08-24) is a separate
-// step.
+// Status: ships with Swing (both installers and ReaPack; JSFX_EXCLUDE in
+// gen_manifest.py has been empty since 2026-08-25). The circuit is shared
+// with Swing through a lib, not a connection: libs/rk_anvil.jsfx-inc is
+// imported by this file AND by Swing, whose master comp runs it as the Anvil
+// voice.
 
 slider1:anv_sl_in=0<-30,24,0.1>-Input drive (dB)
 slider2:anv_sl_out=0<-24,24,0.1>-Output (dB)
@@ -103,7 +105,14 @@ import libs/rk_vu.jsfx-inc
 import libs/rk_anvil.jsfx-inc
 
 @init
-ext_noinit = 0;
+// ⭐ ext_noinit = 1 (sweep PLG1, 2026-10-26). It was 0 from the first commit, with no reason recorded,
+// and this file has no @serialize: REAPER therefore re-zeroed EVERY variable and re-ran this whole
+// section on every play start and every enable (wiki 3.2, counted) -- both 257x513 cell surfaces
+// rebuilt, the self-check re-run, the XTRAS drawer snapped shut, the needle and both detectors reset,
+// and the output cores reseated under flowing audio. Nothing here needs the re-run: anv_engine_block
+// re-latches srate and every rate-derived constant, rk_vu reads the live srate per step, and the
+// voice / bypass / gain targets follow the sliders through anv_rc_req. Same as Weld and Swing.
+ext_noinit = 1;
 gfx_ext_retina == 0 ? gfx_ext_retina = 1;
 // ⚠ 0x100 is NOT what makes an embed work. REAPER sets bit 1 itself when a
 //   JSFX is embedded (6.30+); 0x100 only asks for the embed to be drawn
@@ -116,8 +125,6 @@ gfx_ext_flags |= 0x100 | 0x400;
 
 // ── functions (definition order matters: EEL2 resolves at definition time) ──
 
-// Stable positive root of a*x^2 + b*x + c = 0. b >= 1 here; the c/q branch
-// stays finite as a -> 0 (ln_k near 0.5), where the schoolbook form cancels.
 // The circuit itself lives in libs/rk_anvil.jsfx-inc (phase 2 of the comp-voices
 // spec): anv_engine_init / anv_engine_block / anv_process. What is left here is
 // the face -- knobs, meter, chips -- and the five lines of host memory below.
@@ -156,10 +163,9 @@ function anv_wt(fs, s) local(i, c, dig) (
 );
 
 // Needle position -> GR dB. The VU lib owns the ballistics (fed per sample
-// with the actual applied gain). On rk_vu the needle position IS the linear
-// gain it shows (1 = no reduction), so this is one log, not an inversion of
-// the old spring's calibration constants: the needle and the readout are the
-// same number by construction. Same call EON Weld makes.
+// with the actual applied gain). rk_vu's GR needle position is already dB of
+// reduction (0 = none), so this only negates it: the needle and the readout
+// are the same number by construction. Same call EON Weld makes.
 function anv_gr_db() ( -gr_vu.pos; );   // rk_vu's GR pos IS dB of reduction, 0 = none
 
 // Letter-spaced silkscreen. Real panel legends are tracked out; drawing
@@ -202,7 +208,7 @@ function anv_sep(y) (
 // and noisy at strip size, while ticks are already the coarsest mark.
 function anv_knob(cx, cy, r, val, vmin, vmax, usearc, hov)
   local(t, a, i, f, ta, maj, lit, r0, r1, px, py, sa, ca, ar, n,
-        cr, cg, cb, lr, lg, lb, tw, th, nx, ny, sh, rk, rt, t2) (
+        tw, th, nx, ny, sh, rk, rt, t2) (
   t = (vmax - vmin) != 0 ? (val - vmin)/(vmax - vmin) : 0;
   t < 0 ? t = 0; t > 1 ? t = 1;
   a = ANV_KSTART + t*ANV_KSWEEP;
@@ -482,12 +488,6 @@ gx_fw = micro ? 1 : max(1, min(W/(420*sc), 1.20));
 mx = mouse_x; my = mouse_y;
 LMB = mouse_cap & 1;
 lmb_down = LMB && !prev_LMB;
-// Face sheet open (rk_vu_picker, called last): widgets drawn before it must
-// not see this click. Stash the press edge; the picker call restores it.
-// ⚠️Stashed ONLY while the sheet is open: closed, the picker takes what the
-// widgets leave, so a click the THEME panel swallowed cannot also open it
-// (GainKit's FOLLOW chip did, 2026-09-28; wiki 4.5).
-_anv_pk_lmb = 0; !micro && gr_vu.pk_open ? ( _anv_pk_lmb = lmb_down; lmb_down = 0; );
 RMB = mouse_cap & 2;
 rmb_down = RMB && !prev_RMB;
 CTRL = mouse_cap & 4;
@@ -495,6 +495,17 @@ SHIFT = mouse_cap & 8;
 gx_dt = min(time_precise() - gx_lt, 0.05); gx_lt = time_precise();
 dt = gx_dt; tau = 2*$pi; hv_speed = 11;   // knobs_kbsg caller contract
 frame_wheel = mouse_wheel/120;
+// Face sheet open (rk_vu_picker, called last): widgets drawn before it must
+// not see this click. Stash the press edge; the picker call restores it.
+// ⚠️Stashed ONLY while the sheet is open: closed, the picker takes what the
+// widgets leave, so a click the THEME panel swallowed cannot also open it
+// (GainKit's FOLLOW chip did, 2026-09-28; wiki 4.5).
+// The right button and the wheel go with it (sweep PLG10): the sheet covers the
+// INPUT / OUTPUT caps in the default window, and ssl_knob_interact resets on
+// hover + rmb_down and turns on hover + frame_wheel -- under the sheet they
+// turned or snapped a knob nobody could see. The picker uses neither, so they
+// are dropped, not stashed.
+_anv_pk_lmb = 0; !micro && gr_vu.pk_open ? ( _anv_pk_lmb = lmb_down; lmb_down = 0; rmb_down = 0; frame_wheel = 0; );
 // Clear 0x200 UNCONDITIONALLY (house pattern: Drum Strip:1590, Swing_ReaKit,
 // Weld post-2026-08-27): gfx_ext_flags is ONE variable shared by both @gfx
 // passes, so a micro-gated clear leaves the embed's end-of-frame re-arm
@@ -549,8 +560,8 @@ gfx_gradrect(0, 0, W, H,
 show_chrome = !micro && H >= floor(120*ret);
 gx_hov = 0;
 
-// ── Needle physics: lightly under-damped spring chasing the true GR from
-// the solved surface (the meter reads the same table the audio uses).
+// ── Readout target: the GR chip shows the VU lib's needle position (the
+// ballistics run per sample inside rk_vu, fed the applied gain), zero in bypass.
 gx_tgt = anv_sl_byp > 0.5 ? 0 : anv_gr_db();
 
 // ── Layout ─────────────────────────────────────────────────────────────
@@ -660,8 +671,13 @@ rk_vu_cap_led(gr_vu.over > 0);
 // about it. INPUT is the threshold on this topology, so the arriving level
 // is the number you set INPUT against.
 gx_ind = anv_pk > 0.0000158 ? log(anv_pk)*8.68588963806504 : -99;
-gx_ind > -98 ? sprintf(#anv_val, "IN %.0f    GR %.1f", gx_ind, -gx_tgt)
-             : sprintf(#anv_val, "IN --    GR %.1f", -gx_tgt);
+// abs(gx_tgt), not -gx_tgt (sweep PLG11): in bypass gx_tgt is +0, unary minus flips its sign
+// bit and "%.1f" keeps it, so the chip read "GR -0.0" until bypass was lifted while the active
+// rest state printed "GR 0.0". GR is never negative (gx_tgt <= 0: rk_vu's pos is dB of
+// reduction), so abs() is the same number with no sign to carry. ⚠️ Not `0 - gx_tgt`: EEL2
+// folds that back into the negate and prints "-0.0" too (measured in the harness, 2026-10-26).
+gx_ind > -98 ? sprintf(#anv_val, "IN %.0f    GR %.1f", gx_ind, abs(gx_tgt))
+             : sprintf(#anv_val, "IN --    GR %.1f", abs(gx_tgt));
 gx_cy = gx_vbot + floor(8*(micro ? ret : sc));
 anv_chip(gx_mfc, gx_cy, floor(min(158*sc*gx_fw, gx_mfw - floor(16*sc))), floor(19*sc),
          0.86, 0.72, 0.42);
@@ -712,7 +728,7 @@ gx_rt_show ? (
   gx_ry = micro ? gx_cy + floor(20*ret) : gx_ry_f;
   gx_i = 0;
   loop(5,
-    gx_bx = gx_rx + gx_i*(gx_bw + gx_gap) + (gx_i == 4 ? 0 : 0);
+    gx_bx = gx_rx + gx_i*(gx_bw + gx_gap);
     gx_bwc = gx_i == 4 ? gx_aw : gx_bw;
     gx_bhov = mx >= gx_bx && mx <= gx_bx + gx_bwc && my >= gx_ry && my <= gx_ry + gx_bh;
     gx_bhov && lmb_down ? ( anv_sl_ratio = gx_i; slider_automate(16); atomic_set(anv_rc_req, 1); );
@@ -1009,7 +1025,8 @@ anv_xt_open ? (
                gx_supax,            gx_supay + gx_supts);
 );
 
-// ── Footer: bypass bar, 2x chip, selftest LED ──────────────────────────
+// ── Footer: bypass bar (a bypass dot when there is no room for it); the
+// selftest LED and brand corner follow below ──────────────────────────────
 gx_bp_show ? (
   gx_bpw = micro ? floor(W*0.7) : floor(146*sc*gx_fw);
   gx_bph = micro ? floor(18*ret) : floor(27*sc);

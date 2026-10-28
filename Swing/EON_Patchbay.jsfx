@@ -26,12 +26,13 @@ desc:EON Patchbay
 // link_inst: the Swing's INSTANCE ID, pushed by the bridge when Wired switches
 // on and re-stamped by its identity walker; it selects the ring, resolved from
 // the registry every block (C-1). link_slot: Swing's registry slot at Wired-on
-// (session-volatile), the ring only while no id is set. Neither is a user
-// control.
+// (session-volatile), the ring only while no id is set; -1 = none yet (sweep
+// PLG19: a fresh Patchbay is PARKED -- it writes no ring -- until the bridge
+// links it, instead of stamping slot 0's ring). Neither is a user control.
 
 options:gmem=Swing_Media_Transfer no_meter
 
-slider1:link_slot=0<0,15,1>-Instance slot (internal; set by the bridge)
+slider1:link_slot=-1<-1,15,1>-Instance slot (internal; set by the bridge; -1 = none yet)
 slider2:link_inst=0<0,99999999,1>-Link Instance (internal; bridge-set)
 
 in_pin:Return L
@@ -173,7 +174,7 @@ gfx_ext_retina == 0 ? gfx_ext_retina = 1;
 //   WITHOUT DECORATION (7.45+), and 0x400 suppresses REAPER's own tooltip
 //   over it (7.79+). Reading 0x100 as "embed support" is how the README came
 //   to tell users below 7.45 that nothing could embed at all.
-// Embed support -- 0x100 MUST be set in @init (REAPER 7.45+); 0x400 = no MCP
+// 0x100 = undecorated embed, set in @init (REAPER 7.45+); 0x400 = no MCP
 // hover tooltip over the embed (7.79+; older ignores).
 gfx_ext_flags |= 0x100 | 0x400;
 
@@ -212,6 +213,14 @@ function pb_aim(slot) (
   gmem[_pb_base + PATCH_OFF_GEN]   = (gmem[_pb_base + PATCH_OFF_GEN] | 0) + 1;
 );
 
+// PARK the producer (sweep PLG6 / PLG19): no ring, so no gmem write anywhere -- @init, @block, @sample and
+// @gfx all test _pb_slot < 0. The channels are still zeroed and metered in @sample. Left by pb_aim.
+function pb_park() (
+  _pb_slot = -1;
+  _pb_base = -1;
+  _pb_wpos = 0;
+);
+
 _pb_slot = -1;
 _pb_votes = 0; _pb_chb_seen = -1;
 _pb_fit = samplesblock <= PATCH_FRAMES ? 64 : 0;   // blocks in a row that fit the new ring (capped at 64): see @block
@@ -220,26 +229,36 @@ _pb_fit = samplesblock <= PATCH_FRAMES ? 64 : 0;   // blocks in a row that fit t
 // project first); this @init re-runs at every play start, and aiming at link_slot there bumped another Swing's
 // ring and seeded the layout below from it -- the old layout for our first blocks of every Play, bank B through
 // bank A's pairs until the votes and the registry re-aim caught up (2026-10-12).
-_pb_fs = -1; _pb_s = 0;
+// With an id the registry does not hold (yet), NO fallback to link_slot and no aim at all: parked until @block
+// finds the id (sweep PLG6 -- the stale slot may be another Swing's ring by now). Without an id, link_slot, and
+// only a real one: a fresh Patchbay's default is -1 (it was 0, and TrackFX_AddByName ran this @init before the
+// bridge had linked it, so the stamp below -- WPOS 0, GEN + 1, HB 0 -- landed on slot 0's ring and its Swing
+// re-primed, two blocks of its Wired kit gone at every Wired-on of ANOTHER Swing; sweep PLG19).
+_pb_fs = -1; _pb_s = 0; _pb_miss = 0;
 (link_inst | 0) > 0 ? loop(PB_REG_MAX,
   (_pb_fs < 0 && (gmem[PB_REG_BASE + _pb_s * PB_REG_STRIDE] | 0) == (link_inst | 0)) ? _pb_fs = _pb_s;
   _pb_s += 1;
 );
-pb_aim(_pb_fs >= 0 ? _pb_fs : (link_slot | 0));
+_pb_aim_at = (link_inst | 0) > 0 ? _pb_fs : (link_slot | 0);
+_pb_aim_at >= 0 ? pb_aim(_pb_aim_at) : pb_park();
 // The layout, SEEDED from this ring's own header (step 5). REAPER re-runs this @init, every variable zeroed first,
 // on every play start and every enable (no ext_noinit, no @serialize: wiki 3.2). Starting each time in the old
 // layout made every Play renegotiate -- two more held blocks, the first two blocks of every pad lost (review
 // 2026-10-12). The previous incarnation stamped NCH every block, and a step-5 consumer writes CONS_V2 beside
 // CONS_HB, so the new layout carries over exactly when it was in force and its consumer is a step-5 Swing; the
-// votes in @block undo a wrong seed within two blocks. A fresh Patchbay on a ring nobody uses gets the old one.
-_pb_v2 = ((gmem[_pb_base + PATCH_OFF_NCH] | 0) == PATCH_CHANS
+// votes in @block undo a wrong seed within two blocks. A fresh Patchbay on a ring nobody uses gets the old one,
+// and so does a parked one (no ring to read).
+_pb_v2 = (_pb_slot >= 0
+          && (gmem[_pb_base + PATCH_OFF_NCH] | 0) == PATCH_CHANS
           && gmem[_pb_base + PATCH_OFF_CONS_V2] == gmem[_pb_base + PATCH_OFF_CONS_HB]
           && samplesblock <= PATCH_FRAMES) ? 1 : 0;
 _pb_nch   = _pb_v2 ? PATCH_CHANS  : PATCH_CHANS_V1;   // = pb_layout(), written out so @init is seen to set them
 _pb_depth = _pb_v2 ? PATCH_FRAMES : PATCH_FRAMES_V1;
-gmem[_pb_base + PATCH_OFF_NCH] = _pb_nch;
-gmem[_pb_base + PATCH_OFF_HB] = 0;
-gmem[_pb_base + PATCH_OFF_NCH_HB] = 0;   // = HB: the layout stamp is this producer's from the first block
+_pb_slot >= 0 ? (
+  gmem[_pb_base + PATCH_OFF_NCH] = _pb_nch;
+  gmem[_pb_base + PATCH_OFF_HB] = 0;
+  gmem[_pb_base + PATCH_OFF_NCH_HB] = 0;   // = HB: the layout stamp is this producer's from the first block
+);
 _pb_hb   = 0;
 
 // Per-pad peaks. _pb_acc fills in @sample (audio thread), @block hands the
@@ -258,8 +277,8 @@ loop(PATCH_PCOLS, _pb_acc[_pb_c] = 0; _pb_pk[_pb_c] = 0; _pb_gpk[_pb_c] = 0; _pb
 // link_slot speaks only while no instance id is set (link_inst 0: a chunk saved
 // before C-1, or a Patchbay the bridge is still stamping). With an id, @block
 // resolves the slot from the registry every block. Re-pointing never clears
-// the ring (pb_aim).
-(link_inst | 0) == 0 && (link_slot | 0) != _pb_slot ? pb_aim(link_slot | 0);
+// the ring (pb_aim). A -1 (the fresh default) aims nowhere: parked.
+(link_inst | 0) == 0 && (link_slot | 0) >= 0 && (link_slot | 0) != _pb_slot ? pb_aim(link_slot | 0);
 
 @block
 
@@ -282,7 +301,19 @@ loop(PATCH_PCOLS, _pb_acc[_pb_c] = 0; _pb_pk[_pb_c] = 0; _pb_gpk[_pb_c] = 0; _pb
     (_pb_fs < 0 && (gmem[PB_REG_BASE + _pb_s * PB_REG_STRIDE] | 0) == (link_inst | 0)) ? _pb_fs = _pb_s;
     _pb_s += 1;
   );
-  (_pb_fs >= 0 && _pb_fs != _pb_slot) ? pb_aim(_pb_fs);
+  _pb_fs >= 0 ? (
+    _pb_miss = 0;
+    _pb_fs != _pb_slot ? pb_aim(_pb_fs);   // found, or found again after a park: a fresh incarnation
+  ) : (
+    // Not found: keep the aim for about a second (the cases above), then PARK (sweep PLG6). An orphaned
+    // Patchbay -- its Swing deleted, the plugin left on the track -- otherwise kept writing frames, WPOS and
+    // its heartbeat into a ring another Swing may own by now, and that Swing drained its silence or saw HB
+    // jump and re-primed. In the stream's clock (samples), as every liveness window here.
+    _pb_slot >= 0 ? (
+      _pb_miss += samplesblock;
+      _pb_miss >= srate ? pb_park();
+    );
+  );
 );
 
 // ── The layout (Pad Banks Outputs step 5) ──────────────────────────────────
@@ -296,24 +327,26 @@ loop(PATCH_PCOLS, _pb_acc[_pb_c] = 0; _pb_pk[_pb_c] = 0; _pb_gpk[_pb_c] = 0; _pb
 // buffer near its depth -- some blocks over, some split shorter -- cannot flip the layout to and fro (each flip
 // is a re-prime). Without such a block the count stays full and the two votes decide.
 _pb_fit = samplesblock <= PATCH_FRAMES ? min(_pb_fit + 1, 64) : 0;
-_pb_ch2 = gmem[_pb_base + PATCH_OFF_CONS_HB];
-_pb_ch2 != _pb_chb_seen ? (
-  _pb_chb_seen = _pb_ch2;
-  _pb_want = (gmem[_pb_base + PATCH_OFF_CONS_V2] == _pb_ch2 && _pb_fit >= 64) ? 1 : 0;
-  _pb_want == _pb_v2 ? _pb_votes = 0 : _pb_votes += 1;
-  _pb_votes >= 2 ? ( _pb_v2 = _pb_want; _pb_votes = 0; pb_layout(); pb_aim(_pb_slot); );
-);
-// A block the new ring cannot hold drops to the old layout at once, consumer or not.
-_pb_v2 && samplesblock > PATCH_FRAMES ? ( _pb_v2 = 0; _pb_votes = 0; pb_layout(); pb_aim(_pb_slot); );
-// Re-asserted every block: a fresh Patchbay's @init stamps its default slot 0 before the bridge links it, and
-// that foreign stamp must not stand as slot 0's layout for longer than a block.
-gmem[_pb_base + PATCH_OFF_NCH] = _pb_nch;
+// Parked (no ring): no vote, no stamp, no heartbeat -- nothing of ours on anybody's ring.
+_pb_slot >= 0 ? (
+  _pb_ch2 = gmem[_pb_base + PATCH_OFF_CONS_HB];
+  _pb_ch2 != _pb_chb_seen ? (
+    _pb_chb_seen = _pb_ch2;
+    _pb_want = (gmem[_pb_base + PATCH_OFF_CONS_V2] == _pb_ch2 && _pb_fit >= 64) ? 1 : 0;
+    _pb_want == _pb_v2 ? _pb_votes = 0 : _pb_votes += 1;
+    _pb_votes >= 2 ? ( _pb_v2 = _pb_want; _pb_votes = 0; pb_layout(); pb_aim(_pb_slot); );
+  );
+  // A block the new ring cannot hold drops to the old layout at once, consumer or not.
+  _pb_v2 && samplesblock > PATCH_FRAMES ? ( _pb_v2 = 0; _pb_votes = 0; pb_layout(); pb_aim(_pb_slot); );
+  // Re-asserted every block (a stamp another incarnation left must not stand for longer than a block).
+  gmem[_pb_base + PATCH_OFF_NCH] = _pb_nch;
 
-// The heartbeat is a COUNTER, not a clock — this has no wall clock and Swing
-// only needs to know it moved.
-_pb_hb += 1;
-gmem[_pb_base + PATCH_OFF_HB] = _pb_hb;
-gmem[_pb_base + PATCH_OFF_NCH_HB] = _pb_hb;   // with HB: the NCH stamp is this beating producer's (step 5)
+  // The heartbeat is a COUNTER, not a clock — this has no wall clock and Swing
+  // only needs to know it moved.
+  _pb_hb += 1;
+  gmem[_pb_base + PATCH_OFF_HB] = _pb_hb;
+  gmem[_pb_base + PATCH_OFF_NCH_HB] = _pb_hb;   // with HB: the NCH stamp is this beating producer's (step 5)
+);
 
 // Hand last block's peaks to the face and start the next block clean. @block
 // runs before this block's @sample, so the copy is always a whole block.
@@ -338,18 +371,22 @@ loop(_pb_nch,
   // audio feeds the reverb and delay buffers, the master filters and the
   // compressor's detector. Swing's own guard sits at its OUTPUT, which is too
   // late -- zeroing an output cannot clean a filter whose history already holds
-  // a NaN, and the plugin only has to misbehave once. Same policy Swing uses
-  // there (a NaN fails every comparison, so the test is written to catch it),
-  // The abs() is the peak meter's, one line down, so the guard costs one
-  // compare per channel.
+  // a NaN, and the plugin only has to misbehave once. The test keeps a sample
+  // only when 0 <= abs(x) <= 8: that zeroes Inf and runaways (> +18 dBFS) AND a
+  // NaN. `!(abs(x) <= 8)` alone missed the NaN: EEL2's compiler folds it into
+  // `abs(x) > 8`, which a NaN fails (measured in REAPER, EON_Probe_NanSem, and in
+  // the ysfx harness, fr_2_test.py, 2026-10-27). `x >= 0` is false for a NaN on
+  // both, so it goes INSIDE the && (a `!` straight over one comparison is folded
+  // the same way: never write `!(abs(x) >= 0)`). The abs() is the peak meter's,
+  // one line down, so the guard costs two compares per channel.
   // ⛔ NO SCIENTIFIC NOTATION. A denormal squelch written `< 1e-30` here made
   // REAPER refuse to compile THIS SECTION ALONE -- @init and @block ran, @sample
   // silently did not, so the ring filled with nothing and Wired went quiet. No
   // static gate saw it (jsfx-lint and the audit both passed the file) and it is
   // the only such literal the codebase has ever contained. Write decimals.
   _pb_a = abs(_pb_v);
-  !(_pb_a <= 8) ? ( _pb_v = 0; _pb_a = 0; );
-  atomic_set(gmem[_pb_row + _pb_c], _pb_v);
+  !(_pb_a >= 0 && _pb_a <= 8) ? ( _pb_v = 0; _pb_a = 0; );
+  _pb_slot >= 0 ? atomic_set(gmem[_pb_row + _pb_c], _pb_v);   // parked: no ring (the channel is still zeroed below)
   // Peak per pair column (both channels fold into one lane): bank A's pads 0..15, then (the new layout) the
   // bank sends 16/17, Bank B/C/D 18..20, Own 1-10 21..30.
   _pb_pi = (_pb_c * 0.5) | 0;
@@ -363,7 +400,7 @@ loop(_pb_nch,
 
 _pb_wpos += 1;
 _pb_wpos >= _pb_depth ? _pb_wpos = 0;
-atomic_set(gmem[_pb_base + PATCH_OFF_WPOS], _pb_wpos);
+_pb_slot >= 0 ? atomic_set(gmem[_pb_base + PATCH_OFF_WPOS], _pb_wpos);
 
 @gfx 300 900
 // ⚠️ @gfx sets the EMBED ASPECT (house rule: portrait, so the strip pairs with
@@ -396,9 +433,13 @@ sc = max(0.5, min(W / 300, H / 700));
 _pb_full = W >= 150 && H >= 663 * sc + max(8, 10 * sc);
 
 // ── Is Swing reading the ring? Its consumer counter moves every live block. ─
-_pb_chb = gmem[_pb_base + PATCH_OFF_CONS_HB];
+_pb_chb = _pb_slot >= 0 ? gmem[_pb_base + PATCH_OFF_CONS_HB] : 0;   // parked: no ring to read
 _pb_chb != _pb_chb_prev ? ( _pb_chb_prev = _pb_chb; _pb_chb_t = time_precise(); );
 _pb_listening = _pb_chb > 0 && (time_precise() - _pb_chb_t) < 0.5;
+// Why not (sweep PLG20): a buffer deeper than the deeper ring (8184 frames, the old layout) is refused
+// by Swing (patch_live needs samplesblock <= the ring's depth), so the lamp's "Wired off?" was wrong
+// there -- say so. samplesblock is the audio thread's; one scalar, read whole, like srate.
+_pb_toobig = samplesblock > PATCH_FRAMES_V1;
 
 // ── Meter ballistics: instant up, ~300 ms fall, on the face's clock ────────
 _pb_now = time_precise();
@@ -452,7 +493,10 @@ _pb_full ? (
   gfx_setfont(2, "Arial", max(8, floor(11 * sc)));
   gfx_set(0.62, 0.65, 0.70, 1);
   gfx_x = floor(30 * sc); gfx_y = floor(35 * sc);
-  gfx_drawstr(_pb_listening ? "Swing is reading the ring" : "not reading -- Wired off?");
+  gfx_drawstr(_pb_listening ? "Swing is reading the ring"
+            : _pb_toobig    ? "buffer too large for Wired (max 8184)"
+            : _pb_slot < 0  ? "not linked to a Swing yet"
+            :                 "not reading -- Wired off?");
   gfx_set(1, 1, 1, 0.06);
   gfx_rect(floor(12 * sc), floor(58 * sc), W - floor(24 * sc), 1);
 
@@ -510,7 +554,8 @@ _pb_full ? (
   gfx_setfont(2, "Arial", max(8, floor(10 * sc)));
   gfx_set(0.72, 0.75, 0.80, 0.95);
   gfx_x = floor(14 * sc); gfx_y = H - floor(44 * sc);
-  sprintf(#_pb_s, "%d channels back to Swing, slot %d.", _pb_nch, _pb_slot);   // the layout in force
+  _pb_slot >= 0 ? sprintf(#_pb_s, "%d channels back to Swing, slot %d.", _pb_nch, _pb_slot)   // the layout in force
+                : strcpy(#_pb_s, "No ring yet: waiting for the bridge to link a Swing.");
   gfx_drawstr(#_pb_s);
   gfx_set(0.52, 0.56, 0.62, 0.9);
   gfx_x = floor(14 * sc); gfx_y = H - floor(31 * sc);
@@ -548,7 +593,7 @@ _pb_full ? (
   _pb_txt_y = max(2, H * 0.012);
   _pb_gfs = max(6, floor(_pb_u * 0.15));
   gfx_setfont(2, "Arial", _pb_gfs, 'b');
-  sprintf(#_pb_s, "%s", _pb_listening ? "READING" : "NOT READING");
+  sprintf(#_pb_s, "%s", _pb_listening ? "READING" : _pb_toobig ? "BUFFER TOO BIG" : "NOT READING");
   gfx_measurestr(#_pb_s, tw, th);
   tw > W - 4 ? (
     _pb_gfs = max(5, floor(_pb_gfs * (W - 4) / max(1, tw)));

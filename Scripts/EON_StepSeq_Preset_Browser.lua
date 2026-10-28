@@ -146,8 +146,10 @@ local slot     = math.max(0, math.min(15, math.floor((r.gmem_read(BROWSER_SLOT) 
 local sel_idx  = -1
 local last_cur = -1     -- last CUR_IDX seen from the bridge (to follow the strip / scroll once)
 -- Seed our select counter from the current gmem value so a fresh launch can't collide
--- with a stale request the bridge already consumed.
-local selseq  = math.floor((r.gmem_read(PB + 0 * PS + 5) or 0) + 0.5)
+-- with a stale request the bridge already consumed. The TARGET slot's cell: the
+-- bridge edge-detects per slot, and a seed from slot 0 while slot 1's counter was
+-- ahead made the first click write a number the bridge had already seen (SCR112).
+local selseq  = math.floor((r.gmem_read(PB + slot * PS + 5) or 0) + 0.5)
 
 local function select_entry(e)
   sel_idx = e.idx

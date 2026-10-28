@@ -16,13 +16,22 @@
 //     the sequencer's SEQ_SIDE_W 600). The bottom slot is the sequencer's gate (rk_seq_ui swing_seq_gate / under_draw):
 //     the sequencer unless placed at the side, the browser when placed below.
 //   * swing_side_draw replaces swing_fb_draw at the host's two draw sites. Closed: the browser's draw alone (its gutter and
-//     chevron). Open: a 22 px row across the top, then the panels. SIDE BY SIDE (pfx_split: two or three open and the slot
-//     as wide as they want): the columns left to right -- the editor, the sequencer, the browser with the gutter -- each
-//     taking the presses in its own column from the gate's stash; the top row shows their titles. TABS otherwise: the front
-//     panel alone (side_front: 0 the browser, 1 the editor, 2 the sequencer) under the tabs; the browser in front draws as
-//     ever; another panel in front: the browser's draw still runs (it owns the gutter, its chevron and its state) but
-//     BLIND -- the mouse parked off-canvas, the stash and the frame's key emptied for the call -- and the panel paints
-//     over its body. A browser placed BELOW (fb_place 3) is never drawn here: the slot paints its own gutter instead
+//     chevron). Open: a 22 px row across the top, then the panels. SIDE BY SIDE (pfx_split: two or more of the open panels
+//     fit the slot): the columns left to right -- the editor, the sequencer, the browser with the gutter -- each taking the
+//     presses in its own column from the gate's stash; the top row shows their titles. Which open panels show
+//     (swing_side_fit; the owner, 2026-10-27: "show as many side by side as fit and stack only the rest as tabs"): the
+//     front panel (side_front: 0 the browser, 1 the editor, 2 the sequencer -- the one picked last) always, then the one in
+//     front before it (side_prev, kept for the session only: a load starts it at -1, the rest in column order), then the
+//     rest in column order, each while the sum of their MINIMUM widths still fits (2026-10-27, "squeeze before tabbing":
+//     the shown ones then share the room, each growing back from its minimum toward its own width in proportion to what
+//     it gave up); they draw in COLUMN order whatever the pick order, the rest of the width past their own widths going
+//     to the last shown column. An open panel left out keeps a TAB cell in the top row at its place in
+//     column order (a press brings it to the front; the least recently picked shown panel becomes the tab). All of them
+//     fitting is the old rule's own test, so that case draws as before. TABS when only the front fits: the front panel
+//     alone under the tabs; the browser in front draws as ever; another panel in front (or the browser left out beside
+//     two others): the browser's draw still runs (it owns the gutter, its chevron and its state) but BLIND -- the mouse
+//     parked off-canvas, the stash and the frame's key emptied for the call -- and the panels paint over its body. A
+//     browser placed BELOW (fb_place 3) is never drawn here: the slot paints its own gutter instead
 //     (swing_side_gutter_draw) -- a blind call would still advance the browser's press and release shadows and its
 //     keyboard flags, and the live browser below missed its drop and lost the filter's focus (the swap's audit).
 //   * The gutter's handle FOLDS the whole slot in every mode; each panel's X (in its title cell) closes that panel alone.
@@ -49,15 +58,80 @@ function swing_side_present(k) ( k == 0 ? fb_place != 3 : k == 1 ? fx_place != 3
 function swing_side_isopen(k)  ( k == 0 ? (fb_open && fb_place != 3) : k == 1 ? (pfx_open && fx_place != 3) : (seq_shown && seq_place == 1); );
 function swing_side_pw(k)      ( k == 0 ? FB_PANEL_W + (fb_tree ? swing_fb_tree_w() : 0) : k == 1 ? PFX_PANEL_W : SEQ_SIDE_W; );
 
+// ── Which open panels show side by side (the owner, 2026-10-27: "show as many side by side as fit and stack only the rest
+// as tabs"). All @gfx; nothing here is saved (pfx_open / side_front under gate 80 are the saved state, as before).
+//   side_sh0 / 1 / 2: shown this frame, by k (swing_side_fit sets them; the columns and the top row read them)
+//   side_prev: the panel in front just before side_front -- the fit's second pick; -1 = none known (a load, or a reload:
+//              the rest go in column order). side_last: side_front as the slot last laid it out (the change is seen
+//              there, whoever set side_front: a tab, the PAD FX / SEQ buttons, the OPT menu, the gutter).
+side_sh0 = 0; side_sh1 = 0; side_sh2 = 0;
+side_prev = -1; side_last = -1;
+SIDE_TAB_CELL_B = 100;   // an open panel's TAB cell beside the columns, design px: its title and its X (a closed one's dim cell is 72)
+function swing_side_shown(k) ( k == 0 ? side_sh0 : k == 1 ? side_sh1 : side_sh2; );
+// SQUEEZE BEFORE TABBING (the owner, 2026-10-27): a panel may give up width down to its own minimum (PFX_SIDE_MIN_W,
+// SEQ_SIDE_MIN_W, the browser's list floor + the rail's; rk_swing_ui_minibrowser says why each) before any becomes a tab.
+// side_cw0 / 1 / 2: each shown column's width this frame, by k, before a dragged width's rest (swing_side_fit sets them).
+side_cw0 = 0; side_cw1 = 0; side_cw2 = 0;
+side_sq = 0;   // this frame's columns are squeezed (the top row's middle cell reads it)
+function swing_side_mw(k) ( min(swing_side_pw(k), k == 0 ? FB_LIST_MIN + (fb_tree ? FB_TREE_MIN : 0) : k == 1 ? PFX_SIDE_MIN_W : SEQ_SIDE_MIN_W); );
+function swing_side_cw(k) ( k == 0 ? side_cw0 : k == 1 ? side_cw1 : side_cw2; );
+// room = the panels' width (the slot less the seam and the gutter); sum = the open panels' widths. All of them fitting is
+// decided by the old all-or-nothing test itself, so that case lays out exactly as before. Otherwise: the front panel,
+// then side_prev, then the rest in column order (the editor, the sequencer, the browser), each taken when it still fits
+// beside those taken AT ITS MINIMUM (the same 2 px margin). The ones taken fitting at their own widths: those widths, as
+// before; else each gets its minimum plus a share of what is left in proportion to what it gave up, so all of them grow
+// back together and reach their own widths at once. Returns how many show.
+function swing_side_fit(room, sum) local(_sf_i, _sf_k, _sf_s, _sf_n, _sf_m)
+(
+  side_sh0 = 0; side_sh1 = 0; side_sh2 = 0; side_sq = 0;
+  side_cw0 = swing_side_pw(0); side_cw1 = swing_side_pw(1); side_cw2 = swing_side_pw(2);
+  room >= sum - 2 ? (
+    side_sh0 = swing_side_isopen(0); side_sh1 = swing_side_isopen(1); side_sh2 = swing_side_isopen(2);
+  ) : (
+    _sf_s = 0; _sf_i = 0;
+    loop(5,
+      _sf_k = _sf_i == 0 ? side_front : _sf_i == 1 ? side_prev : _sf_i == 2 ? 1 : _sf_i == 3 ? 2 : 0;
+      _sf_k >= 0 && swing_side_isopen(_sf_k) && !swing_side_shown(_sf_k) && (_sf_i == 0 || room >= _sf_s + swing_side_mw(_sf_k) - 2) ? (
+        _sf_k == 0 ? side_sh0 = 1 : _sf_k == 1 ? side_sh1 = 1 : side_sh2 = 1;
+        _sf_s += swing_side_mw(_sf_k);
+      );
+      _sf_i += 1;
+    );
+    // the squeeze: two or more shown that do not fit at their own widths (the front alone is the tabs: the whole slot)
+    _sf_n = (side_sh0 ? side_cw0 : 0) + (side_sh1 ? side_cw1 : 0) + (side_sh2 ? side_cw2 : 0);
+    side_sh0 + side_sh1 + side_sh2 >= 2 && room < _sf_n - 2 ? (
+      side_sq = 1;
+      _sf_m = max(0, room - _sf_s) / (_sf_n - _sf_s);   // > 0 apart: room >= _sf_s - 2 and room < _sf_n - 2
+      side_cw0 = floor(swing_side_mw(0) + (side_cw0 - swing_side_mw(0)) * _sf_m);
+      side_cw1 = floor(swing_side_mw(1) + (side_cw1 - swing_side_mw(1)) * _sf_m);
+      side_cw2 = floor(swing_side_mw(2) + (side_cw2 - swing_side_mw(2)) * _sf_m);
+    );
+  );
+  side_sh0 + side_sh1 + side_sh2;
+);
+
+// The set of open panels the dragged width (side_w, gate 83) was made for: another set puts the panels' own widths
+// back. -1 = not seen yet: the first draw after @init adopts whatever is open WITHOUT clearing side_w, so a saved width
+// survives the project's reload (until 2026-10-26 the count started at 0, every reload read "another set" on its first
+// frame and zeroed the width the save had just restored; sweep LIB118). @init runs before @serialize restores side_w.
+side_n_prev = -1;
+function swing_side_seen(n) (
+  n != side_n_prev ? ( side_n_prev >= 0 ? side_w = 0; side_n_prev = n; );
+);
+
 // ── The slot's top row: a cell per present panel in column order (the editor, the sequencer, the browser). Side by side:
-// the cells are the columns' titles, and a present panel that is closed keeps a narrow dim cell at its place, taken off
-// an open neighbour's title (the audit: with the editor and the sequencer side by side the browser had no cell and its
-// chevron was blind -- no way to open it short of folding). Tabs: equal cells, the lit one in front, a dim one opens its
-// panel and brings it to the front. Each open panel's X at its cell's right end closes that panel alone. ──
+// the cells are the shown columns' titles, and a present panel not shown keeps a narrow cell at its place, taken off a
+// shown neighbour's title: a closed one a dim cell (the audit: with the editor and the sequencer side by side the browser
+// had no cell and its chevron was blind -- no way to open it short of folding), an open one with no room beside the
+// others a TAB cell (swing_side_fit; the open look and its X; a press brings it to the front). Tabs: equal cells, the lit
+// one in front, a dim one opens its panel and brings it to the front. Each open panel's X at its cell's right end closes
+// that panel alone -- and leaves the front where it was (until 2026-10-27 a press on a tab's X also made it the front
+// for the frame, and the front then fell to the fallback order, away from the panel the user was on). ──
 function swing_side_tabs_draw(x, y, w, h, split)
-local(_st_i, _st_k, _st_x, _st_cw, _st_n, _st_on, _st_lit, _st_hot, _st_edge, _st_tw, _st_th, _st_bw, _st_xx, _st_w0, _st_w1, _st_w2, _st_dim)
+local(_st_i, _st_k, _st_x, _st_cw, _st_n, _st_on, _st_lit, _st_hot, _st_edge, _st_tw, _st_th, _st_bw, _st_xx, _st_w0, _st_w1, _st_w2, _st_dim, _st_tab, _st_c, _st_f0)
 (
   _st_edge = _fb_g_lmbdown;
+  _st_f0 = side_front;
   gfx_set(_fb_gr * 0.62, _fb_gg * 0.62, _fb_gb * 0.62, 1); gfx_rect(x, y, w, h);
   rk_font(1, swing_fs(9), 'b');
   _st_bw = w - FB_GUTTER_W;
@@ -66,15 +140,17 @@ local(_st_i, _st_k, _st_x, _st_cw, _st_n, _st_on, _st_lit, _st_hot, _st_edge, _s
   pfx_tab_x = x; pfx_tab_y = y; pfx_tab_h = h; pfx_tab_w = (_st_bw / _st_n) | 0;
   _st_w0 = 0; _st_w1 = 0; _st_w2 = 0;
   split ? (
-    // the columns' widths as title cells (the browser's the rest); a present panel that is closed: a dim cell of its own,
-    // taken off the open neighbour after it (the one before it when none follows)
-    _st_w1 = swing_side_isopen(1) ? swing_side_pw(1) : 0; _st_w2 = swing_side_isopen(2) ? swing_side_pw(2) : 0;
-    _st_w0 = swing_side_isopen(0) ? (_st_bw - _st_w1 - _st_w2) : 0;
-    !swing_side_isopen(0) ? ( _st_w2 > 0 ? _st_w2 = _st_bw - _st_w1 : _st_w1 = _st_bw; );   // no browser: the last open column's cell takes a dragged width's rest
-    _st_dim = swing_px(72);
-    swing_side_present(1) && !swing_side_isopen(1) ? ( _st_w1 = _st_dim; _st_w2 > 0 ? _st_w2 -= _st_dim : _st_w0 -= _st_dim; );
-    swing_side_present(2) && !swing_side_isopen(2) ? ( _st_w2 = _st_dim; _st_w0 > 0 ? _st_w0 -= _st_dim : _st_w1 -= _st_dim; );
-    swing_side_present(0) && !swing_side_isopen(0) ? ( _st_w0 = _st_dim; _st_w2 > 0 ? _st_w2 -= _st_dim : _st_w1 -= _st_dim; );
+    // the shown columns' widths as title cells (the browser's the rest); a present panel not shown: a cell of its own --
+    // dim when closed, a tab when open -- taken off the shown neighbour after it (the one before it when none follows)
+    _st_w1 = swing_side_shown(1) ? swing_side_cw(1) : 0; _st_w2 = swing_side_shown(2) ? swing_side_cw(2) : 0;   // the columns' widths, squeezed or their own (swing_side_fit)
+    _st_w0 = swing_side_shown(0) ? (_st_bw - _st_w1 - _st_w2) : 0;
+    !swing_side_shown(0) ? ( _st_w2 > 0 ? _st_w2 = _st_bw - _st_w1 : _st_w1 = _st_bw; );   // no browser shown: the last shown column's cell takes a dragged width's rest
+    _st_dim = swing_px(72); _st_tab = swing_px(SIDE_TAB_CELL_B);
+    swing_side_present(1) && !swing_side_shown(1) ? ( _st_c = swing_side_isopen(1) ? _st_tab : _st_dim; _st_w1 = _st_c; _st_w2 > 0 ? _st_w2 -= _st_c : _st_w0 -= _st_c; );
+    // (squeezed, the sequencer's cell between the editor and the browser comes off the wider of the two: off a browser at
+    // its minimum the cell left its title no room -- at 1.5x none at all, the title and its X gone)
+    swing_side_present(2) && !swing_side_shown(2) ? ( _st_c = swing_side_isopen(2) ? _st_tab : _st_dim; _st_w2 = _st_c; _st_w0 > 0 && !(side_sq && _st_w1 > _st_w0) ? _st_w0 -= _st_c : _st_w1 -= _st_c; );
+    swing_side_present(0) && !swing_side_shown(0) ? ( _st_c = swing_side_isopen(0) ? _st_tab : _st_dim; _st_w0 = _st_c; _st_w2 > 0 ? _st_w2 -= _st_c : _st_w1 -= _st_c; );
   );
   _st_x = x; _st_i = 0;
   loop(3,
@@ -84,35 +160,39 @@ local(_st_i, _st_k, _st_x, _st_cw, _st_n, _st_on, _st_lit, _st_hot, _st_edge, _s
       // the cell's width: its column side by side (the browser's the rest; a closed panel's dim cell), an equal share as tabs
       _st_cw = split ? (_st_k == 0 ? _st_w0 : _st_k == 1 ? _st_w1 : _st_w2) : pfx_tab_w;
       _st_cw > 0 ? (
-        _st_lit = _st_on && (split || side_front == _st_k);
+        _st_lit = _st_on && (split ? swing_side_shown(_st_k) : side_front == _st_k);   // side by side: every shown column's title; an open tab beside them is not lit
         _st_hot = mx >= _st_x && mx < _st_x + _st_cw && my >= y && my < y + h;
-        _st_lit ? gfx_set(_fb_gr * 0.95, _fb_gg * 0.95, _fb_gb * 0.95, 1)
-                : gfx_set(_fb_gr * 0.72, _fb_gg * 0.72, _fb_gb * 0.72, _st_hot ? 1 : 0.85);
-        gfx_rect(_st_x + 1, y + 2, _st_cw - 2, h - 2);
-        _st_lit ? ( gfx_set(0.85, 0.20, 0.12, 1); gfx_rect(_st_x + 1, y + h - 2, _st_cw - 2, 2); );   // the active underline, the LCD tabs' red
-        gfx_set(_fb_tc, _fb_tc, _fb_tc, _st_lit ? 1 : (_st_on ? 0.75 : 0.45));
+        // the SOUND / SYNTH page chips' look and press (swing_pfx_pages_draw; the bottom slot's chips have it too) --
+        // the owner, 2026-10-27: "make the pad FX and browser tabs switch ... the way the sound and synth tabs do": the
+        // panel shown is a blue chip, the others the ground's chip, the words white (dimmer for a closed panel); a
+        // press on a chip not shown brings its panel up and marks the project, as a page pick does. (Until then: a
+        // light cell with the LCD tabs' red underline.)
+        _st_lit ? gfx_set(0.25, 0.47, 0.68, 1) : gfx_set(_fb_gr * 0.78, _fb_gg * 0.78, _fb_gb * 0.78, _st_hot ? 1 : 0.9);
+        gfx_rect(_st_x + swing_px(2), y + 2, _st_cw - swing_px(4), h - 4);
+        gfx_set(1, 1, 1, _st_lit ? 1 : (_st_on ? 0.7 : 0.45));
         _st_k == 1 ? (
           (sel_pad >= 0 && sel_pad < NUM_SLOTS) ? ( swing_pad_lbl(sel_pad | 0, #pfx_lbl); sprintf(#pfx_ttl, "PAD FX  %s  %s", #pfx_lbl, get_name_slot(sel_pad | 0)); ) : strcpy(#pfx_ttl, "PAD FX");
         ) : strcpy(#pfx_ttl, _st_k == 2 ? "SEQ" : "BROWSER");
         gfx_measurestr(#pfx_ttl, _st_tw, _st_th);
         _st_tw > _st_cw - swing_px(30) ? ( strcpy(#pfx_ttl, _st_k == 1 ? "PAD FX" : _st_k == 2 ? "SEQ" : "BROWSER"); gfx_measurestr(#pfx_ttl, _st_tw, _st_th); );
         gfx_x = _st_x + max(swing_px(6), (_st_cw - _st_tw) * 0.5); gfx_y = y + (h - _st_th) * 0.5; gfx_drawstr(#pfx_ttl);
-        _st_hot ? swing_tooltip_check(1480 + _st_k, _st_k == 0 ? "The sample browser in the side panel. Click to open it; with room for all it sits beside the others."
-                                               : _st_k == 1 ? "The pad editor in the side panel: the pad you clicked last. Click to open it; with room for all it sits beside the others."
-                                                            : "The step sequencer, placed at the side (OPT). Click to open it; with room for all it sits beside the others.");
+        _st_hot ? swing_tooltip_check(1480 + _st_k, _st_k == 0 ? "The sample browser in the side panel. Click to open it or bring it up; the others sit beside it as far as the room goes."
+                                               : _st_k == 1 ? "The pad editor in the side panel: the pad you clicked last. Click to open it or bring it up; the others sit beside it as far as the room goes."
+                                                            : "The step sequencer, placed at the side (OPT). Click to open it or bring it up; the others sit beside it as far as the room goes.");
         _st_hot && _st_edge && !_st_lit ? (
           _st_k == 0 ? ( fb_open = 1; side_front = 0; swing_fb_request(0, 0, -1); )
           : _st_k == 1 ? ( pfx_open = 1; side_front = 1; fb_kbd = 0; fb_filt_focus = 0; )
                        : ( seq_shown = 1; side_front = 2; fb_kbd = 0; fb_filt_focus = 0; seq_ui_focus = 1; );
+          mark_dirty();   // what is open and in front is saved (gate 80), as the page chips' pfx_page is
         );
         // the X: closes this panel alone
         _st_on ? (
           _st_xx = _st_x + _st_cw - swing_px(12);
           _st_hot = abs(mx - _st_xx) <= swing_px(8) && abs(my - (y + h * 0.5)) <= swing_px(8);
-          gfx_set(_fb_tc, _fb_tc, _fb_tc, _st_hot ? 1 : 0.6);
+          gfx_set(1, 1, 1, _st_hot ? 1 : 0.6);
           gfx_line(_st_xx - 4, y + h * 0.5 - 4, _st_xx + 4, y + h * 0.5 + 4); gfx_line(_st_xx - 4, y + h * 0.5 + 4, _st_xx + 4, y + h * 0.5 - 4);
           _st_hot ? swing_tooltip_check(1485 + _st_k, _st_k == 0 ? "Close the browser's panel." : _st_k == 1 ? "Close the pad editor's panel (PAD FX opens it again)." : "Close the sequencer's panel (SEQ opens it again).");
-          _st_hot && _st_edge ? ( _st_k == 0 ? fb_open = 0 : _st_k == 1 ? pfx_open = 0 : seq_shown = 0; );
+          _st_hot && _st_edge ? ( _st_k == 0 ? fb_open = 0 : _st_k == 1 ? pfx_open = 0 : seq_shown = 0; side_front = _st_f0; );   // the cell's press above took the front: give it back
           _st_k == 0 ? ( pfx_bx_cx = _st_xx; pfx_bx_cy = y + h * 0.5; ) : _st_k == 1 ? ( pfx_x_cx = _st_xx; pfx_x_cy = y + h * 0.5; ) : ( pfx_sx_cx = _st_xx; pfx_sx_cy = y + h * 0.5; );
         );
         _st_x += _st_cw;
@@ -173,21 +253,8 @@ local(_gd_gx, _gd_hot, _gd_cx, _gd_cy, _gd_i)
 (
   swing_fb_ground();
   _gd_gx = x + w - FB_GUTTER_W;
-  gfx_set(_fb_gr * 0.72, _fb_gg * 0.72, _fb_gb * 0.72, 1); gfx_rect(_gd_gx, y, FB_GUTTER_W, h);
-  gfx_set(0, 0, 0, 0.30); gfx_rect(_gd_gx, y, 1, h);
-  gfx_set(1, 1, 1, 0.06); gfx_rect(_gd_gx + 1, y, 1, h);
   _gd_hot = mx >= _gd_gx && mx < _gd_gx + FB_GUTTER_W && my >= y && my < y + h;
-  _gd_hot ? ( gfx_set(1, 1, 1, 0.10); gfx_rect(_gd_gx, y, FB_GUTTER_W, h); );
-  gfx_set(_fb_tc, _fb_tc, _fb_tc, _gd_hot ? 0.5 : 0.25);
-  gfx_rect(_gd_gx + FB_GUTTER_W * 0.5 - 4, y + h * 0.5 - 30, 1, 22); gfx_rect(_gd_gx + FB_GUTTER_W * 0.5 + 3, y + h * 0.5 - 30, 1, 22);
-  gfx_rect(_gd_gx + FB_GUTTER_W * 0.5 - 4, y + h * 0.5 + 8, 1, 22);  gfx_rect(_gd_gx + FB_GUTTER_W * 0.5 + 3, y + h * 0.5 + 8, 1, 22);
-  _gd_cx = _gd_gx + FB_GUTTER_W * 0.5; _gd_cy = y + h * 0.5;
-  gfx_set(0.62, 0.70, 0.82, _gd_hot ? 1 : 0.72);
-  _gd_i = 0; loop(5,
-    open ? gfx_line(_gd_cx - 2 + _gd_i * 0.5, _gd_cy - 5 + _gd_i, _gd_cx - 2 + _gd_i * 0.5, _gd_cy + 5 - _gd_i)
-         : gfx_line(_gd_cx + 2 - _gd_i * 0.5, _gd_cy - 5 + _gd_i, _gd_cx + 2 - _gd_i * 0.5, _gd_cy + 5 - _gd_i);
-    _gd_i += 1;
-  );
+  swing_fb_gutter_paint(_gd_gx, y, h, _gd_hot, open);   // the browser's own gutter look (the redraw, P1a: one painter for both)
   _gd_hot ? swing_tooltip_check(1489, open ? "Fold the side panels." : seq_place == 1 ? "Open the step sequencer at the side (the browser is placed below: OPT)." : fx_place != 3 ? "Open the pad editor at the side (the browser is placed below: OPT)." : "The panels are placed below the pads (the sequencer's OPT menu).");
   !open && _gd_hot && _fb_g_lmbdown ? ( seq_place == 1 ? ( seq_shown = 1; side_front = 2; seq_ui_focus = 1; ) : fx_place != 3 ? ( pfx_open = 1; side_front = 1; ) : 0; );
 );
@@ -196,11 +263,13 @@ local(_gd_gx, _gd_hot, _gd_cx, _gd_cy, _gd_i)
 // where the pad FX is"). A slim strip in the slot's ground colour with three dots at mid-height, lit under the mouse or
 // while a drag runs; swing_side_handle (the browser lib) reads the drag, the wheel and the right-click on it. ──
 function swing_side_seam_draw(x, y, w, h) local(_ss_hot, _ss_cy, _ss_i) (
-  _ss_hot = (mx >= x && mx < x + w && my >= y && my < y + h) || side_gdrag;
+  _ss_hot = (mx >= x && mx < x + w && my >= y && my < y + h) || side_gdrag || swing_side_seam_ext(mx, my);   // + its reach over the pads' margin (2026-10-27)
   gfx_set(_fb_gr * 0.55, _fb_gg * 0.55, _fb_gb * 0.55, 1); gfx_rect(x, y, w, h);
   gfx_set(0, 0, 0, 0.35); gfx_rect(x, y, 1, h);
   gfx_set(1, 1, 1, 0.06); gfx_rect(x + w - 1, y, 1, h);
-  _ss_hot ? ( gfx_set(1, 1, 1, 0.12); gfx_rect(x, y, w, h); );
+  // under the mouse or dragging: the seam lifts and its edge against the pads lights in the house blue (the owner,
+  // 2026-10-27: "hard to grab" -- the bottom handle's top edge lights the same way, rk_seq_ui swing_seq_under_draw)
+  _ss_hot ? ( gfx_set(1, 1, 1, 0.12); gfx_rect(x, y, w, h); gfx_set(0.20, 0.62, 0.86, 0.95); gfx_rect(x, y, max(2, swing_px(2)), h); );
   _ss_cy = y + h * 0.5;
   gfx_set(_fb_tc, _fb_tc, _fb_tc, _ss_hot ? 0.9 : 0.4);
   _ss_i = -1; loop(3, gfx_circle(x + w * 0.5, _ss_cy + _ss_i * swing_px(7), swing_px(1.5), 1, 1); _ss_i += 1; );
@@ -208,7 +277,7 @@ function swing_side_seam_draw(x, y, w, h) local(_ss_hot, _ss_cy, _ss_i) (
 
 // ── The side slot: what the host draws in place of swing_fb_draw (the full face and the rack face). ──
 function swing_side_draw(x, y, w, h)
-local(_sd_th, _sd_gx, _sd_sx, _sd_sw, _sd_fb0, _sd_sum, _sd_n, _sd_cx, _sd_cw, _sd_rest, _sd_k, _sd_i, _sd_front_ok, _sd_fold)
+local(_sd_th, _sd_gx, _sd_sx, _sd_sw, _sd_fb0, _sd_sum, _sd_n, _sd_cx, _sd_cw, _sd_rest, _sd_k, _sd_i, _sd_front_ok, _sd_fold, _sd_ns)
 (
   // the PAD FX button's request (rk_swing_ui_panels_controls), applied here -- after swing_fb_snapshot posted this frame's
   // width request -- so the slot's gate baselines the window BEFORE the bridge widens it (the chevron's own timing)
@@ -217,12 +286,16 @@ local(_sd_th, _sd_gx, _sd_sx, _sd_sw, _sd_fb0, _sd_sum, _sd_n, _sd_cx, _sd_cw, _
   pfx_req == 1 ? ( pfx_open = 1; fx_place == 3 ? pfx_bstamp = (bot_stamp += 1) : ( side_front = 1; fb_kbd = 0; fb_filt_focus = 0; ); )
   : pfx_req == 2 ? ( pfx_open = 0; fx_place != 3 ? side_front = 0; );
   pfx_req = 0;
-  // the front panel is always an open, present one: the one asked for, else the sequencer, the editor, the browser
+  // the front panel is always an open, present one: the one asked for, else the one in front before it (2026-10-27: the
+  // front closed, the panel the user was on before it comes up), else the sequencer, the editor, the browser
   _sd_front_ok = swing_side_present(side_front) && swing_side_isopen(side_front);
-  !_sd_front_ok ? side_front = swing_side_isopen(2) ? 2 : swing_side_isopen(1) ? 1 : 0;
-  pfx_split = 0; pfx_seq_x = 0; pfx_seq_w = 0;
+  !_sd_front_ok ? ( side_front = ((side_prev >= 0 && swing_side_isopen(side_prev)) ? side_prev : (swing_side_isopen(2) ? 2 : (swing_side_isopen(1) ? 1 : 0))); );
+  pfx_split = 0; pfx_seq_x = 0; pfx_seq_w = 0; side_sh0 = 0; side_sh1 = 0; side_sh2 = 0;
   _sd_n = swing_side_isopen(0) + swing_side_isopen(1) + swing_side_isopen(2);
-  _sd_n != side_n_prev ? ( side_w = 0; side_n_prev = _sd_n; );   // another set of panels: their own widths again (the handle's width was for the last set)
+  swing_side_seen(_sd_n);   // another set of panels: their own widths again (the handle's width was for the last set)
+  // the front's history, whoever changed side_front (a tab, the PAD FX / SEQ buttons, the OPT menu, the gutter, a close):
+  // the one it replaced is the one before it -- the fit's second pick. Not while nothing is open (a fold keeps it).
+  _sd_n > 0 && side_front != side_last ? ( side_prev = side_last; side_last = side_front; );
   _sd_n == 0 ? (
     fb_place == 3 ? swing_side_gutter_draw(x, y, w, h, 0) : swing_fb_draw(x, y, w, h);   // placed below: the slot's own gutter (its press opens the panel placed here)
   ) : (
@@ -230,19 +303,22 @@ local(_sd_th, _sd_gx, _sd_sx, _sd_sw, _sd_fb0, _sd_sum, _sd_n, _sd_cx, _sd_cw, _
     _sd_sx = x + swing_px(FB_SEAM_W); _sd_sw = w - swing_px(FB_SEAM_W);   // the seam at the slot's left edge; the rest is the panels' and the gutter
     _sd_gx = x + w - FB_GUTTER_W;
     _sd_sum = (swing_side_isopen(0) ? swing_side_pw(0) : 0) + (swing_side_isopen(1) ? swing_side_pw(1) : 0) + (swing_side_isopen(2) ? swing_side_pw(2) : 0);
-    pfx_split = _sd_n >= 2 && (_sd_sw - FB_GUTTER_W >= _sd_sum - 2);   // the room for all: the render
+    _sd_ns = swing_side_fit(_sd_sw - FB_GUTTER_W, _sd_sum);   // which show: all when all fit (the render), else the front, the one before it, the rest
+    pfx_split = _sd_n >= 2 && _sd_ns >= 2;   // two or more side by side; only the front: the tabs
     _sd_fb0 = fb_open;
-    _sd_rest = max(0, (_sd_sw - FB_GUTTER_W) - _sd_sum);   // a dragged width past the panels' own: the LAST open column takes it
+    _sd_sum = (side_sh0 ? side_cw0 : 0) + (side_sh1 ? side_cw1 : 0) + (side_sh2 ? side_cw2 : 0);   // the shown ones' widths (squeezed or their own)
+    _sd_rest = max(0, (_sd_sw - FB_GUTTER_W) - _sd_sum);   // a dragged width past the panels' own (or the squeeze's rounding): the LAST shown column takes it
     pfx_split ? (
-      // side by side: the editor, the sequencer, then the browser with the gutter; each takes the presses in its own
-      // column from the same stash (the browser's draw first: the slot's ground colours are its)
-      _sd_cx = _sd_sx + (swing_side_isopen(1) ? PFX_PANEL_W : 0) + (swing_side_isopen(2) ? SEQ_SIDE_W : 0) + (swing_side_isopen(0) ? 0 : _sd_rest);
-      swing_side_isopen(0) ? swing_fb_draw(_sd_cx, y + _sd_th, x + w - _sd_cx, h - _sd_th)
+      // side by side: the editor, the sequencer, then the browser with the gutter -- the shown ones, in that order; each
+      // takes the presses in its own column from the same stash (the browser's draw first: the slot's ground colours are its)
+      _sd_cx = _sd_sx + (side_sh1 ? side_cw1 : 0) + (side_sh2 ? side_cw2 : 0) + (side_sh0 ? 0 : _sd_rest);
+      side_sh0 ? swing_fb_draw(_sd_cx, y + _sd_th, x + w - _sd_cx, h - _sd_th)
       : fb_place == 3 ? swing_side_gutter_draw(_sd_cx, y + _sd_th, x + w - _sd_cx, h - _sd_th, 1)
-                      : swing_side_fb_blind(_sd_cx, y + _sd_th, x + w - _sd_cx, h - _sd_th);   // present and closed: blind (the title row's dim cell opens it)
+      : swing_side_isopen(0) ? swing_side_fb_blind(_sd_sx, y + _sd_th, _sd_sw, h - _sd_th)   // open but left out (a tab): blind over the whole slot, as under the tabs; the columns paint over its body
+                             : swing_side_fb_blind(_sd_cx, y + _sd_th, x + w - _sd_cx, h - _sd_th);   // present and closed: blind (the title row's dim cell opens it)
       _sd_cx = _sd_sx;
-      swing_side_isopen(1) ? ( _sd_cw = PFX_PANEL_W + ((!swing_side_isopen(2) && !swing_side_isopen(0)) ? _sd_rest : 0); swing_pfx_draw(_sd_cx, y + _sd_th, _sd_cw, h - _sd_th); _sd_cx += _sd_cw; );
-      swing_side_isopen(2) ? ( _sd_cw = SEQ_SIDE_W + (!swing_side_isopen(0) ? _sd_rest : 0); swing_sseq_draw(_sd_cx, y + _sd_th, _sd_cw, h - _sd_th); _sd_cx += _sd_cw; );
+      side_sh1 ? ( _sd_cw = side_cw1 + ((!side_sh2 && !side_sh0) ? _sd_rest : 0); swing_pfx_draw(_sd_cx, y + _sd_th, _sd_cw, h - _sd_th); _sd_cx += _sd_cw; );
+      side_sh2 ? ( _sd_cw = side_cw2 + (!side_sh0 ? _sd_rest : 0); swing_sseq_draw(_sd_cx, y + _sd_th, _sd_cw, h - _sd_th); _sd_cx += _sd_cw; );
     ) : side_front == 0 ? (
       swing_fb_draw(_sd_sx, y + _sd_th, _sd_sw, h - _sd_th);   // tabs, the browser in front, as ever
     ) : (

@@ -218,14 +218,11 @@ SP_PITCH_ALGO_VOICE         = 3;      // Elastique Soloist + Speech
 
 // ─── Heartbeat / Extension-alive watchdog ────────────────────────────────
 // The Extension writes SP_PITCH_HEARTBEAT every tick. If it hasn't advanced
-// within sp_pitch_ext_grace_blocks audio blocks, we declare the Extension
+// within SP_PITCH_GRACE_S of wall time, we declare the Extension
 // absent and force-fall-back every pad's effective mode to Repitch (0)
 // wherever it's consumed. Keeps Tuned and Stretch modes non-load-bearing.
 sp_pitch_ext_last_hb       = 0;
-sp_pitch_ext_last_seen_blk = 0;
 sp_pitch_ext_alive         = 0;
-sp_pitch_block_counter     = 0;
-sp_pitch_ext_grace_blocks  = 64;       // ~1.4 s @ 48 kHz / 1024-frame blocks (kept for readers; the watchdog is wall time)
 SP_PITCH_GRACE_S           = 1.5;      // the watchdog's grace in wall time (2026-10-06; a render outruns a block count)
 sp_pitch_ext_last_seen_t   = time_precise();   // starts alive, as the block version did, for the first grace
 // Set per block beside sp_pitch_any_stretch: 1 when any pad is in Tuned or
@@ -254,7 +251,12 @@ sp_pitch_any_ext_mode      = 0;
 // settles (latched by sp_ring_alloc_slot). @init only touches the control
 // band block, which is shared and slot-independent.
 sp_ring_alloc_slot = -1;               // latch: which slot's rings are allocated
-gmem[STRETCH_PER_PAD_MODE_BASE] = 0;   // block 496 (control band)
+// Block 496 (the control band). Touched through a cell NOBODY reads: slot 0's SRCGEN stride
+// holds sixteen pads at +0..15 and nothing at +16..79. The first build wrote the 0 to
+// STRETCH_PER_PAD_MODE_BASE -- registry slot 0's spot-0 MODE -- so every new Swing's @init
+// stomped a live slot-0 Swing's pad 0 to Repitch until it republished, and a bridge tick in
+// between read "spot 0 left Tuned" and queued a revert (sweep LIB14).
+gmem[STRETCH_PER_PAD_SRCGEN_BASE + 16] = 0;
 
 // ─── B1c lazy ring allocation (per registry slot) ───────────────────────
 // Forces NSEEL to allocate this instance's 8 ring blocks at
@@ -269,7 +271,9 @@ local(_ar_base _ar_i)
     _ar_base = STRETCH_AUDIO_BASE + _slot * STRETCH_INST_AUDIO_STRIDE;
     _ar_i = 0;
     loop(8,
-      gmem[_ar_base + _ar_i * 65536] = 0;
+      // +3 = the ring header's RESERVED cell (STRETCH_OFF_* above), not WRITE_POS: the Extension
+      // may already be feeding these rings for the slot's previous occupant (sweep LIB14)
+      gmem[_ar_base + _ar_i * 65536 + 3] = 0;
       _ar_i += 1;
     );
   );
@@ -288,21 +292,20 @@ SP_SWAP_CHUNK = 524288;
 // GS_KIT_LOAD_REQ=2), this just copies ONE pad's audio from gmem into
 // JSFX freemem. No clear_pad, no per-pad meta touch, no kit_busy gate —
 // the pad's mode/algo/tune/gain/etc. all stay exactly as the user has
-// them. Only s_len + the audio buffer change.
+// them. Only the audio buffer, s_len (l_len[0]) and the bake anchor
+// (sp_baked_tune) change.
 //
-// Wire protocol:
-//   gmem[KIT_GMEM_PARAM1] = pad_idx     (0..15), + 0.25 a bake / + 0.5 a revert (2026-10-02; whole = unmarked,
-//                                       an older bridge)
-//   gmem[KIT_GMEM_CMD]    = 65
-// JSFX reads PARAM1, computes audio_off by summing prior pads' AUDIOLEN
-// (mirrors the bridge's pack-by-prior-lengths layout in load_audio_to_pad),
-// copies gmem[AUDIO_BASE + audio_off ..] into the pad's audio (p_aptr[pad]),
-// updates s_len, clears CMD.
-//
-// Length safety: AUDIOLEN written by the bridge during the load is taken
-// as truth (matches the actual gmem-written sample count). For Tuned-mode
-// bakes the length equals the source length (Signalsmith preserves
-// duration at rate_ratio=1.0), so audio_off for other pads doesn't shift.
+// Wire protocol (the CMD-67 shape since 2026-07-16; the bridge stages the
+// baked audio at KIT_GMEM_AUDIO+0):
+//   gmem[KIT_GMEM_PARAM1]        = spot (0..15; swing_spot_pad maps it to the pad), + 0.25 a bake /
+//                                  + 0.5 a revert (2026-10-02; whole = unmarked, an older bridge)
+//   gmem[KIT_GMEM_NAMELEN]       = interleaved sample count       (slot 3 reused)
+//   gmem[GS_PENDING_PITCH_INST]  = slot      (route — only that instance acts)
+//   gmem[KIT_GMEM_CMD]           = 65
+// JSFX copies gmem[KIT_GMEM_AUDIO + 0..len-1] into the pad's audio (layer 0's
+// region on a layered pad, else the plain region), updates s_len (and l_len[0]
+// on a layered pad), clears CMD. For Tuned-mode bakes the length equals the
+// source length (Signalsmith preserves duration at rate_ratio=1.0).
 function swing_pad_audio_swap()
 local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j, _sp_n, _sp_ok, _sp_mk, _sp_pf)
 (
@@ -326,7 +329,7 @@ local(_sp_pad, _sp_len, _sp_src_off, _sp_p, _sp_dst, _sp_j, _sp_n, _sp_ok, _sp_m
       // this instance's bus, we want a short ramp from the previous output
       // tail to silence rather than a hard step. -40 dB threshold matches
       // CMD 63's heuristic — below that the noise floor masks the cut.
-      !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
+      !_xf_active && swing_xf_prev_level() > 0.01 ? (
         _xf_pos    = 0;
         _xf_len    = swing_xf_len(0.010);  // 10 ms crossfade (+ a block under Wired, A-5)
         _xf_active = 1;
@@ -548,7 +551,7 @@ local(_lp_pad _lp_layer _lp_len _lp_lidx _lp_dst _lp_j _lp_ok _lp_plain _lp_n _l
    _lp_len > 0 && _lp_len <= LAYER_SIZE &&
    !(_lp_mk == SP_MARK_BAKE && sp_pitch_mode[_lp_pad] != SP_PITCH_MODE_TUNED)) ? (   // a stale bake: refused (CMD 65)
     // Arm anti-click crossfade BEFORE killing voices (mirrors CMD 65/63).
-    !_xf_active && abs(_xf_prev[0]) + abs(_xf_prev[1]) > 0.01 ? (
+    !_xf_active && swing_xf_prev_level() > 0.01 ? (
       _xf_pos    = 0;
       _xf_len    = swing_xf_len(0.010);  // 10 ms crossfade (+ a block under Wired, A-5)
       _xf_active = 1;
@@ -602,8 +605,11 @@ local(_lp_pad _lp_layer _lp_len _lp_lidx _lp_dst _lp_j _lp_ok _lp_plain _lp_n _l
 // single publisher declares the full per-pad state in one place.
 
 // ─── Declarative state publisher (stateless "anchor" protocol v3) ─────────
-// Called from @init, @slider, @block, and @gfx (options:gfx_idle), gated to
-// the LOCK-owning instance. This function does NOT diff, queue, or keep any
+// Called from @init, @slider, @block, and @gfx (options:gfx_idle) as part of
+// swing_block_pitch_tick(). Every instance publishes into its OWN registry
+// slot's strided region (no owner election), and only while it holds a slot
+// and no pad swap is waiting for the spot map (the gate in
+// swing_block_pitch_tick). This function does NOT diff, queue, or keep any
 // shadow. Every call it idempotently blast-writes the current desired
 // per-pad state (MODE / TUNE / ALGO) for all 16 pads into the named-segment
 // bands, and republishes the protocol version. The Extension's 30 Hz
@@ -616,8 +622,9 @@ local(_lp_pad _lp_layer _lp_len _lp_lidx _lp_dst _lp_j _lp_ok _lp_plain _lp_n _l
 // Requires from caller (main jsfx) at @init:
 //   * NUM_PADS       — pad count (16)
 //   * sp_pitch_mode[]/sp_pitch_algo[]/p_tune[] — current per-pad state
-// (No registry-slot dependency — publishes unconditionally; see the blast
-//  block below for why the old _reg_my_slot==0 gate was removed.)
+// (The registry slot is the address: an instance without one -- before its
+//  claim, or after a collision vacate -- publishes nothing; see the blast
+//  block below.)
 
 // ─── Registry slot claim (single-pass) ───────────────────────────────────
 // Shared by the main jsfx @init (first claim) and @block (re-claim after a
@@ -792,12 +799,10 @@ local(_pi _base _pp)
   // @gfx, "Drive the Tuned-mode pitch chain at GUI rate"), so the watchdog's globals have two writers at once. Every
   // write is the moment's time_precise() or a fresh read of the Extension's rising heartbeat, so a lost race leaves
   // sp_pitch_ext_last_seen_t microseconds old, or counts one heartbeat a tick late -- against a 1.5 s grace
-  // (gate_baseline gfx_audio accepts it, FINDINGS_LOG 2026-10-12; sp_pitch_cur_hb / _last_hb / _last_seen_blk alike).
-  sp_pitch_block_counter += 1;
+  // (gate_baseline gfx_audio accepts it, FINDINGS_LOG 2026-10-12; sp_pitch_cur_hb / _last_hb alike).
   sp_pitch_cur_hb = atomic_get(gmem[SP_PITCH_HEARTBEAT]);
   sp_pitch_cur_hb != sp_pitch_ext_last_hb ? (
     sp_pitch_ext_last_hb       = sp_pitch_cur_hb;
-    sp_pitch_ext_last_seen_blk = sp_pitch_block_counter;
     sp_pitch_ext_last_seen_t   = time_precise();
   );
   sp_pitch_ext_alive = (time_precise() - sp_pitch_ext_last_seen_t) < SP_PITCH_GRACE_S;
@@ -900,6 +905,7 @@ local(_ssi_e _ssi_i)
     _ssi_i += 1;
   );
   sp_gen_hw = 0;   // the highest GEN published on any spot this epoch (swing_spot_tick); a give lifts above it (H20)
+  sp_map_slot = -1;   // the registry slot the map was last published on (swing_spot_tick re-runs the order on a change)
   sp_br_last_hb = 0; sp_br_last_seen_t = time_precise(); sp_br_alive = 0;   // starts alive for one grace, as the Extension's
   sp_drain_ctr = 0;
   sp_br_lends = 0;
@@ -1062,6 +1068,14 @@ local(_st_r _st_p _st_mb _st_ab _st_g _st_ans _st_hb _st_n _st_q _st_a _st_b)
   _reg_my_slot >= 0 ? (
     _st_mb = SPOT_MAP_BASE + _reg_my_slot * SPOT_MAP_STRIDE;
     _st_ab = SPOT_ANS_BASE + _reg_my_slot * SPOT_ANS_STRIDE;
+    // A different slot than the map was last published on (a re-claim after check_owner dropped a stale
+    // latch): the slot's SRCGEN band and its answers are another occupant's, so every spot re-runs the
+    // ORDER and the HOLD, as at @init. With the old slot's gens kept, a spot whose generation matched
+    // went out at once with no answer waited for, and the Extension could pin a wrong source (sweep LIB17).
+    sp_map_slot != _reg_my_slot ? (
+      _st_r = 0; loop(NUM_PADS, sp_pub_gen[_st_r] = 0; sp_map_gen[_st_r] = 0; _st_r += 1; );
+      sp_map_slot = _reg_my_slot;
+    );
     // The bridge's heartbeat: alive only while it MOVES (wiki 5.8), the Extension watchdog's grace, in wall time
     // (a render runs blocks faster than the bridge ticks).
     _st_hb = gmem[_st_ab + SPOT_ANS_OFF_HB];

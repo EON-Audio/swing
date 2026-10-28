@@ -1,5 +1,6 @@
--- track_reflect.lua — EON ReaKit P4. The ONE writer of REAPER TCP track
--- identity (name / color / icon) from the published Swing pad state.
+-- track_reflect.lua — EON ReaKit P4. Writes REAPER TCP track identity
+-- (name / color / icon) for the Drum Matrix MIDI lanes from the published
+-- Swing pad state.
 --
 -- Why this exists
 -- ───────────────
@@ -10,18 +11,19 @@
 --   4. refresh_multiout_colors_if_changed()  — live audio-track color refresh
 --   5. refresh_multiout_names_if_changed()   — live audio-track name refresh
 -- Each could (and did) disagree with the others — colors lagging names,
--- different blank-detection paths, drifting "NN " prefix discipline. The
--- single-writer rule collapses all of that into this one module: callers
--- assemble an identity record and ask `Reflect()` to apply it.
+-- different blank-detection paths, drifting "NN " prefix discipline. Only
+-- path 1 moved here: swing_sync is the one caller. The bridge (paths 2-5)
+-- still writes multi-out names and colours itself and icons through
+-- rk_lua_icons.apply, so a fix made here does not reach multi-out tracks.
 --
 -- What this is NOT
 -- ────────────────
 -- This module is a sink, not a source. It does not read gmem, does not
 -- decide what a pad's identity is, and does not choose blank-vs-loaded.
--- Callers (swing_sync, the bridge's multi-out refreshers) own those
--- decisions; track_reflect is the one place where the resulting identity
--- becomes a track's I_CUSTOMCOLOR / P_NAME / P_ICON. Keeping the policy
--- with the caller and the mechanism here is what kills the tug-of-wars.
+-- The caller (swing_sync) owns those decisions; track_reflect is where the
+-- resulting identity becomes a lane track's I_CUSTOMCOLOR / P_NAME /
+-- P_ICON. Keeping the policy with the caller and the mechanism here is
+-- what kills the tug-of-wars.
 --
 -- Identity record (table passed to Reflect)
 -- ─────────────────────────────────────────
@@ -30,8 +32,7 @@
 --                                "custom-color-enabled" bit), 0 = REAPER
 --                                default, nil = leave unchanged
 --   icon_path  string or nil  — P_ICON path; nil = leave unchanged, ""
---                                clears, "/abs/path.png" sets (P2 will
---                                populate; today every caller passes nil)
+--                                clears, "/abs/path.png" sets
 --
 -- Reflect() is silent (no Undo block — track identity is published state,
 -- not a user edit) and idempotent: re-applying the same identity to a
@@ -96,21 +97,6 @@ function M.Reflect(track, ident)
   end
 
   return changed
-end
-
--- Convenience: apply a per-pad identity map to a per-pad track map. Both
--- keyed by pad_index (1-based). Callers that already have a {pad → track}
--- mapping (the bridge walks Swing's sends to build it; swing_sync iterates
--- lane_tools.GetLanes()) can pass it straight through. Returns the count
--- of tracks that actually changed.
-function M.ReflectMany(tracks_by_pad, idents_by_pad)
-  if not (tracks_by_pad and idents_by_pad) then return 0 end
-  local n = 0
-  for pad, track in pairs(tracks_by_pad) do
-    local ident = idents_by_pad[pad]
-    if ident and M.Reflect(track, ident) then n = n + 1 end
-  end
-  return n
 end
 
 return M

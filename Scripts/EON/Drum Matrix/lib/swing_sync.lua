@@ -145,27 +145,12 @@ local function ensure_init()
   swing_state.Init()
 end
 
--- Swing JSFX only republishes pad metadata to gmem while the bridge-alive
--- slot (99) holds a RECENT os.time() value (see EON_DM_Build.lua header). The
--- overlay must therefore keep bumping it, or Swing goes quiet and we'd read
--- stale names after the first kit change. Throttled to ~once/second so we
--- don't ask Swing to republish on every audio block.
--- Phase A1: source the bridge-alive slot from the shared map via
--- swing_state_reader.GMEM (one core.GMEM load, shared). Falls back to the
--- verified literal 99 if the cross-tool map didn't resolve.
-local KIT_GMEM_BRIDGE_ALIVE = (swing_state.GMEM and swing_state.GMEM.BRIDGE_ALIVE) or 99
-local _last_heartbeat_t = 0
--- Kept comfortably below any reasonable Swing freshness window so the bridge
--- never has a "dead" gap during which a user change could be missed. Swing
--- only republishes on an actual change (not on every heartbeat), so a tighter
--- interval costs nothing extra on the JSFX side — it's one gmem_write/0.5s.
-local HEARTBEAT_INTERVAL = 0.5   -- seconds
-local function pump_bridge_heartbeat()
-  local now = reaper.time_precise()
-  if (now - _last_heartbeat_t) < HEARTBEAT_INTERVAL then return end
-  _last_heartbeat_t = now
-  reaper.gmem_write(KIT_GMEM_BRIDGE_ALIVE, os.time())
-end
+-- No bridge heartbeat from here (DM213, 2026-10-26). This module used to stamp the Kit Bridge's alive cell (99)
+-- with os.time() every 0.5 s "so Swing keeps publishing", but Swing's pad bands (the per-instance IDENT / PADNAME
+-- publish and the shared-block mirror in Swing_ReaKit.jsfx @block) are written whatever that cell holds; only
+-- bridge commands read it. With no bridge running the stamp impersonated one: a real bridge started afterwards
+-- saw a fresh stamp and refused to start, Swing's gates offered bridge features nobody served, and a fresh Swing
+-- posted its auto-load request (CMD 22 + LOCK) into silence.
 
 -- Build a digest of the live Swing pad state. Cheap enough to run per frame
 -- (~500 gmem reads). Returns the digest string AND a snapshot table so the
@@ -202,24 +187,32 @@ local function read_swing_snapshot(slot)
     -- share the value and a pure hue change (kit recolor with no rename) is
     -- captured in the digest below and trips a resync.
     local color = blank and 0 or kit_color_native(i, slot)
-    -- P2 — icon path derived from the same name→category mapping the browser
-    -- uses, so the icon, color, and name share one source of truth. Blank
-    -- pads pass '' (clears P_ICON). nil means "no resolver available" and
-    -- track_reflect leaves the existing P_ICON alone.
-    local icon = blank and '' or icon_for_pad_name(name, color)
-    pads[i] = { name = name, pitch = pitch, blank = blank, color = color, icon = icon }
-    -- Digest includes blank-state, color, AND icon so any one of them
-    -- changing (without name change) trips a resync.
+    pads[i] = { name = name, pitch = pitch, blank = blank, color = color }
+    -- Digest includes blank-state AND color so either changing (without a
+    -- name change) trips a resync. The icon is a function of name + color,
+    -- so it rides along without being computed here (resolve_icons).
     parts[#parts + 1] = name
     parts[#parts + 1] = tostring(pitch or '-')
     parts[#parts + 1] = blank and 'B' or '.'
     parts[#parts + 1] = tostring(color)
-    parts[#parts + 1] = tostring(icon or '~')
   end
   return table.concat(parts, '\0'), pads
 end
 
--- Does this lane's live Swing state differ from its stored P_EXT? Used both
+-- P2 — icon path per pad, derived from the same name→category mapping the
+-- browser uses, so the icon, color, and name share one source of truth. Blank
+-- pads pass '' (clears P_ICON). nil means "no resolver available" and
+-- track_reflect leaves the existing P_ICON alone. Resolved only for a snapshot
+-- about to be applied (DM229, 2026-10-26): the classifier runs ~620 string
+-- finds per name, and doing 16 of them into every Tick's digest cost ~10k
+-- finds per group per frame, in the bridge and the overlay both, for nothing.
+local function resolve_icons(snapshot)
+  for i = 1, 16 do
+    local pad = snapshot[i]
+    pad.icon = pad.blank and '' or icon_for_pad_name(pad.name, pad.color)
+  end
+end
+
 -- Icon target for a lane under the current policy. Under "reaper" the tint
 -- follows the lane's LIVE track color (REAPER/SWS owns it — matching what the
 -- bridge already does for the audio multi-outs); under "swing"/"none" it
@@ -254,6 +247,7 @@ local function lane_color_sig(lanes, policy)
   return '\0' .. table.concat(sig, ',')
 end
 
+-- Does this lane's live Swing state differ from its stored P_EXT? Used both
 -- to decide whether to write (unlocked) and to detect a "pending change held
 -- back by a lock" (locked).
 local function lane_diff(lane, snapshot, policy)
@@ -351,8 +345,9 @@ local function sync_lane(lane, snapshot, policy)
   -- P4 — one writer. Build the identity record (TCP "NN Name" prefix; P_EXT
   -- keeps the bare name, set above) and hand off to track_reflect. pad.color
   -- is the snapshot's precomputed kit-hue native int, so diff and write can't
-  -- disagree. P_ICON intentionally nil here — P2 will set it from the same
-  -- shared identity once icons publish.
+  -- disagree. P_ICON comes from want_icon (the same resolver lane_diff uses);
+  -- track_reflect writes it only while the track still wears our auto icon
+  -- (EON_ICON_AUTO), so a user-set icon is left alone.
   -- color = nil under "reaper"/"none" (track_reflect leaves it unchanged).
   local want_color = nil
   if policy.write_tracks then want_color = pad.color end
@@ -365,13 +360,6 @@ local function sync_lane(lane, snapshot, policy)
   return true
 end
 
--- Internal worker shared by Tick (digest-gated) and ForceResync.
--- Returns (touched, deferred):
---   touched  = lanes actually written this pass
---   deferred = locked lanes that HAD a pending change we suppressed. The
---              caller uses this to decide whether to advance the digest cache
---              — if a lock is holding back a change, we must keep re-checking
---              so the moment the user unlocks, the change lands.
 -- Edge case #4 — surface (don't silently absorb) a kit that maps two loaded
 -- pads to the SAME trigger-note. Lanes are one-track-per-pad, so the auto-
 -- follow transpose can't merge their MIDI; but the user should know two lanes
@@ -415,14 +403,53 @@ end
 local function slot_for_group(guid, n_groups)
   local slot = (guid ~= '') and swing_state.SlotForGuid(guid) or nil
   if slot ~= nil then return slot end
-  -- Degenerate single-group case: behave exactly like the old single-Swing
-  -- sync — any live Swing publishes the shared block and the lanes follow it.
-  -- With SEVERAL groups that would cross-feed kits, so unresolved groups
-  -- freeze instead.
-  if n_groups == 1 and swing_state.IsAlive() then return false end
+  -- Degenerate single-group case, GUID-LESS lanes only: behave exactly like
+  -- the old single-Swing sync — any live Swing publishes the shared block and
+  -- the lanes follow it. A group that NAMES its Swing and cannot resolve it
+  -- (bypassed, offline, its track gone, no registry slot) freezes instead
+  -- (DM230, 2026-10-26): the shared block is whichever Swing is the browser
+  -- target, so the fallback renamed, recoloured and transposed those lanes to
+  -- another kit while their own Swing was bypassed, and back when it returned.
+  -- With SEVERAL groups the fallback would cross-feed kits, so nobody gets it.
+  if guid == '' and n_groups == 1 and swing_state.IsAlive() then return false end
   return nil
 end
 
+-- Pad Banks step 5a: the lanes are bank A's. While the Swing shows another bank its bands carry that bank, and
+-- a sync would rename the lanes and TRANSPOSE their MIDI to that bank's notes, so the group pauses; the digest
+-- is kept, so coming back to bank A changes nothing unless bank A itself changed meanwhile.
+-- The return to bank A is trusted late (DM214, 2026-10-26): @gfx writes GS_INST_BANK_CUR = 0 the moment the A
+-- tab is clicked, while the IDENT / PADNAME bands and the kit hash still carry bank B..D until the next @block
+-- publishes them. A Tick in that gap read "bank A" off the cell and synced B's names into the lanes, moving their
+-- MIDI to B's notes; the next Tick moved it back, and a note already at the B pitch was merged. So after the cell
+-- goes 0 the group stays paused until the instance's registry heartbeat -- written by @block, after the bands --
+-- has moved twice. Returns true when the group may sync.
+local bank_last   = {}   -- guid -> the bank the cell showed on the last call
+local bank_settle = {}   -- guid -> { hb = heartbeat seen when the cell went 0, n = moves since }
+local function bank_a_settled(guid, slot)
+  local bank = swing_state.SlotBankCur(slot)
+  local prev = bank_last[guid]
+  bank_last[guid] = bank
+  if bank ~= 0 then bank_settle[guid] = nil; return false end
+  if prev ~= nil and prev ~= 0 then
+    bank_settle[guid] = { hb = swing_state.SlotHeartbeat(slot), n = 0 }
+  end
+  local st = bank_settle[guid]
+  if not st then return true end
+  local hb = swing_state.SlotHeartbeat(slot)
+  if hb ~= st.hb then st.hb = hb; st.n = st.n + 1 end
+  if st.n < 2 then return false end
+  bank_settle[guid] = nil
+  return true
+end
+
+-- Internal worker shared by Tick (digest-gated) and ForceResync.
+-- Returns (touched, deferred):
+--   touched  = lanes actually written this pass
+--   deferred = locked lanes that HAD a pending change we suppressed. The
+--              caller uses this to decide whether to advance the digest cache
+--              — if a lock is holding back a change, we must keep re-checking
+--              so the moment the user unlocks, the change lands.
 local function do_sync(snapshot, lanes, policy)
   local touched, deferred = 0, 0
   for _, lane in ipairs(lanes) do
@@ -491,13 +518,19 @@ end
 -- public
 -- =============================================================================
 
+-- Tick's project scan -- every track's P_EXT, a json.decode per lane, a membership signature per group -- ran on
+-- every defer frame of the bridge AND the overlay (DM231, 2026-10-26), while the Swing-side digest it feeds moves
+-- on a kit load or a rename, never per frame. At most one scan per TICK_SCAN_S; a change lands at most that late.
+local TICK_SCAN_S  = 0.1
+local _last_scan_t = -math.huge
+
 -- Per-frame entry. Cheap when nothing changed (one digest compare per
--- instance group).
+-- instance group, at most every TICK_SCAN_S).
 function M.Tick()
   ensure_init()
-  -- Keep the bridge warm so Swing keeps publishing live names/pitches. This
-  -- runs even when no lanes exist yet (harmless) and is self-throttled.
-  pump_bridge_heartbeat()
+  local now = reaper.time_precise()
+  if (now - _last_scan_t) < TICK_SCAN_S then return end
+  _last_scan_t = now
   -- Skip while a kit load is in flight so we never sync against a half-
   -- published block. Digests are left untouched, so the next idle frame
   -- re-reads the fully-published state. (Edge case #2.)
@@ -516,10 +549,9 @@ function M.Tick()
       last_digest[guid] = nil
     end
     local slot = slot_for_group(guid, n_groups)
-    -- Pad Banks step 5a: the lanes are bank A's. While the Swing shows another bank its bands carry that bank,
-    -- and a sync would rename the lanes and TRANSPOSE their MIDI to that bank's notes. Pause; the digest is
-    -- kept, so coming back to bank A changes nothing unless bank A itself changed meanwhile.
-    if slot and swing_state.SlotBankCur(slot) ~= 0 then slot = nil end
+    -- Pad Banks step 5a: pause while the Swing shows a bank other than A, and until the return to A has
+    -- settled in the bands (bank_a_settled, DM214).
+    if slot and not bank_a_settled(guid, slot) then slot = nil end
     -- ...and lanes with no guid read the legacy shared block: the bank ITS publisher shows (audit S13)
     if slot == false and swing_state.SharedBankCur() ~= 0 then slot = nil end
     if slot ~= nil then
@@ -534,6 +566,7 @@ function M.Tick()
       -- OR an external recolor forces exactly one resync pass.
       digest = pol_name .. '\0' .. digest .. lane_color_sig(lanes, policy)
       if digest ~= last_digest[guid] then
+        resolve_icons(snapshot)
         warn_pitch_collisions(snapshot)
         local _, deferred = do_sync(snapshot, lanes, policy)
         -- Only commit the digest when nothing is being held back by a lock.
@@ -559,7 +592,7 @@ function M.ForceResync()
   local touched, any = 0, false
   for guid, lanes in pairs(groups) do
     local slot = slot_for_group(guid, n_groups)
-    if slot and swing_state.SlotBankCur(slot) ~= 0 then slot = nil end   -- step 5a: not while another bank is shown
+    if slot and not bank_a_settled(guid, slot) then slot = nil end   -- step 5a + DM214: not while another bank is shown or just left
     if slot == false and swing_state.SharedBankCur() ~= 0 then slot = nil end   -- the shared block's bank (audit S13)
     if slot ~= nil then
       any = true
@@ -567,6 +600,7 @@ function M.ForceResync()
       if slot == false then slot = nil end
       local digest, snapshot = read_swing_snapshot(slot)
       digest = pol_name .. '\0' .. digest .. lane_color_sig(lanes, policy)
+      resolve_icons(snapshot)
       warn_pitch_collisions(snapshot)
       local t, deferred = do_sync(snapshot, lanes, policy)
       touched = touched + t

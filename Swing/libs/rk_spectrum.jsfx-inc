@@ -6,9 +6,10 @@ desc: rk_spectrum - FFT spectrum analyzer (ReaKit suite)
 ================================================================================
 
   FFT spectrum analyzer library for the EON Studios ReaKit suite.
-  Provides multi-buffer averaging, log-frequency axis mapping, dB-scaled
+  Provides up to six buffers (each drawn as a line or a fill: the per-bin
+  maximum, falling back with a decay), log-frequency axis mapping, dB-scaled
   display with configurable floor, piano-keys overlay, peak hold, and
-  octave gridlines.
+  decade gridlines (10, 20 .. 100, 200 ..). No averaging.
 
   This file is a port of Justin Johnson's S2GFX spectrum.jsfx-inc as
   bundled with the Tukan plugin suite. The instance namespace has been
@@ -20,15 +21,14 @@ desc: rk_spectrum - FFT spectrum analyzer (ReaKit suite)
     https://lists.gnu.org/archive/html/help-octave/2015-07/msg00016.html
     http://apmr.matelys.com/Standards/OctaveBands.html
 
-  Usage example:
+  Usage example (EON Tone's sequence; init() does every allocation):
     @init
-    rk_spectrum.init_memory(__memtop__);
-    rk_spectrum.alloc_memory(...);
-    rk_spectrum.set_block_size(2048);
+    rk_spectrum.init_memory(freemem);
+    rk_spectrum.init();
+    freemem = rk_spectrum.get_memory_index();
     @sample
     rk_spectrum.sample0(spl0 + spl1);
     @gfx
-    rk_spectrum.draw_grid(0);
     rk_spectrum.draw(0);
 
 ================================================================================
@@ -507,7 +507,8 @@ function rk_spectrum.draw_line(x1, y1, x2, y2)
  */
 function rk_spectrum.draw(bufindex)
   local(i, pwr, windowpos, dwindowpos, buf1, buf2, buf3, tx, ty, spectrum_fill, tpx, tpy, fill_slast, fill_slmin,
-        lx, ly, tx0, lx0, num_bins, last_bin, bin, ipnt, mag, freq, bottom, delta, time, rate_over_fftsize, nb, log2c)
+        lx, ly, tx0, lx0, num_bins, last_bin, bin, ipnt, mag, freq, bottom, delta, time, rate_over_fftsize, nb, log2c,
+        gx0, gx1, gy0, sx, sy, ex, ey)
 (
   // Select buffer to draw
   bufindex == 0 ? ( 
@@ -681,6 +682,7 @@ function rk_spectrum.draw(bufindex)
 
   ly = 0;
   lx = -1;
+  gx0 = rk_spectrum.left_margin; gx1 = grf_w - rk_spectrum.right_margin; gy0 = rk_spectrum.top_margin;   // the graph's edges (the clip below)
   // Start at 1: index 0 is the historical never-written slot (freq 0), whose
   // log-domain x/y are off-scale. Under an 8192 FFT the guard hid the phantom
   // segment (first real bin sat left of left_margin); at smaller FFT sizes the
@@ -701,8 +703,17 @@ function rk_spectrum.draw(bufindex)
 
       ty = rk_spectrum.01_to_y(rk_spectrum.bin_y[ipnt]);
 
-      lx != -1 && tx >= rk_spectrum.left_margin && (ly < bottom-1 || ty < bottom-1) ? 
+      // The trace stays INSIDE the graph (sweep LIB130): a segment is drawn only while it starts
+      // left of the right edge, its ends are cut to [left_margin, grf_w - right_margin] with the
+      // y interpolated, and no end rises above top_margin. The bins run to Nyquist and the first
+      // one sits left of the margin, so the trace used to run through both margins (at 96 k past
+      // the window's edge) and over the top. The unclipped point carries on to the next segment.
+      lx != -1 && tx >= gx0 && lx < gx1 && (ly < bottom-1 || ty < bottom-1) ?
       (
+        sx = lx; sy = ly; ex = tx; ey = ty;
+        lx < gx0 ? ( ly = sy + (ey - sy) * (gx0 - sx) / max(ex - sx, 0.000001); lx = gx0; );
+        tx > gx1 ? ( ty = sy + (ey - sy) * (gx1 - sx) / max(ex - sx, 0.000001); tx = gx1; );
+        ly = max(ly, gy0); ty = max(ty, gy0);
         spectrum_fill ? (
           tx0=tx|0;
           lx0=lx|0;
@@ -727,6 +738,7 @@ function rk_spectrum.draw(bufindex)
             rk_spectrum.draw_line(lx, ly, tx, ty);
           );
         );
+        lx = sx; ly = sy; tx = ex; ty = ey;   // the unclipped point goes on to the next segment
       );
 
       lx=tx; ly=ty;

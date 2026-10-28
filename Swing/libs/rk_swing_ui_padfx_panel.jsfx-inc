@@ -23,12 +23,27 @@ PFX_BOTTOM_H_B = 300;    // the wide form's default height below the pads, desig
 PFX_BOTTOM_MIN_B = 300;  // and its floor: shorter and the bottom buttons would run into the sends
 PFX_PAGE_H = 22;         // the page chips' row at the top of the panel, design px
 SIDE_TAB_H = 22;         // the side slot's top row (its tabs or titles), design px -- here, below the bottom slot's gate, which reads the need
+// The page SCROLLS where it is taller than the room under the chips (swing_pfx_panel_draw; the owner, 2026-10-27, docked: the
+// column was cut off at the bottom, the SENDS knobs half off the docker). Not saved: back at the top for another pad or page.
+PFX_SCR_W = 8;           // the scroll bar's column at the panel's right edge, design px (the page gives it that width while it scrolls)
+PFX_SYNTH_NEED_H = 232;  // the SYNTH page's height under the chips: swing_synth_body_draw starts 26 px up under them, its controls
+                         // end by its top + 240 and its hint line sits 13 px above its bottom
+PFX_SCR_IMG = 120;       // the offscreen image of the save-under (only 0..127 work, knobs_kbsg; the knobs use 127, the kit cover 96)
+pfx_scr = 0; pfx_scr_pad = -1; pfx_scr_page = -1; pfx_sb_drag = 0; pfx_sb_y0 = 0; pfx_sb_s0 = 0; pfx_scr_on = 0; pfx_scr_max = 0;
+pfx_whl_left = 0; pfx_vis_y0 = -1000000; pfx_vis_y1 = 1000000; pfx_su_w = 0; pfx_su_h = 0;
 
 // The height the side slot NEEDS for what is open in it: the editor's column is laid out for PFX_EDITOR_H under the tab
 // row (the browser and the sequencer fold to any height). The bottom slot's gate keeps the pads' area at least this
 // tall, so the panel below gives up height before the editor's bottom is cut (the user, 2026-10-22: "the bottom gets
 // chopped off when resized").
-function swing_side_need_h() ( (pfx_open && fx_place != 3) ? swing_px(PFX_EDITOR_H + SIDE_TAB_H) : 0; );
+// As a floor on the PADS' height (rk_seq_ui's cap on the bottom slot): the side slot starts at y = 28 and spans the
+// LCD bar and the bank strip beside the pads, so the pads owe the editor its stack (the tab row, the page chips,
+// the editor) LESS those two. Floored at the editor's full stack, the bottom slot gave up about 134 design px more
+// than the editor needed (LIB319).
+function swing_side_need_h() (
+  (pfx_open && fx_place != 3) ?
+    max(0, swing_px(SIDE_TAB_H + PFX_PAGE_H + PFX_EDITOR_H) - swing_px(LCD_BAR_H) - swing_px(BANK_STRIP_H)) : 0;
+);
 
 // The editor's ask when it is placed below the pads (fx_place 3): its dragged height (fx_h, gate 82, 0 = the default) or
 // the default.
@@ -81,8 +96,10 @@ local(_ps_sel, _ps_tile, _ps_tw, _ps_th, _ps_cw, _ps_cw2, _ps_m,
       _ov_draw_buttons();                         // at the panel's bottom (op_y + op_h - 66 / - 38), right-aligned in the column
     );
     // a file dropped from the OS on the panel: the overlay's own drop -- the layer tab under it, else the layer shown
-    // (the panel took no drop at all; the audit, 2026-10-22)
-    !_ui_modal_up && mouse_x >= x && mouse_x < x + w && mouse_y >= y && mouse_y < y + h ? _ov_take_drop();
+    // (the panel took no drop at all; the audit, 2026-10-22); on the part of the page that shows (pfx_vis_y0 .. y1: the
+    // room under the chips -- the page scrolls, 2026-10-27; the whole page when it fits)
+    !_ui_modal_up && mouse_x >= x && mouse_x < x + w && mouse_y >= max(y, pfx_vis_y0) && mouse_y < min(y + h, pfx_vis_y1) ? _ov_take_drop();
+    pfx_whl_left = frame_wheel;   // the wheel no section took (each that takes it zeroes it): the panel's scroll reads it
     lmb_down = 0; LMB = 0; rmb_down = 0; frame_wheel = 0;   // spent
     pfx_hpf_cx = op_x + (op_w / 7) * 0.5; pfx_hpf_cy = eq_dy + eq_dh + 4 + 10 + 11 + 2;   // the HPF knob's centre, for the rig (the column it is in)
     pfx_sw_x0 = _sw_x0; pfx_sw_w = _sw_w; pfx_sw_y = _cp_y;                                 // the colour swatch row, for the rig
@@ -124,8 +141,23 @@ local(_pg_i, _pg_x, _pg_cw, _pg_hot, _pg_tw, _pg_th)
 // ── The panel: what both slots draw -- the ground, the notes (the pad editor open over the pads in a compact face; no pad
 // clicked yet), the page chips and the page. (x, y, w, h) = the whole panel; wide = the form below the pads. The mouse:
 // the frame's globals as the caller left them; a modal up hands the panel none; spent after. ──
+// THE SCROLL (2026-10-27; the owner's docked screenshot: the column cut off at the bottom, the SENDS knobs half off the
+// docker). A page taller than the room under the chips (the SOUND page's PFX_EDITOR_H narrow, PFX_BOTTOM_MIN_B wide; the
+// SYNTH page's PFX_SYNTH_NEED_H) is drawn at its own height, moved up by pfx_scr, a little narrower: a thin bar takes the
+// panel's right PFX_SCR_W (its thumb drags, a press above or below it pages, the wheel over it scrolls), and the wheel no
+// control of the page takes (pfx_whl_left: over a label or an empty spot; the knobs keep theirs) scrolls too. The page is
+// drawn ON SCREEN where it shows, so the pointer needs no offset: off the room under the chips (and on the bar) it gets no
+// press and no wheel, and with the button up no pointer at all (no hover, no tooltip for a part out of view; with the
+// button held a drag in flight keeps it). JSFX cannot clip, so what the moved page paints above that room is put back
+// after it: the strip is copied from the frame before the page draws and blitted back after (PFX_SCR_IMG; the same frame's
+// pixels, never a picture held across frames: the no-blink rule) -- the chips then paint their row, and at the side the
+// slot's tab row paints after this panel. Below, the page runs no further than it did before it scrolled. The drop targets
+// it publishes (the layer tabs ovl_tabs_*, the waveform ovl_wave_*) are cut to the part that shows, or withdrawn.
+// A page that fits draws exactly as before, with no bar.
 function swing_pfx_panel_draw(x, y, w, h, wide)
-local(_pp_sel, _pp_tw, _pp_th, _pp_ph, _pp_ld, _pp_lc, _pp_rd, _pp_wh)
+local(_pp_sel, _pp_tw, _pp_th, _pp_ph, _pp_ld, _pp_lc, _pp_rd, _pp_wh,
+      _pp_vy, _pp_vh, _pp_need, _pp_sbw, _pp_cy, _pp_pw, _pp_in, _pp_bar, _pp_park, _pp_mx, _pp_my, _pp_tt, _pp_ty,
+      _pp_su, _pp_suy, _pp_suh, _pp_d, _pp_a, _pp_m, _pp_t0, _pp_w0, _pp_c0, _pp_c1, _pp_sc)
 (
   pfx_px = x; pfx_py = y; pfx_pw = w; pfx_ph = h; pfx_wide = wide;
   swing_fb_ground();
@@ -133,6 +165,7 @@ local(_pp_sel, _pp_tw, _pp_th, _pp_ph, _pp_ld, _pp_lc, _pp_rd, _pp_wh)
   _ui_modal_up ? ( lmb_down = 0; LMB = 0; rmb_down = 0; frame_wheel = 0; );
   _pp_sel = (sel_pad >= 0 && sel_pad < NUM_SLOTS) ? (sel_pad | 0) : -1;
   overlay_pad >= 0 || _pp_sel < 0 ? (
+    pfx_scr_on = 0; pfx_sb_drag = 0;
     gfx_set(0.15, 0.16, 0.19, 1); gfx_rect(x, y, w, h);
     rk_font(1, swing_fs(10), 0); gfx_set(_fb_tc, _fb_tc, _fb_tc, 0.6);
     strcpy(#pfx_ttl, overlay_pad >= 0 ? "The pad editor is open over the pads." : "Click a pad: its editor shows here.");
@@ -144,10 +177,83 @@ local(_pp_sel, _pp_tw, _pp_th, _pp_ph, _pp_ld, _pp_lc, _pp_rd, _pp_wh)
     // start below the row, so the order changes nothing for the mouse
     _pp_ph = swing_px(PFX_PAGE_H);
     _pp_ld = lmb_down; _pp_lc = LMB; _pp_rd = rmb_down; _pp_wh = frame_wheel;   // the row reads the frame's press after the page (the sound page spends it)
-    pfx_page == 1 ? swing_synth_body_draw(x, y + _pp_ph - 26, w, h - _pp_ph + 26, _pp_sel, 0, wide)
-                  : swing_pfx_sections_draw(x, y + _pp_ph, w, h - _pp_ph, wide);
+    // the scroll: the room under the chips, the page's own height, the bar
+    _pp_vy = y + _pp_ph; _pp_vh = h - _pp_ph;
+    _pp_need = pfx_page == 1 ? PFX_SYNTH_NEED_H : wide ? swing_px(PFX_BOTTOM_MIN_B) : PFX_EDITOR_H;
+    pfx_scr_on = _pp_vh > 0 && _pp_need > _pp_vh;
+    (_pp_sel != pfx_scr_pad || pfx_page != pfx_scr_page) ? ( pfx_scr = 0; pfx_scr_pad = _pp_sel; pfx_scr_page = pfx_page; pfx_sb_drag = 0; );
+    pfx_scr_max = pfx_scr_on ? _pp_need - _pp_vh : 0;
+    pfx_scr = max(0, min(pfx_scr_max, pfx_scr | 0));
+    (!pfx_scr_on || !LMB) ? pfx_sb_drag = 0;
+    _pp_sbw = pfx_scr_on ? swing_px(PFX_SCR_W) : 0;
+    pfx_scr_on ? (
+      // the bar's press is the bar's (the page never sees it): the thumb drags, a press above or below it pages
+      _pp_tt = max(swing_px(16), (_pp_vh * _pp_vh / _pp_need) | 0);
+      _pp_ty = _pp_vy + ((_pp_vh - _pp_tt) * pfx_scr / max(1, pfx_scr_max)) | 0;
+      _pp_bar = mx >= x + w - _pp_sbw && mx < x + w && my >= _pp_vy && my < y + h;
+      _pp_bar && lmb_down ? (
+        my >= _pp_ty && my < _pp_ty + _pp_tt ? ( pfx_sb_drag = 1; pfx_sb_y0 = my; pfx_sb_s0 = pfx_scr; )
+        : pfx_scr = max(0, min(pfx_scr_max, pfx_scr + (my < _pp_ty ? -1 : 1) * max(swing_px(24), _pp_vh - swing_px(24))));
+      );
+      pfx_sb_drag && LMB ? pfx_scr = max(0, min(pfx_scr_max, pfx_sb_s0 + ((my - pfx_sb_y0) * pfx_scr_max / max(1, _pp_vh - _pp_tt)) | 0));
+    );
+    _pp_cy = _pp_vy - pfx_scr;                       // the page's top, moved up by the scroll
+    _pp_pw = w - _pp_sbw;                            // ... and its width (the bar's column off while it scrolls)
+    pfx_vis_y0 = _pp_vy; pfx_vis_y1 = y + h;         // the part that shows (the OS drop's test in the sections)
+    // the pointer for the page: off the part that shows, or on the bar, no press and no wheel; button up, no pointer
+    _pp_in = mx >= x && mx < x + _pp_pw && my >= _pp_vy && my < y + h;
+    _pp_park = pfx_scr_on && (pfx_sb_drag || (!_pp_in && !LMB));
+    pfx_scr_on && !_pp_in ? ( lmb_down = 0; rmb_down = 0; frame_wheel = 0; );
+    _pp_park ? ( _pp_mx = mx; _pp_my = my; mx = -10000; my = -10000; LMB = 0; lmb_down = 0; rmb_down = 0; frame_wheel = 0; );
+    // the save-under: the strip [x, x + w) the moved page paints above the room under the chips (the SYNTH body's from 26 px
+    // above the page's top: its header row, under the chips)
+    _pp_suy = max(0, (_pp_cy - (pfx_page == 1 ? 26 : 0)) | 0); _pp_suh = (_pp_vy | 0) - _pp_suy;
+    _pp_su = pfx_scr_on && _pp_suh > 0 && w >= 1;
+    _pp_su ? (
+      _pp_d = gfx_dest; _pp_a = gfx_a; _pp_m = gfx_mode;
+      (w > pfx_su_w || _pp_suh > pfx_su_h) ? ( pfx_su_w = max(pfx_su_w, ceil(w)); pfx_su_h = max(pfx_su_h, _pp_suh); gfx_setimgdim(PFX_SCR_IMG, pfx_su_w, pfx_su_h); );
+      gfx_dest = PFX_SCR_IMG; gfx_mode = 6; gfx_a = 1;   // 2: the source's alpha off, 4: no filtering -- a straight copy
+      gfx_blit(_pp_d, 1, 0, x, _pp_suy, w, _pp_suh, 0, 0, w, _pp_suh);
+      gfx_dest = _pp_d; gfx_mode = _pp_m; gfx_a = _pp_a;
+    );
+    _pp_t0 = ovl_tabs_t; _pp_w0 = ovl_wave_t; pfx_whl_left = 0;
+    pfx_page == 1 ? ( swing_synth_body_draw(x, _pp_cy - 26, _pp_pw, (pfx_scr_on ? _pp_need : _pp_vh) + 26, _pp_sel, 0, wide); pfx_whl_left = frame_wheel; )
+                  : swing_pfx_sections_draw(x, _pp_cy, _pp_pw, pfx_scr_on ? _pp_need : _pp_vh, wide);
+    _pp_su ? (
+      _pp_a = gfx_a; _pp_m = gfx_mode;
+      gfx_dest = _pp_d; gfx_mode = 6; gfx_a = 1;
+      gfx_blit(PFX_SCR_IMG, 1, 0, 0, 0, w, _pp_suh, x, _pp_suy, w, _pp_suh);
+      gfx_mode = _pp_m; gfx_a = _pp_a;
+    );
+    pfx_scr_on ? (
+      // the drop targets the page published this frame, cut to the part that shows (a drop over the chips, the slot's tab
+      // row or past the bottom never lands on a layer out of view); nothing left: withdrawn
+      ovl_tabs_t != _pp_t0 ? (
+        _pp_c0 = max(ovl_tabs_y, _pp_vy); _pp_c1 = min(ovl_tabs_y + ovl_tabs_h, y + h - 1);
+        _pp_c1 > _pp_c0 ? ( ovl_tabs_y = _pp_c0; ovl_tabs_h = _pp_c1 - _pp_c0; ) : ovl_tabs_t = 0;
+      );
+      ovl_wave_t != _pp_w0 ? (
+        _pp_c0 = max(ovl_wave_y, _pp_vy); _pp_c1 = min(ovl_wave_y + ovl_wave_h, y + h - 1);
+        _pp_c1 > _pp_c0 ? ( ovl_wave_y = _pp_c0; ovl_wave_h = _pp_c1 - _pp_c0; ) : ovl_wave_t = 0;
+      );
+    );
+    _pp_park ? ( mx = _pp_mx; my = _pp_my; );
     lmb_down = _pp_ld; LMB = _pp_lc; rmb_down = _pp_rd; frame_wheel = _pp_wh;
     swing_pfx_pages_draw(x, y, w, _pp_ph, _pp_sel);
+    pfx_scr_on ? (
+      // the bar, as the page was drawn (the theme's ground lifted toward its text colour: the mini browser's list bar)
+      _pp_tt = max(swing_px(16), (_pp_vh * _pp_vh / _pp_need) | 0);
+      _pp_ty = _pp_vy + ((_pp_vh - _pp_tt) * pfx_scr / max(1, pfx_scr_max)) | 0;
+      _pp_bar = mx >= x + w - _pp_sbw && mx < x + w && my >= _pp_vy && my < y + h;
+      swing_fb_mixset(_fb_gr * 0.86, _fb_gg * 0.86, _fb_gb * 0.86, _fb_tc, _fb_tc, _fb_tc, 0.08);
+      gfx_rect(x + w - _pp_sbw, _pp_vy, _pp_sbw, _pp_vh);
+      _pp_sc = (_pp_bar || pfx_sb_drag) ? 0.60 : 0.34;
+      swing_fb_mixset(_fb_gr * 0.86, _fb_gg * 0.86, _fb_gb * 0.86, _fb_tc, _fb_tc, _fb_tc, _pp_sc);
+      swing_fb_rr(x + w - _pp_sbw + floor((_pp_sbw - swing_px(4)) * 0.5), _pp_ty, swing_px(4), _pp_tt, 2);
+      // the wheel: over the bar (the frame's), or over the page where no control of it took the wheel
+      (_pp_bar && _pp_wh != 0) || (_pp_in && pfx_whl_left != 0) ?
+        pfx_scr = max(0, min(pfx_scr_max, pfx_scr - ((_pp_bar ? _pp_wh : pfx_whl_left) > 0 ? 1 : -1) * swing_px(40)));
+    );
   );
   lmb_down = 0; LMB = 0; rmb_down = 0; frame_wheel = 0;   // spent
 );

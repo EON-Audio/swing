@@ -28,13 +28,28 @@ reaper.gmem_attach('Swing_Media_Transfer')
 -- This courier now lives INSIDE the always-on bridge (Swing_Kit_Bridge.lua,
 -- eon_courier_tick) as of the Phase 2 fold-in. Running this standalone copy at the
 -- same time would double-push (two writers staging the same buffer + bumping
--- dm_push). So if the bridge is alive (it writes os.time() to gmem[99]=BRIDGE_ALIVE
--- while running, 0 on exit), self-disable and let the bridge own it. The standalone
--- only matters now as a bare-DM fallback when the bridge isn't running.
-if (reaper.gmem_read(99) or 0) > 0 then
+-- dm_push). So if the bridge is alive, self-disable and let the bridge own it. The
+-- standalone only matters now as a bare-DM fallback when the bridge isn't running.
+-- The bridge is alive when BOTH hold: it publishes what it can do in GS_BRIDGE_LEVEL
+-- (2636: only a bridge writes it, its atexit zeroes it) AND its BRIDGE_ALIVE stamp
+-- (99, os.time() every tick) is fresh -- the 5 s window the bridge's own guard uses.
+-- The old test, gmem[99] > 0, was also true after the Drum Matrix overlay's own
+-- heartbeat or a Build / SeedLane stamped that cell, so this fallback exited exactly
+-- when it was needed (audit DM119, 2026-10-26). Re-checked every tick: a bridge
+-- that starts later takes over, and this copy ends.
+local GS_BRIDGE_LEVEL = 2636
+local BRIDGE_ALIVE    = 99
+local function bridge_alive()
+  if (reaper.gmem_read(GS_BRIDGE_LEVEL) or 0) <= 0 then return false end
+  return (os.time() - (reaper.gmem_read(BRIDGE_ALIVE) or 0)) < 5
+end
+local function yield_to_bridge()
   reaper.ShowConsoleMsg(
     '[StepSeq Sync Courier] Bridge is alive and now owns this courier ' ..
     '(eon_courier_tick) -- standalone copy exiting to avoid a double-push.\n')
+end
+if bridge_alive() then
+  yield_to_bridge()
   return
 end
 
@@ -43,6 +58,10 @@ local SYNC_BASE, SYNC_STRIDE = 26030000, 64
 local F_DMPUSH, F_LISTLEN, F_SPB, F_SYNCON = 8, 9, 10, 11
 local XFER_BASE, XFER_DATA = 26171536, 26171544   -- XFER v2 (Package 2, 2026-09-03); planes 16 x 128
 local XFER_OFF, XFER_LEN, XFER_SUBDIV = 26173592, 26175640, 26177688
+local XFER_CC, XFER_CCMETA = 26196120, 26196632   -- 2B: CC rows, 4 x 128 steps; per row: cc+1 (0 = no row), channel
+-- A note at q lands in step floor(q*spb + RTOL): a hair-early note belongs to the
+-- next step, a note past half a step does NOT (the bridge's rule, stage_blob_to_slot).
+local RTOL = 0.02   -- steps; ~2.5 ms at 120 bpm 16ths -- above PPQ jitter, below musical offsets
 
 local prev_syncon, push_seq = {}, {}
 
@@ -110,6 +129,7 @@ local function push_region_to_slot(slot)
   gw(XFER_BASE + 5, 0)         -- target pattern + 1 (0 = the editor's pattern). Since step 1 the
                                -- StepSeq routes on this field; a stale value left by a bridge push
                                -- would otherwise land this import in another pattern.
+  gw(XFER_BASE + 6, 2)         -- layout version: OFF/LEN planes present (as the bridge stages)
   -- zero the grid
   for pad = 0, 15 do
     for s = 0, listlen - 1 do
@@ -117,20 +137,55 @@ local function push_region_to_slot(slot)
       gw(XFER_DATA + cell, 0); gw(XFER_OFF + cell, 0); gw(XFER_LEN + cell, 0); gw(XFER_SUBDIV + cell, 0)   -- no stale planes from a bridge push
     end
   end
-  -- fill: pad_index (1-based) -> pad (0-based); note QN offset -> step.
+  -- ... and the CC rows: the StepSeq applies any row it finds, so a row left by
+  -- its own last export rewrote a CC lane with old values on engage (audit DM120,
+  -- 2026-10-26). Same clear + fill as the bridge's stage_blob_to_slot.
+  for k = 0, 3 do
+    gw(XFER_CCMETA + k * 2, 0); gw(XFER_CCMETA + k * 2 + 1, 0)
+    for s = 0, listlen - 1 do gw(XFER_CC + k * 128 + s, 0) end
+  end
+  -- fill: pad_index (1-based) -> pad (0-based); note QN offset -> step. The
+  -- bridge's rule (Package 2): a note at q lands in step floor(q*spb + RTOL), with
+  -- OFF = its fraction inside the step and LEN = its length in steps -- the StepSeq
+  -- turns OFF into a hand nudge and LEN into ties. Rounding to the NEAREST step
+  -- moved a late note onto the next step and the empty OFF/LEN planes dropped every
+  -- tie (audit DM121, 2026-10-26). Several notes in one step: the loudest wins (the
+  -- bridge's ratchet fit is not ported here).
   for pad_index, lane in pairs(blob.lanes or {}) do
     local pad = (tonumber(pad_index) or 0) - 1
     if pad >= 0 and pad < 16 then
       for _, n in ipairs(lane.notes or {}) do
-        local step = math.floor((tonumber(n.q) or 0) * spb + 0.5)
+        local sf   = (tonumber(n.q) or 0) * spb
+        local step = math.floor(sf + RTOL)
         if step >= 0 and step < listlen then
           local v = math.floor(tonumber(n.v) or 0)
           if v > 0 then
-            local addr = XFER_DATA + pad * listlen + step
-            if v > (gr(addr) or 0) then gw(addr, v) end   -- keep the loudest hit per cell
+            local cell = pad * listlen + step
+            if v > (gr(XFER_DATA + cell) or 0) then   -- keep the loudest hit per cell
+              local f = sf - step
+              if f < 0 then f = 0 end
+              gw(XFER_DATA + cell, v)
+              gw(XFER_OFF + cell, f)
+              gw(XFER_LEN + cell, (tonumber(n.d) or 0) * spb)
+            end
           end
         end
       end
+    end
+  end
+  -- CC events -> rows (up to 4, one per distinct cc+channel, in first-seen order);
+  -- meta = (cc+1, channel), per step 0 = none, 128 + value (the last in a step wins).
+  local rows, nrows = {}, 0
+  for _, ev in ipairs(blob.cc or {}) do
+    local key = tostring(ev.cc) .. ':' .. tostring(ev.chan)
+    local row = rows[key]
+    if row == nil and nrows < 4 then
+      row = nrows; nrows = nrows + 1; rows[key] = row
+      gw(XFER_CCMETA + row * 2, (ev.cc or 0) + 1); gw(XFER_CCMETA + row * 2 + 1, ev.chan or 0)
+    end
+    if row ~= nil then
+      local s = math.floor((tonumber(ev.q) or 0) * spb + RTOL)
+      if s >= 0 and s < listlen then gw(XFER_CC + row * 128 + s, 128 + math.max(0, math.min(127, math.floor(ev.v or 0)))) end
     end
   end
 
@@ -138,6 +193,10 @@ local function push_region_to_slot(slot)
 end
 
 local function tick()
+  if bridge_alive() then   -- a bridge started after us: it owns the courier now
+    yield_to_bridge()
+    return
+  end
   pcall(function()
     for slot = 0, 15 do
       local on = (gr(SYNC_BASE + slot * SYNC_STRIDE + F_SYNCON) or 0) > 0.5

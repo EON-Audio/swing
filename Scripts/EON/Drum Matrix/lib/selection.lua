@@ -241,15 +241,19 @@ function M.MoveBy(qn_delta, d_semi)
   -- pitch still held by another selected note makes the next entry re-resolve
   -- to the already-moved note (matched by pitch+ppq), so a chord note never
   -- moves and looks "cut off". Delete-then-insert removes that re-match hazard.
-  local src = {}      -- { take, ppq_s, ppq_e, pitch, vel }
+  -- The snapshot carries each note's mute flag and channel: re-inserting
+  -- unmuted on channel 1 woke muted ghost notes and moved them to channel 1
+  -- (audit DM116, 2026-10-26; a single-note drag keeps both through SetNote).
+  local src = {}      -- { take, ppq_s, ppq_e, pitch, vel, muted, chan }
   local del = {}      -- take -> { note_idx, ... }
   for _, e in ipairs(entries) do
     if reaper.ValidatePtr(e.take, 'MediaItem_Take*') then
       local _, ncount = reaper.MIDI_CountEvts(e.take)
       for i = 0, ncount - 1 do
-        local ok, _, _, ppq_s, ppq_e, _, pitch, vel = reaper.MIDI_GetNote(e.take, i)
+        local ok, _, muted, ppq_s, ppq_e, chan, pitch, vel = reaper.MIDI_GetNote(e.take, i)
         if ok and pitch == e.pitch and math.abs(ppq_s - e.ppq_s) < 1 then
-          src[#src + 1] = { take = e.take, ppq_s = ppq_s, ppq_e = ppq_e, pitch = pitch, vel = vel }
+          src[#src + 1] = { take = e.take, ppq_s = ppq_s, ppq_e = ppq_e, pitch = pitch, vel = vel,
+                            muted = muted or false, chan = chan or 0 }
           del[e.take] = del[e.take] or {}
           table.insert(del[e.take], i)
           break
@@ -278,7 +282,7 @@ function M.MoveBy(qn_delta, d_semi)
     end
     local npitch = s.pitch + d_semi
     if npitch < 0 then npitch = 0 elseif npitch > 127 then npitch = 127 end
-    reaper.MIDI_InsertNote(s.take, false, false, nppq_s, nppq_e, 0, npitch, s.vel, true)
+    reaper.MIDI_InsertNote(s.take, false, s.muted, nppq_s, nppq_e, s.chan, npitch, s.vel, true)
     touched[s.take] = true
     new_entries[#new_entries + 1] = { take = s.take, ppq_s = nppq_s, pitch = npitch }
   end
@@ -303,16 +307,21 @@ function M.TransposeBy(d_semi) return M.MoveBy(0, d_semi) end
 function M.DuplicateBy(qn_delta, d_semi)
   qn_delta = qn_delta or 0
   d_semi   = d_semi or 0
-  if #entries == 0 then return 0 end
+  -- A zero delta (a Shift+drag released back on its own cell) would stack an
+  -- exact copy on every selected note: two hits per step, invisible in the
+  -- grid (audit DM117, 2026-10-26). Same guard as MoveBy.
+  if #entries == 0 or (qn_delta == 0 and d_semi == 0) then return 0 end
   -- Snapshot source notes first (project time) so inserts don't perturb the scan.
+  -- Mute flag and channel ride along (see MoveBy).
   local src = {}
   for _, e in ipairs(entries) do
     if reaper.ValidatePtr(e.take, 'MediaItem_Take*') then
       local _, ncount = reaper.MIDI_CountEvts(e.take)
       for i = 0, ncount - 1 do
-        local ok, _, _, ppq_s, ppq_e, _, pitch, vel = reaper.MIDI_GetNote(e.take, i)
+        local ok, _, muted, ppq_s, ppq_e, chan, pitch, vel = reaper.MIDI_GetNote(e.take, i)
         if ok and pitch == e.pitch and math.abs(ppq_s - e.ppq_s) < 1 then
-          src[#src + 1] = { take = e.take, ppq_s = ppq_s, ppq_e = ppq_e, pitch = pitch, vel = vel }
+          src[#src + 1] = { take = e.take, ppq_s = ppq_s, ppq_e = ppq_e, pitch = pitch, vel = vel,
+                            muted = muted or false, chan = chan or 0 }
           break
         end
       end
@@ -330,7 +339,7 @@ function M.DuplicateBy(qn_delta, d_semi)
     local nppq_e = reaper.MIDI_GetPPQPosFromProjTime(s.take, ne)
     local npitch = s.pitch + d_semi
     if npitch < 0 then npitch = 0 elseif npitch > 127 then npitch = 127 end
-    reaper.MIDI_InsertNote(s.take, false, false, nppq_s, nppq_e, 0, npitch, s.vel, true)
+    reaper.MIDI_InsertNote(s.take, false, s.muted, nppq_s, nppq_e, s.chan, npitch, s.vel, true)
     touched[s.take] = true
     new_entries[#new_entries + 1] = { take = s.take, ppq_s = nppq_s, pitch = npitch }
   end

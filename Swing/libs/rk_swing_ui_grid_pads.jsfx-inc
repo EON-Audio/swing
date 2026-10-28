@@ -154,6 +154,76 @@ function swing_banktabs_draw() local(_b, _tx, _has, _on, _drop, _hov, _lw, _lh, 
   gfx_set(0, 0, 0, 0.6); gfx_rect(bt_x, bt_y + bt_h - 1, bt_w, 1);
 );
 
+// The loudest bin of a waveform cache over [b0, b1): one gfx_line per PIXEL COLUMN instead of one per bin.
+// Every loaded pad drew WV_RES (256) lines per frame whatever its width -- 256 lines on the ~38 columns of a
+// TCP/MCP strip, each column overdrawn ~7 times, for every embed of every instance (LIB231). A pad at least
+// WV_RES px wide still draws one line per bin, so its picture is unchanged.
+function swing_grid_wv_peak(_wp_ptr, _wp_b0, _wp_b1) local(_wp_m, _wp_b) (
+  _wp_m = 0; _wp_b = _wp_b0;
+  loop(_wp_b1 - _wp_b0, abs(_wp_ptr[_wp_b]) > _wp_m ? _wp_m = abs(_wp_ptr[_wp_b]); _wp_b += 1;);
+  _wp_m;
+);
+// Columns for a face `px` wide, and the bin span of column j (globals _wv_b0/_wv_b1: callable from any pass).
+function swing_grid_wv_cols(px) ( min(WV_RES, max(1, px | 0)); );
+function swing_grid_wv_span(j, cols) (
+  _wv_b0 = (j * WV_RES / cols) | 0;
+  _wv_b1 = ((j + 1) * WV_RES / cols) | 0;
+  _wv_b1 <= _wv_b0 ? _wv_b1 = _wv_b0 + 1;
+);
+
+// ─── The wave LOOKS Outline (1) and True peaks (2) (slider48; 2026-10-27, the owner's pick from the gallery) ─────────
+// Peak (0) is the code above and below, untouched. These two read slot s's raw bins (rk_swing_core swing_wvb_*): one
+// line per pixel column, its span folded from the bins. Outline = the column's TRUE peak, lighter (0.7 x the wave
+// alpha), with its mean |x| over it, brighter (1.4 x); True peaks = the column's true min to its true max (a media
+// item's look). Channel c (0 L, 1 R), lane centre cy, scale sc (the caller's, times the normalize gain), clamp cl
+// (the strip's; the window has none), the span x0 / ww, colour r g b at alpha a, reversed rv (the bins are forward).
+function swing_grid_wvb_lane(s, c, look, cy, sc, cl, x0, ww, r, g, b, a, rv) local(_cols, _j, _wx, _amp) (
+  _cols = max(1, ww | 0);
+  _j = 0; loop(_cols,
+    swing_wvb_col(s, c, _j, _cols, rv);   // wvb_cmx / wvb_cmn / wvb_cme (rk_swing_core)
+    _wx = x0 + (_j / _cols) * ww;
+    look == 1 ? (
+      gfx_set(r, g, b, a * 0.7);
+      _amp = min(cl, max(wvb_cmx, -wvb_cmn) * sc);
+      gfx_line(_wx, cy - _amp, _wx, cy + _amp);
+      gfx_set(r, g, b, min(1, a * 1.4));
+      _amp = min(cl, wvb_cme * sc);
+      gfx_line(_wx, cy - _amp, _wx, cy + _amp);
+    ) : (
+      gfx_set(r, g, b, a);
+      gfx_line(_wx, cy - min(cl, max(-cl, wvb_cmx * sc)), _wx, cy - min(cl, max(-cl, wvb_cmn * sc)));
+    );
+    _j += 1;
+  );
+);
+// A pad's wave in the look: emb 0 = the window's pad (swing_grid_draw_pads: also the rack face), 1 = a TCP / MCP strip
+// tile (swing_grid_draw_embedded). The lanes and scales are each site's Peak ones, so a pad keeps its place and size.
+function swing_grid_wvb_pad(s, look, x, y, w, h, a, emb) local(_g, _rv) (
+  _g = swing_wvb_gain(s); _rv = p_reverse[s] > 0.5;
+  emb ? (
+    p_stereo[s] ? (
+      swing_grid_wvb_lane(s, 0, look, y + h * 0.25, h * 0.20 * _g, h * 0.22, x, w, 1, 1, 1, a, _rv);
+      swing_grid_wvb_lane(s, 1, look, y + h * 0.75, h * 0.20 * _g, h * 0.22, x, w, 1, 1, 1, a, _rv);
+    ) : (   // mono: the louder channel of a pad mono by balance (wv_monoch, build_wv_cache), else L
+      swing_grid_wvb_lane(s, wv_monoch[s], look, y + h * 0.5, h * 0.40 * _g, h * 0.45, x, w, 1, 1, 1, a, _rv);
+    );
+  ) : (
+    p_stereo[s] ? (
+      swing_grid_wvb_lane(s, 0, look, y + h * 0.24, h * 0.20 * _g, 1000000, x + 4, w - 8, 1, 1, 1, a, _rv);
+      swing_grid_wvb_lane(s, 1, look, y + h * 0.72, h * 0.20 * _g, 1000000, x + 4, w - 8, 1, 1, 1, a, _rv);
+    ) : (
+      swing_grid_wvb_lane(s, wv_monoch[s], look, y + h * 0.48, h * 0.40 * _g, 1000000, x + 4, w - 8, 1, 1, 1, a, _rv);
+    );
+  );
+  gfx_set(1, 1, 1, a);   // leave the colour the Peak branch leaves, for whatever the face draws next
+);
+
+// A drop no handler took this frame is discarded at the frame's end (the main @gfx tail): a file dropped on a
+// pad's S/M/R strip, a gap, the LCD, the mini browser or a big view stayed armed -- gfx_getdropfile(0) answers
+// the same list every frame until it is cleared -- and loaded, with no drop gesture, into the next pad face the
+// mouse crossed, resetting that pad's mix (LIB26). Every taker (pad faces, the cover tile, the editor) ran above.
+function swing_grid_drop_discard() ( gfx_getdropfile(0, #_dd_tmp) ? gfx_getdropfile(-1); );
+
 function swing_grid_draw_embedded() (
   gfx_set(bg_r, bg_g, bg_b, 1); gfx_rect(0, 0, gfx_w, gfx_h);  // cream background
   e_cw = (gfx_w / 4)|0;
@@ -223,16 +293,21 @@ function swing_grid_draw_embedded() (
         ptr   = wv_cache   + gi_s * WV_RES;   // by SLOT, as build_wv_cache writes it (the tile showed bank A's wave on B-D)
         ptr_R = wv_cache_R + gi_s * WV_RES;
         wv_a = is_muted ? 0.25 : 0.50;
+        // PAD WAVE (slider48): Outline / True peaks once the slot's bins are in; Peak, and any slot still building, below
+        _wv_look = swing_wvb_use(gi_s);
+        _wv_look ? swing_grid_wvb_pad(gi_s, _wv_look, ex_, ey_, ew_, eh_, wv_a, 1) : (
         gfx_set(1, 1, 1, wv_a);
         p_stereo[gi_s] ? (
           _wv_scale = eh_ * 0.20;
           _wv_clamp = eh_ * 0.22;
           _wy_topc  = ey_ + eh_ * 0.25;
           _wy_botc  = ey_ + eh_ * 0.75;
-          j = 0; loop(WV_RES,
-            wx = ex_ + (j / WV_RES) * ew_;
-            amp_L = min(_wv_clamp, abs(ptr  [j]) * _wv_scale);
-            amp_R = min(_wv_clamp, abs(ptr_R[j]) * _wv_scale);
+          _wv_cols = swing_grid_wv_cols(ew_);   // one line per pixel column (LIB231)
+          j = 0; loop(_wv_cols,
+            swing_grid_wv_span(j, _wv_cols);
+            wx = ex_ + (j / _wv_cols) * ew_;
+            amp_L = min(_wv_clamp, swing_grid_wv_peak(ptr,   _wv_b0, _wv_b1) * _wv_scale);
+            amp_R = min(_wv_clamp, swing_grid_wv_peak(ptr_R, _wv_b0, _wv_b1) * _wv_scale);
             gfx_line(wx, _wy_topc - amp_L, wx, _wy_topc + amp_L);
             gfx_line(wx, _wy_botc - amp_R, wx, _wy_botc + amp_R);
             j += 1;
@@ -241,13 +316,16 @@ function swing_grid_draw_embedded() (
           _wv_scale = eh_ * 0.40;
           _wv_clamp = eh_ * 0.45;
           wy = ey_ + eh_ * 0.5;
-          j = 0; loop(WV_RES,
-            wx = ex_ + (j / WV_RES) * ew_;
-            amp = min(_wv_clamp, abs(ptr[j]) * _wv_scale);
+          _wv_cols = swing_grid_wv_cols(ew_);   // (LIB231)
+          j = 0; loop(_wv_cols,
+            swing_grid_wv_span(j, _wv_cols);
+            wx = ex_ + (j / _wv_cols) * ew_;
+            amp = min(_wv_clamp, swing_grid_wv_peak(ptr, _wv_b0, _wv_b1) * _wv_scale);
             gfx_line(wx, wy - amp, wx, wy + amp);
             j += 1;
           );
         );
+        );   // (Peak: the lines above, as before the row)
       );
 
       // Synth-only face: engine glyph whenever it fits (per-engine identity),
@@ -392,21 +470,16 @@ function swing_grid_draw_embedded() (
         );
       );
 
-      // Output bus dropdown click (check before pad trigger). Migrated to
-      // popup — gi is captured into _pad_grid_target since the loop var
-      // moves past by the time the popup's result fires (next frame).
-      // Output-bus change is FLOATING-VIEW only. Embedded, this popup can't be
+      // Output-bus change is FLOATING-VIEW only. Embedded, its popup can't be
       // dismissed (REAPER eats the close-click), so a stray click on the tiny pad's
       // "Out N" label opened it and it stuck open, blocking the pad knobs ("works,
-      // then doesn't"). Keep "Out N" informational in the embed; the click falls
+      // then doesn't"). So "Out N" is informational in the embed; the click falls
       // through to the pad trigger below. Change outputs from the floating window.
-      _eout_clicked = 0;
 
       // (right-click menu removed — REAPER eats RMB in embedded mode)
-      // Settings button drawn after the pad loop instead
 
       // Click to trigger via full voice launch (same path as MIDI, supports Sum/RR/VelSplit)
-      mx >= ex_ && mx <= ex_ + ew_ && my >= ey_ && my <= ey_ + eh_ && lmb_down && !_eout_clicked && !_e_knob_hover ? (
+      mx >= ex_ && mx <= ex_ + ew_ && my >= ey_ && my <= ey_ + eh_ && lmb_down && !_e_knob_hover ? (
         pad_is_playable(gi_s) ? (
           swing_gt_post(gi_s, p_note[gi_s], 127, 8);
           p_held[gi_s] = 1; p_held_vel[gi_s] = 127; p_held_note[gi_s] = p_note[gi_s]; gui_held_pad = gi_s;
@@ -417,9 +490,13 @@ function swing_grid_draw_embedded() (
       mx >= ex_ && mx <= ex_ + ew_ && my >= ey_ && my <= ey_ + eh_ && gfx_getdropfile(0, #df) ? (
         // .sfz files route through the Lua bridge import pipeline instead of
         // being treated as audio (load_from_path would silently fail on a
-        // text-based SFZ file).
-        _is_kit_import_ext(#df) && gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 ? (
-          _send_kit_import_to_bridge(#df);
+        // text-based SFZ file). The EXTENSION decides first: with no bridge, or
+        // a busy one, a kit file used to fall through to the audio loader, which
+        // read nch 0, emptied the pad and stored the .sfz as its path (LIB27).
+        // Refused with the bridge cue instead (1 = no bridge, 2 = busy).
+        _is_kit_import_ext(#df) ? (
+          gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 ? _send_kit_import_to_bridge(#df)
+                                                                     : kit_bridge_warn = gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? 2 : 1;
         ) : (
           // Tukan-style undo: let REAPER's automatic chunk-diff capture
           // the load via the mark_dirty() call below. Audio is
@@ -430,25 +507,35 @@ function swing_grid_draw_embedded() (
           // Ctrl+Z. Removing it lets REAPER do its own thing.
           drop_gi = gi; drop_idx = 0;
           while(gfx_getdropfile(drop_idx, #df) && drop_gi < NUM_PADS) (
+            !_is_kit_import_ext(#df) ? (   // a kit file among the samples is skipped, never read as audio (LIB27)
             _da = swing_bp(drop_gi);   // the tile walks the bank; the engine takes the slot (step 4a)
-            // Reset per-pad mix params so stale kit values don't leak
-            // into the new sample. Lighter than full clear_pad which
-            // caused voice tripling when used here.
-            p_gain[_da] = 1.0; p_pan[_da] = 0; p_tune[_da] = 0;
-            p_panL[_da] = 1.0; p_panR[_da] = 1.0;
-            s_start[_da] = 0; s_end[_da] = 1.0;
             // A sounding pad fades instead of cutting at the loader's s_len = 0
             // (A-3): the browser path's kill-and-crossfade, same helper.
             swing_voice_kill_pad_xf(_da);
             load_from_path(_da, #df);
+            // Reset per-pad mix params so stale kit values don't leak into the
+            // new sample. Lighter than full clear_pad which caused voice
+            // tripling when used here. AFTER the load, and only when the loader
+            // took it: a refusal (the pool full) leaves the old sample, so it
+            // must leave the gain, pan, tune, trim and category too (LIB235).
+            !ldr_job1[LDR_F_REFUSED] ? (
+              p_gain[_da] = 1.0; p_pan[_da] = 0; p_tune[_da] = 0;
+              p_panL[_da] = 1.0; p_panR[_da] = 1.0;
+              s_start[_da] = 0; s_end[_da] = 1.0;
+              // The pad's JOB follows its new sample: a native drop never touches
+              // the browser, so this is the only place that can classify it.
+              swing_lcd_padcat_queue_drop(_da);
+            );
             swing_rcp_post_pad(_da); s_dirty[_da] = 1;
-            // The pad's JOB follows its new sample: a native drop never touches
-            // the browser, so this is the only place that can classify it.
-            swing_lcd_padcat_queue_drop(_da);
-            drop_gi += 1; drop_idx += 1;
+            drop_gi += 1;
+            );
+            drop_idx += 1;
           );
           mark_dirty_pad(gi_s); sync_note_names();
+          // One REAPER undo point for the drop, however many pads it filled (2026-10-27; f = the pads walked).
+          drop_gi > gi ? swing_rup_want(RUP_K_SAMPLE, gi_s, -1, -1, drop_gi - gi);
           col_dirty = 1; // re-derive auto-color from dropped samples
+          swing_lcd_rn_drop_gen += 1;   // A2: @block asks the bridge for the root notes, paths attached
         );
         gfx_getdropfile(-1);
       );
@@ -659,15 +746,20 @@ function swing_grid_draw_pads() (
         ptr   = wv_cache   + gi_s * WV_RES;   // by SLOT, as build_wv_cache writes it (the tile showed bank A's wave on B-D)
         ptr_R = wv_cache_R + gi_s * WV_RES;
         wv_a = is_muted ? 0.20 : 0.55;
+        // PAD WAVE (slider48): Outline / True peaks once the slot's bins are in; Peak, and any slot still building, below
+        _wv_look = swing_wvb_use(gi_s);
+        _wv_look ? swing_grid_wvb_pad(gi_s, _wv_look, pad_x, pad_y, pw, ph, wv_a, 0) : (
         gfx_set(1, 1, 1, wv_a);
         p_stereo[gi_s] ? (
           _wv_scale = ph * 0.20;
           _wy_topc  = pad_y + ph * 0.24;
           _wy_botc  = pad_y + ph * 0.72;
-          j = 0; loop(WV_RES,
-            wx = pad_x + 4 + ((j / WV_RES) * (pw - 8));
-            amp_L = abs(ptr  [j]) * _wv_scale;
-            amp_R = abs(ptr_R[j]) * _wv_scale;
+          _wv_cols = swing_grid_wv_cols(pw - 8);   // one line per pixel column (LIB231)
+          j = 0; loop(_wv_cols,
+            swing_grid_wv_span(j, _wv_cols);
+            wx = pad_x + 4 + ((j / _wv_cols) * (pw - 8));
+            amp_L = swing_grid_wv_peak(ptr,   _wv_b0, _wv_b1) * _wv_scale;
+            amp_R = swing_grid_wv_peak(ptr_R, _wv_b0, _wv_b1) * _wv_scale;
             gfx_line(wx, _wy_topc - amp_L, wx, _wy_topc + amp_L);
             gfx_line(wx, _wy_botc - amp_R, wx, _wy_botc + amp_R);
             j += 1;
@@ -675,13 +767,16 @@ function swing_grid_draw_pads() (
         ) : (
           _wv_scale = ph * 0.40;
           wy = pad_y + ph * 0.48;
-          j = 0; loop(WV_RES,
-            wx = pad_x + 4 + ((j / WV_RES) * (pw - 8));
-            amp = abs(ptr[j]) * _wv_scale;
+          _wv_cols = swing_grid_wv_cols(pw - 8);   // (LIB231)
+          j = 0; loop(_wv_cols,
+            swing_grid_wv_span(j, _wv_cols);
+            wx = pad_x + 4 + ((j / _wv_cols) * (pw - 8));
+            amp = swing_grid_wv_peak(ptr, _wv_b0, _wv_b1) * _wv_scale;
             gfx_line(wx, wy - amp, wx, wy + amp);
             j += 1;
           );
         );
+        );   // (Peak: the lines above, as before the row)
       );
     );
 
@@ -817,7 +912,7 @@ function swing_grid_draw_pads() (
     _bl_hov ? (
       swing_badge_hvpad != gi ? ( swing_badge_hvpad = gi; swing_badge_hv = 0; );
       swing_badge_hv += (1 - swing_badge_hv) * 0.30;
-      frame_wheel != 0 ? swing_lcd_padcat_wheel(gi_s, frame_wheel|0);
+      frame_wheel != 0 ? swing_lcd_padcat_wheel(gi_s, frame_wheel);   // raw: the ring steps by sign_of and skips a sub-notch delta (sweep LIB111)
       rmb_down ? cat_ov_pad = gi_s;   // §9c: the glyph-grid overlay (was: text menu)
     ) : ( swing_badge_hvpad == gi ? swing_badge_hv += (0 - swing_badge_hv) * 0.30; );
     swing_badge_hvpad == gi && swing_badge_hv > 0.01 ? (   // animated hover ring
@@ -1101,9 +1196,7 @@ function swing_grid_draw_pads() (
 
     // VOL mini-knob (right of S/M/RPT pills). Radius scales with the
     // control-row height so the knobs grow with the pad rather than
-    // staying frozen at 7px on a stretched window. Floor at 6px (still
-    // clickable on small windows), ceiling at 12px (mini-knob shouldn't
-    // crowd the label below it).
+    // staying frozen at 7px on a stretched window.
     _knob_area_w = cx + pw - _knob_area_x;
     // Knob fills the strip and grows with the pad: radius bounded by the VERTICAL
     // room left after the label below it ((_ctrl_h - label - 3)/2) AND the
@@ -1277,8 +1370,11 @@ function swing_grid_draw_pads() (
         swing_synthview_open(gi_s);
       );
 
-      // Shift+left-click pad → start drag-swap
-      in_pad && lmb_down && SHIFT && pad_input_allowed() && !_knob_hover ? (
+      // Shift+left-click pad → start drag-swap. The pill guards the plain click
+      // carries: a Shift-click on the Out / note / name / SYN pill opened that
+      // pill AND started a drag (LIB234).
+      in_pad && lmb_down && SHIFT && pad_input_allowed() && !_knob_hover &&
+      !_out_clicked && !_note_clicked && !_name_clicked && !_syn_clicked ? (
         drag_src_pad = gi_s; drag_active = 0;
         drag_start_x = mx; drag_start_y = my;
       );
@@ -1307,7 +1403,11 @@ function swing_grid_draw_pads() (
         // not the first Swing's (C-4, audit C 2026-09-14; a bare 1..16 from
         // an older face still resolves to the first Swing). Gated on bridge
         // alive so the request doesn't stale-trigger when the bridge later
-        // starts.
+        // starts. The request carries the TILE; the bridge reads the bank on screen
+        // (eon_fx_bank) and, on banks B-D, selects the pad's own split-out track
+        // or that bank's track (Kit Bridge round F, C14, 2026-10-26) -- so every
+        // bank posts. (LIB232/233's bank-A-only gate undone at the merge: it
+        // predated that bridge fix and would have made B-D clicks select nothing.)
         pad_click_selects_track && gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
           gmem[GS_PAD_TRACK_SELECT] = (gi + 1) + instance_id * 32;
         );
@@ -1316,7 +1416,10 @@ function swing_grid_draw_pads() (
       // Ctrl+click pad → clear pad (deferred for undo). Playable gate, not
       // audio: a synth-only pad clears too (ratified table — Clear Pad = all);
       // both downstream paths pair clear_pad + clear_pad_syn.
-      in_pad && lmb_down && CTRL && pad_input_allowed() && pad_is_playable(gi_s) ? (
+      // The same pill guards as the plain click: a Ctrl-click on a pill used to
+      // open it AND clear the pad under it (LIB234).
+      in_pad && lmb_down && CTRL && pad_input_allowed() && pad_is_playable(gi_s) &&
+      !_out_clicked && !_note_clicked && !_name_clicked && !_knob_hover && !_syn_clicked ? (
         gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 ? (
           gmem[KIT_GMEM_UNDO_DESC] = 2; gmem[KIT_GMEM_CMD] = 46;
           _undo_pending = 2; _undo_pad = gi_s;   // a slot: swing_ui_process_undo clears it (step 4d)
@@ -1344,32 +1447,45 @@ function swing_grid_draw_pads() (
       // .sfz files route through the Lua bridge import pipeline instead of
       // being loaded as raw audio.
       in_pad && pad_input_allowed() && gfx_getdropfile(0, #df) ? (
-        _is_kit_import_ext(#df) && gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 ? (
-          _send_kit_import_to_bridge(#df);
+        // The extension decides first; no bridge or a busy one refuses with the
+        // bridge cue instead of reading the kit file as audio (LIB27; see the
+        // embedded grid).
+        _is_kit_import_ext(#df) ? (
+          gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 ? _send_kit_import_to_bridge(#df)
+                                                                     : kit_bridge_warn = gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? 2 : 1;
         ) : (
-          // Tukan-style undo — see main grid drag at line ~190 for the
-          // rationale. Audio is in @serialize, mark_dirty()
+          // Tukan-style undo — see the embedded drop handler's Tukan note in
+          // swing_grid_draw_embedded for the rationale. Audio is in @serialize, mark_dirty()
           // triggers REAPER's automatic chunk diff. No CMD 46/48.
           drop_gi = gi;
           drop_idx = 0;
           while(gfx_getdropfile(drop_idx, #df) && drop_gi < NUM_PADS) (
+            !_is_kit_import_ext(#df) ? (   // a kit file among the samples is skipped (LIB27)
             _da = swing_bp(drop_gi);   // the tile walks the bank; the engine takes the slot (step 4a)
-            p_gain[_da] = 1.0; p_pan[_da] = 0; p_tune[_da] = 0;
-            p_panL[_da] = 1.0; p_panR[_da] = 1.0;
-            s_start[_da] = 0; s_end[_da] = 1.0;
             swing_voice_kill_pad_xf(_da);   // A-3: fade, never cut (see the embedded grid)
             load_from_path(_da, #df);
+            // The mix reset and the category follow an ACCEPTED load only: a
+            // refusal leaves the old sample, so it leaves its mix (LIB235).
+            !ldr_job1[LDR_F_REFUSED] ? (
+              p_gain[_da] = 1.0; p_pan[_da] = 0; p_tune[_da] = 0;
+              p_panL[_da] = 1.0; p_panR[_da] = 1.0;
+              s_start[_da] = 0; s_end[_da] = 1.0;
+              // The pad's JOB follows its new sample: a native drop never touches
+              // the browser, so this is the only place that can classify it.
+              swing_lcd_padcat_queue_drop(_da);
+            );
             swing_rcp_post_pad(_da);
             s_dirty[_da] = 1;
-            // The pad's JOB follows its new sample: a native drop never touches
-            // the browser, so this is the only place that can classify it.
-            swing_lcd_padcat_queue_drop(_da);
             drop_gi += 1;
+            );
             drop_idx += 1;
           );
           mark_dirty_pad(gi_s);
           sync_note_names();
+          // One REAPER undo point for the drop, however many pads it filled (2026-10-27; f = the pads walked).
+          drop_gi > gi ? swing_rup_want(RUP_K_SAMPLE, gi_s, -1, -1, drop_gi - gi);
           col_dirty = 1; // re-derive auto-color from dropped samples
+          swing_lcd_rn_drop_gen += 1;   // A2: @block asks the bridge for the root notes, paths attached
         );
         gfx_getdropfile(-1);
       );
@@ -1482,8 +1598,9 @@ function swing_grid_draw_pads() (
       abs(mx - drag_start_x) + abs(my - drag_start_y) > 6 ? drag_active = 1;
 
       drag_active ? (
-        // Draw ghost pad at cursor
-        _cb = drag_src_pad * 3;
+        // Draw ghost pad at cursor. col_rgba holds the sixteen TILES; drag_src_pad is a
+        // SLOT (0..63), which on banks B-D read past the table (LIB236).
+        _cb = swing_pad_tile(drag_src_pad) * 3;
         gfx_set(col_rgba[_cb], col_rgba[_cb+1], col_rgba[_cb+2], 0.5);
         gfx_rect(mx - 15, my - 15, 30, 30);
         gfx_set(1, 1, 1, 0.7);
@@ -1634,7 +1751,7 @@ function swing_grid_extdrag() local(_xd_b, _xd_st, _xd_n, _xd_mode, _xd_live,
 
     // Rect math mirrors whichever draw path actually ran this frame, so the
     // lit pad is pixel-exact with the drawn one:
-    //   embedded — swing_grid_draw_embedded() lines 28-40 (whole surface in
+    //   embedded — swing_grid_draw_embedded()'s e_cw/e_ch/e_gap block (whole surface in
     //     quarters, e_gap inset). e_cw/e_ch/e_gap are globals that survive the
     //     call; ex_/ey_ do NOT (they hold only the last loop iteration), so
     //     the rects are recomputed here.
@@ -1700,6 +1817,14 @@ function swing_grid_extdrag() local(_xd_b, _xd_st, _xd_n, _xd_mode, _xd_live,
       _xd_k += 1;
     );
   );
+  // ...and its waveform: the layer shown, as if dropped on that layer's tab (the owner, 2026-10-27; the same window test)
+  xdrag_tab < 0 && _xd_st != 0 && (time_precise() - xdrag_seen_t) < 0.30 && !is_embedded && !swing_popup_active
+    && gmem[_xd_b + EON_DRAG_OFF_MODE] != EON_DRAG_MODE_BLIND
+    && gmem[_xd_b + EON_DRAG_OFF_W] == gfx_w && gmem[_xd_b + EON_DRAG_OFF_H] == gfx_h
+    && abs(mouse_x - gmem[_xd_b + EON_DRAG_OFF_X]) <= 2 && abs(mouse_y - gmem[_xd_b + EON_DRAG_OFF_Y]) <= 2
+    && time_precise() - ovl_wave_t < 0.25 && ovl_wave_pad == ovl_tabs_pad
+    && mouse_x >= ovl_wave_x && mouse_x <= ovl_wave_x + ovl_wave_w && mouse_y >= ovl_wave_y && mouse_y <= ovl_wave_y + ovl_wave_h
+    ? xdrag_tab = ovl_wave_layer;
   xdrag_tab >= 0 ? (
     xdrag_pad = -1;
     _xd_f = swing_layer_drop_first(ovl_tabs_pad, xdrag_tab);

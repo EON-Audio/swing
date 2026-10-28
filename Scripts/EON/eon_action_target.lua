@@ -9,7 +9,8 @@
 -- the "focused wins" logic in exactly one place.
 --
 -- Buses (must match the JSFX / bridge):
---   gmem[0]    CMD               -- the BRIDGE bus (build/toggle/routing/etc.)
+--   gmem[26090300] CMD           -- the BRIDGE bus (build/toggle/routing/etc.;
+--                                   moved off gmem[0] 2026-07-09)
 --   gmem[1710] GS_COMPANION_CMD  -- the JSFX bus (EON_SB_* companion commands)
 --   gmem[97]   LOCK              -- instance the bridge routes the command to
 --
@@ -102,25 +103,15 @@ function M.focus_lock()
   if iid then reaper.gmem_write(LOCK, iid) end
 end
 
--- Post to the BRIDGE bus (gmem[0]) only if it's idle, so we never stomp a
--- command already in flight.
+-- Post to the BRIDGE bus (CMD) only if it's idle, so we never stomp a
+-- command already in flight. The LUAPOST stamp goes first (the bridge reads
+-- it against CMD); it was declared above but never written, so the bridge's
+-- orphan-98 release had nothing to track (sweep SCR115, 2026-10-26).
 function M.bridge(code)
   reaper.gmem_attach(SEG)
   if math.floor(reaper.gmem_read(CMD)) == 0 then
+    reaper.gmem_write(LUAPOST, code)
     reaper.gmem_write(CMD, code)
-  end
-end
-
--- Post to the JSFX companion bus (gmem[1710]) only if idle. Stamps the
--- TARGET cell 0 (broadcast) so a stale address from an interrupted
--- targeted arm can never mis-route this post.
--- ⚠️ A broadcast goes to whichever instance's @gfx ticks first, not to the
--- Swing the user means: anything that acts on ONE kit uses companion_to.
-function M.companion(code)
-  reaper.gmem_attach(SEG)
-  if math.floor(reaper.gmem_read(COMP)) == 0 then
-    reaper.gmem_write(COMPT, 0)
-    reaper.gmem_write(COMP, code)
   end
 end
 
@@ -165,7 +156,12 @@ end
 
 -- Convenience: focus-lock, then post to the bridge bus in one call. This is the
 -- common case for the Swing-panel wrappers.
+-- Bus first, LOCK second (post_locked's order): a post the busy bus drops must
+-- not have moved LOCK -- the op in flight reads it later (a parked Save form
+-- records its file against whichever Swing was clicked since; sweep SCR11).
 function M.fire(code)
+  reaper.gmem_attach(SEG)
+  if math.floor(reaper.gmem_read(CMD)) ~= 0 then return end
   M.focus_lock()
   M.bridge(code)
 end
@@ -181,6 +177,7 @@ function M.post_locked(iid, code)
   reaper.gmem_attach(SEG)
   if math.floor(reaper.gmem_read(CMD)) ~= 0 then return false end
   if iid and iid > 0 then reaper.gmem_write(LOCK, math.floor(iid)) end
+  reaper.gmem_write(LUAPOST, code)   -- stamp BEFORE CMD (see M.bridge)
   reaper.gmem_write(CMD, code)
   return true
 end

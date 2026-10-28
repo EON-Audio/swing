@@ -66,9 +66,17 @@ local M = {}
 
 local ENV_RATE     = 1000   -- coarse envelope resolution (Hz) = 1 ms per point
 local ENV_MAX_SEC  = 12     -- cap for very long files; longer tails read as "legato"
-local FFT_SIZE     = 4096   -- 10.8 Hz per bin @ 44.1k — enough to split SUB from LOW
+local FFT_SIZE     = 4096   -- 10.8 Hz per bin @ 44.1k — enough to split SUB from LOW; AT 44.1k: see fft_size_for
 local FFT_FRAMES   = 3
-local FFT_HOP      = 2048
+-- The window and the bin width are fixed in SECONDS, not samples: 4096 at 44.1/48k, 8192 at 88.2/96k, 16384 at
+-- 176.4/192k (the nearest power of two to 4096 * sr / 44100, at most 32768). Fixed at 4096 samples, a kick at
+-- 192k was measured over 43 ms instead of 186 ms with one bin in SUB, so a library's 96k copy tagged differently
+-- from its 44.1k copy. The hop is half the size.
+local function fft_size_for(sr)
+  local n = FFT_SIZE
+  while n < 32768 and n * 1.5 <= FFT_SIZE * (sr or 44100) / 44100 do n = n * 2 end
+  return n
+end
 local PRE_ROLL_S   = 0.005  -- read a little before the onset so the attack is complete
 -- Up to this length a file is read in one go. 5 s at 48 kHz stereo is about
 -- 960k array entries — fine to hold, and it covers nearly every one-shot.
@@ -128,9 +136,16 @@ end
 
 local env_amp, hull, mag, mono, hp_env = {}, {}, {}, {}, {}
 
-local hann = {}
-for i = 1, FFT_SIZE do
-  hann[i] = 0.5 - 0.5 * math.cos(2 * math.pi * (i - 1) / (FFT_SIZE - 1))
+-- One Hann window per FFT size (fft_size_for), built on first use and kept.
+local hann_by = {}
+local function hann_for(n)
+  local h = hann_by[n]
+  if not h then
+    h = {}
+    for i = 1, n do h[i] = 0.5 - 0.5 * math.cos(2 * math.pi * (i - 1) / (n - 1)) end
+    hann_by[n] = h
+  end
+  return h
 end
 
 local function clamp01(v)
@@ -357,6 +372,8 @@ local function analyze_source(src)
 
   -- 2. Samples around the onset, for attack, spectrum and width. Already in
   --    hand on the single-read path; otherwise one more read.
+  local fft_size = fft_size_for(sr)
+  local fft_hop  = fft_size // 2
   local base, avail
   if single then
     base = math.floor(onset_t * sr)
@@ -364,7 +381,7 @@ local function analyze_source(src)
   else
     local block_t = math.max(0, onset_t - PRE_ROLL_S)
     base = math.floor((onset_t - block_t) * sr)
-    avail = base + FFT_SIZE + FFT_HOP * (FFT_FRAMES - 1)
+    avail = base + fft_size + fft_hop * (FFT_FRAMES - 1)
     local got, me, se = read_samples(src, sr, block_t, nch, avail)
     if not got then return nil end
     mid_e, side_e = me, se
@@ -378,25 +395,33 @@ local function analyze_source(src)
     attack_ms = math.max(peak_i - onset_i, ATTACK_BANDLIMIT_MS)
   end
 
-  local half = math.floor(FFT_SIZE / 2)
+  local half = fft_size // 2
   for b = 1, half do mag[b] = 0 end
-  local fft = scratch_array("fft", FFT_SIZE)
+  local fft = scratch_array("fft", fft_size)
   if not fft then return nil end
+  local hann = hann_for(fft_size)
 
   local frames = 0
   for f = 0, FFT_FRAMES - 1 do
-    local off = base + f * FFT_HOP
+    local off = base + f * fft_hop
     local energy = 0
-    for i = 1, FFT_SIZE do
-      local v = (mono[off + i] or 0) * hann[i]
+    for i = 1, fft_size do
+      -- Bounded by `avail`, this file's samples: mono[] is module-level and never cleared, so on the single-read
+      -- path (avail = the whole file) a frame past the end read the PREVIOUS, longer file's samples -- a 100 ms
+      -- hat measured with an 808's sub mixed in, and the cache kept it.
+      local s = (off + i <= avail) and mono[off + i] or 0
+      local v = s * hann[i]
       fft[i] = v
       energy = energy + v * v
     end
     if energy > 1e-10 then
-      fft.fft_real(FFT_SIZE, true)
+      fft.fft_real(fft_size, true)
+      -- fft_real packs the DC and Nyquist reals into the FIRST pair, so on this 1-based array bin b sits at
+      -- [2b+1], [2b+2]. The old [2b], [2b+1] paired Im(b-1) with Re(b): every magnitude mixed two bins and
+      -- moved with phase (a 50 Hz kick leaked into the next bin: SUB vs LOW, the centroid, flatness, pitch).
       for b = 1, half - 1 do
-        local re = fft[b * 2] or 0
-        local im = fft[b * 2 + 1] or 0
+        local re = fft[b * 2 + 1] or 0
+        local im = fft[b * 2 + 2] or 0
         mag[b] = mag[b] + math.sqrt(re * re + im * im)
       end
       frames = frames + 1
@@ -404,7 +429,7 @@ local function analyze_source(src)
   end
   if frames == 0 then return nil end
 
-  local bin_hz = sr / FFT_SIZE
+  local bin_hz = sr / fft_size
   local bands = {}
   for i = 1, M.BAND_COUNT do bands[i] = 0 end
 

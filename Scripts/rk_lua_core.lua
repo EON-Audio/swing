@@ -134,10 +134,18 @@ local function _jsfx_scan(dir, want_lower, depth)
 end
 
 function core.jsfx_addname(basename, hint_tr, hint_fx)
-  -- Only successes are cached. A miss must stay retryable so a mid-session
-  -- ReaPack install heals without a REAPER restart.
+  -- Successes are cached for good. A miss is cached for ten seconds: it must
+  -- stay retryable so a mid-session ReaPack install heals without a REAPER
+  -- restart, but every miss re-walked the whole Effects tree (depth 5), and
+  -- the strip sync asks per strip-less child track every scan -- on an
+  -- install missing EON_Drum_Strip.jsfx that was ~16 full walks every
+  -- 0.17 s, a stutter until the file appeared (sweep SCR130).
   local hit = core._jsfx_cache[basename]
-  if hit then return hit.addname, hit.abs end
+  if hit then
+    if not hit.miss then return hit.addname, hit.abs end
+    if reaper.time_precise() < hit.retry_at then return nil, nil, hit.err end
+    core._jsfx_cache[basename] = nil
+  end
 
   local eff = reaper.GetResourcePath() .. core.sep .. "Effects"
   local abs
@@ -185,7 +193,9 @@ function core.jsfx_addname(basename, hint_tr, hint_fx)
   if not abs then abs = _jsfx_scan(eff, basename:lower(), 0) end
 
   if not abs then
-    return nil, nil, basename .. " was not found anywhere under " .. eff
+    local err = basename .. " was not found anywhere under " .. eff
+    core._jsfx_cache[basename] = { miss = true, err = err, retry_at = reaper.time_precise() + 10 }
+    return nil, nil, err
   end
 
   -- NEVER return "JS:" glued onto an absolute path -- that is the exact silent
@@ -399,6 +409,10 @@ end
 
 function core.format_duration(sec)
   if not sec or sec <= 0 then return "\xE2\x80\x94" end
+  -- Round to the tenth BEFORE splitting off the minutes: %04.1f rounded
+  -- 59.95..59.999 up to "60.0" after the split, so 59.97 s read "0:60.0" and
+  -- 119.97 s "1:60.0" (sweep SCR131).
+  sec = math.floor(sec * 10 + 0.5) / 10
   if sec < 60 then
     return string.format("0:%04.1f", sec)
   else
@@ -586,7 +600,7 @@ core.GMEM = {
   GS_REDO_AVAIL        = 2537,   -- 1 = redo available, 0 = stack empty
   -- Live per-pad effective-mute state (mute OR muted-by-solo). JSFX writes
   -- every frame from the active browser-target instance; browser reads to
-  -- dim muted pads to mirror the JSFX UI. 16 slots: 2282..2297.
+  -- dim muted pads to mirror the JSFX UI. 16 slots: 2538..2553.
   GS_PAD_MUTED_BASE    = 2538,
   -- Pending kit-load target — JSFX writes its instance_id when triggering
   -- a kit load (e.g. CMD 22 auto-load) so the receive handler routes the
@@ -646,6 +660,13 @@ core.GMEM = {
                                     -- pickup. Pad Banks step 4c, 2026-09-23.
   GS_KIT_EXPORT_ONLY   = 26090347,  -- JSFX → bridge: bank + 1 = save that ONE bank as a one-bank kit;
                                     -- consumed at CMD 10 / the dev-export pickup. Step 4c.
+  GS_KIT_SAVE_OWNER    = 26090348,  -- bridge → JSFX: the instance_id whose kit save (or dev export / kit-undo
+                                    -- dump) the bus's save codes 11 / 93 / 98 / 99 / 85 answer; 0 = no save.
+                                    -- Bridge level 322 (2026-10-27, LIB121 / LIB122): eon_save_owner_tick.
+  GS_KIT_SAVE_PREFILL  = 26090349,  -- JSFX → bridge: 1 = the NEXT CMD 10 is the kit-name click (a rename): the
+                                    -- name form starts at the kit's name, which the Swing wrote into the NAME
+                                    -- cells with it; 0 = Save As ("My Kit"). Written from bridge level 323 up,
+                                    -- read and zeroed at every save start (eon_save_rename_prefill). RR-1.
   GS_EXPORT_OVER       = 26090343,  -- JSFX → bridge: 1 = the state-11 audio dump stopped
                                     -- at the export band's ceiling (AUDIO_DUMP_END): the
                                     -- kit holds more audio than the band carries. The
@@ -712,12 +733,6 @@ core.GMEM = {
   -- GS_PAD_ACTION channel (2620-2622) RETIRED in P4 — pad actions post to
   -- the target instance's INCMD mailbox (see INCMD_* below + post_pad_incmd).
   -- Slots stay reserved (Swing Lite still compiles a dormant reader).
-  -- Action codes (semantic names — keep in sync with JSFX)
-  PAD_ACTION_MUTE      = 1,
-  PAD_ACTION_SOLO      = 2,
-  PAD_ACTION_REVERSE   = 3,
-  PAD_ACTION_SET_NOTE  = 4,
-  PAD_ACTION_SET_OUT   = 5,
   -- JSFX → bridge: pad-click → MCP/TCP track select. Value =
   -- (pad + 1) + instance_id * 32 (C-4, 2026-09-15: the bridge decodes
   -- inst = floor(v / 32), pad = v - inst * 32 - 1 and resolves the track
@@ -977,14 +992,15 @@ core.GMEM = {
   GS_THEME_KNOB_REQ = 2696,
   -- bridge→JSFX: Drum Matrix paint-mode mirror (1 = on), sourced from ExtState
   -- "EON_DRUM_MATRIX"/"paint_mode". The Swing PAINT button reads it for its lit
-  -- state; CMD 75 flips it. Last free slot before StepSeq M/S (2700).
+  -- state; CMD 75 flips it.
   GS_DM_PAINT       = 2697,
   -- bridge→JSFX: Drum Matrix overlay running (1 = the eon_drum_matrix.lua
   -- singleton lock is fresh). The Swing GRID button reads it for its lit state;
-  -- CMD 76 toggles the overlay. Last free slot before StepSeq M/S (2700).
+  -- CMD 76 toggles the overlay.
   GS_DM_OVERLAY     = 2698,
   -- bridge→JSFX: EON toolbar open (1 = its "Open/close toolbar N" toggle state is
   -- on). The Swing header TOOLBAR chip reads it for its lit colour.
+  -- 2696..2699 are all taken; 2700 starts StepSeq M/S.
   GS_TOOLBAR_OPEN   = 2699,
   -- Appearance-cluster VU-face SYNC broadcast (rk_theme.jsfx-inc rkth_cluster's
   -- ">ALL" latch). REQ: JSFX→bridge, written into the FX's OWN gmem segment as
@@ -1143,7 +1159,13 @@ core.GMEM = {
   RN_SRC_NONE         = 0,
   RN_SRC_DETECTED     = 1,
   RN_SRC_SYNTH        = 2,
-  ROOTNOTE_REQ        = 26008048,  -- +0 seq LAST, +1 slot, +2 pad (-1=all), +3 rsvd
+  ROOTNOTE_REQ        = 26008048,  -- +0 seq LAST, +1 slot, +2 pad (-1=all), +3 PSEQ
+  -- The request carries its pads' paths (A2, 2026-10-26, bridge level 320): one length-prefixed path per
+  -- TILE at ROOTNOTE_REQ_PATHS + tile*260 (16 tiles, ..26265159; [0] len, 0 = no path), whole when PSEQ
+  -- equals the request's seq (-1 while Swing writes them; never written by an older Swing, which leaves the
+  -- bridge on the old AUDIO_BASE read). Same names as the JSFX (gmem_name_parity).
+  ROOTNOTE_REQ_PSEQ   = 26008051,
+  ROOTNOTE_REQ_PATHS  = 26261000,
 
   -- Inbound per-instance command mailboxes (IN direction, Increment D).
   -- External writers (bridge TCP mirror, browser, Pad-FX) post pad color/name
@@ -1450,10 +1472,14 @@ core.GMEM = {
   -- and no other traffic. Requires HS_CAP >= 202 (JSFX advertises); the
   -- bridge falls back to the legacy cells for older builds.
   -- Layout: +0 adopted-count echo (JSFX, written BEFORE the CMD ack;
-  -- bridge presets -1), +1..7 reserved, then 80 length-prefixed 260-cell
+  -- bridge presets -1), +1 the CMD-86 bank selector (below), +2..7 reserved,
+  -- then 80 length-prefixed 260-cell
   -- path slots: pad-main at +8+pad*260, layers at +8+16*260+(pad*4+L)*260.
   MIGR_STAGE_BASE   = 26300000,
   MIGR_ADOPTED      = 26300000,
+  MIGR_BANK         = 26300001,  -- producer: one-shot CMD-86 bank selector (2026-10-26, C3; HS_CAP >= 207): 0 = the
+                                 -- old adopt (pad-main into the bank on screen, layers into bank A's), 1..4 = bank A..D
+                                 -- whole (pad-main + layers); the JSFX resets it to 0 at the consume.
   MIGR_PAD_CELLS    = 26300008,               -- + pad*260
   MIGR_LAYER_CELLS  = 26300008 + 16 * 260,    -- + (pad*4+layer)*260 (= 26304168)
 
@@ -1527,6 +1553,16 @@ core.SWBROWSE = {
   TR_RPT   = 11,  -- the sequencer's transport row (P0a): REAPER's repeat state 0 / 1
   TR_MEAS  = 12,  -- the bar under the play (or edit) cursor, 1-based
   TR_BEAT  = 13,  -- the beat inside it x 1000, 0-based
+  -- FMT 2 (the mini browser's next round, 2026-10-27; Spec_Swing_Mini_Browser_Next_Round §10), written only for a
+  -- face that wrote REQ_FMT >= 2, inside the seqlock:
+  CAT_N       = 14,  -- P2: the categories present in the listing (the chip table's length)
+  CAT_OFF     = 15,  -- P2: the index of the first category on this chip page
+  CAT_TAB     = 16,  -- P2: up to six pairs, 16..27: (glyph id + 1) * 1,000,000 + count, then the packed colour
+  CAT_TAB_N   = 6,
+  CAT_ON      = 28,  -- P2: the category filter this view was built with, glyph id + 1 (0 = all)
+  FILES_SHOWN = 29,  -- P1b: files in the view (TOTAL counts view rows, labels included)
+  FILES_ALL   = 30,  -- P1b: files in the listing (the ALL chip)
+  -- FLAGS bit6 (64) = the categories are still being counted (FMT 2)
 
   -- request half (face writes) — REQ_SEQ / ACT_SEQ written LAST
   REQ_SEQ  = 32,
@@ -1556,9 +1592,24 @@ core.SWBROWSE = {
                      -- sequencer's panel under the pads (rk_seq_ui, 2026-10-19);
                      -- 0 = none. The same resize as REQ_GROW, downward, kept on
                      -- screen (eon_fb_grow).
+  -- (47..57 are the docked keyboard's: EON_Swing_Dock.lua FB_DOCK_*; 45 is free but the browser rigs' sandbox hooks
+  --  use it to open the strip: fbgrow_setup.sh / fbhello_setup.sh)
+  REQ_CATF    = 59,  -- P2 (2026-10-27): verb 17's category filter, glyph id + 1 (0 = all); every request carries it
+  REQ_FMT     = 60,  -- the format the face understands, written every frame: 2 = FMT 2 (P1b-P4); an older face never
+                     -- writes it and gets the FMT 1 shape. Verb 17 = set the category filter (REQ_CATF) and the chip
+                     -- page (REQ_RIDX = the index of the page's first category).
   REQ_FILT_LEN = 192,  -- verb 9: filter text length...
   REQ_FILT     = 193,  -- ...and its chars, +193..240
   REQ_FILT_MAX = 48,
+  -- P4 (2026-10-27): the root note of the row the deck describes, bridge -> face, OUTSIDE the seqlock: payload first,
+  -- RN_RIDX LAST; the face shows it only when RN_RIDX names its selected row and RN_GEN the listing on screen
+  RN_RIDX     = 241,  -- the RIDX answered + 1 (written LAST)
+  RN_NOTE     = 242,  -- MIDI note + 1 (0 = no pitch found)
+  RN_STATE    = 243,  -- 1 running, 2 done, 3 failed (unreadable)
+  RN_GEN      = 244,  -- the listing's GEN the answer belongs to
+  -- P1b (FMT 2, inside the seqlock): the deck's "n of N"
+  DK_RIDX     = 245,  -- the row last described + 1 (0 = none)
+  DK_ORD      = 246,  -- its place among the files shown, 1-based (0 = not in the view)
 
   -- waveform peaks for the SELECTED row, its own band (a row record is 60
   -- cells; these could never ride along). Declared in the supplement tsv.
@@ -1587,6 +1638,12 @@ core.SWBROWSE = {
   FR_CH      = 54,
   FR_MS      = 55,
   FR_PLKIND  = 56,  -- places only: 1 starred, 2 recent, 3 drive
+  -- FMT 2 (2026-10-27): the row's last three cells -- the stride is full after these (256 + 64 * 60 = 4096)
+  FR_CAT     = 57,  -- P2: glyph id + 1 (0 = none, or not classified yet)
+  FR_PHASH   = 58,  -- P3: the row's path as a 52-bit number (eon_fb_path_hash; 0 = none) -- the face tags the pad
+  FR_CCOL    = 59,  -- P2: the category's colour, r * 65536 + g * 256 + b
+  -- FR_KIND 5 (FMT 2) = a group LABEL (P1b): FR_RIDX -1, FR_SIZE_KB = its files in the view, the name = the trimmed
+  -- prefix, char 31, the folder under the root
 }
 
 -- Extension → wire code. 0 = unknown/other. Keep in sync with the JSFX face,
@@ -1665,7 +1722,13 @@ function core.read_pad_name(pad)
   local chars = {}
   for i = 0, G.PADNAME_LEN - 1 do
     local c = math.floor(reaper.gmem_read(base + i))
-    if c <= 0 or c > 127 then break end  -- 0 = terminator, >127 = stale/misaligned gmem
+    -- 0 = terminator. UTF-8 bytes 128..255 are the name ("Caña", "Größe"):
+    -- write_pad_name stores them raw and the JSFX republishes them through
+    -- the default SIGNED str_getchar (-128..-1), so fold the negative half
+    -- back; stopping at the first one cut "Caña" to "Ca" in every Lua panel
+    -- (sweep SCR133). Anything past 255 is stale/misaligned gmem.
+    if c < 0 then c = c + 256 end
+    if c <= 0 or c > 255 then break end
     chars[#chars + 1] = string.char(c)
   end
   return table.concat(chars)
@@ -1967,14 +2030,6 @@ function core.relay_vu_fx_segments(vreq)
   end)
 end
 
--- Reader (Lua consumers): one semantic color → r,g,b (0..1), or nil if idle.
-function core.read_theme_color(slot)
-  local G = core.GMEM
-  if (reaper.gmem_read(G.GS_THEME_ID) or 0) <= 0 then return nil end
-  local base = G.GS_THEME_BASE + slot * 3
-  return reaper.gmem_read(base), reaper.gmem_read(base + 1), reaper.gmem_read(base + 2)
-end
-
 function core.write_pad_name(pad, name)
   local G = core.GMEM
   local base = G.PADNAME_BASE + pad * G.PADNAME_LEN
@@ -2116,16 +2171,44 @@ core.DRUM_COLORS = {
   conga=0.95, bongo=0.97, ["909"]=0.00
 }
 
+-- The EARLIEST keyword in the name wins ("Kick Sub" is a kick, "Clap Snap" a
+-- clap); at one position the longer keyword ("hihat" over "hat"), then the
+-- alphabetically first, so the answer is the same on every launch. It used to
+-- walk DRUM_COLORS with pairs(), whose order Lua 5.4 reseeds per state: a
+-- name holding two keywords of different hue came out red one launch and
+-- purple the next, and the hue is saved with the kit (sweep SCR135).
+-- The digit-only keys ("808", "909") are a FALLBACK on the raw name, tried
+-- only when no word matched: the digit strip below made them dead (a sample
+-- named only by its machine got the neutral hue, SCR134), and tried first
+-- they would paint every "808 Clap" red.
 function core.guess_drum_type(filename)
   local name = filename:lower()
   -- Strip common audio extensions
   name = name:gsub("%.wav$",""):gsub("%.aif[f]?$",""):gsub("%.mp3$","")
              :gsub("%.flac$",""):gsub("%.ogg$","")
+  local raw = name
   -- Clean up for matching
   name = name:gsub("%d+",""):gsub("^%s+",""):gsub("%s+$",""):gsub("[_%-]"," ")
+  local best, best_hue, best_at
   for keyword, hue in pairs(core.DRUM_COLORS) do
-    if name:find(keyword, 1, true) then return keyword, hue end
+    if not keyword:find("^%d+$") then
+      local at = name:find(keyword, 1, true)
+      if at and (not best or at < best_at
+                 or (at == best_at and (#keyword > #best or (#keyword == #best and keyword < best)))) then
+        best, best_hue, best_at = keyword, hue, at
+      end
+    end
   end
+  if best then return best, best_hue end
+  for keyword, hue in pairs(core.DRUM_COLORS) do
+    if keyword:find("^%d+$") then
+      local at = raw:find(keyword, 1, true)
+      if at and (not best or at < best_at or (at == best_at and keyword < best)) then
+        best, best_hue, best_at = keyword, hue, at
+      end
+    end
+  end
+  if best then return best, best_hue end
   return nil, 0.5  -- no match → neutral hue
 end
 
@@ -2297,11 +2380,9 @@ function core.ensure_macros(tr, swing_tr, swing_fx)
   return fx
 end
 
---- The source of a link to macro `macro` (1..8) for a plugin on `tr`:
--- returns src_fx, src_param, or nil + reason.
---- A relay INSIDE container `cidx` (top-level index) on `tr`: found, or added
--- as child 0 with Swing's id baked in. Returns its CHILD position (what a
--- plink.effect inside that container expects), or -1.
+--- A relay INSIDE container `cidx` (top-level index) on `tr`: found, or appended
+-- as the last child with Swing's id baked in. Returns its CHILD position (what a
+-- plink.effect inside that container expects) and its encoded index, or -1.
 function core.ensure_macros_in(tr, cidx, swing_tr, swing_fx)
   if not tr or not cidx then return -1 end
   local ok, cnt = reaper.TrackFX_GetNamedConfigParm(tr, cidx, "container_count")

@@ -7,10 +7,12 @@
 
 // Keep a promoted single's pad-level trim in step with its layer-0 trim.
 //
-// A pad loaded by the browser or by a drag is a PROMOTED SINGLE: p_layer_cnt is
-// 1, the audio sits in layer 0, and that layer carries no path of its own — its
-// source is the pad-main path. Dragging the trim handles on such a pad writes
-// ONLY l_start/l_end, while s_start/s_end keep the 0/1 clear_pad left behind.
+// A pad loaded by the browser or by a drag is a PLAIN pad (p_layer_cnt 0, since
+// 2026-09-08): its trim handles write s_start/s_end directly and need no mirror.
+// This covers a PROMOTED SINGLE: p_layer_cnt is 1, the audio sits in layer 0, and
+// that layer carries no path of its own — its source is the pad-main path.
+// Dragging the trim handles on such a pad writes ONLY l_start/l_end, while
+// s_start/s_end keep the 0/1 clear_pad left behind.
 // That does not matter until the project is reopened in marker mode, where the
 // reload rebuilds the layer FROM the pad values (load_from_path does
 // l_start[_lidx] = s_start[idx]) and the dragged trim is silently wiped.
@@ -71,9 +73,13 @@ function swing_synprev_init(fm) (
   synp_st  = fm; fm += RK_SYN_STATE_SIZE;   // scratch engine state, ours alone
   synp_mac = fm; fm += 8;
   synp_hi  = fm; fm += SYNPREV_COLS;        // |peak| per column, NO envelope
-  synp_key = fm; fm += 12;
+  // the key: [0] pad, [1] engine, [2..9] the eight macros, [10] tune, [11] the throttle's time, [12] the window
+  // (seconds). The window sat in cell 9 -- the eighth macro's -- so every stale check put ps_mac7 back over the
+  // fitted window: the self-fit never held, a synth pad re-rendered about eight times a second while its editor
+  // was open, and the label read 0.80 s over a 0.5 s picture (LIB310).
+  synp_key = fm; fm += 13;
   synp_key[0]  = -1;                         // nothing rendered yet
-  synp_key[9]  = SYNPREV_SEC;                // current window, seconds
+  synp_key[12] = SYNPREV_SEC;                // current window, seconds
   synp_key[11] = -1000;                      // ...and no throttle to wait on
                                              // (EEL2 has no 1e9-style literal)
   fm;
@@ -108,7 +114,7 @@ function swing_synprev_stale(_sk_pad) local(_sk_i, _sk_ch) (
 // noise-driven and a fresh seed would make the display crawl.
 function swing_synprev_build(_sp_pad)
 local(_sp_i, _sp_col, _sp_cw, _sp_pk, _sp_y, _sp_last, _sp_win) (
-  _sp_cw = max(1, ((synp_key[9] * srate) | 0) / SYNPREV_COLS) | 0;
+  _sp_cw = max(1, ((synp_key[12] * srate) | 0) / SYNPREV_COLS) | 0;
   memset(synp_st, 0, RK_SYN_STATE_SIZE);
   synp_st[1] = 20261;                        // nonzero seed, as the core does
   _sp_i = 0; loop(8, synp_mac[_sp_i] = _syn_mac_get(_sp_pad, _sp_i); _sp_i += 1;);
@@ -136,15 +142,15 @@ local(_sp_i, _sp_col, _sp_cw, _sp_pk, _sp_y, _sp_last, _sp_win) (
     synp_hi[_sp_col] > 0.03 ? _sp_last = _sp_col;
     _sp_col += 1;
   );
-  _sp_win = synp_key[9];
+  _sp_win = synp_key[12];
   _sp_last > SYNPREV_COLS * 0.93 ? _sp_win = min(3.0, _sp_win * 1.6) :
   _sp_last < SYNPREV_COLS * 0.45 ? _sp_win = max(0.12, _sp_win * 0.625);
-  _sp_win != synp_key[9] ? ( synp_key[9] = _sp_win; synp_key[0] = -1; );
+  _sp_win != synp_key[12] ? ( synp_key[12] = _sp_win; synp_key[0] = -1; );
 );
 
 function _ov_draw_waveform_and_adsr()
 local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
-      _wv_use_cache, _wv_cL, _wv_cR, _ci, _sL, _sR,
+      _wv_use_cache, _wv_cL, _wv_cR, _ci, _sL, _sR, _wv_cj, _wv_lk, _wv_mc,
       _sp_cw, _sp_ac, _sp_dc, _sp_sus, _sp_env, _sp_stg, _sp_col, _sp_x, _sp_y)
 (
     // ── Sample display: waveform + ADSR envelope overlaid ─────────────
@@ -152,6 +158,13 @@ local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
     _has_ctrl_row = (p_layer_mode[oi] == 1 || p_layer_mode[oi] == 2 || p_layer_mode[oi] == 3);
     wf_y = _has_ctrl_row ? op_y + 100 : op_y + 54;
     wf_x = op_x + 10; wf_w = op_w - 20; wf_h = 120;
+    // The waveform as a DROP target for Swing's own browsers, as the layer tabs are (_ov_draw_layers_and_mode): their
+    // drags never become an OS drop, so "DRAG SAMPLE HERE" took only Explorer's (the owner, 2026-10-27). A drop on it
+    // lands on the layer shown, as an OS drop on it does (_ov_take_drop); fresh within a quarter second, as the tabs.
+    overlay_layer < MAX_LAYERS ? (
+      ovl_wave_t = time_precise(); ovl_wave_pad = oi; ovl_wave_layer = overlay_layer;
+      ovl_wave_x = wf_x; ovl_wave_y = wf_y; ovl_wave_w = wf_w; ovl_wave_h = wf_h;
+    );
     gfx_set(0.06, 0.06, 0.08, 1); gfx_rect(wf_x, wf_y, wf_w, wf_h);
 
     // Waveform (full frame) — show layer waveform if in layer mode, else legacy
@@ -176,16 +189,20 @@ local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
     _slen > 0 ? (
       // ── Mouse wheel zoom in waveform area ──
       _in_wf = mx >= wf_x && mx <= wf_x + wf_w && my >= wf_y && my <= wf_y + wf_h;
-      _in_wf && mouse_wheel != 0 ? (
+      // frame_wheel, not mouse_wheel: the @gfx head (Swing_ReaKit) copies mouse_wheel into frame_wheel and zeroes
+      // it before any panel draws, so a test of mouse_wheel here never fired -- the zoom, its badge, the scroll
+      // bar and the Ctrl/middle-drag scroll were unreachable (LIB311). Consumed by zeroing frame_wheel, the
+      // house pattern (the mini browser's note on it).
+      _in_wf && frame_wheel != 0 ? (
         _mpos_norm = (mx - wf_x) / wf_w;  // cursor position 0–1 in display
         _old_zoom = wf_zoom;
-        mouse_wheel > 0 ? wf_zoom = min(64, wf_zoom * 1.25) : wf_zoom = max(1, wf_zoom / 1.25);
+        frame_wheel > 0 ? wf_zoom = min(64, wf_zoom * 1.25) : wf_zoom = max(1, wf_zoom / 1.25);
         // Adjust scroll to keep the cursor point stable
         _view_w = 1.0 / wf_zoom;
         _cursor_norm = wf_scroll + _mpos_norm * (1.0 / _old_zoom);
         wf_scroll = _cursor_norm - _mpos_norm * _view_w;
         wf_scroll = max(0, min(1.0 - _view_w, wf_scroll));
-        mouse_wheel = 0;
+        frame_wheel = 0;
       );
 
       // ── Zoom-aware rendering ──
@@ -218,14 +235,41 @@ local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
 
       // Stereo (L != R content) → top=L bottom=R; mono → single centered.
       gfx_set(pr * 0.5 + 0.1, pgg * 0.5 + 0.1, pb * 0.5 + 0.1, 0.45);
+      // PAD WAVE (slider48, 2026-10-27): the UNZOOMED view draws Outline / True peaks from the slot's bins
+      // (rk_swing_core swing_wvb_*) when they hold the layer on view -- a plain pad, or a layered pad's first layer
+      // with audio, unbaked (a baked layer keeps the frozen original the overview promises, below). Bins are raw:
+      // sg (this layer's normalize gain) and the reverse flip apply here. Zoomed, and Peak, draw as before.
+      _wv_lk = _wv_use_cache ? swing_wvb_use(oi) : 0;
+      // Mono views draw the LOUDER channel of a pad mono by balance (wv_monoch, build_wv_cache, 2026-10-27) where the
+      // view shows the audio that was judged: a plain pad, or the layer build_wv_cache chose (the bins' key holds it).
+      // Another layer of the pad keeps L, as before.
+      _wv_mc = (wv_monoch[oi] && (p_layer_cnt[oi] > 0 ? wvb_key[oi * WVB_KEYN + 1] == overlay_layer : 1)) ? 1 : 0;
+      (_wv_lk &&
+       (p_layer_cnt[oi] > 0 ? (wvb_key[oi * WVB_KEYN + 1] == overlay_layer && sp_baked_tune[oi * MAX_LAYERS + overlay_layer] == 0)
+                            : wvb_key[oi * WVB_KEYN + 1] < 0)) ? (
+        p_stereo[oi] ? (
+          swing_grid_wvb_lane(oi, 0, _wv_lk, wf_y + wf_h * 0.25, (wf_h / 4.8) * sg, 1000000, wf_x, wf_w,
+                              pr * 0.5 + 0.1, pgg * 0.5 + 0.1, pb * 0.5 + 0.1, 0.45, p_reverse[oi] > 0.5);
+          swing_grid_wvb_lane(oi, 1, _wv_lk, wf_y + wf_h * 0.75, (wf_h / 4.8) * sg, 1000000, wf_x, wf_w,
+                              pr * 0.5 + 0.1, pgg * 0.5 + 0.1, pb * 0.5 + 0.1, 0.45, p_reverse[oi] > 0.5);
+        ) : (
+          swing_grid_wvb_lane(oi, _wv_mc, _wv_lk, wf_y + wf_h * 0.5, (wf_h / 2.4) * sg, 1000000, wf_x, wf_w,
+                              pr * 0.5 + 0.1, pgg * 0.5 + 0.1, pb * 0.5 + 0.1, 0.45, p_reverse[oi] > 0.5);
+        );
+        gfx_set(pr * 0.5 + 0.1, pgg * 0.5 + 0.1, pb * 0.5 + 0.1, 0.45);
+      ) : (
       p_stereo[oi] ? (
         _wf_amp_scale = (wf_h / 4.8) * (_wv_use_cache ? 1.0 : sg);
         _wv_top_cy    = wf_y + wf_h * 0.25;
         _wv_bot_cy    = wf_y + wf_h * 0.75;
         j = 0; loop(wf_w,
           _rev_j = p_reverse[oi] ? (wf_w - 1 - j) : j;
+          // The per-pad cache (a PLAIN pad) is stored already reversed by build_wv_cache (the grid tile reads it
+          // as is); flipping it again here drew a reversed plain pad forward while its trim markers were mirrored
+          // (LIB312). The per-layer cache and the live buffer are forward: those take the flip.
+          _wv_cj = (p_layer_cnt[oi] == 0) ? j : _rev_j;
           _wv_use_cache ? (
-            _ci = (_rev_j * WV_RES / wf_w)|0; _ci = min(_ci, WV_RES - 1);
+            _ci = (_wv_cj * WV_RES / wf_w)|0; _ci = min(_ci, WV_RES - 1);
             _sL = _wv_cL[_ci]; _sR = _wv_cR[_ci];
           ) : (
             sample_idx = (_vis_s0 + (_rev_j * step)|0);
@@ -243,19 +287,21 @@ local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
         _wf_amp_scale = (wf_h / 2.4) * (_wv_use_cache ? 1.0 : sg);
         j = 0; loop(wf_w,
           _rev_j = p_reverse[oi] ? (wf_w - 1 - j) : j;
+          _wv_cj = (p_layer_cnt[oi] == 0) ? j : _rev_j;   // the plain pad's cache is stored reversed (LIB312, above)
           _wv_use_cache ? (
-            _ci = (_rev_j * WV_RES / wf_w)|0; _ci = min(_ci, WV_RES - 1);
-            _sL = _wv_cL[_ci];
+            _ci = (_wv_cj * WV_RES / wf_w)|0; _ci = min(_ci, WV_RES - 1);
+            _sL = _wv_mc ? _wv_cR[_ci] : _wv_cL[_ci];
           ) : (
             sample_idx = (_vis_s0 + (_rev_j * step)|0);
             sample_idx = min(sample_idx, _mono_len - 1);
-            _sL = buf[sample_idx * 2];
+            _sL = buf[sample_idx * 2 + _wv_mc];
           );
           val = _sL * _wf_amp_scale;  // L = R for mono
           gfx_line(wf_x + j, wv_cy - val, wf_x + j, wv_cy + val);
           j += 1;
         );
       );
+      );   // (Peak, zoomed, or bins not ready: the lines above, as before the row)
 
       // ── Start/end trim markers (zoom-aware, mirrored when reversed) ──
       // Convert normalized start/end to pixel positions in the current view
@@ -366,6 +412,7 @@ local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
             );
           );
           _ov_mirror_trim_to_pad(oi, _ovw_lidx);
+          mark_dirty_pad(oi);   // the trim is an edit: the undo entry, the kit's SAVE dot, the project's dirty flag (LIB313)
         ) : active_id = -1;
       );
       active_id == 201 ? (
@@ -404,6 +451,7 @@ local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
             );
           );
           _ov_mirror_trim_to_pad(oi, _ovw_lidx);
+          mark_dirty_pad(oi);   // as the start handle (LIB313)
         ) : active_id = -1;
       );
       active_id == -1 && lmb_down ? (
@@ -434,8 +482,8 @@ local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
       // collapsing — the only dead thing here was the waveform.
       // Label at the top, hint at the bottom, so the envelope curve crosses
       // the middle without running through either.
-      // _syn_engine_name / _syn_engine_col resolve: rk_swing_ui_overlay_syn
-      // imports at 139, this file at 140.
+      // _syn_engine_name / _syn_engine_col resolve: Swing_ReaKit.jsfx imports
+      // rk_swing_ui_overlay_syn right before this file.
       // ── the voice itself, rendered ──────────────────────────────────────
       // Rebuild only when the ENGINE changed; the envelope is applied below
       // per column, so dragging ATK/DEC/SUS costs nothing.
@@ -443,7 +491,7 @@ local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
       // Per-COLUMN envelope coefficients: the same stage machine the voice
       // runs, stepped once per column instead of once per sample. Coarse by
       // design — this is a picture, and 512 columns is finer than the pixels.
-      _sp_cw  = max(1, ((synp_key[9] * srate) | 0) / SYNPREV_COLS) | 0;
+      _sp_cw  = max(1, ((synp_key[12] * srate) | 0) / SYNPREV_COLS) | 0;
       _sp_ac  = pow(exp(-5.0 / max(1, p_attack[oi]  * 0.001 * srate)), _sp_cw);
       _sp_dc  = pow(exp(-5.0 / max(1, p_decay[oi]   * 0.001 * srate)), _sp_cw);
       _sp_sus = max(0, min(1, p_sustain[oi]));
@@ -476,7 +524,7 @@ local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
       // or a short pad and a long one look identical.
       rk_font(1, 8, 0);
       gfx_set(0.38, 0.41, 0.46, 1);
-      sprintf(#_ov_syn_lbl, "%.2f s", synp_key[9]);
+      sprintf(#_ov_syn_lbl, "%.2f s", synp_key[12]);
       gfx_measurestr(#_ov_syn_lbl, tw, th);
       gfx_x = wf_x + wf_w - tw - 5; gfx_y = wf_y + 4;
       gfx_drawstr(#_ov_syn_lbl);
@@ -511,10 +559,10 @@ local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
     // Node positions depend only on their own parameter (+ preceding for sequencing).
     // This prevents the bug where changing one parameter visually shifts other nodes.
     // Max values match the actual knob ranges.
-    a_max_w  = env_w * 0.20;   // attack zone:  0-500ms
-    d_max_w  = env_w * 0.35;   // decay zone:   0-5000ms
+    a_max_w  = env_w * 0.20;   // attack zone:  1-1000ms
+    d_max_w  = env_w * 0.35;   // decay zone:   1-10000ms
     s_hold_w = env_w * 0.10;   // sustain hold:  fixed
-    r_max_w  = env_w * 0.35;   // release zone: 0-2000ms
+    r_max_w  = env_w * 0.35;   // release zone: 1-5000ms
 
     // Pixel widths from parameter values (LOG scaling for time params,
     // matching the log drag mapping below). Linear scaling collapsed
@@ -610,7 +658,7 @@ local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
     // 0..1 level, not a time.
     // _adsr_dir is fixed +1 (the envelope no longer mirrors for reverse),
     // so the drag mapping is plain rightward-grows in both directions.
-    active_id == 210 ? (  // A node (n1) — drag X = attack time (1..500ms log)
+    active_id == 210 ? (  // A node (n1) — drag X = attack time (1..1000ms log)
       LMB ? (
         delta_px = (mx - adsr_drag_mx) * _adsr_dir;
         // log(1000) ≈ 6.91 — full drag width sweeps 1..1000ms.
@@ -621,7 +669,7 @@ local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
         swing_rcp_post_pad(oi); s_dirty[oi] = 1; mark_dirty_pad(oi);
       ) : active_id = -1;
     );
-    active_id == 211 ? (  // D node (n2) — drag X = decay time (1..5000ms log)
+    active_id == 211 ? (  // D node (n2) — drag X = decay time (1..10000ms log)
       LMB ? (
         delta_px = (mx - adsr_drag_mx) * _adsr_dir;
         // log(10000) ≈ 9.21. Wide range covers atmospheric tails; log
@@ -649,7 +697,7 @@ local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
         swing_rcp_post_pad(oi); s_dirty[oi] = 1; mark_dirty_pad(oi);
       ) : active_id = -1;
     );
-    active_id == 213 ? (  // R node (n4) — drag X = release time (1..2000ms log)
+    active_id == 213 ? (  // R node (n4) — drag X = release time (1..5000ms log)
       LMB ? (
         delta_px = (mx - adsr_drag_mx) * _adsr_dir;
         // log(5000) ≈ 8.52. Extended for ambient/reverb-tail samples.
@@ -699,7 +747,7 @@ local(val, j, _rev_j, sample_idx, wv_cy, step, _has_ctrl_row,
     // from inside JSFX. Will be re-added when the EON Extension can do it
     // properly with the actual sample in C++ instead of a JSFX heuristic.)
 
-    // 7 knobs: ATK, DEC, SUS, REL, GAIN, PAN, TUNE — sitting on the display bottom edge
+    // 8 knobs: ATK, DEC, SUS, REL, GAIN, PAN, TUNE, OFS — sitting on the display bottom edge
     knob_r = 13;
     krow_y = wf_y + wf_h;  // knob centers sit right at display bottom
     k_spacing = op_w / 8;
@@ -960,8 +1008,11 @@ function _ov_draw_eq_and_filters() (
 
     // Draw nodes (antialiased, hover-animated: grow + soft glow; same dt/
     // hv_speed ease the SSL knobs use — matches the Drum Strip's nodes)
-    _eqhov = active_id >= 220 ? (active_id == 220 ? 1 : active_id == 221 ? 2 :
-                                 active_id == 223 ? 3 : 4) :
+    // Only the four node IDs light a node; the hover test runs when nothing is held, and any other drag (the hue
+    // strip 250, TIGHT, the layer VOL, a velocity handle, a mixer fader) lights none -- every id >= 220 but
+    // 220 / 221 / 223 used to count as the HI node, which swelled and glowed for the whole drag (LIB334).
+    _eqhov = active_id == 220 ? 1 : active_id == 221 ? 2 : active_id == 223 ? 3 : active_id == 222 ? 4 :
+             active_id != -1 ? 0 :
              (dist(mx, my, _lo_nx, _lo_ny) <= _eq_nr + 4 ? 1 :
               dist(mx, my, _md_nx, _md_ny) <= _eq_nr + 4 ? 2 :
               dist(mx, my, _m2_nx, _m2_ny) <= _eq_nr + 4 ? 3 :
@@ -1010,6 +1061,11 @@ function _ov_draw_eq_and_filters() (
         ) : (
           active_id = _hit_node;
           _dbl_click_id = _hit_node; _dbl_click_time = _eq_now;
+          // the frequency the drag starts from: the X drag is RELATIVE, like the gain and the master EQ's
+          // nodes (rk_swing_ui_panels_lcd); mapped straight from mx, a plain click on a node moved its
+          // frequency by the click's offset from the centre -- about 12 % on the MID node (LIB335)
+          eq_drag_f0 = _hit_node == 220 ? fx_eq_lo_freq[oi] : _hit_node == 221 ? fx_eq_mid_freq[oi] :
+                       _hit_node == 223 ? fx_eq_mid2_freq[oi] : fx_eq_hi_freq[oi];
         );
       );
     );
@@ -1017,7 +1073,8 @@ function _ov_draw_eq_and_filters() (
     // Wheel over ANY band node adjusts that band's Q (Shift = fine) —
     // bells AND shelves as of v48 (shelf Q 0.7071 == the old fixed S=1.0).
     // Same consume-and-zero pattern as the waveform zoom above.
-    mouse_wheel != 0 && active_id == -1 ? (
+    // frame_wheel (notches, with sign), never mouse_wheel: zeroed at the @gfx head before this draws (LIB311).
+    frame_wheel != 0 && active_id == -1 ? (
       _whl_qn = dist(mx, my, _md_nx, _md_ny) <= _eq_nr + 4 ? 0 :
                 dist(mx, my, _m2_nx, _m2_ny) <= _eq_nr + 4 ? 1 :
                 dist(mx, my, _lo_nx, _lo_ny) <= _eq_nr + 4 ? 2 :
@@ -1027,13 +1084,13 @@ function _ov_draw_eq_and_filters() (
         _whl_q = _whl_qn == 0 ? fx_eq_mid_q[oi] :
                  _whl_qn == 1 ? fx_eq_mid2_q[oi] :
                  _whl_qn == 2 ? fx_eq_lo_q[oi] : fx_eq_hi_q[oi];
-        _whl_q = max(0.3, min(6.0, _whl_q * (1 + (mouse_wheel / 120) * _whl_step)));
+        _whl_q = max(0.3, min(6.0, _whl_q * (1 + frame_wheel * _whl_step)));
         _whl_qn == 0 ? fx_eq_mid_q[oi]  = _whl_q :
         _whl_qn == 1 ? fx_eq_mid2_q[oi] = _whl_q :
         _whl_qn == 2 ? fx_eq_lo_q[oi]   = _whl_q :
                        fx_eq_hi_q[oi]   = _whl_q;
         swing_rcp_post_fx(oi); mark_dirty_pad(oi);
-        mouse_wheel = 0;
+        frame_wheel = 0;
       );
     );
 
@@ -1080,8 +1137,8 @@ function _ov_draw_eq_and_filters() (
       LMB ? (
         // Y drag: gain
         fx_eq_lo[oi] = max(-12, min(12, eq_drag_val_lo - (my - eq_drag_my) / _eq_yr * eq_dbr * ((mouse_cap & 8) ? 0.25 : 1)));
-        // X drag: frequency (log mapping)
-        fx_eq_lo_freq[oi] = pow(10.0, _log_lo + (mx - eq_dx) / eq_dw * _log_range);
+        // X drag: frequency, the delta from the press in log space (LIB335)
+        fx_eq_lo_freq[oi] = eq_drag_f0 * pow(10.0, (mx - eq_drag_mx) / eq_dw * _log_range);
         fx_eq_lo_freq[oi] = max(40, min(500, fx_eq_lo_freq[oi]));  // clamp to range
         swing_rcp_post_fx(oi); mark_dirty_pad(oi);
       ) : active_id = -1;
@@ -1089,7 +1146,7 @@ function _ov_draw_eq_and_filters() (
     active_id == 221 ? (
       LMB ? (
         fx_eq_mid[oi] = max(-12, min(12, eq_drag_val_md - (my - eq_drag_my) / _eq_yr * eq_dbr * ((mouse_cap & 8) ? 0.25 : 1)));
-        fx_eq_mid_freq[oi] = pow(10.0, _log_lo + (mx - eq_dx) / eq_dw * _log_range);
+        fx_eq_mid_freq[oi] = eq_drag_f0 * pow(10.0, (mx - eq_drag_mx) / eq_dw * _log_range);
         fx_eq_mid_freq[oi] = max(200, min(8000, fx_eq_mid_freq[oi]));  // clamp to range
         swing_rcp_post_fx(oi); mark_dirty_pad(oi);
       ) : active_id = -1;
@@ -1097,7 +1154,7 @@ function _ov_draw_eq_and_filters() (
     active_id == 223 ? (
       LMB ? (
         fx_eq_mid2[oi] = max(-12, min(12, eq_drag_val_m2 - (my - eq_drag_my) / _eq_yr * eq_dbr * ((mouse_cap & 8) ? 0.25 : 1)));
-        fx_eq_mid2_freq[oi] = pow(10.0, _log_lo + (mx - eq_dx) / eq_dw * _log_range);
+        fx_eq_mid2_freq[oi] = eq_drag_f0 * pow(10.0, (mx - eq_drag_mx) / eq_dw * _log_range);
         fx_eq_mid2_freq[oi] = max(500, min(12000, fx_eq_mid2_freq[oi]));  // clamp to range
         swing_rcp_post_fx(oi); mark_dirty_pad(oi);
       ) : active_id = -1;
@@ -1105,7 +1162,7 @@ function _ov_draw_eq_and_filters() (
     active_id == 222 ? (
       LMB ? (
         fx_eq_hi[oi] = max(-12, min(12, eq_drag_val_hi - (my - eq_drag_my) / _eq_yr * eq_dbr * ((mouse_cap & 8) ? 0.25 : 1)));
-        fx_eq_hi_freq[oi] = pow(10.0, _log_lo + (mx - eq_dx) / eq_dw * _log_range);
+        fx_eq_hi_freq[oi] = eq_drag_f0 * pow(10.0, (mx - eq_drag_mx) / eq_dw * _log_range);
         fx_eq_hi_freq[oi] = max(2000, min(16000, fx_eq_hi_freq[oi]));  // clamp to range
         swing_rcp_post_fx(oi); mark_dirty_pad(oi);
       ) : active_id = -1;
@@ -1116,7 +1173,7 @@ function _ov_draw_eq_and_filters() (
 function _ov_draw_fx_knobs() (
     // ── Two-row FX layout ───────────────────────────────────────────────
     // Row 1 (SSL):     [HPF LPF RESO] | [RATE BITS DRIVE COMP]  (7 knobs)
-    // Row 2 (Encoder): [DLY RVB]  centered                      (2 knobs)
+    // Row 2 (Encoder): SENDS [DLY RVB SMSH]  centered           (3 knobs)
     fxk_r = 11;
     _fxk_top = eq_dy + eq_dh + 4;
     _r1_sp = op_w / 7;   // Row 1: 7 evenly spaced slots
@@ -1366,8 +1423,8 @@ function _ov_draw_fx_knobs() (
 );
 
 function _ov_draw_buttons() (
-    // ── Button rows: Row 1 = OUT/LEARN/CHOKE/1SHOT/REV, Row 2 = SKIP/NORM/EXPT
-    ob_h = 20; ob_w = 46; ob_gap = 6;
+    // ── Button rows: Row 1 = OUT/LEARN/CHOKE/1SHOT/REV, Row 2 = Clear Layer / Clear Pad
+    ob_h = 20; ob_gap = 6;
     ob_y1 = op_y + op_h - 66;  // top button row
     ob_y2 = op_y + op_h - 38;  // bottom button row
 
@@ -1398,7 +1455,7 @@ function _ov_draw_buttons() (
       swing_popup_result = 0;
     );
     // Scroll wheel: bank A steps through Out 1-16, a bank B-D pad between its bank's track and its own output
-    _in_out_btn && frame_wheel != 0 ? swing_out_step(oi, sign_of(frame_wheel));
+    _in_out_btn && frame_wheel != 0 ? ( swing_out_step(oi, sign_of(frame_wheel)); frame_wheel = 0; );   // consumed (2026-10-27: the pad panel's scroll takes a wheel no control took)
 
     // LEARN button
     lrn_bx = out_bx + out_bw + ob_gap; lrn_bw = 50;
@@ -1519,14 +1576,8 @@ function _ov_draw_buttons() (
         gmem[KIT_GMEM_UNDO_DESC] = 7; gmem[KIT_GMEM_CMD] = 46;
         _undo_pending = 3; _undo_pad = oi; _undo_layer = overlay_layer;
       ) : (
-        p_layer_cnt[oi] > 0 ? (
-          clear_layer(oi, overlay_layer);
-        ) : (
-          s_len[oi] = 0; s_start[oi] = 0; s_end[oi] = 1.0;
-          s_sr[oi] = 0; s_norm[oi] = 0; s_norm_gain[oi] = 1.0;
-          strcpy(get_name_slot(oi), "");
-          strcpy(get_path_slot(oi), "");
-        );
+        // the layer, or a plain pad's sample: the one copy the bridge's acked path runs too (rk_swing_core, LIB314)
+        clear_layer_eff(oi, overlay_layer);
         // Clearing a layer changes the effective RR sequence; reset
         // cursor so the next hit starts at position 1.
         p_rr_idx[oi] = 0;

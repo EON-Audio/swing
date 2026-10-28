@@ -129,6 +129,7 @@ function _ov_draw_header_and_colorpicker() (
       swing_color_manualize(oi);
       mark_dirty_pad(oi);
       col_dirty = 1;
+      frame_wheel = 0;   // consumed (the pad panel's scroll takes a wheel no control took; 2026-10-27)
     );
 
     // ── Hue slider (fine-tune, right side) ──
@@ -181,15 +182,40 @@ function _ov_draw_header_and_colorpicker() (
       swing_color_manualize(oi);
       mark_dirty_pad(oi);
       col_dirty = 1;
+      frame_wheel = 0;   // consumed (2026-10-27, as the swatches')
     );
 
-    // Close button [x]
+    // Close button [x] -- the FLOATING editor's (overlay_pad >= 0): only _ov_draw_drop_and_close tests it,
+    // and the pad PANEL (rk_swing_ui_padfx_panel draws this header too) never calls that, so there the
+    // red x was a dead button beside the slot's own X (sweep LIB135).
     cl_x = op_x + op_w - 22; cl_y = op_y + 4;
-    gfx_set(0.55, 0.20, 0.20, 1);
-    gfx_rect(cl_x, cl_y, 18, 18);
-    gfx_set(1, 1, 1, 0.85);
-    rk_font(1, 11, 'b');
-    gfx_x = cl_x + 3; gfx_y = cl_y + 2; gfx_drawstr("x");
+    overlay_pad >= 0 ? (
+      gfx_set(0.55, 0.20, 0.20, 1);
+      gfx_rect(cl_x, cl_y, 18, 18);
+      gfx_set(1, 1, 1, 0.85);
+      rk_font(1, 11, 'b');
+      gfx_x = cl_x + 3; gfx_y = cl_y + 2; gfx_drawstr("x");
+    );
+);
+
+// Round-robin ORDER - / +: the orders stay a PERMUTATION. The layer that already holds the
+// target order takes this layer's old one (a swap). Rewriting one layer's order alone left
+// two layers on one order, and select_layer (rk_drumkit_dsp) then played the first of them
+// at both positions and the other never (sweep LIB115). dir is -1 or +1; a pad with no
+// layers is left alone (the old min(cnt - 1, ..) wrote -1 there).
+function swing_grid_rr_order_step(ap, lidx, dir) local(_cnt, _old, _new, _k, _b, _done) (
+  _cnt = p_layer_cnt[ap] | 0;
+  _old = l_rr_order[lidx] | 0;
+  _new = max(0, min(_cnt - 1, _old + dir));
+  _cnt > 0 && _new != _old ? (
+    _k = 0; _done = 0;
+    while (_k < _cnt && !_done) (
+      _b = ap * MAX_LAYERS + _k;
+      (_b != lidx && (l_rr_order[_b] | 0) == _new) ? ( l_rr_order[_b] = _old; _done = 1; );
+      _k += 1;
+    );
+    l_rr_order[lidx] = _new;
+  );
 );
 
 function _ov_draw_layers_and_mode() (
@@ -415,7 +441,7 @@ function _ov_draw_layers_and_mode() (
         gfx_set(0.45, 0.47, 0.50, 0.7); gfx_rect(_btn_x, ctrl_y, 26, 22, 0);
         gfx_set(1,1,1,0.9); gfx_x = _btn_x + 9; gfx_y = ctrl_y + 3; gfx_drawstr("-");
         mx >= _btn_x && mx <= _btn_x + 26 && my >= ctrl_y && my <= ctrl_y + 22 && lmb_down ? (
-          l_rr_order[_cur_lidx] = max(0, _rr_ord - 1);
+          swing_grid_rr_order_step(oi, _cur_lidx, -1);
           // Reorder resets the cursor: the user reordered the sequence,
           // so the next hit must start from position 1 of the new order.
           p_rr_idx[oi] = 0;
@@ -427,7 +453,7 @@ function _ov_draw_layers_and_mode() (
         gfx_set(0.45, 0.47, 0.50, 0.7); gfx_rect(_btn_x, ctrl_y, 26, 22, 0);
         gfx_set(1,1,1,0.9); gfx_x = _btn_x + 8; gfx_y = ctrl_y + 3; gfx_drawstr("+");
         mx >= _btn_x && mx <= _btn_x + 26 && my >= ctrl_y && my <= ctrl_y + 22 && lmb_down ? (
-          l_rr_order[_cur_lidx] = min(p_layer_cnt[oi] - 1, _rr_ord + 1);
+          swing_grid_rr_order_step(oi, _cur_lidx, 1);
           p_rr_idx[oi] = 0;
           mark_dirty_pad(oi);
         );
@@ -473,31 +499,29 @@ function _ov_draw_layers_and_mode() (
         _in_tl && frame_wheel != 0 ? (
           p_sum_tight[oi] = max(0, min(1.0, p_sum_tight[oi] + frame_wheel * 0.05));
           mark_dirty_pad(oi);
+          frame_wheel = 0;   // consumed (2026-10-27, as the swatches')
         );
 
-        // ── Per-layer VOL slider (for current layer tab) ──
+        // ── Per-layer VOL knob (for current layer tab) ──
+        // A KNOB since 2026-10-27 (the owner: "The pad FX Vol knob should be on big ass knob"; it was a 90 px slider
+        // bar): the editor's main knob -- the ATK .. OFS row's style (ws_knob, knobs_kbsg) at its radius and in GAIN's
+        // green, as big as the row holds (the tabs end at op_y + 68, the waveform starts at op_y + 100 = ctrl_y + 22),
+        // the dB beside it. Drag, wheel, double-click or right-click = unity (the lib's gestures, as GAIN's). Its
+        // hover / drag memory is the pad's FX knob slot 3, which no knob uses (km_fx: 12 per pad, _ov_draw_fx_knobs
+        // takes 0-2 and 5-11), so the overlay's close (_ov_draw_drop_and_close) clears its drag flag with the pad's
+        // other knobs'.
         _vl_lidx = oi * MAX_LAYERS + overlay_layer;
         _vl_lbl_x = _sl_x + _sl_w + 50;
-        _vl_x = _vl_lbl_x + 34; _vl_w = 90; _vl_h = 22;
+        _vl_r = 13; _vl_cx = _vl_lbl_x + 34 + _vl_r; _vl_cy = ctrl_y + 8;   // op_y + 73 .. op_y + 99
+        _vl_km = km_fx + (oi * KM_FX_PER_PAD + 3) * KS;
         // "VOL" label — bold, bright
         rk_font(1, 12, 'b');
         gfx_set(1.0, 1.0, 1.0, 0.95);
         gfx_x = _vl_lbl_x; gfx_y = ctrl_y + 3; gfx_drawstr("VOL");
-        // Slider background
-        gfx_set(0.20, 0.22, 0.26, 1); gfx_rect(_vl_x, ctrl_y, _vl_w, _vl_h);
-        // Fill (0–2.0 range, 1.0 = center = unity)
-        _vl_norm = l_gain[_vl_lidx] / 2.0;
-        _vl_fill = (_vl_norm * _vl_w)|0;
-        gfx_set(0.35, 0.55, 0.75, 0.7); gfx_rect(_vl_x, ctrl_y, _vl_fill, _vl_h);
-        // Unity marker at center
-        gfx_set(0.6, 0.6, 0.6, 0.4);
-        gfx_line(_vl_x + (_vl_w / 2)|0, ctrl_y + 2, _vl_x + (_vl_w / 2)|0, ctrl_y + _vl_h - 2);
-        // Thumb
-        _vl_fill > 0 ? (
-          gfx_set(0.50, 0.75, 1.0, 1.0);
-          gfx_rect(_vl_x + _vl_fill - 1, ctrl_y, 3, _vl_h);
-        );
-        // dB readout inside slider bar (centered)
+        _vl_nv = ws_knob_interact(_vl_km, _vl_cx, _vl_cy, _vl_r, l_gain[_vl_lidx], 0, 2.0, 1.0);
+        _vl_nv != l_gain[_vl_lidx] ? ( l_gain[_vl_lidx] = _vl_nv; s_dirty[oi] = 1; mark_dirty_pad(oi); );
+        ws_knob_draw(_vl_cx, _vl_cy, _vl_r, l_gain[_vl_lidx], 0, 2.0, 0, _vl_km[0], 0.40, 0.90, 0.45, 0.10, 0.24, 0.12);
+        // dB readout right of the knob
         rk_font(1, 11, 'b');
         l_gain[_vl_lidx] < 0.001 ? (
           gfx_set(1.0, 1.0, 1.0, 0.7);
@@ -508,31 +532,8 @@ function _ov_draw_layers_and_mode() (
           sprintf(#_vldb, "%+.1f dB", _vl_db);
         );
         gfx_measurestr(#_vldb, _vldb_w, _vldb_h);
-        gfx_x = _vl_x + (_vl_w - _vldb_w) / 2; gfx_y = ctrl_y + 3;
+        gfx_x = _vl_cx + _vl_r + 6; gfx_y = ctrl_y + 3;
         gfx_drawstr(#_vldb);
-        // Interaction: drag
-        _in_vl = mx >= _vl_x && mx <= _vl_x + _vl_w && my >= ctrl_y && my <= ctrl_y + _vl_h;
-        active_id == 296 ? ( LMB ? (
-          l_gain[_vl_lidx] = max(0, min(2.0, ((mx - _vl_x) / _vl_w) * 2.0));
-          s_dirty[oi] = 1; mark_dirty_pad(oi);
-        ) : active_id = -1; );
-        // Double-click reset to 1.0 (unity) — must check BEFORE single-click
-        active_id == -1 && lmb_down && _in_vl ? (
-          _now = time_precise();
-          _mix_dbl_id == 296 && (_now - _mix_dbl_time) < DBL_CLICK_T ? (
-            l_gain[_vl_lidx] = 1.0; s_dirty[oi] = 1; mark_dirty_pad(oi); _mix_dbl_id = -1;
-          ) : (
-            _mix_dbl_time = _now; _mix_dbl_id = 296;
-            active_id = 296;
-            l_gain[_vl_lidx] = max(0, min(2.0, ((mx - _vl_x) / _vl_w) * 2.0));
-            s_dirty[oi] = 1; mark_dirty_pad(oi);
-          );
-        );
-        // Scroll wheel
-        _in_vl && frame_wheel != 0 ? (
-          l_gain[_vl_lidx] = max(0, min(2.0, l_gain[_vl_lidx] + frame_wheel * 0.05));
-          s_dirty[oi] = 1; mark_dirty_pad(oi);
-        );
       );
 
     // Vel range readout (layers exist, except mode 1 which has full bar)
@@ -573,6 +574,10 @@ function _ov_take_drop() (
       // CMD 63/64 paths do (the layer path kills the whole pad's voices too).
       swing_voice_kill_pad_xf(oi);
       overlay_layer == 0 && p_layer_cnt[oi] == 0 ? (
+        // The trim and mix are reset BEFORE the load, which can be refused for room (§5.4: the pad keeps its
+        // old sample). A refusal puts them back, so the old sample does not come back untrimmed (sweep LIB136).
+        _ovd_g = p_gain[oi]; _ovd_p = p_pan[oi]; _ovd_t = p_tune[oi]; _ovd_pl = p_panL[oi]; _ovd_pr = p_panR[oi];
+        _ovd_s0 = s_start[oi]; _ovd_s1 = s_end[oi];
         s_len[oi] == 0 ? (
           // Empty pad: reset per-pad mix params so stale kit values don't leak
           // into the new sample. A replace keeps them, as a layer replace does.
@@ -581,6 +586,10 @@ function _ov_take_drop() (
         );
         s_start[oi] = 0; s_end[oi] = 1.0;   // a new sample starts untrimmed
         load_from_path(oi, #df);
+        ldr_job1[LDR_F_REFUSED] ? (
+          p_gain[oi] = _ovd_g; p_pan[oi] = _ovd_p; p_tune[oi] = _ovd_t; p_panL[oi] = _ovd_pl; p_panR[oi] = _ovd_pr;
+          s_start[oi] = _ovd_s0; s_end[oi] = _ovd_s1;
+        );
         swing_rcp_post_pad(oi);
         s_dirty[oi] = 1;
       ) : (
@@ -591,12 +600,14 @@ function _ov_take_drop() (
         s_dirty[oi] = 1;
       );
       mark_dirty_pad(oi);
+      !ldr_job1[LDR_F_REFUSED] ? swing_rup_want(RUP_K_SAMPLE, oi, overlay_layer, -1, 1);   // its REAPER undo point (2026-10-27)
       sync_note_names();
       // The pad's JOB follows its new sample (a native drop never touches the
       // browser, so this is the only place that can classify it) — but LAYER 0
       // only: layers 1..n are velocity/RR variants of the SAME drum and must not
       // re-classify the pad. The browser's load_layer_to_pad draws the same line.
       overlay_layer == 0 ? swing_lcd_padcat_queue_drop(oi);
+      overlay_layer == 0 ? swing_lcd_rn_drop_gen += 1;   // A2: and its root note (layer 0 decides it, as CMD 64)
       gfx_getdropfile(-1);
       );  // end drop-processing block
     );

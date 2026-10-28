@@ -152,8 +152,6 @@ function M.parse_name(disp, ident)
 end
 
 -- ── category: rung 1 (recipe DB) ───────────────────────────────────────────
--- ROWS arrive pre-sorted longest-key-first, so the first token hit is also the
--- most specific one ("pro c 2" before "pro c"). No runtime sort.
 
 -- Exact hash on the ident. JSFX rows in the hand-edited list are keyed on their
 -- PATH rather than their name, because a display name changes the moment its
@@ -164,15 +162,9 @@ local function path_row(ident)
   return recipes.PATHS[(ident:gsub("\\", "/")):lower()]
 end
 
--- Token-prefix scan over the name-keyed rows: the card recipes plus every
--- commercial plugin in the list. Pre-sorted longest-first, so the first hit is
--- also the most specific.
+-- Exact lookup over the name-keyed rows: the card recipes plus every
+-- commercial plugin in the list.
 --   returns bucket, subcategory, kind
--- ⚠️ A SINGLE-WORD curated key must match EXACTLY, never as a prefix. The list
--- holds real product names, and some are one short common word: a row for the
--- plugin called "Tape" was swallowing "Tape Echo", which is a delay. Multi-word
--- keys keep prefix matching, which is what lets the card row "pro c" cover
--- "Pro-C 2". 316 of the keys are single-token, so this is not a corner case.
 -- ⚠️ CURATED NAME ROWS MATCH EXACTLY. Nothing else is safe: a row is a claim
 -- about ONE product, and every looser rule leaked in measurement --
 --   prefix-anywhere : "Manipulator" (a real Polyverse pitch plugin) captured
@@ -181,20 +173,35 @@ end
 -- Exact matching cost exactly one row on the real 1120 (ReaSurroundPan, which
 -- simply wants its own entry) and fixed two wrong ones. When a variant needs
 -- covering, ADD A ROW -- that is what the list is for.
-local function row_hit(key, rk)
-  return key == rk
+--
+-- The rows BY KEY, built once on first use. An exact match needs no scan, and
+-- the scan ran over all 789 rows three times per installed plugin at the
+-- registry build and twice per chain slot every half second from the console
+-- publisher (sweep BRW31/32, 2026-10-26). The FIRST row holding a key wins, as
+-- the scan's order did, and `alt` is tried as the scan tried it: whichever of
+-- the two sits on the earlier row.
+local BY_KEY = nil
+local function recipe_index()
+  if BY_KEY then return BY_KEY end
+  BY_KEY = {}
+  for i = 1, #recipes.ROWS do
+    local rk = recipes.ROWS[i][1]
+    if BY_KEY[rk] == nil then BY_KEY[rk] = i end
+  end
+  return BY_KEY
 end
 
 local function recipe_row(key, alt)
   if not recipes then return nil end
-  for i = 1, #recipes.ROWS do
-    local rk = recipes.ROWS[i][1]
-    if row_hit(key, rk) or (alt and alt ~= key and row_hit(alt, rk)) then
-      local r = recipes.ROWS[i]
-      return r[2], r[3], r[4]
-    end
+  local ix = recipe_index()
+  local i = ix[key]
+  if alt and alt ~= key then
+    local j = ix[alt]
+    if j and (not i or j < i) then i = j end
   end
-  return nil
+  if not i then return nil end
+  local r = recipes.ROWS[i]
+  return r[2], r[3], r[4]
 end
 
 -- REAPER can hand back a name carrying TWO parenthetical groups -- the real
@@ -331,6 +338,16 @@ local function declared_cat(tr, idx)
   return nil
 end
 
+-- The ident REAPER reports for a live slot (a path, or a JS relative path), or
+-- "". Above category_fx, which reads it: a local function is an upvalue only
+-- for code compiled after it.
+local function fx_ident(tr, idx)
+  if not r.TrackFX_GetNamedConfigParm then return "" end
+  local ok, got, val = pcall(r.TrackFX_GetNamedConfigParm, tr, idx, "fx_ident")
+  if ok and got and val then return val end
+  return ""
+end
+
 --- Resolve a bucket for a plugin that is not (necessarily) inserted.
 --   the list, by path  ->  the list/cards, by name  ->  name classifier  ->  ?
 -- Rung 2 (plugin-declared) is unreachable here by construction; see category_fx.
@@ -354,7 +371,15 @@ function M.subcategory(name, ident)
 end
 
 --- Resolve a bucket for a slot that IS in a chain -- the full four-rung ladder.
-function M.category_fx(tr, idx)
+--- `ident`: fx_ident's answer when the caller already holds it (M.chain, M.entry
+--- read it once per slot); read here otherwise.
+function M.category_fx(tr, idx, ident)
+  -- The list by PATH first, the rung category() and subcategory() both start
+  -- on: without it a path-keyed JSFX (an Airwindows port, a Saike synth) wore
+  -- a guessed bucket in the chain beside its curated sub (sweep BRW33/34,
+  -- 2026-10-26).
+  local p = path_row(ident or fx_ident(tr, idx))
+  if p then return p[1] end
   local disp = select(2, r.TrackFX_GetFXName(tr, idx, ""))
   local name = M.parse_name(disp)
   local key = norm(name)
@@ -538,13 +563,7 @@ function M.search(q, opts)
 end
 
 -- ── chain read ─────────────────────────────────────────────────────────────
-
-local function fx_ident(tr, idx)
-  if not r.TrackFX_GetNamedConfigParm then return "" end
-  local ok, got, val = pcall(r.TrackFX_GetNamedConfigParm, tr, idx, "fx_ident")
-  if ok and got and val then return val end
-  return ""
-end
+-- (fx_ident lives above M.category, which now reads it too.)
 
 --- Read a track's FX chain as picker slots.
 function M.chain(tr)
@@ -553,12 +572,13 @@ function M.chain(tr)
   local n = r.TrackFX_GetCount(tr)
   for i = 0, n - 1 do
     local _, disp = r.TrackFX_GetFXName(tr, i, "")
-    local name, vendor, fmt = M.parse_name(disp, fx_ident(tr, i))
+    local ident = fx_ident(tr, i)   -- once a slot: it was three pcalls, every half second (sweep BRW31)
+    local name, vendor, fmt = M.parse_name(disp, ident)
     out[#out + 1] = {
       idx = i, name = name, vendor = vendor, fmt = fmt,
-      ident = fx_ident(tr, i), disp = disp or "",
-      cat = M.category_fx(tr, i),
-      sub = M.subcategory(name, fx_ident(tr, i)),
+      ident = ident, disp = disp or "",
+      cat = M.category_fx(tr, i, ident),
+      sub = M.subcategory(name, ident),
       enabled = r.TrackFX_GetEnabled(tr, i),
       offline = r.TrackFX_GetOffline and r.TrackFX_GetOffline(tr, i) or false,
     }
@@ -670,8 +690,10 @@ end
 --- pos = nil or >= count appends. Returns the resulting index.
 --
 -- Mechanism is the house-proven one (spec): append with TrackFX_AddByName, then
--- move into place. The `-1000-pos` AddByName trick is explicitly NOT used --
--- unproven in-house.
+-- move into place. insert_raw stays on append + move; the pad-view code further
+-- down (ensure_pad_container and the container inserts) does use the
+-- `-1000-pos` AddByName positional insert, probed by
+-- .dev_tests/EON_Probe_Container_run.ps1.
 --
 -- ⚠️ instantiate = -1 (ALWAYS create), not the 1 the bridge uses. A positive
 -- value means "add only if not already present, else return the existing one",
@@ -1115,6 +1137,11 @@ function M.chain_list(rel)
   local dir = M.chain_dir()
   if rel ~= "" then dir = dir .. SEP .. rel end
   if not r.EnumerateSubdirectories or not r.EnumerateFiles then return out end
+  -- REAPER keeps ONE listing cache per path (rk_lua_core's rule, the kit
+  -- bridge's too); -1 drops it, so a chain just saved shows in the rail now
+  -- and not after the next folder change (sweep BRW35, 2026-10-26).
+  r.EnumerateSubdirectories(dir, -1)
+  r.EnumerateFiles(dir, -1)
   local i = 0
   while true do
     local d = r.EnumerateSubdirectories(dir, i)
@@ -1525,22 +1552,27 @@ function M.name_pad_container(tr, pad, name, at)
   return true
 end
 
---- { swing, pb, pad, container, idx = { chain indices, encoded for children } },
+--- { swing, pb, pad, container, idx = { chain indices, encoded for children },
+--   cof = { [encoded child] = the top-level index of ITS container } },
 -- or nil (no Swing here). Signal order: a container is expanded in place.
+-- `container` is the FIRST container on the pair (where inserts go); every
+-- container on it is expanded, so a pasted second one's children are in the
+-- view too, and cof says which container each child lives in -- addressed by
+-- the first one, a child of the second was never found (sweep BRW36).
 function M.view(tr, pad)
   if not tr or pad == nil then return nil end
   local si = M.find_swing(tr)
   if si < 0 then return nil end
   local pb = M.find_patchbay(tr)
   local n = r.TrackFX_GetCount(tr)
-  local idx, container = {}, -1
+  local idx, container, cof = {}, -1, {}
   if pad >= 0 then
     local last = (pb >= 0) and pb or n          -- pad plugins live ABOVE the Patchbay
     for i = si + 1, last - 1 do
       if M.pad_of(tr, i) == pad then
         if M.is_container(tr, i) then
           if container < 0 then container = i end
-          for _, e in ipairs(container_children(tr, i)) do idx[#idx + 1] = e end
+          for _, e in ipairs(container_children(tr, i)) do idx[#idx + 1] = e; cof[e] = i end
         else
           idx[#idx + 1] = i
         end
@@ -1551,18 +1583,19 @@ function M.view(tr, pad)
       if i ~= pb and M.pad_of(tr, i) < 0 then idx[#idx + 1] = i end
     end
   end
-  return { swing = si, pb = pb, pad = pad, container = container, idx = idx }
+  return { swing = si, pb = pb, pad = pad, container = container, idx = idx, cof = cof }
 end
 
 --- One picker slot for any index, encoded included (M.chain's shape).
 function M.entry(tr, i)
   local _, disp = r.TrackFX_GetFXName(tr, i, "")
-  local name, vendor, fmt = M.parse_name(disp, fx_ident(tr, i))
+  local ident = fx_ident(tr, i)   -- once a slot (sweep BRW31)
+  local name, vendor, fmt = M.parse_name(disp, ident)
   return {
     idx = i, name = name, vendor = vendor, fmt = fmt,
-    ident = fx_ident(tr, i), disp = disp or "",
-    cat = M.category_fx(tr, i),
-    sub = M.subcategory(name, fx_ident(tr, i)),
+    ident = ident, disp = disp or "",
+    cat = M.category_fx(tr, i, ident),
+    sub = M.subcategory(name, ident),
     enabled = r.TrackFX_GetEnabled(tr, i),
     offline = r.TrackFX_GetOffline and r.TrackFX_GetOffline(tr, i) or false,
   }
@@ -1641,6 +1674,7 @@ function M.view_insert(tr, pad, add, after, name)
     if c < 0 then undo_end("insert"); return nil, "insert: could not make the container for " .. M.pair_label(pad) end
     local pos = M.container_count(tr, c)
     if after and after >= 0 and v.idx[after + 1] and is_enc(v.idx[after + 1]) then
+      c = v.cof[v.idx[after + 1]] or c   -- "after" a child of a pasted second container: into THAT one (sweep BRW36)
       local p = child_pos(tr, c, v.idx[after + 1])
       if p >= 0 then pos = p + 1 end
     end
@@ -1655,7 +1689,8 @@ function M.view_insert(tr, pad, add, after, name)
         undo_end("insert"); return nil, "insert: '" .. tostring(add) .. "' not found or refused"
       end
       top = r.TrackFX_GetCount(tr) - 1
-      c = M.pad_container(tr, pad)                       -- indices unchanged, but be safe
+      -- c stands: the newcomer was appended BELOW it, and pad_container would
+      -- name the first container where `pos` was read in a pasted second one
       r.TrackFX_CopyToTrack(tr, top, tr, M.enc(tr, c, pos), true)
     end
     at = M.container_child(tr, c, pos)
@@ -1679,8 +1714,11 @@ function M.view_swap(tr, pad, vidx, add)
   undo_begin()
   local at, err
   if is_enc(target) then
-    local c = v.container
+    local c = v.cof[target] or v.container   -- the child's OWN container (sweep BRW36)
     local pos = child_pos(tr, c, target)
+    -- Unfound, the newcomer went in at child 0 and the old plugin stayed, with
+    -- -1 back and no word (sweep BRW36).
+    if pos < 0 then undo_end("swap slot"); return nil, "swap: slot " .. tostring(vidx) .. " is not in its container" end
     local before = M.container_count(tr, c)
     r.TrackFX_AddByName(tr, add, false, -1000 - M.enc(tr, c, pos + 1))
     if M.container_count(tr, c) <= before then
@@ -1710,13 +1748,14 @@ function M.view_move(tr, pad, vfrom, vto)
   local a, b = v.idx[vfrom + 1], v.idx[vto + 1]
   if not a or not b then return nil, "move: slot out of this view" end
   if is_enc(a) and is_enc(b) then
-    local c = v.container
+    local c = v.cof[a] or v.container   -- the children's OWN container (sweep BRW36)
+    if (v.cof[b] or v.container) ~= c then return nil, "move: the two slots are in different containers" end
     undo_begin()
     local ok, err = cmove(tr, c, child_pos(tr, c, a), child_pos(tr, c, b))
     undo_end("move slot")
     return ok, err
   elseif not is_enc(a) and is_enc(b) then
-    local c = v.container
+    local c = v.cof[b] or v.container   -- the slot's OWN container (sweep BRW36)
     -- "Ends up AT view slot vto": once the flat plugin has left the view,
     -- everything after it moves up one, so a move DOWN lands after b's child
     -- position and a move UP lands at it.
@@ -1730,10 +1769,10 @@ function M.view_move(tr, pad, vfrom, vto)
     if a < c then
       move_raw(tr, a, r.TrackFX_GetCount(tr) - 1)
       a = r.TrackFX_GetCount(tr) - 1
-      c = M.pad_container(tr, pad)
+      c = c - 1   -- the slots above the parked one moved up by one; pad_container would name the FIRST container (sweep BRW36)
     end
     r.TrackFX_CopyToTrack(tr, a, tr, M.enc(tr, c, pos), true)
-    c = M.pad_container(tr, pad)
+    -- c stands: the slot that left the top level was the last one, below the container
     -- verify by GUID: landed at pos, or somewhere inside (then walk it there)
     local e = M.container_child(tr, c, pos)
     if e < 0 or r.TrackFX_GetFXGUID(tr, e) ~= guid then
@@ -1770,16 +1809,24 @@ function M.view_chain_apply(tr, pad, rel, mode, name)
   local abs = M.chain_dir() .. SEP .. rel
   undo_begin()
   if mode == "replace" then
+    -- TWO passes (sweep BRW37, 2026-10-26). Every container child first, by
+    -- position in its OWN container, last first: a child's encoded index is
+    -- (c + 1) + (pos + 1) * (top-level count + 1), so a flat slot deleted
+    -- before it -- one the user dragged BELOW the container, which the one
+    -- last-first loop reached first -- re-encoded every child and child_pos
+    -- found none of them; the old children stayed under the new chain. Then
+    -- the flat slots, last first, when no encoded value is needed any more.
     for k = #v.idx, 1, -1 do
       local i = v.idx[k]
       if is_enc(i) then
-        -- children re-encode as siblings vanish: delete by position, last first
-        local c = v.container
+        local c = v.cof[i] or v.container
         local p = child_pos(tr, c, i)
         if p >= 0 then r.TrackFX_Delete(tr, M.container_child(tr, c, p)) end
-      else
-        r.TrackFX_Delete(tr, i)
       end
+    end
+    for k = #v.idx, 1, -1 do
+      local i = v.idx[k]
+      if not is_enc(i) then r.TrackFX_Delete(tr, i) end
     end
     v = M.view(tr, pad)
   end

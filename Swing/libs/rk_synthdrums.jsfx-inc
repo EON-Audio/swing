@@ -6,8 +6,10 @@ desc:rk_synthdrums — Swing synth-layer engine library (shared, rk_syn_*)
 // 2026-07-29): LUT sine −130 dB / LUT exp −84 dB / LUT tanh −92 dB nulls vs
 // transcendentals; Simper SVF −160 dB vs DD-101 lineage; Park-Miller ≡ rand()
 // statistically; control-rate-16 swept coefficients −111 dB vs per-sample tan.
-// Ear rulings baked in: CYM = 2-op FM + noise; SNARE pitch curve = original
-// double-exp via LUT-exp; HAT = 2-op PM (over the 6-square stack, 4.6× CPU).
+// The engines are the DD-101 parity ports (PARITY PORT LAYER below); the
+// first-generation engines and their ear rulings (CYM 2-op FM, HAT 2-op PM)
+// were retired 2026-08-12. The hat IS DD-101's square stack, and family 4
+// (the old CYM slot) is the ride.
 //
 // LICENSES (ship these notices): engine voicings adapted from Saike DD-101
 // "Dum Drums" (c) 2022 Joep Vanlier, MIT (github.com/JoepVanlier/JSFX,
@@ -24,16 +26,19 @@ desc:rk_synthdrums — Swing synth-layer engine library (shared, rk_syn_*)
 //   freemem = rk_syn_init(freemem);                     // @init once: LUTs
 //   rk_syn_reset(engine, st, mac, tune, vel);           // trigger rate
 //   out = rk_syn_tick(st);                              // per sample
-// st  = RK_SYN_STATE_SIZE-cell voice state block (caller zeroes on steal)
+// st  = RK_SYN_STATE_SIZE-cell voice state block (Swing's core zeroes the whole
+//       block on EVERY launch, before rk_syn_reset -- launch_syn_for_pad)
 // mac = RK_SYN_MACROS-cell macro block, each 0..1 (engine-interpreted, §3)
 // tune = pad tune in semitones (0 = engine default pitch); vel = 0..1
 // ============================================================================
 
 @init
 
-RK_SYN_VER = 1;
-
-// engine ids (spec §3 rows)
+// Family ids 0..5 (the first-generation spec §3 rows). The live encoding is
+// family + 10 * type, families 0..8 (see ENGINE DISPATCH, rk_syn_reset): these
+// six are type 0 of families 0..5, and 4 is now the RIDE. Nothing in the plugin
+// reads these names (the dispatch, LCD and synth view use the literal numbers);
+// the dev probes do (synthlayer_probe.jsfx, EON_Probe_SrateSwitch).
 RK_SYN_KICK  = 0;
 RK_SYN_SNARE = 1;
 RK_SYN_CLAP  = 2;
@@ -47,11 +52,12 @@ RK_SYN_STATE_SIZE = 256;  // Spec_Synthdrums_Parity §5.3. Sized ONCE for the
                           // so no family ever needs a second bump and no engine
                           // has to union regions (union layouts are exactly how
                           // one-past-end aliasing bugs happen).
-                          // measured: dd_kick 92, dd_snare 171 (63 of them the
-                          // type-0 9-bandpass bank, 46 the freq shifter); his
-                          // hat projects to ~120. Cost = 17*256 = 4352 cells,
-                          // ~34 KB - negligible.
-                          // (legacy engines: CYM fattest at 36, CLAP 35)
+                          // measured: dd_kick 92, dd_snare 170 (63 of them the
+                          // type-0 9-bandpass bank, 46 the freq shifter); the
+                          // largest is the ride, 232 (RK_DDR_CELLS). rk_syn_reset
+                          // keeps st[0..1] (family, seed), so an engine gets 254.
+                          // Cost: Swing claims V_SLOTS * 256 = 132 * 256 =
+                          // 33,792 cells (~264 KB), plus the preview's one block.
 
 // ── DD-101 parity: his global scaling terms (saikedrums.jsfx:663-664) ──────
 // max(1, srate) because srate has been reported as 0 in @init (Geraint Luff's
@@ -76,10 +82,11 @@ RK_SYN_EXPMIN = -8;
 RK_SYN_TANHN  = 1024;     // tanh over [-RK_SYN_TANHR, RK_SYN_TANHR]
 RK_SYN_TANHR  = 8;
 
-// flat-block layouts
+// flat-block layouts. These *_CELLS sizes (and each engine's RK_DD*_CELLS
+// below) are layout documentation: no plugin code reads them; the dev probes
+// read a few (RK_SYN_SVF_CELLS, RK_DDK_CELLS, RK_DD_SHIFT_CELLS).
 RK_SYN_SVF_CELLS  = 7;    // g k a1 a2 a3 ic1 ic2
 RK_SYN_BELL_CELLS = 8;    // g k a1 a2 a3 m1 ic1 ic2
-RK_SYN_RC_CELLS   = 2;    // a z
 
 // ── one-time LUT construction: freemem = rk_syn_init(freemem) ──────────────
 function rk_syn_init(mem)
@@ -171,6 +178,8 @@ global()
 // ── flat Simper SVF: b[0..6] = g k a1 a2 a3 ic1 ic2 ────────────────────────
 // _set variants use tan(): TRIGGER RATE ONLY (or control-rate ≥16-sample
 // steps with linear g interp — probe-proven transparent at −111 dB).
+// No engine calls rk_syn_svf_set any more (they use the state-preserving
+// rk_syn_dd_*_keep setters); it stays for .dev_tests/synthlayer_probe.jsfx.
 function rk_syn_svf_set(b, fc, invq)
 local(g)
 global(srate)
@@ -180,24 +189,6 @@ global(srate)
   b[0] = g;
   b[1] = invq;
   b[2] = 1 / (1 + g * (g + invq));
-  b[3] = g * b[2];
-  b[4] = g * b[3];
-  b[5] = b[6] = 0;
-);
-
-// reserved for direct DD-101 normalized-map voicing ports (unused by v1 engines,
-// as is rk_syn_lut_cos — kept for future engines)
-function rk_syn_svf_set_norm(b, freq, res)
-local(f0, g, k)
-global()
-(
-  f0 = exp((1 - freq) * log(20 / 22050));
-  f0 = min(f0, 0.98);   // below 1.0: tan(pi/2) at f0=1 would blow up the coefficients
-  g = tan(0.5 * $pi * f0);
-  k = 2 - 2 * res;
-  b[0] = g;
-  b[1] = k;
-  b[2] = 1 / (1 + g * (g + k));
   b[3] = g * b[2];
   b[4] = g * b[3];
   b[5] = b[6] = 0;
@@ -240,22 +231,7 @@ global()
 );
 
 // ── flat bell: b[0..7] = g k a1 a2 a3 m1 ic1 ic2 ───────────────────────────
-function rk_syn_bell_set(b, fc, q, gain)
-local(a, g, k)
-global(srate)
-(
-  a = pow(10, gain / 40);
-  g = tan($pi * fc / srate);
-  k = 1.0 / (q * a);
-  b[0] = g;
-  b[1] = k;
-  b[2] = 1.0 / (1.0 + g * (g + k));
-  b[3] = g * b[2];
-  b[4] = g * b[3];
-  b[5] = k * (a * a - 1.0);
-  b[6] = b[7] = 0;
-);
-
+// (set by the state-preserving rk_syn_dd_bell_set_keep / _invq_keep below)
 function rk_syn_bell(b, v0)
 local(v1, v2, v3)
 global()
@@ -266,13 +242,6 @@ global()
   b[6] = 2.0 * v1 - b[6];
   b[7] = 2.0 * v2 - b[7];
   v0 + b[5] * v1;
-);
-
-// one-multiply envelope coefficient from seconds (trigger rate: uses exp)
-function rk_syn_env_k(sec)
-global(srate)
-(
-  1 - exp(-1 / (max(sec, 0.0001) * srate));
 );
 
 
@@ -484,7 +453,7 @@ RK_DDK_SRATIO = 10;   // sample_ratio latched
 RK_DDK_FSHIFT = 11;
 RK_DDK_PENV   = 12;   // pitch env   5 cells -> 12..16
 RK_DDK_AENV   = 17;   // amp env     5 cells -> 17..21
-RK_DDK_AHIGH  = 22;   // amp k_high_decay (his kick_stop / choke)
+RK_DDK_AHIGH  = 22;   // amp k_high_decay (his kick_stop / choke): written, never read -- the stop path is not ported
 RK_DDK_NBP    = 23;   // noise BP svf     7 -> 23..29
 RK_DDK_MUD    = 30;   // mud_dip bell     8 -> 30..37
 RK_DDK_CLICK  = 38;   // click_boost bell 8 -> 38..45
@@ -638,7 +607,7 @@ global()
 // dispatch and tick all branch only on 0..3. Position 4 is a DEAD slider
 // position in DD-101; deliberately not replicated (spec §3.1).
 //
-// state: 171 cells.
+// state: 170 cells (top index 169).
 // ============================================================================
 RK_DDS_PREVY  = 0;
 RK_DDS_SEED   = 1;
@@ -653,7 +622,7 @@ RK_DDS_SMOOTH = 9;
 RK_DDS_PENV   = 10;   // pitch env   5 -> 10..14
 RK_DDS_NENV   = 15;   // noise env   5 -> 15..19
 RK_DDS_AENV   = 20;   // amp env     5 -> 20..24
-RK_DDS_NFAST  = 25;   // noise.fast_decay
+RK_DDS_NFAST  = 25;   // noise.fast_decay: stored for the parity harness, never read (no stop path is ported)
 RK_DDS_NVOL   = 26;   // noise.vol (type 0)
 // -- type 0 punch system --
 RK_DDS_PST    = 27;   // punch.state
@@ -936,8 +905,9 @@ global()
 //
 // ⚠️ OSCILLATOR PHASES t1..t13 ARE FREE-RUNNING - hat_reset never zeroes them,
 // only the sample counter `t`. Each hit catches the bank at a different phase.
-// Our reset preserves them identically. (Swing's memset-on-voice-steal is a
-// separate scenario and does zero them; noted, not a parity concern.)
+// Our reset leaves them alone too, but in Swing the core zeroes the whole voice
+// block on EVERY launch (launch_syn_for_pad), so every hit starts the bank at
+// phase 0 -- DD-101's hit-to-hit phase variety does not happen in Swing.
 //
 // ⚠️ `a1_2` carries a per-hit `(0.95 + 0.1*rand())` randomisation, so no two
 // triggers are identical even in his engine. The harness pins it on both sides.
@@ -954,7 +924,7 @@ RK_DDH_T     = 0;    // sample counter (his `t`), reset per trigger
 RK_DDH_SEED  = 1;
 RK_DDH_TYPE  = 2;
 RK_DDH_BODY  = 3;    // current_hat_body
-RK_DDH_PH    = 4;    // t1..t13   -> 4..16   (FREE-RUNNING, never reset)
+RK_DDH_PH    = 4;    // t1..t13   -> 4..16   (FREE-RUNNING: the reset never zeroes them; Swing's launch memset does)
 RK_DDH_DT    = 17;   // dt1..dt13 -> 17..29
 // envelope blocks: [0]=s [1]=n [2]=k_atk [3]=k_rel [4]=a [5]=k_rel_fast
 RK_DDH_E12   = 30;   // his s1_2 / n1_2 / k1_2_atk / k1_2_rel / a1_2
@@ -1077,7 +1047,10 @@ global(srate, RK_DDH_T, RK_DDH_SEED, RK_DDH_TYPE, RK_DDH_BODY, RK_DDH_DT,
   st[RK_DDH_E3 + 2] = 7.264430222920869 / st[RK_DDH_E3 + 1];
   st[RK_DDH_E3 + 3] = 7.264430222920869 * isr_dec / 0.21747253516471457;
 
-  st[RK_DDH_E12 + 5] = st[RK_DDH_E12 + 3] * 9;   // his *_rel_fast (hat_stop)
+  // his *_rel_fast (hat_stop): stored for the parity harness only. His stop path
+  // is not ported -- a Swing choke fades the voice with the core's generic
+  // v_stage = 4 release -- so no tick reads these four.
+  st[RK_DDH_E12 + 5] = st[RK_DDH_E12 + 3] * 9;
   st[RK_DDH_E13 + 5] = st[RK_DDH_E13 + 3] * 2;
   st[RK_DDH_E2  + 5] = st[RK_DDH_E2  + 3] * 2;
   st[RK_DDH_E3  + 5] = st[RK_DDH_E3  + 3] * 2;
@@ -1429,6 +1402,9 @@ global(RK_DDC_SEED, RK_DDC_TYPE, RK_DDC_AST, RK_DDC_WST,
 // ⚠️ synth1's punch.dt is in RADIANS (2*pi*f*israte) for its sine recurrence;
 //    synth2/3 use normalised f*israte. Different conventions, both ported.
 // ⚠️ punch.t / punch.t3 are NOT reset per trigger - free-running, like the hat.
+//    Our reset leaves them alone too, but Swing's core zeroes the whole voice
+//    block on every launch (launch_syn_for_pad), so in Swing they start at 0
+//    on every hit.
 // ⚠️ synth3 calls eval_linearSVF_LP on the filter it *named* `bp`. Not a typo.
 // ⚠️ synth2 and synth3 both init bp2 TWICE; the second call wins. Both kept.
 // ⚠️ synth3's output ternary has no else branch, so |sqp| <= 0.001 yields 0 -
@@ -1672,15 +1648,15 @@ global()
 // never assigned; ride_tick_2's whole crash block sits behind a literal `0 ?`.
 //
 // ⚠️ Types SHARE the filter/envelope slots — a voice is exactly one type, same
-// as the hat. Do not lay them out non-overlapping; t1 alone is ~195 cells.
+// as the hat. Do not lay them out non-overlapping; t1 alone reaches cell 230.
 //
-// state: 231 cells.
+// state: 232 cells (RK_DDR_CELLS).
 // ============================================================================
 RK_DDR_SEED  = 0;
 RK_DDR_TYPE  = 1;
 RK_DDR_T     = 2;    // sample counter
 RK_DDR_DUTY  = 3;    // ride_duty latched
-RK_DDR_TONE  = 4;    // ride_tone latched (t0 recomputes dt5/dt6 per sample)
+RK_DDR_TONE  = 4;    // ride_tone latched (t0's dt5/dt6 come from it, once at launch: rk_syn_dd_ride_latch_dt56)
 RK_DDR_PH    = 5;    // t1..t13   -> 5..17
 RK_DDR_DT    = 18;   // dt1..dt13 -> 18..30
 // envelope set A (types 0 and 2): [0]=s [1]=n [2]=k_atk [3]=k_rel [4]=a
@@ -1709,9 +1685,8 @@ RK_DDR_F9    = 125;  // bps3  (t2)      peak8
 RK_DDR_F10   = 132;  // lp    (t2)      peak9
 RK_DDR_SH1   = 139;  // t1 only: his ride.fshift,  110 Hz -> 139..184
 RK_DDR_SH2   = 185;  // t1 only: his fshift2,      0.4 Hz -> 185..230
-// Pad TUNE, latched at launch. It has to be STORED because ride type 0
-// rebuilds dt5/dt6 every sample (see the tick) and so cannot use the
-// one-shot scaling every other oscillator gets at launch.
+// Pad TUNE, latched at launch for ride type 0's dt5/dt6, which come from TONE
+// (rk_syn_dd_ride_latch_dt56, run by the dispatcher after this is latched).
 RK_DDR_TUNEF = 231;  // 1 = no transposition
 RK_DDR_CELLS = 232;
 
@@ -1873,6 +1848,23 @@ global(srate, RK_DDR_SEED, RK_DDR_TYPE, RK_DDR_T, RK_DDR_DUTY, RK_DDR_TONE,
   );
 );
 
+// Ride type 0's dt5 / dt6: from TONE, piecewise about 0.5, times the pad's tune ratio -- latched ONCE here, at launch,
+// after rk_syn_reset has latched TUNEF (it calls this last). The tick used to rebuild the two every sample from the
+// same two launch-latched values, per voice (LIB342); this is the tick's arithmetic, so the increments are the same
+// bits. Type 0 only: the other types' DT+4 / DT+5 are the reset's, scaled by the dispatcher's `*= f`.
+function rk_syn_dd_ride_latch_dt56(st)
+local(tn, d5, d6)
+global(srate, RK_DDR_TYPE, RK_DDR_TONE, RK_DDR_TUNEF, RK_DDR_DT)
+(
+  st[RK_DDR_TYPE] == 0 ? (
+    tn = st[RK_DDR_TONE];
+    d5 = (tn < 0.5 ? 359.4 + 881.2 * tn : 450.09 + 699.8 * tn);
+    d6 = (tn < 0.5 ? 254.3 + 571.4 * tn : 452.8 + 174.4 * tn);
+    d5 *= st[RK_DDR_TUNEF] / srate; d6 *= st[RK_DDR_TUNEF] / srate;
+    st[RK_DDR_DT + 4] = d5; st[RK_DDR_DT + 5] = d6;
+  );
+);
+
 function rk_syn_dd_ride_tick(st)
 local(oscs, oscs2, v1, v2, v3, metal2, nz, nz2, nz3, ss2, tt, d5, d6, tn)
 global(srate,
@@ -1886,18 +1878,9 @@ global(srate,
   tt = st[RK_DDR_T];
 
   st[RK_DDR_TYPE] == 0 ? (
-    // ⚠️ dt5/dt6 are recomputed EVERY SAMPLE from tone, piecewise about 0.5
-    tn = st[RK_DDR_TONE];
-    d5 = (tn < 0.5 ? 359.4 + 881.2 * tn : 450.09 + 699.8 * tn);
-    d6 = (tn < 0.5 ? 254.3 + 571.4 * tn : 452.8 + 174.4 * tn);
-    // ⚠️ dt5/dt6 are the ONLY two of the ride's six oscillators rebuilt here
-    // rather than at launch, so the one-shot `*= f` that transposes the other
-    // eleven rates was overwritten every sample and these two stayed put. Tune
-    // a type-0 ride an octave and two thirds of the cymbal moved while a third
-    // stayed anchored. The ratio is latched at launch for exactly this.
-    d5 *= st[RK_DDR_TUNEF] / srate; d6 *= st[RK_DDR_TUNEF] / srate;
-    st[RK_DDR_DT + 4] = d5; st[RK_DDR_DT + 5] = d6;
-
+    // dt5/dt6 (TONE-swept, tune-scaled) were rebuilt here EVERY SAMPLE from two values latched at launch; since
+    // 2026-10-26 rk_syn_dd_ride_latch_dt56 writes them once at launch, the same arithmetic (LIB342).
+    d5 = st[RK_DDR_DT + 4]; d6 = st[RK_DDR_DT + 5];
     st[RK_DDR_PH + 0] += st[RK_DDR_DT + 0];
     st[RK_DDR_PH + 1] += st[RK_DDR_DT + 1];
     st[RK_DDR_PH + 2] += st[RK_DDR_DT + 2];
@@ -2174,7 +2157,7 @@ global(RK_DDM_SEED, RK_DDM_TYPE, RK_DDM_PST, RK_DDM_PST2, RK_DDM_PST3,
 // (increments divided by 2π at reset). Un-nullable ((1+0.2*rand()) multiplies
 // the tone) → coefficient parity.
 // ⚠️ t0/t2 excite a BP with the boolean (pulse > 0) — a timed square gate.
-// state: 79 cells.
+// state: 66 cells (RK_DDW_CELLS).
 // ============================================================================
 RK_DDW_SEED   = 0;
 RK_DDW_TYPE   = 1;
@@ -2203,7 +2186,7 @@ RK_DDW_F7     = 59;  // lp  / cbp7
 RK_DDW_CELLS  = 66;
 
 function rk_syn_dd_cowbell_reset(st, wtype, tune, decay)
-local(t_s, tuning, twopi)
+local(t_s, tuning)
 global(srate, RK_DDW_SEED, RK_DDW_TYPE, RK_DDW_PST, RK_DDW_PST2, RK_DDW_PST3,
        RK_DDW_PATK, RK_DDW_PK, RK_DDW_PK2, RK_DDW_PK3, RK_DDW_PKATK,
        RK_DDW_PULSE, RK_DDW_PULSE2, RK_DDW_DT, RK_DDW_DT2, RK_DDW_T, RK_DDW_T2,
@@ -2213,7 +2196,6 @@ global(srate, RK_DDW_SEED, RK_DDW_TYPE, RK_DDW_PST, RK_DDW_PST2, RK_DDW_PST3,
   st[RK_DDW_TYPE] = wtype;
   st[RK_DDW_SEED] <= 0 ? st[RK_DDW_SEED] = 55555;
   tuning = pow(2, tune - 0.5);
-  twopi = 2 * $pi;
 
   wtype == 0 ? (
     t_s = 0.03 * (0.5 + decay);
@@ -2322,10 +2304,10 @@ global(RK_DDW_SEED, RK_DDW_TYPE, RK_DDW_PST, RK_DDW_PST2, RK_DDW_PST3,
     st[RK_DDW_T2] += st[RK_DDW_DT2];
     sqrs = st[RK_DDW_PST] + st[RK_DDW_PST2];
     sqrs = sqrs / (1.0 + sqrs);
+    y = rk_syn_dd_saw(st[RK_DDW_T], st[RK_DDW_DT]);   // once: the dry term and the band-pass took the same saw twice (LIB343)
     0.35 * (
-      0.5 * rk_syn_dd_saw(st[RK_DDW_T], st[RK_DDW_DT])
-      + 3 * rk_syn_svf_bp(st + RK_DDW_F1,
-              rk_syn_dd_saw(st[RK_DDW_T], st[RK_DDW_DT]))
+      0.5 * y
+      + 3 * rk_syn_svf_bp(st + RK_DDW_F1, y)
       + rk_syn_dd_saw(st[RK_DDW_T2], st[RK_DDW_DT2])
     ) * sqrs;
   ) : st[RK_DDW_TYPE] == 2 ? (
@@ -2379,7 +2361,7 @@ global(RK_DDW_SEED, RK_DDW_TYPE, RK_DDW_PST, RK_DDW_PST2, RK_DDW_PST3,
 // by envelope-trajectory null + coefficient parity.
 // ⚠️ his reset writes global shaker_tune_freq (consumed by his MAIN jsfx, not
 // by drum_elements) — dropped from the port, noted here.
-// state: 62 cells.
+// state: 60 cells (RK_DDK2_CELLS).
 // ============================================================================
 RK_DDK2_SEED  = 0;
 RK_DDK2_TYPE  = 1;
@@ -2516,11 +2498,12 @@ global(RK_DDK2_SEED, RK_DDK2_TYPE, RK_DDK2_EST, RK_DDK2_EST2, RK_DDK2_EST3,
 // ps_engine encodes family + 10*type (family = engine%10 0..8, type =
 // floor(engine/10) 0..3). Legacy values 0..5 decode as families 0..5 type 0;
 // the old CYM slot (4) is the RIDE family. The legacy rk_syn_<fam>_* engines
-// above are now DEAD CODE, kept only until a cleanup commit removes them.
+// were removed after their 2026-08-12 retirement; only shared helpers remain.
 //
 // Voice-state layout: st[0] = family (tick dispatch), st[1] = per-hit PRNG
 // seed (written by rk_swing_core BEFORE reset — the existing contract),
-// engine state at st+2. Worst engine (ride t1 ~195 cells) + 2 <= 256.
+// engine state at st+2. Worst engine (the ride, RK_DDR_CELLS = 232) + 2 = 234
+// <= 256.
 //
 // MACRO CONTRACT (spec §4.1): each macro is the normalized position of ONE of
 // his sliders, and rk_syn_dd_macro_default() returns his slider default in
@@ -2528,12 +2511,15 @@ global(RK_DDK2_SEED, RK_DDK2_TYPE, RK_DDK2_EST, RK_DDK2_EST2, RK_DDK2_EST3,
 // exactly. Unassigned macros are inert. Velocity inside the engine is his
 // default (all sens = 0): the core already applies vel to level.
 //
-// Pad TUNE (semitones): families with exponential tune (tom/rim/cowbell) fold
-// in exactly (+s/12 pre-pow); kick/snare transpose their bottom frequency;
-// hat/ride post-scale every oscillator increment by 2^(s/12); shaker scales
-// its linear tuning term. ⚠️known small deviation: ride t0 recomputes its two
-// TONE-swept oscillators per sample — those two (of six) do not transpose.
+// Pad TUNE (semitones): families with exponential tune (tom/rim/cowbell types
+// 0-2) fold in exactly (+s/12 pre-pow); kick/snare and cowbell type 3 (linear
+// in t) transpose their frequency and re-normalise; hat/ride post-scale every
+// oscillator increment by 2^(s/12) (ride t0's two TONE-swept oscillators are
+// latched at launch with the ratio, rk_syn_dd_ride_latch_dt56); shaker scales
+// its linear tuning term.
 // ══════════════════════════════════════════════════════════════════════════
+// The family table by name -- documentation: rk_syn_reset / rk_syn_tick, the
+// LCD and the synth view all use the literal numbers, and nothing reads these.
 RK_SYN_RIDE     = 4;   // the old CYM slot
 RK_SYN_RIM      = 6;
 RK_SYN_COWBELL  = 7;
@@ -2631,10 +2617,11 @@ global(srate,
   fam == 4 ? (
     es[RK_DDR_SEED] = seed;
     rk_syn_dd_ride_reset(es, min(typ, 2), mac[0], mac[1], mac[2], mac[3]);
-    // Latched for the tick's per-sample rebuild of dt5/dt6. The reset leaves
+    // Latched for dt5/dt6 (type 0's TONE-swept pair, below). The reset leaves
     // it at 1, so an untuned pad is byte-for-byte what it was before.
     tune != 0 ? ( i = 0; loop(13, es[RK_DDR_DT + i] *= f; i += 1; );
                   es[RK_DDR_TUNEF] = f; );
+    rk_syn_dd_ride_latch_dt56(es);   // once per launch, not per sample (LIB342)
   ) :
   fam == 5 ? (
     es[RK_DDT_SEED] = seed;
@@ -2647,7 +2634,13 @@ global(srate,
   ) :
   fam == 7 ? (
     es[RK_DDW_SEED] = seed;
-    rk_syn_dd_cowbell_reset(es, typ, mac[0] + tune / 12, mac[1]);
+    // Types 0-2 tune by pow(2, t - 0.5): +s/12 folds in exactly. Type 3's pitch is LINEAR in t ((600 + 4200 t) Hz,
+    // its band-pass 802 + 400 t), so there the transposed frequency is re-normalised the kick's way; +s/12 added
+    // to the linear term went DOWN to 0 Hz at -7.7 st and up again below it, +12 gave +16 st (LIB321). tune == 0
+    // stays byte-for-byte: the re-normalisation is skipped, as the ride's.
+    rk_syn_dd_cowbell_reset(es, typ,
+                            (typ == 3 && tune != 0) ? ((600 + 4200 * mac[0]) * f - 600) / 4200 : mac[0] + tune / 12,
+                            mac[1]);
   ) : (
     es[RK_DDK2_SEED] = seed;
     // linear tuning term (0.5 + t): scale it, re-normalize

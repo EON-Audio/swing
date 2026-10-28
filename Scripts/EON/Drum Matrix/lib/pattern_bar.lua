@@ -41,6 +41,13 @@ local song_target   = nil   -- chain position the song right-click menu acts on
 local arr_menu_open = false -- arrangement picker popup showing
 local arr_rename    = nil   -- arrangement index being renamed (modal open while non-nil)
 local arr_rename_buffer = ''
+-- A rename modal a menu asked for: its popup id, opened by Render at WINDOW
+-- scope once the menus are done. ImGui hashes a popup id in the current ID
+-- stack, so an OpenPopup made inside the pattern / arrangement menu popup named
+-- an id BeginPopupModal at window scope never found: no modal, the rename
+-- target stuck set, and IsHovered blocked every paint click until a restart
+-- (audit DM113, 2026-10-26). The "+" chip opens its modal at window scope.
+local open_modal    = nil   -- 'pat_rename' | 'arr_rename' | nil
 
 -- Layout metrics.
 local CHIP_W   = 64    -- pattern chip
@@ -368,7 +375,7 @@ local function render_arr_popup(ctx)
       local sel = select(3, song.ArrActive())
       arr_rename = act
       arr_rename_buffer = sel or ''
-      reaper.ImGui_OpenPopup(ctx, 'arr_rename')
+      open_modal = 'arr_rename'   -- opened by Render at window scope (see open_modal)
     end
     if #list > 1 then
       if reaper.ImGui_MenuItem(ctx, 'Delete ' .. song.ArrLetter(act) .. '...') then
@@ -446,7 +453,7 @@ local function render_pattern_popup(ctx)
     if reaper.ImGui_MenuItem(ctx, 'Rename...') then
       rename_target = idx
       rename_buffer = (patterns.GetByIndex(idx) or {}).name or ''
-      reaper.ImGui_OpenPopup(ctx, 'pat_rename')
+      open_modal = 'pat_rename'   -- opened by Render at window scope (see open_modal)
     end
     if reaper.ImGui_MenuItem(ctx, 'Delete pattern') then patterns.Delete(idx) end
     reaper.ImGui_EndPopup(ctx)
@@ -563,6 +570,11 @@ function M.Render(ctx, L, T, R, B)
     render_pattern_popup(ctx)
     render_song_popup(ctx)
     render_arr_popup(ctx)
+    -- The rename modals open HERE, in the window's own ID scope (see open_modal).
+    if open_modal then
+      reaper.ImGui_OpenPopup(ctx, open_modal)
+      open_modal = nil
+    end
     render_rename_modal(ctx)
     render_arr_rename_modal(ctx)
     reaper.ImGui_End(ctx)
