@@ -19,10 +19,12 @@
 // pads (the compact faces), the panel shows a note instead.
 @init
 PFX_EDITOR_H = 560;      // the editor's own height (the overlay's op_h): the narrow form is laid out for at least this
-PFX_BOTTOM_H_B = 300;    // the wide form's default height below the pads, design px (its two columns need ~280)
-PFX_BOTTOM_MIN_B = 300;  // and its floor: shorter and the bottom buttons would run into the sends
-PFX_PAGE_H = 22;         // the page chips' row at the top of the panel, design px
-SIDE_TAB_H = 22;         // the side slot's top row (its tabs or titles), design px -- here, below the bottom slot's gate, which reads the need
+PFX_BOTTOM_H_B = 310;    // the wide form's default height below the pads, design px: the right column's EQ (from 50), FX
+                         // and SENDS rows end by 232 (OV_FX_ROW_H + OV_SND_ROW_H, 2026-10-28), the buttons start 66 above its bottom
+PFX_BOTTOM_MIN_B = 310;  // and its floor: shorter and the bottom buttons would run into the sends
+PFX_PAGE_H = 26;         // the page chips' row at the top of the panel, design px (22 until 2026-10-28, the owner: "the tabs
+                         // themselves are small"; 26 = the SYNTH body's header, which starts 26 above the page: now flush)
+SIDE_TAB_H = 28;         // the side slot's top row (its tabs or titles), design px -- here, below the bottom slot's gate, which reads the need (22 until 2026-10-28)
 // The page SCROLLS where it is taller than the room under the chips (swing_pfx_panel_draw; the owner, 2026-10-27, docked: the
 // column was cut off at the bottom, the SENDS knobs half off the docker). Not saved: back at the top for another pad or page.
 PFX_SCR_W = 8;           // the scroll bar's column at the panel's right edge, design px (the page gives it that width while it scrolls)
@@ -31,6 +33,12 @@ PFX_SYNTH_NEED_H = 232;  // the SYNTH page's height under the chips: swing_synth
 PFX_SCR_IMG = 120;       // the offscreen image of the save-under (only 0..127 work, knobs_kbsg; the knobs use 127, the kit cover 96)
 pfx_scr = 0; pfx_scr_pad = -1; pfx_scr_page = -1; pfx_sb_drag = 0; pfx_sb_y0 = 0; pfx_sb_s0 = 0; pfx_scr_on = 0; pfx_scr_max = 0;
 pfx_whl_left = 0; pfx_vis_y0 = -1000000; pfx_vis_y1 = 1000000; pfx_su_w = 0; pfx_su_h = 0;
+pfx_lmix_need = 0;       // the wide form's page height down to the layer mixer's bottom (drawn last frame; the scroll's need)
+// The layer mixer PINNED to the narrow panel's bottom (2026-10-29; swing_pfx_pin_draw): its handle's height (panel chrome,
+// swing_px) and the least the page above keeps; the handle's drag state (not saved: the height it sets is, lmix_hx)
+PFX_GRIP_H = 8;
+PFX_PAGE_MIN = 110;
+pfx_pin_drag = 0; pfx_pin_y0 = 0; pfx_pin_h0 = 0; pfx_pin_t = 0; pfx_pin_y = 0; pfx_pin_gh = 0;
 
 // The height the side slot NEEDS for what is open in it: the editor's column is laid out for PFX_EDITOR_H under the tab
 // row (the browser and the sequencer fold to any height). The bottom slot's gate keeps the pads' area at least this
@@ -68,32 +76,45 @@ local(_ps_sel, _ps_tile, _ps_tw, _ps_th, _ps_cw, _ps_cw2, _ps_m,
     _ui_modal_up ? ( lmb_down = 0; LMB = 0; rmb_down = 0; frame_wheel = 0; );
     !wide ? (
       // NARROW: the overlay's own stack. op_h is the editor's 560 at least: a shorter column lets the lower part run
-      // under whatever paints after this slot (the sequencer's panel owns the clicks below its top).
-      op_x = x; op_y = y; op_w = w; op_h = max(h, PFX_EDITOR_H);
+      // under whatever paints after this slot (the sequencer's panel owns the clicks below its top). At the editor's
+      // zoom (ov_k: swing_pfx_panel_draw sets it, before the scroll reads the page's height).
+      // The layer mixer is not on this page: it is PINNED to the panel's bottom (swing_pfx_pin_draw, 2026-10-29), so the
+      // page is the sections and the buttons, and the room under it is the panel's less the mixer.
+      op_x = x; op_y = y; op_w = w; op_h = max(h, ov_px(swing_ov_need_d(_ps_sel) - swing_lmix_h()));   // the page as folded
+      ov_lmix_h = 0; ov_lmix_on = !lmix_fold;     // folded: its bar, and GAIN / PAN back in the knob row
       _ov_draw_header_and_colorpicker();          // the ground, the border, the PAD N -- name bar, the colour swatches and hue slider
       overlay_layer >= MAX_LAYERS ? overlay_layer = 0;
       _ov_draw_layers_and_mode();                 // L1..L4, the mode menu, TIGHT / LOOSE and VOL
+      ov_wf_grow = 1;                             // one column: the waveform takes the room left free above the buttons
       _ov_draw_waveform_and_adsr();               // the waveform, its trim and envelope, the ATK .. OFS knobs (sets knob_r and krow_y)
       _ov_draw_eq_and_filters();                  // the EQ display with its nodes, the HPF / LPF markers
-      _ov_draw_fx_knobs();                        // HPF LPF RESO | RATE BITS DRIVE COMP | DLY RVB SMSH
-      _ov_draw_buttons();                         // Out, LEARN, CHK, GLOBAL, REV; Clear Layer, Clear Pad -- 66 px above op_y + op_h
+      _ov_draw_fx_knobs();                        // RATE BITS DRIVE COMP | DLY RVB SMSH (the filters: nodes on the EQ)
+      _ov_draw_buttons();                         // Out, LEARN, CHK, GLOBAL, REV; Clear Layer, Clear Pad -- at the page's bottom
+      swing_grid_opt_draw();                      // the OPTIONS sheet, last: on top (the mouse the header parked back)
     ) : (
       // WIDE: two columns (the sections lay themselves out from op_w: the knob rows spread, the waveform and the EQ take the
       // column's width) -- the left one 56 % of the room, so the TIGHT / LOOSE / VOL row (its own width 350) fits from a
       // 700 px window up (the pictures of 2026-10-22: at a half split the VOL box ran into the EQ); the right one, knob rows
       // of seven and four, takes the rest. The name bar and the colour row span the panel.
       _ps_m = swing_px(10); _ps_cw = ((w - 3 * _ps_m) * 0.56) | 0; _ps_cw2 = w - 3 * _ps_m - _ps_cw;
-      op_x = x; op_y = y; op_w = w; op_h = max(h, swing_px(PFX_BOTTOM_MIN_B));
+      op_x = x; op_y = y; op_w = w; op_h = max(h, ov_px(PFX_BOTTOM_MIN_B));
+      ov_lmix_on = !lmix_fold; ov_lmix_h = 0;     // the mixer goes in the left column (below), not under the buttons
       _ov_draw_header_and_colorpicker();
       overlay_layer >= MAX_LAYERS ? overlay_layer = 0;
       op_x = x + _ps_m; op_w = _ps_cw;            // the left column: layers, mode, volume (op_y + 48), the waveform (op_y + 100 / 54) and the envelope knobs
       _ov_draw_layers_and_mode();
+      ov_wf_grow = 0;                             // two columns: the waveform keeps its 120 (the mixer follows the knobs)
       _ov_draw_waveform_and_adsr();
-      op_x = x + 2 * _ps_m + _ps_cw; op_w = _ps_cw2;   // the right column: the EQ at the top under the colour row -- its anchor is the
-      krow_y = y + swing_px(50) - knob_r * 2 - 38; // envelope row's bottom (fxk_y = krow_y + knob_r * 2 + 38), set for it -- then FX, sends
+      // the layer mixer under the envelope (its knobs, or its bar folded: ov_env_end); the page scrolls to it
+      swing_lmix_draw(op_x, ov_env_end + ov_px(4), op_w);
+      pfx_lmix_need = ov_env_end + ov_px(4 + swing_lmix_h() + 6) - y;
+      op_x = x + 2 * _ps_m + _ps_cw; op_w = _ps_cw2;   // the right column: the EQ's bar and display at the top under the
+      ov_eq_top = y + ov_px(50 - OV_FOLD_BLK);         // colour row (the display at y + 50, as before) -- then FX, sends
       _ov_draw_eq_and_filters();
       _ov_draw_fx_knobs();
       _ov_draw_buttons();                         // at the panel's bottom (op_y + op_h - 66 / - 38), right-aligned in the column
+      op_x = x; op_w = w;                         // the OPTIONS sheet across the panel (the header's width), last: on top
+      swing_grid_opt_draw();
     );
     // a file dropped from the OS on the panel: the overlay's own drop -- the layer tab under it, else the layer shown
     // (the panel took no drop at all; the audit, 2026-10-22); on the part of the page that shows (pfx_vis_y0 .. y1: the
@@ -101,7 +122,7 @@ local(_ps_sel, _ps_tile, _ps_tw, _ps_th, _ps_cw, _ps_cw2, _ps_m,
     !_ui_modal_up && mouse_x >= x && mouse_x < x + w && mouse_y >= max(y, pfx_vis_y0) && mouse_y < min(y + h, pfx_vis_y1) ? _ov_take_drop();
     pfx_whl_left = frame_wheel;   // the wheel no section took (each that takes it zeroes it): the panel's scroll reads it
     lmb_down = 0; LMB = 0; rmb_down = 0; frame_wheel = 0;   // spent
-    pfx_hpf_cx = op_x + (op_w / 7) * 0.5; pfx_hpf_cy = eq_dy + eq_dh + 4 + 10 + 11 + 2;   // the HPF knob's centre, for the rig (the column it is in)
+    pfx_hpf_cx = _hp_nx; pfx_hpf_cy = _hp_ny;   // the HPF node's centre on the EQ display (its knob until 2026-10-28), for the rig
     pfx_sw_x0 = _sw_x0; pfx_sw_w = _sw_w; pfx_sw_y = _cp_y;                                 // the colour swatch row, for the rig
     oi = _ps_oi; op_x = _ps_opx; op_y = _ps_opy; op_w = _ps_opw; op_h = _ps_oph; knob_r = _ps_kr; krow_y = _ps_ky;
     pr = _ps_pr; pgg = _ps_pg; pb = _ps_pb;
@@ -116,8 +137,8 @@ function swing_pfx_pages_draw(x, y, w, h, sel)
 local(_pg_i, _pg_x, _pg_cw, _pg_hot, _pg_tw, _pg_th)
 (
   gfx_set(_fb_gr * 0.62, _fb_gg * 0.62, _fb_gb * 0.62, 1); gfx_rect(x, y, w, h);
-  rk_font(1, swing_fs(9), 'b');
-  _pg_cw = swing_px(70);
+  rk_font(1, swing_fs(11), 'b');   // 9 until 2026-10-28 (the owner: "the tabs themselves are small")
+  _pg_cw = swing_px(84);
   pfx_pg_cx0 = x + swing_px(4) + _pg_cw * 0.5; pfx_pg_cx1 = pfx_pg_cx0 + _pg_cw + swing_px(4); pfx_pg_cy = y + h * 0.5;   // for the rig
   _pg_i = 0; _pg_x = x + swing_px(4);
   loop(2,
@@ -131,11 +152,51 @@ local(_pg_i, _pg_x, _pg_cw, _pg_hot, _pg_tw, _pg_th)
     _pg_hot && lmb_down ? ( pfx_page = _pg_i; mark_dirty(); );
     _pg_x += _pg_cw + swing_px(4); _pg_i += 1;
   );
-  sel >= 0 ? (
+  // the pad and its name on the SYNTH page only: the SOUND page's own header shows them (the name once, 2026-10-28)
+  sel >= 0 && pfx_page == 1 ? (
     swing_pad_lbl(sel, #pfx_lbl); sprintf(#pfx_ttl, "%s  %s", #pfx_lbl, get_name_slot(sel));
     gfx_set(_fb_tc, _fb_tc, _fb_tc, 0.7); gfx_measurestr(#pfx_ttl, _pg_tw, _pg_th);
     _pg_tw < w - (_pg_x - x) - swing_px(8) ? ( gfx_x = _pg_x + swing_px(6); gfx_y = y + (h - _pg_th) * 0.5; gfx_drawstr(#pfx_ttl); );
   );
+);
+
+// ── The layer mixer PINNED to the narrow panel's bottom (2026-10-29, the owner: "can we give the layer mixer a handle to
+// make it taller. in order to see it i have to stretch swing window even with the other tabs closed"; the approved
+// render): (x, y, w, h) its block, room the most the panel gives it. Open: a handle across its top (the side seam's look
+// on its side: grip dots, lit in the house blue under the mouse or while it drags) -- drag up for a taller mixer, down
+// for a shorter one (lmix_hx, saved, gate 89; held to what the panel shows), a double-click puts its own height back --
+// and the mixer filling the rest; folded, its bar alone. The editor's pad's mixer (oi for the draw, put back after), at the
+// editor's zoom; an OS drop over its strips lands on that strip's layer (_ov_take_drop: the page's test covers the page). ──
+function swing_pfx_pin_draw(x, y, w, h, sel, room) local(_pn_oi, _pn_gh, _pn_hot, _pn_now, _pn_cy, _pn_i, _pn_hmax)
+(
+  _pn_oi = oi; oi = sel;
+  ov_set(0.15, 0.16, 0.19, 1); gfx_rect(x, y, w, h);   // the editor's ground (it covers what the scrolled page paints below its room)
+  _pn_gh = lmix_fold ? 0 : swing_px(PFX_GRIP_H);
+  _pn_gh > 0 ? (
+    _pn_hot = mx >= x && mx < x + w && my >= y && my < y + _pn_gh;
+    _pn_hot && lmb_down ? (
+      _pn_now = time_precise();
+      _pn_now - pfx_pin_t < DBL_CLICK_T ? ( lmix_hx = 0; pfx_pin_drag = 0; pfx_pin_t = 0; )
+                                        : ( pfx_pin_drag = 1; pfx_pin_y0 = my; pfx_pin_h0 = lmix_hx; pfx_pin_t = _pn_now; );
+      lmb_down = 0;
+    );
+    _pn_hmax = (room - _pn_gh - ov_px(2)) / ov_k - LMIX_H;   // the tallest the panel shows, as lmix_hx
+    pfx_pin_drag ? ( LMB ? lmix_hx = max(LMIX_HX_MIN, min(LMIX_HX_MAX, min(_pn_hmax, pfx_pin_h0 + (pfx_pin_y0 - my) / ov_k)))
+                         : pfx_pin_drag = 0; );
+    gfx_set(_fb_gr * 0.55, _fb_gg * 0.55, _fb_gb * 0.55, 1); gfx_rect(x, y, w, _pn_gh);
+    (_pn_hot || pfx_pin_drag) ? ( gfx_set(1, 1, 1, 0.12); gfx_rect(x, y, w, _pn_gh);
+                                  gfx_set(0.20, 0.62, 0.86, 0.95); gfx_rect(x, y, w, max(2, swing_px(2))); );
+    _pn_cy = y + _pn_gh * 0.5;
+    gfx_set(_fb_tc, _fb_tc, _fb_tc, (_pn_hot || pfx_pin_drag) ? 0.9 : 0.4);
+    _pn_i = -2; loop(5, gfx_circle(x + w * 0.5 + _pn_i * swing_px(7), _pn_cy, swing_px(1.5), 1, 1); _pn_i += 1; );
+    _pn_hot ? swing_tooltip_check(1603, "Drag to make the layer mixer taller or shorter (made short, its faders turn into knobs). Double-click: its own height back.");
+  );
+  lmix_force_h = h < ov_px(swing_lmix_h()) + _pn_gh ? h - _pn_gh - ov_px(2) : 0;   // short of its height: the room it has
+  swing_lmix_draw(x + ov_px(10), y + _pn_gh + ov_px(2), w - ov_px(20));
+  lmix_force_h = 0;
+  !_ui_modal_up && mouse_x >= x && mouse_x < x + w && mouse_y >= y && mouse_y < y + h ? _ov_take_drop();
+  pfx_pin_y = y; pfx_pin_gh = _pn_gh;   // for the rig
+  oi = _pn_oi;
 );
 
 // ── The panel: what both slots draw -- the ground, the notes (the pad editor open over the pads in a compact face; no pad
@@ -152,12 +213,13 @@ local(_pg_i, _pg_x, _pg_cw, _pg_hot, _pg_tw, _pg_th)
 // after it: the strip is copied from the frame before the page draws and blitted back after (PFX_SCR_IMG; the same frame's
 // pixels, never a picture held across frames: the no-blink rule) -- the chips then paint their row, and at the side the
 // slot's tab row paints after this panel. Below, the page runs no further than it did before it scrolled. The drop targets
-// it publishes (the layer tabs ovl_tabs_*, the waveform ovl_wave_*) are cut to the part that shows, or withdrawn.
+// it publishes (the layer tabs ovl_tabs_*, the waveform ovl_wave_*, the mixer's strips ovl_lmix_*) are cut to the part
+// that shows, or withdrawn.
 // A page that fits draws exactly as before, with no bar.
 function swing_pfx_panel_draw(x, y, w, h, wide)
 local(_pp_sel, _pp_tw, _pp_th, _pp_ph, _pp_ld, _pp_lc, _pp_rd, _pp_wh,
       _pp_vy, _pp_vh, _pp_need, _pp_sbw, _pp_cy, _pp_pw, _pp_in, _pp_bar, _pp_park, _pp_mx, _pp_my, _pp_tt, _pp_ty,
-      _pp_su, _pp_suy, _pp_suh, _pp_d, _pp_a, _pp_m, _pp_t0, _pp_w0, _pp_c0, _pp_c1, _pp_sc)
+      _pp_su, _pp_suy, _pp_suh, _pp_d, _pp_a, _pp_m, _pp_t0, _pp_w0, _pp_c0, _pp_c1, _pp_sc, _pp_l0, _pp_mh, _pp_vb, _pp_room, _pp_mn)
 (
   pfx_px = x; pfx_py = y; pfx_pw = w; pfx_ph = h; pfx_wide = wide;
   swing_fb_ground();
@@ -166,7 +228,7 @@ local(_pp_sel, _pp_tw, _pp_th, _pp_ph, _pp_ld, _pp_lc, _pp_rd, _pp_wh,
   _pp_sel = (sel_pad >= 0 && sel_pad < NUM_SLOTS) ? (sel_pad | 0) : -1;
   overlay_pad >= 0 || _pp_sel < 0 ? (
     pfx_scr_on = 0; pfx_sb_drag = 0;
-    gfx_set(0.15, 0.16, 0.19, 1); gfx_rect(x, y, w, h);
+    ov_set(0.15, 0.16, 0.19, 1); gfx_rect(x, y, w, h);   // the editor's ground (the LCD look too: ov_set)
     rk_font(1, swing_fs(10), 0); gfx_set(_fb_tc, _fb_tc, _fb_tc, 0.6);
     strcpy(#pfx_ttl, overlay_pad >= 0 ? "The pad editor is open over the pads." : "Click a pad: its editor shows here.");
     gfx_measurestr(#pfx_ttl, _pp_tw, _pp_th);
@@ -177,9 +239,29 @@ local(_pp_sel, _pp_tw, _pp_th, _pp_ph, _pp_ld, _pp_lc, _pp_rd, _pp_wh,
     // start below the row, so the order changes nothing for the mouse
     _pp_ph = swing_px(PFX_PAGE_H);
     _pp_ld = lmb_down; _pp_lc = LMB; _pp_rd = rmb_down; _pp_wh = frame_wheel;   // the row reads the frame's press after the page (the sound page spends it)
+    // the editor's zoom (2026-10-28; rk_swing_ui_layer_mixer swing_ov_zoom): narrow, from the column's width; wide, from
+    // the right column's (the widest fixed row, the buttons, lives there) and no more than the panel's height holds the
+    // form whole (drag that panel taller for more) -- set once here, before the page's height is read; the narrow
+    // width as if the scroll bar showed, so the bar coming and going never moves the zoom
+    wide ? ( swing_ov_zoom(0.44 * (w - 3 * swing_px(10))); ov_k = min(ov_k, max(1, (h - _pp_ph) / PFX_BOTTOM_MIN_B)); )
+         : swing_ov_zoom(w - swing_px(PFX_SCR_W));
+    pfx_ov_k = ov_k;   // for the rig
     // the scroll: the room under the chips, the page's own height, the bar
     _pp_vy = y + _pp_ph; _pp_vh = h - _pp_ph;
-    _pp_need = pfx_page == 1 ? PFX_SYNTH_NEED_H : wide ? swing_px(PFX_BOTTOM_MIN_B) : PFX_EDITOR_H;
+    // the layer mixer PINNED to the bottom on the narrow SOUND page (swing_pfx_pin_draw): its block -- the handle and the
+    // mixer at the user's height, folded its bar alone -- comes off the page's room, never leaving the page under
+    // PFX_PAGE_MIN unless the mixer would go under its least (its strips with knobs, LMIX_HX_MIN); the page scrolls above it
+    _pp_room = max(0, _pp_vh - swing_px(PFX_PAGE_MIN));
+    _pp_mh = (!wide && pfx_page == 0) ? (
+      _pp_mn = lmix_fold ? ov_px(LMIX_BAR_H) : ov_px(LMIX_H + LMIX_HX_MIN) + swing_px(PFX_GRIP_H);
+      max(0, min(_pp_vh, min(ov_px(swing_lmix_h()) + (lmix_fold ? 0 : swing_px(PFX_GRIP_H)), max(_pp_room, _pp_mn))))
+    ) : 0;
+    _pp_vh -= _pp_mh; _pp_vb = _pp_vy + _pp_vh;   // the page's room ends here
+    // (narrow: the page as its sections are folded -- a fold shortens it, step 2 -- swing_ov_need_d, less the pinned mixer)
+    // (the SYNTH page at the zoom too, 2026-10-29: the body's 258 from its top, 26 of them under the chips; narrow, + the
+    // pad picker's block on top, its bar or open the picker: swing_sv_pick_h, rk_swing_ui_synthview)
+    _pp_need = pfx_page == 1 ? ov_px(PFX_SYNTH_NEED_H + 26 + (wide ? 0 : swing_sv_pick_h())) - 26
+             : wide ? max(ov_px(PFX_BOTTOM_MIN_B), pfx_lmix_need) : ov_px(swing_ov_need_d(_pp_sel) - swing_lmix_h());
     pfx_scr_on = _pp_vh > 0 && _pp_need > _pp_vh;
     (_pp_sel != pfx_scr_pad || pfx_page != pfx_scr_page) ? ( pfx_scr = 0; pfx_scr_pad = _pp_sel; pfx_scr_page = pfx_page; pfx_sb_drag = 0; );
     pfx_scr_max = pfx_scr_on ? _pp_need - _pp_vh : 0;
@@ -190,7 +272,7 @@ local(_pp_sel, _pp_tw, _pp_th, _pp_ph, _pp_ld, _pp_lc, _pp_rd, _pp_wh,
       // the bar's press is the bar's (the page never sees it): the thumb drags, a press above or below it pages
       _pp_tt = max(swing_px(16), (_pp_vh * _pp_vh / _pp_need) | 0);
       _pp_ty = _pp_vy + ((_pp_vh - _pp_tt) * pfx_scr / max(1, pfx_scr_max)) | 0;
-      _pp_bar = mx >= x + w - _pp_sbw && mx < x + w && my >= _pp_vy && my < y + h;
+      _pp_bar = mx >= x + w - _pp_sbw && mx < x + w && my >= _pp_vy && my < _pp_vb;
       _pp_bar && lmb_down ? (
         my >= _pp_ty && my < _pp_ty + _pp_tt ? ( pfx_sb_drag = 1; pfx_sb_y0 = my; pfx_sb_s0 = pfx_scr; )
         : pfx_scr = max(0, min(pfx_scr_max, pfx_scr + (my < _pp_ty ? -1 : 1) * max(swing_px(24), _pp_vh - swing_px(24))));
@@ -199,11 +281,11 @@ local(_pp_sel, _pp_tw, _pp_th, _pp_ph, _pp_ld, _pp_lc, _pp_rd, _pp_wh,
     );
     _pp_cy = _pp_vy - pfx_scr;                       // the page's top, moved up by the scroll
     _pp_pw = w - _pp_sbw;                            // ... and its width (the bar's column off while it scrolls)
-    pfx_vis_y0 = _pp_vy; pfx_vis_y1 = y + h;         // the part that shows (the OS drop's test in the sections)
+    pfx_vis_y0 = _pp_vy; pfx_vis_y1 = _pp_vb;        // the part that shows (the OS drop's test in the sections)
     // the pointer for the page: off the part that shows, or on the bar, no press and no wheel; button up, no pointer
-    _pp_in = mx >= x && mx < x + _pp_pw && my >= _pp_vy && my < y + h;
+    _pp_in = mx >= x && mx < x + _pp_pw && my >= _pp_vy && my < _pp_vb;
     _pp_park = pfx_scr_on && (pfx_sb_drag || (!_pp_in && !LMB));
-    pfx_scr_on && !_pp_in ? ( lmb_down = 0; rmb_down = 0; frame_wheel = 0; );
+    (pfx_scr_on || _pp_mh > 0) && !_pp_in ? ( lmb_down = 0; rmb_down = 0; frame_wheel = 0; );   // (the pinned mixer's presses are its own)
     _pp_park ? ( _pp_mx = mx; _pp_my = my; mx = -10000; my = -10000; LMB = 0; lmb_down = 0; rmb_down = 0; frame_wheel = 0; );
     // the save-under: the strip [x, x + w) the moved page paints above the room under the chips (the SYNTH body's from 26 px
     // above the page's top: its header row, under the chips)
@@ -216,7 +298,7 @@ local(_pp_sel, _pp_tw, _pp_th, _pp_ph, _pp_ld, _pp_lc, _pp_rd, _pp_wh,
       gfx_blit(_pp_d, 1, 0, x, _pp_suy, w, _pp_suh, 0, 0, w, _pp_suh);
       gfx_dest = _pp_d; gfx_mode = _pp_m; gfx_a = _pp_a;
     );
-    _pp_t0 = ovl_tabs_t; _pp_w0 = ovl_wave_t; pfx_whl_left = 0;
+    _pp_t0 = ovl_tabs_t; _pp_w0 = ovl_wave_t; _pp_l0 = ovl_lmix_t; pfx_whl_left = 0;
     pfx_page == 1 ? ( swing_synth_body_draw(x, _pp_cy - 26, _pp_pw, (pfx_scr_on ? _pp_need : _pp_vh) + 26, _pp_sel, 0, wide); pfx_whl_left = frame_wheel; )
                   : swing_pfx_sections_draw(x, _pp_cy, _pp_pw, pfx_scr_on ? _pp_need : _pp_vh, wide);
     _pp_su ? (
@@ -229,22 +311,27 @@ local(_pp_sel, _pp_tw, _pp_th, _pp_ph, _pp_ld, _pp_lc, _pp_rd, _pp_wh,
       // the drop targets the page published this frame, cut to the part that shows (a drop over the chips, the slot's tab
       // row or past the bottom never lands on a layer out of view); nothing left: withdrawn
       ovl_tabs_t != _pp_t0 ? (
-        _pp_c0 = max(ovl_tabs_y, _pp_vy); _pp_c1 = min(ovl_tabs_y + ovl_tabs_h, y + h - 1);
+        _pp_c0 = max(ovl_tabs_y, _pp_vy); _pp_c1 = min(ovl_tabs_y + ovl_tabs_h, _pp_vb - 1);
         _pp_c1 > _pp_c0 ? ( ovl_tabs_y = _pp_c0; ovl_tabs_h = _pp_c1 - _pp_c0; ) : ovl_tabs_t = 0;
       );
       ovl_wave_t != _pp_w0 ? (
-        _pp_c0 = max(ovl_wave_y, _pp_vy); _pp_c1 = min(ovl_wave_y + ovl_wave_h, y + h - 1);
+        _pp_c0 = max(ovl_wave_y, _pp_vy); _pp_c1 = min(ovl_wave_y + ovl_wave_h, _pp_vb - 1);
         _pp_c1 > _pp_c0 ? ( ovl_wave_y = _pp_c0; ovl_wave_h = _pp_c1 - _pp_c0; ) : ovl_wave_t = 0;
+      );
+      ovl_lmix_t != _pp_l0 ? (   // the layer mixer's strips (rk_swing_ui_layer_mixer)
+        _pp_c0 = max(ovl_lmix_y, _pp_vy); _pp_c1 = min(ovl_lmix_y + ovl_lmix_h, _pp_vb - 1);
+        _pp_c1 > _pp_c0 ? ( ovl_lmix_y = _pp_c0; ovl_lmix_h = _pp_c1 - _pp_c0; ) : ovl_lmix_t = 0;
       );
     );
     _pp_park ? ( mx = _pp_mx; my = _pp_my; );
     lmb_down = _pp_ld; LMB = _pp_lc; rmb_down = _pp_rd; frame_wheel = _pp_wh;
+    _pp_mh > 0 ? swing_pfx_pin_draw(x, _pp_vb, w, _pp_mh, _pp_sel, _pp_room);   // the pinned mixer, over the page's bottom
     swing_pfx_pages_draw(x, y, w, _pp_ph, _pp_sel);
     pfx_scr_on ? (
       // the bar, as the page was drawn (the theme's ground lifted toward its text colour: the mini browser's list bar)
       _pp_tt = max(swing_px(16), (_pp_vh * _pp_vh / _pp_need) | 0);
       _pp_ty = _pp_vy + ((_pp_vh - _pp_tt) * pfx_scr / max(1, pfx_scr_max)) | 0;
-      _pp_bar = mx >= x + w - _pp_sbw && mx < x + w && my >= _pp_vy && my < y + h;
+      _pp_bar = mx >= x + w - _pp_sbw && mx < x + w && my >= _pp_vy && my < _pp_vb;
       swing_fb_mixset(_fb_gr * 0.86, _fb_gg * 0.86, _fb_gb * 0.86, _fb_tc, _fb_tc, _fb_tc, 0.08);
       gfx_rect(x + w - _pp_sbw, _pp_vy, _pp_sbw, _pp_vh);
       _pp_sc = (_pp_bar || pfx_sb_drag) ? 0.60 : 0.34;

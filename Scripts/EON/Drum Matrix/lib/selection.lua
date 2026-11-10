@@ -88,6 +88,56 @@ function M.PurgeStale()
 end
 
 -- =============================================================================
+-- undo / redo: the selection CLEARS (audit DM115; the owner's call 2026-10-29)
+-- =============================================================================
+-- ShiftBy / MoveBy / DuplicateBy re-key the selection to the moved notes, and
+-- nothing re-keys it when an undo or a redo moves them back: the highlight sat
+-- on the wrong cells and the next nudge / velocity / delete acted there. The
+-- selection clears on an undo or a redo and on NOTHING else (a track colour
+-- change, an item move in the arrange keep it).
+--
+-- The Drum Matrix's own undo / redo keys clear it themselves (eon_drum_matrix's
+-- keymap handlers). An undo or redo made anywhere else (Ctrl+Z in the arrange,
+-- the Edit menu, the Undo History window) is read off REAPER's undo history:
+-- the main loop calls SnapUndo at the END of each frame (after the overlay's
+-- own edits) and CheckUndoRedo at the START of the next, so what moved between
+-- the two was done outside the overlay's frame. A new action empties the redo
+-- list; so a history that moved and still has a redo is an undo (or an Undo
+-- History jump, or a redo short of the end), and a redo to the end puts the old
+-- next-redo on top of the undo list. Not seen: a redo to the end from the Undo
+-- History window several steps at once; a third same-named edit undone after a
+-- reselect (the history strings read the same before and after). Cleared by
+-- mistake: an action done outside the overlay right after an undo, with the
+-- same name as the action that undo made redoable.
+local watch_proj, watch_u, watch_r = nil, nil, nil
+
+local function undo_strings()
+  local u = reaper.Undo_CanUndo2 and reaper.Undo_CanUndo2(0)
+  local r = reaper.Undo_CanRedo2 and reaper.Undo_CanRedo2(0)
+  return u or '', r or ''
+end
+
+function M.SnapUndo()
+  watch_proj = reaper.EnumProjects and reaper.EnumProjects(-1) or 0
+  watch_u, watch_r = undo_strings()
+end
+
+-- Returns true when it saw an undo or a redo (and cleared the selection).
+function M.CheckUndoRedo()
+  local proj = reaper.EnumProjects and reaper.EnumProjects(-1) or 0
+  local u, r = undo_strings()
+  -- First frame, or another project tab: that project's history, not an undo.
+  if watch_u == nil or proj ~= watch_proj then
+    watch_proj, watch_u, watch_r = proj, u, r
+    return false
+  end
+  local hit = (u ~= watch_u or r ~= watch_r) and (r ~= '' or u == watch_r)
+  watch_u, watch_r = u, r
+  if hit then M.Clear() end
+  return hit
+end
+
+-- =============================================================================
 -- internal: for-each-selected helper that re-resolves the note in its take.
 -- Calls fn(take, note_idx) — returning false from fn means "skip this entry"
 -- but still continue. Sorts + UpdateItemInProject per touched take at end.

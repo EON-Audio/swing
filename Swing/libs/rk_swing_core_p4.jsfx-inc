@@ -1,0 +1,655 @@
+// rk_swing_core_p4.jsfx-inc -- part 4 of rk_swing_core.jsfx-inc (4 parts), cut at a function boundary by
+// .dev_tests/split_big_incs.py: REAPER's load time grows with the square of a file's size. Edit freely;
+// keep each file under about 40 KB.
+
+// ⚠️ @init IS LOAD-BEARING (.docs/wiki/02-file-structure.md).
+@init
+
+// ─── The voice's block constants (phase V, Spec_Swing_Seq_View §16, 2026-10-14) ─────
+// What the @sample voice loop used to resolve from the pad and layer tables every sample:
+// the buffer pointer, the interleaved start / end positions (trim), and whether the voice
+// sums into its pad's accumulator (the Stretch gate: a local voice on a Stretch pad defers
+// to the Extension's ring unless it is the fallback that played because the Extension was
+// unreachable). Set at launch (both kinds), when a stolen voice is parked in a fade slot,
+// and for every live voice at the top of @block's voice pass -- so a trim drag, a bake that
+// changes a length, or a mode flip reaches a sounding voice within a block (it used to
+// within a sample; the writers run in @block and @gfx, never between two samples). The
+// formulas are the loop's old ones, unchanged, so the null rig renders the same bytes.
+// ONE place for them: the loop reads v_* only. SYN voices carry no buffer and always sum.
+function swing_voice_prep(_vp_vi) local(_vp_si, _vp_lidx) (
+  _vp_si = v_slot[_vp_vi];
+  v_kind[_vp_vi] ? (
+    v_bptr[_vp_vi] = 0; v_astart[_vp_vi] = 0; v_aend[_vp_vi] = 0;
+    v_sum[_vp_vi] = 1;
+  ) : (
+    p_layer_cnt[_vp_si] > 0 ? (
+      _vp_lidx = _vp_si * MAX_LAYERS + v_layer[_vp_vi];
+      v_bptr[_vp_vi]   = p_lptr[_vp_lidx];
+      v_astart[_vp_vi] = l_start[_vp_lidx] * l_len[_vp_lidx];
+      v_aend[_vp_vi]   = (l_end[_vp_lidx] * l_len[_vp_lidx]) - SILENCE_T;
+    ) : (
+      v_bptr[_vp_vi]   = p_aptr[_vp_si];
+      v_astart[_vp_vi] = s_start[_vp_si] * s_len[_vp_si];
+      v_aend[_vp_vi]   = (s_end[_vp_si] * s_len[_vp_si]) - SILENCE_T;
+    );
+    // a fallback voice must be summed (v_stfb); otherwise a pad defers to its Stretch ring only while it plays Stretch,
+    // i.e. holds a spot (swing_pitch_eff). Until 2026-10-15 the test was "a B..D pad is never Stretch (4a.1)" plus the
+    // stored mode: since Pad Banks step 4 lent spots to every bank that summed a B..D Stretch pad's local voice over its
+    // ring, and a bank A Stretch pad WAITING for a spot (effective Repitch) had its local voice gated off -- silent.
+    v_sum[_vp_vi] = (v_stfb[_vp_vi] || swing_pitch_eff(_vp_si) != SP_PITCH_MODE_STRETCH) ? 1 : 0;
+  );
+);
+
+// ─── Steal-fade park (A-2) ───────────────────────────────────────────────
+// A stolen voice is not cut: its state moves into one of the STEAL_FADES slots past
+// the pool (MAX_VOICES .. V_SLOTS - 1), where @sample runs it in release under
+// steal_coeff (~5 ms) until it falls silent. ONE such slot used to serve every steal,
+// so two steals in one block (eighteen note-ons against sixteen voices) cut the first
+// victim hard when the second overwrote it -- and its v_age was never set, so the
+// first-sample safety net in @sample zeroed the copied envelope: a click either way.
+// The slot taken is the quietest (a free one scores -1), so a fifth steal within
+// ~5 ms only ever truncates the fade that is already nearest silence.
+// Order is the audio-thread gate: the fade slot's v_stage goes to 4 LAST among its
+// writes, then the victim is parked before its slot is rewritten by the caller.
+function swing_voice_steal_park(_stl_vi) local(_stl_k, _stl_sf, _stl_best, _stl_score) (
+  _stl_sf = MAX_VOICES; _stl_best = 1000;
+  _stl_k = MAX_VOICES;
+  loop(STEAL_FADES,
+    _stl_score = v_stage[_stl_k] > 0 ? v_env[_stl_k] : -1;   // free = -1, else how loud its fade still is
+    _stl_score < _stl_best ? ( _stl_best = _stl_score; _stl_sf = _stl_k; );
+    _stl_k += 1;
+  );
+  v_slot[_stl_sf] = v_slot[_stl_vi]; v_pos[_stl_sf] = v_pos[_stl_vi];
+  v_startpos[_stl_sf] = v_startpos[_stl_vi];
+  v_gain[_stl_sf] = v_gain[_stl_vi];
+  v_env[_stl_sf] = v_env[_stl_vi]; v_note[_stl_sf] = v_note[_stl_vi];
+  v_inc[_stl_sf] = v_inc[_stl_vi]; v_decay_ct[_stl_sf] = 0;
+  v_sg[_stl_sf] = v_sg[_stl_vi]; v_layer[_stl_sf] = v_layer[_stl_vi];
+  v_pl[_stl_sf] = v_pl[_stl_vi]; v_pr[_stl_sf] = v_pr[_stl_vi];   // the layer's pan fades out where it was
+  v_quiet[_stl_sf] = v_quiet[_stl_vi];
+  v_age[_stl_sf] = max(1, v_age[_stl_vi]);   // never 0: @sample zeroes a voice's envelope on its first sample
+  // synth voices carry their engine state into the fade slot
+  v_kind[_stl_sf] = v_kind[_stl_vi];
+  v_stfb[_stl_sf] = v_stfb[_stl_vi];   // or a stolen fallback mutes as it releases
+  swing_voice_prep(_stl_sf);   // its block constants, from the slot / layer / kind / stfb just copied
+  v_kind[_stl_vi] == 1 ? memcpy(v_syn_state + _stl_sf * RK_SYN_STATE_SIZE,
+                                v_syn_state + _stl_vi * RK_SYN_STATE_SIZE, RK_SYN_STATE_SIZE);
+  _stl_sf + 1 > v_hi ? v_hi = _stl_sf + 1;   // step 2c: a fade slot sits past the pool; the @sample loop must reach it
+  v_stage[_stl_sf] = 4;   // LAST -- audio thread gate
+  // park the stolen slot NOW so @sample never observes a live voice mid-rewrite
+  // (sweep finding). Every launch runs in @block since A-9b, in sequence with
+  // @sample, so this order is kept as a guard for any future off-thread caller.
+  v_stage[_stl_vi] = 0; v_pos[_stl_vi] = -1; v_env[_stl_vi] = 0;
+);
+
+// ─── SYN voice launch ────────────────────────────────────────────────────
+// Lifted out of launch_voices_for_pad so it has TWO callers: a full pad
+// trigger runs it underneath the sample voices as before, and the SYN view's
+// 3D drum runs it ALONE — when you are editing the engine you need to hear
+// the ENGINE, not the pad's sample layer on top of it.
+//
+// The body is the block that used to sit inline; the one new thing is
+// _sy_gaindiv, which carries the sum-mode gain split that the full-trigger
+// path applies. A solo audition passes 1.
+//
+// Deliberately does NOT run the choke / duplicate-kill pass, and does NOT
+// touch pad_flash or p_held: those belong to a pad TRIGGER. An audition is
+// one drum on its own, and its caller owns the visual feedback.
+//
+// ⚠️ Defined BEFORE launch_voices_for_pad_ofs on purpose — EEL2 resolves function
+// references at DEFINITION time, so a call to a later-defined function
+// silently kills the whole file (feedback_jsfx_import_order).
+function launch_syn_for_pad(_sy_pad, _sy_midi, _sy_vel, _sy_gaindiv, _sy_ofs)
+  local(vi, max_age, _oldest_vi, j, _syn_st) (
+  vi = -1; max_age = -1; _oldest_vi = -1;
+  j = 0; loop(MAX_VOICES,
+    v_pos[j] < 0 && v_stage[j] == 0 ? (
+      vi < 0 ? vi = j;
+    ) : (
+      v_age[j] > max_age ? (max_age = v_age[j]; _oldest_vi = j;);
+    );
+    j += 1;
+  );
+  vi < 0 ? ( vi = _oldest_vi; );
+  vi >= 0 && (v_pos[vi] >= 0 || v_stage[vi] > 0) ? (
+    v_pos[vi] < 0 ? (
+      v_pos[vi] = -1; v_env[vi] = 0; v_stage[vi] = 0;
+    ) : (
+      swing_voice_steal_park(vi);   // into the quietest steal-fade slot, then park vi (A-2)
+    );
+  );
+  vi >= 0 ? (
+    v_slot[vi] = _sy_pad;
+    v_layer[vi] = 0;
+    v_pl[vi] = 1.0 - max(0.0, ps_pan[_sy_pad]);   // the SYN strip's pan (the layer law: the far side falls)
+    v_pr[vi] = 1.0 + min(0.0, ps_pan[_sy_pad]);
+    v_kind[vi] = 1;
+    v_stfb[vi] = 0;   // a SYN slot may be reused from a Stretch fallback voice; do not inherit its flag
+    _syn_mac_scratch[0] = ps_mac0[_sy_pad]; _syn_mac_scratch[1] = ps_mac1[_sy_pad];
+    _syn_mac_scratch[2] = ps_mac2[_sy_pad]; _syn_mac_scratch[3] = ps_mac3[_sy_pad];
+    _syn_mac_scratch[4] = ps_mac4[_sy_pad]; _syn_mac_scratch[5] = ps_mac5[_sy_pad];
+    _syn_mac_scratch[6] = ps_mac6[_sy_pad]; _syn_mac_scratch[7] = ps_mac7[_sy_pad];
+    _syn_st = v_syn_state + vi * RK_SYN_STATE_SIZE;
+    memset(_syn_st, 0, RK_SYN_STATE_SIZE);
+    _syn_trig_ctr += 1;
+    _syn_st[1] = 1 + ((_syn_trig_ctr * 48271) % 2147483646);   // per-hit PRNG seed
+    // pad TUNE + chromatic offset -> engine pitch (Tuned-mode-native, spec §0.4)
+    rk_syn_reset(ps_engine[_sy_pad], _syn_st, _syn_mac_scratch,
+                 p_tune[_sy_pad] + (_sy_midi - p_note[_sy_pad]), _sy_vel / 127.0);
+    // _sy_ofs > 0 parks the voice pending for that many samples (note repeat
+    // firing mid-block). v_startpos 0 = a SYN voice always resumes at its start.
+    v_pos[vi] = _sy_ofs > 0 ? -(_sy_ofs + 1) : 0; v_inc[vi] = 0; v_startpos[vi] = 0;
+    v_quiet[vi] = 0;   // silence counter starts fresh, or a reused slot would
+                       // arrive already "quiet" and retire on its first sample
+    // max(1,...) so a future caller passing 0 can never divide by zero here;
+    // every real divisor is sqrt(count) >= 1.
+    v_gain[vi] = apply_vel_curve(_sy_vel / 127.0, vel_curve) * ps_level[_sy_pad]
+                 / max(1, _sy_gaindiv);
+    v_sg[vi] = strip_tk[_sy_pad] ? 1.0 : p_gain[_sy_pad];
+    v_note[vi] = _sy_midi;
+    v_age[vi] = 0; v_fastrel[vi] = 0;
+    v_env[vi] = 0;
+    v_decay_ct[vi] = 0;
+    swing_voice_prep(vi);   // block constants: no buffer, always sums
+    v_gen[vi] += 1;   // a new voice: a note-off queued for this slot's last one must not release it
+    vi + 1 > v_hi ? v_hi = vi + 1;   // step 2c: the @sample loop must reach this slot before the gate opens
+    v_stage[vi] = 1;  // LAST — audio thread gate
+  );
+);
+
+// ─── Choke pass (A-7) ─────────────────────────────────────────────────────
+// Runs at every trigger, local or Stretch, at the trigger's own sample (swing_voice_choke_at
+// below). Local voices: a voice on the SAME pad
+// younger than the retrigger lockout is released (duplicate-kill), a voice on another
+// pad of the same choke group is released (choke). Stretch pads of the same group are
+// marked choked: @sample's ring drain fades their frames under steal_coeff (~5 ms) and
+// then parks their read cursor at the write cursor, discarding what the Extension still
+// writes for that hit, until the pad's own next trigger. The Extension is never told
+// about choke groups (it gets mode, tune, algo and source only), so the consumer side
+// is where a Stretch pad can be choked at all. A Stretch pad's own retrigger needs no
+// duplicate-kill: its trigger-edge ring reset already drops the old tail.
+// ⚠️ RANGED pads are MONOPHONIC -- the manual says so in five places, and the
+// scalar p_held / p_held_vel / p_held_note bookkeeping is built for exactly one
+// note at a time. The duplicate-kill below only released a same-pad voice
+// YOUNGER than the retrigger lockout, so an OLDER one survived a new key and
+// the pad played a chord: two voices sounding, one p_held between them, and a
+// note-off on either key clearing the repeat/pressure state while the other was
+// still down. A ranged pad now releases every voice it owns before the new
+// pitch launches, which makes the scalar state correct by construction.
+function swing_voice_choke_pass(_ck_pad) local(_ck_j, _ck_g, _ck_p, _ck_mono, _ck_bank) (
+  _ck_g = p_choke[_ck_pad];
+  _ck_mono = p_rng_lo[_ck_pad] > 0 || p_rng_hi[_ck_pad] > 0;
+  _ck_bank = (_ck_pad / NUM_PADS) | 0;   // step 2b: a choke group stays inside its bank (Spec_Swing_Pad_Banks 4.3)
+  _ck_j = 0; loop(MAX_VOICES,
+    v_pos[_ck_j] >= 0 && v_age[_ck_j] > 0 ? (
+      v_slot[_ck_j] == _ck_pad ? (
+        _ck_mono || v_age[_ck_j] < _retrig_lockout ? ( v_stage[_ck_j] = 4; );  // duplicate-kill
+      ) : (
+        _ck_g > 0 && p_choke[v_slot[_ck_j]] == _ck_g && ((v_slot[_ck_j] / NUM_PADS) | 0) == _ck_bank ? ( v_stage[_ck_j] = 4; );  // choke group, same bank
+      );
+    );
+    _ck_j += 1;
+  );
+  _ck_g > 0 ? (
+    _ck_p = _ck_bank * NUM_PADS; loop(NUM_PADS,   // this bank's sixteen slots
+      _ck_p != _ck_pad && p_choke[_ck_p] == _ck_g && swing_pitch_eff(_ck_p) == SP_PITCH_MODE_STRETCH
+        && stretch_choked[_ck_p] == 0 ? stretch_choked[_ck_p] = 1;   // 1 = fading, 2 = parked
+      _ck_p += 1;
+    );
+  );
+);
+
+// ─── The voice schedule: chokes and note-off releases AT their sample ────────
+// What a MIDI event does to voices already sounding has to happen at the event's own sample,
+// not when @block reads it:
+//  * a launch `_ca_ofs` samples into the block (MIDI at its offset, note repeat) runs its choke
+//    / duplicate-kill pass there. Run in @block it released the voice it chokes up to a block
+//    before the new hit sounds, and it could not see a voice still waiting for its own offset
+//    (Swing_Audit_A, refuted candidate 10 -- harmless while MIDI hits all started at the
+//    block's first sample, not once they start on their note);
+//  * a gate-mode note-off releases its voices there. Run in @block it cut a note up to a block
+//    short, and a note that began and ended inside one block went into release before its
+//    first sample and was never heard.
+// So both are queued with their sample and @sample runs them before the voice loop. Every
+// voice that has started by then is judged at the right moment; a voice still waiting for
+// this sample (the new hit's own, or a note-on read after the note-off) is left alone.
+// A release names (voice, v_gen): a slot reused since the note-off was read is not touched.
+// ckq_pad / ckq_ofs / ckq_gen / CKQ_MAX live in Swing_ReaKit.jsfx @init; @block empties the
+// schedule (swing_voice_sched_flush) before its first launch.
+// Insert in offset order: MIDI arrives in order, but note repeat launches after the MIDI loop
+// and can land earlier in the block; equal offsets keep their order. 0 = full.
+function swing_voice_sched_put(_sp_code, _sp_gen, _sp_ofs) local(_sp_k) (
+  ckq_n < CKQ_MAX ? (
+    _sp_k = ckq_n;
+    while(_sp_k > ckq_i && ckq_ofs[_sp_k - 1] > _sp_ofs) (
+      ckq_ofs[_sp_k] = ckq_ofs[_sp_k - 1];
+      ckq_pad[_sp_k] = ckq_pad[_sp_k - 1];
+      ckq_gen[_sp_k] = ckq_gen[_sp_k - 1];
+      _sp_k -= 1;
+    );
+    ckq_ofs[_sp_k] = _sp_ofs;
+    ckq_pad[_sp_k] = _sp_code;
+    ckq_gen[_sp_k] = _sp_gen;
+    ckq_n += 1;
+    1;
+  ) : 0;
+);
+// 1 if voice `_sb_v` began before sample `_sb_ofs` of this block, so a note-off there ends it;
+// 0 if it starts at or after that sample -- launched in this block and still waiting (its
+// start is -v_pos - 1, the renderer's encoding), or launched at 0 and not yet run. Read in
+// @block, before this block's samples. A note-on that reaches the plugin just ahead of the
+// previous note's note-off on the same sample survives it this way.
+function swing_voice_started_before(_sb_v, _sb_ofs) (
+  v_pos[_sb_v] < 0 ? (-v_pos[_sb_v] - 1) < _sb_ofs : (v_age[_sb_v] > 0 || _sb_ofs > 0);
+);
+// A note-off's release: the voice goes to its release stage if it is still the one it named.
+function swing_voice_release_now(_rn_v, _rn_gen) (
+  v_gen[_rn_v] == _rn_gen && v_stage[_rn_v] > 0 && v_stage[_rn_v] < 4 ? v_stage[_rn_v] = 4;
+);
+// Offset 0, or a full schedule: now.
+function swing_voice_choke_at(_ca_pad, _ca_ofs) (
+  !(_ca_ofs > 0 && swing_voice_sched_put(_ca_pad, 0, _ca_ofs)) ? swing_voice_choke_pass(_ca_pad);
+);
+function swing_voice_release_at(_ra_v, _ra_ofs) (
+  !(_ra_ofs > 0 && swing_voice_sched_put(-1 - _ra_v, v_gen[_ra_v], _ra_ofs)) ?
+    swing_voice_release_now(_ra_v, v_gen[_ra_v]);
+);
+function swing_voice_sched_due(_cd_spl) local(_cd_c) (
+  while(ckq_i < ckq_n && ckq_ofs[ckq_i] <= _cd_spl) (
+    _cd_c = ckq_pad[ckq_i];
+    _cd_c >= 0 ? swing_voice_choke_pass(_cd_c) : swing_voice_release_now(-1 - _cd_c, ckq_gen[ckq_i]);
+    ckq_i += 1;
+  );
+);
+// Top of @block. Every queued offset lies inside its own block, so nothing should be left;
+// if something ever is, it runs now -- late rather than never.
+function swing_voice_sched_flush() (
+  ckq_i < ckq_n ? swing_voice_sched_due(ckq_ofs[ckq_n - 1]);
+  ckq_n = 0; ckq_i = 0; ckq_spl = 0;
+);
+
+// ─── Mute takes effect NOW (user, 2026-09-23: "mute should mute instantly") ─────
+// Every sounding voice of the pad goes to its release stage with the steal pool's fast
+// fade on top (v_fastrel: steal_coeff, ~5 ms, in @sample), so a pad with a long release
+// still falls silent at once and without a click; a voice still waiting to start (loose
+// Sum) is simply freed; a Stretch pad's ring drain fades the way a choke fades it.
+// Called from the mute/solo edge pass at the top of @block (Swing_ReaKit.jsfx), whatever
+// surface wrote the flag. Touches globals only.
+function swing_voice_silence_pad(_sl_pad) local(_sl_j) (
+  _sl_j = 0; loop(MAX_VOICES,
+    v_slot[_sl_j] == _sl_pad && v_stage[_sl_j] > 0 ? (
+      v_pos[_sl_j] < 0 ? ( v_stage[_sl_j] = 0; ) : ( v_stage[_sl_j] = 4; v_fastrel[_sl_j] = 1; );
+    );
+    _sl_j += 1;
+  );
+  swing_pitch_eff(_sl_pad) == SP_PITCH_MODE_STRETCH && stretch_choked[_sl_pad] == 0 ? ( stretch_choked[_sl_pad] = 1; );
+);
+
+// The layer mixer (2026-10-28): one LAYER of a pad muted or soloed out while it sounds -- its sample voices release
+// as a muted pad's do (the fast release); the synth and the other layers ring on.
+function swing_voice_silence_layer(_sl_pad, _sl_lay) local(_sl_j) (   // _sl_lay = MAX_LAYERS: the pad's synth voices
+  _sl_j = 0; loop(MAX_VOICES,
+    v_slot[_sl_j] == _sl_pad && v_stage[_sl_j] > 0
+      && (_sl_lay >= MAX_LAYERS ? v_kind[_sl_j] == 1 : v_kind[_sl_j] == 0 && v_layer[_sl_j] == _sl_lay) ? (
+      v_pos[_sl_j] < 0 ? ( v_stage[_sl_j] = 0; ) : ( v_stage[_sl_j] = 4; v_fastrel[_sl_j] = 1; );
+    );
+    _sl_j += 1;
+  );
+);
+
+// ─── Voice launch helper (eliminates triplication across note-on + repeats) ──
+// _lv_midi = the played MIDI note. For single-note (drum) pads it equals
+// p_note[pad] (offset 0). For a chromatic pad it's the actual key, and the
+// voice pitches by (_lv_midi - p_note[pad]) semitones. Non-MIDI callers
+// (browser/preview/repeat) pass p_note[pad] so behavior is unchanged.
+// _lv_ofs delays the whole launch by that many samples inside the current
+// block -- the sub-block accuracy note repeat and MIDI need (the MIDI note-on
+// passes its midirecv offset since 2026-09-30; before that every MIDI hit
+// sounded at the block's first sample, early by up to a whole buffer). The
+// choke / duplicate-kill pass waits for the same sample (swing_voice_choke_at).
+// 0 = start immediately, which is what the 4-arg launch_voices_for_pad
+// wrapper below passes.
+// Wake a pad (banks step 2b): it may sound from this block on, so it goes on the awake list built at the end of
+// @block and under the high-water mark. Every @block launch path calls this first -- launch_voices_for_pad_ofs below
+// and the SYNTH view's audition (swing_block_gt_consume, which calls launch_syn_for_pad without this).
+function swing_pad_wake(_pw_pad) (
+  pad_awake[_pw_pad] = 1;
+  _pw_pad + 1 > pad_hi ? pad_hi = _pw_pad + 1;
+);
+// A pad a kit load is still filling (SQ-K, 2026-10-26: a kit changed while the step sequencer plays). The import's
+// state 2 adopts every pad's META of the pass at once -- lengths, rate, layers, tune, envelope -- while each pad's
+// audio arrives later, one pad after another (a VER-26 blob per bridge tick, a VER-201 file per few blocks). A hit in
+// between played the OLD buffer under the NEW lengths: the old sound cut short or at the wrong pitch, read past its
+// region into another pad's audio, or -- a pad that held no audio before -- read from cell 0 up (whatever the
+// variables there hold, at full level). Such a pad stays silent from state 2 until its audio has landed (state 3
+// clears its bit: rk_swing_ui_state); the walker, its MIDI-out mirror and every other pad keep going. @block's
+// alone (the import tick and every launch run there); the mask is read only while an import is past state 1, so any
+// way an import ends (state 4, an @init) opens it again.
+function swing_kit_pad_loading(_kl_p) (
+  kit_import_state >= 2 && kit_ld_pend > 0 && floor(_kl_p / NUM_PADS) == kit_ld_bank
+    && (floor(kit_ld_pend / (2 ^ (_kl_p - kit_ld_bank * NUM_PADS))) & 1);
+);
+function launch_voices_for_pad_ofs(_lv_pad, _lv_midi, _lv_vel, _lv_flash, _lv_ofs)
+  local(_is_sum, _sum_cnt, _sum_cur, _active_cnt, _sel_layer, _skip_voice, vi, _lidx,
+        _slen, _sstart, _send, _ssr, max_age, _oldest_vi, j, _delay, _end_i, _start_i,
+        _pt_eff, _st_off, _sr_base_t, _new_rpos, _lv_spot, _bt_lidx, _tie_pg,
+        _sel_syn, _syn_go, _syn_v, _syn_st, _has_smp, _comp_sum) (
+  !swing_kit_pad_loading(_lv_pad) ? (   // SQ-K: not while a kit load is filling this pad (above)
+  // Banks step 2b: whatever this launch does (local voices, a SYN voice, the Stretch ring),
+  // the pad may sound from this block on -- wake it before anything else.
+  swing_pad_wake(_lv_pad);
+  // Step 3b: Mode=Stretch diverts to the Extension's audio_hook. Don't
+  // allocate a local sinc voice; instead bump the per-pad trigger counter
+  // (Extension diffs against its shadow to detect new triggers), publish
+  // the current p_tune so élastique uses the right pitch ratio, and update
+  // pad_flash for UI feedback. The audio_hook renders élastique into the
+  // per-pad SPSC ring; JSFX @sample reads from the ring instead of running
+  // the local voice loop. Pads in Mode=Repitch or Mode=Tuned fall through
+  // to the existing local-voice path unchanged.
+  // ⚠️⚠️ `&& _reg_my_slot >= 0`: WITHOUT A SLOT THIS PAD WAS SILENT. The branch
+  // published nothing (the inner guard below), never fell through to the local
+  // path, and still flashed the pad -- so the hit lit up and made no sound. Not a
+  // startup race either: `_regfull_since` and its LCD banner exist precisely
+  // because a full registry leaves an instance without a slot indefinitely, and
+  // swing_registry_check_owner drops us to -1 whenever our slot is reassigned. In
+  // that state the pad's Repitch and Tuned neighbours played normally and only its
+  // Stretch pads went quiet. Falling through to the resident-buffer resampler is
+  // exactly what the header promises when the Extension is not there; being
+  // unreachable is the same thing from the player's side.
+  // ⭐ Swing_ReaKit.jsfx's "@block re-claim" note records fixing this identical
+  // shape in the @block heartbeat -- gated `_reg_my_slot >= 0`, so a vacated
+  // instance stayed silent.
+  // Same gate, same silence, one function over, and it went unlooked-for.
+  // ... and not while the pad's source change is still being handed to the Extension (swing_pitch_held: from the
+  // change until SP_HOLD_TICKS heartbeats after the bridge's answer, §5A.3): the hit takes the local path below and
+  // v_stfb marks it for @sample, so it cannot reach the OLD sound the Extension keeps loaded meanwhile.
+  swing_pitch_eff(_lv_pad) == SP_PITCH_MODE_STRETCH && _reg_my_slot >= 0 && !swing_pitch_held(_lv_pad) ? (   // a pad holding a spot, any bank (Pad Banks step 4; 4a.1 kept B..D out before)
+    // ── Trigger-edge ring reset (consumer-side jump) ────────────────────
+    // The Extension audio_hook (producer) and JSFX @sample (consumer) run
+    // on the same audio thread. REAPER's per-buffer order is:
+    //   audio_hook(pre) → JSFX @block → JSFX @sample×N → audio_hook(post)
+    // We're in @block right now bumping the trigger counter; the producer
+    // hasn't yet seen this new trigger (its pre-FX callback already ran
+    // this buffer with the OLD counter). So gmem write_pos at THIS moment
+    // reflects the END of any stale tail from the prior trigger, not new
+    // audio. Setting read_pos = write_pos here parks the consumer exactly
+    // at the boundary; @sample drains nothing until the next audio_hook
+    // services this trigger, calls voice.trigger() (Reset shifter), and
+    // writes fresh stretched audio. Without this jump, @sample would
+    // drain ~5ms of prior-trigger tail before reaching the new audio —
+    // perceived as a doubled transient ("old tail + new attack").
+    // Same-thread, single-producer/single-consumer: no race possible.
+    // Pad Banks step 4: the counter is the SPOT's -- the Extension diffs it against a per-spot shadow, so a new owner
+    // whose own count happened to equal the old owner's last one would have its first hit ignored.
+    _lv_spot = sp_row[_lv_pad];
+    sp_pitch_trigger_cnt[_lv_spot] += 1;
+    // B1c multi-instance: stride the TRIGGER/PITCH_ST control writes AND the
+    // audio-ring read_pos reset by our registry slot, same as the MODE/TUNE/
+    // ALGO publish in swing_block_pitch_tick() and the @sample consumer in the
+    // main JSFX. Guard on a claimed slot so a pre-claim _reg_my_slot = -1 can't
+    // underflow or stomp slot 0's ring (owned by another instance). Pre-B1c the
+    // ring reset used the singleton base STRETCH_AUDIO_BASE + pad*PAD_STRIDE,
+    // which parked the WRONG instance's consumer whenever this instance held a
+    // non-zero slot — the read_pos jump landed in slot 0's ring.
+    // Pad Banks step 4 (2026-10-09): the trigger, PITCH_ST and the ring are the pad's SPOT's (sp_row; swing_pitch_eff
+    // == Stretch means it holds one), not the pad's index -- on a lent spot those cells are another pad's.
+    _reg_my_slot >= 0 ? (
+      atomic_set(gmem[STRETCH_PER_PAD_TRIGGER_BASE  + _reg_my_slot * STRETCH_CONTROL_INSTANCE_STRIDE + _lv_spot], sp_pitch_trigger_cnt[_lv_spot]);
+      atomic_set(gmem[STRETCH_PER_PAD_PITCH_ST_BASE + _reg_my_slot * STRETCH_CONTROL_INSTANCE_STRIDE + _lv_spot], p_tune[_lv_pad]);
+      _sr_base_t = STRETCH_AUDIO_BASE + _reg_my_slot * STRETCH_INST_AUDIO_STRIDE + _lv_spot * STRETCH_PAD_STRIDE;
+      _new_rpos  = atomic_get(gmem[_sr_base_t + STRETCH_OFF_WRITE_POS]);
+      stretch_read_pos[_lv_spot] = _new_rpos;   // the ring's read cursor: per spot
+      atomic_set(gmem[_sr_base_t + STRETCH_OFF_READ_POS], _new_rpos);
+    );
+    // Held back by the @sample consumer, not here: the Extension has not seen
+    // this trigger yet and will not until its next audio_hook.
+    stretch_hold[_lv_pad] = _lv_ofs;
+    // A retrigger un-chokes this pad (its ring was just parked at the write cursor,
+    // so the old tail is gone anyway), then the same choke pass as a local launch:
+    // a Stretch closed hat releases the open hat, local or Stretch (A-7).
+    stretch_choked[_lv_pad] = 0; stretch_gain[_lv_pad] = 1;
+    swing_voice_choke_at(_lv_pad, _lv_ofs);
+    pad_flash[_lv_pad] = _lv_flash;
+  ) : (
+  // Only mode 3 (Sum) stacks all layers; mode 0 uses single-layer selection. The layer mixer's play button
+  // (lmix_force >= 0) plays one layer alone in any mode, at the level the Sum compensation gives it.
+  _is_sum = p_layer_cnt[_lv_pad] > 0 && p_layer_mode[_lv_pad] == 3 && lmix_force < 0;
+  _sel_syn = 0;
+  // Count active (non-empty) layers for gain compensation. The SYN slot counts
+  // as one more active layer in sum mode (spec §7: generalize the hard-coded 4).
+  // A PLAIN pad (no layers, its sample at the slot base) counts as one active
+  // layer too, so a plain pad + SYN slot in Sum mode keeps the 1/sqrt(2) split
+  // it had while every load promoted the pad to a one-layer pad
+  // (Spec_Swing_Long_Pad_Layer_Cap §4.2). _is_sum still gates the voice loop.
+  _comp_sum = p_layer_mode[_lv_pad] == 3;
+  _active_cnt = 0;
+  _comp_sum ? (
+    p_layer_cnt[_lv_pad] > 0 ? (
+      j = 0; loop(p_layer_cnt[_lv_pad],
+        l_len[_lv_pad * MAX_LAYERS + j] > 0 ? _active_cnt += 1;
+        j += 1;
+      );
+    ) : (
+      s_len[_lv_pad] > SILENCE_T + 4 ? _active_cnt += 1;
+    );
+    ps_enable[_lv_pad] ? _active_cnt += 1;
+  );
+  _sum_cnt = _is_sum ? p_layer_cnt[_lv_pad] : 1;
+  _sum_cur = 0;
+  while(_sum_cur < _sum_cnt) (
+    _is_sum ? (
+      _sel_layer = _sum_cur;
+      _skip_voice = !swing_layer_audible(_lv_pad, _sel_layer);   // empty, muted or soloed out (the layer mixer)
+    ) : (
+      p_layer_cnt[_lv_pad] > 0 ? (
+        lmix_force >= 0 ? (
+          _sel_layer = lmix_force;   // the strip's play button: that layer, muted or soloed out or not
+          _skip_voice = l_len[_lv_pad * MAX_LAYERS + _sel_layer] <= 0;
+        ) : (
+        _sel_layer = select_layer(_lv_pad, _lv_vel / 127.0, p_layer_mode[_lv_pad]);
+        // MAX_LAYERS = SYN sentinel (round-robin): this hit belongs to the
+        // synth — skip the sample voice, flag the synth launch below.
+        // -1 = no layer may sound (the layer mixer): no sample voice either.
+        _sel_layer >= MAX_LAYERS ? ( _sel_syn = 1; _skip_voice = 1; ) : _sel_layer < 0 ? _skip_voice = 1 : _skip_voice = 0;
+        );
+      ) : (
+        _sel_layer = -1;
+        // a PLAIN pad is the mixer's L1: its mute silences it, so does a soloed synth (the strip's play button plays it)
+        _skip_voice = lmix_force < 0 && !swing_layer_sounds(_lv_pad, 0);
+      );
+    );
+    !_skip_voice ? (
+      // Find free voice or oldest for steal (single pass)
+      vi = -1; max_age = -1; _oldest_vi = -1;
+      j = 0; loop(MAX_VOICES,
+        v_pos[j] < 0 && v_stage[j] == 0 ? (
+          vi < 0 ? vi = j;  // take first free slot
+        ) : (
+          v_age[j] > max_age ? (max_age = v_age[j]; _oldest_vi = j;);
+        );
+        j += 1;
+      );
+      vi < 0 ? ( vi = _oldest_vi; );  // no free voice — steal oldest
+      // Steal: vi points at an in-use voice that needs to be replaced
+      vi >= 0 && (v_pos[vi] >= 0 || v_stage[vi] > 0) ? (
+        // If stolen voice was still waiting (negative v_pos, pre-delay), just kill it
+        v_pos[vi] < 0 ? (
+          v_pos[vi] = -1; v_env[vi] = 0; v_stage[vi] = 0;
+        ) : (
+          swing_voice_steal_park(vi);   // into the quietest steal-fade slot, then park vi (A-2)
+        );
+      );
+      vi >= 0 ? (
+        v_slot[vi] = _lv_pad;
+        v_kind[vi] = 0;   // sample voice (slot may be reused from a synth voice)
+        // Reaching the local path on a STRETCH pad means the Extension was
+        // unreachable, so @sample must sum this voice rather than defer to a ring
+        // that will never fill. Every other mode stamps 0 and behaves as before.
+        v_stfb[vi] = swing_pitch_eff(_lv_pad) == SP_PITCH_MODE_STRETCH ? 1 : 0;
+        _sel_layer >= 0 && p_layer_cnt[_lv_pad] > 0 ? (
+          v_layer[vi] = _sel_layer;
+          _lidx = _lv_pad * MAX_LAYERS + _sel_layer;
+          _slen = l_len[_lidx];
+          _sstart = l_start[_lidx];
+          _send = l_end[_lidx];
+          _ssr = l_sr[_lidx];
+        ) : (
+          v_layer[vi] = 0;
+          _slen = s_len[_lv_pad];
+          _sstart = s_start[_lv_pad];
+          _send = s_end[_lv_pad];
+          _ssr = s_sr[_lv_pad];
+        );
+        // Clamp start/end to safe interleaved range (SILENCE_T margin for interpolation)
+        _end_i = min(_send * _slen, _slen) - SILENCE_T;
+        _end_i = max(0, _end_i);
+        _start_i = max(0, min(_sstart * _slen, _end_i));
+        // Skip launch if sample too short for safe playback
+        _slen > SILENCE_T + 4 ? (
+        // When MODE=Tuned, the Extension bakes the pad's audio to pitch and
+        // swaps it in (~70 ms after a knob move). Playing the baked buffer at
+        // native rate only sounds right ONCE the bake has caught up — until
+        // then the old buffer is at the OLD pitch, which is the lag the user
+        // hears. So play the RESIDUAL between the live tune and the tune the
+        // current buffer is baked at (sp_baked_tune): a knob move shows up
+        // INSTANTLY as a varispeed shift, and the residual returns to 0 (pure
+        // duration-preserved) when the matching bake arrives. Extension absent
+        // → fall back to full Repitch so the pad still tracks the knob.
+        // Per-layer residual (A4/A5): each layer is baked independently, so the
+        // anchor is sp_baked_tune[pad*MAX_LAYERS + selected_layer]. Layered pads
+        // (Sum/VelSplit/RR) pick the sounding layer; non-layered pads (_sel_layer
+        // < 0) use layer 0. Until a layer's bake lands its anchor is 0, so it
+        // residual-repitches the full tune via varispeed (correct pitch, shorter
+        // duration) — matching the Extension-absent fallback per layer.
+        _bt_lidx = _lv_pad * MAX_LAYERS + (_sel_layer >= 0 ? _sel_layer : 0);
+        // Chromatic offset: 0 for single-note pads (played == root). For a
+        // chromatic pad it varispeeds the sample by the key's distance from
+        // root. In Tuned mode this rides on the residual — the Extension only
+        // ever bakes at p_tune (never the played note), so root plays the
+        // pristine bake and off-root keys varispeed off it (no double-pitch).
+        _st_off = _lv_midi - p_note[_lv_pad];
+        _pt_eff = (swing_pitch_eff(_lv_pad) == SP_PITCH_MODE_TUNED ?
+          (sp_pitch_ext_alive ? (p_tune[_lv_pad] - sp_baked_tune[_bt_lidx]) : p_tune[_lv_pad]) :
+          p_tune[_lv_pad]) + _st_off;
+        p_reverse[_lv_pad] ? (
+          v_pos[vi] = _end_i;
+          v_inc[vi] = -pow(2.0, _pt_eff / 12.0) * 2.0 * (_ssr > 0 ? _ssr / srate : 1.0);
+        ) : (
+          v_pos[vi] = _start_i;
+          v_inc[vi] = pow(2.0, _pt_eff / 12.0) * 2.0 * (_ssr > 0 ? _ssr / srate : 1.0);
+        );
+        // Apply sample offset — absolute position in sample, clamped to trim bounds
+        p_sample_offset[_lv_pad] > 0.001 ? (
+          _abs_ofs = p_sample_offset[_lv_pad] * _slen;
+          v_pos[vi] = max(_start_i, min(_end_i, _abs_ofs));
+        );
+        // Sum mode loose timing: delay non-primary layers at random (below)
+        // Store real start position so delayed voice resumes at correct trim point
+        v_startpos[vi] = v_pos[vi];
+        // Sub-block start offset and sum-mode looseness are the same mechanism
+        // -- a negative v_pos the renderer counts up -- so they simply add.
+        // The +1 is the encoding, not a fudge: the renderer increments BEFORE it
+        // tests, so v_pos = -N first sounds at sample N-1. Measured, not reasoned:
+        // without it every repeat landed exactly one sample ahead of its step.
+        _delay = _lv_ofs > 0 ? _lv_ofs + 1 : 0;
+        // Sum mode LOOSE (the TIGHT .. LOOSE slider): each layer after the first starts up to 50 ms late, at random -- a
+        // loose flam at full LOOSE, a hint of hand-played spread lower down (the owner, 2026-10-28: "tight and loose sound
+        // too similar"; it was at most 40 samples, under 1 ms; then up to 20 ms; 2026-10-29: "can we make loose more
+        // loose"). The square keeps the first half of the slider subtle: 25 % -> up to 3 ms, 50 % -> 12.5 ms, 75 % -> 28 ms,
+        // 100 % -> 50 ms. The wait counts down per sample across blocks (the @sample voice loop), inside its -99999 floor.
+        _is_sum && _sum_cur > 0 && p_sum_tight[_lv_pad] > 0.001 ? (
+          _delay += (rand(1) * p_sum_tight[_lv_pad] * p_sum_tight[_lv_pad] * 0.050 * srate) | 0;
+        );
+        _delay > 0 ? v_pos[vi] = -_delay;
+        v_gain[vi] = apply_vel_curve(_lv_vel / 127.0, vel_curve);
+        // Sum mode: compensate gain by active (non-empty) layer count
+        _comp_sum && _active_cnt > 1 ? ( v_gain[vi] = v_gain[vi] / sqrt(_active_cnt); );
+        v_note[vi] = _lv_midi;   // PLAYED note (was p_note[pad]) so note-off matches the actual key
+        v_age[vi] = 0; v_fastrel[vi] = 0;
+        v_env[vi] = 0;
+        v_decay_ct[vi] = 0;
+        // One-Mixer console tie: while strip_takeover (multi-out + fresh
+        // strip-sync heartbeat) the child track's D_VOL is the ONE audible
+        // gain stage — the companion mirrors p_gain onto it, so applying
+        // p_gain here too would square the gain. Layer/norm gains stay:
+        // they're sample identity, not mix. Baked at launch (matches the
+        // existing p_gain semantics; takeover flips affect new hits only).
+        _tie_pg = strip_tk[_lv_pad] ? 1.0 : p_gain[_lv_pad];
+        _sel_layer >= 0 && p_layer_cnt[_lv_pad] > 0 ? (
+          _lidx = _lv_pad * MAX_LAYERS + _sel_layer;
+          v_sg[vi] = _tie_pg * l_gain[_lidx] * (l_norm[_lidx] ? l_norm_gain[_lidx] : 1.0);
+          // the layer's pan (the layer mixer), the pad's own pan law (recalc_pad), baked at launch like the gains
+          v_pl[vi] = 1.0 - max(0.0, l_pan[_lidx]);
+          v_pr[vi] = 1.0 + min(0.0, l_pan[_lidx]);
+        ) : (
+          // a PLAIN pad: the mixer's L1 is its sample -- layer 0's level and pan (1 and centre unless the strip moved
+          // them: a plain load and clear_pad reset them, and a project from before the mixer reads them as such)
+          _lidx = _lv_pad * MAX_LAYERS;
+          v_sg[vi] = _tie_pg * l_gain[_lidx] * (s_norm[_lv_pad] ? s_norm_gain[_lv_pad] : 1.0);
+          v_pl[vi] = 1.0 - max(0.0, l_pan[_lidx]);
+          v_pr[vi] = 1.0 + min(0.0, l_pan[_lidx]);
+        );
+        swing_voice_prep(vi);   // block constants: the buffer pointer, the trim bounds, the sum gate (slot / layer / stfb are set above)
+        // v_stage MUST be set last — @sample uses it as the gate condition. Every
+        // launch runs in @block since A-9b, in sequence with @sample, so the order
+        // is a guard for any future off-thread caller (one would let @sample read
+        // stale v_env/v_sg).
+        v_gen[vi] += 1;   // a new voice: a note-off queued for this slot's last one must not release it
+        vi + 1 > v_hi ? v_hi = vi + 1;   // step 2c: the @sample loop must reach this slot before the gate opens
+        v_stage[vi] = 1;
+        ) : ( // _slen too short — kill voice
+          v_pos[vi] = -1; v_env[vi] = 0; v_stage[vi] = 0;
+        );
+      );
+    );
+    _sum_cur += 1;
+  );
+
+  // ── SYN slot launch (Spec_Swing_Synth_Layer §2.2) ──────────────────────
+  // Independent of the sample voices. Per layer mode: sum = always underneath;
+  // vel-split = plays when vel is in the ps_ range; round-robin = when the
+  // extended rotation selected it (sentinel above); single = only when the pad
+  // has no sample audio (the emergent "synth pad" rule — no mode flag).
+  // Stretch pads excluded: their audio path is the Extension ring.
+  ps_enable[_lv_pad] && lmix_force < 0 && swing_pitch_eff(_lv_pad) != SP_PITCH_MODE_STRETCH ? (   // a layer's play button plays no synth
+    _has_smp = 0;
+    p_layer_cnt[_lv_pad] > 0 ? (
+      j = 0; loop(p_layer_cnt[_lv_pad],
+        l_len[_lv_pad * MAX_LAYERS + j] > 0 ? _has_smp = 1;
+        j += 1;
+      );
+    ) : (
+      s_len[_lv_pad] > SILENCE_T + 4 ? _has_smp = 1;
+    );
+    // the SYN strip (the layer mixer): a muted or soloed-out synth plays in no mode (round-robin's turn was spent above)
+    _syn_go = !swing_syn_audible(_lv_pad) ? 0 :
+      !_has_smp ? 1 :
+      p_layer_mode[_lv_pad] == 3 ? 1 :
+      p_layer_mode[_lv_pad] == 1 ? (
+        _syn_v = _lv_vel / 127.0;
+        _syn_v >= ps_vel_lo[_lv_pad] && (_syn_v < ps_vel_hi[_lv_pad] || ps_vel_hi[_lv_pad] >= 1.0)
+      ) :
+      p_layer_mode[_lv_pad] == 2 ? _sel_syn :
+      0;
+    // Body lives in launch_syn_for_pad (defined above) so the SYN view can
+    // audition the engine on its own. Sum mode splits gain across the active
+    // layers; every other mode plays the synth at full level, divisor 1.
+    _syn_go ? (
+      launch_syn_for_pad(_lv_pad, _lv_midi, _lv_vel,
+                         _comp_sum && _active_cnt > 1 ? sqrt(_active_cnt) : 1,
+                         _lv_ofs);
+    );
+  );
+  pad_flash[_lv_pad] = _lv_flash;
+  swing_voice_choke_at(_lv_pad, _lv_ofs);   // duplicate-kill + choke group, local voices and Stretch pads (A-7), at the hit's sample
+  );  // end of Mode != Stretch branch (Step 3b launch_voices divert)
+  );  // end of the SQ-K kit-load gate
+);
+
+// Every caller that wants a hit NOW keeps the four-argument name. EEL2 has no
+// overloading, so the offset-aware version needs its own name (two callers
+// still use this one: the browser's pad trigger (GS_PAD_TRIGGER) in
+// Swing_ReaKit.jsfx and the UI-click consumer in rk_swing_block).
+function launch_voices_for_pad(_lv_pad, _lv_midi, _lv_vel, _lv_flash) (
+  launch_voices_for_pad_ofs(_lv_pad, _lv_midi, _lv_vel, _lv_flash, 0);
+);

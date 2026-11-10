@@ -353,7 +353,7 @@ telling apart at a glance.
 These are the changes most likely to have you hunting for something.
 
 - **The four vintage-machine sample kits from 2.1.x are gone.** They're replaced
-  by eleven Vintage Synth kits and two sampled 808 kits. The synth kits cover
+  by eleven Vintage Synth kits and a sampled 808 kit. The synth kits cover
   the same ground with fully editable voices. **Your own kits are untouched** —
   the installer never removes your content.
 - **"Load Kit (.swing)" is no longer in the LOAD right-click menu.** Left-click

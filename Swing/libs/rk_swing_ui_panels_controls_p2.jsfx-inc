@@ -1,0 +1,234 @@
+// rk_swing_ui_panels_controls_p2.jsfx-inc -- part 2 of rk_swing_ui_panels_controls.jsfx-inc (2 parts), cut at a function boundary by
+// .dev_tests/split_big_incs.py: REAPER's load time grows with the square of a file's size. Edit freely;
+// keep each file under about 40 KB.
+
+// ⚠️ @init IS LOAD-BEARING (.docs/wiki/02-file-structure.md).
+@init
+
+// ── Master VOL taper (dB ⇄ knob position) ─────────────────────────────────
+// The value range is deliberately lopsided — 48 dB of cut against 12 dB of
+// boost — so a LINEAR value→angle map lands unity at 80% of the 260° sweep:
+// the arc reads "nearly maxed" on an untouched instance. These two functions
+// warp between dB and knob POSITION (0..1 along the sweep) so 0 dB sits at
+// exactly 0.5 = 12 o'clock:
+//
+//   pos = ((db + 48) / 60) ^ 3.106284        db = -48 + 60 * pos ^ 0.3219281
+//
+// The exponent is ln(0.5)/ln(0.8) — the only value that maps unity's linear
+// norm (0.8) onto the midpoint. Quarter points: 25% = -9.6 dB, 50% = 0 dB,
+// 75% = +6.7 dB. Wanted side effect: drag and scroll are position-relative,
+// so both get finer around unity (~0.6 dB per scroll tick vs 1.08 before) and
+// coarser on the dive to silence.
+//
+// Deliberately NOT in knobs_kbsg.jsfx-inc: jog_knob_draw and ssl_knob_interact
+// both work in whatever units the caller passes, so handing them a 0..1
+// position leaves every other knob in the bundle — and the Forge preview
+// port of the shared lib — completely untouched.
+function swing_panels_mvol_db2pos(_db) (
+  pow(max(0, min(1, (_db + 48) / 60)), 3.106284);
+);
+// Inverse, snapped to the slider's own 0.1 dB step so the round trip can never
+// produce values like -0.0374 that would write back forever.
+function swing_panels_mvol_pos2db(_p) (
+  floor((-48 + 60 * pow(max(0, min(1, _p)), 0.3219281)) * 10 + 0.5) / 10;
+);
+
+function swing_panels_draw_master() (
+  // Available area below last button row
+  _ctrl_area_y = _btn7_y + _btn_h + 8;
+  _ctrl_area_h = ui_bot - _ctrl_area_y - 6;   // the master block ends where the sequencer's gutter begins (swing_seq_gate)
+
+  // Side-by-side layout: DRIVE on left, VOL on right
+  _drv_zone_w = (left_w * 0.28)|0;
+  _knob_zone_w = left_w - _drv_zone_w;
+
+  // Master VOL knob sizing. Scales with the panel (height + knob-zone width) but
+  // capped at 75 so it doesn't balloon to fill the whole left panel on a big
+  // window. (Was 88 — trimmed so the knob reads smaller in the master section.)
+  // ⚠ The 75 cap is a DESIGN intent ("don't balloon"), written in design
+  // pixels at 780. On a 1.75x surface the panel is 1.75x bigger, so the cap
+  // has to be too or the intent inverts into "shrink".
+  _mvol_r = min(swing_px(75), (_ctrl_area_h - swing_px(16)) / 2);
+  _mvol_r = min(_mvol_r, (_knob_zone_w / 2 - swing_px(8)));
+  _mvol_r = max(swing_px(26), _mvol_r);
+
+  // DRIVE fader (left side, vertically centered in zone). Scales with the panel
+  // height, capped at 150 (was 220) so the slider reads shorter; it still
+  // centers in the available zone via _drv_y below.
+  _drv_h = min(swing_px(150), _ctrl_area_h - swing_px(18));
+  _drv_cx = swing_px(4) + _drv_zone_w / 2;
+  _drv_y = _ctrl_area_y + ((_ctrl_area_h - _drv_h - swing_px(14)) / 2)|0;
+  _drv_track_w = swing_px(6);    // wider track
+  _drv_thumb_w = swing_px(28);   // wider thumb
+  _drv_thumb_h = swing_px(12);
+
+  // Master drive character color (matches the per-pad drive palette in
+  // rk_swing_ui_grid_overlay_fx.jsfx-inc). The fader fill, thumb line and
+  // mode pill all key off gfx_drv_mode so the DRIVE control recolors per type.
+  _mdm = gfx_drv_mode | 0;
+  _mdm == 0 ? ( _mdrv_r=0.85; _mdrv_g=0.25; _mdrv_b=0.25; ) :  // SOFT
+  _mdm == 1 ? ( _mdrv_r=0.90; _mdrv_g=0.60; _mdrv_b=0.15; ) :  // TUBE
+  _mdm == 2 ? ( _mdrv_r=0.70; _mdrv_g=0.55; _mdrv_b=0.30; ) :  // TAPE
+  _mdm == 3 ? ( _mdrv_r=0.90; _mdrv_g=0.20; _mdrv_b=0.55; ) :  // FUZZ
+             ( _mdrv_r=0.50; _mdrv_g=0.75; _mdrv_b=0.90; );     // CLIP
+
+  // Track (wider dark groove)
+  _drv_track_x = _drv_cx - (_drv_track_w / 2)|0;
+  gfx_set(0.06, 0.06, 0.08, 1);
+  gfx_rect(_drv_track_x, _drv_y, _drv_track_w, _drv_h);
+  // Track inset bevel
+  gfx_set(0.03, 0.03, 0.05, 0.8);
+  gfx_rect(_drv_track_x, _drv_y, _drv_track_w, 1);
+  gfx_rect(_drv_track_x, _drv_y, 1, _drv_h);
+  gfx_set(0.20, 0.20, 0.22, 0.4);
+  gfx_rect(_drv_track_x, _drv_y + _drv_h - 1, _drv_track_w, 1);
+
+  // Drive-type colored fill (shows current drive level in the track)
+  _drv_fill_h = (gfx_sat_drv * _drv_h)|0;
+  _drv_fill_h > 0 ? (
+    gfx_set(_mdrv_r, _mdrv_g, _mdrv_b, 0.85);
+    gfx_rect(_drv_track_x + 1, _drv_y + _drv_h - _drv_fill_h, _drv_track_w - 2, _drv_fill_h);
+  );
+
+  // Tick marks (5 ticks on left side)
+  gfx_set(0.50, 0.48, 0.45, 0.5);
+  _ti = 0; loop(5,
+    _tick_y = (_drv_y + (_ti / 4.0) * _drv_h)|0;
+    gfx_line(_drv_track_x - 4, _tick_y, _drv_track_x - 1, _tick_y);
+    _ti += 1;
+  );
+
+  // Thumb position
+  _drv_thumb_y = _drv_y + (1.0 - gfx_sat_drv) * (_drv_h - _drv_thumb_h);
+  _drv_thumb_x = _drv_cx - (_drv_thumb_w / 2)|0;
+
+  // Thumb cap (metallic silver)
+  gfx_set(0.62, 0.60, 0.57, 1);
+  gfx_rect(_drv_thumb_x, _drv_thumb_y, _drv_thumb_w, _drv_thumb_h);
+  // Top highlight
+  gfx_set(0.82, 0.80, 0.77, 0.7);
+  gfx_rect(_drv_thumb_x, _drv_thumb_y, _drv_thumb_w, 1);
+  gfx_rect(_drv_thumb_x, _drv_thumb_y, 1, _drv_thumb_h);
+  // Bottom/right shadow
+  gfx_set(0.28, 0.26, 0.23, 0.7);
+  gfx_rect(_drv_thumb_x, _drv_thumb_y + _drv_thumb_h - 1, _drv_thumb_w, 1);
+  gfx_rect(_drv_thumb_x + _drv_thumb_w - 1, _drv_thumb_y, 1, _drv_thumb_h);
+  // Drive-type colored center line on thumb (slightly darker than the fill)
+  gfx_set(_mdrv_r * 0.8, _mdrv_g * 0.8, _mdrv_b * 0.8, 0.85);
+  gfx_rect(_drv_thumb_x + 4, _drv_thumb_y + (_drv_thumb_h / 2)|0, _drv_thumb_w - 8, 2);
+
+  // Drive interaction (vertical drag, ID 270). The thumb is drawn on a
+  // (H - thumb_h) travel, so the pointer maps onto the same travel from the
+  // thumb's centre: mapping it on H made a press on the thumb, without moving,
+  // jump the drive by thumb_h / 2H (0.04 at H = 150) and switch saturation on
+  // (LIB211).
+  active_id == 270 ? ( LMB ? (
+    gfx_sat_drv = max(0, min(1.0, 1.0 - (my - _drv_y - _drv_thumb_h * 0.5) / max(1, _drv_h - _drv_thumb_h)));
+    mark_dirty_kit();
+  ) : active_id = -1; );
+
+  active_id == -1 && mx >= _drv_thumb_x - 4 && mx <= _drv_thumb_x + _drv_thumb_w + 4 && my >= _drv_y && my <= _drv_y + _drv_h && lmb_down ? (
+    // double-click resets to 0 (clean), as the tooltip has always said (LIB211); the second press starts no drag
+    time_precise() - _drv_dbl_t < RK_DBLCLICK_T ? (
+      gfx_sat_drv = 0; mark_dirty_kit(); _drv_dbl_t = 0;
+    ) : (
+      active_id = 270; _drv_dbl_t = time_precise();
+    );
+  );
+
+  // Tooltip: zone 3 = master DRIVE fader. Hover zone uses the same
+  // hitbox as the click + scroll detectors above.
+  mx >= _drv_thumb_x - 6 && mx <= _drv_thumb_x + _drv_thumb_w + 6 && my >= _drv_y && my <= _drv_y + _drv_h ?
+    swing_tooltip_check(3, "Master DRIVE — saturation amount applied at the final stage. 0 = clean, 1 = fully saturated. Drag thumb, scroll wheel, or double-click to reset.");
+
+  // Drive scroll wheel — anywhere over the fader column adjusts the
+  // drive amount. Matches the wheel sensitivity of the LCD 0..1 knobs
+  // (delay feedback / mix etc., 0.02 per tick = 50 ticks full range).
+  // Hitbox uses the thumb width plus a 6px gutter so the user can land
+  // the scroll without aiming exactly at the moving thumb.
+  mx >= _drv_thumb_x - 6 && mx <= _drv_thumb_x + _drv_thumb_w + 6 && my >= _drv_y && my <= _drv_y + _drv_h && frame_wheel != 0 ? (
+    gfx_sat_drv = max(0, min(1.0, gfx_sat_drv + frame_wheel * 0.02));
+    mark_dirty_kit();
+  );
+
+  // Drive label — themed TEXT slot (follows the active theme's text colour);
+  // falls back to the cream-panel dark ink when the bridge isn't publishing.
+  rk_font(1, swing_fs(10), 'b');
+  rkth_setcol(2, 0.18, 0.16, 0.14, 1.0);
+  gfx_measurestr("DRIVE", tw, th);
+  gfx_x = _drv_cx - tw / 2; gfx_y = _drv_y + _drv_h + 4; gfx_drawstr("DRIVE");
+
+  // ── Drive-type pill (click cycles, wheel scrolls) — colored per type ──
+  // Mirrors the per-pad drive pill idiom (dark-tinted rect + full-color text).
+  rk_font(1, swing_fs(8), 'b');
+  _mdm == 0 ? strcpy(#mdrv_lbl, "SOFT") :
+  _mdm == 1 ? strcpy(#mdrv_lbl, "TUBE") :
+  _mdm == 2 ? strcpy(#mdrv_lbl, "TAPE") :
+  _mdm == 3 ? strcpy(#mdrv_lbl, "FUZZ") :
+              strcpy(#mdrv_lbl, "CLIP");
+  gfx_measurestr(#mdrv_lbl, tw, th);
+  _mpill_x = _drv_cx - tw/2 - 4; _mpill_y = _drv_y + _drv_h + 17;
+  _mpill_w = tw + 8; _mpill_h = th + 3;
+  gfx_set(_mdrv_r * 0.3, _mdrv_g * 0.3, _mdrv_b * 0.3, 0.85);
+  gfx_rect(_mpill_x, _mpill_y, _mpill_w, _mpill_h);
+  gfx_set(_mdrv_r, _mdrv_g, _mdrv_b, 1);
+  gfx_x = _drv_cx - tw/2; gfx_y = _mpill_y + 1; gfx_drawstr(#mdrv_lbl);
+
+  // Pill hover/interact zone (distinct from the fader amount zones above).
+  _mpill_hit = mx >= _mpill_x && mx <= _mpill_x + _mpill_w && my >= _mpill_y && my <= _mpill_y + _mpill_h;
+  _mpill_hit ?
+    swing_tooltip_check(24, "Master DRIVE type — SOFT/TUBE/TAPE/FUZZ/CLIP saturation character. Click to cycle, scroll to change.");
+  // Click cycles forward through the 5 types.
+  _mpill_hit && lmb_down ? (
+    gfx_drv_mode = (_mdm + 1) % 5;
+    mark_dirty_play();   // not a kit key; a sound change: its REAPER undo point (2026-10-27)
+  );
+  // Wheel scrolls type (up = next, down = previous).
+  _mpill_hit && frame_wheel != 0 ? (
+    gfx_drv_mode = (_mdm + (frame_wheel > 0 ? 1 : 4)) % 5;
+    mark_dirty_play();
+  );
+
+  // ── Master VOL jog wheel knob (centered in knob zone) ──
+  _mvol_cx = _drv_zone_w + _knob_zone_w / 2;
+  _mvol_cy = _ctrl_area_y + (_ctrl_area_h / 2)|0;
+
+  // Master vol is logged as dB (ver 40+): -48 dB (silence) .. +12 dB, default
+  // 0 dB = unity gain. The knob is driven in POSITION space (0..1) through the
+  // taper above so unity sits at 12 o'clock instead of 80% round. Conversion to
+  // linear amplitude still happens in Swing_ReaKit.jsfx @slider, from master_db.
+  // Tooltip: zone 21 = master VOL knob. Hitbox matches the interact zone.
+  _mvol_dx = mx - _mvol_cx; _mvol_dy = my - _mvol_cy;
+  _mvol_dx*_mvol_dx + _mvol_dy*_mvol_dy <= (_mvol_r+6)*(_mvol_r+6) ?
+    swing_tooltip_check(21, "Master output volume (-48 dB silence to +12 dB). Drag, scroll, or double-click to reset to 0 dB (unity).");
+  _mvol_pos = swing_panels_mvol_db2pos(master_db);
+  jog_knob_draw(_mvol_cx, _mvol_cy, _mvol_r, _mvol_pos, 0, 1, km_master_vol[0],
+                0.15, 0.55, 1.0);
+
+  // Interact: drag, scroll, double-click reset to 0 dB (= position 0.5).
+  // The change test is in POSITION space, not dB: when the knob is untouched
+  // jog_knob_interact hands back cur_val bit-identical, so an automation
+  // envelope driving master_db to a non-0.1 value is never snapped and written
+  // back underneath itself.
+  _mvol_np = jog_knob_interact(km_master_vol, _mvol_cx, _mvol_cy, _mvol_r + 6,
+                               _mvol_pos, 0, 1, 0.5, 0);
+  _mvol_np != _mvol_pos ? (
+    master_db = swing_panels_mvol_pos2db(_mvol_np);
+    slider2 = master_db;
+    slider_automate(slider2);
+    // Recompute global_vol immediately so the next @sample uses the new amp
+    // (don't wait for @slider — it fires on the NEXT block boundary).
+    global_vol = master_db <= -48 ? 0 : exp(master_db * 0.11512925465);
+  );
+
+  // Label: MASTER VOL (bold) — themed TEXT slot (follows the active theme's text
+  // colour); falls back to the cream-panel dark ink when the bridge isn't publishing.
+  rk_font(1, swing_fs(10), 'b');
+  rkth_setcol(2, 0.18, 0.16, 0.14, 1.0);
+  gfx_measurestr("MASTER VOL", tw, th);
+  gfx_x = _mvol_cx - tw / 2; gfx_y = _mvol_cy + _mvol_r + 10; gfx_drawstr("MASTER VOL");
+
+  // Tooltip rendering happens once at end of @gfx via swing_tooltip_draw()
+  // in Swing_ReaKit.jsfx. Hover-site swing_tooltip_check() calls above
+  // have already set the render text + zone-tracking state.
+);

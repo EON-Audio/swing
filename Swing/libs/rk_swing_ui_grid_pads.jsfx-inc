@@ -461,10 +461,12 @@ function swing_grid_draw_embedded() (
         // off-centre knob on the first sample dropped there.
         _km_v = km_pad_vol_pan + (gi * KM_PAD_MINI + 0) * KS;
         has_content ? (
-          rk_knob_draw(sk_kp, _e_vol_cx, _e_knob_cy, _e_mini_kr, p_gain[gi_s], 0, 2.0, 0, _km_v[0],
+          // in POSITION 0..1 on the gain knobs' taper (unity at 12 o'clock, +12 dB at the top, rk_swing_core swing_kgain_*; 2026-10-29)
+          _e_gp = swing_kgain_g2p(p_gain[gi_s]);
+          rk_knob_draw(sk_kp, _e_vol_cx, _e_knob_cy, _e_mini_kr, _e_gp, 0, 1, 0, _km_v[0],
                        ac_r, ac_g, ac_b, 0, pad_bg_r*(1-dim)+pr*dim, pad_bg_g*(1-dim)+pgg*dim, pad_bg_b*(1-dim)+pb*dim);
-          nv = mpc_knob_interact(_km_v, _e_vol_cx, _e_knob_cy, _e_mini_kr, p_gain[gi_s], 0, 2.0, 1.0, 0);
-          nv != p_gain[gi_s] ? (p_gain[gi_s] = nv; s_dirty[gi_s] = 1; mark_dirty_pad(gi_s););
+          nv = mpc_knob_interact(_km_v, _e_vol_cx, _e_knob_cy, _e_mini_kr, _e_gp, 0, 1, KGAIN_UNITY_P, 0);
+          nv != _e_gp ? (p_gain[gi_s] = swing_kgain_p2g(nv); s_dirty[gi_s] = 1; mark_dirty_pad(gi_s););
           _km_v[1] ? _e_knob_active = 1;
           _e_knob_hover = _e_knob_active || dist(mx, my, _e_vol_cx, _e_knob_cy) <= _e_mini_kr + 3;
         );
@@ -1107,6 +1109,18 @@ function swing_grid_draw_pads() (
     gfx_set(_syn_cr, _syn_cg, _syn_cb, min(1.0, _syn_ca + 0.35 * _syn_hva));
     gfx_x = _syn_lx; gfx_y = _out_ly; gfx_drawstr("SYN");
 
+    // ── Layer-solo badge (left of SYN): a gold S while the layer mixer's solo silences part of the pad -- a layer, its L1
+    // or its synth soloed beside something that is not (swing_mix_solo_shows) -- so a pad that plays only part of itself
+    // says so on its face; never over the category badge (bottom-left, 25 px)
+    gfx_measurestr("S", _ls_tw, _ls_th);
+    _ls_x = _syn_lx - _ls_tw - 12;
+    _ls_x >= pad_x + 27 && swing_mix_solo_shows(gi_s) ? (
+      gfx_set(0.85, 0.71, 0.19, is_muted ? 0.5 : 1);
+      gfx_rect(_ls_x - 3, _out_ly - 1, _ls_tw + 6, _syn_th + 2);
+      gfx_set(0.10, 0.08, 0.03, 1);
+      gfx_x = _ls_x; gfx_y = _out_ly; gfx_drawstr("S");
+    );
+
     // ── Control strip below pad: [S] [M] [RPT] ──VOL── ──PAN── ───────────
     _ctrl_y = cy + ph + 4;
     _ctrl_h = btn_h;
@@ -1238,7 +1252,8 @@ function swing_grid_draw_pads() (
     // has_sample gate hid two working knobs and left them draggable-blind.
     _km_v = km_pad_vol_pan + (gi * KM_PAD_MINI + 0) * KS;
     has_content ? (
-      rk_knob_draw(_pk_vstyle, _vol_cx, _knob_cy, _mini_kr, p_gain[gi_s], 0, 2.0, 0, _km_v[0],
+      // in POSITION 0..1 on the gain knobs' taper (unity at 12 o'clock, +12 dB at the top, rk_swing_core swing_kgain_*; 2026-10-29)
+      rk_knob_draw(_pk_vstyle, _vol_cx, _knob_cy, _mini_kr, swing_kgain_g2p(p_gain[gi_s]), 0, 1, 0, _km_v[0],
                    _pkv_r, _pkv_g, _pkv_b, 0, 0.36, 0.34, 0.32);
       // Bigger, brighter, fully opaque label so VOL/PAN read clearly
       // against the dark control-strip area at the bottom of the pad.
@@ -1256,9 +1271,10 @@ function swing_grid_draw_pads() (
       // Right-click on VOL / PAN = that knob's style menu (below), not a reset;
       // see the note on the LCD PAN knob in rk_swing_lcd.
       _rmb_keep = rmb_down; rmb_down = 0;
-      nv = mpc_knob_interact(_km_v, _vol_cx, _knob_cy, _mini_kr, p_gain[gi_s], 0, 2.0, 1.0, 0);
+      _pt_gp = swing_kgain_g2p(p_gain[gi_s]);   // the knob's position (the gain knobs' taper: unity at 12 o'clock)
+      nv = mpc_knob_interact(_km_v, _vol_cx, _knob_cy, _mini_kr, _pt_gp, 0, 1, KGAIN_UNITY_P, 0);
       rmb_down = _rmb_keep;
-      nv != p_gain[gi_s] ? (p_gain[gi_s] = nv; s_dirty[gi_s] = 1; mark_dirty_pad(gi_s););
+      nv != _pt_gp ? (p_gain[gi_s] = swing_kgain_p2g(nv); s_dirty[gi_s] = 1; mark_dirty_pad(gi_s););
       _km_v[1] ? _knob_active = 1;
     );
 
@@ -1668,184 +1684,5 @@ function swing_grid_draw_pads() (
     _ggl_i += 1;
   );
   _grid_gesture_live = drag_src_pad >= 0 || _ggl_knob;
-);
-
-// ── External drag-over (browser → pad grid) ───────────────────────────────
-// Swing_Browser drags are ImGui-internal and never become an OLE drop, so
-// gfx_getdropfile never fires for them. Instead the browser tracks its own
-// gesture and mails us the cursor position; WE own the hit-test, so the pad
-// that lights up and the pad that loads are the same pad by construction,
-// and the geometry stays correct without the browser knowing any of it.
-//
-// Call AFTER swing_grid_draw_pads() — grid_x/cell_w/pad_h are recomputed
-// there every frame and the highlight must paint over the pad faces.
-// Echoes the browser's own stamp back so a stale echo can't read as fresh.
-function swing_grid_extdrag() local(_xd_b, _xd_st, _xd_n, _xd_mode, _xd_live,
-                                   _xd_x, _xd_y, _xd_row, _xd_col, _xd_i,
-                                   _xd_cx, _xd_cy, _xd_pw, _xd_ph, _xd_k,
-                                   _xd_ox, _xd_oy, _xd_sx, _xd_sy, _xd_f) (
-  _xd_b = EON_DRAG_BASE;
-  _xd_st = gmem[_xd_b + EON_DRAG_OFF_STAMP];
-
-  // ADOPT whatever is already in the cell rather than treating it as new.
-  // gmem is session-scoped: it survives our @init, a recompile, and a
-  // registry-slot re-claim, while our shadow resets to 0. A stamp left
-  // behind by a browser that died mid-drag would otherwise read as a
-  // change on our first frame and flash a phantom highlight.
-  xdrag_last_slot != _reg_my_slot ? (
-    xdrag_last_slot  = _reg_my_slot;
-    xdrag_last_stamp = _xd_st;
-    xdrag_seen_t     = 0;
-  );
-
-  // Stamp CHANGE (not clock comparison) marks activity — the browser's
-  // time_precise() and ours need not share an origin for this to work.
-  _xd_st != xdrag_last_stamp ? (
-    xdrag_last_stamp = _xd_st;
-    xdrag_seen_t = time_precise();
-  );
-
-  xdrag_pad = -1;
-
-  // Am I the surface under the cursor? Two ways to answer, because an
-  // EMBEDDED view cannot be matched on coordinates (see the protocol note in
-  // Swing_ReaKit.jsfx: its mouse_x/y are relative to the embed rect, which
-  // the browser cannot know).
-  //   PRECISE — the broadcast carries the cursor in CLIENT pixels of the
-  //     topmost jsfx_gfx window. Same OS cursor, same client rect, so the true
-  //     window's own mouse_x/mouse_y equal those numbers; any other instance
-  //     sees different-origin values and stays silent. Floating / FX-chain.
-  //   BLIND — the cursor is over REAPER but not over a jsfx_gfx window, so
-  //     only an EMBEDDED instance can be the target and it decides purely on
-  //     its own pointer being in bounds. Embedded strips never overlap.
-  // Either way the in-bounds test is the 2D AND: one axis can be in range
-  // while the other is not (probe-measured).
-  _xd_mode = gmem[_xd_b + EON_DRAG_OFF_MODE];
-  _xd_live = _xd_st != 0 && (time_precise() - xdrag_seen_t) < 0.30
-    && mouse_x >= 0 && mouse_x < gfx_w
-    && mouse_y >= 0 && mouse_y < gfx_h;
-
-  // ⚠️pad_input_allowed()/popup gate the FLOATING path only. The embedded
-  // branch of @gfx draws nothing but the pad grid, so an embedded surface
-  // shows pads no matter what big_view_id says in that instance's floating
-  // window — gating it would refuse drops for a view the user cannot even see
-  // here. This matches the embedded native-drop handler above, which gates on
-  // neither. ⚠️an instance embedded in BOTH TCP and MCP renders twice but has
-  // ONE mouse_x/y, so the hit-test resolves against whichever REAPER drew
-  // last; inherent to JSFX and already true of the embedded click handler.
-  _xd_live = _xd_live && (
-    _xd_mode == EON_DRAG_MODE_BLIND ? is_embedded : (
-      !is_embedded && pad_input_allowed() && !swing_popup_active
-      && gmem[_xd_b + EON_DRAG_OFF_W] == gfx_w
-      && gmem[_xd_b + EON_DRAG_OFF_H] == gfx_h
-      && abs(mouse_x - gmem[_xd_b + EON_DRAG_OFF_X]) <= 2
-      && abs(mouse_y - gmem[_xd_b + EON_DRAG_OFF_Y]) <= 2
-    )
-  );
-
-  _xd_live ? (
-    _xd_n = max(1, gmem[_xd_b + EON_DRAG_OFF_COUNT]|0);
-    // Hit-test our OWN pointer — no normalisation, no rounding drift.
-    _xd_x = mouse_x;
-    _xd_y = mouse_y;
-
-    // Rect math mirrors whichever draw path actually ran this frame, so the
-    // lit pad is pixel-exact with the drawn one:
-    //   embedded — swing_grid_draw_embedded()'s e_cw/e_ch/e_gap block (whole surface in
-    //     quarters, e_gap inset). e_cw/e_ch/e_gap are globals that survive the
-    //     call; ex_/ey_ do NOT (they hold only the last loop iteration), so
-    //     the rects are recomputed here.
-    //   floating — swing_grid_draw_pads() (pad face = cx+2, cy+2, cell_w-4,
-    //     pad_h).
-    is_embedded ? (
-      _xd_ox = e_gap; _xd_oy = e_gap;
-      _xd_sx = e_cw;  _xd_sy = e_ch;
-      _xd_pw = e_cw - e_gap * 2;
-      _xd_ph = e_ch - e_gap * 2;
-    ) : (
-      _xd_ox = grid_x + 2; _xd_oy = grid_y + 2;
-      _xd_sx = cell_w;     _xd_sy = cell_h;
-      _xd_pw = cell_w - 4;
-      _xd_ph = pad_h;
-    );
-
-    _xd_row = 0;
-    loop(4,
-      _xd_col = 0;
-      loop(4,
-        _xd_i  = (3 - _xd_row) * 4 + _xd_col;
-        _xd_cx = _xd_ox + _xd_col * _xd_sx;
-        _xd_cy = _xd_oy + _xd_row * _xd_sy;
-        _xd_x >= _xd_cx && _xd_x <= _xd_cx + _xd_pw &&
-        _xd_y >= _xd_cy && _xd_y <= _xd_cy + _xd_ph ? xdrag_pad = _xd_i;
-        _xd_col += 1;
-      );
-      _xd_row += 1;
-    );
-
-    // Highlight the landing pad, plus the consecutive run a multi-file
-    // drop would fill (matching the native drop handler's fill order).
-    xdrag_pad >= 0 ? (
-      _xd_k = 0;
-      loop(min(_xd_n, NUM_PADS - xdrag_pad),
-        _xd_i  = xdrag_pad + _xd_k;
-        _xd_row = 3 - ((_xd_i / 4)|0);
-        _xd_col = _xd_i - (((_xd_i / 4)|0) * 4);
-        _xd_cx = _xd_ox + _xd_col * _xd_sx;
-        _xd_cy = _xd_oy + _xd_row * _xd_sy;
-        gfx_set(1, 1, 1, _xd_k == 0 ? 0.28 : 0.14);
-        gfx_rect(_xd_cx, _xd_cy, _xd_pw, _xd_ph);
-        _xd_k == 0 ? (
-          gfx_set(1, 1, 1, 0.85);
-          gfx_roundrect(_xd_cx - 1, _xd_cy - 1, _xd_pw + 2, _xd_ph + 2, 4);
-        );
-        _xd_k += 1;
-      );
-    );
-  );
-
-  // The pad editor's layer tabs (the user, 2026-10-22): the same window test as the floating path, then the tabs the
-  // editor published within a quarter second; over a tab no pad is the target and the claim carries the layer code.
-  xdrag_tab = -1;
-  _xd_st != 0 && (time_precise() - xdrag_seen_t) < 0.30 && !is_embedded && !swing_popup_active
-    && gmem[_xd_b + EON_DRAG_OFF_MODE] != EON_DRAG_MODE_BLIND
-    && gmem[_xd_b + EON_DRAG_OFF_W] == gfx_w && gmem[_xd_b + EON_DRAG_OFF_H] == gfx_h
-    && abs(mouse_x - gmem[_xd_b + EON_DRAG_OFF_X]) <= 2 && abs(mouse_y - gmem[_xd_b + EON_DRAG_OFF_Y]) <= 2
-    && time_precise() - ovl_tabs_t < 0.25 && mouse_y >= ovl_tabs_y && mouse_y <= ovl_tabs_y + ovl_tabs_h ? (
-    _xd_k = 0; loop(MAX_LAYERS,
-      mouse_x >= ovl_tabs_x + _xd_k * ovl_tabs_w && mouse_x <= ovl_tabs_x + _xd_k * ovl_tabs_w + ovl_tabs_w - 2 ? xdrag_tab = _xd_k;
-      _xd_k += 1;
-    );
-  );
-  // ...and its waveform: the layer shown, as if dropped on that layer's tab (the owner, 2026-10-27; the same window test)
-  xdrag_tab < 0 && _xd_st != 0 && (time_precise() - xdrag_seen_t) < 0.30 && !is_embedded && !swing_popup_active
-    && gmem[_xd_b + EON_DRAG_OFF_MODE] != EON_DRAG_MODE_BLIND
-    && gmem[_xd_b + EON_DRAG_OFF_W] == gfx_w && gmem[_xd_b + EON_DRAG_OFF_H] == gfx_h
-    && abs(mouse_x - gmem[_xd_b + EON_DRAG_OFF_X]) <= 2 && abs(mouse_y - gmem[_xd_b + EON_DRAG_OFF_Y]) <= 2
-    && time_precise() - ovl_wave_t < 0.25 && ovl_wave_pad == ovl_tabs_pad
-    && mouse_x >= ovl_wave_x && mouse_x <= ovl_wave_x + ovl_wave_w && mouse_y >= ovl_wave_y && mouse_y <= ovl_wave_y + ovl_wave_h
-    ? xdrag_tab = ovl_wave_layer;
-  xdrag_tab >= 0 ? (
-    xdrag_pad = -1;
-    _xd_f = swing_layer_drop_first(ovl_tabs_pad, xdrag_tab);
-    ovl_drag_l0 = max(0, _xd_f);
-    ovl_drag_n = min(max(1, gmem[_xd_b + EON_DRAG_OFF_COUNT]|0), MAX_LAYERS - ovl_drag_l0);
-    ovl_drag_t = time_precise();
-  );
-
-  // CLAIM: only an instance that actually resolved a pad answers, and it
-  // answers in its OWN registry slot so concurrent instances never collide.
-  // Payload first, stamp echo LAST (the stamp is the memory barrier
-  // stand-in); echoing 0 when we did not claim keeps the browser from
-  // reading a previous frame's answer as current.
-  _reg_my_slot >= 0 ? (
-    _xd_cx = EON_DRAG_CLAIM_BASE + _reg_my_slot * EON_DRAG_CLAIM_STRIDE;
-    gmem[_xd_cx + 0] = xdrag_tab >= 0 ? ovl_tabs_pad : xdrag_pad >= 0 ? swing_bp(xdrag_pad) : -1;   // the ABSOLUTE pad (4a)
-    gmem[_xd_cx + 1] = instance_id;
-    // cell 3, the LAYER code (2026-10-22): 0 = the pad itself (an older Swing leaves it 0), 1..4 = from layer code - 1,
-    // 9 = the first file replaces the pad and the rest stack from layer 1 (swing_layer_drop_first's -1)
-    gmem[_xd_cx + 3] = xdrag_tab >= 0 ? (_xd_f < 0 ? 9 : _xd_f + 1) : 0;
-    gmem[_xd_cx + 2] = (xdrag_pad >= 0 || xdrag_tab >= 0) ? _xd_st : 0;
-  );
 );
 

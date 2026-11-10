@@ -1,0 +1,624 @@
+// rk_seq_core_p3.jsfx-inc -- part 3 of rk_seq_core.jsfx-inc (4 parts), cut at a function boundary by
+// .dev_tests/split_big_incs.py: REAPER's load time grows with the square of a file's size. Edit freely;
+// keep each file under about 40 KB.
+
+// ⚠️ @init IS LOAD-BEARING (.docs/wiki/02-file-structure.md).
+@init
+
+// ─── The project save: the body of serialize gate 78 (spec 8) ───────────────
+// Sparse in both axes. Header (the instance's settings, fixed scalars with two spares), the song chain
+// (a count, then the slots), the pattern count, then per pattern a used flag; a used pattern carries its
+// record, its sixteen lane records and, per lane, a count of switched-on steps followed by that many
+// (step, word A, word B) triples. Presence in the list is "on". Word A = vel | prob<<7 | (ratchet-1)<<14 |
+// tie<<16 | acc<<18 | rsub_follows<<19; word B = (nudge+50) | (pitch+48)<<7 | (pan+100)<<14 | cond<<22:
+// both below 2^24, exact in the stream's 32-bit floats. rsub_follows = the roll's three sub-velocities
+// follow the triple (S2 writes them when any is set; S1 never did and skipped them on read). Every count
+// meets a STATIC bound before any file_mem or loop (wiki 3.5); a count past its bound ends the read --
+// nothing after it in this gate is touched, so the reader never walks the stream out of alignment. file_var
+// itself writes only seq_io_tmp (through seq_io_var, @serialize's channel 0); the seq_srz_* scratch scalars and
+// the counters are locals of the functions that use them (seq_srz_bad, a diagnostic flag, is the one global).
+function seq_pack_a(_pa_b, _pa_rs) (
+  (max(1, min(127, _pa_b[1] | 0))) | ((max(0, min(100, _pa_b[2] | 0))) << 7)
+    | ((max(0, min(3, (_pa_b[3] | 0) - 1))) << 14) | ((max(0, min(2, _pa_b[4] | 0))) << 16)
+    | ((_pa_b[8] ? 1 : 0) << 18) | ((_pa_rs ? 1 : 0) << 19);
+);
+function seq_pack_b(_pb_b) (
+  (max(0, min(100, (_pb_b[5] | 0) + 50))) | ((max(0, min(96, (_pb_b[6] | 0) + 48))) << 7)
+    | ((max(0, min(200, (_pb_b[7] | 0) + 100))) << 14) | ((max(0, min(3, _pb_b[9] | 0))) << 22);
+);
+function seq_unpack(_up_b, _up_a, _up_w) (
+  _up_a = _up_a | 0; _up_w = _up_w | 0;
+  _up_b[1] = max(1, _up_a & 127); _up_b[2] = (_up_a >> 7) & 127; _up_b[3] = ((_up_a >> 14) & 3) + 1;
+  _up_b[4] = (_up_a >> 16) & 3; _up_b[8] = (_up_a >> 18) & 1;
+  _up_b[5] = (_up_w & 127) - 50; _up_b[6] = ((_up_w >> 7) & 127) - 48; _up_b[7] = ((_up_w >> 14) & 255) - 100;
+  _up_b[9] = (_up_w >> 22) & 3;
+  _up_b[0] = 1;   // last: the walker reads a whole step once it sees the flag
+);
+// ─── The stream's channel (S3c): the project file, or a gmem band for a kit's record ─────────────────────────────────
+// Every serialize function reads and writes through these two, so the SAME code packs the project chunk (@serialize:
+// file_var / file_mem) and the kit record (a band: EON_SEQ_KIT). Each channel keeps its state in its own cells of
+// seq_io (SEQ_IO_F a channel: 0 mode -- 0 the file, 1 a band written, 2 a band read; 1 the next cell; 2 one past the
+// band's end; 3 over -- a write past the end was refused, a read past it read 0; 4 reading) and every serialize function
+// takes the channel (_ch): channel 0 is @serialize's alone, channel 1 the kit record's (@block), so the two never share
+// a cell -- wiki 4.1: @serialize runs beside the audio thread, unmutexed. The functions' own counts are locals.
+// Cell 5 counts the cells the channel has moved, either way (audit K14, 2026-10-26): the tagged reader holds every tag
+// to its stated length by it (seq_srz_tagged).
+SEQ_IO_F = 8;
+seq_io_tmp = 0;   // the file channel's file_var cell (an lvalue: @serialize's alone)
+function seq_io_rd(_ir_c) ( seq_io[_ir_c * SEQ_IO_F + 4]; );
+// Mode 3 (FU-P, 2026-10-26): the kit's record read back from the plugin's own copy (seq_kit_pend, cells 1 and 2 are
+// indices into it, not gmem addresses) -- a kit's patterns kept on offer while the user's stay.
+function seq_io_var(_iv_v, _iv_c) local(_iv_b) (
+  _iv_b = seq_io + _iv_c * SEQ_IO_F;
+  _iv_b[5] += 1;
+  _iv_b[0] == 0 ? ( seq_io_tmp = _iv_v; file_var(0, seq_io_tmp); seq_io_tmp )
+  : _iv_b[0] == 1 ? ( _iv_b[1] < _iv_b[2] ? gmem[_iv_b[1]] = _iv_v : _iv_b[3] = 1; _iv_b[1] += 1; _iv_v )
+  : ( _iv_b[1] < _iv_b[2] ? _iv_v = (_iv_b[0] == 3 ? seq_kit_pend[_iv_b[1]] : gmem[_iv_b[1]]) : ( _iv_v = 0; _iv_b[3] = 1; ); _iv_b[1] += 1; _iv_v );
+);
+function seq_io_mem(_im_p, _im_n, _im_c) local(_im_b, _im_k) (
+  _im_b = seq_io + _im_c * SEQ_IO_F;
+  _im_b[5] += _im_n;
+  _im_b[0] == 0 ? file_mem(0, _im_p, _im_n)
+  : _im_b[0] == 1 ? ( _im_k = 0; loop(_im_n, _im_b[1] < _im_b[2] ? gmem[_im_b[1]] = _im_p[_im_k] : _im_b[3] = 1; _im_b[1] += 1; _im_k += 1; ); )
+  : ( _im_k = 0; loop(_im_n, _im_b[1] < _im_b[2] ? _im_p[_im_k] = (_im_b[0] == 3 ? seq_kit_pend[_im_b[1]] : gmem[_im_b[1]]) : ( _im_p[_im_k] = 0; _im_b[3] = 1; ); _im_b[1] += 1; _im_k += 1; ); );
+);
+
+// Is anything in this pattern worth writing? Any switched-on step, or any lane or pattern field off its default.
+// The answer is an OR, so the walk stops after the first LANE that makes the pattern used (the R2 speed pass,
+// 2026-11-02; FINDINGS 2026-10-22: the chip row asks this for every chip every frame, and it read all 16 lanes' 64
+// steps after the first hit). A lane's cells are still read with loop() to the lane's end: a cell-by-cell while()
+// measured twice as slow per cell (ysfx), so stopping at the cell lost on an empty pattern. Each cell is tested in the
+// same form as before (a truth test where it was one, > 0 for a note's pitch); only where the reads stop changed.
+// r2_seq_patused_test.py holds the old one beside it, case by case. An empty pattern is still read to its end.
+function seq_pat_used(p) local(_pu_l, _pu_b, _pu_lb, _pu_pb, _pu_u) (
+  _pu_u = 0;
+  _pu_pb = seq_pat_at(p);
+  (_pu_pb[0] != SEQ_LEN_DEFAULT || _pu_pb[1] != SEQ_DIV_DEFAULT || _pu_pb[2] || _pu_pb[3] || _pu_pb[4] != SEQ_GATE_DEFAULT
+    || _pu_pb[5] || _pu_pb[6] || _pu_pb[7]) ? _pu_u = 1;
+  _pu_l = 0;
+  while(!_pu_u && _pu_l < SEQ_LANES) (   // the lanes: their fields, then their steps
+    _pu_lb = seq_lane_at(p, _pu_l);
+    (_pu_lb[0] != _pu_l || _pu_lb[1] != SEQ_LEN_DEFAULT || _pu_lb[2] != SEQ_DIV_DEFAULT || _pu_lb[3] || _pu_lb[4] || _pu_lb[5]
+      || _pu_lb[6] != 1 || _pu_lb[7] || _pu_lb[8] != SEQ_LSW_FOLLOW || _pu_lb[9] != -1 || _pu_lb[10] || _pu_lb[11] || _pu_lb[12]) ? _pu_u = 1;
+    _pu_b = seq_step_at(p, _pu_l, 0);
+    loop(SEQ_STEPS, _pu_b[0] ? _pu_u = 1; _pu_b += SEQ_ATTR; );
+    _pu_l += 1;
+  );
+  _pu_l = 0;
+  while(!_pu_u && _pu_l < SEQ_LANES) (   // S5: the notes, a lane's slots at a time (each lane's are contiguous)
+    _pu_b = seq_note_at(p, _pu_l, 0);
+    loop(SEQ_STEPS * SEQ_CHORD_N, _pu_b[0] > 0 ? _pu_u = 1; _pu_b += SEQ_NOTE_F; );
+    _pu_l += 1;
+  );
+  _pu_u;
+);
+// The slot a duplicate lands in: the first unused pattern after p, wrapping round; -1 when every slot is used.
+function seq_dup_target(_dt_p) local(_dt_k, _dt_q, _dt_hit) (
+  _dt_hit = -1; _dt_k = 1;
+  loop(SEQ_PATS - 1,
+    _dt_q = _dt_p + _dt_k; _dt_q >= SEQ_PATS ? _dt_q -= SEQ_PATS;
+    _dt_hit < 0 && !seq_pat_used(_dt_q) ? _dt_hit = _dt_q;
+    _dt_k += 1;
+  );
+  _dt_hit;
+);
+// Clamp a lane record read from a file (another program's numbers). The target keeps a MIDI-channel value
+// (-1..-16, phase 4b) so a later build's lane survives a round trip through this one; the walker ignores it.
+function seq_srz_clamp_lane(_cl_b, _cl_l) (
+  _cl_b[0] = max(-16, min(NUM_SLOTS - 1, _cl_b[0] | 0));
+  _cl_b[1] = max(1, min(SEQ_STEPS, _cl_b[1] | 0)); _cl_b[2] = max(0, min(SEQ_DIV_N - 1, _cl_b[2] | 0));
+  _cl_b[3] = max(-500, min(500, _cl_b[3])); _cl_b[4] = _cl_b[4] ? 1 : 0; _cl_b[5] = _cl_b[5] ? 1 : 0;
+  _cl_b[6] = max(0, min(2, _cl_b[6])); _cl_b[7] = max(-1, min(1, _cl_b[7])); _cl_b[8] = max(-1, min(100, _cl_b[8] | 0));
+  _cl_b[9] = max(-1, min(SEQ_LANES - 1, _cl_b[9] | 0)); _cl_b[10] = _cl_b[10] ? 1 : 0;
+  _cl_b[11] = max(0, min(32, _cl_b[11] | 0)); _cl_b[12] = max(0, min(15, _cl_b[12] | 0));
+);
+function seq_srz_clamp_pat(_cq_b) (
+  _cq_b[0] = max(1, min(SEQ_STEPS, _cq_b[0] | 0)); _cq_b[1] = max(0, min(SEQ_DIV_N - 1, _cq_b[1] | 0));
+  _cq_b[2] = max(0, min(2, _cq_b[2] | 0)); _cq_b[3] = max(0, min(100, _cq_b[3])); _cq_b[4] = max(1, min(100, _cq_b[4]));
+  _cq_b[5] = max(0, min(100, _cq_b[5])); _cq_b[6] = max(0, min(100, _cq_b[6])); _cq_b[7] = max(-127, min(127, _cq_b[7]));
+  // field 8 (used) stays what the writer stored: nothing reads it yet, and a value the reader invents breaks the
+  // round trip (the rig's checksums differed by exactly 8 * 31^3 until this read it as 1, 2026-10-19)
+  _cq_b[8] = _cq_b[8] ? 1 : 0; _cq_b[10] = max(-1, min(SEQ_SRZ_PATS_MAX - 1, _cq_b[10] | 0));
+);
+// One pattern's body, both directions. _sp_dst < 0 = read and drop (a pattern past this build's count):
+// its records land in the 64-cell scratch, its triples in the scratch scalars. Returns 1, or 0 when a
+// count failed its bound (the caller then reads nothing more).
+function seq_srz_pattern(_sp_dst, _ch) local(_sp_l, _sp_s, _sp_b, _sp_lb, _sp_pb, _sp_cnt, _sp_ok, _sp_k, _sp_rs, _sp_rb, seq_srz_a, seq_srz_cnt, seq_srz_s, seq_srz_w) (
+  _sp_ok = 1;
+  _sp_pb = _sp_dst >= 0 ? seq_pat_at(_sp_dst) : seq_srz_tmp;
+  seq_io_mem(_sp_pb, SEQ_PAT_F, _ch);
+  seq_io_rd(_ch) && _sp_dst >= 0 ? seq_srz_clamp_pat(_sp_pb);
+  _sp_l = 0;
+  while(_sp_ok && _sp_l < SEQ_LANES) (
+    _sp_lb = _sp_dst >= 0 ? seq_lane_at(_sp_dst, _sp_l) : seq_srz_tmp;
+    seq_io_mem(_sp_lb, SEQ_LANE_F, _ch);
+    seq_io_rd(_ch) && _sp_dst >= 0 ? seq_srz_clamp_lane(_sp_lb, _sp_l);
+    _sp_cnt = 0;
+    !seq_io_rd(_ch) ? (
+      _sp_b = seq_step_at(_sp_dst, _sp_l, 0);
+      _sp_s = 0; loop(SEQ_STEPS, _sp_b[0] ? _sp_cnt += 1; _sp_b += SEQ_ATTR; _sp_s += 1; );
+    );
+    seq_srz_cnt = _sp_cnt;
+    seq_srz_cnt = seq_io_var(seq_srz_cnt, _ch);
+    seq_io_rd(_ch) ? ( _sp_cnt = seq_srz_cnt | 0; (_sp_cnt < 0 || _sp_cnt > SEQ_STEPS) ? _sp_ok = 0; );
+    _sp_ok ? (
+      !seq_io_rd(_ch) ? (
+        _sp_s = 0; loop(SEQ_STEPS,
+          _sp_b = seq_step_at(_sp_dst, _sp_l, _sp_s);
+          _sp_b[0] ? (
+            _sp_rb = seq_rsub_at(_sp_dst, _sp_l, _sp_s);
+            _sp_rs = (_sp_rb[0] | 0) || (_sp_rb[1] | 0) || (_sp_rb[2] | 0);
+            seq_srz_s = _sp_s;                      seq_srz_s = seq_io_var(seq_srz_s, _ch);
+            seq_srz_a = seq_pack_a(_sp_b, _sp_rs);  seq_srz_a = seq_io_var(seq_srz_a, _ch);
+            seq_srz_w = seq_pack_b(_sp_b);          seq_srz_w = seq_io_var(seq_srz_w, _ch);
+            _sp_rs ? ( seq_io_mem(_sp_rb, SEQ_RSUB_N, _ch); );
+          );
+          _sp_s += 1;
+        );
+      ) : (
+        _sp_k = 0; loop(_sp_cnt,
+          seq_srz_s = seq_io_var(seq_srz_s, _ch); seq_srz_a = seq_io_var(seq_srz_a, _ch); seq_srz_w = seq_io_var(seq_srz_w, _ch);
+          _sp_s = seq_srz_s | 0;
+          _sp_dst >= 0 && _sp_s >= 0 && _sp_s < SEQ_STEPS ? seq_unpack(seq_step_at(_sp_dst, _sp_l, _sp_s), seq_srz_a, seq_srz_w);
+          ((seq_srz_a | 0) & 524288) ? (
+            // the roll's sub-velocities: three cells, into the step (or the scratch for a dropped pattern)
+            _sp_rb = (_sp_dst >= 0 && _sp_s >= 0 && _sp_s < SEQ_STEPS) ? seq_rsub_at(_sp_dst, _sp_l, _sp_s) : seq_srz_tmp;
+            seq_io_mem(_sp_rb, SEQ_RSUB_N, _ch);
+            _sp_rb[0] = max(0, min(127, _sp_rb[0] | 0)); _sp_rb[1] = max(0, min(127, _sp_rb[1] | 0)); _sp_rb[2] = max(0, min(127, _sp_rb[2] | 0));
+          );
+          _sp_k += 1;
+        );
+      );
+    );
+    _sp_l += 1;
+  );
+  _sp_ok;
+);
+// ─── Gate 79: the TAGGED stream (P0a, 2026-10-20, decision 23) ───────────────
+// `[tag, len, cells...]` sections, a count first. A reader takes the tags it knows and SKIPS the others by their
+// length (a count-bounded skip), so a later build can add a section (the note pool, S5; the kit record's
+// revision) without a new gate number, and a missing tag means defaults: the stream cannot desync a positional
+// reader, which is what the wiki's "a new gate for every layout change, in ship order" rule exists to prevent.
+// The writer states every length (a counting pass mirrors the pattern writer). Tags: 1 SETTINGS (a fixed block
+// of SEQ_SRZ_SET_N cells, the spares written as 0 and ignored on read), 2 SONG, 3 PATTERNS (the sparse body as
+// gate 78 wrote it). A file written by gate 78 (the user's own test projects; nothing shipped) is read by the
+// 78 body below and converted: lane W (a strength of the pattern's swing) -> the lane's own swing.
+// SONG is READ ONLY since 2026-10-29 (the owner's D9): nothing ever filled the chain (decision 23 made the song the
+// regions' and the bridge's chain engine), so the writer no longer writes its 134 cells of zeros into every project
+// save and kit record; a stream that carries it (every save before) still reads it, and one without it reads as an
+// empty chain -- in an older build too (a missing tag means defaults; seq_serialize / seq_kit_apply clear first).
+SEQ_SRZ_TAG_SET  = 1;
+SEQ_SRZ_TAG_SONG = 2;
+SEQ_SRZ_TAG_PATS = 3;
+SEQ_SRZ_SET_N    = 32;      // the SETTINGS block: 27 used (19..23 the polish pass; 24-25 the roll; 26 the patterns on show, round two H: the lanes' mute and solo masks, their marker,
+                            // the hidden columns, the lane order), the rest spare (read into the 64-cell scratch)
+SEQ_SRZ_TAGS_MAX = 64;      // static bounds (wiki 3.5)
+SEQ_SRZ_LEN_MAX  = 4000000;
+
+// How many cells the PATTERNS body will take (mirrors seq_srz_pattern's writer exactly).
+function seq_srz_count_pats() local(_cn_p, _cn_l, _cn_s, _cn_b, _cn_rb, _cn_n) (
+  _cn_n = 1;   // the pattern count
+  _cn_p = 0; loop(SEQ_PATS,
+    _cn_n += 1;   // the used flag
+    seq_pat_used(_cn_p) ? (
+      _cn_n += SEQ_PAT_F;
+      _cn_l = 0; loop(SEQ_LANES,
+        _cn_n += SEQ_LANE_F + 1;   // the lane record and the on-step count
+        _cn_b = seq_step_at(_cn_p, _cn_l, 0); _cn_rb = seq_rsub_at(_cn_p, _cn_l, 0);
+        _cn_s = 0; loop(SEQ_STEPS,
+          _cn_b[0] ? ( _cn_n += 3; ((_cn_rb[0] | 0) || (_cn_rb[1] | 0) || (_cn_rb[2] | 0)) ? _cn_n += SEQ_RSUB_N; );
+          _cn_b += SEQ_ATTR; _cn_rb += SEQ_RSUB_N; _cn_s += 1;
+        );
+        _cn_l += 1;
+      );
+    );
+    _cn_p += 1;
+  );
+  _cn_n;
+);
+// Skip _sk_n cells of a tag this build does not know (read into the scratch, 16 at a time; count-bounded).
+function seq_srz_skip(_sk_n, _ch) local(_sk_k, _sk_b) (
+  _sk_n = max(0, min(SEQ_SRZ_LEN_MAX, _sk_n | 0));
+  _sk_b = seq_io + _ch * SEQ_IO_F;
+  _sk_b[0] == 0 ? ( while(_sk_n > 0) ( _sk_k = min(16, _sk_n); seq_io_mem(seq_srz_tmp, _sk_k, _ch); _sk_n -= _sk_k; ); )
+  : ( _sk_b[1] + _sk_n > _sk_b[2] ? _sk_b[3] = 1; _sk_b[1] += _sk_n; _sk_b[5] += _sk_n; );
+);
+// The SETTINGS block, both directions, through the scratch (64 cells; the first SEQ_SRZ_SET_N carry the block).
+function seq_srz_settings(_st_len, _ch) local(_st_k) (
+  !seq_io_rd(_ch) ? (
+    memset(seq_srz_tmp, 0, SEQ_SRZ_SET_N);
+    seq_srz_tmp[0] = seq_shown; seq_srz_tmp[1] = seq_h; seq_srz_tmp[2] = seq_view; seq_srz_tmp[3] = seq_cur;
+    seq_srz_tmp[4] = seq_page; seq_srz_tmp[5] = seq_off; seq_srz_tmp[6] = seq_run; seq_srz_tmp[7] = seq_place;
+    seq_srz_tmp[8] = fb_place; seq_srz_tmp[9] = fx_place; seq_srz_tmp[10] = seq_trig_mode; seq_srz_tmp[11] = seq_trig_base;
+    seq_srz_tmp[12] = seq_opt_icons; seq_srz_tmp[13] = seq_opt_follow; seq_srz_tmp[14] = seq_opt_transport;
+    seq_srz_tmp[15] = seq_opt_sync; seq_srz_tmp[16] = seq_opt_midiout; seq_srz_tmp[17] = seq_opt_midich;
+    seq_srz_tmp[18] = seq_opt_adapt;
+    seq_srz_tmp[19] = seq_gmute; seq_srz_tmp[20] = seq_gsolo; seq_srz_tmp[21] = 1; seq_srz_tmp[22] = seq_col_hide;   // the polish pass
+    seq_srz_tmp[23] = seq_opt_topdown; seq_srz_tmp[24] = seq_opt_snap; seq_srz_tmp[25] = seq_opt_rollh;
+    seq_srz_tmp[26] = seq_npat;   // round two H: the patterns on show
+    seq_io_mem(seq_srz_tmp, SEQ_SRZ_SET_N, _ch);
+  ) : (
+    memset(seq_srz_tmp, 0, 64);
+    _st_k = max(0, min(SEQ_SRZ_SET_N, _st_len | 0));
+    _st_k > 0 ? seq_io_mem(seq_srz_tmp, _st_k, _ch);
+    _st_len > _st_k ? seq_srz_skip(_st_len - _st_k, _ch);   // a later build's longer block: the rest is its own
+    seq_shown = seq_srz_tmp[0] ? 1 : 0; seq_h = max(0, min(4096, seq_srz_tmp[1])); seq_view = max(0, min(6, seq_srz_tmp[2] | 0));
+    seq_cur = max(0, min(SEQ_PATS - 1, seq_srz_tmp[3] | 0)); seq_page = max(0, min(3, seq_srz_tmp[4] | 0));
+    seq_off = seq_srz_tmp[5] ? 1 : 0; seq_run = seq_srz_tmp[6] ? 1 : 0;
+    seq_place = (seq_srz_tmp[7] >= 0 && seq_srz_tmp[7] <= 4) ? seq_srz_tmp[7] | 0 : 0;
+    fb_place = (seq_srz_tmp[8] >= 0 && seq_srz_tmp[8] <= 4) ? seq_srz_tmp[8] | 0 : 0;
+    fx_place = (seq_srz_tmp[9] >= 0 && seq_srz_tmp[9] <= 4) ? seq_srz_tmp[9] | 0 : 0;
+    seq_trig_mode = max(0, min(5, seq_srz_tmp[10] | 0)); seq_trig_base = max(0, min(127, seq_srz_tmp[11] | 0));
+    seq_opt_icons = seq_srz_tmp[12] ? 1 : 0; seq_opt_follow = seq_srz_tmp[13] ? 1 : 0; seq_opt_transport = seq_srz_tmp[14] ? 1 : 0;
+    seq_opt_sync = seq_srz_tmp[15] ? 1 : 0; seq_opt_midiout = seq_srz_tmp[16] ? 1 : 0; seq_opt_midich = max(1, min(16, seq_srz_tmp[17] | 0));
+    seq_opt_adapt = seq_srz_tmp[18] ? 1 : 0;
+    seq_gmute = max(0, min(65535, seq_srz_tmp[19] | 0)); seq_gsolo = max(0, min(65535, seq_srz_tmp[20] | 0));
+    seq_gms_srz = seq_srz_tmp[21] ? 1 : 0; seq_col_hide = max(0, min(31, seq_srz_tmp[22] | 0));
+    seq_opt_topdown = seq_srz_tmp[23] ? 1 : 0; seq_opt_snap = max(0, min(3, seq_srz_tmp[24] | 0));
+    seq_opt_rollh = max(0, min(100, seq_srz_tmp[25] | 0));
+    seq_npat = max(0, min(SEQ_PATS, seq_srz_tmp[26] | 0));   // 0 = an older stream: seq_npat_fix derives it after the read
+  );
+);
+// The SONG block, both directions (the count first, then the three scalars, then the slots).
+function seq_srz_song(_ch) local(_sg_ok, seq_srz_n) (
+  seq_srz_n = SEQ_SONG_MAX; seq_srz_n = seq_io_var(seq_srz_n, _ch);
+  seq_song_len = seq_io_var(seq_song_len, _ch); seq_song_loop = seq_io_var(seq_song_loop, _ch); seq_song_pos = seq_io_var(seq_song_pos, _ch);
+  _sg_ok = (seq_srz_n | 0) >= 0 && (seq_srz_n | 0) <= SEQ_SONG_MAX;
+  _sg_ok ? seq_io_mem(seq_song, (seq_srz_n | 0) * 2, _ch);
+  seq_io_rd(_ch) ? (
+    seq_song_len = max(0, min(SEQ_SONG_MAX, seq_song_len | 0)); seq_song_loop = seq_song_loop ? 1 : 0;
+    seq_song_pos = max(0, min(SEQ_SONG_MAX - 1, seq_song_pos | 0));
+  );
+  _sg_ok;
+);
+// The PATTERNS block, both directions (the count, then per pattern a used flag and its body). Returns 1, or 0
+// when a count failed its bound (the caller reads nothing more).
+function seq_srz_pats(_ch) local(_sp_p, _sp_np, _sp_ok, _sp_dst, seq_srz_n, seq_srz_u) (
+  seq_srz_n = SEQ_PATS; seq_srz_n = seq_io_var(seq_srz_n, _ch);
+  _sp_np = seq_srz_n | 0;
+  _sp_ok = _sp_np >= 0 && _sp_np <= SEQ_SRZ_PATS_MAX;
+  _sp_p = 0;
+  while(_sp_ok && _sp_p < _sp_np) (
+    _sp_dst = _sp_p < SEQ_PATS ? _sp_p : -1;
+    seq_srz_u = (!seq_io_rd(_ch) && _sp_dst >= 0) ? seq_pat_used(_sp_p) : 0;
+    seq_srz_u = seq_io_var(seq_srz_u, _ch);
+    seq_srz_u ? _sp_ok = seq_srz_pattern(_sp_dst, _ch);
+    _sp_p += 1;
+  );
+  _sp_ok;
+);
+// A 78 file's lanes: W (a strength 0..100 % of the pattern's swing, 100 the default) -> the lane's own swing:
+// 100 -> follow the pattern (-1), anything else -> round(SWING x W / 100), the same timing the file played with.
+function seq_srz_convert_78() local(_cv_p, _cv_l, _cv_lb, _cv_sw, _cv_w) (
+  _cv_p = 0; loop(SEQ_PATS,
+    _cv_sw = max(0, min(100, seq_pat_at(_cv_p)[3]));
+    _cv_l = 0; loop(SEQ_LANES,
+      _cv_lb = seq_lane_at(_cv_p, _cv_l);
+      // only a lane the file carried (W 0..100); a pattern the file left out was cleared to -1 already, and
+      // converting that -1 made every empty pattern "used" (2,600 cells of empty lane records in the project:
+      // the rig's SIZE line, 2026-10-20)
+      _cv_lb[8] >= 0 ? (
+        _cv_w = max(0, min(100, _cv_lb[8]));
+        _cv_lb[8] = _cv_w >= 100 ? SEQ_LSW_FOLLOW : floor(_cv_sw * _cv_w / 100 + 0.5);
+      );
+      _cv_l += 1;
+    );
+    _cv_p += 1;
+  );
+);
+// The 78 body (the positional stream S1 wrote; a READER now: nothing writes 78 any more).
+function seq_srz_body78(_ch) local(_ss_p, _ss_np, _ss_ok, _ss_dst, seq_srz_n, seq_srz_spare0, seq_srz_spare1, seq_srz_u) (
+  // ── header (78's: the twelve scalars and two spares) ──
+  seq_shown = seq_io_var(seq_shown, _ch); seq_h = seq_io_var(seq_h, _ch); seq_view = seq_io_var(seq_view, _ch); seq_cur = seq_io_var(seq_cur, _ch); seq_page = seq_io_var(seq_page, _ch);
+  seq_off = seq_io_var(seq_off, _ch); seq_run = seq_io_var(seq_run, _ch); seq_place = seq_io_var(seq_place, _ch); fb_place = seq_io_var(fb_place, _ch); fx_place = seq_io_var(fx_place, _ch);
+  seq_trig_mode = seq_io_var(seq_trig_mode, _ch); seq_trig_base = seq_io_var(seq_trig_base, _ch); seq_srz_spare0 = seq_io_var(seq_srz_spare0, _ch); seq_srz_spare1 = seq_io_var(seq_srz_spare1, _ch);
+  seq_io_rd(_ch) ? (
+    seq_shown = seq_shown ? 1 : 0; seq_h = max(0, min(4096, seq_h)); seq_view = max(0, min(6, seq_view | 0));
+    seq_cur = max(0, min(SEQ_PATS - 1, seq_cur | 0)); seq_page = max(0, min(3, seq_page | 0));
+    seq_off = seq_off ? 1 : 0; seq_run = seq_run ? 1 : 0;
+    seq_place = (seq_place >= 0 && seq_place <= 4) ? seq_place | 0 : 0;
+    fb_place = (fb_place >= 0 && fb_place <= 4) ? fb_place | 0 : 0;
+    fx_place = (fx_place >= 0 && fx_place <= 4) ? fx_place | 0 : 0;
+    seq_trig_mode = max(0, min(5, seq_trig_mode | 0)); seq_trig_base = max(0, min(127, seq_trig_base | 0));
+  );
+  // ── the song chain ──
+  seq_srz_n = SEQ_SONG_MAX; seq_srz_n = seq_io_var(seq_srz_n, _ch);
+  seq_song_len = seq_io_var(seq_song_len, _ch); seq_song_loop = seq_io_var(seq_song_loop, _ch); seq_song_pos = seq_io_var(seq_song_pos, _ch);
+  _ss_ok = (seq_srz_n | 0) >= 0 && (seq_srz_n | 0) <= SEQ_SONG_MAX;
+  _ss_ok ? seq_io_mem(seq_song, (seq_srz_n | 0) * 2, _ch);
+  seq_io_rd(_ch) ? (
+    seq_song_len = max(0, min(SEQ_SONG_MAX, seq_song_len | 0)); seq_song_loop = seq_song_loop ? 1 : 0;
+    seq_song_pos = max(0, min(SEQ_SONG_MAX - 1, seq_song_pos | 0));
+  );
+  // ── the patterns ──
+  _ss_ok ? (
+    seq_srz_n = SEQ_PATS; seq_srz_n = seq_io_var(seq_srz_n, _ch);
+    _ss_np = seq_srz_n | 0;
+    _ss_ok = _ss_np >= 0 && _ss_np <= SEQ_SRZ_PATS_MAX;
+    _ss_p = 0;
+    while(_ss_ok && _ss_p < _ss_np) (
+      _ss_dst = _ss_p < SEQ_PATS ? _ss_p : -1;
+      seq_srz_u = (!seq_io_rd(_ch) && _ss_dst >= 0) ? seq_pat_used(_ss_p) : 0;
+      seq_srz_u = seq_io_var(seq_srz_u, _ch);
+      seq_srz_u ? _ss_ok = seq_srz_pattern(_ss_dst, _ch);
+      _ss_p += 1;
+    );
+  );
+  seq_io_rd(_ch) && !_ss_ok ? seq_srz_bad = 1;   // a diagnostic flag: the read stopped at a count past its bound
+);
+
+// ─── S5: the notes as their own tag (NOTES, 4) ───────────────────────────────────────────────────────────────
+// [the pattern count, then per pattern: its note count, then per note two words] -- word A = lane + 16 x step + 1024 x
+// pitch (< 2^17), word B = velocity + 128 x (length in quarter steps x 128 + nudge + 50) (< 2^23): exact in the
+// stream's 32-bit floats. A read puts each note in the first free slot of its step; a count past its static bound
+// ends the read (wiki 3.5). A build before S5 skips the tag by its length; a stream without it has no notes.
+SEQ_SRZ_TAG_NOTES = 4;
+function seq_srz_count_notes() local(_cn_p, _cn_n, _cn_b) (
+  _cn_n = 1;
+  _cn_p = 0; loop(SEQ_PATS,
+    _cn_n += 1;
+    _cn_b = seq_note_at(_cn_p, 0, 0); loop(SEQ_LANES * SEQ_STEPS * SEQ_CHORD_N, _cn_b[0] > 0 ? _cn_n += 2; _cn_b += SEQ_NOTE_F; );
+    _cn_p += 1;
+  );
+  _cn_n;
+);
+function seq_srz_notes(_ch) local(_sn_np, _sn_p, _sn_ok, _sn_n, _sn_b, _sn_k, _sn_l, _sn_s, _sn_nb, _sn_a, _sn_w, _sn_q, seq_srz_a, seq_srz_b, seq_srz_n, seq_srz_u) (
+  seq_srz_n = SEQ_PATS; seq_srz_n = seq_io_var(seq_srz_n, _ch);
+  _sn_np = seq_srz_n | 0; _sn_ok = _sn_np >= 0 && _sn_np <= SEQ_SRZ_PATS_MAX;
+  _sn_p = 0;
+  while(_sn_ok && _sn_p < _sn_np) (
+    _sn_b = _sn_p < SEQ_PATS ? seq_note_at(_sn_p, 0, 0) : -1;
+    !seq_io_rd(_ch) ? ( seq_srz_u = 0; _sn_nb = _sn_b; loop(SEQ_LANES * SEQ_STEPS * SEQ_CHORD_N, _sn_nb[0] > 0 ? seq_srz_u += 1; _sn_nb += SEQ_NOTE_F; ); );
+    seq_srz_u = seq_io_var(seq_srz_u, _ch);
+    _sn_n = seq_srz_u | 0;
+    _sn_n < 0 || _sn_n > SEQ_LANES * SEQ_STEPS * SEQ_CHORD_N ? _sn_ok = 0 : (
+      !seq_io_rd(_ch) ? (
+        _sn_k = 0;
+        loop(SEQ_LANES * SEQ_STEPS * SEQ_CHORD_N,
+          _sn_nb = _sn_b + _sn_k * SEQ_NOTE_F;
+          _sn_nb[0] > 0 ? (
+            _sn_l = floor(_sn_k / (SEQ_STEPS * SEQ_CHORD_N)); _sn_s = floor(_sn_k / SEQ_CHORD_N) - _sn_l * SEQ_STEPS;
+            seq_srz_a = _sn_l + 16 * _sn_s + 1024 * ((_sn_nb[0] | 0) - 1);
+            seq_srz_b = max(1, min(127, _sn_nb[1] | 0)) + 128 * (_sn_nb[2] | 0);
+            seq_srz_a = seq_io_var(seq_srz_a, _ch); seq_srz_b = seq_io_var(seq_srz_b, _ch);
+          );
+          _sn_k += 1;
+        );
+      ) : (
+        loop(_sn_n,
+          seq_srz_a = seq_io_var(seq_srz_a, _ch); seq_srz_b = seq_io_var(seq_srz_b, _ch);
+          _sn_a = max(0, seq_srz_a | 0); _sn_w = max(0, seq_srz_b | 0);
+          _sn_b >= 0 ? (
+            _sn_l = _sn_a % 16; _sn_s = floor(_sn_a / 16) % 64; _sn_q = floor(_sn_a / 1024);
+            _sn_nb = seq_note_at(_sn_p, _sn_l, _sn_s); _sn_k = 0;
+            loop(SEQ_CHORD_N, _sn_k >= 0 && _sn_nb[0] == 0 ? ( _sn_k = -1; ) : ( _sn_k >= 0 ? ( _sn_nb += SEQ_NOTE_F; _sn_k += 1; ); ); );
+            _sn_k < 0 && _sn_q <= 127 ? (
+              _sn_nb[1] = max(1, min(127, _sn_w % 128)); _sn_nb[2] = max(128, min(256 * 128 + 100, floor(_sn_w / 128)));
+              _sn_nb[0] = _sn_q + 1;
+            );
+          );
+        );
+      );
+    );
+    _sn_p += 1;
+  );
+  _sn_ok;
+);
+// ─── Round two H (2026-10-21): each pattern's own NAME and COLOUR, and the COUNT of patterns on show (META, 5) ───
+// The user: "the chips that indicate which pattern we have selected, can those be color-coded as well? ... it did not
+// show all the patterns at once. It allowed for there to be room until more patterns were created." A pattern keeps
+// its own name (16 chars) and colour (packed RGB, 0 = none: the chip takes a hue from its number) in the META block,
+// written as its own tag: the project file and a kit's record both carry it, and a build before this skips the tag
+// by its length. The COUNT (seq_npat: the chips on show, 1..32; "+" adds one, DUP raises it, SONG on follows the
+// regions) is SETTINGS cell 26 in the project; a kit's record has no settings, so after a kit lands the count is
+// raised to show every used pattern (seq_npat_fix; the same for an older project's stream, which has no count). The
+// face owns seq_npat and the meta; the engine reads the count for the trigger range only (a note past it does
+// nothing, the user's choice).
+SEQ_META_F   = 17;      // a pattern's record: +0 colour (packed RGB, 0 none), +1..16 the name's chars, 0-terminated
+SEQ_NAME_LEN = 16;
+SEQ_SRZ_TAG_META = 5;
+seq_npat = 1;           // the patterns on show: a fresh sequencer shows one and "+"
+seq_meta = 0;
+function seq_meta_init(_mi_base) ( seq_meta = _mi_base; memset(seq_meta, 0, SEQ_PATS * SEQ_META_F); );
+function seq_meta_clear_all() ( seq_meta ? memset(seq_meta, 0, SEQ_PATS * SEQ_META_F); );
+function seq_meta_col(_mc_p) ( seq_meta[max(0, min(SEQ_PATS - 1, _mc_p | 0)) * SEQ_META_F] | 0; );
+function seq_meta_col_set(_ms_p, _ms_c) ( seq_meta[max(0, min(SEQ_PATS - 1, _ms_p | 0)) * SEQ_META_F] = max(0, min(16777215, _ms_c | 0)); );
+function seq_meta_has_name(_mh_p) ( seq_meta[max(0, min(SEQ_PATS - 1, _mh_p | 0)) * SEQ_META_F + 1] >= 32; );
+// the name into #seq_meta_str (the caller copies it out); returns its length
+function seq_meta_name(_mn_p) local(_mn_b, _mn_k, _mn_c) (
+  _mn_b = seq_meta + max(0, min(SEQ_PATS - 1, _mn_p | 0)) * SEQ_META_F + 1;
+  strcpy(#seq_meta_str, ""); _mn_k = 0; _mn_c = _mn_b[0] | 0;
+  while(_mn_k < SEQ_NAME_LEN && _mn_c >= 32 && _mn_c < 127) (
+    sprintf(#seq_meta_c, "%c", _mn_c); strcat(#seq_meta_str, #seq_meta_c);
+    _mn_k += 1; _mn_c = _mn_k < SEQ_NAME_LEN ? _mn_b[_mn_k] | 0 : 0;
+  );
+  _mn_k;
+);
+function seq_meta_name_set(_ns_p, _ns_str) local(_ns_b, _ns_k, _ns_n, _ns_c) (
+  _ns_b = seq_meta + max(0, min(SEQ_PATS - 1, _ns_p | 0)) * SEQ_META_F + 1;
+  _ns_n = min(SEQ_NAME_LEN, strlen(_ns_str)); _ns_k = 0;
+  loop(SEQ_NAME_LEN, _ns_c = _ns_k < _ns_n ? str_getchar(_ns_str, _ns_k) : 0; _ns_b[_ns_k] = (_ns_c >= 32 && _ns_c < 127) ? _ns_c : 0; _ns_k += 1; );
+);
+function seq_meta_clear(_mx_p) ( memset(seq_meta + max(0, min(SEQ_PATS - 1, _mx_p | 0)) * SEQ_META_F, 0, SEQ_META_F); );
+// the last used pattern + 1 (0 = none)
+function seq_npat_used() local(_nu_p, _nu_u) (
+  _nu_u = 0; _nu_p = 0; loop(SEQ_PATS, seq_pat_used(_nu_p) ? _nu_u = _nu_p + 1; _nu_p += 1; );
+  _nu_u;
+);
+// the count after a project read (@serialize, which restores the face's words the same way): never below one, never
+// below the last used pattern
+function seq_npat_fix() ( seq_npat = max(1, min(SEQ_PATS, max(seq_npat | 0, seq_npat_used()))); );
+// a kit landed (@block): @block never writes seq_npat (the face's word, written every frame); it posts the count the kit's
+// patterns want -- the value first, the sequence number bumped LAST -- and the face raises its count to it once
+seq_npat_req_v = 0; seq_npat_req_n = 0;
+function seq_npat_post() ( seq_npat_req_v = seq_npat_used(); seq_npat_req_n += 1; );
+function seq_srz_count_meta() ( 1 + SEQ_PATS * SEQ_META_F; );
+// the META block, both directions: the record count, then the records; a read clamps every cell to its kind. The count's
+// bound is the stream's (SEQ_SRZ_PATS_MAX, as PATS and NOTES allow), not this build's: a later build holding more patterns
+// writes more records, read here to this build's count and the rest dropped -- SEQ_PATS can grow (audit K14, 2026-10-26)
+function seq_srz_meta(_ch) local(_sm_ok, _sm_k, _sm_v, _sm_n, seq_srz_n) (
+  seq_srz_n = SEQ_PATS; seq_srz_n = seq_io_var(seq_srz_n, _ch);
+  _sm_n = seq_srz_n | 0;
+  _sm_ok = _sm_n >= 0 && _sm_n <= SEQ_SRZ_PATS_MAX;
+  _sm_ok ? (
+    seq_io_mem(seq_meta, min(_sm_n, SEQ_PATS) * SEQ_META_F, _ch);
+    _sm_n > SEQ_PATS ? seq_srz_skip((_sm_n - SEQ_PATS) * SEQ_META_F, _ch);
+  );
+  seq_io_rd(_ch) ? (
+    _sm_k = 0;
+    loop(SEQ_PATS * SEQ_META_F,
+      _sm_v = seq_meta[_sm_k] | 0;
+      seq_meta[_sm_k] = (_sm_k % SEQ_META_F) == 0 ? max(0, min(16777215, _sm_v)) : ((_sm_v >= 32 && _sm_v < 127) ? _sm_v : 0);
+      _sm_k += 1;
+    );
+  );
+  _sm_ok;
+);
+// The lanes' mute and solo from one pattern's legacy fields 4 / 5 (an older file; the timing rig's passes too).
+function seq_gms_migrate(_gm_p) local(_gm_l, _gm_lb) (
+  seq_gmute = 0; seq_gsolo = 0; _gm_p = max(0, min(SEQ_PATS - 1, _gm_p | 0));
+  _gm_l = 0; loop(SEQ_LANES, _gm_lb = seq_lane_at(_gm_p, _gm_l); _gm_lb[4] ? seq_gmute += 2 ^ _gm_l; _gm_lb[5] ? seq_gsolo += 2 ^ _gm_l; _gm_l += 1; );
+);
+// The tagged stream, both directions, on the channel seq_io_mode names. A WRITE gives the tags from _st_from on (0
+// SETTINGS, 1 PATTERNS, 2 NOTES, 3 META): the project file all four, a kit's record (S3c) from 1 -- a kit carries no
+// settings (the options, the lanes' mute and solo, the view are the project's). SONG is no longer written (D9, 2026-10-29;
+// it was the second, between SETTINGS and PATTERNS). A READ takes whatever tags the stream carries, SONG included, in any
+// order (_st_from is the writer's alone). Returns 1 when every count met its bound.
+function seq_srz_tagged(_st_from, _ch) local(_ss_k, _ss_nt, _ss_tag, _ss_len, _ss_ok, _ss_pos, _ss_used, seq_srz_len, seq_srz_n, seq_srz_tag) (
+  seq_srz_n = 4 - _st_from; seq_srz_n = seq_io_var(seq_srz_n, _ch);
+  _ss_nt = seq_srz_n | 0; _ss_ok = _ss_nt >= 0 && _ss_nt <= SEQ_SRZ_TAGS_MAX;
+  _ss_k = 0;
+  while(_ss_ok && _ss_k < _ss_nt) (
+    !seq_io_rd(_ch) ? (
+      seq_srz_tag = (_st_from + _ss_k) == 0 ? SEQ_SRZ_TAG_SET : (_st_from + _ss_k) == 1 ? SEQ_SRZ_TAG_PATS : (_st_from + _ss_k) == 2 ? SEQ_SRZ_TAG_NOTES : SEQ_SRZ_TAG_META;
+      seq_srz_len = seq_srz_tag == SEQ_SRZ_TAG_SET ? SEQ_SRZ_SET_N
+                  : seq_srz_tag == SEQ_SRZ_TAG_PATS ? seq_srz_count_pats()
+                  : seq_srz_tag == SEQ_SRZ_TAG_NOTES ? seq_srz_count_notes() : seq_srz_count_meta();
+    );
+    seq_srz_tag = seq_io_var(seq_srz_tag, _ch); seq_srz_len = seq_io_var(seq_srz_len, _ch);
+    _ss_tag = seq_srz_tag | 0; _ss_len = seq_srz_len | 0;
+    _ss_len < 0 || _ss_len > SEQ_SRZ_LEN_MAX ? _ss_ok = 0 : (
+      _ss_pos = seq_io[_ch * SEQ_IO_F + 5];
+      _ss_tag == SEQ_SRZ_TAG_SET ? seq_srz_settings(_ss_len, _ch)
+      : _ss_tag == SEQ_SRZ_TAG_SONG ? _ss_ok = seq_srz_song(_ch)
+      : _ss_tag == SEQ_SRZ_TAG_PATS ? _ss_ok = seq_srz_pats(_ch)
+      : _ss_tag == SEQ_SRZ_TAG_NOTES ? _ss_ok = seq_srz_notes(_ch)
+      : _ss_tag == SEQ_SRZ_TAG_META ? _ss_ok = seq_srz_meta(_ch)
+      : seq_srz_skip(_ss_len, _ch);   // a tag this build does not know: a later build's; skipped whole
+      // A read holds every tag to its STATED length (audit K14, 2026-10-26): a later build that grows a known tag's record
+      // leaves cells this reader does not know -- skipped here, so the next tag is read where it starts, as the comment
+      // above promises; a tag whose body read PAST its stated length (a record shorter than this build's) has desynced:
+      // the read stops, and nothing after the tag is touched (the count rule's answer, wiki 3.5).
+      seq_io_rd(_ch) && _ss_ok ? (
+        _ss_used = seq_io[_ch * SEQ_IO_F + 5] - _ss_pos;
+        _ss_used < _ss_len ? seq_srz_skip(_ss_len - _ss_used, _ch) : _ss_used > _ss_len ? _ss_ok = 0;
+      );
+    );
+    _ss_k += 1;
+  );
+  _ss_ok;
+);
+// The stream's size in cells as seq_srz_tagged(_sc_from) writes it: the count word, then each tag's two words and its body.
+function seq_srz_count_all(_sc_from) local(_sc_n) (
+  _sc_n = 1;
+  _sc_from <= 0 ? _sc_n += 2 + SEQ_SRZ_SET_N;
+  _sc_from <= 1 ? _sc_n += 2 + seq_srz_count_pats();
+  _sc_from <= 2 ? _sc_n += 2 + seq_srz_count_notes();
+  _sc_from <= 3 ? _sc_n += 2 + seq_srz_count_meta();
+  _sc_n;
+);
+// The whole gate. Called by the host inside `ser_ver >= 78 ? ...` in both directions; the host's
+// `is_read && ser_ver < 78` backfill is seq_clear_all. A write is always the tagged stream (ser_ver 79); a read
+// takes the file's own gate: 79 tagged, 78 the positional body (seq_srz_body78, then the W conversion).
+function seq_serialize() local(_ss_ok) (
+  seq_io[0] = 0; seq_io[4] = is_read ? 1 : 0;   // channel 0: the project file, @serialize's alone
+  is_read ? ( seq_clear_all(); seq_meta_clear_all(); seq_npat = 1; seq_ui_undo_wait = 0; );   // whatever the stream does not carry is empty, never the
+                                                        // previous project's; and a read IS the state REAPER wants (an
+                                                        // undo, a load): a point still pending for an edit before it
+                                                        // would capture this state and drop the redo history (self-audit
+                                                        // 2026-10-20 finding 9)
+  is_read && ser_ver < 79 ? (
+    seq_srz_body78(0);
+    seq_srz_convert_78();
+  ) : (
+    _ss_ok = seq_srz_tagged(0, 0);
+    is_read && !_ss_ok ? seq_srz_bad = 1;
+  );
+  is_read ? seq_npat_fix();   // round two H: an older stream has no count (a 78 file none at all -- only the tagged branch fixed it until audit K15); never below the last used pattern
+  // An older file kept mute and solo per PATTERN (lane fields 4 / 5): the pattern it opens on gives the lanes theirs, the
+  // way the user last heard it (the polish pass, 2026-10-20: "if the pattern changes the solos and mute changes").
+  is_read && !seq_gms_srz ? seq_gms_migrate(seq_cur);
+);
+
+// ─── S3c: the patterns in a kit file (Spec_Swing_Seq_View decision 23, the plan's S3c; 2026-10-20) ─────────────────
+// A whole-kit SAVE publishes the tagged stream from tag 1 (PATTERNS, NOTES, META -- no settings; SONG too until D9) into the EON_SEQ_KIT
+// band and the bridge packs it as the kit file's tail record 7 (eon_seq_pack); a whole-kit LOAD stages it back
+// (eon_seq_stage) and the plugin adopts it. The band: +0 the bridge's staged flag (written last, cleared on adopt),
+// +1 the record's version, +2 the cells the publisher wrote (0 = no record: an empty sequencer or a bank-only save;
+// -1 = refused, too big for the band: the kit is saved without, the face says so), +3 the overflow in cells when
+// refused, +8.. the cells. One band for every instance: the kit bus's LOCK serializes a save and a load, the KMAC_KIT
+// discipline. Both ends run in @block, the walk's thread (the patterns are its): seq_kit_pub_req (the export's state
+// 11 asks by bumping it, with seq_kit_pub_only the kind; state 12 hands the bus over once seq_kit_pub_ack, @block's
+// own cell, meets it -- one writer a cell) and seq_kit_adopt_req (the import's bank A pass, @block's) are the
+// requests the host's @block answers right before the walk; rk_swing_ui_state is imported before this file.
+seq_kit_pub_req = 0; seq_kit_pub_ack = 0; seq_kit_pub_only = 0;   // the request counter (@gfx's), its ack (@block's), the kind
+seq_kit_adopt_req = 0;                                           // @block's alone (the import tick asks, the host answers)
+seq_kit_last = 0; seq_kit_over = 0;   // the last publish: cells written, 0 none, -1 refused (seq_kit_over cells too many)
+seq_kit_pubs = 0;                     // bumped per publish: the face says when one was refused
+seq_kit_adopted = 0;                  // bumped per adopt: the face says so and makes the undo point
+// FU-P (2026-10-26; the owner's decision on SQ-K question 1, the stricter version: "when you play the pattern and change
+// the kit, the pattern keeps playing"): a kit load NEVER changes the user's patterns, the song, the names / colours or
+// the pattern on screen -- not even an empty sequencer's. A whole-kit load whose kit CARRIES patterns only puts them ON
+// OFFER, in the plugin's own copy (seq_kit_pend, EON_SEQ_KIT_CAP cells the host claims; the gmem band is one for every
+// instance and the next save or load writes it), until the face's one click uses them, the user dismisses the offer, or
+// the next whole-kit load replaces it. The copy is @block's alone; it is never saved: a reopen (or an @init re-run)
+// drops the offer. The face asks through seq_kit_ui_req (its counter, bumped LAST after seq_kit_ui_act -- 1 use, 2
+// dismiss -- and seq_kit_ui_gen, the offer it answers); @block answers in seq_kit_ui_tick and acks.
+seq_kit_pend = 0;        // the copy's base (seq_kit_pend_init; 0 = the host claimed none: a kit's record is then dropped)
+seq_kit_pend_n = 0;      // cells on offer (0 = no offer); written LAST when an offer is made, the face shows it while > 0
+seq_kit_pend_gen = 0;    // bumped per offer: a click answers the offer it saw, never a newer one
+seq_kit_offered = 0;     // bumped per offer (the tests' and the rig's count)
+seq_kit_ui_req = 0; seq_kit_ui_act = 0; seq_kit_ui_gen = 0;   // @gfx's
+seq_kit_ui_ack = 0;                                          // @block's
+function seq_kit_pend_init(_kq_base) ( seq_kit_pend = _kq_base; seq_kit_pend_n = 0; );
+// Is there anything for a kit's record? A used pattern (the song chain is not written since D9, so its length -- always
+// 0: nothing fills it -- is no longer asked).
+function seq_any_used() local(_au_p, _au_u) (
+  _au_u = 0; _au_p = 0;
+  loop(SEQ_PATS, !_au_u && seq_pat_used(_au_p) ? _au_u = 1; _au_p += 1; );
+  _au_u;
+);
+// The patterns and the song back to empty: a kit's record arrives into a clean slate; the settings stay the project's.
+function seq_kit_clear() local(_kc_p) (
+  _kc_p = 0; loop(SEQ_PATS, seq_clear_pattern(_kc_p); _kc_p += 1; );
+  seq_meta_clear_all();   // round two H: the names and colours are the kit's too
+  memset(seq_song, 0, SEQ_SONG_MAX * 2);
+  seq_song_len = 0; seq_song_loop = 0; seq_song_pos = 0;
+  // the pattern on screen: back to 1 when stopped; while the transport plays it KEEPS its number (FU-P, the owner: never
+  // jump the playing pattern mid-play) -- the walkers restart on that number's new content, in phase with the timeline
+  !(play_state & 1) ? seq_cur = 0;   // (the page: the face clamps it to the pattern on screen)
+);
+// The publish (@block, the block after the export's state 11 asks): _kp_only = a bank-only save or a bank pass of the
+// whole-kit walk, which carry no patterns (the walk's final pass is bank A's: that one carries them).
+function seq_kit_publish() local(_kp_n, _kp_w, _kp_b, _kp_only) (
+  _kp_only = seq_kit_pub_only;
+  gmem[EON_SEQ_KIT_BASE + 1] = 1; gmem[EON_SEQ_KIT_BASE + 3] = 0; seq_kit_over = 0;
+  _kp_only || !seq_any_used() ? ( gmem[EON_SEQ_KIT_BASE + 2] = 0; seq_kit_last = 0; ) : (
+    _kp_n = seq_srz_count_all(1);
+    _kp_n > EON_SEQ_KIT_CAP ? (
+      gmem[EON_SEQ_KIT_BASE + 2] = -1; gmem[EON_SEQ_KIT_BASE + 3] = _kp_n - EON_SEQ_KIT_CAP;
+      seq_kit_last = -1; seq_kit_over = _kp_n - EON_SEQ_KIT_CAP;
+    ) : (
+      _kp_b = seq_io + SEQ_IO_F;   // channel 1: the band, written
+      _kp_b[0] = 1; _kp_b[1] = EON_SEQ_KIT_BASE + 8; _kp_b[2] = EON_SEQ_KIT_BASE + 8 + EON_SEQ_KIT_CAP; _kp_b[3] = 0; _kp_b[4] = 0;
+      seq_srz_tagged(1, 1);
+      _kp_w = _kp_b[1] - (EON_SEQ_KIT_BASE + 8);
+      _kp_b[3] || _kp_w != _kp_n ? (   // the count and the write disagree: refused rather than a short record
+        gmem[EON_SEQ_KIT_BASE + 2] = -1; gmem[EON_SEQ_KIT_BASE + 3] = max(1, _kp_w - EON_SEQ_KIT_CAP);
+        seq_kit_last = -1; seq_kit_over = max(1, _kp_w - EON_SEQ_KIT_CAP);
+      ) : ( gmem[EON_SEQ_KIT_BASE + 2] = _kp_w; seq_kit_last = _kp_w; );
+    );
+  );
+  seq_kit_pubs += 1;
+  seq_kit_pub_ack = seq_kit_pub_req;   // LAST: the export's state 12 hands the bus to the bridge once the ack meets the request
+);

@@ -1,0 +1,661 @@
+// rk_synthdrums_p3.jsfx-inc -- part 3 of rk_synthdrums.jsfx-inc (3 parts), cut at a function boundary by
+// .dev_tests/split_big_incs.py: REAPER's load time grows with the square of a file's size. Edit freely;
+// keep each file under about 40 KB.
+
+// ⚠️ @init IS LOAD-BEARING (.docs/wiki/02-file-structure.md).
+@init
+
+// ── two more of his filter primitives (saikedrums_basic_filters 17-92) ─────
+// 1-pole: b[0]=coeff b[1]=s. init uses tan() - trigger rate only.
+function rk_syn_dd_lp1_set(b, freq)
+local(g)
+global(srate)
+(
+  g = tan($pi * freq / srate);
+  b[0] = g / (1 + g);
+);
+
+function rk_syn_dd_lp1_hp(b, x)
+local(v, y)
+global()
+(
+  v = b[0] * (x - b[1]);
+  y = v + b[1];
+  b[1] = y + v;
+  x - y;
+);
+
+// his init_linearSVF_bell(raw_freq, invq, gain_factor): k = invq/gain_factor,
+// m1 = k*(gain_factor^2 - 1). Same eval as our rk_syn_bell block layout.
+function rk_syn_dd_bell_set_invq_keep(b, fc, invq, gain_factor)
+local(g, k)
+global(srate)
+(
+  fc = min(fc, 0.5 * srate);
+  g = tan($pi * fc / srate);
+  k = invq / gain_factor;
+  b[0] = g;
+  b[1] = k;
+  b[2] = 1.0 / (1.0 + g * (g + k));
+  b[3] = g * b[2];
+  b[4] = g * b[3];
+  b[5] = k * (gain_factor * gain_factor - 1.0);
+);
+
+// ============================================================================
+// DD-101 RIM — types 0, 1, 2 (rim_synth1/2/3, drum_elements 1638-1784).
+// Type 3 is start_sample — out of scope. One shared skeleton: three decaying
+// states + fast attack + 4-5 resonant BPs + soft clip y/(1+|y|) (t2: 2x).
+// All three ARE exact-nullable: the rand-carrying filters are separable.
+// state: 46 cells.
+// ============================================================================
+RK_DDM_SEED  = 0;
+RK_DDM_TYPE  = 1;
+RK_DDM_PST   = 2;   // punch.state
+RK_DDM_PST2  = 3;
+RK_DDM_PST3  = 4;
+RK_DDM_PATK  = 5;
+RK_DDM_PK    = 6;
+RK_DDM_PK2   = 7;
+RK_DDM_PK3   = 8;
+RK_DDM_PKATK = 9;
+RK_DDM_BP    = 11;
+RK_DDM_BP2   = 18;
+RK_DDM_BP3   = 25;
+RK_DDM_BP4   = 32;
+RK_DDM_BP5   = 39;
+RK_DDM_CELLS = 46;
+
+function rk_syn_dd_rim_reset(st, mtype, tune, decay)
+local(t_s, tuning)
+global(srate, RK_DDM_SEED, RK_DDM_TYPE, RK_DDM_PST, RK_DDM_PST2, RK_DDM_PST3,
+       RK_DDM_PATK, RK_DDM_PK, RK_DDM_PK2, RK_DDM_PK3, RK_DDM_PKATK,
+       RK_DDM_BP, RK_DDM_BP2, RK_DDM_BP3, RK_DDM_BP4, RK_DDM_BP5)
+(
+  st[RK_DDM_TYPE] = mtype;
+  st[RK_DDM_SEED] <= 0 ? st[RK_DDM_SEED] = 11111;
+  t_s = 0.015 * (0.5 + decay);
+  tuning = pow(2, tune - 0.5);
+
+  st[RK_DDM_PST] = 1; st[RK_DDM_PST2] = 1; st[RK_DDM_PST3] = 1;
+  st[RK_DDM_PATK] = 1;
+  st[RK_DDM_PK]  = pow(10, -24 / (20 * t_s * srate));
+  st[RK_DDM_PK2] = pow(10, -24 / (30 * t_s * srate));
+  st[RK_DDM_PK3] = pow(10, -24 / (30 * t_s * srate));
+  // ⚠️ t0's attack is 0.0004 s; t1/t2 use 0.003 s
+  st[RK_DDM_PKATK] = pow(10, -24 / (20 * (mtype == 0 ? 0.0004 : 0.003) * srate));
+
+  mtype == 0 ? (
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP,  220 * tuning,  0.005);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP2, 511 * tuning,  0.01);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP3, 1000,          0.06);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP4, 2600 * tuning, 0.02);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP5, 737,           0.01);
+  ) : mtype == 1 ? (
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP,  1750 * tuning, 0.05);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP2, 511 * tuning,  0.01);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP3, 908,           0.06);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP4, 4600 * tuning, 1);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP5, 708,           0.01);
+  ) : (
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP,  413 * tuning,  0.002);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP2, 1040 * tuning, 0.01);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP3, 1887,          0.06);
+    rk_syn_dd_svf_set_keep(st + RK_DDM_BP4, 1130 * tuning, 1);
+  );
+);
+
+function rk_syn_dd_rim_tick(st)
+local(y)
+global(RK_DDM_SEED, RK_DDM_TYPE, RK_DDM_PST, RK_DDM_PST2, RK_DDM_PST3,
+       RK_DDM_PATK, RK_DDM_PK, RK_DDM_PK2, RK_DDM_PK3, RK_DDM_PKATK,
+       RK_DDM_BP, RK_DDM_BP2, RK_DDM_BP3, RK_DDM_BP4, RK_DDM_BP5)
+(
+  st[RK_DDM_PATK] *= st[RK_DDM_PKATK];
+  st[RK_DDM_PST]  *= st[RK_DDM_PK];
+  st[RK_DDM_PST2] *= st[RK_DDM_PK2];
+  st[RK_DDM_PST3] *= st[RK_DDM_PK3];
+
+  st[RK_DDM_TYPE] == 0 ? (
+    y = (1 - st[RK_DDM_PATK]) * st[RK_DDM_PST3] * (
+      1.4 * rk_syn_svf_bp(st + RK_DDM_BP,  st[RK_DDM_PST2]) +
+      1.7 * rk_syn_svf_bp(st + RK_DDM_BP2, st[RK_DDM_PST3]) * st[RK_DDM_PST2] +
+      0.8 * rk_syn_svf_bp(st + RK_DDM_BP3, st[RK_DDM_PST] + rk_syn_dd_rand01(st + RK_DDM_SEED) - 0.5) * st[RK_DDM_PST3] +
+      0.2 * rk_syn_svf_bp(st + RK_DDM_BP4, st[RK_DDM_PST] + rk_syn_dd_rand01(st + RK_DDM_SEED) - 0.5) * st[RK_DDM_PST3] +
+      0.4 * rk_syn_svf_bp(st + RK_DDM_BP5, st[RK_DDM_PST] + rk_syn_dd_rand01(st + RK_DDM_SEED) - 0.5) * st[RK_DDM_PST3]);
+    y / (1 + abs(y));
+  ) : st[RK_DDM_TYPE] == 1 ? (
+    y = (1 - st[RK_DDM_PATK]) * st[RK_DDM_PST3] * (
+      1.4 * rk_syn_svf_bp(st + RK_DDM_BP,  st[RK_DDM_PST2]) +
+      1.7 * rk_syn_svf_bp(st + RK_DDM_BP2, st[RK_DDM_PST3]) * st[RK_DDM_PST2] +
+      0.8 * rk_syn_svf_bp(st + RK_DDM_BP3, st[RK_DDM_PST] + rk_syn_dd_rand01(st + RK_DDM_SEED) - 0.5) * st[RK_DDM_PST3] +
+      5   * rk_syn_svf_bp(st + RK_DDM_BP4, rk_syn_dd_rand01(st + RK_DDM_SEED) - 0.5) * st[RK_DDM_PST3] * st[RK_DDM_PST3] * st[RK_DDM_PST3] +
+      0.1 * rk_syn_svf_bp(st + RK_DDM_BP5, st[RK_DDM_PST]) * st[RK_DDM_PST3]);
+    y / (1 + abs(y));
+  ) : (
+    y = (1 - st[RK_DDM_PATK]) * (
+      0.4 * st[RK_DDM_PST3] * rk_syn_svf_bp(st + RK_DDM_BP, st[RK_DDM_PST2]) +
+      0.3 * rk_syn_svf_bp(st + RK_DDM_BP2, rk_syn_dd_rand01(st + RK_DDM_SEED) - 0.5) * st[RK_DDM_PST2] +
+      0.1 * rk_syn_svf_bp(st + RK_DDM_BP3, st[RK_DDM_PST3]) * st[RK_DDM_PST] +
+      0.5 * rk_syn_svf_bp(st + RK_DDM_BP4, rk_syn_dd_rand01(st + RK_DDM_SEED) - 0.5) * st[RK_DDM_PST3] * st[RK_DDM_PST3]);
+    2.0 * y / (1 + abs(y));
+  );
+);
+
+// ============================================================================
+// DD-101 COWBELL — all 4 types are synths (cowbell_synth1/2/3/4, 1829-2059).
+// ⚠️ t1 (synth2) contains NO rand() at all — his rand is commented out — so it
+// is FULLY exact-nullable with nothing silenced. Its reset assigns dt/dt2
+// THREE times (823→823.3→848.3); only the LAST pair is live, ported as such.
+// Its phases start at 0.5, not 0.
+// ⚠️ t3 (synth4) runs sin() per sample → LUT sine, phases kept in CYCLES
+// (increments divided by 2π at reset). Un-nullable ((1+0.2*rand()) multiplies
+// the tone) → coefficient parity.
+// ⚠️ t0/t2 excite a BP with the boolean (pulse > 0) — a timed square gate.
+// state: 66 cells (RK_DDW_CELLS).
+// ============================================================================
+RK_DDW_SEED   = 0;
+RK_DDW_TYPE   = 1;
+RK_DDW_PST    = 2;
+RK_DDW_PST2   = 3;
+RK_DDW_PST3   = 4;
+RK_DDW_PATK   = 5;
+RK_DDW_PK     = 6;
+RK_DDW_PK2    = 7;
+RK_DDW_PK3    = 8;
+RK_DDW_PKATK  = 9;
+RK_DDW_PULSE  = 10;
+RK_DDW_PULSE2 = 11;
+RK_DDW_DT     = 12;  // synth2 dt / synth4 sr   (cycles per sample)
+RK_DDW_DT2    = 13;  // synth2 dt2 / synth4 sr2 (cycles per sample)
+RK_DDW_T      = 14;  // synth2 t  / synth4 tc   (cycles)
+RK_DDW_T2     = 15;  // synth2 t2 / synth4 tc2  (cycles)
+RK_DDW_ST2INC = 16;  // synth4 punch.state2 (a decaying EXTRA phase increment)
+RK_DDW_F1     = 17;  // bp / cbp
+RK_DDW_F2     = 24;  // bp2 / cbp2
+RK_DDW_F3     = 31;  // bp3 / cbp3
+RK_DDW_F4     = 38;  // bp4 / cbp4
+RK_DDW_F5     = 45;  // bp5 / cbp5
+RK_DDW_F6     = 52;  // bp6 / cbp6
+RK_DDW_F7     = 59;  // lp  / cbp7
+RK_DDW_CELLS  = 66;
+
+function rk_syn_dd_cowbell_reset(st, wtype, tune, decay)
+local(t_s, tuning)
+global(srate, RK_DDW_SEED, RK_DDW_TYPE, RK_DDW_PST, RK_DDW_PST2, RK_DDW_PST3,
+       RK_DDW_PATK, RK_DDW_PK, RK_DDW_PK2, RK_DDW_PK3, RK_DDW_PKATK,
+       RK_DDW_PULSE, RK_DDW_PULSE2, RK_DDW_DT, RK_DDW_DT2, RK_DDW_T, RK_DDW_T2,
+       RK_DDW_ST2INC, RK_DDW_F1, RK_DDW_F2, RK_DDW_F3, RK_DDW_F4, RK_DDW_F5,
+       RK_DDW_F6, RK_DDW_F7)
+(
+  st[RK_DDW_TYPE] = wtype;
+  st[RK_DDW_SEED] <= 0 ? st[RK_DDW_SEED] = 55555;
+  tuning = pow(2, tune - 0.5);
+
+  wtype == 0 ? (
+    t_s = 0.03 * (0.5 + decay);
+    st[RK_DDW_PST] = 1; st[RK_DDW_PST2] = 1; st[RK_DDW_PST3] = 1;
+    st[RK_DDW_PULSE]  = 0.005 * srate;
+    st[RK_DDW_PULSE2] = 0.02 * srate * (0.5 + decay);
+    st[RK_DDW_PATK]  = 1;
+    st[RK_DDW_PK]    = pow(10, -24 / (20 * t_s * srate));
+    st[RK_DDW_PK2]   = pow(10, -24 / (30 * t_s * srate));
+    st[RK_DDW_PK3]   = pow(10, -24 / (50 * t_s * srate));
+    st[RK_DDW_PKATK] = pow(10, -24 / (20 * 0.003 * srate));
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F1, 487 * tuning,  0.002);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F2, 1033 * tuning, 0.01);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F3, 1496,          0.06);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F4, 2000 * tuning, 1);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F5, 2300 * tuning, 0.001);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F6, 3000 * tuning, 0.001);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F7, 1500 * tuning, 1);   // his lp
+  ) : wtype == 1 ? (
+    t_s = 0.036 * (0.25 + 1.25 * decay);
+    st[RK_DDW_PULSE] = 0.002 * srate * (0.5 + decay);
+    // his reset assigns dt/dt2 three times; final pair wins (848.3 / 563.2)
+    st[RK_DDW_DT]  = 848.3 / srate * tuning;
+    st[RK_DDW_DT2] = 563.2 / srate * tuning;
+    st[RK_DDW_T] = 0.5; st[RK_DDW_T2] = 0.5;    // phases start at 0.5
+    st[RK_DDW_PATK]  = 1;
+    st[RK_DDW_PKATK] = pow(10, -24 / (20 * 0.0002 * srate));
+    st[RK_DDW_PST]  = 1.0;
+    st[RK_DDW_PST2] = 0.15;
+    st[RK_DDW_PK]   = pow(10, -24 / (20 * t_s * srate));
+    st[RK_DDW_PK2]  = pow(10, -24 / (20 * 10 * t_s * srate));
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F1, 709.3 * tuning, 0.4);
+  ) : wtype == 2 ? (
+    t_s = 0.15 * (0.5 + decay);
+    st[RK_DDW_PST] = 1; st[RK_DDW_PST2] = 1; st[RK_DDW_PST3] = 1;
+    st[RK_DDW_PULSE]  = 0.005 * srate;
+    st[RK_DDW_PULSE2] = 0.02 * srate * (0.25 + decay);
+    st[RK_DDW_PATK]  = 1;
+    st[RK_DDW_PK]    = pow(10, -24 / (20 * t_s * srate));
+    st[RK_DDW_PK2]   = pow(10, -24 / (30 * t_s * srate));
+    st[RK_DDW_PK3]   = pow(10, -24 / (50 * t_s * srate));
+    st[RK_DDW_PKATK] = pow(10, -24 / (20 * 0.003 * srate));
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F1, 387 * tuning,  0.002);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F2, 430 * tuning,  0.001);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F3, 802,           0.006);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F4, 1281 * tuning, 0.05);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F5, 2596 * tuning, 0.001);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F6, 3172 * tuning, 0.001);
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F7, 4400 * tuning, 0.1);
+  ) : (
+    t_s = 0.15 * (0.5 + decay);
+    // his sr/sr2 and punch.state2 are RADIAN increments; stored in CYCLES for
+    // the LUT sine (spec §7 substitution)
+    st[RK_DDW_DT]  = (600 + 4200 * tune) / srate;
+    st[RK_DDW_DT2] = 0.62 * st[RK_DDW_DT];
+    st[RK_DDW_T] = 0; st[RK_DDW_T2] = 0;
+    st[RK_DDW_PST]    = 1;
+    st[RK_DDW_ST2INC] = 3600 / srate;
+    st[RK_DDW_PULSE]  = 0.005 * srate;
+    st[RK_DDW_PULSE2] = 0.02 * srate * (0.25 + decay);
+    st[RK_DDW_PATK]  = 1;
+    st[RK_DDW_PK]    = pow(10, -24 / (20 * t_s * srate));
+    st[RK_DDW_PK2]   = pow(10, -24 / (0.05 * t_s * srate));
+    st[RK_DDW_PKATK] = pow(10, -24 / (20 * 0.003 * srate));
+    rk_syn_dd_svf_set_keep(st + RK_DDW_F3, 802 + 400 * tune, 0.0006);
+  );
+);
+
+function rk_syn_dd_cowbell_tick(st)
+local(y, nz, nz2, sqrs)
+global(RK_DDW_SEED, RK_DDW_TYPE, RK_DDW_PST, RK_DDW_PST2, RK_DDW_PST3,
+       RK_DDW_PATK, RK_DDW_PK, RK_DDW_PK2, RK_DDW_PK3, RK_DDW_PKATK,
+       RK_DDW_PULSE, RK_DDW_PULSE2, RK_DDW_DT, RK_DDW_DT2, RK_DDW_T, RK_DDW_T2,
+       RK_DDW_ST2INC, RK_DDW_F1, RK_DDW_F2, RK_DDW_F3, RK_DDW_F4, RK_DDW_F5,
+       RK_DDW_F6, RK_DDW_F7)
+(
+  st[RK_DDW_TYPE] == 0 ? (
+    st[RK_DDW_PATK] *= st[RK_DDW_PKATK];
+    st[RK_DDW_PULSE]  -= 1;
+    st[RK_DDW_PULSE2] -= 1;
+    st[RK_DDW_PULSE2] < 0 ? (
+      st[RK_DDW_PST]  *= st[RK_DDW_PK];
+      st[RK_DDW_PST2] *= st[RK_DDW_PK2];
+      st[RK_DDW_PST3] *= st[RK_DDW_PK3];
+    );
+    nz  = 2 * rk_syn_dd_rand01(st + RK_DDW_SEED) - 1;
+    nz2 = rk_syn_svf_bp(st + RK_DDW_F2, nz);
+    0.15 * (1 - st[RK_DDW_PATK]) * (
+      1.4 * st[RK_DDW_PST3] * rk_syn_svf_bp(st + RK_DDW_F1, st[RK_DDW_PULSE] > 0) +
+      0.3 * nz2 * st[RK_DDW_PST2] +
+      3   * rk_syn_svf_bp(st + RK_DDW_F3, st[RK_DDW_PST3]) * st[RK_DDW_PST] +
+      0.4 * rk_syn_svf_bp(st + RK_DDW_F4, nz) * st[RK_DDW_PST3] * st[RK_DDW_PST3] +
+      0.02 * rk_syn_svf_bp(st + RK_DDW_F5, nz) * st[RK_DDW_PST3] +
+      0.01 * rk_syn_svf_bp(st + RK_DDW_F6, nz) * st[RK_DDW_PST2] +
+      rk_syn_svf_lp(st + RK_DDW_F7, nz) * st[RK_DDW_PST]);
+  ) : st[RK_DDW_TYPE] == 1 ? (
+    st[RK_DDW_PULSE] < 0 ? (
+      st[RK_DDW_PST]  *= st[RK_DDW_PK];
+      st[RK_DDW_PST2] *= st[RK_DDW_PK2];
+    ) : (
+      st[RK_DDW_PST] = 1.0 - 1.0 * st[RK_DDW_PATK];
+      st[RK_DDW_PATK] *= st[RK_DDW_PKATK];
+    );
+    st[RK_DDW_PULSE] -= 1;
+    st[RK_DDW_T]  += st[RK_DDW_DT];
+    st[RK_DDW_T2] += st[RK_DDW_DT2];
+    sqrs = st[RK_DDW_PST] + st[RK_DDW_PST2];
+    sqrs = sqrs / (1.0 + sqrs);
+    y = rk_syn_dd_saw(st[RK_DDW_T], st[RK_DDW_DT]);   // once: the dry term and the band-pass took the same saw twice (LIB343)
+    0.35 * (
+      0.5 * y
+      + 3 * rk_syn_svf_bp(st + RK_DDW_F1, y)
+      + rk_syn_dd_saw(st[RK_DDW_T2], st[RK_DDW_DT2])
+    ) * sqrs;
+  ) : st[RK_DDW_TYPE] == 2 ? (
+    st[RK_DDW_PATK] *= st[RK_DDW_PKATK];
+    st[RK_DDW_PULSE]  -= 1;
+    st[RK_DDW_PULSE2] -= 1;
+    st[RK_DDW_PULSE2] < 0 ? (
+      st[RK_DDW_PST]  *= st[RK_DDW_PK];
+      st[RK_DDW_PST2] *= st[RK_DDW_PK2];
+      st[RK_DDW_PST3] *= st[RK_DDW_PK3];
+    );
+    nz  = 2 * rk_syn_dd_rand01(st + RK_DDW_SEED) - 1;
+    nz2 = rk_syn_svf_bp(st + RK_DDW_F2, st[RK_DDW_PST3]);
+    0.24 * (1 - st[RK_DDW_PATK]) * (
+      1.4 * st[RK_DDW_PST3] * rk_syn_svf_bp(st + RK_DDW_F1, st[RK_DDW_PULSE] > 0) +
+      0.9 * nz2 * st[RK_DDW_PST2] +
+      0.3 * rk_syn_svf_bp(st + RK_DDW_F3, st[RK_DDW_PST]) * st[RK_DDW_PST] +
+      2.8 * rk_syn_svf_bp(st + RK_DDW_F4, st[RK_DDW_PST] + 0.1 * nz) * st[RK_DDW_PST3] * st[RK_DDW_PST3] +
+      0.2 * rk_syn_svf_bp(st + RK_DDW_F5, st[RK_DDW_PST]) * st[RK_DDW_PST3] +
+      0.2 * rk_syn_svf_bp(st + RK_DDW_F6, st[RK_DDW_PST]) * st[RK_DDW_PST2] +
+      6   * rk_syn_svf_bp(st + RK_DDW_F7, st[RK_DDW_PST]) * st[RK_DDW_PST]);
+  ) : (
+    st[RK_DDW_PATK] *= st[RK_DDW_PKATK];
+    st[RK_DDW_PULSE]  -= 1;
+    st[RK_DDW_PULSE2] -= 1;
+    st[RK_DDW_PULSE2] < 0 ? (
+      st[RK_DDW_PST]    *= st[RK_DDW_PK];
+      st[RK_DDW_ST2INC] *= st[RK_DDW_PK2];
+    );
+    // his: tc += sr + punch.state2 (radians). Ours accumulates CYCLES.
+    st[RK_DDW_T]  += st[RK_DDW_DT] + st[RK_DDW_ST2INC];
+    st[RK_DDW_T2] += st[RK_DDW_DT2];
+    nz2 = 0.1 * rk_syn_lut_sin(st[RK_DDW_T])
+        * (0.5 + rk_syn_lut_sin(st[RK_DDW_T2]))
+        * st[RK_DDW_PST]
+        * (1 + 0.2 * rk_syn_dd_rand01(st + RK_DDW_SEED));
+    0.04 * (1 - st[RK_DDW_PATK]) * (
+      rk_syn_svf_bp(st + RK_DDW_F3, rk_syn_dd_rand01(st + RK_DDW_SEED) - 0.5)
+      * st[RK_DDW_PST]
+    ) + nz2;
+  );
+);
+
+// ============================================================================
+// DD-101 SHAKER — synth types 0, 1, 2 (shaker_reset/tick, 2101-2203).
+// Type 3 is start_sample — out of scope. One shared env machine (attack
+// counter + up to 3 decaying states with threshold-triggered fast decays),
+// per-type filter stacks. t2 runs cos() per sample → LUT (phase in cycles;
+// his dt is RADIANS with a 44100/srate factor).
+// ⚠️ ALL noise-driven — no deterministic audio path (like the clap) → verified
+// by envelope-trajectory null + coefficient parity.
+// ⚠️ his reset writes global shaker_tune_freq (consumed by his MAIN jsfx, not
+// by drum_elements) — dropped from the port, noted here.
+// state: 60 cells (RK_DDK2_CELLS).
+// ============================================================================
+RK_DDK2_SEED  = 0;
+RK_DDK2_TYPE  = 1;
+RK_DDK2_EST   = 2;   // env.state
+RK_DDK2_EST2  = 3;
+RK_DDK2_EST3  = 4;
+RK_DDK2_EATK  = 5;   // env.attack
+RK_DDK2_ENATK = 6;   // env.n_attack (counts down)
+RK_DDK2_EK    = 7;
+RK_DDK2_EKATK = 8;
+RK_DDK2_EKFST = 9;
+RK_DDK2_EKSLW = 10;
+RK_DDK2_T     = 11;  // t2 phase (cycles)
+RK_DDK2_DT    = 12;
+RK_DDK2_LP    = 13;  // lp   (t0)
+RK_DDK2_LP2   = 20;  // lp2  (t0)
+RK_DDK2_HP2   = 27;  // hp2  (t1/t2)
+RK_DDK2_HP1P  = 34;  // hp 1-pole (t1/t2): coeff + s
+RK_DDK2_BELL  = 36;  // bell  (t1/t2)  8 cells
+RK_DDK2_BELL2 = 44;  // bell2 (t1/t2)
+RK_DDK2_BELL3 = 52;  // bell3 (t0)
+RK_DDK2_CELLS = 60;
+
+function rk_syn_dd_shaker_reset(st, ktype, tune, decay)
+local(t_decay, t_atk, tuning)
+global(srate, RK_DDK2_SEED, RK_DDK2_TYPE, RK_DDK2_EST, RK_DDK2_EST2,
+       RK_DDK2_EST3, RK_DDK2_EATK, RK_DDK2_ENATK, RK_DDK2_EK, RK_DDK2_EKATK,
+       RK_DDK2_EKFST, RK_DDK2_EKSLW, RK_DDK2_T, RK_DDK2_DT,
+       RK_DDK2_LP, RK_DDK2_LP2, RK_DDK2_HP2, RK_DDK2_HP1P,
+       RK_DDK2_BELL, RK_DDK2_BELL2, RK_DDK2_BELL3)
+(
+  st[RK_DDK2_TYPE] = ktype;
+  st[RK_DDK2_SEED] <= 0 ? st[RK_DDK2_SEED] = 12321;
+  st[RK_DDK2_EST] = 0;
+
+  ktype == 0 ? (
+    t_atk = 0.015;
+    tuning = min(0.5 + tune, 1.5);
+    t_decay = 0.03 * (0.5 + decay);
+    rk_syn_dd_svf_set_keep(st + RK_DDK2_LP,  5982 * tuning,  0.25);
+    rk_syn_dd_svf_set_keep(st + RK_DDK2_LP2, 11340 * tuning, 0.25);
+    rk_syn_dd_bell_set_invq_keep(st + RK_DDK2_BELL3, 850 * tuning, 3, 0.01);
+  ) : ktype == 1 ? (
+    t_atk = 0.03 * (0.5 + 0.25 * decay);
+    tuning = 0.5 + tune;
+    t_decay = 0.3 * (0.5 + 0.25 * decay);
+    rk_syn_dd_lp1_set(st + RK_DDK2_HP1P, 500 * tuning);
+    rk_syn_dd_svf_set_keep(st + RK_DDK2_HP2, 3000 * tuning, 1);
+    rk_syn_dd_bell_set_invq_keep(st + RK_DDK2_BELL,  5121 * tuning,  7, 20);
+    rk_syn_dd_bell_set_invq_keep(st + RK_DDK2_BELL2, 10121 * tuning, 9, 20);
+    st[RK_DDK2_EST2] = 1;
+  ) : (
+    st[RK_DDK2_T] = 0;
+    // his dt is RADIANS incl. a 44100/srate factor; stored in cycles
+    st[RK_DDK2_DT] = (0.0006 + 0.0003 * decay) * 44100 / srate / (2 * $pi);
+    t_atk = 0.03 * (0.5 + 0.25 * decay);
+    tuning = 0.5 + tune;
+    t_decay = 0.5 * (0.5 + 0.5 * decay);
+    rk_syn_dd_lp1_set(st + RK_DDK2_HP1P, 500 * tuning);
+    rk_syn_dd_svf_set_keep(st + RK_DDK2_HP2, 3000 * tuning, 1);
+    rk_syn_dd_bell_set_invq_keep(st + RK_DDK2_BELL,  5121 * tuning, 7, 20);
+    rk_syn_dd_bell_set_invq_keep(st + RK_DDK2_BELL2, 7121 * tuning, 9, 20);
+    st[RK_DDK2_EST2] = 1;
+    st[RK_DDK2_EST3] = 1;
+  );
+
+  st[RK_DDK2_EK]    = pow(10, -24 / (20 * t_decay * srate));
+  st[RK_DDK2_EKATK] = pow(10, -24 / (20 * t_atk * srate));
+  st[RK_DDK2_EKFST] = pow(10, -24 / (10 * t_decay * srate));
+  st[RK_DDK2_EKSLW] = pow(10, -24 / (30 * t_decay * t_decay * srate));
+  st[RK_DDK2_EATK]  = 1;
+  st[RK_DDK2_ENATK] = 2 * t_atk * srate;
+);
+
+function rk_syn_dd_shaker_tick(st)
+local(nz, nz2, y, envsq)
+global(RK_DDK2_SEED, RK_DDK2_TYPE, RK_DDK2_EST, RK_DDK2_EST2, RK_DDK2_EST3,
+       RK_DDK2_EATK, RK_DDK2_ENATK, RK_DDK2_EK, RK_DDK2_EKATK, RK_DDK2_EKFST,
+       RK_DDK2_EKSLW, RK_DDK2_T, RK_DDK2_DT,
+       RK_DDK2_LP, RK_DDK2_LP2, RK_DDK2_HP2, RK_DDK2_HP1P,
+       RK_DDK2_BELL, RK_DDK2_BELL2, RK_DDK2_BELL3)
+(
+  st[RK_DDK2_ENATK] > 0 ? (
+    st[RK_DDK2_ENATK] -= 1;
+    st[RK_DDK2_EST] = 1.0 - st[RK_DDK2_EATK];
+    st[RK_DDK2_EATK] *= st[RK_DDK2_EKATK];
+  ) : (
+    st[RK_DDK2_EST] *= st[RK_DDK2_EK];
+  );
+
+  nz = rk_syn_dd_rand01(st + RK_DDK2_SEED) - 0.5;
+
+  st[RK_DDK2_TYPE] == 0 ? (
+    y = 100 * st[RK_DDK2_EST] * (
+      rk_syn_svf_lp(st + RK_DDK2_LP2,
+        rk_syn_svf_lp(st + RK_DDK2_LP,
+          rk_syn_bell(st + RK_DDK2_BELL3, nz * nz * nz)))
+      + 0.0001 * nz);
+  ) : st[RK_DDK2_TYPE] == 1 ? (
+    st[RK_DDK2_EST] < 0.75 ? st[RK_DDK2_EST] *= st[RK_DDK2_EKFST];
+    st[RK_DDK2_EST2] *= st[RK_DDK2_EKFST];
+    nz2 = rk_syn_dd_rand01(st + RK_DDK2_SEED) - 0.5;
+    envsq = st[RK_DDK2_EST] * st[RK_DDK2_EST];
+    y = 0.75 * envsq * (
+      0.005 * rk_syn_bell(st + RK_DDK2_BELL,
+                rk_syn_svf_hp(st + RK_DDK2_HP2, nz)) +
+      0.007 * st[RK_DDK2_EST2] * rk_syn_bell(st + RK_DDK2_BELL2,
+                rk_syn_dd_lp1_hp(st + RK_DDK2_HP1P, nz2)) +
+      0.0005 * nz);
+  ) : (
+    st[RK_DDK2_EST] < 0.175 ? st[RK_DDK2_EST] *= st[RK_DDK2_EKFST];
+    st[RK_DDK2_EST2] *= st[RK_DDK2_EKFST];
+    st[RK_DDK2_EST3] *= st[RK_DDK2_EKSLW];
+    nz2 = (rk_syn_dd_rand01(st + RK_DDK2_SEED) > 0.15)
+        * (rk_syn_dd_rand01(st + RK_DDK2_SEED) - 0.5);
+    nz *= (rk_syn_dd_rand01(st + RK_DDK2_SEED) > 0.995);
+
+    st[RK_DDK2_T] += st[RK_DDK2_DT];
+    envsq = st[RK_DDK2_EST] * st[RK_DDK2_EST];
+    y = 0.75 * rk_syn_lut_cos(st[RK_DDK2_T])
+      * (envsq + st[RK_DDK2_EST3] * (1 - st[RK_DDK2_EST]) * (1 - st[RK_DDK2_EST2])) * (
+      0.005 * rk_syn_bell(st + RK_DDK2_BELL,
+                rk_syn_svf_hp(st + RK_DDK2_HP2, nz)) +
+      0.009 * st[RK_DDK2_EST2] * rk_syn_bell(st + RK_DDK2_BELL2,
+                rk_syn_dd_lp1_hp(st + RK_DDK2_HP1P, nz2)) +
+      0.0005 * nz);
+  );
+  y;
+);
+
+// ══════════════════════════════════════════════════════════════════════════
+// ENGINE DISPATCH — DD-101 PARITY LAYER (Spec_Synthdrums_Parity §4-§5)
+//
+// ps_engine encodes family + 10*type (family = engine%10 0..8, type =
+// floor(engine/10) 0..3). Legacy values 0..5 decode as families 0..5 type 0;
+// the old CYM slot (4) is the RIDE family. The legacy rk_syn_<fam>_* engines
+// were removed after their 2026-08-12 retirement; only shared helpers remain.
+//
+// Voice-state layout: st[0] = family (tick dispatch), st[1] = per-hit PRNG
+// seed (written by rk_swing_core BEFORE reset — the existing contract),
+// engine state at st+2. Worst engine (the ride, RK_DDR_CELLS = 232) + 2 = 234
+// <= 256.
+//
+// MACRO CONTRACT (spec §4.1): each macro is the normalized position of ONE of
+// his sliders, and rk_syn_dd_macro_default() returns his slider default in
+// that normalization — so ALL MACROS AT DEFAULT == THE DD-101 FACTORY SOUND,
+// exactly. Unassigned macros are inert. Velocity inside the engine is his
+// default (all sens = 0): the core already applies vel to level.
+//
+// Pad TUNE (semitones): families with exponential tune (tom/rim/cowbell types
+// 0-2) fold in exactly (+s/12 pre-pow); kick/snare and cowbell type 3 (linear
+// in t) transpose their frequency and re-normalise; hat/ride post-scale every
+// oscillator increment by 2^(s/12) (ride t0's two TONE-swept oscillators are
+// latched at launch with the ratio, rk_syn_dd_ride_latch_dt56); shaker scales
+// its linear tuning term.
+// ══════════════════════════════════════════════════════════════════════════
+// The family table by name -- documentation: rk_syn_reset / rk_syn_tick, the
+// LCD and the synth view all use the literal numbers, and nothing reads these.
+RK_SYN_RIDE     = 4;   // the old CYM slot
+RK_SYN_RIM      = 6;
+RK_SYN_COWBELL  = 7;
+RK_SYN_SHAKER   = 8;
+RK_SYN_FAMILIES = 9;
+
+// assigned macros per family (UI hides the inert knobs beyond this)
+function rk_syn_dd_macro_count(fam)
+global()
+(
+  fam == 0 ? 6 : fam == 1 ? 6 : fam == 2 ? 2 :
+  fam == 3 ? 5 : fam == 4 ? 4 : fam == 5 ? 3 : 2;
+);
+
+// synth type variants per family (spec §3: sampler type-3s excluded)
+function rk_syn_dd_type_count(fam)
+global()
+(
+  fam == 0 || fam == 1 || fam == 7 ? 4 : 3;
+);
+
+// his slider defaults, normalized to macro space (spec §4.1 table)
+function rk_syn_dd_macro_default(fam, idx)
+global()
+(
+  fam == 0 ? (   // KICK: TUNE PDEC ADEC PENV NOISE SHIFT - -
+    idx == 0 ? 0.15 : idx == 1 ? 0.70 : idx == 2 ? 0.30 :
+    idx == 3 ? 0.60 : idx == 4 ? 0.78 : 0;
+  ) :
+  fam == 1 ? (   // SNARE: TUNE DECAY ADEC PENV NDEC SHIFT - -
+    idx == 1 ? 0.67 : idx == 2 ? 0.30 : idx == 3 ? 0.30 :
+    idx == 4 ? 0.20 : 0;
+  ) :
+  fam == 2 ? (   // CLAP: ATTACK DECAY - - - - - -
+    idx == 0 ? 0.50 : idx == 1 ? 0.25 : 0;
+  ) :
+  fam == 3 ? (   // HAT: ATTACK DECAY TONE BODY OPEN - - -
+    idx <= 2 ? 0.50 : idx == 3 ? 0.41666666666666667 /* 0.5 of 0..1.2 */ : 0;
+  ) :
+  fam == 4 ? (   // RIDE: ATTACK DECAY TONE DUTY - - - -
+    idx <= 2 ? 0.50 : idx == 3 ? 0.4798 : 0;
+  ) :
+  fam == 5 ? (   // TOM: TUNE DECAY WHICH(hi/mid/low) - - - - -
+    idx <= 2 ? 0.50 : 0;
+  ) : (          // RIM / COWBELL / SHAKER: TUNE DECAY - - - - - -
+    idx <= 1 ? 0.50 : 0;
+  );
+);
+
+function rk_syn_reset(engine, st, mac, tune, vel)
+local(fam, typ, es, seed, f, kb, t2, i)
+global(srate,
+       RK_DDK_SEED, RK_DDS_SEED, RK_DDH_SEED, RK_DDH_DT,
+       RK_DDC_SEED, RK_DDR_SEED, RK_DDR_DT, RK_DDT_SEED,
+       RK_DDM_SEED, RK_DDW_SEED, RK_DDK2_SEED, RK_DDR_TUNEF)
+(
+  engine = max(0, engine|0);
+  typ = (engine * 0.1)|0;
+  fam = engine - typ * 10;
+  fam > 8 ? ( fam = 0; typ = 0; );
+  typ > 3 ? typ = 3;
+
+  st[0] = fam;
+  seed  = st[1];                      // per-hit seed from the core (nonzero)
+  es    = st + 2;
+  f     = pow(2, tune / 12);          // pad transposition factor
+
+  fam == 0 ? (
+    es[RK_DDK_SEED] = seed;
+    // transpose his bottom frequency (20 + 80*t), re-normalize, clamp
+    t2 = ((20 + 80 * mac[0]) * f - 20) / 80;
+    t2 = max(0, min(1, t2));
+    kb = log((20 + 80 * t2) / 22050);
+    rk_syn_dd_kick_reset(es, typ, mac[1], mac[2], mac[4],
+                         mac[3] * 0.5, kb, mac[5] >= 0.5);
+  ) :
+  fam == 1 ? (
+    es[RK_DDS_SEED] = seed;
+    t2 = ((170 + 230 * mac[0]) * f - 170) / 230;
+    t2 = max(0, min(1, t2));
+    rk_syn_dd_snare_reset(es, typ, mac[1], mac[2], mac[4],
+                          mac[3], log((170 + 230 * t2) / 22050), t2,
+                          mac[5] >= 0.5);
+  ) :
+  fam == 2 ? (
+    es[RK_DDC_SEED] = seed;
+    rk_syn_dd_clap_reset(es, min(typ, 2), mac[0], mac[1]);
+  ) :
+  fam == 3 ? (
+    es[RK_DDH_SEED] = seed;
+    rk_syn_dd_hat_reset(es, min(typ, 2), mac[4] < 0.5 ? 1 : 0,
+                        mac[0], mac[1], mac[2], mac[3] * 1.2);
+    tune != 0 ? ( i = 0; loop(13, es[RK_DDH_DT + i] *= f; i += 1; ); );
+  ) :
+  fam == 4 ? (
+    es[RK_DDR_SEED] = seed;
+    rk_syn_dd_ride_reset(es, min(typ, 2), mac[0], mac[1], mac[2], mac[3]);
+    // Latched for dt5/dt6 (type 0's TONE-swept pair, below). The reset leaves
+    // it at 1, so an untuned pad is byte-for-byte what it was before.
+    tune != 0 ? ( i = 0; loop(13, es[RK_DDR_DT + i] *= f; i += 1; );
+                  es[RK_DDR_TUNEF] = f; );
+    rk_syn_dd_ride_latch_dt56(es);   // once per launch, not per sample (LIB342)
+  ) :
+  fam == 5 ? (
+    es[RK_DDT_SEED] = seed;
+    rk_syn_dd_tom_reset(es, min(typ, 2), min((mac[2] * 3)|0, 2),
+                        mac[0] + tune / 12, mac[1]);
+  ) :
+  fam == 6 ? (
+    es[RK_DDM_SEED] = seed;
+    rk_syn_dd_rim_reset(es, min(typ, 2), mac[0] + tune / 12, mac[1]);
+  ) :
+  fam == 7 ? (
+    es[RK_DDW_SEED] = seed;
+    // Types 0-2 tune by pow(2, t - 0.5): +s/12 folds in exactly. Type 3's pitch is LINEAR in t ((600 + 4200 t) Hz,
+    // its band-pass 802 + 400 t), so there the transposed frequency is re-normalised the kick's way; +s/12 added
+    // to the linear term went DOWN to 0 Hz at -7.7 st and up again below it, +12 gave +16 st (LIB321). tune == 0
+    // stays byte-for-byte: the re-normalisation is skipped, as the ride's.
+    rk_syn_dd_cowbell_reset(es, typ,
+                            (typ == 3 && tune != 0) ? ((600 + 4200 * mac[0]) * f - 600) / 4200 : mac[0] + tune / 12,
+                            mac[1]);
+  ) : (
+    es[RK_DDK2_SEED] = seed;
+    // linear tuning term (0.5 + t): scale it, re-normalize
+    rk_syn_dd_shaker_reset(es, min(typ, 2),
+                           (0.5 + mac[0]) * f - 0.5, mac[1]);
+  );
+  1;
+);
+
+function rk_syn_tick(st)
+global()
+(
+  st[0] == 0 ? rk_syn_dd_kick_tick(st + 2) :
+  st[0] == 1 ? rk_syn_dd_snare_tick(st + 2) :
+  st[0] == 2 ? rk_syn_dd_clap_tick(st + 2) :
+  st[0] == 3 ? rk_syn_dd_hat_tick(st + 2) :
+  st[0] == 4 ? rk_syn_dd_ride_tick(st + 2) :
+  st[0] == 5 ? rk_syn_dd_tom_tick(st + 2) :
+  st[0] == 6 ? rk_syn_dd_rim_tick(st + 2) :
+  st[0] == 7 ? rk_syn_dd_cowbell_tick(st + 2) :
+  st[0] == 8 ? rk_syn_dd_shaker_tick(st + 2) :
+  0;
+);

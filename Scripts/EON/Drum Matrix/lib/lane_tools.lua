@@ -86,6 +86,164 @@ function M.GetLanes()
 end
 
 -- =============================================================================
+-- kits: which Swing a lane plays (two kits in one project, 2026-11-05)
+-- =============================================================================
+-- Every lane carries its Swing track's GUID (swing_instance_guid); a KIT is the lanes that share one. A lane built
+-- before lanes carried it has none: its kit is '' (the one-kit era). The kit-wide tools below (Clear ALL lanes,
+-- Duplicate bar all lanes, Stamp, Commit, Steppa's region sync) all walked GetLanes() as is, so with two kits in a
+-- project they cleared, copied into, merged and wiped the OTHER kit's notes too (rig .dev_tests/EON_Probe_SyncChecks_*,
+-- part 2). Each now takes a `kit`:
+--   * a GUID string -> that kit's lanes (no lane carries it -> the untagged lanes: a build from before the tag);
+--   * M.ALL_KITS    -> every lane in the project (a song-wide write: the song chain committed to the timeline);
+--   * nil           -> the kit the user is working on (M.CurrentKit). With two or more kits and nothing selected to
+--                      say which, the tool does nothing and says so in the status bar instead of guessing.
+M.ALL_KITS = '*'
+
+function M.KitOf(lane_info)
+  local g = type(lane_info) == 'table' and lane_info.swing_instance_guid or nil
+  return type(g) == 'string' and g or ''
+end
+
+-- The distinct kits among `lanes` (default: every lane), in track order.
+function M.Kits(lanes)
+  local out, seen = {}, {}
+  for _, lane in ipairs(lanes or M.GetLanes()) do
+    local k = M.KitOf(lane.lane_info)
+    if not seen[k] then seen[k] = true; out[#out + 1] = k end
+  end
+  return out
+end
+
+-- One kit's lanes, out of `lanes` (default: every lane). kit = a GUID ('' = the untagged lanes) or M.ALL_KITS.
+function M.GetKitLanes(kit, lanes)
+  lanes = lanes or M.GetLanes()
+  if kit == M.ALL_KITS then return lanes end
+  local out, untagged = {}, {}
+  for _, lane in ipairs(lanes) do
+    local k = M.KitOf(lane.lane_info)
+    if k == kit then out[#out + 1] = lane
+    elseif k == '' then untagged[#untagged + 1] = lane end
+  end
+  if #out == 0 then return untagged end
+  return out
+end
+
+-- The kits found INSIDE a folder track, added to `found` (a "Swing - <kit>" parent folder holds the Swing track, its
+-- audio sub and the MIDI folder). Nothing when `tr` is not a folder. `known` = { [guid] = true } for the kits that
+-- have lanes.
+local function kits_in_folder(tr, known, found)
+  if reaper.GetMediaTrackInfo_Value(tr, 'I_FOLDERDEPTH') ~= 1 then return end
+  local level = 1
+  local i = math.floor(reaper.GetMediaTrackInfo_Value(tr, 'IP_TRACKNUMBER') + 0.5)   -- 1-based = the next track's index
+  local n = reaper.CountTracks(0)
+  while i < n and level > 0 do
+    local t = reaper.GetTrack(0, i)
+    local lane = M.LaneFromTrack(t)
+    local g = reaper.GetTrackGUID(t)
+    if lane then found[M.KitOf(lane.lane_info)] = true
+    elseif known[g] then found[g] = true end
+    level = level + reaper.GetMediaTrackInfo_Value(t, 'I_FOLDERDEPTH')
+    i = i + 1
+  end
+end
+
+-- The kit one track belongs to, or nil: a lane's own; the kit's Swing track (its GUID is a kit's); the Drum Matrix
+-- kit folder (EON_DRUM_KIT_FOLDER.swing_guid); Swing's own parent folder (EON_SWING_PARENT) holding one kit --
+-- walking up the folders, so any track inside a kit's folders counts (a pad's audio track too).
+local function kit_of_track(tr, known)
+  local hops = 0
+  while tr and hops < 64 do
+    local lane = M.LaneFromTrack(tr)
+    if lane then return M.KitOf(lane.lane_info) end
+    local g = reaper.GetTrackGUID(tr)
+    if known[g] then return g end
+    if json then
+      local _, raw = reaper.GetSetMediaTrackInfo_String(tr, 'P_EXT:EON_DRUM_KIT_FOLDER', '', false)
+      if raw ~= '' then
+        local ok, dec = pcall(json.decode, raw)
+        if ok and type(dec) == 'table' and type(dec.swing_guid) == 'string' and known[dec.swing_guid] then
+          return dec.swing_guid
+        end
+      end
+    end
+    local _, sp = reaper.GetSetMediaTrackInfo_String(tr, 'P_EXT:EON_SWING_PARENT', '', false)
+    if sp ~= '' then
+      local inside, pick, n = {}, nil, 0
+      kits_in_folder(tr, known, inside)
+      for k in pairs(inside) do pick, n = k, n + 1 end
+      if n == 1 then return pick end
+    end
+    tr = reaper.GetParentTrack(tr)
+    hops = hops + 1
+  end
+  return nil
+end
+
+-- The kit the user is working on: the one the SELECTED tracks belong to (a lane, the kit's Swing track, its folders,
+-- any track inside them); with nothing selected that belongs to a kit, the project's only kit. nil when there are no
+-- lanes, or two or more kits and the selection names none of them (or names more than one).
+function M.CurrentKit(lanes)
+  lanes = lanes or M.GetLanes()
+  local kits = M.Kits(lanes)
+  if #kits == 0 then return nil end
+  if #kits == 1 then return kits[1] end   -- one kit: the answer whatever is selected, and no selection walk per call
+  local known = {}
+  for _, k in ipairs(kits) do if k ~= '' then known[k] = true end end
+  local found = {}
+  for s = 0, reaper.CountSelectedTracks(0) - 1 do
+    local tr = reaper.GetSelectedTrack(0, s)
+    local k = kit_of_track(tr, known)
+    if k then found[k] = true else kits_in_folder(tr, known, found) end
+  end
+  local pick, n = nil, 0
+  for k in pairs(found) do pick, n = k, n + 1 end
+  if n == 1 then return pick end
+  return nil
+end
+
+-- A kit's name for messages: the Drum Matrix kit folder's kit_name, else its Swing track's name. nil when unknown.
+function M.KitName(kit)
+  if type(kit) ~= 'string' or kit == '' or kit == M.ALL_KITS then return nil end
+  for i = 0, reaper.CountTracks(0) - 1 do
+    local tr = reaper.GetTrack(0, i)
+    if json then
+      local _, raw = reaper.GetSetMediaTrackInfo_String(tr, 'P_EXT:EON_DRUM_KIT_FOLDER', '', false)
+      if raw ~= '' then
+        local ok, dec = pcall(json.decode, raw)
+        if ok and type(dec) == 'table' and dec.swing_guid == kit and type(dec.kit_name) == 'string'
+           and dec.kit_name ~= '' then
+          return dec.kit_name
+        end
+      end
+    end
+  end
+  for i = 0, reaper.CountTracks(0) - 1 do
+    local tr = reaper.GetTrack(0, i)
+    if reaper.GetTrackGUID(tr) == kit then
+      local _, nm = reaper.GetSetMediaTrackInfo_String(tr, 'P_NAME', '', false)
+      return (nm and nm ~= '') and nm or nil
+    end
+  end
+  return nil
+end
+
+-- The lanes a kit-wide tool acts on, from its `kit` argument (above). nil when the kit is ambiguous -- the status bar
+-- then says why and the tool must do nothing. A project with no lanes gives {} (each tool reports that itself).
+function M.ToolLanes(kit)
+  local lanes = M.GetLanes()
+  if kit == nil then
+    if #lanes == 0 then return lanes end
+    kit = M.CurrentKit(lanes)
+    if kit == nil then
+      status(string.format('EON DM: %d kits in this project -- select a track of the kit to work on first',
+                           #M.Kits(lanes)))
+      return nil
+    end
+  end
+  return M.GetKitLanes(kit, lanes)
+end
+
+-- =============================================================================
 -- low-level helpers (operate on one take/lane at a time)
 -- =============================================================================
 
@@ -242,25 +400,38 @@ function M.ClearLane(lane)
   return removed
 end
 
-function M.ClearAllLanes()
-  local total = 0
+-- A LOCKED lane is kept, as Randomize Kit and Full Kit keep it (DM227): the lock protects a finished pattern
+-- from the kit-wide ops. Returns notes removed, lanes cleared, locked lanes kept. ONE kit's lanes (`kit`: the kits
+-- section above; nil = the kit the user is working on).
+function M.ClearAllLanes(kit)
+  local lanes = M.ToolLanes(kit)
+  if not lanes then return 0, 0, 0 end
+  local total, cleared, kept = 0, 0, 0
   reaper.PreventUIRefresh(1)
   reaper.Undo_BeginBlock()
-  for _, lane in ipairs(M.GetLanes()) do
-    each_midi_take_on_track(lane.track, function(item, take)
-      local notes = collect_lane_notes(take, lane.lane_info)
-      if #notes > 0 then
-        local idxs = {}
-        for _, n in ipairs(notes) do idxs[#idxs + 1] = n.idx end
-        delete_notes_desc(take, idxs)
-        total = total + #idxs
-        finalize_take(take)
-      end
-    end)
+  for _, lane in ipairs(lanes) do
+    if lane.lane_info.locked == true then
+      kept = kept + 1
+    else
+      cleared = cleared + 1
+      each_midi_take_on_track(lane.track, function(item, take)
+        local notes = collect_lane_notes(take, lane.lane_info)
+        if #notes > 0 then
+          local idxs = {}
+          for _, n in ipairs(notes) do idxs[#idxs + 1] = n.idx end
+          delete_notes_desc(take, idxs)
+          total = total + #idxs
+          finalize_take(take)
+        end
+      end)
+    end
   end
   reaper.Undo_EndBlock('EON DM: clear all lanes', -1)
   reaper.PreventUIRefresh(-1)
-  return total
+  status(string.format('EON DM Clear ALL: %d note%s on %d lane%s%s', total, total == 1 and '' or 's',
+                       cleared, cleared == 1 and '' or 's',
+                       kept > 0 and string.format(', %d locked lane%s kept', kept, kept == 1 and '' or 's') or ''))
+  return total, cleared, kept
 end
 
 -- Clear the whole clip: delete EVERY note on the lane's items regardless of
@@ -906,12 +1077,13 @@ function M.DuplicateBarToNext(lane, src_time)
   return n
 end
 
--- Duplicate the source bar forward one bar across EVERY drum lane, in ONE
--- Undo block (a single shared source time so all lanes use the same bar).
-function M.DuplicateBarAllLanes(src_time)
+-- Duplicate the source bar forward one bar across every lane of ONE kit (`kit`: the kits section above; nil = the
+-- kit the user is working on), in ONE Undo block (a single shared source time so all lanes use the same bar).
+function M.DuplicateBarAllLanes(src_time, kit)
   local playing
   src_time, playing = resolve_src(src_time)
-  local lanes = M.GetLanes()
+  local lanes = M.ToolLanes(kit)
+  if not lanes then return 0 end
   if #lanes == 0 then status('EON DM: no drum lanes detected'); return 0 end
   reaper.PreventUIRefresh(1)
   reaper.Undo_BeginBlock()
@@ -982,16 +1154,18 @@ local function stamp_range_core(lane, src_t0, src_t1, dest_t0)
   return written, dropped
 end
 
--- Stamp the [src_t0, src_t1) range across EVERY drum lane to dest_t0, in ONE
+-- Stamp the [src_t0, src_t1) range across every lane of ONE kit to dest_t0 (`kit`: the kits section above; nil =
+-- the kit the user is working on; M.ALL_KITS = every kit, the song chain's commit), in ONE
 -- Undo block (so a whole pattern stamp is a single undo). dest_t0 defaults to
 -- the play cursor when transport is rolling, else the edit cursor. When stopped
 -- and something was stamped, advance the edit cursor by the range length so
 -- repeated stamps chain forward. Returns total notes inserted.
-function M.StampRangeAllLanes(src_t0, src_t1, dest_t0)
+function M.StampRangeAllLanes(src_t0, src_t1, dest_t0, kit)
   if not (src_t0 and src_t1) or src_t1 <= src_t0 then return 0 end
   local playing
   dest_t0, playing = resolve_src(dest_t0)
-  local lanes = M.GetLanes()
+  local lanes = M.ToolLanes(kit)
+  if not lanes then return 0 end
   if #lanes == 0 then status('EON DM: no drum lanes detected'); return 0 end
   reaper.PreventUIRefresh(1)
   reaper.Undo_BeginBlock()
@@ -1012,14 +1186,18 @@ function M.StampRangeAllLanes(src_t0, src_t1, dest_t0)
   return total
 end
 
--- Count drum notes whose start falls in [t0, t1) across EVERY lane. Read-only
+-- Count drum notes whose start falls in [t0, t1) across one kit's lanes. Read-only
 -- (no Undo, no edits) — used by the Pattern Manager's note-count column. Reuses
 -- the same lane/take/note traversal as the stamp engine so the count matches
--- exactly what a stamp would copy.
-function M.CountNotesInRange(t0, t1)
+-- exactly what a stamp would copy: the kit a stamp would take (nil = the kit the user is working on). With no kit
+-- to name (two kits, nothing selected) a stamp copies nothing and asks; the count then shows every kit's notes.
+function M.CountNotesInRange(t0, t1, kit)
   if not (t0 and t1) or t1 <= t0 then return 0 end
   local count = 0
-  for _, lane in ipairs(M.GetLanes()) do
+  local lanes = M.GetLanes()
+  kit = kit or M.CurrentKit(lanes)
+  if kit then lanes = M.GetKitLanes(kit, lanes) end
+  for _, lane in ipairs(lanes) do
     if lane.track and lane.lane_info then
       each_midi_take_on_track(lane.track, function(_, take)
         for _, nrec in ipairs(collect_lane_notes(take, lane.lane_info)) do
@@ -1094,11 +1272,14 @@ function M.StereoRows(lane_info)
   return rows
 end
 
--- Read every Drum Matrix lane's notes whose START falls in [t0, t1) into a blob.
+-- Read one kit's lane notes whose START falls in [t0, t1) into a blob (`kit`: the kits section above -- the bridge
+-- passes the synced Swing's own; with every kit's lanes, two kits' kicks landed on one pad).
 -- Read-only (no edits, no Undo).
-function M.CollectRegion(t0, t1)
+function M.CollectRegion(t0, t1, kit)
   local blob = { len_qn = 0, lanes = {} }
   if not (t0 and t1) or t1 <= t0 then return blob end
+  local kit_lanes = M.ToolLanes(kit)
+  if not kit_lanes then return blob end
   local q0 = reaper.TimeMap_timeToQN(t0)
   blob.len_qn = reaper.TimeMap_timeToQN(t1) - q0
 
@@ -1114,7 +1295,7 @@ function M.CollectRegion(t0, t1)
     return { q = q, v = n.vel, d = d, pitch = n.pitch }
   end
 
-  for _, lane in ipairs(M.GetLanes()) do
+  for _, lane in ipairs(kit_lanes) do
     local li = lane.lane_info
     if li.stereo == true then
       -- Stereo lane: ONE take holds every pad. Split notes into blob lanes by
@@ -1155,7 +1336,7 @@ function M.CollectRegion(t0, t1)
   -- otherwise the first lane) -> blob.cc = { {q, chan, cc, v}, ... }. The StepSeq's
   -- CC lanes live there on export, so that is where they are read back from.
   local home = nil
-  for _, lane in ipairs(M.GetLanes()) do
+  for _, lane in ipairs(kit_lanes) do
     if lane.lane_info and lane.lane_info.stereo == true then home = lane; break end
     home = home or lane
   end
@@ -1177,12 +1358,15 @@ function M.CollectRegion(t0, t1)
   return blob
 end
 
--- Replace every lane's notes within [t0, t1) with the blob's notes (the StepSeq
--- "flatten"). Lanes present in the project but absent from the blob are CLEARED
+-- Replace one kit's lane notes within [t0, t1) with the blob's notes (the StepSeq
+-- "flatten"). Lanes of the kit absent from the blob are CLEARED
 -- in-window, so an Export fully defines the region. ONE Undo block; HARD
--- CONTRACT. Returns the number of notes written.
-function M.WriteRegion(t0, t1, blob)
+-- CONTRACT. Returns the number of notes written. `kit`: the kits section above -- the bridge passes the synced
+-- Swing's own; with every kit's lanes, a Steppa's export wiped the other kit's region and gave it this kit's hits.
+function M.WriteRegion(t0, t1, blob, kit)
   if not (t0 and t1) or t1 <= t0 or type(blob) ~= 'table' then return 0 end
+  local kit_lanes = M.ToolLanes(kit)
+  if not kit_lanes then return 0, 0 end
   local lanes_blob = blob.lanes or {}
   local q0 = reaper.TimeMap_timeToQN(t0)
   local written, dropped = 0, 0
@@ -1211,7 +1395,7 @@ function M.WriteRegion(t0, t1, blob)
 
   reaper.PreventUIRefresh(1)
   reaper.Undo_BeginBlock()
-  for _, lane in ipairs(M.GetLanes()) do
+  for _, lane in ipairs(kit_lanes) do
     local li = lane.lane_info
     -- 1) clear the [t0,t1) window on this lane (across its takes). Range-aware:
     --    a stereo lane's collect covers its whole note_lo..note_hi window, so
@@ -1281,7 +1465,7 @@ function M.WriteRegion(t0, t1, blob)
   -- item -- pitch bend, other CCs -- is not ours and stays.
   if type(blob.cc_lanes) == 'table' and #blob.cc_lanes > 0 then
     local home = nil
-    for _, lane in ipairs(M.GetLanes()) do
+    for _, lane in ipairs(kit_lanes) do
       if lane.lane_info and lane.lane_info.stereo == true then home = lane; break end
       home = home or lane
     end
@@ -1358,11 +1542,13 @@ local function resolve_kit_name(lanes)
   return nil
 end
 
--- Flatten every lane's notes into ONE MIDI item on a NEW track placed just below
+-- Flatten one kit's lane notes into ONE MIDI item on a NEW track placed just below
 -- the kit, routed into Swing the same way the lanes are (MIDI send, audio off).
--- Source lanes are left untouched. The whole thing is one undo step.
-function M.CommitPatternToItem()
-  local lanes = M.GetLanes()
+-- Source lanes are left untouched. The whole thing is one undo step. `kit`: the kits section above (nil = the kit
+-- the user is working on); with every kit's lanes, two kits' notes went into one item played by the first Swing.
+function M.CommitPatternToItem(kit)
+  local lanes = M.ToolLanes(kit)
+  if not lanes then return false end
   if #lanes == 0 then status('EON DM: no drum lanes detected'); return false end
 
   -- A stereo-grid pattern already IS one item on the Swing track — there is

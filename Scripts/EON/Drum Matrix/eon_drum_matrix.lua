@@ -40,6 +40,7 @@ local auto_zoom   = dofile(SCRIPT_DIR .. 'lib/render_auto_zoom.lua')
 local midi_cache  = dofile(SCRIPT_DIR .. 'lib/midi_cache.lua')
 local paint_mode  = dofile(SCRIPT_DIR .. 'lib/paint_mode.lua')
 local lane_tools  = dofile(SCRIPT_DIR .. 'lib/lane_tools.lua')
+local note_mute   = dofile(SCRIPT_DIR .. 'lib/note_mute.lua')   -- the greying lanes' own M / S (2026-10-30)
 local item_style    = dofile(SCRIPT_DIR .. 'lib/item_style.lua')
 local grid_state    = dofile(SCRIPT_DIR .. 'lib/grid_state.lua')
 local settings      = dofile(SCRIPT_DIR .. 'lib/settings_store.lua')
@@ -96,9 +97,11 @@ local KEYMAP_HANDLERS = {
   cursor_start     = function() reaper.Main_OnCommand(40042, 0) end,
   cursor_end       = function() reaper.Main_OnCommand(40043, 0) end,
   zoom_pattern     = function() pattern_regions.ZoomToCurrent() end,
-  undo             = function() reaper.Main_OnCommand(40029, 0) end,
-  redo             = function() reaper.Main_OnCommand(40030, 0) end,
-  redo_alt         = function() reaper.Main_OnCommand(40030, 0) end,
+  -- An undo / redo moves the notes back without re-keying the selection, so it clears (DM115;
+  -- an undo made outside the overlay: selection.CheckUndoRedo in MainLoop).
+  undo             = function() selection.Clear(); reaper.Main_OnCommand(40029, 0) end,
+  redo             = function() selection.Clear(); reaper.Main_OnCommand(40030, 0) end,
+  redo_alt         = function() selection.Clear(); reaper.Main_OnCommand(40030, 0) end,
   dup_bar_all      = function() lane_tools.DuplicateBarAllLanes() end,
   dup_bar_lane     = _dup_bar_lane,
   nudge_left       = function() paint_mode.NudgeSelection(-1,  0) end,
@@ -264,8 +267,9 @@ local MS_SIZE = 14
 local MS_GAP  = 4
 local LABEL_X_OFFSET = COG_SIZE + MS_GAP + MS_SIZE + MS_GAP + MS_SIZE + 6  -- = 58
 
-local function draw_mute_button(dl, x, y, muted, pad_r, pad_g, pad_b, mx, my)
-  local x2, y2 = x + MS_SIZE, y + MS_SIZE
+local function draw_mute_button(dl, x, y, muted, pad_r, pad_g, pad_b, mx, my, sz)
+  sz = sz or MS_SIZE
+  local x2, y2 = x + sz, y + sz
   local hovered = (mx and my and mx >= x and mx <= x2 and my >= y and my <= y2)
   local border_col = hovered and 0xFFFFFFFF or 0x888888CC
   if muted then
@@ -274,12 +278,13 @@ local function draw_mute_button(dl, x, y, muted, pad_r, pad_g, pad_b, mx, my)
   end
   r.ImGui_DrawList_AddRect(dl, x, y, x2, y2, border_col, 2, 0, 1)
   local glyph_col = muted and 0x000000FF or 0xAAAAAACC
-  r.ImGui_DrawList_AddText(dl, x + 3, y + 1, glyph_col, 'M')
-  return { x = x, y = y, w = MS_SIZE, h = MS_SIZE }
+  if sz >= 12 then r.ImGui_DrawList_AddText(dl, x + 3, y + 1, glyph_col, 'M') end   -- no room for the letter below 12 px
+  return { x = x, y = y, w = sz, h = sz }
 end
 
-local function draw_solo_button(dl, x, y, solo, mx, my)
-  local x2, y2 = x + MS_SIZE, y + MS_SIZE
+local function draw_solo_button(dl, x, y, solo, mx, my, sz)
+  sz = sz or MS_SIZE
+  local x2, y2 = x + sz, y + sz
   local hovered = (mx and my and mx >= x and mx <= x2 and my >= y and my <= y2)
   local border_col = hovered and 0xFFFFFFFF or 0x888888CC
   if solo ~= 0 then
@@ -288,8 +293,36 @@ local function draw_solo_button(dl, x, y, solo, mx, my)
   end
   r.ImGui_DrawList_AddRect(dl, x, y, x2, y2, border_col, 2, 0, 1)
   local glyph_col = (solo ~= 0) and 0x000000FF or 0xAAAAAACC
-  r.ImGui_DrawList_AddText(dl, x + 4, y + 1, glyph_col, 'S')
-  return { x = x, y = y, w = MS_SIZE, h = MS_SIZE }
+  if sz >= 12 then r.ImGui_DrawList_AddText(dl, x + 4, y + 1, glyph_col, 'S') end
+  return { x = x, y = y, w = sz, h = sz }
+end
+
+-- The stereo kit's per-pad M / S (2026-10-30, the owner's "add them now"): one pair beside each pad row, in the kit
+-- pair's columns, each greying that pad's notes in the Drum Matrix's items (note_mute.DM_PADS; paint_mode toggles).
+-- Drawn with the lane's controls, on rows at least 10 px tall (a button 8 px or more); the letter from 12 px. Returns
+-- { { pad, mute = rect, solo = rect }, ... } for paint_mode.
+local function draw_stereo_pad_ms(dl, track, lane_info, swing_state, L, item_top, sub_row_h, lo, hi, mx, my)
+  local out = {}
+  if not (item_top and sub_row_h and lo and hi) then return out end
+  local sz = math.min(MS_SIZE, math.floor(sub_row_h) - 2)
+  if sz < 8 then return out end
+  local slot = swing_state.SlotForLane(lane_info)
+  local mm, sm = note_mute.dm_pads(track)
+  local xm = L + 2 + COG_SIZE + MS_GAP
+  local xs = xm + MS_SIZE + MS_GAP
+  for _, row in ipairs(lane_tools.StereoRows(lane_info)) do
+    if row.pitch >= lo and row.pitch <= hi then
+      local y = math.floor(item_top + (hi - row.pitch) * sub_row_h + (sub_row_h - sz) / 2)
+      if not (renderer.RectHidden and renderer.RectHidden(xm, y, xs + sz, y + sz)) then
+        local b = 1 << (row.pad - 1)
+        local pr, pg, pb = swing_state.GetPadColor(row.pad, slot)
+        out[#out + 1] = { pad = row.pad,
+          mute = draw_mute_button(dl, xm, y, mm & b ~= 0, pr, pg, pb, mx, my, sz),
+          solo = draw_solo_button(dl, xs, y, (sm & b ~= 0) and 2 or 0, mx, my, sz) }
+      end
+    end
+  end
+  return out
 end
 
 -- Pad name label drawn at the left edge of a drum lane (with shadow for legibility).
@@ -330,8 +363,16 @@ local function draw_pad_label(dl, track, lane_info, coords, swing_state, L, mx, 
     if (pname == '' or pname == nil) and (lane_info.pad_name or '') == '' then
       pr, pg, pb = 0.30, 0.30, 0.32
     end
-    local mute_val  = r.GetMediaTrackInfo_Value(track, 'B_MUTE') or 0
-    local solo_val  = r.GetMediaTrackInfo_Value(track, 'I_SOLO') or 0
+    local mute_val, solo_val
+    if note_mute.dm_kind(lane_info) then
+      -- a stereo lane IS Swing's track, a merged lane the pad's audio track: their M / S are the lane's own state,
+      -- which greys the Drum Matrix's notes there (note_mute, 2026-10-30) -- not the track's mute / solo (the mixer's)
+      local m, s = note_mute.dm_state(track)
+      mute_val, solo_val = m and 1 or 0, s and 2 or 0
+    else
+      mute_val = r.GetMediaTrackInfo_Value(track, 'B_MUTE') or 0
+      solo_val = r.GetMediaTrackInfo_Value(track, 'I_SOLO') or 0
+    end
     mute_rect = draw_mute_button(dl, L + 2 + COG_SIZE + MS_GAP, y1 + 2,
       mute_val > 0.5, pr, pg, pb, mx, my)
     solo_rect = draw_solo_button(dl, L + 2 + COG_SIZE + MS_GAP + MS_SIZE + MS_GAP, y1 + 2,
@@ -405,7 +446,7 @@ local function draw_pad_label(dl, track, lane_info, coords, swing_state, L, mx, 
       r.ImGui_DrawList_AddText(dl, cb_x,     y,     0x66CCFFFF, '\xE2\x86\x95')
     end
   end
-  return { cog = cog_rect, mute = mute_rect, solo = solo_rect }
+  return { cog = cog_rect, mute = mute_rect, solo = solo_rect, shown = controls_visible }
 end
 
 -- Playhead removed in Phase 4 polish — REAPER's native play cursor is already
@@ -512,6 +553,10 @@ local function MainLoopBody()
             if piano and lo and hi then
               _, sub_row_h = renderer.PianoRowGeometry(sy1, sy2, strip, lo, hi, hdr)
             end
+            local pad_ms   -- the stereo kit's per-pad M / S, shown with the lane's controls
+            if piano and lane_info.stereo == true and not collapsed and rects and rects.shown then
+              pad_ms = draw_stereo_pad_ms(dl, track, lane_info, swing_state, L, item_top, sub_row_h, lo, hi, mx, my)
+            end
             -- Pad render color (matches the renderer, incl. blank-pad grey) so
             -- the phantom cell color-matches the real one it precedes. Slot
             -- routes the read to this lane's own Swing instance (multi-Swing).
@@ -526,6 +571,7 @@ local function MainLoopBody()
               cog = cog_rect,                                          -- rect for hit-testing
               mute = rects and rects.mute,                             -- M button rect
               solo = rects and rects.solo,                             -- S button rect
+              pad_ms = pad_ms,                                         -- stereo kit: { { pad, mute, solo } }
               strip = strip,
               piano = piano or false,
               note_lo = lo,
@@ -559,7 +605,7 @@ local function MainLoopBody()
     -- Pattern bar lives in its own window just left of the cog; suppress paint
     -- click-through when the cursor is over it (or a popup/modal is open).
     if not ui_over and settings.Get('show_pattern_bar') and not settings.Get('minimal_mode')
-       and pattern_bar.IsHovered and pattern_bar.IsHovered(ctx, R, T) then
+       and pattern_bar.IsHovered and pattern_bar.IsHovered(ctx, R, T, L) then   -- L: the strip stops there (DM112)
       ui_over = true
     end
     -- Grid cog: suppress paint click/scroll bleed-through over its rect.
@@ -798,6 +844,25 @@ local function MainLoopBody()
   end
 end
 
+-- The greying lanes (stereo kits and their pads, merged lanes; note_mute, 2026-10-30): a note painted, pasted, rolled,
+-- or written by Steppa's export into a greyed lane or pad comes in sounding; this greys it too and marks it ours, so the
+-- un-mute brings it back. At most twice a second, only when the project changed and some greying lane or pad has its M
+-- or S on (or had, the pass before: a deleted soloed lane lets the others sound again). No undo block: the next point
+-- holds it, and an undo / redo that brings a sounding note back into a greyed lane is greyed again here.
+local grey_watch = { t = 0, pcc = -1, any = false }
+local function dm_grey_tick()
+  local now = r.time_precise()
+  if now - grey_watch.t < 0.5 then return end
+  grey_watch.t = now
+  local pcc = r.GetProjectStateChangeCount(0)
+  if pcc == grey_watch.pcc then return end
+  grey_watch.pcc = pcc
+  local lanes = lane_tools.GetLanes()
+  local any = note_mute.dm_any(lanes)
+  if any or grey_watch.any then note_mute.dm_apply(note_mute.dm_with_rows(lanes, lane_tools.StereoRows)) end
+  grey_watch.any = any
+end
+
 -- Public MainLoop — pcall-protected so a single bad frame doesn't kill the
 -- defer. Caches are also purged each tick (cheap) so stale take pointers
 -- don't accumulate when items are deleted externally. Lock TTL is refreshed
@@ -815,18 +880,26 @@ local function MainLoop()
 
   safety.RefreshScriptLock('main_overlay')
 
+  -- An undo / redo made outside the overlay since the last frame's snapshot
+  -- clears the selection before this frame's keys can act on it (DM115).
+  safety.SafePcall('selection.CheckUndoRedo', selection.CheckUndoRedo)
+
   safety.SafePcall('MainLoopBody', MainLoopBody)
 
   -- Song-mode driver: keeps the next pattern region queued via GoToRegion so
   -- the chain plays one after another. Runs every frame, independent of overlay
   -- focus or paint mode; cheap no-op when no song is playing.
   safety.SafePcall('pattern_song.SongTick', pattern_song.SongTick)
+  safety.SafePcall('dm_grey_tick', dm_grey_tick)   -- a greyed lane / pad keeps new notes greyed
 
   -- Pointer-validity sweeps — pcall'd individually so one bad cache can't
   -- starve the others.
   safety.SafePcall('midi_cache.PurgeStale',     midi_cache.PurgeStale)
   safety.SafePcall('lane_integrity.PurgeStale', lane_integrity.PurgeStale)
   safety.SafePcall('selection.PurgeStale',      selection.PurgeStale)
+
+  -- The undo history after this frame's own edits: the next frame's check sees only what moved outside it.
+  safety.SafePcall('selection.SnapUndo',        selection.SnapUndo)
 
   r.defer(MainLoop)
 end

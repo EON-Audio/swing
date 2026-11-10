@@ -234,15 +234,12 @@ function core.get_cache_dir()
   return dir
 end
 
--- Windows-safe atomic file write. Writes to path.tmp, closes it, removes the
--- old path, then renames tmp -> path. Windows os.rename fails if the target
--- exists, so the remove is required — the brief window where the file is
--- missing is acceptable only if callers treat "missing" as "no data yet"
--- (defaults, rebuild from empty). A crash before rename leaves the previous
--- file intact and an orphaned .tmp; a crash after rename is the new file.
 -- `writer` is either a body string or a function(f) that streams into f.
--- Returns true on success, false (+ message) on any failure — a writer that
--- throws is caught so the old file is not clobbered.
+-- Windows' os.rename refuses an existing target, hence the aside shuffle
+-- below. One gap is left: a crash in the instant between moving the old file
+-- aside and renaming the temp in leaves only <path>.prev, which no reader
+-- looks at (outside audit F06, 2026-10-28; open). A crash before that leaves
+-- the old file and an orphaned .tmp; after it, the new file.
 -- Checked, atomic file writer (2026-09-14, audits B-1 and B-3). Writes
 -- <path>.tmp beside the destination and hands `writer` a handle whose write()
 -- RAISES on the first failure: a stdio write returns nil, err and never throws,
@@ -390,6 +387,49 @@ function core.copy_file(src, dst)
   end
   if had_old then os.remove(prev) end
   return true
+end
+
+-- The one gap write_file_checked and copy_file leave (outside audit F06,
+-- 2026-10-28): a crash in the instant between moving the old file aside and
+-- renaming the new one in leaves only <path>.prev, and the NEXT save of that
+-- path removes the .prev first -- the only copy. A reader calls this before it
+-- reads: when <path> is gone and <path>.prev is there, the old file goes back.
+-- Returns true when it put one back. Never touches a file that exists (an
+-- unreadable one included: reaper.file_exists, not io.open, decides).
+function core.recover_prev(path)
+  if not path or path == "" then return false end
+  local exists
+  if reaper and reaper.file_exists then
+    exists = reaper.file_exists(path)
+  else
+    local f = io.open(path, "rb"); exists = f ~= nil; if f then f:close() end
+  end
+  if exists then return false end
+  local p = io.open(path .. ".prev", "rb")
+  if not p then return false end
+  p:close()
+  return os.rename(path .. ".prev", path) and true or false
+end
+
+-- The same for a folder (the kits): every <name><ext>.prev whose <name><ext>
+-- is gone goes back. Call it before listing the folder; when it put any back
+-- it drops REAPER's listing cache so the listing that follows sees them.
+-- Returns how many it put back.
+function core.recover_prev_dir(dir, ext)
+  if not dir or dir == "" then return 0 end
+  local want, orphans, i = (ext .. ".prev"):lower(), {}, 0
+  while true do
+    local fn = reaper.EnumerateFiles(dir, i)
+    if not fn or fn == "" then break end
+    if fn:sub(-#want):lower() == want then orphans[#orphans + 1] = fn:sub(1, -6) end
+    i = i + 1
+  end
+  local back = 0
+  for _, nm in ipairs(orphans) do
+    if core.recover_prev(dir .. core.sep .. nm) then back = back + 1 end
+  end
+  if back > 0 then reaper.EnumerateFiles(dir, -1) end
+  return back
 end
 
 -- ═══════════════════════════════════════════════════════════════════════════════
@@ -563,6 +603,13 @@ core.GMEM = {
   GS_KIT_EXPORT_ANCHOR       = 26090120,  -- ..26090183
   GS_KIT_EXPORT_ANCHOR_STAMP = 26090184,
   GS_KIT_EXPORT_ANCHOR_ID    = 26090185,
+  -- The layer mixer's kit band (2026-10-28): + (tile * SLOTS + slot) * PP = pan, mute, solo, level (slots 0..3 the
+  -- layers, 4 the synth); the dump writes it before the anchor stamp, a load stages it and +STAGED_OFF (1 staged / 0
+  -- the kit has none). MUST match Swing_ReaKit.jsfx GS_KIT_LMIX_*.
+  GS_KIT_LMIX_BASE       = 26091200,  -- ..26091519
+  GS_KIT_LMIX_PP         = 4,
+  GS_KIT_LMIX_SLOTS      = 5,
+  GS_KIT_LMIX_STAGED_OFF = 320,       -- 26091520
   GS_COMPANION_CMD     = 1710,
   GS_COMPANION_TARGET  = 2250,  -- instance_id the companion cmd is FOR (0 = broadcast).
                                 -- Stamp BEFORE the cmd; the consumer clears both.
@@ -692,6 +739,8 @@ core.GMEM = {
   GS_INST_REG_OFF_PAD_COUNT  = 2,
   GS_INST_REG_OFF_KIT_HASH   = 3,
   GS_INST_BANK_CUR           = 26090352,   -- + registry slot: the pad bank on screen, 0..3 (Pad Banks step 5a)
+  GS_INST_PAUSED_BASE        = 26090368,   -- + registry slot: when the bridge last found that slot's Swing in a BACKGROUND
+                                           --   project tab (time_precise); the claim keeps it free for it (D1, 2026-10-29)
   -- ─── EON_DRAG: browser drag-over mailbox (base + slot*STRIDE) ───────
   -- A ReaImGui drag never becomes an OLE drop, so the JSFX pad grid's
   -- gfx_getdropfile can't see a browser drag. The browser tracks the
@@ -1560,7 +1609,7 @@ core.SWBROWSE = {
   CAT_TAB     = 16,  -- P2: up to six pairs, 16..27: (glyph id + 1) * 1,000,000 + count, then the packed colour
   CAT_TAB_N   = 6,
   CAT_ON      = 28,  -- P2: the category filter this view was built with, glyph id + 1 (0 = all)
-  FILES_SHOWN = 29,  -- P1b: files in the view (TOTAL counts view rows, labels included)
+  FILES_SHOWN = 29,  -- P1b: files the filters pass, a folded group's too (TOTAL counts view rows, labels included)
   FILES_ALL   = 30,  -- P1b: files in the listing (the ALL chip)
   -- FLAGS bit6 (64) = the categories are still being counted (FMT 2)
 
@@ -1643,7 +1692,13 @@ core.SWBROWSE = {
   FR_PHASH   = 58,  -- P3: the row's path as a 52-bit number (eon_fb_path_hash; 0 = none) -- the face tags the pad
   FR_CCOL    = 59,  -- P2: the category's colour, r * 65536 + g * 256 + b
   -- FR_KIND 5 (FMT 2) = a group LABEL (P1b): FR_RIDX -1, FR_SIZE_KB = its files in the view, the name = the trimmed
-  -- prefix, char 31, the folder under the root
+  -- prefix, char 31, the folder under the root past the folders every group shares (" / " between folders; the face
+  -- draws it first); FR_SR = its group (1-based), FR_PLKIND = 1 when it is folded.
+  -- Verb 18 folds / unfolds one: REQ_RIDX = GEN * 2^20 + that group (a stale GEN folds nothing), REQ_PAD 1 = every
+  -- group (a folded group's files leave the view).
+  -- NESTED (subfolder mode, 2026-10-28): a TOP label (the first folder past the shared ones) has FR_SR = 2^19 + its
+  -- top and FR_CH 0; a folder's own label inside it FR_CH 1 (the face indents it). Verb 19 = FOLD ALL (REQ_RIDX 1) /
+  -- OPEN ALL (0). FLAGS bit7 (128) = the view holds folder labels (the face shows the FOLD ALL / OPEN ALL row).
 }
 
 -- Extension → wire code. 0 = unknown/other. Keep in sync with the JSFX face,
@@ -2495,6 +2550,37 @@ function core.run_bounded(chunk, budget)
   local ok, res = pcall(chunk)
   debug.sethook()
   return ok, res
+end
+
+-- ── A file path into the CMD 63 / 64 / 69 staging band (2026-10-29; the 3.0.20 sweep's SCR132) ─────────────────────
+-- GMEM.GS_BROWSER_PATH holds GS_BROWSER_PATH_MAX - 1 = 259 BYTES of a path (UTF-8 bytes, not characters: a folder
+-- named in Cyrillic or Japanese gets there sooner), its length in GS_BROWSER_PATH_LEN; Swing takes no longer one
+-- (rk_swing_browser_load). Six writers cut a longer path to 259 bytes and posted it anyway: the load failed without a
+-- word, or loaded whatever file the cut path happened to name. Every writer asks here first. A path that does not fit
+-- is refused with ONE console line per path (which file, how long, from where -- no box: a queued load must not stop
+-- the user's work); gmem_put_path writes one that fits, the length last, and returns its length (nil when refused).
+-- `who` names the caller in the line. The refused-path memory is per script (each loads its own copy of this file).
+-- 258, not the band's 259: a streamed load (rk_padpcm) copies the path into its header's PATH record, which holds a
+-- length, 258 bytes and a 0 (write_path_record; Swing's swing_padpcm_read_path takes < 259), and Swing keeps THAT as
+-- the pad's path -- a 259-byte path loaded, and its pad was saved with no path at all.
+core.path_refused = core.path_refused or {}
+function core.gmem_path_fits(path, who)
+  local most = core.GMEM.GS_BROWSER_PATH_MAX - 2
+  path = path or ""
+  if #path <= most then return #path > 0 end
+  if not core.path_refused[path] then
+    core.path_refused[path] = true
+    reaper.ShowConsoleMsg(("[Swing] %s: not loaded -- the file's path is %d bytes long, Swing takes %d at most. "
+      .. "Move or rename it and load it again:\n  %s\n"):format(who or "load", #path, most, path))
+  end
+  return false
+end
+function core.gmem_put_path(path, who)
+  local G = core.GMEM
+  if not core.gmem_path_fits(path, who) then return nil end
+  for i = 0, #path - 1 do reaper.gmem_write(G.GS_BROWSER_PATH + i, path:byte(i + 1)) end
+  reaper.gmem_write(G.GS_BROWSER_PATH_LEN, #path)
+  return #path
 end
 
 return core

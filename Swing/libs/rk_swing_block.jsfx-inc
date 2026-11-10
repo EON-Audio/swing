@@ -48,13 +48,28 @@ function swing_pad_blocked(_pb_i) (
 // always played it, and with no mute / solo gate, as before. It used to call launch_syn_for_pad from @gfx: a voice
 // started mid-block on a pad nobody had woken, so above the high-water mark the start of the sound was lost until
 // the next block. Here it is woken first and launched in @block like every other click.
-function swing_block_gt_consume() local(_gc_i, _gc_p) (
+// The flash code also carries the layer mixer's two requests (2026-10-28; a normal click posts 8, a SYN audition -1):
+//   1000 + L = the strip's play button: layer L alone, muted or soloed-out or not, the pad muted or not;
+//   2000     = a layer's or the synth's mute / solo changed: stop what of the pad can no longer sound (its layers by
+//              swing_layer_sounds, its synth by swing_syn_audible).
+// The SYN strip's play button posts -1, the SYNTH view's audition: the synth alone, muted or soloed-out or not.
+function swing_block_gt_consume() local(_gc_i, _gc_p, _gc_l) (
   while (_gt_rd < _gt_wr) (
     _gc_i = _gt_rd % GT_RING;
     _gc_p = _gt_pad[_gc_i] | 0;
     _gt_flash[_gc_i] < 0 ? (
       swing_pad_wake(_gc_p);
       launch_syn_for_pad(_gc_p, _gt_note[_gc_i], _gt_vel[_gc_i], 1, 0);
+    ) : _gt_flash[_gc_i] >= 2000 ? (
+      _gc_l = 0; loop(MAX_LAYERS,
+        !swing_layer_sounds(_gc_p, _gc_l) ? swing_voice_silence_layer(_gc_p, _gc_l);
+        _gc_l += 1;
+      );
+      !swing_syn_audible(_gc_p) ? swing_voice_silence_layer(_gc_p, MAX_LAYERS);   // the synth's voices
+    ) : _gt_flash[_gc_i] >= 1000 ? (
+      lmix_force = min(MAX_LAYERS - 1, max(0, (_gt_flash[_gc_i] - 1000) | 0));
+      launch_voices_for_pad(_gc_p, _gt_note[_gc_i], _gt_vel[_gc_i], 8);
+      lmix_force = -1;
     ) : (
       !swing_pad_blocked(_gc_p) ? launch_voices_for_pad(_gc_p, _gt_note[_gc_i], _gt_vel[_gc_i], _gt_flash[_gc_i]);
     );
@@ -308,8 +323,8 @@ function swing_block_process_note_repeat()
 local(rpt_interval, rpt_threshold, _rpt_iters, i, blocked, _pp_interval, _pp_thr,
       _rpt_ofs, _ofs_max, _grid, _sw, _pos0, _pos1, _n, _sp, _any_held)
 (
-  // Renderer treats v_pos <= -9999 as "not a pending voice", so an offset can
-  // never reach it. Real buffers are far below this.
+  // Renderer treats v_pos <= -99999 as "not a pending voice" (-9999 until 2026-10-29: Sum LOOSE waits up to 50 ms on
+  // top), so an offset can never reach it. Real buffers are far below this.
   _ofs_max = max(0, min(samplesblock - 1, 8192));
 
   // How long each pad has been held, for the grid-entry guard. Block resolution

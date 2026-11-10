@@ -326,8 +326,9 @@ function M.start(kind, path, inst, pad, layer, max_cells, cmd)
       -- and no preview played. Now: ask once at ANY size (a hit is a few thousand frames -- the first
       -- form of this loop started at a 65 536-frame floor and failed every short file; the PadSpeed
       -- rig caught it the same hour), and on a refusal halve the frames while a retry is still worth
-      -- a chunk, so REAPER grants the array (a 2-minute file plays its first ~45 s at 44.1 k instead
-      -- of nothing); a file refused even at that size is failed cleanly (acked FAILED, nothing leaked).
+      -- a chunk, so REAPER grants the array (a 2-minute file plays its first 30 s at 44.1 k instead
+      -- of nothing: 120 s -> 60 s, 5.29 M cells, measured refused -> 30 s); a file refused even at that
+      -- size is failed cleanly (acked FAILED, nothing leaked).
       local ok_arr, arr = pcall(reaper.new_array, frames * 2)
       while not (ok_arr and arr) and frames >= 131072 do
         frames = math.floor(frames / 2)

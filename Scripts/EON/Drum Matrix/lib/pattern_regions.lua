@@ -9,7 +9,9 @@
 -- (EON_DRUM_MATRIX:patterns = JSON array of region index numbers) so we don't
 -- hijack regions the user made for other purposes. The list is SELF-HEALED on
 -- every read: a region the user deletes in the ruler simply drops out, and the
--- membership set is rewritten to match what actually exists.
+-- membership set is rewritten to match what actually exists. Who the members
+-- ARE is kept by region GUID beside it (IDS_KEY, "region identity" below): a
+-- number is not an identity.
 
 local M = {}
 
@@ -42,6 +44,25 @@ local CUR_KEY  = 'current'   -- "current pattern" region idx, shared via ExtStat
 -- by the region idx the membership set and the song chain use. KEY's format is left alone: an older
 -- reader skips any entry that is not a number, and its next write would wipe the membership.
 local LINK_KEY = 'pattern_link'
+-- REGION IDENTITY (DM222, Swing solid round 2, 2026-10-29). A region's NUMBER is not who it is: "Renumber all regions"
+-- changes every number, and REAPER hands a deleted region's number to the next region made. Its GUID is, measured in
+-- REAPER 7.84 (.dev_tests/EON_Probe_RegionGuid_run.ps1): kept through a renumber and its undo / redo, a delete and its
+-- undo / redo (the API's and the ruler's own "Delete region near cursor"), a move / resize / new number, a save + reopen
+-- and a read of a background tab; a copy (Copy contents of time selection) gets a fresh one; a script cannot set it;
+-- and project ExtState does NOT ride undo. So KEY, LINK_KEY and CUR_KEY keep their format and hold LIVE numbers (an
+-- older Drum Matrix reads them as it always did), and IDS_KEY says who the members are:
+--   { "v": 1, "s": <stamp>, "m": [ { "g": GUID, "n": number, "p": pattern0 }, ... ], "d": [ the same ] }
+-- m = the members (n = the number at the last write, p = the fixed link, absent = none yet); d = DETACHED members,
+-- newest last, at most DETACHED_MAX: their region is gone (the ruler, Delete(), a redo). A detached member is not
+-- listed and holds no pattern (New() may hand its pattern on), but when its GUID comes back -- an undo of the delete --
+-- it is a member again with its old link. A new region that got a gone member's number has another GUID, so it is never
+-- taken for that member. s = the text of KEY and LINK_KEY as written with it: a write by anyone else (an older Drum
+-- Matrix in this project) leaves s behind, and the next read takes the members from KEY by number, as on a project's
+-- first sight. CUR_GUID_KEY is the current pattern's GUID beside CUR_KEY. With no region GUID to read (an old REAPER, a
+-- stubbed reaper) none of this runs: every key works by number exactly as before.
+local IDS_KEY      = 'pattern_ids'
+local CUR_GUID_KEY = 'current_guid'
+local DETACHED_MAX = 32
 
 -- Pattern color palette. Each new pattern cycles to the next swatch so patterns
 -- are individually color-coded — and we apply the SAME color to the actual
@@ -77,6 +98,28 @@ function M.ImGuiColor(native, alpha)
   return (r << 24) | (g << 16) | (b << 8) | alpha
 end
 
+-- The GUID of the marker / region at enumeration index i (EnumProjectMarkers3's i, not its number), or nil: no API,
+-- or nothing readable there.
+local function region_guid(i)
+  local f = reaper.GetSetProjectInfo_String
+  if not f then return nil end
+  local ok, g = f(0, 'MARKER_GUID:' .. tostring(i), '', false)
+  if ok and type(g) == 'string' and g:sub(1, 1) == '{' then return g end
+  return nil
+end
+
+-- The GUID of the region numbered idx, or nil.
+local function guid_of(idx)
+  if idx == nil then return nil end
+  local i = 0
+  while true do
+    local retval, isrgn, _, _, _, num = reaper.EnumProjectMarkers3(0, i)
+    if retval == 0 then return nil end
+    if isrgn and num == idx then return region_guid(i) end
+    i = i + 1
+  end
+end
+
 -- "Current pattern" (region index number). Drives the next/prev/stamp hotkey
 -- commands AND the manager/bar highlight. Stored in PROJECT ExtState rather than
 -- a module local because pattern_regions.lua is dofile'd by several modules
@@ -86,8 +129,13 @@ local function get_current()
   local _, v = reaper.GetProjExtState(0, SECTION, CUR_KEY)
   return tonumber(v)   -- nil if unset / non-numeric
 end
+-- CUR_GUID_KEY beside it (the bridge's DM -> sequencer select watches the GUID, so a renumber is not a click). Written
+-- only when there is a GUID to write or an old one to clear: without region GUIDs nothing but CUR_KEY is touched.
 local function set_current(idx)
   reaper.SetProjExtState(0, SECTION, CUR_KEY, idx and tostring(idx) or '')
+  local g = guid_of(idx) or ''
+  local _, old = reaper.GetProjExtState(0, SECTION, CUR_GUID_KEY)
+  if g ~= (old or '') then reaper.SetProjExtState(0, SECTION, CUR_GUID_KEY, g) end
 end
 
 local function status(msg)
@@ -111,7 +159,7 @@ local function read_set()
   return set
 end
 
-local function write_set(set)
+local function put_set(set)
   if not json then return end
   local arr = {}
   for idx in pairs(set) do arr[#arr + 1] = idx end
@@ -119,6 +167,10 @@ local function write_set(set)
   local ok, enc = pcall(json.encode, arr)
   if ok and enc then reaper.SetProjExtState(0, SECTION, KEY, enc) end
 end
+-- The by-number code below writes KEY / LINK_KEY through these two; IDS_KEY then follows what they wrote (refresh_ids,
+-- defined with the identity layer further down).
+local refresh_ids
+local function write_set(set) put_set(set); refresh_ids() end
 
 -- The link as stored: { [idx] = pattern0 } (a fresh copy: callers edit it). The decode is cached by the
 -- stored text, so the courier's once-a-tick read costs one GetProjExtState. A missing or unreadable
@@ -148,7 +200,7 @@ local function read_link()
   return out
 end
 
-local function write_link(t)
+local function put_link(t)
   if not json then return end
   local obj = {}
   for idx, p in pairs(t) do obj[tostring(math.floor(idx))] = p end
@@ -158,6 +210,7 @@ local function write_link(t)
     link_raw, link_tbl = nil, nil   -- the next read decodes what was written
   end
 end
+local function write_link(t) put_link(t); refresh_ids() end
 
 -- The lowest pattern no entry of `link` holds.
 local function lowest_free(link)
@@ -178,17 +231,197 @@ local function drop_dead_links(alive)
   if changed then write_link(link) end
 end
 
--- Enumerate every region in the project, keyed by its index number.
-local function enum_regions()
-  local out = {}
+-- Enumerate every region in the project, keyed by its index number. with_guid: each region also carries its GUID
+-- (.guid), and the second return maps GUID -> region (nil when no region has a readable GUID). A GUID read costs ~1 us
+-- a region (REAPER 7.84: 64 regions, 61-69 us against 5 us for the walk alone), so only the membership reads ask.
+local function enum_regions(with_guid)
+  local out, byguid = {}, nil
   local i = 0
   while true do
     local retval, isrgn, pos, rgnend, name, idx, color = reaper.EnumProjectMarkers3(0, i)
     if retval == 0 then break end
-    if isrgn then out[idx] = { idx = idx, name = name or '', start = pos, end_ = rgnend, color = color } end
+    if isrgn then
+      local r = { idx = idx, name = name or '', start = pos, end_ = rgnend, color = color }
+      if with_guid then
+        local g = region_guid(i)
+        if g then
+          r.guid = g
+          byguid = byguid or {}
+          -- two regions with one GUID were never seen (a copy gets its own): the first in time order is that region
+          if byguid[g] == nil then byguid[g] = r end
+        end
+      end
+      out[idx] = r
+    end
     i = i + 1
   end
+  return out, byguid
+end
+
+-- ── the identity layer (see IDS_KEY) ─────────────────────────────────────────────────────────────────────────────────
+
+-- IDS_KEY as stored: { s, m = { {g, n, p}, ... }, d = { ... } } (a fresh copy: callers edit it), or nil when it is
+-- missing or unreadable. The decode is cached by the stored text.
+local ids_raw, ids_tbl = nil, nil
+local function read_ids()
+  if not json then return nil end
+  local _, raw = reaper.GetProjExtState(0, SECTION, IDS_KEY)
+  raw = raw or ''
+  if raw ~= ids_raw then
+    local t = nil
+    if raw ~= '' then
+      local ok, obj = pcall(json.decode, raw)
+      if ok and type(obj) == 'table' and type(obj.s) == 'string' then
+        t = { s = obj.s, m = {}, d = {} }
+        for _, part in ipairs({ 'm', 'd' }) do
+          local src = obj[part]
+          for _, e in ipairs(type(src) == 'table' and src or {}) do
+            if type(e) == 'table' and type(e.g) == 'string' and type(e.n) == 'number' then
+              local p = e.p
+              if not (type(p) == 'number' and p >= 0 and p == math.floor(p)) then p = nil end
+              t[part][#t[part] + 1] = { g = e.g, n = math.floor(e.n), p = p }
+            end
+          end
+        end
+      end
+    end
+    ids_raw, ids_tbl = raw, t
+  end
+  if not ids_tbl then return nil end
+  local out = { s = ids_tbl.s, m = {}, d = {} }
+  for _, part in ipairs({ 'm', 'd' }) do
+    for i, e in ipairs(ids_tbl[part]) do out[part][i] = { g = e.g, n = e.n, p = e.p } end
+  end
   return out
+end
+
+-- enum_regions(true) for the identity layer. With no region left there is no GUID to read, which is not "no GUIDs":
+-- when IDS_KEY exists the map is then empty (every member's region is gone, so each one detaches).
+local function enum_ids()
+  local regs, byguid = enum_regions(true)
+  if not byguid and next(regs) == nil and read_ids() then byguid = {} end
+  return regs, byguid
+end
+
+-- The stamp IDS_KEY carries: KEY's and LINK_KEY's stored text, as they are now.
+local function ids_stamp()
+  local _, a = reaper.GetProjExtState(0, SECTION, KEY)
+  local _, b = reaper.GetProjExtState(0, SECTION, LINK_KEY)
+  return (a or '') .. '|' .. (b or '')
+end
+
+local function write_ids(m, d)
+  if not json then return end
+  while #d > DETACHED_MAX do table.remove(d, 1) end   -- the oldest detached member is forgotten first
+  table.sort(m, function(a, b) return a.n < b.n end)
+  local ok, enc = pcall(json.encode, { v = 1, s = ids_stamp(), m = m, d = d })
+  if ok and enc then
+    reaper.SetProjExtState(0, SECTION, IDS_KEY, enc)
+    ids_raw, ids_tbl = nil, nil
+  end
+end
+
+-- Two sets / links hold the same entries.
+local function same_keys(a, b)
+  for k, v in pairs(a) do if b[k] ~= v then return false end end
+  for k, v in pairs(b) do if a[k] ~= v then return false end end
+  return true
+end
+
+-- Before anything reads by number: KEY / LINK_KEY / CUR_KEY brought to the LIVE numbers of the members IDS_KEY names by
+-- GUID, IDS_KEY brought up to date. Writes only what changed (nothing at all on a quiet project). A member whose GUID is
+-- gone becomes DETACHED; a detached one whose GUID is back is a member again (link and all). A number in KEY that no
+-- record names is taken by number only where nothing better exists: on a project's first sight (or after another
+-- writer), and for a region whose GUID cannot be read; otherwise it is a stale number and leaves KEY -- that is the
+-- trap the GUIDs close (a renumbered or reused number naming another region). Returns the regions walked (by number).
+-- A project with no members and no IDS_KEY (one that never used patterns) costs one walk and no GUID read.
+local function sync()
+  local _, raw_set = reaper.GetProjExtState(0, SECTION, KEY)
+  local _, raw_ids = reaper.GetProjExtState(0, SECTION, IDS_KEY)
+  raw_set = raw_set or ''
+  if not json or ((raw_set == '' or raw_set == '[]') and (raw_ids or '') == '') then return enum_regions(false) end
+  local regs, byguid = enum_ids()
+  if not byguid then return regs end   -- no region GUIDs: everything by number, as before
+  local _, raw_link = reaper.GetProjExtState(0, SECTION, LINK_KEY)
+  local ids = read_ids()
+  local set, link = read_set(), read_link()
+  local fresh = (ids == nil) or ids.s ~= raw_set .. '|' .. (raw_link or '')
+  local m, d, newd, nset, nlink, changed = {}, {}, {}, {}, {}, fresh
+  local function take(e, r)   -- record e is the member at live region r
+    nset[r.idx] = true
+    if e.p ~= nil then nlink[r.idx] = e.p end
+    m[#m + 1] = { g = r.guid, n = r.idx, p = e.p }
+    if e.n ~= r.idx then changed = true end
+  end
+  if not fresh then
+    for _, e in ipairs(ids.m) do
+      local r = byguid[e.g]
+      if r and not nset[r.idx] then take(e, r)
+      elseif not r then newd[#newd + 1] = e; changed = true   -- its region is gone: DETACHED
+      else changed = true end                                 -- a second record for one region: the first stays
+    end
+  end
+  for _, e in ipairs(ids and ids.d or {}) do
+    local r = byguid[e.g]
+    if r and not nset[r.idx] then take(e, r); changed = true   -- its region came back (an undo): a member again
+    elseif not r then d[#d + 1] = e end
+  end
+  for _, e in ipairs(newd) do d[#d + 1] = e end   -- newest last: the trim forgets the oldest
+  for n in pairs(set) do
+    local r = regs[n]
+    if r and not nset[n] and (fresh or not r.guid) then
+      nset[n] = true
+      if link[n] ~= nil then nlink[n] = link[n] end
+      if r.guid then m[#m + 1] = { g = r.guid, n = n, p = link[n] } end
+    elseif not nset[n] then
+      changed = true   -- gone, or a stale number: it leaves KEY
+    end
+  end
+  if changed then
+    if not same_keys(set, nset) then put_set(nset) end
+    if not same_keys(link, nlink) then put_link(nlink) end
+    write_ids(m, d)
+  end
+  -- the current pattern follows its GUID; a project from before the GUIDs gets one beside its number
+  local _, cur_g = reaper.GetProjExtState(0, SECTION, CUR_GUID_KEY)
+  local cur_n = get_current()
+  if cur_g and cur_g ~= '' then
+    local r = byguid[cur_g]
+    if not r then
+      reaper.SetProjExtState(0, SECTION, CUR_KEY, '')
+      reaper.SetProjExtState(0, SECTION, CUR_GUID_KEY, '')
+    elseif r.idx ~= cur_n then
+      reaper.SetProjExtState(0, SECTION, CUR_KEY, tostring(r.idx))
+    end
+  elseif cur_n and regs[cur_n] and regs[cur_n].guid then
+    reaper.SetProjExtState(0, SECTION, CUR_GUID_KEY, regs[cur_n].guid)
+  end
+  return regs
+end
+
+-- After the by-number code wrote KEY or LINK_KEY (on live numbers: sync ran first): the records follow what was
+-- written. A member that left KEY with its region gone is DETACHED (Delete() removes the region first for this);
+-- one whose region is still there was let go on purpose and is forgotten.
+refresh_ids = function()
+  local regs, byguid = enum_ids()
+  if not byguid then return end
+  local old = read_ids()
+  local set, link = read_set(), read_link()
+  local m, d, inm = {}, {}, {}
+  for n in pairs(set) do
+    local r = regs[n]
+    if r and r.guid and not inm[r.guid] then
+      inm[r.guid] = true
+      m[#m + 1] = { g = r.guid, n = n, p = link[n] }
+    end
+  end
+  if old then
+    for _, e in ipairs(old.d) do if not inm[e.g] then d[#d + 1] = e end end
+    for _, e in ipairs(old.m) do
+      if not inm[e.g] and not byguid[e.g] then d[#d + 1] = e end
+    end
+  end
+  write_ids(m, d)
 end
 
 -- =============================================================================
@@ -196,11 +429,11 @@ end
 -- =============================================================================
 
 -- Ordered list of our pattern regions (by start time). Self-heals the
--- membership set against what actually exists. Returns
--- { { idx, name, start, end_, color }, ... }.
+-- membership set against what actually exists (by GUID first: sync). Returns
+-- { { idx, name, start, end_, color, guid }, ... } (guid nil without region GUIDs).
 function M.List()
+  local regions = sync()
   local set     = read_set()
-  local regions = enum_regions()
   local out, kept, changed = {}, {}, false
   for idx in pairs(set) do
     local r = regions[idx]
@@ -220,7 +453,8 @@ end
 
 -- The FIXED LINK, healed: { [region idx] = pattern0 } for every member, and nothing else. A member
 -- with no link -- a project from before the link, a region Adopt()ed by the Song Starter or the DM's
--- Adopt Regions, one an undo brought back -- gets the lowest pattern no region holds, members taken
+-- Adopt Regions, one an undo brought back without region GUIDs (with them it is a detached member
+-- and gets its own link back, see IDS_KEY) -- gets the lowest pattern no region holds, members taken
 -- in time order; so a project from before the link keeps exactly what it played (ordinal - 1) and a
 -- new pattern fills the first hole. Entries of regions that are no longer members are dropped. Writes
 -- the key only when something changed. `list` = a fresh M.List() if the caller holds one.
@@ -262,6 +496,7 @@ end
 function M.Adopt(idx)
   idx = tonumber(idx)
   if not idx or idx < 0 then return false end
+  sync()   -- KEY on live numbers before a by-number edit (the records are rebuilt from it)
   local set = read_set()
   if not set[idx] then
     set[idx] = true
@@ -270,8 +505,32 @@ function M.Adopt(idx)
   return true
 end
 
-function M.GetCurrent() return get_current() end
+function M.GetCurrent() sync(); return get_current() end   -- sync: a renumber since the last read moves the number
 function M.SetCurrent(idx) set_current(idx) end
+
+-- The GUIDs of the DETACHED members (their region is gone; an undo brings them back) as a set, for pattern_song's
+-- chain, which keeps those entries aside; nil when there are no region GUIDs to go by (then nothing is kept aside).
+function M.DetachedGuids()
+  if not reaper.GetSetProjectInfo_String then return nil end
+  local out = {}
+  local ids = read_ids()
+  for _, e in ipairs(ids and ids.d or {}) do out[e.g] = true end
+  return out
+end
+
+-- The number the region with GUID g has NOW, or nil (gone, or no GUIDs): REAPER's own lookup, then that index read
+-- back. The song's queued seek goes by number, so a renumber while a song plays must not aim it at another region.
+function M.NumberOfGuid(g)
+  local f = reaper.GetSetProjectInfo_String
+  if not (f and type(g) == 'string' and g ~= '') then return nil end
+  local ok, v = f(0, 'MARKER_INDEX_FROM_GUID:' .. g, '', false)
+  local i = ok and tonumber(v) or nil
+  if not i or i < 0 then return nil end
+  i = math.floor(i)
+  local retval, isrgn, _, _, _, num = reaper.EnumProjectMarkers3(0, i)
+  if retval ~= 0 and isrgn and region_guid(i) == g then return num end
+  return nil
+end
 
 -- =============================================================================
 -- create / rename / delete
@@ -387,14 +646,18 @@ function M.SetColor(idx, color)
                                   (math.floor(color) % 16777216) | 0x1000000)
 end
 
+-- The region goes FIRST: the member then leaves KEY with its region gone, so it is DETACHED (an undo of the delete
+-- brings it back, link and all) rather than let go.
 function M.Delete(idx)
+  sync()
+  local ok = reaper.DeleteProjectMarker(0, idx, true)
   local set = read_set()
   set[idx] = nil
   write_set(set)
   local link = read_link()
   if link[idx] ~= nil then link[idx] = nil; write_link(link) end   -- its pattern is free again
   if get_current() == idx then set_current(nil) end
-  return reaper.DeleteProjectMarker(0, idx, true)
+  return ok
 end
 
 -- =============================================================================
@@ -492,19 +755,21 @@ end
 
 -- Stamp an independent copy of the pattern's content at dest_t (nil = play
 -- cursor when rolling, else edit cursor — resolved inside lane_tools). Returns
--- the number of notes inserted.
-function M.Stamp(idx, dest_t)
+-- the number of notes inserted. `kit` = whose lanes (lane_tools' kits section): nil = the kit the user is working
+-- on, lane_tools.ALL_KITS = every kit (the song chain's commit to the timeline).
+function M.Stamp(idx, dest_t, kit)
   if not lane_tools then status('EON DM: lane_tools unavailable — cannot stamp'); return 0 end
   local r = M.GetByIndex(idx)
   if not r then status('EON DM: pattern not found'); return 0 end
   set_current(idx)
-  local n = lane_tools.StampRangeAllLanes(r.start, r.end_, dest_t)
+  local n = lane_tools.StampRangeAllLanes(r.start, r.end_, dest_t, kit)
   if n > 0 then status(string.format('EON DM: stamped "%s" (%d notes)', r.name ~= '' and r.name or ('#' .. idx), n)) end
   return n
 end
 
 -- Hotkey helpers (operate on the "current" pattern, or the first one).
 local function current_or_first()
+  sync()   -- the current number as it is NOW (a renumber since the last read)
   local cur = get_current()
   if cur then return cur end
   local list = M.List()

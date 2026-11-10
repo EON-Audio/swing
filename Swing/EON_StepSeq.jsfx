@@ -88,7 +88,12 @@ import libs/rk_widgets.jsfx-inc
 // was live when it was parsed. Swing never imports both -- Steppa is the first,
 // hence the note.
 import libs/knobs_kbsg.jsfx-inc
+import libs/knobs_kbsg_p2.jsfx-inc
+import libs/knobs_kbsg_p3.jsfx-inc
+import libs/knobs_kbsg_p4.jsfx-inc
 import libs/rk_theme.jsfx-inc
+// Steppa without Swing: EON / Dark / Light painted by Steppa itself (ssth_tick in @gfx). After rk_theme (its cells).
+import libs/rk_ss_selftheme.jsfx-inc
 import libs/rk_cat_glyphs.jsfx-inc
 // THEME menu. ⚠ ORDER IS LOAD-BEARING (rk_thememenu_core.jsfx-inc:8-15): the
 // shim gives rk_swing_popup the two helpers it calls but does not define, and
@@ -152,6 +157,8 @@ slider53:0<0,1,1{Free,Docked}>--EON Rig Docked (set by the dock rig script, not 
 slider54:0<0,1,1{No,Yes}>--EON Dock Wanted (the wordmark's dock INTENT; set by "dock me", cleared only by "pop out"; outlives a closed pane, unlike slider53)
 slider55:1<0,1,1{Off,On}>--EON Song Strip (the ruler-gutter SONG pill; view-only, persists via FX chunk; ON by default since 2026-09-03)
 slider56:0<0,1,1{Hidden,Shown}>--EON Name Bar (the THEME menu's NAME BAR row; 0 = borderless embed, house rule 1; view-only, persists via FX chunk)
+slider57:0<0,1000000,1>--EON Dirty: Global (the bridge nudges it inside the undo point of a lane M / S click; no other meaning)
+slider58:0<0,127,1>--EON Look Alone (the theme Steppa painted itself with no Kit Bridge: theme 1..3 + 4 * (knob style + 1); 0 = none; rk_ss_selftheme)
 in_pin:none
 out_pin:none
 
@@ -755,6 +762,21 @@ memset(ss_knob_mem, 0, 1568);
 // 7 columns: 0 icon, 1 name, 2 mute, 3 solo, 4 vol, 5 pan, 6 swing.
 eon_colx             = nextslot1;  nextslot1 = eon_colx + 000008;
 eon_colw             = nextslot1;  nextslot1 = eon_colw + 000008;
+// The note and channel each lane's sounding note went out on (outside audit F08,
+// 2026-10-28). Every note-off sends THESE: recomputing npos+basenote+trans[npos] /
+// chan[npos] at off time missed the note whenever Note start (@slider, the face),
+// the mode (it swaps trans/chan) or a lane's pad map moved while it held -- a hung
+// note on gate / ranged pads. Written next to every noteonstate bit set; NOT zeroed,
+// like noteonstate itself, so an @init re-run mid-play cannot orphan a held note.
+eon_sent_note        = nextslot1;  nextslot1 = eon_sent_note + 000128;
+eon_sent_chan        = nextslot1;  nextslot1 = eon_sent_chan + 000128;
+// The same for a key PLAYED IN (live MIDI thru, 2026-10-29; FINDINGS 2026-10-28): per
+// input channel x note (16 x 128), where its note-on went out -- 1 + channel*128 + note;
+// -1 = the map put it out of range and nothing went out; 0 = nothing known. Its note-off
+// goes there: mapped again with the CURRENT Note start / mode / lane map, moving one while
+// the key was held sent the off to another note and the played note hung. NOT zeroed,
+// like eon_sent_note: an @init re-run must not orphan a held key.
+eon_thru_sent        = nextslot1;  nextslot1 = eon_thru_sent + 002048;
 EON_COL_STUB = 9;   // collapsed-column width: just enough for a restore chevron
 // DOCK FACE: the lane-header columns the slim face keeps. The P (pan) knob and
 // the per-lane swing pill are dropped -- the approved mockup gives each lane an
@@ -897,16 +919,11 @@ function eon_e2_rebuild_map(slot) local(p, L, note_p, ib, live) (
     p += 1;
   );
 );
-// E-2: a paired+mapped lane gates on the PAD state (one mute, every surface);
-// unmapped lanes and unpaired instances keep the local lane state (legacy).
-function eon_audible(n) local(pd, ib) (
-  pd = _eon_blk_ps >= 0 ? eon_lane_pad[n] : -1;
-  pd >= 0 ? (
-    ib = EON_ID_BASE + _eon_blk_ps*EON_ID_STRIDE + pd*EON_ID_FIELDS;
-    !(gmem[ib + EON_ID_MUTE] > 0.5) && (eon_band_anysolo == 0 || gmem[ib + EON_ID_SOLO] > 0.5);
-  ) : (
-    !lane_mute[n] && (any_solo==0 || lane_solo[n]);
-  );
+// Every lane gates on its OWN mute / solo, paired or not (2026-10-30, the owner's "only grey the notes"; under E-2 a
+// paired lane gated on its Swing pad's state). The paired Swing's pad mute stays Swing's own: it silences the pad in
+// Swing itself, whatever plays it.
+function eon_audible(n) (
+  !lane_mute[n] && (any_solo==0 || lane_solo[n]);
 );
 // recompute the cached any_solo flag (call on toggle + after deserialize).
 function eon_recalc_solo() local(i) (
@@ -921,11 +938,12 @@ function eon_recalc_solo() local(i) (
 // (byte-identical to the original behavior), so a bridge-less StepSeq still works.
 function eon_publish_ms() local(p, note_p, L, found, ab, nb, st, mb, sb, rm, rs, adopted) (
   eon_pair_slot >= 0 ? (
-    // E-2: PAIRED lanes are views/controllers of the PAD state — the banded
-    // M/S region is RETIRED (no heartbeat, no publish, no reverse-mailbox
-    // consume). The bridge's banded mirror sees the dead heartbeat and goes
-    // silent; its pad-M/S legs own the child tracks; pill clicks post to the
-    // Swing's INCMD sequencer cells instead. Unpaired branch below unchanged.
+    // PAIRED: the banded M/S mirror region stays RETIRED (no heartbeat, no
+    // publish, no reverse-mailbox consume), so the bridge's banded mirror reads
+    // the dead heartbeat and stays silent -- Swing's own pad M/S legs own the
+    // child tracks. A paired lane's M/S is its own state and greys its pad's
+    // notes in the Drum Matrix clips instead (eon_ss_grey_publish, the band's
+    // cells 72..75, 2026-10-30). Unpaired branch below unchanged.
     0;
   ) : (
     nb = EON_SW_META_BASE + EON_SW_NOTE_OFF; st = EON_SW_META_PP;
@@ -945,6 +963,25 @@ function eon_publish_ms() local(p, note_p, L, found, ab, nb, st, mb, sb, rm, rs,
       p += 1;
     );
   );
+);
+// The lanes' M / S masks into the paired slot's band (every @block while paired, and on a click).
+function eon_ss_grey_publish(slot) local(L, mm, sm, b) (
+  mm = 0; sm = 0; L = 0;
+  loop(min(numnotes, 16), lane_mute[L] ? mm += 2^L; lane_solo[L] ? sm += 2^L; L += 1;);
+  b = EON_SS_MSB_BASE + slot*EON_SS_MSB_STRIDE;
+  gmem[b + EON_SS_GREY_MUTE] = mm;
+  gmem[b + EON_SS_GREY_SOLO] = sm;
+  gmem[b + EON_SS_GREY_ON] = 1;
+);
+// A lane M / S click (after the lane's state changed): paired with a bridge of this level, publish now and bump the seq
+// LAST -> 1 (the bridge books the undo point with the greyed notes, so the click books none); else 0.
+function eon_ss_grey_click() local(b) (
+  eon_pair_slot >= 0 && gmem[EON_BRIDGE_LEVEL_CELL] >= BRIDGE_LEVEL_SS_GREY ? (
+    eon_ss_grey_publish(eon_pair_slot);
+    b = EON_SS_MSB_BASE + eon_pair_slot*EON_SS_MSB_STRIDE;
+    gmem[b + EON_SS_GREY_SEQ] = gmem[b + EON_SS_GREY_SEQ] + 1;
+    1;
+  ) : 0;
 );
 // filled horizontal PILL (rounded-end rect): round caps + middle rect.
 function eon_fill_pill(px, py, pw, ph) local(r) (
@@ -1324,6 +1361,10 @@ EON_POPOUT_REQ  = 2628;
 EON_REDOCK_REQ  = 2631;
 EON_REDOCK_SLOT = 2632;
 EON_KB_ALIVE    = 99;
+// Steppa without Swing: EON_Steppa_Helper.lua's heartbeat (time_precise, stamped every tick while it serves; 0 when
+// it stops). It serves the REDOCK request when no bridge does, so the wordmark's dock click is offered while EITHER
+// is alive (ss_dock_can, set each @gfx frame). Protocol row 2637, claimed 2026-11-10 on the owner's yes.
+EON_SH_ALIVE    = 2637;
 GS_THEME_ID         = 2649;  // band 2649..2673 (padfx=2625-2648; StepSeq M/S=2700+)
 GS_THEME_BASE       = 2650;
 GS_THEME_REQ        = 2674;  // theme selector -> bridge: 0 none; 1 eon,2 dark,3 light,4 reaper
@@ -1350,6 +1391,15 @@ EON_SS_MSB_STRIDE = 80;        // [0]=heartbeat, [1]=anysolo, [2..17]=pad mute, 
                                // [40..55]=REVERSE pad-mute cmd, [56..71]=REVERSE pad-solo cmd
                                // (bridge -> StepSeq when the user edits the child track in the
                                //  TCP: 0=none, 1=set OFF, 2=set ON; consumed by eon_publish_ms)
+// A PAIRED Steppa's lane M / S grey its pads' notes in the Drum Matrix clips (2026-10-30, the owner's "only grey the
+// notes"; Swing_Kit_Bridge eon_ss_grey_tick does the greying). Four cells of the slot's band no one used ([0] stays the
+// retired heartbeat: the bridge's banded mirror must keep reading it dead):
+EON_SS_GREY_SEQ  = 72;         // bumped LAST per M / S click: the bridge books the click's ONE undo point, notes included
+EON_SS_GREY_MUTE = 73;         // lane mute mask, bit L = lane L = pad L (lanes 0..15)
+EON_SS_GREY_SOLO = 74;         // lane solo mask
+EON_SS_GREY_ON   = 75;         // 1 = a Steppa of this version publishes here (every @block while paired)
+EON_BRIDGE_LEVEL_CELL = 2636;  // == Swing GS_BRIDGE_LEVEL (the running bridge's capability level)
+BRIDGE_LEVEL_SS_GREY  = 325;   // the bridge greys for Steppa from this level on
 // EON -- per-instance IDENTITY band (unified single source of truth). Byte-exact
 // match to Swing INST_IDENT_* / rk_lua_core core.GMEM. When the bridge pairs this
 // StepSeq to a specific Swing instance it pushes that Swing's registry SLOT+1 into
@@ -1547,7 +1597,9 @@ EON_SS_SYNC_SS_MAXLEN  = 58;
 EON_SS_SYNC_DMPUSH_ACK = 59;
 // Section map (bridge -> StepSeq), per slot: +0 GEN (bumped LAST), +1 COUNT, then per
 // region i: +2+i*4 start QN, +3+i*4 end QN, +4+i*4 pattern index (= ordinal-1, -1 when
-// past the pattern cap), +5+i*4 packed region colour. 64 regions x 4 + 2 = 258 <
+// past the pattern cap; on a slot Swing's SONG shares, Swing's fixed link -- the mirror
+// below replaces it with the ordinal, the pattern a Steppa holds that region in),
+// +5+i*4 packed region colour. 64 regions x 4 + 2 = 258 <
 // EON_SS_MAP_NAMEOFF 260; the names then run to 260 + 64 x 3 = 452 <= stride 512. Read
 // into eon_map when GEN changes; consumed by the engine's region switch (step 3) and the
 // song ruler.
@@ -3286,6 +3338,9 @@ file_var(0, groove_vel_amt_p1);
 // projects/presets (incl. codec-generated library presets, which end earlier) read
 // 0 items -> the array stays all-0 = Auto for every lane. Not initialised in @init.
 (file_mem(0, lane_icon_override, max_numnotes) >= max_numnotes) ? lane_icon_override_loaded = 1;
+// The lanes' M / S version (2026-10-30, appended LAST): 1 = saved under "only grey the notes". Old projects hit EOF and
+// keep the load-time 0, so @block clears a PAIRED instance's stale lane_mute / lane_solo once. Not initialised in @init.
+file_var(0, ss_ms_v);
 
 _srz_serialread ?(
 
@@ -3390,11 +3445,20 @@ _srz_serialread ?(
 // auto/manual, irrelevant here). E-2: PAIRED no longer advances the banded M/S
 // heartbeat — that region is retired and the bridge's banded mirror must see it
 // dead (the pad-M/S legs own the child tracks now). Instead, rebuild the
-// lane->pad map + band any-solo so eon_audible band-gates correctly even with
-// the GUI closed. Unpaired keeps the legacy global heartbeat.
+// lane->pad map (the lanes' notes follow their pads) and publish the lanes'
+// own M/S for the bridge's greying, even with the GUI closed. Unpaired keeps
+// the legacy global heartbeat.
 _eon_blk_ps = (abs(slider48)|0) - 1;
+// Once, on the first block under this version (2026-10-30): a PAIRED Steppa's own lane_mute / lane_solo were not the
+// live state under E-2 (its Swing pad's was), so values left from before pairing are cleared -- nothing that sounded
+// becomes greyed or silent. Unpaired keeps them (they always were its state). ss_ms_v is saved (end of @serialize).
+ss_ms_v < 1 ? (
+  _eon_blk_ps >= 0 ? ( memset(lane_mute, 0, max_numnotes); memset(lane_solo, 0, max_numnotes); eon_recalc_solo(); );
+  ss_ms_v = 1;
+);
 _eon_blk_ps >= 0 ? (
   eon_e2_rebuild_map(_eon_blk_ps);
+  eon_ss_grey_publish(_eon_blk_ps);   // the bridge greys the pads' notes in the Drum Matrix clips from these
 ) : (
   gmem[EON_SS_ALIVE] = gmem[EON_SS_ALIVE] + 1;
 );
@@ -3649,6 +3713,17 @@ eon_len_follow = 0;   // Match-rule indicator for @gfx (Len pill tick + tooltip)
       eon_map[_mapi] = gmem[_mapb + 2 + _mapi];
       _mapi += 1;
     );
+    // The pattern of region i is ITS PLACE IN TIME, i (2026-10-29, Codex 3.0.19 #3): every pattern
+    // here is primed by ordinal (the bridge stages region ord into pattern ord-1, and the editor's
+    // pattern p is region p+1), so that is what this Steppa must play. The map's own cell holds the
+    // same on a Steppa-only slot, but on a slot Swing's SONG shares (field 60) the bridge writes
+    // Swing's FIXED LINK there -- read as a pattern, a reordered region played another region's
+    // notes. Every reader of eon_map[i*4+2] (the engine, LISTEN, the strip, the menus) gets i.
+    _mapi = 0;
+    loop(eon_map_n,
+      eon_map[_mapi*4+2] = _mapi;
+      _mapi += 1;
+    );
   );
   // Region-pick: publish the active pattern index (for AUTO positional mapping) and
   // this pattern's override (0 = Auto, k>=1 = pin to region ordinal k). The courier
@@ -3836,7 +3911,7 @@ function all_playing_notes_off()
   noteonstate=0;
   while(
     (noneed&1) ? (
-      midisend(cursplpos,0x80+chan[npos],npos+basenote+trans[npos]); 
+      midisend(cursplpos,0x80+eon_sent_chan[npos],eon_sent_note[npos]);   // the note that went out (F08)
     );
     npos+=1;
     noneed*=0.5;
@@ -3858,14 +3933,16 @@ mode == 1 ? (
   chan=zerochan;
 );
 
+// The preview offs send the note and channel the preview went out on, like the
+// engine's (F08): Note start or the mode can move while a cell is held down.
 want_previewoff && last_preview >=0 ? (
-  midisend(0,0x80+chan[last_preview],last_preview+basenote+trans[last_preview]);
+  midisend(0,0x80+last_preview_ch,last_preview_sent);
   last_preview=-1;
 );
 want_previewoff=0;
 
 want_previewoff_nt && last_preview_nt >=0 ? (
-  midisend(0,0x80+preview_nt_chan,last_preview_nt+basenote+trans[last_preview_nt]);
+  midisend(0,0x80+preview_nt_chan,last_preview_nt_sent);
   last_preview_nt=-1;
 );
 want_previewoff_nt=0;
@@ -3880,6 +3957,7 @@ want_preview >=0 ?
   is_midi_val(note_to_send = want_preview+basenote+trans[want_preview]) ? (
     midisend(0,0x90+chan[want_preview],note_to_send+previewvelo*256);
     last_preview=want_preview;
+    last_preview_sent=note_to_send; last_preview_ch=chan[want_preview];
   );
   want_preview=-1;
 );
@@ -3890,6 +3968,7 @@ want_preview_nt >=0 ?
     preview_nt_chan=chan[want_preview_nt];
     midisend(0,0x90+preview_nt_chan,note_to_send+lastvelo*256);
     last_preview_nt=want_preview_nt;
+    last_preview_nt_sent=note_to_send;
   );
   want_preview_nt=-1;
 );
@@ -4070,7 +4149,7 @@ loop((play_state&1) ? samplesblock : 1,
       sdnum == 0 ? ( // not subdiv
         notelen_eff = defnotelen + eff; notelen_eff > tpb ? notelen_eff = tpb;   // ==tpb -> off falls to the boundary (legacy truncation)
         (noneed&1) && notelen_eff == ticks && !(ltiestate_t&1) ? (
-          midisend(cursplpos,0x80+chan[npos],npos+basenote+trans[npos]);
+          midisend(cursplpos,0x80+eon_sent_chan[npos],eon_sent_note[npos]);   // the note that went out (F08)
           noteonstate -= 2^npos; // exact to lane 48; guarded by (noneed&1) so the bit is
             // provably set. ⚠️NEVER use (1<<npos)/0xFFFFFFFF idioms on lane masks: EEL2
             // shifts are 32-BIT (probe-verified: 1<<40==256) and the old clear here wiped
@@ -4083,6 +4162,7 @@ loop((play_state&1) ? samplesblock : 1,
               eon_audible(npos) ? ( // EON: mute/solo gate -- PHYSICAL noteonstate: bit set
                                     // only when the note-on actually left the JSFX
                 midisend(cursplpos,0x90+chan[npos],note_to_send + grv_velo(eng_getVelo(npos*eng_listlength+beatpos), npos, beatpos)*256);
+                eon_sent_note[npos] = note_to_send; eon_sent_chan[npos] = chan[npos];
                 noteonstate |= 2^npos; // pow not shift: EEL2 << is 32-bit, lanes go to 48
               );
             ) : (
@@ -4109,13 +4189,16 @@ loop((play_state&1) ? samplesblock : 1,
             // (sdpos-1) negative-shift edge at the first deferred hit. All mask math is
             // 2^npos pow -- EEL2 shifts are 32-bit, lanes go to 48 (probe-verified).
             (noteonstate & 2^npos) ? (
-              midisend(cursplpos,0x80+chan[npos],npos+basenote+trans[npos]); // note-off previous subdiv note
+              midisend(cursplpos,0x80+eon_sent_chan[npos],eon_sent_note[npos]); // note-off previous subdiv note (the one sent, F08)
               noteonstate -= 2^npos; // exact: guarded by the & test above
             );
             (sd_playstate[2*npos+1] >> (sdpos))&1 ? (// current sd step is enabled
               playvelo=grv_velo(eng_getSubdivVelo(npos, beatpos, sdpos), npos, beatpos);
-              eon_audible(npos) ? ( // EON: mute/solo gate
-                midisend(cursplpos,0x90+chan[npos],npos+basenote+trans[npos] + playvelo*256); // note-on subdiv note
+              // EON: mute/solo gate; and the 0..127 check the plain paths have (outside audit
+              // F02, 2026-10-28: Note start 120 with 16 lanes sent ratchet note numbers > 127)
+              eon_audible(npos) && is_midi_val(note_to_send = npos+basenote+trans[npos]) ? (
+                midisend(cursplpos,0x90+chan[npos],note_to_send + playvelo*256); // note-on subdiv note
+                eon_sent_note[npos] = note_to_send; eon_sent_chan[npos] = chan[npos];
                 noteonstate |= 2^npos;
               );
             );
@@ -4210,7 +4293,7 @@ loop((play_state&1) ? samplesblock : 1,
       eff = eng_getStart(npos*eng_listlength+beatpos) + groove_off_rt[npos*max_seqlength+beatpos];
       eff > tpb-1 ? eff = tpb-1;
       (noneed&1) && !(ltiestate&1) ? (
-         midisend(cursplpos,0x80+chan[npos],npos+basenote+trans[npos]); // send note off
+         midisend(cursplpos,0x80+eon_sent_chan[npos],eon_sent_note[npos]); // send note off (the note that went out, F08)
       );
       (a&1) && (rand_a_play || chan[npos]!=cc_chan[0] || (ltiestate&1))? (
         sdnum=eng_getSubdivNum(npos*eng_listlength+beatpos);
@@ -4237,6 +4320,7 @@ loop((play_state&1) ? samplesblock : 1,
               !(ltiestate&1) ? ( // no tie from previous note -> fresh note-on
                 eon_audible(npos) ? ( // EON: mute/solo gate
                   midisend(cursplpos,0x90+chan[npos],note_to_send + playvelo*256);
+                  eon_sent_note[npos] = note_to_send; eon_sent_chan[npos] = chan[npos];
                   noteonstate |= 2^npos; // pow not shift: EEL2 << is 32-bit, lanes go to 48
                 );
               ) : (
@@ -4265,8 +4349,10 @@ loop((play_state&1) ? samplesblock : 1,
           groove_off_rt[npos*max_seqlength+beatpos] == 0 ? (
             sd_playstate[2*npos+1]&1 ? (// first sd step is enabled
               playvelo=grv_velo(eng_getSubdivVelo(npos, beatpos, 0), npos, beatpos);
-              eon_audible(npos) ? ( // EON: mute/solo gate -- PHYSICAL noteonstate
-                midisend(cursplpos,0x90+chan[npos],npos+basenote+trans[npos] + playvelo*256); // note-on subdiv note
+              // EON: mute/solo gate -- PHYSICAL noteonstate; plus the 0..127 check (F02, as above)
+              eon_audible(npos) && is_midi_val(note_to_send = npos+basenote+trans[npos]) ? (
+                midisend(cursplpos,0x90+chan[npos],note_to_send + playvelo*256); // note-on subdiv note
+                eon_sent_note[npos] = note_to_send; eon_sent_chan[npos] = chan[npos];
                 noteonstate |= 2^npos; // |= : idempotent vs the tie-carry above
               );
             );
@@ -4344,14 +4430,30 @@ loop(midi_buf_len,
       );
     );
   );
-  // Transpose notes (Only in in Drum map mode)
-  (s == 0x90 || s == 0x80) && npos >= 0 && npos < numnotes ? ( // note-on or note-off, and within visible grid
-    is_midi_val(note_to_send = npos+basenote+trans[npos]) ? (
-      msg23 = msg23-n+note_to_send; // transpose note
-      msg1 = (msg1&0xF0) + chan[npos]; // remap MIDI channel
+  // Transpose notes (Only in in Drum map mode). A note-on is mapped with the map as it is now
+  // and remembered per input key (eon_thru_sent); its note-off goes to the note and channel the
+  // note-on went out on, so Note start, the mode or a lane map moved while the key is held cannot
+  // strand it. A key with nothing remembered (held from before this instance) maps as it is now.
+  (s == 0x90 || s == 0x80) ? (
+    eon_thru_k = (msg1&0x0F)*128 + n;
+    (s == 0x90 && ((msg23/256)|0) > 0) ? ( eon_thru_v = 0; ) : ( eon_thru_v = eon_thru_sent[eon_thru_k]; eon_thru_sent[eon_thru_k] = 0; );
+    eon_thru_v == 0 ? (
+      npos >= 0 && npos < numnotes ? ( // within the visible grid: transpose and remap the channel
+        eon_thru_v = is_midi_val(note_to_send = npos+basenote+trans[npos]) ? 1 + chan[npos]*128 + note_to_send : -1;
+      ) : eon_thru_v = 1 + eon_thru_k; // not within the visible grid: unmodified
+      (s == 0x90 && ((msg23/256)|0) > 0) ? (
+        // the key struck again before its off, the map moved meanwhile: the earlier note ends first
+        eon_thru_sent[eon_thru_k] > 0 && eon_thru_sent[eon_thru_k] != eon_thru_v ?
+          midisend(offset,0x80+(((eon_thru_sent[eon_thru_k]-1)/128)|0),(eon_thru_sent[eon_thru_k]-1)%128);
+        eon_thru_sent[eon_thru_k] = eon_thru_v;
+      );
+    );
+    eon_thru_v > 0 ? (
+      msg23 = msg23-n+(eon_thru_v-1)%128; // transpose note
+      msg1 = (msg1&0xF0) + (((eon_thru_v-1)/128)|0); // remap MIDI channel
       midisend(offset,msg1,msg23);
     );
-  ) : ( // received note is not within visible grid, or some other event received. -> send unmodified
+  ) : ( // some other event received. -> send unmodified
     midisend(offset,msg1,msg23);
   );
   i_buf+=1;
@@ -4448,6 +4550,26 @@ _raw_lmb_down = lmb_down; _raw_LMB = LMB; _raw_wheel = frame_wheel;
 // defaults are accent for VOL and accent2 for PAN, so they are different colours,
 // and collapsing them onto one role (which an earlier pass here did) is exactly
 // what made every lane knob the same flat orange.
+// Steppa without Swing: serve a theme / knob pick ourselves when no Kit Bridge does (rk_ss_selftheme). First, so the
+// frame that follows already reads the band it painted.
+ssth_tick();
+// No Kit Bridge (Steppa installed without Swing, or Swing's bridge not running): SYNC, SWING, MTRX and PAIR have
+// nobody to talk to. They draw greyed, take no click and say why in their hint (the Steppa-alone survey, 2026-11-10).
+ss_noswing = gmem[EON_KB_ALIVE] <= 0;
+ss_dock_can = !ss_noswing || (time_precise() - gmem[EON_SH_ALIVE]) < 2;   // somebody hears a dock request
+// The toolbar is a cached draw: a bridge that starts or leaves must repaint it (the buttons stayed grey under a new
+// bridge until something else redrew the row -- seen in the sandbox, 2026-11-10). ss_noswing_drawn starts at 0, so a
+// Steppa that opens with no bridge repaints once.
+ss_noswing != ss_noswing_drawn ? ( ss_noswing_drawn = ss_noswing; refresh_tb = 1; eon_pdraw = max(eon_pdraw, 4); );
+// Nobody serves the preset strip, the browsers or the dock: no Kit Bridge and EON_Steppa_Helper is not running (a
+// Steppa-only install whose owner has not started the helper yet). The strip then says how to switch it on instead of
+// doing nothing silently (the self audit, 2026-11-10; the owner: "do those two things"). Cached toolbar: repaint on a change.
+// Only after 5 s with nobody there: REAPER starting up (the bridge or the helper is still on its way), the helper's
+// own 3 s start grace and a stalled frame must not flash the message. The words fit a Swing install too (its
+// bridge stopped), where there is no helper to run.
+ss_nohost_t == 0 || ss_dock_can ? ss_nohost_t = time_precise();
+ss_nohost = (time_precise() - ss_nohost_t) > 5;
+ss_nohost != ss_nohost_drawn ? ( ss_nohost_drawn = ss_nohost; refresh_tb = 1; eon_pdraw = max(eon_pdraw, 4); );
 ss_th_live = gmem[GS_THEME_ID] > 0;
 sk_kp = (ss_th_live && gmem[GS_THEME_KNOB_P] >= 1) ? (gmem[GS_THEME_KNOB_P] | 0) : 1;
 ss_pmb    = eon_pair_slot >= 0 ? EON_SW_PADMIX_BASE + eon_pair_slot*EON_SW_PADMIX_STRIDE : -1;
@@ -4665,7 +4787,7 @@ eon_name_dig != eon_lnamedig ? (eon_lnamedig = eon_name_dig; refresh_tb = 1;);
   ss_dk_now = time_precise();
   ss_dk_now - ss_dk_gfx_t > 1 ? ss_dk_hello = 0;
   ss_dk_gfx_t = ss_dk_now;
-  ss_dock_want && !ss_dk_hello && gmem[EON_KB_ALIVE] > 0
+  ss_dock_want && !ss_dk_hello && ss_dock_can
     && !(ss_rig_live && ss_rig_docked) ? (
     ss_dk_hello = 1;
     gmem[EON_REDOCK_SLOT] = eon_pair_slot >= 0 ? eon_pair_slot : -1;
@@ -5485,18 +5607,15 @@ function draw_drum_note(note) local(notepos, nt, trans, half_rh, scaled_tr, offs
   colorscheme==10 ? (
     eon_ms_by = (tbh+notepos*row_height + eon_ms_row2dy)|0;
     eon_ms_ty = eon_ms_by + (((eon_ms_bh-8)/2)|0);              // text top within a button
-    // E-2: paired+mapped lanes DISPLAY the pad state from the IDENT band (the
-    // canonical mute/solo); unmapped/unpaired lanes show the local lane state.
+    // Every lane shows its OWN mute / solo, paired too (2026-10-30). A paired lane whose pad is muted in Swing itself
+    // (Swing's pad mute, the mixer) is dimmed as well, so that silence is never unexplained.
     eon_vpd = eon_pair_slot >= 0 ? eon_lane_pad[note] : -1;
-    eon_vm = eon_vpd >= 0
-      ? gmem[EON_ID_BASE + eon_pair_slot*EON_ID_STRIDE + eon_vpd*EON_ID_FIELDS + EON_ID_MUTE] > 0.5
-      : lane_mute[note];
-    eon_vs = eon_vpd >= 0
-      ? gmem[EON_ID_BASE + eon_pair_slot*EON_ID_STRIDE + eon_vpd*EON_ID_FIELDS + EON_ID_SOLO] > 0.5
-      : lane_solo[note];
-    eon_va = eon_vpd >= 0 ? eon_band_anysolo : any_solo;
+    eon_vm = lane_mute[note];
+    eon_vs = lane_solo[note];
+    eon_va = any_solo;
+    eon_vpm = eon_vpd >= 0 && gmem[EON_ID_BASE + eon_pair_slot*EON_ID_STRIDE + eon_vpd*EON_ID_FIELDS + EON_ID_MUTE] > 0.5;
     // silenced overlay over the NAME area only (leave the control strip readable)
-    (eon_vm || (eon_va && !eon_vs)) ? (
+    (eon_vm || eon_vpm || (eon_va && !eon_vs)) ? (
       gfx_set(0,0,0,0.42); gfx_x=2; gfx_y=tbh+notepos*row_height+1; gfx_rectto(eon_cz-1, gfx_y+row_height-2);
     );
     // control-strip backdrop so M/S/swing read as their own zone, separate from
@@ -6083,30 +6202,18 @@ function ss_toggle_step(lane, step) local(mask, nidx) (
   update_has_notes();
 );
 
-// Toggle lane mute/solo — mirrors the pianokeys pill click (~line 4180): paired +
-// mapped posts a SET toggle of the PAD state to the Swing INCMD mailbox (band echoes
-// back); unpaired toggles the local lane array. Repaint via refresh_pianokeys.
-function ss_mute_toggle(lane) local(pd, cb) (
-  pd = eon_pair_slot >= 0 ? eon_lane_pad[lane] : -1;
-  pd >= 0 ? (
-    cb = EON_INCMD_BASE + eon_pair_slot*EON_INCMD_STRIDE + EON_INCMD_SEQ_MUTE + pd*2;
-    gmem[cb+1] = gmem[EON_ID_BASE + eon_pair_slot*EON_ID_STRIDE + pd*EON_ID_FIELDS + EON_ID_MUTE] > 0.5 ? 0 : 1;
-    gmem[cb] = 2;
-  ) : (
-    lane_mute[lane] = lane_mute[lane] ? 0 : 1;
-  );
+// Toggle lane mute/solo — mirrors the pianokeys pill click: the lane's OWN state, paired or not (2026-10-30, the
+// owner's "only grey the notes"; under E-2 a paired lane posted a SET of its Swing pad's state). Paired, the bridge
+// greys the pad's notes in the Drum Matrix clips (eon_ss_grey_click). Repaint via refresh_pianokeys.
+function ss_mute_toggle(lane) (
+  lane_mute[lane] = lane_mute[lane] ? 0 : 1;
+  eon_ss_grey_click();
   refresh_pianokeys = 1;
 );
-function ss_solo_toggle(lane) local(pd, cb) (
-  pd = eon_pair_slot >= 0 ? eon_lane_pad[lane] : -1;
-  pd >= 0 ? (
-    cb = EON_INCMD_BASE + eon_pair_slot*EON_INCMD_STRIDE + EON_INCMD_SEQ_SOLO + pd*2;
-    gmem[cb+1] = gmem[EON_ID_BASE + eon_pair_slot*EON_ID_STRIDE + pd*EON_ID_FIELDS + EON_ID_SOLO] > 0.5 ? 0 : 1;
-    gmem[cb] = 2;
-  ) : (
-    lane_solo[lane] = lane_solo[lane] ? 0 : 1;
-    eon_recalc_solo();
-  );
+function ss_solo_toggle(lane) (
+  lane_solo[lane] = lane_solo[lane] ? 0 : 1;
+  eon_recalc_solo();
+  eon_ss_grey_click();
   refresh_pianokeys = 1;
 );
 
@@ -6250,13 +6357,15 @@ function ss_embed_panels()
     cy  = hh + row*rh;
     nt  = basenote + lane + notetranspose[lane];
     vpd = eon_pair_slot >= 0 ? eon_lane_pad[lane] : -1;
-    vm  = vpd >= 0 ? gmem[EON_ID_BASE + eon_pair_slot*EON_ID_STRIDE + vpd*EON_ID_FIELDS + EON_ID_MUTE] > 0.5 : lane_mute[lane];
-    vs  = vpd >= 0 ? gmem[EON_ID_BASE + eon_pair_slot*EON_ID_STRIDE + vpd*EON_ID_FIELDS + EON_ID_SOLO] > 0.5 : lane_solo[lane];
+    vm  = lane_mute[lane];   // the lane's OWN state (2026-10-30); a pad muted in Swing itself dims the cell below
+    vs  = lane_solo[lane];
     named = eon_pad_rgb(nt);
     named ? ( lr=gfx_r; lg=gfx_g; lb=gfx_b; ) : ( lr=0.30; lg=0.30; lb=0.34; );
     gfx_set(lr, lg, lb, 1);
     gfx_rect(cx+1, cy+1, colw-2, max(1, rh-2));
-    vm ? ( gfx_set(0, 0, 0, 0.48); gfx_rect(cx+1, cy+1, colw-2, max(1, rh-2)); );  // dim when muted
+    (vm || (vpd >= 0 && gmem[EON_ID_BASE + eon_pair_slot*EON_ID_STRIDE + vpd*EON_ID_FIELDS + EON_ID_MUTE] > 0.5)) ? (
+      gfx_set(0, 0, 0, 0.48); gfx_rect(cx+1, cy+1, colw-2, max(1, rh-2));   // dim when muted (here or in Swing)
+    );
     (!vm && gfx_beatpos >= 0 && gfx_beatpos < listlength && (notelist[gfx_beatpos] & 2^lane)) ? (
       gfx_set(1, 1, 1, 0.22); gfx_rect(cx+1, cy+1, colw-2, max(1, rh-2));          // step flash
     );
@@ -6377,7 +6486,7 @@ function ss_dk_dock_toggle() (
   (ss_rig_live && ss_rig_docked) ? (
     gmem[EON_POPOUT_REQ] = (gmem[EON_POPOUT_REQ]|0) + 1;
     ss_dock_want ? ( ss_dock_want = 0; sliderchange(slider54 = 0); );
-  ) : gmem[EON_KB_ALIVE] > 0 ? (
+  ) : ss_dock_can ? (
     gmem[EON_REDOCK_SLOT] = eon_pair_slot >= 0 ? eon_pair_slot : -1;
     gmem[EON_REDOCK_REQ]  = (gmem[EON_REDOCK_REQ]|0) + 1;
     !ss_dock_want ? ( ss_dock_want = 1; sliderchange(slider54 = 1); );
@@ -6623,13 +6732,13 @@ function ss_dock_input() local(_i, _v, _lmb, _rmb, _cell) (
       // held in the dock face (the one-directional rule keeps faces put) must
       // say "return", not promise a pop-out it cannot do.
       ss_dk_tt = (ss_rig_live && ss_rig_docked) ? "Click: pop out to a floating window - right-click: Auto / Full UI / Dock face" :
-                 gmem[EON_KB_ALIVE] > 0         ? "Click: return to the dock - right-click: Auto / Full UI / Dock face" :
+                 ss_dock_can                    ? "Click: return to the dock - right-click: Auto / Full UI / Dock face" :
                                                   "Right-click: Auto / Full UI / Dock face";
     ) :
     ss_dk_over(ss_dk_len_x, ss_dk_len_w) ? ss_dk_tt = "Pattern length (drag / scroll)" :
     ss_dk_over(ss_dk_fl_x,  ss_dk_fl_w)  ? ss_dk_tt = "Grid: Straight / Triplet" :
     ss_dk_over(ss_dk_sw_x,  ss_dk_sw_w)  ? ss_dk_tt = "Swing amount (drag / scroll)" :
-    ss_dk_over(ss_dk_ps_x,  ss_dk_ps_w)  ? ss_dk_tt = "Presets: prev | browse | next" :
+    ss_dk_over(ss_dk_ps_x,  ss_dk_ps_w)  ? ss_dk_tt = (ss_nohost ? "Presets: run the action 'EON Steppa Helper' once (with Swing: its Kit Bridge)" : "Presets: prev | browse | next") :
     ss_dk_over(ss_dk_mo_x,  ss_dk_mo_w)  ? ss_dk_tt = "U velocity, Note length, View, CC lane, Sync, Zoom, Loop, Clear" :
     ss_dk_over(ss_dk_add_x, ss_dk_pat_w) ? ss_dk_tt = "New Drum Matrix region" :
     ss_dk_over(ss_dk_pg_x,  ss_dk_pat_w) ? ss_dk_tt = "Next page of regions" :
@@ -7199,12 +7308,20 @@ colorscheme==10 ? (
   // ⭐ _ss_thit is gated the same way, and it must be: it is computed BEFORE the call,
   // so a consumed click cannot unset it. This face reads the RAW buttons, so lmb is
   // mouse_cap==1 here, the mirror of the rmb argument below.
-  _ss_thit = !rkth_open && mstate==0 && mouse_cap==1
+  // Steppa without Swing (ssth_alone, rk_ss_selftheme): only EON / Dark / Light can be painted. The shared chip's own
+  // list shows all fourteen and its wheel steps through all fourteen, so alone a RIGHT click opens the THEME MENU too
+  // (its list greys the eleven) and the wheel steps through the three here; the shared library is not changed.
+  _ss_thit = !rkth_open && mstate==0 && (mouse_cap==1 || (ssth_alone && mouse_cap==2))
           && mouse_x>=eon_thx && mouse_x<eon_thx+eon_thw
           && mouse_y>=eon_thy && mouse_y<eon_thy+eon_thh;
+  ssth_alone && mouse_wheel != 0 && mouse_x>=eon_thx && mouse_x<eon_thx+eon_thw
+             && mouse_y>=eon_thy && mouse_y<eon_thy+eon_thh ? (
+    gmem[GS_THEME_REQ] = ((min(rkth_cur(), SSTH_N) - 1 + (mouse_wheel > 0 ? 1 : -1) + SSTH_N) % SSTH_N) + 1;
+    mouse_wheel = 0; refresh_tb = 1; eon_pdraw = 4;
+  );
   rkth_input(eon_thx, eon_thy, eon_thw, eon_thh, mouse_x, mouse_y,
              rkth_open ? ((mstate==0 && mouse_cap==1) ? 1 : 0) : 0,
-             (mstate==0 && mouse_cap==2) ? 1 : 0,
+             (!ssth_alone && mstate==0 && mouse_cap==2) ? 1 : 0,
              mouse_wheel, 19) ? (
     mstate=ms_tb_button_noundo; refresh_tb=1; eon_pdraw=4; mouse_wheel=0;
   );
@@ -7764,14 +7881,14 @@ colorscheme==10 && mstate==0 && mouse_cap==1 && mouse_y>=eon_pbh && mouse_y<eon_
 
 // EON: PAIR selector click (pattern row, busp*27-30). Either button toggles the custom
 // pairing dropdown (drawn + handled by the eon_prdd blocks, mirroring the THEME dropdown).
-colorscheme==10 && mstate==0 && (mouse_cap==1 || mouse_cap==2) && mouse_y>=eon_pbh && mouse_y<eon_pbh+tbrh && mouse_x>=busp*22-2 && mouse_x<busp*25-2 ? (
+colorscheme==10 && mstate==0 && (mouse_cap==1 || mouse_cap==2) && mouse_y>=eon_pbh && mouse_y<eon_pbh+tbrh && mouse_x>=busp*22-2 && mouse_x<busp*25-2 && !ss_noswing ? (
   eon_prdd_open = 1 - eon_prdd_open;
   refresh_tb=1; mstate=ms_tb_button_noundo;
 );
 
 // EON: SYNC toggle button (top-right) -> toggle Sync (DM) mode (slider49). Front-and-centre
 // replacement for the buried SETTINGS row.
-colorscheme==10 && mstate==0 && mouse_cap==1 && mouse_y>=eon_pbh && mouse_y<eon_pbh+tbrh && mouse_x>=eon_syncb_x && mouse_x<eon_syncb_x+eon_cmdb_w ? (
+colorscheme==10 && mstate==0 && mouse_cap==1 && mouse_y>=eon_pbh && mouse_y<eon_pbh+tbrh && mouse_x>=eon_syncb_x && mouse_x<eon_syncb_x+eon_cmdb_w && !ss_noswing ? (
   eon_sync_mode = eon_sync_mode ? 0 : 1;
   sliderchange(slider49=eon_sync_mode);
   refresh_tb=1; mstate=ms_tb_button_noundo;
@@ -7783,7 +7900,7 @@ colorscheme==10 && mstate==0 && mouse_cap==1 && mouse_y>=eon_pbh && mouse_y<eon_
   mstate=ms_tb_button_noundo;
 );
 // EON: MATRIX toggle button (top-right) -> toggle the Drum Matrix overlay (global).
-colorscheme==10 && mstate==0 && mouse_cap==1 && mouse_y>=eon_pbh && mouse_y<eon_pbh+tbrh && mouse_x>=eon_mxb_x && mouse_x<eon_mxb_x+eon_cmdb_w ? (
+colorscheme==10 && mstate==0 && mouse_cap==1 && mouse_y>=eon_pbh && mouse_y<eon_pbh+tbrh && mouse_x>=eon_mxb_x && mouse_x<eon_mxb_x+eon_cmdb_w && !ss_noswing ? (
   eon_dmopen_seq = max(eon_dmopen_seq, gmem[EON_SS_DM_OPEN_REQ]|0) + 1;   // ONE global cell for every Steppa: seeded from gmem, or B's click could rewrite the value A left and never edge
   gmem[EON_SS_DM_OPEN_REQ] = eon_dmopen_seq;
   mstate=ms_tb_button_noundo;
@@ -8546,30 +8663,15 @@ colorscheme==10 && slider17 >= 1.5 && slider17 < 3.5 && mouse_x > 0 && mouse_y >
             nt_channel_start = rowchannel[nt_note];
           ) :
           eon_hit_m ? (
-            // E-2: paired+mapped -> post a SET toggle of the PAD mute to the
-            // paired Swing's sequencer-origin mailbox (payload first, flag=2
-            // LAST: the adopt fires mark_dirty_pad = this click's undo point).
-            // The band echoes next block; the pill repaints off the M/S digest.
-            eon_cpd = eon_pair_slot >= 0 ? eon_lane_pad[eon_ms_lane] : -1;
-            eon_cpd >= 0 ? (
-              eon_cb = EON_INCMD_BASE + eon_pair_slot*EON_INCMD_STRIDE + EON_INCMD_SEQ_MUTE + eon_cpd*2;
-              gmem[eon_cb+1] = gmem[EON_ID_BASE + eon_pair_slot*EON_ID_STRIDE + eon_cpd*EON_ID_FIELDS + EON_ID_MUTE] > 0.5 ? 0 : 1;
-              gmem[eon_cb] = 2;
-            ) : (
-              lane_mute[eon_ms_lane] = lane_mute[eon_ms_lane] ? 0 : 1;
-            );
-            mstate=ms_lanebtn; refresh_pianokeys=1;
+            // The lane's OWN mute, paired or not (2026-10-30, the owner's "only grey the notes"). Paired with a bridge
+            // of this level the bridge books the click's ONE undo point with the greyed notes (eon_ss_grey_click), so
+            // the release books none (noundo); else the release's sliderchange books it, as before.
+            lane_mute[eon_ms_lane] = lane_mute[eon_ms_lane] ? 0 : 1;
+            mstate = eon_ss_grey_click() ? ms_tb_button_noundo : ms_lanebtn; refresh_pianokeys=1;
           ) : eon_hit_s ? (
-            eon_cpd = eon_pair_slot >= 0 ? eon_lane_pad[eon_ms_lane] : -1;
-            eon_cpd >= 0 ? (
-              eon_cb = EON_INCMD_BASE + eon_pair_slot*EON_INCMD_STRIDE + EON_INCMD_SEQ_SOLO + eon_cpd*2;
-              gmem[eon_cb+1] = gmem[EON_ID_BASE + eon_pair_slot*EON_ID_STRIDE + eon_cpd*EON_ID_FIELDS + EON_ID_SOLO] > 0.5 ? 0 : 1;
-              gmem[eon_cb] = 2;
-            ) : (
-              lane_solo[eon_ms_lane] = lane_solo[eon_ms_lane] ? 0 : 1;
-              eon_recalc_solo();
-            );
-            mstate=ms_lanebtn; refresh_pianokeys=1;
+            lane_solo[eon_ms_lane] = lane_solo[eon_ms_lane] ? 0 : 1;
+            eon_recalc_solo();
+            mstate = eon_ss_grey_click() ? ms_tb_button_noundo : ms_lanebtn; refresh_pianokeys=1;
           ) : (eon_ms_instrip && mouse_x >= eon_sw_x && mouse_x < eon_sw_x+eon_sw_w) ? (
             // EON GROOVE: click the groove pill -> open the groove-type menu for this lane
             eon_gdd_open = 1;
@@ -10173,18 +10275,25 @@ refresh_tb || lgfx_w_tb != gfx_w || lgfx_h_tb != gfx_h || last_hl_state!=hl_stat
   );
   // EON: command toggles, top-right -- SYNC (DM sync mode) | SWING (paired Swing window) |
   // MATRIX (DM overlay). Highlighted when on, dim when off, + hover brighten.
+  // ss_noswing (no Kit Bridge): all three one flat grey with dim text and no hover brighten -- they take no click.
+  ss_noswing ? gfx_set(0.17,0.17,0.18,1) :
   gfx_set(eon_sync_mode?0.10:0.06, eon_sync_mode?0.48:0.20, eon_sync_mode?0.58:0.26, 1);   // SYNC = teal
   gfx_rect(eon_syncb_x, eon_pbh+1, eon_cmdb_w, tbrh-2);
-  eon_cmd_hov==1 ? (gfx_set(1,1,1,0.12); gfx_rect(eon_syncb_x, eon_pbh+1, eon_cmdb_w, tbrh-2););
-  gfx_set(0.96,0.98,1.0,1); gfx_x=eon_syncb_x+11; gfx_y=(eon_pbh+tbrh/2-4)|0; gfx_drawstr("SYNC");
+  eon_cmd_hov==1 && !ss_noswing ? (gfx_set(1,1,1,0.12); gfx_rect(eon_syncb_x, eon_pbh+1, eon_cmdb_w, tbrh-2););
+  ss_noswing ? gfx_set(0.46,0.46,0.48,1) : gfx_set(0.96,0.98,1.0,1);
+  gfx_x=eon_syncb_x+11; gfx_y=(eon_pbh+tbrh/2-4)|0; gfx_drawstr("SYNC");
+  ss_noswing ? gfx_set(0.17,0.17,0.18,1) :
   gfx_set(eon_swopen_now?0.54:0.24, eon_swopen_now?0.38:0.16, eon_swopen_now?0.10:0.06, 1);  // SWING = amber
   gfx_rect(eon_swb_x, eon_pbh+1, eon_cmdb_w, tbrh-2);
-  eon_cmd_hov==2 ? (gfx_set(1,1,1,0.12); gfx_rect(eon_swb_x, eon_pbh+1, eon_cmdb_w, tbrh-2););
-  gfx_set(1.0,0.99,0.96,1); gfx_x=eon_swb_x+8; gfx_y=(eon_pbh+tbrh/2-4)|0; gfx_drawstr("SWING");
+  eon_cmd_hov==2 && !ss_noswing ? (gfx_set(1,1,1,0.12); gfx_rect(eon_swb_x, eon_pbh+1, eon_cmdb_w, tbrh-2););
+  ss_noswing ? gfx_set(0.46,0.46,0.48,1) : gfx_set(1.0,0.99,0.96,1);
+  gfx_x=eon_swb_x+8; gfx_y=(eon_pbh+tbrh/2-4)|0; gfx_drawstr("SWING");
+  ss_noswing ? gfx_set(0.17,0.17,0.18,1) :
   gfx_set(eon_dmopen_now?0.16:0.07, eon_dmopen_now?0.50:0.22, eon_dmopen_now?0.30:0.14, 1);   // MTRX = green
   gfx_rect(eon_mxb_x, eon_pbh+1, eon_cmdb_w, tbrh-2);
-  eon_cmd_hov==3 ? (gfx_set(1,1,1,0.12); gfx_rect(eon_mxb_x, eon_pbh+1, eon_cmdb_w, tbrh-2););
-  gfx_set(0.96,1.0,0.97,1); gfx_x=eon_mxb_x+7; gfx_y=(eon_pbh+tbrh/2-4)|0; gfx_drawstr("MTRX");
+  eon_cmd_hov==3 && !ss_noswing ? (gfx_set(1,1,1,0.12); gfx_rect(eon_mxb_x, eon_pbh+1, eon_cmdb_w, tbrh-2););
+  ss_noswing ? gfx_set(0.46,0.46,0.48,1) : gfx_set(0.96,1.0,0.97,1);
+  gfx_x=eon_mxb_x+7; gfx_y=(eon_pbh+tbrh/2-4)|0; gfx_drawstr("MTRX");
   draw_swing_slider(eon_swpx, eon_pbh, hl_state==hl_swing);   // Swing beside the patterns (pattern row)
   eon_adapt_pend ? (   // ③ ADAPT chip — appears ONLY while a perm is pending
     gfx_set(0.10, 0.28, 0.18, 1); gfx_rect(eon_swpx-62, eon_pbh+2, 58, tbrh-4);
@@ -10289,7 +10398,7 @@ refresh_tb || lgfx_w_tb != gfx_w || lgfx_h_tb != gfx_h || last_hl_state!=hl_stat
   gfx_x=eon_psx+eon_psw-9;  gfx_y=eon_psy+5; gfx_drawstr(">");
   // Truncate the name to fit between the arrows (~eon_psw-22 px), append "..." if cut.
   eon_pctrl_name(eon_pair_slot>=0 ? eon_pair_slot : 0, #eon_psname, 31);
-  strlen(#eon_psname) < 1 ? strcpy(#eon_psname, "Preset");
+  strlen(#eon_psname) < 1 ? strcpy(#eon_psname, ss_nohost ? "Presets: helper not running" : "Preset");
   eon_psaw = eon_psw - 22;
   strcpy(#eon_pstr, #eon_psname);
   gfx_measurestr(#eon_pstr, eon_psnw, eon_psnh);
@@ -10352,11 +10461,20 @@ colorscheme==10 ? (
   );
   (mouse_y > eon_pbh && mouse_y < eon_pbh+tbrh && mouse_x >= eon_swpx && mouse_x < eon_swpx+eon_swpw) ?
     (eon_tt = "Swing amount (drag; right-click: groove menu)");
+  // Nobody serves the preset strip (ss_nohost): the hint says what to run. REAPER's own preset menu needs nobody.
+  ss_nohost && mouse_y >= eon_r2 && mouse_y < eon_r2b && mouse_x >= eon_psx && mouse_x < eon_psx+eon_psw ?
+    (eon_tt = "Nobody is serving this strip: run the action 'EON Steppa Helper' once (with Swing: its Kit Bridge). REAPER's preset menu works without it");
+  // No Kit Bridge: the greyed SYNC / SWING / MTRX buttons and the PAIR chip say why they are off.
+  ss_noswing && (eon_cmd_hov || (mouse_y >= eon_pbh && mouse_y < eon_pbh+tbrh && mouse_x >= busp*22-2 && mouse_x < busp*25-2)) ?
+    (eon_tt = eon_cmd_hov == 3 ? "Drum Matrix: comes with Swing" :
+              eon_cmd_hov == 2 ? "Opens the paired Swing: needs Swing" :
+              eon_cmd_hov == 1 ? "Sync with Swing's Drum Matrix: needs Swing" :
+                                 "Pairs Steppa with a Swing: needs Swing");
   // Wordmark band. Say only what a click will actually do right now: pop out
   // when the rig holds us, dock when the bridge can hear us, else menu only.
   eon_wm_hov ? (
     (ss_rig_live && ss_rig_docked) ? (eon_tt = "Pop out to a floating window - right-click: view menu") :
-    gmem[EON_KB_ALIVE] > 0        ? (eon_tt = "Return to the dock - right-click: view menu") :
+    ss_dock_can                   ? (eon_tt = "Return to the dock - right-click: view menu") :
                                     (eon_tt = "Right-click: Auto / Full UI / Dock face");
   );
   // Column-header strip hints. The icon/name pair gets its OWN text when it is the

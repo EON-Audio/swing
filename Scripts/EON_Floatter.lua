@@ -1,5 +1,5 @@
 -- @description EON Floatter
--- @version 1.0.9
+-- @version 1.0.10
 -- @author EON Studios
 -- @about
 --   Opens every EON plugin's floating window at the size EON designed for it,
@@ -43,7 +43,7 @@
 
 local r = reaper
 
-local VERSION   = "1.0.9"   -- shown in the panel; keep with @version above (deploy_floatter.sh checks the two agree)
+local VERSION   = "1.0.10"   -- shown in the panel; keep with @version above (deploy_floatter.sh checks the two agree)
 local EXT_D     = "EON_FloatSize"      -- captures / scale / global (the keys the pair used)
 local EXT_F     = "EON_Floatter"       -- this script's own state
 -- ⚠ Mirrored in rk_lua_core.lua (core.ALIVE_FLOATTER_*) for the Kit Bridge,
@@ -334,6 +334,8 @@ local SIZES = {
   ["EON_Drum_Strip"] = { w = 504, h = 368, gfx_w = 300, gfx_h = 900 },
   ["Filter_ReaKit"] = { w = 260, h = 244, gfx_w = 260, gfx_h = 283 },
   ["Gate_ReaKit"] = { w = 512, h = 430, gfx_w = 560, gfx_h = 520 },
+  ["Quezy_ReaKit"] = { w = 648, h = 534, gfx_w = 648, gfx_h = 534 },
+  ["GrandTour_ReaKit"] = { w = 720, h = 460, gfx_w = 340, gfx_h = 952 },
   ["Saturation_ReaKit"] = { w = 288, h = 306, gfx_w = 220, gfx_h = 320 },
   ["StereoWidth_ReaKit"] = { w = 291, h = 204, gfx_w = 200, gfx_h = 280 },
   -- EON SIZES END
@@ -907,7 +909,7 @@ end
 -- declares a taller @gfx, and a fresh window of one opens at that: GainKit's at 450 x 900 (489 x 900 on the canvas,
 -- the float's minimum width), which against the short copy's 540 never read as fresh, so it kept that height. The
 -- Filter's long view (2026-10-09): its tall copy's @gfx is 260 x 588 (the bundle's .dev_tests/gk_tall_sync.py).
-local TALL_GFX_H = { ["ChannelTool_ReaKit"] = 900, ["Filter_ReaKit"] = 588 }
+local TALL_GFX_H = { ["ChannelTool_ReaKit"] = 900, ["Filter_ReaKit"] = 588, ["Quezy_ReaKit"] = 1944 }
 local function learn_scale(e, rc)
   local ship = SIZES[e.key]
   if not ship or not rc then return nil end

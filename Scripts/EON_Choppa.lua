@@ -1069,11 +1069,8 @@ local function apply_to_swing_pads()
       if slen > 0 then
         slen = math.min(slen, math.floor(G.SLOT_SIZE / 2))
         local path = ("%s/pad%02d_g%d_%s.wav"):format(dir, pad_idx, gen, fsbase)
-        if #path >= G.GS_BROWSER_PATH_MAX then
-          reaper.ShowConsoleMsg("EON Choppa: store path too long for pad load:\n  "
-            .. path .. "\n")
-          return
-        end
+        if not core.gmem_path_fits(path, "EON Choppa") then return end   -- too long for Swing: its console line
+
         if not write_slice_wav(path, audio.sample_rate, audio.samples, ss, slen) then
           reaper.ShowConsoleMsg("EON Choppa: WAV write failed: " .. path .. "\n")
           return
@@ -1180,10 +1177,7 @@ local function pump_push()
       return
     end
     reaper.gmem_write(G.INSTANCE, push.inst_id)
-    for i = 0, #item.path - 1 do
-      reaper.gmem_write(G.GS_BROWSER_PATH + i, item.path:byte(i + 1))
-    end
-    reaper.gmem_write(G.GS_BROWSER_PATH_LEN, #item.path)
+    core.gmem_put_path(item.path, "EON Choppa")   -- it fits (checked when the slice was written)
     reaper.gmem_write(G.GS_BROWSE_PAD, item.pad)
     -- This producer stages no display name: drop any armed name-adopt flag, or the handler keeps the pad's OLD
     -- name instead of naming it from the file (the bridge's loader does the same before its CMD 63).

@@ -19,6 +19,14 @@
 --                     * Right-click -> menu (Remove / Move L-R / Repeats +/-)
 --                   Playback rides reaper.GoToRegion (see pattern_song.lua).
 --
+-- The strip grows left from the cog and STOPS at the arrange's left edge (audit
+-- DM112: 20+ chips ran onto the track panel and the next monitor). A row whose
+-- chips do not fit shows as many as fit between two arrows, chips at full size;
+-- the wheel over the patterns row, Shift+wheel or a horizontal wheel over the
+-- song row (a plain wheel on a song chip stays its repeat count), or a click on
+-- an arrow moves it one chip. The pattern under the cursor and the song step
+-- that is playing scroll into view when they change.
+--
 -- ARCHITECTURE NOTE: this lives in its OWN window (like the cog), NOT the main
 -- overlay window, because the overlay is flagged NoMouseInputs whenever paint
 -- mode is OFF — an InvisibleButton there would be dead half the time.
@@ -35,8 +43,10 @@ local manager  = dofile(_SCRIPT_DIR .. 'pattern_manager.lua')
 
 -- Module-scoped UI state.
 local rename_target = nil   -- region idx being renamed (modal open while non-nil)
+local rename_guid   = nil   -- that region's GUID: the number is read back through it on apply (live_idx)
 local rename_buffer = ''
 local popup_target  = nil   -- region idx the pattern right-click menu acts on
+local popup_guid    = nil   -- that region's GUID (live_idx)
 local song_target   = nil   -- chain position the song right-click menu acts on
 local arr_menu_open = false -- arrangement picker popup showing
 local arr_rename    = nil   -- arrangement index being renamed (modal open while non-nil)
@@ -66,6 +76,12 @@ local SONG_W   = 60    -- song chip
 local COG_WIN    = 52
 local COG_MARGIN = 4
 local COG_GAP    = 8
+local EDGE_W     = 12  -- the "more" arrow at each end of a row whose chips do not fit (DM112)
+
+-- Sideways scroll state (DM112), in whole chips: never a chip cut in half.
+local pat_first, song_first   = 0, 0     -- chips hidden off the left of each row
+local pat_wheel, song_wheel   = 0, 0     -- a touchpad's fractional wheel, carried between frames
+local pat_follow, song_follow = nil, nil -- the chip last scrolled into view (follow on a change only)
 
 -- =============================================================================
 -- color helpers
@@ -98,33 +114,74 @@ end
 -- geometry
 -- =============================================================================
 
+-- Row 1 = the pattern chips, then a fixed tail ("+", Mgr, two zooms) next to
+-- the cog. Row 2 = a fixed head (play, loop, arrangement), then the song chain.
+local PAT_TAIL_W  = PLUS_W + GAP + MGR_W + GAP + ZOOM_W + GAP + ZOOM_W
+local SONG_HEAD_W = PLAY_W + GAP + LOOP_W + GAP + ARR_W + GAP
+
 local function pattern_row_w(n)
-  return n * CHIP_W + n * GAP + PLUS_W + GAP + MGR_W + GAP + ZOOM_W + GAP + ZOOM_W
+  return n * (CHIP_W + GAP) + PAT_TAIL_W
+end
+
+local function song_chips_w(k)
+  return (k > 0) and (k * SONG_W + (k - 1) * ARROW_W) or 80  -- min for hint text
 end
 
 local function song_row_w(m)
-  local chips = (m > 0) and (m * SONG_W + (m - 1) * ARROW_W) or 80  -- min for hint text
-  return PLAY_W + GAP + LOOP_W + GAP + ARR_W + GAP + chips
+  return SONG_HEAD_W + song_chips_w(m)
 end
 
--- Screen-space rect of the strip window. Single source of truth shared by
--- Render AND the paint-suppression hover check. Returns x, y, w, h.
-function M.GetStripRect(R, T)
-  if not R or not T then return nil end
+-- How many chips of a row fit in `inner` px: all (over = false), or as many as
+-- fit between the row's two edge arrows (over = true), at least one.
+local function pat_fit(n, inner)
+  if pattern_row_w(n) <= inner then return n, false end
+  return math.max(1, math.floor((inner - PAT_TAIL_W - 2 * EDGE_W) / (CHIP_W + GAP))), true
+end
+
+local function song_fit(m, inner)
+  if song_row_w(m) <= inner then return m, false end
+  return math.max(1, math.floor((inner - SONG_HEAD_W - 2 * EDGE_W + ARROW_W) / (SONG_W + ARROW_W))), true
+end
+
+-- The narrowest strip: each row's fixed part, its two arrows and one chip. An
+-- arrange narrower than this is the one case the strip still crosses L.
+local MIN_INNER = math.max(PAT_TAIL_W + 2 * EDGE_W + CHIP_W + GAP, SONG_HEAD_W + 2 * EDGE_W + SONG_W)
+
+-- The strip's layout: x, y, w, h of its window, then per row the chips shown
+-- (pk / sk) and whether the row scrolls (pover / sover). L nil = no left stop.
+local function layout(R, T, L)
   local n = #patterns.List()
   local m = #song.SongList()
   local inner = math.max(pattern_row_w(n), song_row_w(m))
+  local right = R - COG_WIN - COG_MARGIN - COG_GAP
+  local pk, pover, sk, sover = n, false, m, false
+  if L and inner > right - L - WIN_PAD * 2 then
+    -- Stop at the arrange's left edge (DM112), then hug what the rows show so
+    -- no slack opens between the last chip and the cog.
+    local avail = math.max(MIN_INNER, right - L - WIN_PAD * 2)
+    pk, pover = pat_fit(n, avail)
+    sk, sover = song_fit(m, avail)
+    local w1 = pover and (2 * EDGE_W + pk * (CHIP_W + GAP) + PAT_TAIL_W) or pattern_row_w(n)
+    local w2 = sover and (SONG_HEAD_W + 2 * EDGE_W + song_chips_w(sk)) or song_row_w(m)
+    inner = math.max(w1, w2)
+  end
   local win_w = inner + WIN_PAD * 2
   local win_h = WIN_PAD * 2 + CHIP_H * 2 + ROW_GAP
-  local cog_left = R - COG_WIN - COG_MARGIN
-  local x = cog_left - COG_GAP - win_w
-  local y = T + 4
-  return x, y, win_w, win_h
+  return right - win_w, T + 4, win_w, win_h, pk, pover, sk, sover
 end
 
-function M.IsHovered(ctx, R, T)
+-- Screen-space rect of the strip window. Single source of truth shared by
+-- Render AND the paint-suppression hover check. Returns x, y, w, h. L is the
+-- arrange's left edge (nil: the strip grows without a stop, the old geometry).
+function M.GetStripRect(R, T, L)
+  if not R or not T then return nil end
+  local x, y, w, h = layout(R, T, L)
+  return x, y, w, h
+end
+
+function M.IsHovered(ctx, R, T, L)
   if popup_target or song_target or rename_target or arr_menu_open or arr_rename then return true end
-  local x, y, w, h = M.GetStripRect(R, T)
+  local x, y, w, h = M.GetStripRect(R, T, L)
   if not x then return false end
   local mx, my = reaper.ImGui_GetMousePos(ctx)
   return mx ~= nil and mx >= x and mx <= x + w and my >= y and my <= y + h
@@ -136,6 +193,22 @@ end
 
 local function stamp_at_cursor(idx)
   patterns.Stamp(idx, nil)   -- nil dest -> lane_tools resolves play/edit cursor
+end
+
+-- A region NUMBER held across frames (the open pattern menu, the rename box) is read back through the region's GUID
+-- when it is used: a renumber made meanwhile (the ruler, REAPER's region manager) hands the number to another region,
+-- and the rename / delete / stamp hit that one (Swing_Solid_R2_Region_GUIDs_2026-10-29.md, "Limits and follow-ups";
+-- fixed 2026-10-30). nil = the region is gone. No GUID (a REAPER without region GUIDs): the number, as before.
+local function live_idx(idx, guid)
+  if guid == nil then return idx end
+  return patterns.NumberOfGuid(guid)
+end
+
+local function guid_of(idx)
+  for _, r in ipairs(patterns.List()) do
+    if r.idx == idx then return r.guid end
+  end
+  return nil
 end
 
 -- =============================================================================
@@ -203,6 +276,7 @@ local function render_pattern_chip(ctx, dl, pat, x, y, is_here)
     if shift then stamp_at_cursor(pat.idx) else patterns.JumpTo(pat.idx) end
   elseif rclick then
     popup_target = pat.idx
+    popup_guid   = pat.guid
     reaper.ImGui_OpenPopup(ctx, 'pat_popup')
   end
 end
@@ -225,6 +299,7 @@ local function render_plus_chip(ctx, dl, x, y)
     if idx then
       patterns.JumpTo(idx)   -- land on the new region so you can build it
       rename_target = idx
+      rename_guid   = guid_of(idx)
       rename_buffer = (patterns.GetByIndex(idx) or {}).name or ''
       reaper.ImGui_OpenPopup(ctx, 'pat_rename')
     end
@@ -418,7 +493,9 @@ local function render_arr_rename_modal(ctx)
   end
 end
 
-local function render_song_chip(ctx, dl, entry, x, y, pos, playing_pos, cur)
+-- Returns true when the wheel went to the repeat count (the row then does not
+-- scroll on it). `scrolls`: the song row is scrolling (DM112), for the tooltip.
+local function render_song_chip(ctx, dl, entry, x, y, pos, playing_pos, cur, scrolls)
   local reg  = entry.region
   local glow = (pos == playing_pos) and (0.45 + 0.55 * math.abs(math.sin(reaper.ImGui_GetTime(ctx) * 5))) or 0
   local here = (not playing_pos) and cur and (cur >= reg.start - 1e-6 and cur < reg.end_ - 1e-6)
@@ -426,10 +503,16 @@ local function render_song_chip(ctx, dl, entry, x, y, pos, playing_pos, cur)
   local clicked, hovered, rclick = draw_chip(ctx, dl, 'song##' .. pos, x, y,
     SONG_W, CHIP_H, chip_color(reg), reg.name ~= '' and reg.name or ('#' .. reg.idx),
     { here = here, glow = glow, badge = badge })
+  local used_wheel = false
   if hovered then
-    reaper.ImGui_SetTooltip(ctx, 'Click: jump   Wheel: repeats   Right-click: menu')
+    reaper.ImGui_SetTooltip(ctx, scrolls and 'Click: jump   Wheel: repeats   Shift+wheel: scroll   Right-click: menu'
+                                          or 'Click: jump   Wheel: repeats   Right-click: menu')
     local wheel = reaper.ImGui_GetMouseWheel(ctx)
-    if wheel and wheel ~= 0 then song.SongBumpRepeats(pos, wheel > 0 and 1 or -1) end
+    local shift = ((reaper.ImGui_GetKeyMods(ctx) or 0) & reaper.ImGui_Mod_Shift()) ~= 0
+    if wheel and wheel ~= 0 and not (shift and scrolls) then   -- Shift+wheel scrolls a row that scrolls (DM112)
+      song.SongBumpRepeats(pos, wheel > 0 and 1 or -1)
+      used_wheel = true
+    end
   end
   if clicked then
     patterns.JumpTo(reg.idx)
@@ -437,6 +520,45 @@ local function render_song_chip(ctx, dl, entry, x, y, pos, playing_pos, cur)
     song_target = pos
     reaper.ImGui_OpenPopup(ctx, 'song_popup')
   end
+  return used_wheel
+end
+
+-- A row's end arrow, drawn (and clickable) only while `hidden` chips lie that
+-- way (DM112). dir -1 = left, 1 = right. Returns clicked.
+local function draw_more(ctx, dl, id, x, y, dir, hidden)
+  if hidden <= 0 then return false end
+  reaper.ImGui_SetCursorScreenPos(ctx, x, y)
+  local clicked = reaper.ImGui_InvisibleButton(ctx, id, EDGE_W, CHIP_H)
+  local hovered = reaper.ImGui_IsItemHovered(ctx)
+  local col     = hovered and 0xFFFFFFFF or 0xAAAAAAFF
+  local cx, cy  = x + EDGE_W / 2, y + CHIP_H / 2
+  if dir < 0 then
+    reaper.ImGui_DrawList_AddTriangleFilled(dl, cx + 3, cy - 5, cx + 3, cy + 5, cx - 3, cy, col)
+  else
+    reaper.ImGui_DrawList_AddTriangleFilled(dl, cx - 3, cy - 5, cx - 3, cy + 5, cx + 3, cy, col)
+  end
+  if hovered then
+    reaper.ImGui_SetTooltip(ctx, string.format('%d more -- click, or the wheel, to scroll', hidden))
+  end
+  return clicked
+end
+
+local function clamp_first(first, count, shown)
+  return math.max(0, math.min(first, count - shown))
+end
+
+-- The first-chip offset that puts chip i (1-based) in view, moving as little as it can.
+local function into_view(first, shown, i)
+  if i - 1 < first then return i - 1 end
+  if i > first + shown then return i - shown end
+  return first
+end
+
+-- Whole-chip steps out of a (fractional) wheel, carrying the remainder.
+local function wheel_steps(acc, d)
+  acc = acc + d
+  local s = (acc >= 0) and math.floor(acc) or -math.floor(-acc)
+  return s, acc - s
 end
 
 -- =============================================================================
@@ -445,20 +567,25 @@ end
 
 local function render_pattern_popup(ctx)
   if reaper.ImGui_BeginPopup(ctx, 'pat_popup') then
-    local idx = popup_target
-    if reaper.ImGui_MenuItem(ctx, 'Stamp at cursor') then stamp_at_cursor(idx) end
-    if reaper.ImGui_MenuItem(ctx, 'Jump to') then patterns.JumpTo(idx) end
-    if reaper.ImGui_MenuItem(ctx, 'Add to song') then song.SongAppend(idx) end
-    reaper.ImGui_Separator(ctx)
-    if reaper.ImGui_MenuItem(ctx, 'Rename...') then
-      rename_target = idx
-      rename_buffer = (patterns.GetByIndex(idx) or {}).name or ''
-      open_modal = 'pat_rename'   -- opened by Render at window scope (see open_modal)
+    local idx = live_idx(popup_target, popup_guid)   -- its number NOW (a renumber while the menu is up)
+    if idx == nil then
+      reaper.ImGui_CloseCurrentPopup(ctx)   -- the region went while the menu was up: nothing to act on
+    else
+      if reaper.ImGui_MenuItem(ctx, 'Stamp at cursor') then stamp_at_cursor(idx) end
+      if reaper.ImGui_MenuItem(ctx, 'Jump to') then patterns.JumpTo(idx) end
+      if reaper.ImGui_MenuItem(ctx, 'Add to song') then song.SongAppend(idx) end
+      reaper.ImGui_Separator(ctx)
+      if reaper.ImGui_MenuItem(ctx, 'Rename...') then
+        rename_target = idx
+        rename_guid   = popup_guid
+        rename_buffer = (patterns.GetByIndex(idx) or {}).name or ''
+        open_modal = 'pat_rename'   -- opened by Render at window scope (see open_modal)
+      end
+      if reaper.ImGui_MenuItem(ctx, 'Delete pattern') then patterns.Delete(idx) end
     end
-    if reaper.ImGui_MenuItem(ctx, 'Delete pattern') then patterns.Delete(idx) end
     reaper.ImGui_EndPopup(ctx)
   else
-    popup_target = nil
+    popup_target, popup_guid = nil, nil
   end
 end
 
@@ -484,7 +611,6 @@ local function render_rename_modal(ctx)
   local flags = reaper.ImGui_WindowFlags_AlwaysAutoResize()
   local visible, open = reaper.ImGui_BeginPopupModal(ctx, 'pat_rename', true, flags)
   if visible then
-    local idx = rename_target
     reaper.ImGui_Text(ctx, 'Pattern name')
     local changed, new_text = reaper.ImGui_InputText(ctx, '##patname', rename_buffer, 64)
     if changed then rename_buffer = new_text end
@@ -494,16 +620,17 @@ local function render_rename_modal(ctx)
     local cancel = reaper.ImGui_Button(ctx, 'Cancel') or
                    reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_Escape())
     if commit then
-      patterns.Rename(idx, rename_buffer)
-      rename_target, rename_buffer = nil, ''
+      local idx = live_idx(rename_target, rename_guid)   -- the region's number NOW; nil = it went: nothing renamed
+      if idx then patterns.Rename(idx, rename_buffer) end
+      rename_target, rename_guid, rename_buffer = nil, nil, ''
       reaper.ImGui_CloseCurrentPopup(ctx)
     elseif cancel then
-      rename_target, rename_buffer = nil, ''
+      rename_target, rename_guid, rename_buffer = nil, nil, ''
       reaper.ImGui_CloseCurrentPopup(ctx)
     end
     reaper.ImGui_EndPopup(ctx)
   elseif open == false then
-    rename_target, rename_buffer = nil, ''
+    rename_target, rename_guid, rename_buffer = nil, nil, ''
   end
 end
 
@@ -512,12 +639,30 @@ end
 -- =============================================================================
 
 function M.Render(ctx, L, T, R, B)
-  local x, y, win_w, win_h = M.GetStripRect(R, T)
-  if not x then return end
+  if not R or not T then return end
+  local x, y, win_w, win_h, pk, pover, sk, sover = layout(R, T, L)
   local plist = patterns.List()
   local slist = song.SongList()
   local cur   = reaper.GetCursorPosition()
   local playing_pos = song.CurrentEntryPos()
+  local n, m  = #plist, #slist
+
+  -- The pattern under the cursor and the playing song step scroll into view
+  -- when they CHANGE (DM112); between changes the user's scroll stands.
+  local here_i = nil
+  for i, pat in ipairs(plist) do
+    if cur >= pat.start - 1e-6 and cur < pat.end_ - 1e-6 then here_i = i; break end
+  end
+  if here_i ~= pat_follow then
+    pat_follow = here_i
+    if here_i then pat_first = into_view(pat_first, pk, here_i) end
+  end
+  if playing_pos ~= song_follow then
+    song_follow = playing_pos
+    if playing_pos then song_first = into_view(song_first, sk, playing_pos) end
+  end
+  pat_first  = clamp_first(pat_first, n, pk)
+  song_first = clamp_first(song_first, m, sk)
 
   reaper.ImGui_SetNextWindowPos(ctx, x, y)
   reaper.ImGui_SetNextWindowSize(ctx, win_w, win_h)
@@ -536,19 +681,29 @@ function M.Render(ctx, L, T, R, B)
     local row1y = y + WIN_PAD
     local row2y = row1y + CHIP_H + ROW_GAP
 
-    -- Row 1: patterns + "+"
+    -- Row 1: patterns + "+" (the chips pat_first+1 .. pat_first+pk when it scrolls)
     local bx = x + WIN_PAD
-    for _, pat in ipairs(plist) do
+    if pover then
+      if draw_more(ctx, dl, 'pat_more_l', bx, row1y, -1, pat_first) then pat_first = pat_first - 1 end
+      bx = bx + EDGE_W
+    end
+    for i = pat_first + 1, math.min(n, pat_first + pk) do
+      local pat = plist[i]
       local is_here = (cur >= pat.start - 1e-6 and cur < pat.end_ - 1e-6)
       render_pattern_chip(ctx, dl, pat, bx, row1y, is_here)
       bx = bx + CHIP_W + GAP
+    end
+    if pover then
+      if draw_more(ctx, dl, 'pat_more_r', bx, row1y, 1, n - pat_first - pk) then pat_first = pat_first + 1 end
+      bx = bx + EDGE_W
     end
     render_plus_chip(ctx, dl, bx, row1y); bx = bx + PLUS_W + GAP
     render_mgr_button(ctx, dl, bx, row1y); bx = bx + MGR_W + GAP
     render_zoom_buttons(ctx, dl, bx, row1y)
 
-    -- Row 2: transport + song chain
+    -- Row 2: transport + song chain (the steps song_first+1 .. song_first+sk when it scrolls)
     local sx = x + WIN_PAD
+    local wheel_on_chip = false
     render_play_button(ctx, dl, sx, row2y);  sx = sx + PLAY_W + GAP
     render_loop_button(ctx, dl, sx, row2y);  sx = sx + LOOP_W + GAP
     render_arr_button(ctx, dl, sx, row2y);   sx = sx + ARR_W + GAP
@@ -556,14 +711,45 @@ function M.Render(ctx, L, T, R, B)
       reaper.ImGui_DrawList_AddText(dl, sx + 2, row2y + math.floor((CHIP_H - 14) / 2),
         0x888888FF, 'right-click a pattern -> Add to song')
     else
-      for pos, entry in ipairs(slist) do
-        if pos > 1 then
+      if sover then
+        if draw_more(ctx, dl, 'song_more_l', sx, row2y, -1, song_first) then song_first = song_first - 1 end
+        sx = sx + EDGE_W
+      end
+      for pos = song_first + 1, math.min(m, song_first + sk) do
+        if pos > song_first + 1 then
           reaper.ImGui_DrawList_AddText(dl, sx + 1, row2y + math.floor((CHIP_H - 14) / 2),
             0xAAAAAAFF, '->')
           sx = sx + ARROW_W
         end
-        render_song_chip(ctx, dl, entry, sx, row2y, pos, playing_pos, cur)
+        if render_song_chip(ctx, dl, slist[pos], sx, row2y, pos, playing_pos, cur, sover) then
+          wheel_on_chip = true
+        end
         sx = sx + SONG_W
+      end
+      if sover and draw_more(ctx, dl, 'song_more_r', sx, row2y, 1, m - song_first - sk) then
+        song_first = song_first + 1
+      end
+    end
+
+    -- Sideways scroll (DM112): the wheel over the patterns row; over the song
+    -- row Shift+wheel, a horizontal wheel, or a plain wheel off the chips (on a
+    -- chip it is the repeat count). Up / a left tilt = towards the first chip.
+    if (pover or sover) and reaper.ImGui_IsWindowHovered(ctx) then
+      local wv, wh = reaper.ImGui_GetMouseWheel(ctx)
+      wv, wh = wv or 0, wh or 0
+      local d = (wh ~= 0) and wh or wv
+      local _, my = reaper.ImGui_GetMousePos(ctx)
+      if d ~= 0 and my then
+        local s
+        if my < row2y - ROW_GAP / 2 then
+          if pover then
+            s, pat_wheel = wheel_steps(pat_wheel, d)
+            pat_first = clamp_first(pat_first - s, n, pk)
+          end
+        elseif sover and not wheel_on_chip then
+          s, song_wheel = wheel_steps(song_wheel, d)
+          song_first = clamp_first(song_first - s, m, sk)
+        end
       end
     end
 

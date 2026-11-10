@@ -1,0 +1,760 @@
+// rk_swing_ui_grid_overlay_fx_p2.jsfx-inc -- part 2 of rk_swing_ui_grid_overlay_fx.jsfx-inc (2 parts), cut at a function boundary by
+// .dev_tests/split_big_incs.py: REAPER's load time grows with the square of a file's size. Edit freely;
+// keep each file under about 40 KB.
+
+// ⚠️ @init IS LOAD-BEARING (.docs/wiki/02-file-structure.md).
+@init
+
+// The knob rows under the EQ (2026-10-28): FX, then SENDS under it. Their heights, from a row's top: its title
+// (12), the knob (2 r + 2), the label and the value (20), and under FX the DRIVE / COMP mode pills (10). The waveform's
+// share of the spare room (_ov_draw_waveform_and_adsr) counts on these: change a row, change its height here.
+OV_FX_ROW_H = 66;
+OV_SND_ROW_H = 56;
+OV_EQ_H = 56;           // the EQ display's height (eq_dh)
+
+function _ov_draw_eq_and_filters() (
+    // ── The EQ: its bar at ov_eq_top (the envelope's end; the two-column form sets it), the display under it ─────────
+    // Folded (pfx_fold & 2): the bar alone. Lit: a band boosted or cut, or a cut filter in.
+    // (every size at the editor's zoom: ov_px / ov_font, rk_swing_ui_layer_mixer)
+    fxk_r = ov_px(11);
+    fxk_base = km_fx + oi * KM_FX_PER_PAD * KS;
+    _ov_eq_on = fx_eq_lo[oi] != 0 || fx_eq_mid[oi] != 0 || fx_eq_hi[oi] != 0 || fx_hpf_freq[oi] > 25 || fx_lpf_freq[oi] < 19500;
+    strcpy(#ov_fsum, "");
+    fx_hpf_freq[oi] > 25 ? ( sprintf(#ov_fkv, "HP %d  ", fx_hpf_freq[oi] + 0.5); strcat(#ov_fsum, #ov_fkv); );
+    fx_lpf_freq[oi] < 19500 ? ( fx_lpf_freq[oi] >= 1000 ? sprintf(#ov_fkv, "LP %.1fk  ", fx_lpf_freq[oi] / 1000) : sprintf(#ov_fkv, "LP %d  ", fx_lpf_freq[oi] + 0.5); strcat(#ov_fsum, #ov_fkv); );
+    fx_eq_lo[oi] != 0 || fx_eq_mid[oi] != 0 || fx_eq_hi[oi] != 0 ? strcat(#ov_fsum, "bands");
+    _ov_fold_bar(ov_eq_top, 2, "EQ", _ov_eq_on);
+    fxk_y = ov_eq_top + ov_px(OV_FOLD_BLK);   // the display, under its bar
+    ov_eq_end = (pfx_fold & 2) ? fxk_y : fxk_y + ov_px(OV_EQ_H + ov_geq + 2);   // ov_geq: its share of the room (step 2)
+    !(pfx_fold & 2) ? (
+
+    // ── Full-width EQ + filter response visualizer (biquad-based) ──
+    eq_dx = op_x + ov_px(10);
+    eq_dw = op_w - ov_px(20);
+    eq_dy = fxk_y; eq_dh = ov_px(OV_EQ_H + ov_geq);
+    eq_cy = eq_dy + eq_dh / 2;   // center line = 0dB
+
+    // Background: the LCD look (2026-10-28; _ov_lcd_screen, the waveform's) -- a screen: THEME leaves it and what is on it
+    // as they are (ov_scr, rk_swing_ui_layer_mixer ov_set)
+    ov_scr = 1; _ov_lcd_screen(eq_dx, eq_dy, eq_dw, eq_dh);
+
+    // 0dB center line
+    ov_set(0.25, 0.26, 0.30, 0.6);
+    gfx_line(eq_dx + 1, eq_cy, eq_dx + eq_dw - 2, eq_cy);
+
+    // ±6dB reference lines.
+    // ONE dB scale for the curve, the node positions, AND the drag mapping
+    // (matches EON_Drum_Strip 59b0890; ReEQ's shared db_to_y is the model):
+    // ±15 dB display range, band gains clamp at ±12. Previously nodes used
+    // /12 while the curve used /24, so a boosted node floated at twice its
+    // band's visual height — and these "±6dB" lines actually sat at ±12.
+    eq_dbr = 15;
+    eq_gyr = eq_dh / 2 - ov_px(3);
+    _6db_py = eq_gyr * 6 / eq_dbr;
+    ov_set(0.18, 0.19, 0.22, 0.4);
+    gfx_line(eq_dx + 1, eq_cy - _6db_py, eq_dx + eq_dw - 2, eq_cy - _6db_py);
+    gfx_line(eq_dx + 1, eq_cy + _6db_py, eq_dx + eq_dw - 2, eq_cy + _6db_py);
+
+    // Freq→pixel mapping: log scale 20Hz–20kHz
+    _log_lo = 1.301; _log_range = 3.0;
+
+    // Draw combined SVF frequency response curve (HPF * LPF * Lo * Mid * Hi)
+    // svf_mag_at evaluates the ramp TARGETS, so the curve tracks the knobs
+    // immediately rather than chasing the 30 ms coefficient glide.
+    _peq_bq_base = svf_pad + oi * SVF_PER_PAD * SVF_STEREO_SIZE;
+    _peq_prev_x = -1; _peq_prev_y = -1;
+    _peq_px = 0;
+    _peq_yr = eq_gyr;
+    // Per-PIXEL sampling + solid fill (matches the Drum Strip / ReEQ;
+    // the old 60-step sweep left visible hatching gaps in the fill)
+    loop(eq_dw - 2,
+      _peq_f = pow(10, _log_lo + (_peq_px / max(1, eq_dw - 3)) * _log_range);
+      _peq_f = min(20000, _peq_f);
+      // Combined magnitude of all 5 SVF filters
+      _peq_mag = 1.0;
+      fx_hpf_freq[oi] > 25 ? _peq_mag *= svf_mag_at(_peq_bq_base + SVF_PAD_HPF * SVF_STEREO_SIZE, _peq_f);
+      fx_lpf_freq[oi] < 19500 ? _peq_mag *= svf_mag_at(_peq_bq_base + SVF_PAD_LPF * SVF_STEREO_SIZE, _peq_f);
+      (fx_eq_lo[oi] != 0) ? _peq_mag *= svf_mag_at(_peq_bq_base + SVF_PAD_LO * SVF_STEREO_SIZE, _peq_f);
+      (fx_eq_mid[oi] != 0) ? _peq_mag *= svf_mag_at(_peq_bq_base + SVF_PAD_MID * SVF_STEREO_SIZE, _peq_f);
+      (fx_eq_mid2[oi] != 0) ? _peq_mag *= svf_mag_at(_peq_bq_base + SVF_PAD_MID2 * SVF_STEREO_SIZE, _peq_f);
+      (fx_eq_hi[oi] != 0) ? _peq_mag *= svf_mag_at(_peq_bq_base + SVF_PAD_HI * SVF_STEREO_SIZE, _peq_f);
+      _peq_db = _peq_mag > 0.001 ? 20 * log10(_peq_mag) : -eq_dbr;
+      _peq_db = max(-eq_dbr, min(eq_dbr, _peq_db));
+      _peq_cur_x = eq_dx + 1 + _peq_px;
+      _peq_cur_y = eq_cy - (_peq_db / eq_dbr) * _peq_yr;
+      _peq_cur_y = max(eq_dy + 1, min(eq_dy + eq_dh - 2, _peq_cur_y));
+
+      // Solid fill between curve and 0dB (per-pixel — no hatching)
+      _peq_fy1 = min(eq_cy, _peq_cur_y);
+      _peq_fy2 = max(eq_cy, _peq_cur_y);
+      _peq_fy2 - _peq_fy1 > 0.5 ? (
+        ov_set(pr * 0.3 + 0.1, pgg * 0.3 + 0.1, pb * 0.3 + 0.1, 0.15);
+        gfx_rect(_peq_cur_x, _peq_fy1, 1, _peq_fy2 - _peq_fy1 + 1);
+      );
+      _peq_prev_x >= 0 ? (
+        // Curve line
+        ov_set(pr * 0.5 + 0.4, pgg * 0.5 + 0.4, pb * 0.5 + 0.4, 0.85);
+        gfx_line(_peq_prev_x, _peq_prev_y, _peq_cur_x, _peq_cur_y);
+      );
+      _peq_prev_x = _peq_cur_x;
+      _peq_prev_y = _peq_cur_y;
+      _peq_px += 1;
+    );
+
+    // Freq reference labels
+    ov_font(8, 0); ov_set(0.62, 0.66, 0.70, 0.9);  // readable (2026-10-29, the owner: "make sure all the texxt is visible and easy to read. Values too"): 7 px at half strength read 1.5:1
+    _ref_100 = eq_dx + (log10(100) - _log_lo) / _log_range * eq_dw;
+    _ref_1k  = eq_dx + (log10(1000) - _log_lo) / _log_range * eq_dw;
+    _ref_10k = eq_dx + (log10(10000) - _log_lo) / _log_range * eq_dw;
+    gfx_x = _ref_100 + 1; gfx_y = eq_dy + eq_dh - ov_px(9); gfx_drawstr("100");
+    gfx_x = _ref_1k + 1;  gfx_y = eq_dy + eq_dh - ov_px(9); gfx_drawstr("1k");
+    gfx_x = _ref_10k + 1; gfx_y = eq_dy + eq_dh - ov_px(9); gfx_drawstr("10k");
+
+    // HPF / LPF: NODES on this display since 2026-10-28 (the owner: "move the filters knobs out and into the eq as
+    // nodes"; their knobs are gone from the FX row). A hollow node at the cutoff, as high as the resonance peak (RESO:
+    // the two filters' shared Q, 20 log10 Q dB); OFF it rests at the display's end, dimmed, marked HP / LP. Drag sideways
+    // = the cutoff (back to the end = off), up / down = the resonance, the wheel too; double-click = off. Node ids
+    // 224 (HPF) and 225 (LPF), after the bands' 220..223.
+    ov_font(8, 'b');
+    _hpf_on = fx_hpf_freq[oi] > 25; _lpf_on = fx_lpf_freq[oi] < 19500;
+    _hpf_px = _hpf_on ? eq_dx + (log10(fx_hpf_freq[oi]) - _log_lo) / _log_range * eq_dw : eq_dx;
+    _lpf_px = _lpf_on ? eq_dx + (log10(fx_lpf_freq[oi]) - _log_lo) / _log_range * eq_dw : eq_dx + eq_dw;
+    fx_hpf_freq[oi] > 25 ? (
+      ov_set(EQC_HPF_R, EQC_HPF_G, EQC_HPF_B, 0.8);
+      fx_hpf_freq[oi] >= 1000 ? sprintf(#fkv,"%.1fk",fx_hpf_freq[oi]/1000) : sprintf(#fkv,"%.0f",fx_hpf_freq[oi]);
+      gfx_measurestr(#fkv,tw,th);
+      gfx_x = max(eq_dx + 2, _hpf_px - tw - 2); gfx_y = eq_dy + 1; gfx_drawstr(#fkv);
+      // Vertical marker
+      ov_set(EQC_HPF_R, EQC_HPF_G, EQC_HPF_B, 0.35);
+      gfx_line(_hpf_px, eq_dy + 1, _hpf_px, eq_dy + eq_dh - 2);
+    );
+    fx_lpf_freq[oi] < 19500 ? (
+      ov_set(EQC_LPF_R, EQC_LPF_G, EQC_LPF_B, 0.8);
+      fx_lpf_freq[oi] >= 1000 ? sprintf(#fkv,"%.1fk",fx_lpf_freq[oi]/1000) : sprintf(#fkv,"%.0f",fx_lpf_freq[oi]);
+      gfx_measurestr(#fkv,tw,th);
+      gfx_x = min(eq_dx + eq_dw - tw - 2, _lpf_px + 2); gfx_y = eq_dy + 1; gfx_drawstr(#fkv);
+      ov_set(EQC_LPF_R, EQC_LPF_G, EQC_LPF_B, 0.35);
+      gfx_line(_lpf_px, eq_dy + 1, _lpf_px, eq_dy + eq_dh - 2);
+    );
+
+    // ── Draggable EQ nodes on the response curve (with X+Y freq+gain drag) ──
+    _eq_nr = ov_px(5);
+    // Node positions: computed from per-pad filter frequencies on log scale
+    _lo_nx = eq_dx + (log10(fx_eq_lo_freq[oi]) - _log_lo) / _log_range * eq_dw;
+    _md_nx = eq_dx + (log10(fx_eq_mid_freq[oi]) - _log_lo) / _log_range * eq_dw;
+    _m2_nx = eq_dx + (log10(fx_eq_mid2_freq[oi]) - _log_lo) / _log_range * eq_dw;
+    _hi_nx = eq_dx + (log10(fx_eq_hi_freq[oi]) - _log_lo) / _log_range * eq_dw;
+    // Y position: map current dB gain to display (same scale as the curve)
+    _eq_yr = eq_gyr;
+    _lo_ny = max(eq_dy + _eq_nr, min(eq_dy + eq_dh - _eq_nr, eq_cy - (fx_eq_lo[oi] / eq_dbr) * _eq_yr));
+    _md_ny = max(eq_dy + _eq_nr, min(eq_dy + eq_dh - _eq_nr, eq_cy - (fx_eq_mid[oi] / eq_dbr) * _eq_yr));
+    _m2_ny = max(eq_dy + _eq_nr, min(eq_dy + eq_dh - _eq_nr, eq_cy - (fx_eq_mid2[oi] / eq_dbr) * _eq_yr));
+    _hi_ny = max(eq_dy + _eq_nr, min(eq_dy + eq_dh - _eq_nr, eq_cy - (fx_eq_hi[oi] / eq_dbr) * _eq_yr));
+    _hp_nx = max(eq_dx + _eq_nr + 2, min(eq_dx + eq_dw - _eq_nr - 2, _hpf_px));
+    _lp_nx = max(eq_dx + _eq_nr + 2, min(eq_dx + eq_dw - _eq_nr - 2, _lpf_px));
+    _hp_ny = max(eq_dy + _eq_nr, min(eq_dy + eq_dh - _eq_nr, eq_cy - (20 * log10(max(0.707, fx_reso[oi])) / eq_dbr) * _eq_yr));
+    _lp_ny = _hp_ny;   // one RESO for both
+
+    // Draw nodes (antialiased, hover-animated: grow + soft glow; same dt/
+    // hv_speed ease the SSL knobs use — matches the Drum Strip's nodes)
+    // Only the four node IDs light a node; the hover test runs when nothing is held, and any other drag (the hue
+    // strip 250, TIGHT, the layer VOL, a velocity handle, a mixer fader) lights none -- every id >= 220 but
+    // 220 / 221 / 223 used to count as the HI node, which swelled and glowed for the whole drag (LIB334).
+    _eqhov = active_id == 220 ? 1 : active_id == 221 ? 2 : active_id == 223 ? 3 : active_id == 222 ? 4 :
+             active_id == 224 ? 5 : active_id == 225 ? 6 :
+             active_id != -1 ? 0 :
+             (dist(mx, my, _lo_nx, _lo_ny) <= _eq_nr + ov_px(4) ? 1 :
+              dist(mx, my, _md_nx, _md_ny) <= _eq_nr + ov_px(4) ? 2 :
+              dist(mx, my, _m2_nx, _m2_ny) <= _eq_nr + ov_px(4) ? 3 :
+              dist(mx, my, _hi_nx, _hi_ny) <= _eq_nr + ov_px(4) ? 4 :
+              dist(mx, my, _hp_nx, _hp_ny) <= _eq_nr + ov_px(4) ? 5 :
+              dist(mx, my, _lp_nx, _lp_ny) <= _eq_nr + ov_px(4) ? 6 : 0);
+    _eqease = min(1, dt * hv_speed);
+    eq_nht1 += ((_eqhov == 1) - eq_nht1) * _eqease;
+    eq_nht2 += ((_eqhov == 2) - eq_nht2) * _eqease;
+    eq_nht3 += ((_eqhov == 3) - eq_nht3) * _eqease;
+    eq_nht4 += ((_eqhov == 4) - eq_nht4) * _eqease;
+    eq_nht5 += ((_eqhov == 5) - eq_nht5) * _eqease;
+    eq_nht6 += ((_eqhov == 6) - eq_nht6) * _eqease;
+    // the filter nodes: hollow (a cut, not a band), dim while off, HP / LP under them then
+    ov_set(EQC_HPF_R, EQC_HPF_G, EQC_HPF_B, 0.28 * eq_nht5); gfx_circle(_hp_nx, _hp_ny, _eq_nr + ov_px(4) * eq_nht5, 1, 1);
+    ov_set(EQC_HPF_R, EQC_HPF_G, EQC_HPF_B, _hpf_on ? 1 : 0.45); gfx_circle(_hp_nx, _hp_ny, _eq_nr + 2 * eq_nht5, 1, 1);
+    ov_set(0.06, 0.06, 0.08, 1); gfx_circle(_hp_nx, _hp_ny, (_eq_nr + 2 * eq_nht5) * 0.45, 1, 1);
+    ov_set(EQC_LPF_R, EQC_LPF_G, EQC_LPF_B, 0.28 * eq_nht6); gfx_circle(_lp_nx, _lp_ny, _eq_nr + ov_px(4) * eq_nht6, 1, 1);
+    ov_set(EQC_LPF_R, EQC_LPF_G, EQC_LPF_B, _lpf_on ? 1 : 0.45); gfx_circle(_lp_nx, _lp_ny, _eq_nr + 2 * eq_nht6, 1, 1);
+    ov_set(0.06, 0.06, 0.08, 1); gfx_circle(_lp_nx, _lp_ny, (_eq_nr + 2 * eq_nht6) * 0.45, 1, 1);
+    ov_font(8, 'b');
+    !_hpf_on ? ( ov_set(EQC_HPF_R, EQC_HPF_G, EQC_HPF_B, 0.55); gfx_measurestr("HP", tw, th);
+                 gfx_x = _hp_nx - tw / 2; gfx_y = _hp_ny + _eq_nr + 1; gfx_drawstr("HP"); );
+    !_lpf_on ? ( ov_set(EQC_LPF_R, EQC_LPF_G, EQC_LPF_B, 0.55); gfx_measurestr("LP", tw, th);
+                 gfx_x = _lp_nx - tw / 2; gfx_y = _lp_ny + _eq_nr + 1; gfx_drawstr("LP"); );
+    ov_set(EQC_LO_R, EQC_LO_G, EQC_LO_B, 0.28 * eq_nht1); gfx_circle(_lo_nx, _lo_ny, _eq_nr + ov_px(4) * eq_nht1, 1, 1);
+    ov_set(EQC_LO_R, EQC_LO_G, EQC_LO_B, 1); gfx_circle(_lo_nx, _lo_ny, _eq_nr + 2 * eq_nht1, 1, 1);
+    ov_set(0, 0, 0, 0.5); gfx_circle(_lo_nx, _lo_ny, _eq_nr + 2 * eq_nht1, 0, 1);
+    ov_set(EQC_MID_R, EQC_MID_G, EQC_MID_B, 0.28 * eq_nht2); gfx_circle(_md_nx, _md_ny, _eq_nr + ov_px(4) * eq_nht2, 1, 1);
+    ov_set(EQC_MID_R, EQC_MID_G, EQC_MID_B, 1); gfx_circle(_md_nx, _md_ny, _eq_nr + 2 * eq_nht2, 1, 1);
+    ov_set(0, 0, 0, 0.5); gfx_circle(_md_nx, _md_ny, _eq_nr + 2 * eq_nht2, 0, 1);
+    ov_set(EQC_MID2_R, EQC_MID2_G, EQC_MID2_B, 0.28 * eq_nht3); gfx_circle(_m2_nx, _m2_ny, _eq_nr + ov_px(4) * eq_nht3, 1, 1);
+    ov_set(EQC_MID2_R, EQC_MID2_G, EQC_MID2_B, 1); gfx_circle(_m2_nx, _m2_ny, _eq_nr + 2 * eq_nht3, 1, 1);
+    ov_set(0, 0, 0, 0.5); gfx_circle(_m2_nx, _m2_ny, _eq_nr + 2 * eq_nht3, 0, 1);
+    ov_set(EQC_HI_R, EQC_HI_G, EQC_HI_B, 0.28 * eq_nht4); gfx_circle(_hi_nx, _hi_ny, _eq_nr + ov_px(4) * eq_nht4, 1, 1);
+    ov_set(EQC_HI_R, EQC_HI_G, EQC_HI_B, 1); gfx_circle(_hi_nx, _hi_ny, _eq_nr + 2 * eq_nht4, 1, 1);
+    ov_set(0, 0, 0, 0.5); gfx_circle(_hi_nx, _hi_ny, _eq_nr + 2 * eq_nht4, 0, 1);
+
+    // EQ node hit detection (BEFORE knobs so nodes get click priority)
+    active_id == -1 && lmb_down && mx >= eq_dx && mx <= eq_dx + eq_dw && my >= eq_dy && my <= eq_dy + eq_dh ? (
+      eq_drag_my = my; eq_drag_mx = mx;
+      _hit_node = -1;
+      dist(mx, my, _lo_nx, _lo_ny) <= _eq_nr + ov_px(4) ? (
+        _hit_node = 220; eq_drag_val_lo = fx_eq_lo[oi];
+      ) : dist(mx, my, _md_nx, _md_ny) <= _eq_nr + ov_px(4) ? (
+        _hit_node = 221; eq_drag_val_md = fx_eq_mid[oi];
+      ) : dist(mx, my, _m2_nx, _m2_ny) <= _eq_nr + ov_px(4) ? (
+        _hit_node = 223; eq_drag_val_m2 = fx_eq_mid2[oi];
+      ) : dist(mx, my, _hi_nx, _hi_ny) <= _eq_nr + ov_px(4) ? (
+        _hit_node = 222; eq_drag_val_hi = fx_eq_hi[oi];
+      ) : dist(mx, my, _hp_nx, _hp_ny) <= _eq_nr + ov_px(4) ? (
+        _hit_node = 224; eq_drag_val_rs = fx_reso[oi];
+      ) : dist(mx, my, _lp_nx, _lp_ny) <= _eq_nr + ov_px(4) ? (
+        _hit_node = 225; eq_drag_val_rs = fx_reso[oi];
+      );
+      _hit_node >= 0 ? (
+        _eq_now = time_precise();
+        _dbl_click_id == _hit_node && (_eq_now - _dbl_click_time) < DBL_CLICK_T ? (
+          // Double-click: a filter off; a band's gain to 0 dB and its freq to default
+          _hit_node == 224 ? ( fx_hpf_freq[oi] = 20; ) :
+          _hit_node == 225 ? ( fx_lpf_freq[oi] = 20000; ) :
+          _hit_node == 220 ? ( fx_eq_lo[oi] = 0; fx_eq_lo_freq[oi] = 200; fx_eq_lo_q[oi] = 0.7071; ) :
+          _hit_node == 221 ? ( fx_eq_mid[oi] = 0; fx_eq_mid_freq[oi] = 1000; fx_eq_mid_q[oi] = 0.8; ) :
+          _hit_node == 223 ? ( fx_eq_mid2[oi] = 0; fx_eq_mid2_freq[oi] = 3000; fx_eq_mid2_q[oi] = 0.8; ) :
+          ( fx_eq_hi[oi] = 0; fx_eq_hi_freq[oi] = 5000; fx_eq_hi_q[oi] = 0.7071; );
+          swing_rcp_post_fx(oi); mark_dirty_pad(oi);
+          _dbl_click_id = -1;
+        ) : (
+          active_id = _hit_node;
+          _dbl_click_id = _hit_node; _dbl_click_time = _eq_now;
+          // the frequency the drag starts from: the X drag is RELATIVE, like the gain and the master EQ's
+          // nodes (rk_swing_ui_panels_lcd); mapped straight from mx, a plain click on a node moved its
+          // frequency by the click's offset from the centre -- about 12 % on the MID node (LIB335)
+          eq_drag_f0 = _hit_node == 220 ? fx_eq_lo_freq[oi] : _hit_node == 221 ? fx_eq_mid_freq[oi] :
+                       _hit_node == 223 ? fx_eq_mid2_freq[oi] : _hit_node == 224 ? fx_hpf_freq[oi] :
+                       _hit_node == 225 ? fx_lpf_freq[oi] : fx_eq_hi_freq[oi];
+        );
+      );
+    );
+
+    // Wheel over ANY band node adjusts that band's Q (Shift = fine) —
+    // bells AND shelves as of v48 (shelf Q 0.7071 == the old fixed S=1.0).
+    // Same consume-and-zero pattern as the waveform zoom above.
+    // frame_wheel (notches, with sign), never mouse_wheel: zeroed at the @gfx head before this draws (LIB311).
+    frame_wheel != 0 && active_id == -1 ? (
+      _whl_qn = dist(mx, my, _md_nx, _md_ny) <= _eq_nr + ov_px(4) ? 0 :
+                dist(mx, my, _m2_nx, _m2_ny) <= _eq_nr + ov_px(4) ? 1 :
+                dist(mx, my, _lo_nx, _lo_ny) <= _eq_nr + ov_px(4) ? 2 :
+                dist(mx, my, _hi_nx, _hi_ny) <= _eq_nr + ov_px(4) ? 3 :
+                dist(mx, my, _hp_nx, _hp_ny) <= _eq_nr + ov_px(4) || dist(mx, my, _lp_nx, _lp_ny) <= _eq_nr + ov_px(4) ? 4 : -1;
+      _whl_qn == 4 ? (   // a filter node: RESO (0.707 = flat .. 12)
+        fx_reso[oi] = max(0.707, min(12.0, fx_reso[oi] * (1 + frame_wheel * ((mouse_cap & 8) ? 0.03 : 0.12))));
+        swing_rcp_post_fx(oi); mark_dirty_pad(oi);
+        frame_wheel = 0;
+        _whl_qn = -1;
+      );
+      _whl_qn >= 0 ? (
+        _whl_step = (mouse_cap & 8) ? 0.03 : 0.12;
+        _whl_q = _whl_qn == 0 ? fx_eq_mid_q[oi] :
+                 _whl_qn == 1 ? fx_eq_mid2_q[oi] :
+                 _whl_qn == 2 ? fx_eq_lo_q[oi] : fx_eq_hi_q[oi];
+        _whl_q = max(0.3, min(6.0, _whl_q * (1 + frame_wheel * _whl_step)));
+        _whl_qn == 0 ? fx_eq_mid_q[oi]  = _whl_q :
+        _whl_qn == 1 ? fx_eq_mid2_q[oi] = _whl_q :
+        _whl_qn == 2 ? fx_eq_lo_q[oi]   = _whl_q :
+                       fx_eq_hi_q[oi]   = _whl_q;
+        swing_rcp_post_fx(oi); mark_dirty_pad(oi);
+        frame_wheel = 0;
+      );
+    );
+
+    // (HPF / LPF / RESO: the filter nodes above since 2026-10-28; their knobs are gone)
+
+    // dB value labels on nodes (only when non-zero)
+    ov_font(8, 'b');
+    fx_eq_lo[oi] != 0 ? (
+      ov_set(EQC_LO_R, EQC_LO_G, EQC_LO_B, 0.9);
+      fx_eq_lo_q[oi] != 0.7071 ? sprintf(#fkv,"%+.0f Q%.1f",fx_eq_lo[oi],fx_eq_lo_q[oi])
+                               : sprintf(#fkv,"%+.0f",fx_eq_lo[oi]);
+      gfx_measurestr(#fkv,tw,th);
+      gfx_x = _lo_nx - tw/2; gfx_y = _lo_ny < eq_cy ? _lo_ny - th - 2 : _lo_ny + _eq_nr + 1;
+      gfx_drawstr(#fkv);
+    );
+    fx_eq_mid[oi] != 0 ? (
+      ov_set(EQC_MID_R, EQC_MID_G, EQC_MID_B, 0.9);
+      fx_eq_mid_q[oi] != 0.8 ? sprintf(#fkv,"%+.0f Q%.1f",fx_eq_mid[oi],fx_eq_mid_q[oi])
+                             : sprintf(#fkv,"%+.0f",fx_eq_mid[oi]);
+      gfx_measurestr(#fkv,tw,th);
+      gfx_x = _md_nx - tw/2; gfx_y = _md_ny < eq_cy ? _md_ny - th - 2 : _md_ny + _eq_nr + 1;
+      gfx_drawstr(#fkv);
+    );
+    fx_eq_mid2[oi] != 0 ? (
+      ov_set(EQC_MID2_R, EQC_MID2_G, EQC_MID2_B, 0.9);
+      fx_eq_mid2_q[oi] != 0.8 ? sprintf(#fkv,"%+.0f Q%.1f",fx_eq_mid2[oi],fx_eq_mid2_q[oi])
+                              : sprintf(#fkv,"%+.0f",fx_eq_mid2[oi]);
+      gfx_measurestr(#fkv,tw,th);
+      gfx_x = _m2_nx - tw/2; gfx_y = _m2_ny < eq_cy ? _m2_ny - th - 2 : _m2_ny + _eq_nr + 1;
+      gfx_drawstr(#fkv);
+    );
+    fx_eq_hi[oi] != 0 ? (
+      ov_set(EQC_HI_R, EQC_HI_G, EQC_HI_B, 0.9);
+      fx_eq_hi_q[oi] != 0.7071 ? sprintf(#fkv,"%+.0f Q%.1f",fx_eq_hi[oi],fx_eq_hi_q[oi])
+                               : sprintf(#fkv,"%+.0f",fx_eq_hi[oi]);
+      gfx_measurestr(#fkv,tw,th);
+      gfx_x = _hi_nx - tw/2; gfx_y = _hi_ny < eq_cy ? _hi_ny - th - 2 : _hi_ny + _eq_nr + 1;
+      gfx_drawstr(#fkv);
+    );
+
+    // EQ node drag interaction (IDs: 220=lo, 221=mid, 222=hi) with X+Y freq+gain drag
+    // Post the recalc (A-9a): @block rebuilds the coefficients next block, for the DSP and the curve.
+    active_id == 220 ? (
+      LMB ? (
+        // Y drag: gain
+        fx_eq_lo[oi] = max(-12, min(12, eq_drag_val_lo - (my - eq_drag_my) / _eq_yr * eq_dbr * ((mouse_cap & 8) ? 0.25 : 1)));
+        // X drag: frequency, the delta from the press in log space (LIB335)
+        fx_eq_lo_freq[oi] = eq_drag_f0 * pow(10.0, (mx - eq_drag_mx) / eq_dw * _log_range);
+        fx_eq_lo_freq[oi] = max(40, min(500, fx_eq_lo_freq[oi]));  // clamp to range
+        swing_rcp_post_fx(oi); mark_dirty_pad(oi);
+      ) : active_id = -1;
+    );
+    active_id == 221 ? (
+      LMB ? (
+        fx_eq_mid[oi] = max(-12, min(12, eq_drag_val_md - (my - eq_drag_my) / _eq_yr * eq_dbr * ((mouse_cap & 8) ? 0.25 : 1)));
+        fx_eq_mid_freq[oi] = eq_drag_f0 * pow(10.0, (mx - eq_drag_mx) / eq_dw * _log_range);
+        fx_eq_mid_freq[oi] = max(200, min(8000, fx_eq_mid_freq[oi]));  // clamp to range
+        swing_rcp_post_fx(oi); mark_dirty_pad(oi);
+      ) : active_id = -1;
+    );
+    active_id == 223 ? (
+      LMB ? (
+        fx_eq_mid2[oi] = max(-12, min(12, eq_drag_val_m2 - (my - eq_drag_my) / _eq_yr * eq_dbr * ((mouse_cap & 8) ? 0.25 : 1)));
+        fx_eq_mid2_freq[oi] = eq_drag_f0 * pow(10.0, (mx - eq_drag_mx) / eq_dw * _log_range);
+        fx_eq_mid2_freq[oi] = max(500, min(12000, fx_eq_mid2_freq[oi]));  // clamp to range
+        swing_rcp_post_fx(oi); mark_dirty_pad(oi);
+      ) : active_id = -1;
+    );
+    active_id == 222 ? (
+      LMB ? (
+        fx_eq_hi[oi] = max(-12, min(12, eq_drag_val_hi - (my - eq_drag_my) / _eq_yr * eq_dbr * ((mouse_cap & 8) ? 0.25 : 1)));
+        fx_eq_hi_freq[oi] = eq_drag_f0 * pow(10.0, (mx - eq_drag_mx) / eq_dw * _log_range);
+        fx_eq_hi_freq[oi] = max(2000, min(16000, fx_eq_hi_freq[oi]));  // clamp to range
+        swing_rcp_post_fx(oi); mark_dirty_pad(oi);
+      ) : active_id = -1;
+    );
+    active_id == 224 || active_id == 225 ? (
+      LMB ? (
+        // X: the cutoff, the delta from the press in log space (the bands' way, LIB335); the old knobs' ranges and ends
+        _fq = eq_drag_f0 * pow(10.0, (mx - eq_drag_mx) / eq_dw * _log_range);
+        active_id == 224 ? ( fx_hpf_freq[oi] = max(20, min(8000, _fq)); fx_hpf_freq[oi] <= 25 ? fx_hpf_freq[oi] = 20; )
+                         : ( fx_lpf_freq[oi] = max(200, min(20000, _fq)); fx_lpf_freq[oi] >= 19500 ? fx_lpf_freq[oi] = 20000; );
+        // Y: the resonance, as its peak in dB (Shift = fine)
+        _rdb = 20 * log10(max(0.707, eq_drag_val_rs)) - (my - eq_drag_my) / _eq_yr * eq_dbr * ((mouse_cap & 8) ? 0.25 : 1);
+        fx_reso[oi] = max(0.707, min(12.0, pow(10, _rdb / 20)));
+        swing_rcp_post_fx(oi); mark_dirty_pad(oi);
+      ) : active_id = -1;
+    );
+    ov_scr = 0;
+    );   // the EQ, open
+
+);
+
+function _ov_draw_fx_knobs() (
+    // ── Two rows of knobs (2026-10-28) ─────────────────────────────────
+    // FX [RATE BITS DRIVE COMP], then SENDS [DLY RVB SMSH] under it on the same four columns (the owner: "maybe move
+    // the sends below the FX. There is a lot of space with nothing"): the one row of seven crowded the mode pills and
+    // left a band of nothing under it. The filters live on the EQ display (its HP / LP nodes). Row heights:
+    // OV_FX_ROW_H / OV_SND_ROW_H (the waveform's share of the spare room counts on them). The knob memory keeps each
+    // knob's slot (fxk_base + k * KS).
+    fxk_r = ov_px(11 * ov_gkn);   // ov_gkn: the rows' share of the room (step 2; a row grows 2 r)
+    _fxk_top = ov_eq_end;   // under the EQ (or its bar, folded)
+    _r1_sp = op_w / 4;   // 4 columns, both rows
+    fxk_base = km_fx + oi * KM_FX_PER_PAD * KS;
+
+    // ── The FX row's bar (its title; folds the row, pfx_fold & 4). Lit: any of the four on ──
+    strcpy(#ov_fsum, "");
+    fx_bc_rate[oi] > 0.01 ? ( sprintf(#ov_fkv, "RATE %.0f%%  ", fx_bc_rate[oi] * 100); strcat(#ov_fsum, #ov_fkv); );
+    fx_bc_bits[oi] < 15.5 ? ( sprintf(#ov_fkv, "BITS %d  ", fx_bc_bits[oi] | 0); strcat(#ov_fsum, #ov_fkv); );
+    fx_sat_drv[oi] > 0.005 ? (
+      _dm = fx_drv_mode[oi] | 0;
+      strcat(#ov_fsum, _dm == 0 ? "DRIVE soft  " : _dm == 1 ? "DRIVE tube  " : _dm == 2 ? "DRIVE tape  " : _dm == 3 ? "DRIVE fuzz  " : "DRIVE clip  ");
+    );
+    fx_cmp_amt[oi] > 0.01 ? (
+      _cm = fx_cmp_mode[oi] | 0;
+      strcat(#ov_fsum, _cm == 0 ? "COMP punch" : _cm == 1 ? "COMP glue" : "COMP squash");
+    );
+    _ov_fold_bar(_fxk_top, 4, "FX", strlen(#ov_fsum) > 0);
+
+    _fxk_knob_y = _fxk_top + ov_px(12);
+    fkcy = _fxk_knob_y + fxk_r + ov_px(2);
+    !(pfx_fold & 4) ? (
+
+    // ================================================================
+    // FX  (SSL knobs, teal/red/orange caps)
+    // ================================================================
+
+    // RATE — SSL teal cap (bitcrush rate 0-1)
+    fkcx = op_x + _r1_sp * 0.5;
+    fkm = fxk_base + 6 * KS;
+    _bc_rate_on = fx_bc_rate[oi] > 0.01;
+    nv = ssl_knob_interact(fkm, fkcx, fkcy, fxk_r, fx_bc_rate[oi], 0, 1.0, 0, 0);
+    nv != fx_bc_rate[oi] ? (fx_bc_rate[oi] = nv; swing_rcp_post_fx(oi); mark_dirty_pad(oi););
+    ssl_knob_draw(fkcx, fkcy, fxk_r, fx_bc_rate[oi], 0, 1.0, 0, fkm[0],
+      _bc_rate_on ? 0.20 : 0.30, _bc_rate_on ? 0.85 : 0.35, _bc_rate_on ? 0.65 : 0.40, 0);
+    ov_font(8, 'b'); ov_set(0.70,0.72,0.75,1);
+    gfx_measurestr("RATE",tw,th); gfx_x=fkcx-tw/2; gfx_y=fkcy+fxk_r+ov_px(2); gfx_drawstr("RATE");
+    ov_font(8, 0);   // the value: regular, bold 8-9 px digits misread (wiki 4.7)
+    fx_bc_rate[oi] > 0.01 ? sprintf(#fkv,"%.0f%%", fx_bc_rate[oi] * 100) : strcpy(#fkv,"OFF");
+    gfx_measurestr(#fkv,tw,th); ov_set(0.68,0.70,0.74,1); gfx_x=fkcx-tw/2; gfx_y=fkcy+fxk_r+ov_px(10); gfx_drawstr(#fkv);
+
+    // BITS — SSL teal cap (bitcrush depth 1-16)
+    fkcx = op_x + _r1_sp * 1.5;
+    fkm = fxk_base + 7 * KS;
+    _bc_bits_on = fx_bc_bits[oi] < 15.5;
+    nv = ssl_knob_interact(fkm, fkcx, fkcy, fxk_r, fx_bc_bits[oi], 1, 16, 16, 0);
+    nv != fx_bc_bits[oi] ? (fx_bc_bits[oi] = floor(nv + 0.5); swing_rcp_post_fx(oi); mark_dirty_pad(oi););
+    ssl_knob_draw(fkcx, fkcy, fxk_r, fx_bc_bits[oi], 1, 16, 0, fkm[0],
+      _bc_bits_on ? 0.20 : 0.30, _bc_bits_on ? 0.85 : 0.35, _bc_bits_on ? 0.65 : 0.40, 0);
+    ov_font(8, 'b'); ov_set(0.70,0.72,0.75,1);
+    gfx_measurestr("BITS",tw,th); gfx_x=fkcx-tw/2; gfx_y=fkcy+fxk_r+ov_px(2); gfx_drawstr("BITS");
+    ov_font(8, 0);   // the value: regular, bold 8-9 px digits misread (wiki 4.7)
+    fx_bc_bits[oi] < 15.5 ? sprintf(#fkv,"%d", fx_bc_bits[oi] | 0) : strcpy(#fkv,"16");
+    gfx_measurestr(#fkv,tw,th); ov_set(0.68,0.70,0.74,1); gfx_x=fkcx-tw/2; gfx_y=fkcy+fxk_r+ov_px(10); gfx_drawstr(#fkv);
+
+    // DRIVE — SSL cap colored per drive mode + mode pill
+    fkcx = op_x + _r1_sp * 2.5;
+    fkm = fxk_base + 5 * KS;
+    nv = ssl_knob_interact(fkm, fkcx, fkcy, fxk_r, fx_sat_drv[oi], 0, 1.0, 0, 0);
+    nv != fx_sat_drv[oi] ? (fx_sat_drv[oi] = nv; mark_dirty_pad(oi););
+    _dm = fx_drv_mode[oi] | 0;
+    _dm == 0 ? ( _dkr=0.85; _dkg=0.25; _dkb=0.25; ) :  // SOFT
+    _dm == 1 ? ( _dkr=0.90; _dkg=0.60; _dkb=0.15; ) :  // TUBE
+    _dm == 2 ? ( _dkr=0.70; _dkg=0.55; _dkb=0.30; ) :  // TAPE
+    _dm == 3 ? ( _dkr=0.90; _dkg=0.20; _dkb=0.55; ) :  // FUZZ
+              ( _dkr=0.50; _dkg=0.75; _dkb=0.90; );     // CLIP
+    ssl_knob_draw(fkcx, fkcy, fxk_r, fx_sat_drv[oi], 0, 1.0, 0, fkm[0], _dkr, _dkg, _dkb, 0);
+    ov_font(8, 'b'); ov_set(0.70,0.72,0.75,1);
+    gfx_measurestr("DRIVE",tw,th); gfx_x=fkcx-tw/2; gfx_y=fkcy+fxk_r+ov_px(2); gfx_drawstr("DRIVE");
+    ov_font(8, 0);   // the value: regular, bold 8-9 px digits misread (wiki 4.7)
+    sprintf(#fkv,"%.0f%%",fx_sat_drv[oi]*100); gfx_measurestr(#fkv,tw,th);
+    ov_set(0.68,0.70,0.74,1); gfx_x=fkcx-tw/2; gfx_y=fkcy+fxk_r+ov_px(10); gfx_drawstr(#fkv);
+    // Drive mode clickable pill
+    _dm == 0 ? strcpy(#dml, "SOFT") :
+    _dm == 1 ? strcpy(#dml, "TUBE") :
+    _dm == 2 ? strcpy(#dml, "TAPE") :
+    _dm == 3 ? strcpy(#dml, "FUZZ") :
+               strcpy(#dml, "CLIP");
+    ov_font(8, 'b');
+    gfx_measurestr(#dml,tw,th);
+    _dml_x = fkcx - tw/2 - ov_px(3); _dml_y = fkcy + fxk_r + ov_px(19);
+    _dml_w = tw + ov_px(6); _dml_h = th + ov_px(2);
+    ov_set(_dkr * 0.3, _dkg * 0.3, _dkb * 0.3, 0.8);
+    gfx_rect(_dml_x, _dml_y, _dml_w, _dml_h);
+    ov_set(_dkr, _dkg, _dkb, 1);
+    gfx_x = fkcx - tw/2; gfx_y = _dml_y + ov_px(1);
+    gfx_drawstr(#dml);
+    lmb_down && mx >= _dml_x && mx <= _dml_x + _dml_w && my >= _dml_y && my <= _dml_y + _dml_h ? (
+      fx_drv_mode[oi] = ((_dm + 1) % 5);
+      mark_dirty_pad(oi);
+    );
+
+    // COMP — SSL orange cap + mode pill
+    fkcx = op_x + _r1_sp * 3.5;
+    fkm = fxk_base + 10 * KS;
+    _cmp_on = fx_cmp_amt[oi] > 0.01;
+    nv = ssl_knob_interact(fkm, fkcx, fkcy, fxk_r, fx_cmp_amt[oi], 0, 1.0, 0, 0);
+    // recalc_fx() is required: amt drives threshold + auto-makeup (set in
+    // recalc_pad_comp), so changing amt must rebuild the comp coefficients
+    // for the change to be audible. Other FX knobs (resonance/bitcrush/etc)
+    // do the same.
+    nv != fx_cmp_amt[oi] ? (fx_cmp_amt[oi] = nv; swing_rcp_post_fx(oi); mark_dirty_pad(oi););
+    ssl_knob_draw(fkcx, fkcy, fxk_r, fx_cmp_amt[oi], 0, 1.0, 0, fkm[0],
+      _cmp_on ? 0.90 : 0.30, _cmp_on ? 0.55 : 0.35, _cmp_on ? 0.15 : 0.40, 0);
+    ov_font(8, 'b'); ov_set(0.70,0.72,0.75,1);
+    gfx_measurestr("COMP",tw,th); gfx_x=fkcx-tw/2; gfx_y=fkcy+fxk_r+ov_px(2); gfx_drawstr("COMP");
+    ov_font(8, 0);   // the value: regular, bold 8-9 px digits misread (wiki 4.7)
+    fx_cmp_amt[oi] > 0.01 ? sprintf(#fkv,"%.0f%%", fx_cmp_amt[oi] * 100) : strcpy(#fkv,"OFF");
+    gfx_measurestr(#fkv,tw,th); ov_set(0.68,0.70,0.74,1); gfx_x=fkcx-tw/2; gfx_y=fkcy+fxk_r+ov_px(10); gfx_drawstr(#fkv);
+    // Comp mode clickable pill
+    _cm = fx_cmp_mode[oi] | 0;
+    _cm == 0 ? ( strcpy(#cml, "PUNCH"); _ckr=0.95; _ckg=0.50; _ckb=0.10; ) :
+    _cm == 1 ? ( strcpy(#cml, "GLUE");  _ckr=0.80; _ckg=0.70; _ckb=0.30; ) :
+               ( strcpy(#cml, "SQUASH"); _ckr=0.90; _ckg=0.25; _ckb=0.10; );
+    ov_font(8, 'b');
+    gfx_measurestr(#cml,tw,th);
+    _cml_x = fkcx - tw/2 - ov_px(3); _cml_y = fkcy + fxk_r + ov_px(19);
+    _cml_w = tw + ov_px(6); _cml_h = th + ov_px(2);
+    ov_set(_ckr * 0.3, _ckg * 0.3, _ckb * 0.3, 0.8);
+    gfx_rect(_cml_x, _cml_y, _cml_w, _cml_h);
+    ov_set(_ckr, _ckg, _ckb, 1);
+    gfx_x = fkcx - tw/2; gfx_y = _cml_y + ov_px(1);
+    gfx_drawstr(#cml);
+    lmb_down && mx >= _cml_x && mx <= _cml_x + _cml_w && my >= _cml_y && my <= _cml_y + _cml_h ? (
+      fx_cmp_mode[oi] = ((_cm + 1) % 3);
+      swing_rcp_post_fx(oi);
+      mark_dirty_pad(oi);
+    );
+
+    );   // the FX row, open
+
+    // ================================================================
+    // SENDS  (SSL knobs: delay blue, reverb purple, smash red) -- the row under FX, on its first three columns; its bar
+    // folds it (pfx_fold & 8). Lit: any send up.
+    // ================================================================
+    _snd_top = _fxk_top + ov_px((pfx_fold & 4) ? OV_FOLD_BLK : OV_FX_ROW_H + 22 * (ov_gkn - 1));
+    strcpy(#ov_fsum, "");
+    fx_snd_dly[oi] > 0.005 ? ( sprintf(#ov_fkv, "DLY %.0f%%  ", fx_snd_dly[oi] * 100); strcat(#ov_fsum, #ov_fkv); );
+    fx_snd_rvb[oi] > 0.005 ? ( sprintf(#ov_fkv, "RVB %.0f%%  ", fx_snd_rvb[oi] * 100); strcat(#ov_fsum, #ov_fkv); );
+    fx_snd_smash[oi] > 0.005 ? ( sprintf(#ov_fkv, "SMSH %.0f%%", fx_snd_smash[oi] * 100); strcat(#ov_fsum, #ov_fkv); );
+    _ov_fold_bar(_snd_top, 8, "SENDS", strlen(#ov_fsum) > 0);
+    fkcy = _snd_top + ov_px(14) + fxk_r;
+    !(pfx_fold & 8) ? (
+
+    // DLY
+    fkcx = op_x + _r1_sp * 0.5;
+    fkm = fxk_base + 8 * KS;
+    _dly_on = fx_snd_dly[oi] > 0.005;
+    nv = ssl_knob_interact(fkm, fkcx, fkcy, fxk_r, fx_snd_dly[oi], 0, 1.0, 0, 0);
+    nv != fx_snd_dly[oi] ? (fx_snd_dly[oi] = nv; mark_dirty_pad(oi););
+    ssl_knob_draw(fkcx, fkcy, fxk_r, fx_snd_dly[oi], 0, 1.0, 0, fkm[0],
+      _dly_on ? 0.35 : 0.30, _dly_on ? 0.65 : 0.35, _dly_on ? 0.90 : 0.40, 0);
+    ov_font(8, 'b'); ov_set(0.70,0.72,0.75,1);
+    gfx_measurestr("DLY",tw,th); gfx_x=fkcx-tw/2; gfx_y=fkcy+fxk_r+ov_px(2); gfx_drawstr("DLY");
+    ov_font(8, 0);   // the value: regular, bold 8-9 px digits misread (wiki 4.7)
+    fx_snd_dly[oi] > 0.005 ? sprintf(#fkv,"%.0f%%", fx_snd_dly[oi]*100) : strcpy(#fkv,"OFF");
+    gfx_measurestr(#fkv,tw,th); ov_set(0.68,0.70,0.74,1); gfx_x=fkcx-tw/2; gfx_y=fkcy+fxk_r+ov_px(10); gfx_drawstr(#fkv);
+
+    // RVB
+    fkcx = op_x + _r1_sp * 1.5;
+    fkm = fxk_base + 9 * KS;
+    _rvb_on = fx_snd_rvb[oi] > 0.005;
+    nv = ssl_knob_interact(fkm, fkcx, fkcy, fxk_r, fx_snd_rvb[oi], 0, 1.0, 0, 0);
+    nv != fx_snd_rvb[oi] ? (fx_snd_rvb[oi] = nv; mark_dirty_pad(oi););
+    ssl_knob_draw(fkcx, fkcy, fxk_r, fx_snd_rvb[oi], 0, 1.0, 0, fkm[0],
+      _rvb_on ? 0.55 : 0.30, _rvb_on ? 0.35 : 0.35, _rvb_on ? 0.85 : 0.40, 0);
+    ov_font(8, 'b'); ov_set(0.70,0.72,0.75,1);
+    gfx_measurestr("RVB",tw,th); gfx_x=fkcx-tw/2; gfx_y=fkcy+fxk_r+ov_px(2); gfx_drawstr("RVB");
+    ov_font(8, 0);
+    fx_snd_rvb[oi] > 0.005 ? sprintf(#fkv,"%.0f%%", fx_snd_rvb[oi]*100) : strcpy(#fkv,"OFF");
+    gfx_measurestr(#fkv,tw,th); ov_set(0.68,0.70,0.74,1); gfx_x=fkcx-tw/2; gfx_y=fkcy+fxk_r+ov_px(10); gfx_drawstr(#fkv);
+
+    // SMSH -- the parallel-comp bus send: returns-only (fed to the EON Smash Return in multi-out + FX returns)
+    fkcx = op_x + _r1_sp * 2.5;
+    fkm = fxk_base + 11 * KS;
+    _sms_on = fx_snd_smash[oi] > 0.005;
+    nv = ssl_knob_interact(fkm, fkcx, fkcy, fxk_r, fx_snd_smash[oi], 0, 1.0, 0, 0);
+    nv != fx_snd_smash[oi] ? (fx_snd_smash[oi] = nv; mark_dirty_pad(oi););
+    ssl_knob_draw(fkcx, fkcy, fxk_r, fx_snd_smash[oi], 0, 1.0, 0, fkm[0],
+      _sms_on ? 0.90 : 0.30, _sms_on ? 0.35 : 0.35, _sms_on ? 0.30 : 0.40, 0);
+    ov_font(8, 'b'); ov_set(0.70,0.72,0.75,1);
+    gfx_measurestr("SMSH",tw,th); gfx_x=fkcx-tw/2; gfx_y=fkcy+fxk_r+ov_px(2); gfx_drawstr("SMSH");
+    ov_font(8, 0);
+    fx_snd_smash[oi] > 0.005 ? sprintf(#fkv,"%.0f%%", fx_snd_smash[oi]*100) : strcpy(#fkv,"OFF");
+    gfx_measurestr(#fkv,tw,th); ov_set(0.68,0.70,0.74,1); gfx_x=fkcx-tw/2; gfx_y=fkcy+fxk_r+ov_px(10); gfx_drawstr(#fkv);
+    );   // the SENDS row, open
+    ov_fx_end = _snd_top + ov_px((pfx_fold & 8) ? OV_FOLD_BLK : OV_SND_ROW_H + 22 * (ov_gkn - 1));   // the sections' end: the buttons follow it in one column
+);
+
+function _ov_draw_buttons() (
+    // ── Button rows: Row 1 = OUT/LEARN/CHOKE/1SHOT/REV, Row 2 = Clear Layer / Clear Pad
+    ob_h = ov_px(20); ob_gap = ov_px(6);
+    // One column (ov_wf_grow: the floating editor, the side panel): the buttons follow the sections and the layer mixer
+    // follows them (ov_mix_y), so what the waveform cannot take (OV_WF_GROW_MAX; every section folded) is left at the
+    // bottom, not between the sections and the buttons (the owner's picture, 2026-10-28: all folded, a band in the
+    // middle). Short of the cap the two lines meet: the waveform took the room down to the buttons' old place. Two
+    // columns: the buttons at the column's bottom, as before.
+    ob_y1 = op_y + op_h - ov_px(66 + ov_lmix_h);                         // the top row
+    ov_wf_grow ? ob_y1 = min(ov_fx_end + ov_px(8), ob_y1);
+    ob_y2 = ob_y1 + ov_px(28);                                            // the bottom row
+    ov_mix_y = ob_y1 + ov_px(64);   // the layer mixer, under the buttons (the one-column hosts draw it there)
+
+    // ── Row 1: OUT, LEARN, CHOKE (left), 1SHOT, REV (right) ──────
+    // OUTPUT bus selector
+    out_bx = op_x + ov_px(10); out_bw = ov_px(50);
+    multi_out ? ov_set(0.10, 0.70, 0.85, 1) : ov_set(0.20, 0.21, 0.25, 1);
+    gfx_rect(out_bx, ob_y1, out_bw, ob_h);
+    ov_set(0.28,0.30,0.34,0.5); gfx_rect(out_bx,ob_y1,out_bw,1); gfx_rect(out_bx,ob_y1,1,ob_h);
+    ov_set(0.07,0.07,0.08,0.8); gfx_rect(out_bx,ob_y1+ob_h-1,out_bw,1); gfx_rect(out_bx+out_bw-1,ob_y1,1,ob_h);
+    ov_font(9, 0);   // regular: a bold 9 px "5" draws as a "6" (wiki 4.7)
+    hsl_to_rgb(swing_out_hue(oi), 0.65, 0.60);
+    ov_set(_hsl_r, _hsl_g, _hsl_b, 1);
+    swing_out_pair_name(swing_out_pair(oi), #out_lbl);   // where it plays (Outputs step 1)
+    gfx_measurestr(#out_lbl,tw,th); gfx_x=out_bx+(out_bw-tw)/2; gfx_y=ob_y1+(ob_h-th)/2; gfx_drawstr(#out_lbl);
+    _in_out_btn = mx>=out_bx&&mx<=out_bx+out_bw&&my>=ob_y1&&my<=ob_y1+ob_h;
+    // Left-click: output bus picker (migrated). Separate caller ID from
+    // the LCD-side OUTPUT_BUS so dispatches don't cross over.
+    _in_out_btn && lmb_down ? (
+      swing_out_menu(oi, #out_menu_str);   // the one Out menu (Outputs step 3)
+      swing_popup_open(mx, my, #out_menu_str, SP_POPUP_CALLER_OVERLAY_OUTPUT_BUS);
+    );
+    swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_OVERLAY_OUTPUT_BUS ? (
+      swing_out_menu_pick(oi, swing_popup_result);
+      swing_popup_result = 0;
+    );
+    swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_OVERLAY_OUTPUT_BUS ? (
+      swing_popup_result = 0;
+    );
+    // Scroll wheel: bank A steps through Out 1-16, a bank B-D pad between its bank's track and its own output
+    _in_out_btn && frame_wheel != 0 ? ( swing_out_step(oi, sign_of(frame_wheel)); frame_wheel = 0; );   // consumed (2026-10-27: the pad panel's scroll takes a wheel no control took)
+
+    // LEARN button
+    lrn_bx = out_bx + out_bw + ob_gap; lrn_bw = ov_px(50);
+    midi_learn_pad == oi ? ov_set(1, 0.3, 0.3, 1) : ov_set(0.20, 0.21, 0.25, 1);
+    gfx_rect(lrn_bx, ob_y1, lrn_bw, ob_h);
+    ov_set(0.28,0.30,0.34,0.5); gfx_rect(lrn_bx,ob_y1,lrn_bw,1); gfx_rect(lrn_bx,ob_y1,1,ob_h);
+    ov_set(0.07,0.07,0.08,0.8); gfx_rect(lrn_bx,ob_y1+ob_h-1,lrn_bw,1); gfx_rect(lrn_bx+lrn_bw-1,ob_y1,1,ob_h);
+    ov_font(9, 'b');
+    midi_learn_pad == oi ? ov_set(1,1,1,1) : ov_set(0.65,0.67,0.70,1);
+    gfx_measurestr("LEARN",tw,th); gfx_x=lrn_bx+(lrn_bw-tw)/2; gfx_y=ob_y1+(ob_h-th)/2; gfx_drawstr("LEARN");
+    mx>=lrn_bx&&mx<=lrn_bx+lrn_bw&&my>=ob_y1&&my<=ob_y1+ob_h&&lmb_down?(
+      midi_learn_pad == oi ? midi_learn_pad = -1 : midi_learn_pad = oi;
+    );
+
+    // CHOKE group button (click to cycle 0=OFF, 1-8)
+    chk_bx = lrn_bx + lrn_bw + ob_gap; chk_bw = ov_px(52);
+    p_choke[oi] > 0 ? ov_set(0.85, 0.30, 0.30, 1) : ov_set(0.20, 0.21, 0.25, 1);
+    gfx_rect(chk_bx, ob_y1, chk_bw, ob_h);
+    ov_set(0.28,0.30,0.34,0.5); gfx_rect(chk_bx,ob_y1,chk_bw,1); gfx_rect(chk_bx,ob_y1,1,ob_h);
+    ov_set(0.07,0.07,0.08,0.8); gfx_rect(chk_bx,ob_y1+ob_h-1,chk_bw,1); gfx_rect(chk_bx+chk_bw-1,ob_y1,1,ob_h);
+    ov_font(9, p_choke[oi] > 0 ? 0 : 'b');   // "CHK 5" regular (wiki 4.7), "CHOKE" bold
+    p_choke[oi] > 0 ? ov_set(1,1,1,1) : ov_set(0.65,0.67,0.70,1);
+    p_choke[oi] > 0 ? sprintf(#chk_lbl, "CHK %d", p_choke[oi]) : strcpy(#chk_lbl, "CHOKE");
+    gfx_measurestr(#chk_lbl,tw,th); gfx_x=chk_bx+(chk_bw-tw)/2; gfx_y=ob_y1+(ob_h-th)/2; gfx_drawstr(#chk_lbl);
+    mx>=chk_bx&&mx<=chk_bx+chk_bw&&my>=ob_y1&&my<=ob_y1+ob_h&&lmb_down?(
+      swing_popup_open(mx, my,
+        "OFF|Group 1|Group 2|Group 3|Group 4|Group 5|Group 6|Group 7|Group 8",
+        SP_POPUP_CALLER_OVERLAY_CHOKE);
+    );
+    swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_OVERLAY_CHOKE ? (
+      p_choke[oi] = swing_popup_result - 1;
+      swing_popup_result = 0;
+      mark_dirty_pad(oi);
+    );
+    swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_OVERLAY_CHOKE ? (
+      swing_popup_result = 0;
+    );
+
+    // 1SHOT / GATE / GLOBAL button — tri-state (right-aligned in row 1)
+    // -1 = follow global, 0 = gate (forced), 1 = one-shot (forced)
+    os_bw = ov_px(52);
+    rev_bw = ov_px(40);
+    os_bx = op_x + op_w - ov_px(10) - rev_bw - ob_gap - os_bw;
+    _os_val = p_oneshot[oi];
+    _os_val > 0 ? ov_set(0.85, 0.65, 0.10, 1) :    // amber = 1SHOT
+    _os_val == 0 ? ov_set(0.20, 0.21, 0.25, 1) :    // dark = GATE
+                   ov_set(0.20, 0.55, 0.50, 1);      // teal = GLOBAL
+    gfx_rect(os_bx, ob_y1, os_bw, ob_h);
+    ov_set(0.28,0.30,0.34,0.5); gfx_rect(os_bx,ob_y1,os_bw,1); gfx_rect(os_bx,ob_y1,1,ob_h);
+    ov_set(0.07,0.07,0.08,0.8); gfx_rect(os_bx,ob_y1+ob_h-1,os_bw,1); gfx_rect(os_bx+os_bw-1,ob_y1,1,ob_h);
+    ov_font(9, _os_val > 0 ? 0 : 'b');   // "1SHOT" regular (wiki 4.7), GATE / GLOBAL bold
+    _os_val > 0 ? ov_set(0,0,0,1) :
+    _os_val == 0 ? ov_set(0.65,0.67,0.70,1) :
+                   ov_set(1,1,1,1);
+    _os_val < 0 ? strcpy(#os_lbl, "GLOBAL") :
+    _os_val > 0 ? strcpy(#os_lbl, "1SHOT") :
+                  strcpy(#os_lbl, "GATE");
+    gfx_measurestr(#os_lbl,tw,th); gfx_x=os_bx+(os_bw-tw)/2; gfx_y=ob_y1+(ob_h-th)/2; gfx_drawstr(#os_lbl);
+    // Left-click: cycle -1 → 1 → 0 → -1
+    mx>=os_bx&&mx<=os_bx+os_bw&&my>=ob_y1&&my<=ob_y1+ob_h&&lmb_down?(
+      _os_val < 0 ? p_oneshot[oi] = 1 :
+      _os_val > 0 ? p_oneshot[oi] = 0 :
+                    p_oneshot[oi] = -1;
+      mark_dirty_pad(oi);
+    );
+    // Right-click: direct selection menu (migrated to Swing popup).
+    mx>=os_bx&&mx<=os_bx+os_bw&&my>=ob_y1&&my<=ob_y1+ob_h&&rmb_down?(
+      swing_popup_open(mx, my, "Follow Global|One-Shot|Gate", SP_POPUP_CALLER_OVERLAY_ONESHOT);
+    );
+    swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_OVERLAY_ONESHOT ? (
+      resp = swing_popup_result;
+      swing_popup_result = 0;
+      resp == 1 ? p_oneshot[oi] = -1;
+      resp == 2 ? p_oneshot[oi] = 1;
+      resp == 3 ? p_oneshot[oi] = 0;
+      mark_dirty_pad(oi);
+    );
+    swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_OVERLAY_ONESHOT ? (
+      swing_popup_result = 0;
+    );
+
+    // REV button (rightmost in row 1)
+    rev_bx = op_x + op_w - ov_px(10) - rev_bw;
+    p_reverse[oi] ? ov_set(0.70, 0.20, 0.85, 1) : ov_set(0.20, 0.21, 0.25, 1);
+    gfx_rect(rev_bx, ob_y1, rev_bw, ob_h);
+    ov_set(0.28,0.30,0.34,0.5); gfx_rect(rev_bx,ob_y1,rev_bw,1); gfx_rect(rev_bx,ob_y1,1,ob_h);
+    ov_set(0.07,0.07,0.08,0.8); gfx_rect(rev_bx,ob_y1+ob_h-1,rev_bw,1); gfx_rect(rev_bx+rev_bw-1,ob_y1,1,ob_h);
+    ov_font(9, 'b');
+    p_reverse[oi] ? ov_set(1,1,1,1) : ov_set(0.65,0.67,0.70,1);
+    gfx_measurestr("REV",tw,th); gfx_x=rev_bx+(rev_bw-tw)/2; gfx_y=ob_y1+(ob_h-th)/2; gfx_drawstr("REV");
+    mx>=rev_bx&&mx<=rev_bx+rev_bw&&my>=ob_y1&&my<=ob_y1+ob_h&&lmb_down?(
+      p_reverse[oi] = !p_reverse[oi]; s_dirty[oi] = 1; mark_dirty_pad(oi);
+    );
+
+    // ── Row 2: Clear Layer, Clear Pad -- small and quiet in the corner (2026-10-28, the owner's polish pass: the two
+    // big red buttons sat right over the mixer, easy to hit). A thin outline and dim red text, the hover lights it;
+    // both ASK first: Clear Pad its menu, Clear Layer the layer tab's own "Clear Layer N" (one confirm, one handler in
+    // _ov_draw_layers_and_mode; a click used to clear at once).
+    _clr_w = ov_px(74); _clr_gap = ov_px(6);
+    ob_x0 = op_x + op_w - (_clr_w * 2 + _clr_gap) - ov_px(10);
+
+    // CLEAR LAYER
+    obx = ob_x0;
+    _has_layer_audio = 0;
+    p_layer_cnt[oi] > 0 ? (
+      _has_layer_audio = l_len[oi * MAX_LAYERS + overlay_layer] > 0;
+    ) : (
+      _has_layer_audio = (overlay_layer == 0 && s_len[oi] > 0);
+    );
+    _clr_hov = mx>=obx&&mx<=obx+_clr_w&&my>=ob_y2&&my<=ob_y2+ob_h;
+    ov_set(0.80, 0.42, 0.32, _has_layer_audio ? (_clr_hov ? 0.85 : 0.40) : 0.15);
+    gfx_rect(obx, ob_y2, _clr_w, ob_h, 0);
+    ov_font(9, 0);
+    ov_ink(0.85, 0.52, 0.42, _has_layer_audio ? (_clr_hov ? 1 : 0.75) : 0.30);   // (a light theme: darkened to read)
+    strcpy(#_clrl_lbl, "Clear Layer");
+    gfx_measurestr(#_clrl_lbl,tw,th); gfx_x=obx+(_clr_w-tw)/2; gfx_y=ob_y2+(ob_h-th)/2; gfx_drawstr(#_clrl_lbl);
+    _clr_hov && lmb_down && _has_layer_audio ? (
+      sprintf(#_tab_menu, "Clear Layer %d", overlay_layer + 1);
+      _overlay_clear_layer_target = overlay_layer;
+      swing_popup_open(mx, my, #_tab_menu, SP_POPUP_CALLER_OVERLAY_CLEAR_LAYER);
+    );
+
+    // CLEAR PAD (all layers + FX)
+    obx = ob_x0 + _clr_w + _clr_gap;
+    _clr_hov = mx>=obx&&mx<=obx+_clr_w&&my>=ob_y2&&my<=ob_y2+ob_h;
+    ov_set(0.85, 0.35, 0.32, pad_is_playable(oi) ? (_clr_hov ? 0.85 : 0.40) : 0.15);
+    gfx_rect(obx, ob_y2, _clr_w, ob_h, 0);
+    ov_font(9, 0);
+    ov_ink(0.90, 0.45, 0.42, pad_is_playable(oi) ? (_clr_hov ? 1 : 0.75) : 0.30);   // (a light theme: darkened to read)
+    gfx_measurestr("Clear Pad",tw,th); gfx_x=obx+(_clr_w-tw)/2; gfx_y=ob_y2+(ob_h-th)/2; gfx_drawstr("Clear Pad");
+    _clr_hov && lmb_down && pad_is_playable(oi) ? (
+      swing_popup_open(mx, my, "Clear Pad (all layers + FX)", SP_POPUP_CALLER_OVERLAY_CLEAR_PAD);
+    );
+    swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_OVERLAY_CLEAR_PAD ? (
+      swing_popup_result = 0;
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 ? (
+        gmem[KIT_GMEM_UNDO_DESC] = 2; gmem[KIT_GMEM_CMD] = 46;
+        _undo_pending = 2; _undo_pad = oi;
+      ) : (
+        clear_pad(oi); clear_pad_syn(oi);
+      );
+      // The pad's JOB goes with its content: an emptied pad kept wearing the old
+      // sample's glyph instead of falling back to its number. NONE (not Auto)
+      // because the name goes too — Auto would re-infer from whatever mirror is
+      // still standing. SRC back to 0 so FILL may reclaim the pad. QUEUED, not
+      // posted: the CMD bus is busy with 46 on the branch above, and the drain
+      // owns the pacing for the single-slot mailbox.
+      // ⚠️ Clear LAYER deliberately does NOT do this — dropping one velocity
+      // layer of a multi-layer pad doesn't change what the pad is for.
+      _syn_cat_pend[oi] = PADCAT_NONE; _syn_cat_src[oi] = 0;
+      overlay_pad = -1;
+    );
+    swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_OVERLAY_CLEAR_PAD ? (
+      swing_popup_result = 0;
+    );
+);
+

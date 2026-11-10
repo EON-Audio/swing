@@ -4,6 +4,10 @@
 
 @init
 
+// A folded side section's rows go here: far above any window, so their blocks draw nothing seen and no pointer reaches
+// them (swing_panels_draw_controls' layout, 2026-10-29). Defined, not left 0: 0 is the window's top edge.
+SIDE_FOLD_Y = -100000;
+
 // ── EON tools row helpers ─────────────────────────────────────────────────
 // (The pad-knob style helpers live in rk_swing_ui_state.jsfx-inc now — the KNOB
 // selector moved up to the header next to THEME.)
@@ -30,18 +34,31 @@ function swing_panels_toolbtn_chrome(_x, _y, _w, _h, _br, _bg, _bb, _hilite) (
 // panel's right edge. Caller sets #_sec_lbl before calling. This is the visible
 // "colour coding" for the left-panel grouping (KIT / SOUND / PLAY / SAMPLES /
 // TOOLS / PREFS); the stateful buttons keep their own meaning-colours.
-function swing_panels_section_hdr(_y, _hr, _hg, _hb) (
+function swing_panels_section_hdr(_y, _hr, _hg, _hb, _bit) (
   rk_font(1, swing_fs(10), 'b');
   // The section hue must read on the LIVE body colour: on a light body (cream
   // default / EON / Light themes) the bright hue washes out, so darken it there;
   // on a dark body keep it bright.
   _sec_mul = (bg_r * 0.299 + bg_g * 0.587 + bg_b * 0.114) > 0.55 ? 0.55 : 1;
+  // FOLDING (2026-10-29, the owner: foldable side sections): a click on the band folds the section to it or opens it
+  // again (side_fold, one bit a section: KIT 1, SOUND 2, PLAY 4, SAMPLES 8, TOOLS 16; saved, gate 88; kept by an undo);
+  // the arrow at the rule's right end says which. The layout above (swing_panels_draw_controls) takes the rows away.
+  _sec_hot = mx >= 0 && mx < left_w && my >= _y && my < _y + _hdr_h;
   gfx_set(_hr * _sec_mul, _hg * _sec_mul, _hb * _sec_mul, _sec_mul < 1 ? 1 : 0.95);
   gfx_measurestr(#_sec_lbl, _shw, _shh);
   gfx_x = 8; gfx_y = _y + 1;
   gfx_drawstr(#_sec_lbl);
   gfx_set(_hr * _sec_mul, _hg * _sec_mul, _hb * _sec_mul, 0.40);
-  gfx_rect(8 + _shw + 6, _y + 1 + (_shh * 0.5 | 0), left_w - 16 - _shw - 6, 1);
+  gfx_rect(8 + _shw + 6, _y + 1 + (_shh * 0.5 | 0), left_w - 16 - _shw - 6 - swing_px(14), 1);
+  gfx_set(_hr * _sec_mul, _hg * _sec_mul, _hb * _sec_mul, _sec_hot ? 1 : 0.70);
+  _sec_ax = left_w - 8 - swing_px(9); _sec_ay = _y + 1 + (_shh * 0.5 | 0);
+  (side_fold & _bit) ? gfx_triangle(_sec_ax + swing_px(2), _sec_ay - swing_px(4), _sec_ax + swing_px(2), _sec_ay + swing_px(4),
+                                    _sec_ax + swing_px(7), _sec_ay)                                         // ▸ folded
+                     : gfx_triangle(_sec_ax, _sec_ay - swing_px(2), _sec_ax + swing_px(8), _sec_ay - swing_px(2),
+                                    _sec_ax + swing_px(4), _sec_ay + swing_px(3));                          // ▾ open
+  _sec_hot ? swing_tooltip_check(1710 + _bit,   // 1711 1712 1714 1718 1726
+                                 (side_fold & _bit) ? "Open this section" : "Fold this section to its title (click again to open it)");
+  _sec_hot && lmb_down ? ( side_fold = (side_fold & _bit) ? side_fold - _bit : side_fold + _bit; lmb_down = 0; );
 );
 
 // The RPT division popup (swing_panels_build_rpt_menu, below) is feel-first:
@@ -271,43 +288,54 @@ function swing_panels_draw_controls() (
   _sec_gap = swing_px(8);              // gap after a section's last row
   _full_w  = _btn_w * 2 + _btn_gap;    // full-panel button width
   _cy = _btn_area_y;
+  // A FOLDED section (side_fold, its bit; the header's click, swing_panels_section_hdr) keeps its header and gives up
+  // its rows: they move to SIDE_FOLD_Y, far above the window, where its blocks below draw nothing seen and no pointer
+  // reaches them (immediate mode: hiding needs no change in the blocks themselves).
+  _sfgap = swing_px(3);   // the gap under a folded header
 
   // KIT — SAVE | LOAD | NEW · CLEAR
   _kit_hdr_y = _cy; _cy += _hdr_h;
-  _bk0_y = _cy; _cy += _btn_h + _btn_gap;
-  _clr_y = _cy; _cy += _btn_h + _sec_gap;
+  side_fold & 1 ? ( _bk0_y = _clr_y = SIDE_FOLD_Y; _cy += _sfgap; ) : (
+    _bk0_y = _cy; _cy += _btn_h + _btn_gap;
+    _clr_y = _cy; _cy += _btn_h + _sec_gap;
+  );
 
   // SOUND — COLORS | STEREO/MULTI · VEL | MAP
   _snd_hdr_y = _cy; _cy += _hdr_h;
-  _btn1_y = _cy;
-  _cy += _btn_h + (col_panel_open ? col_panel_h + 2 : 0) + _btn_gap;
-  _btn3_y = _cy; _cy += _btn_h + _sec_gap;
+  side_fold & 2 ? ( _btn1_y = _btn3_y = SIDE_FOLD_Y; _cy += _sfgap; ) : (
+    _btn1_y = _cy;
+    _cy += _btn_h + (col_panel_open ? col_panel_h + 2 : 0) + _btn_gap;
+    _btn3_y = _cy; _cy += _btn_h + _sec_gap;
+  );
 
   // PLAY — RPT | MODE (1Shot/Gate toggle)  (single row)
   _play_hdr_y = _cy; _cy += _hdr_h;
-  _play_y = _cy; _cy += _btn_h + _sec_gap;
+  side_fold & 4 ? ( _play_y = SIDE_FOLD_Y; _cy += _sfgap; ) : ( _play_y = _cy; _cy += _btn_h + _sec_gap; );
 
   // SAMPLES — BROWSE | EXPLORE
   _smp_hdr_y = _cy; _cy += _hdr_h;
-  _smp_y = _cy; _cy += _btn_h + _sec_gap;
+  side_fold & 8 ? ( _smp_y = SIDE_FOLD_Y; _cy += _sfgap; ) : ( _smp_y = _cy; _cy += _btn_h + _sec_gap; );
 
   // TOOLS — SEQ|STEPPA · PAD FX / STEREO|MULTI · WIRED / DM GRID | PAINT
   _tool_hdr_y = _cy; _cy += _hdr_h;
-  _tool_a_y = _cy; _cy += _btn_h + _btn_gap;
-  _tool_b_y = _cy; _cy += _btn_h + _btn_gap;
-  _tool_c_y = _cy; _cy += _btn_h + _sec_gap;
+  side_fold & 16 ? ( _tool_a_y = _tool_b_y = _tool_c_y = SIDE_FOLD_Y; _cy += _sfgap; ) : (
+    _tool_a_y = _cy; _cy += _btn_h + _btn_gap;
+    _tool_b_y = _cy; _cy += _btn_h + _btn_gap;
+    _tool_c_y = _cy; _cy += _btn_h + _sec_gap;
+  );
 
   // (PREFS — SEL TRK / TIPS / MIDI Thru — moved to the header gear menu.)
 
-  // Master section flows below TOOLS (swing_panels_draw_master reads _btn7_y).
-  _btn7_y = _tool_c_y;
+  // Master section flows below TOOLS (swing_panels_draw_master reads _btn7_y as the last row's top: its area starts
+  // _btn_h + 8 under it). From where the panel ENDS, so a fold above moves it up (= _tool_c_y when nothing is folded).
+  _btn7_y = _cy - _btn_h - _sec_gap;
 
   // Colour-coded section headers (the grouping's main colour signal).
-  strcpy(#_sec_lbl, "KIT");     swing_panels_section_hdr(_kit_hdr_y,  0.94, 0.62, 0.15);
-  strcpy(#_sec_lbl, "SOUND");   swing_panels_section_hdr(_snd_hdr_y,  0.18, 0.72, 0.56);
-  strcpy(#_sec_lbl, "PLAY");    swing_panels_section_hdr(_play_hdr_y, 0.59, 0.77, 0.35);
-  strcpy(#_sec_lbl, "SAMPLES"); swing_panels_section_hdr(_smp_hdr_y,  0.36, 0.64, 0.91);
-  strcpy(#_sec_lbl, "TOOLS");   swing_panels_section_hdr(_tool_hdr_y, 0.61, 0.58, 0.93);
+  strcpy(#_sec_lbl, "KIT");     swing_panels_section_hdr(_kit_hdr_y,  0.94, 0.62, 0.15, 1);
+  strcpy(#_sec_lbl, "SOUND");   swing_panels_section_hdr(_snd_hdr_y,  0.18, 0.72, 0.56, 2);
+  strcpy(#_sec_lbl, "PLAY");    swing_panels_section_hdr(_play_hdr_y, 0.59, 0.77, 0.35, 4);
+  strcpy(#_sec_lbl, "SAMPLES"); swing_panels_section_hdr(_smp_hdr_y,  0.36, 0.64, 0.91, 8);
+  strcpy(#_sec_lbl, "TOOLS");   swing_panels_section_hdr(_tool_hdr_y, 0.61, 0.58, 0.93, 16);
 
   // Row 0: SAVE | SAVE AS | LOAD | NEW  (_bk0_y from the section layout above)
   // Went 4-up (was 3) when SAVE split into overwrite-vs-name. Kept to ONE row
@@ -782,7 +810,7 @@ function swing_panels_draw_controls() (
         // adopt (companion CMD 5), or are kept on an Update (CMD 7).
         gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id ? (
           swing_panels_multiout_prep();
-          gmem[KIT_GMEM_CMD] = 40; kit_import_state = 1; kit_busy = 1;
+          gmem[KIT_GMEM_CMD] = 40; kit_import_state = 1; kit_busy = 1; _mo_own = 1;
         ) : (
           kit_bridge_warn = 2; // 2 = bridge busy
         );
@@ -1455,8 +1483,8 @@ function swing_panels_draw_controls() (
       _undo_pending = 1;
     ) : (
       // No bridge, or its CMD taken by another Swing — execute immediately (no undo)
-      _undo_clear_banks ? ( gi = 0; loop(NUM_SLOTS, clear_pad(gi); clear_pad_syn(gi); gi += 1;); _undo_clear_banks = 0; )   // step 4c: all four banks
-      : ( gi = 0; loop(NUM_PADS, gi_s = swing_bp(gi); clear_pad(gi_s); clear_pad_syn(gi_s); gi += 1;); );
+      _undo_clear_banks ? ( gi = 0; loop(NUM_SLOTS, clear_pad(gi); clear_pad_syn(gi); gi += 1;); swing_banktabs_name_clear(-1); _undo_clear_banks = 0; )   // step 4c: all four banks
+      : ( gi = 0; loop(NUM_PADS, gi_s = swing_bp(gi); clear_pad(gi_s); clear_pad_syn(gi_s); gi += 1;); swing_banktabs_name_clear(bank_cur); );
     );
   );
   swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_CLEAR_PADS ? (
@@ -1590,7 +1618,7 @@ function swing_panels_draw_controls() (
       gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
         gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id ? (
           swing_panels_multiout_prep();
-          gmem[KIT_GMEM_CMD] = 40; kit_import_state = 1; kit_busy = 1;
+          gmem[KIT_GMEM_CMD] = 40; kit_import_state = 1; kit_busy = 1; _mo_own = 1;
         ) : ( kit_bridge_warn = 2; );
       ) : ( kit_bridge_warn = 1; );
     );
@@ -1599,7 +1627,7 @@ function swing_panels_draw_controls() (
       gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
         gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id ? (
           swing_panels_multiout_prep();
-          gmem[KIT_GMEM_CMD] = 74; kit_import_state = 1; kit_busy = 1;
+          gmem[KIT_GMEM_CMD] = 74; kit_import_state = 1; kit_busy = 1; _mo_own = 1;
         ) : ( kit_bridge_warn = 2; );
       ) : ( kit_bridge_warn = 1; );
     );
@@ -1616,7 +1644,10 @@ function swing_panels_draw_controls() (
       gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
         gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id ? (
           swing_panels_multiout_prep();
-          gmem[KIT_GMEM_CMD] = 92; kit_import_state = 1; kit_busy = 1;
+          // _mo_own (all four builders here and the DM menu's two): Swing's own build, so it takes the bridge's adopt
+          // (companion 5) / Update (7) while kit_busy -- the build waits for that take before its undo block, and
+          // without the mark it timed out "did not switch to Multi-Out" (the owner's try, 2026-11-02).
+          gmem[KIT_GMEM_CMD] = 92; kit_import_state = 1; kit_busy = 1; _mo_own = 1;
         ) : ( kit_bridge_warn = 2; );
       ) : ( kit_bridge_warn = 1; );
     );
@@ -1724,230 +1755,3 @@ function swing_panels_draw_controls() (
 
 );
 
-// ── Master VOL taper (dB ⇄ knob position) ─────────────────────────────────
-// The value range is deliberately lopsided — 48 dB of cut against 12 dB of
-// boost — so a LINEAR value→angle map lands unity at 80% of the 260° sweep:
-// the arc reads "nearly maxed" on an untouched instance. These two functions
-// warp between dB and knob POSITION (0..1 along the sweep) so 0 dB sits at
-// exactly 0.5 = 12 o'clock:
-//
-//   pos = ((db + 48) / 60) ^ 3.106284        db = -48 + 60 * pos ^ 0.3219281
-//
-// The exponent is ln(0.5)/ln(0.8) — the only value that maps unity's linear
-// norm (0.8) onto the midpoint. Quarter points: 25% = -9.6 dB, 50% = 0 dB,
-// 75% = +6.7 dB. Wanted side effect: drag and scroll are position-relative,
-// so both get finer around unity (~0.6 dB per scroll tick vs 1.08 before) and
-// coarser on the dive to silence.
-//
-// Deliberately NOT in knobs_kbsg.jsfx-inc: jog_knob_draw and ssl_knob_interact
-// both work in whatever units the caller passes, so handing them a 0..1
-// position leaves every other knob in the bundle — and the Forge preview
-// port of the shared lib — completely untouched.
-function swing_panels_mvol_db2pos(_db) (
-  pow(max(0, min(1, (_db + 48) / 60)), 3.106284);
-);
-// Inverse, snapped to the slider's own 0.1 dB step so the round trip can never
-// produce values like -0.0374 that would write back forever.
-function swing_panels_mvol_pos2db(_p) (
-  floor((-48 + 60 * pow(max(0, min(1, _p)), 0.3219281)) * 10 + 0.5) / 10;
-);
-
-function swing_panels_draw_master() (
-  // Available area below last button row
-  _ctrl_area_y = _btn7_y + _btn_h + 8;
-  _ctrl_area_h = ui_bot - _ctrl_area_y - 6;   // the master block ends where the sequencer's gutter begins (swing_seq_gate)
-
-  // Side-by-side layout: DRIVE on left, VOL on right
-  _drv_zone_w = (left_w * 0.28)|0;
-  _knob_zone_w = left_w - _drv_zone_w;
-
-  // Master VOL knob sizing. Scales with the panel (height + knob-zone width) but
-  // capped at 75 so it doesn't balloon to fill the whole left panel on a big
-  // window. (Was 88 — trimmed so the knob reads smaller in the master section.)
-  // ⚠ The 75 cap is a DESIGN intent ("don't balloon"), written in design
-  // pixels at 780. On a 1.75x surface the panel is 1.75x bigger, so the cap
-  // has to be too or the intent inverts into "shrink".
-  _mvol_r = min(swing_px(75), (_ctrl_area_h - swing_px(16)) / 2);
-  _mvol_r = min(_mvol_r, (_knob_zone_w / 2 - swing_px(8)));
-  _mvol_r = max(swing_px(26), _mvol_r);
-
-  // DRIVE fader (left side, vertically centered in zone). Scales with the panel
-  // height, capped at 150 (was 220) so the slider reads shorter; it still
-  // centers in the available zone via _drv_y below.
-  _drv_h = min(swing_px(150), _ctrl_area_h - swing_px(18));
-  _drv_cx = swing_px(4) + _drv_zone_w / 2;
-  _drv_y = _ctrl_area_y + ((_ctrl_area_h - _drv_h - swing_px(14)) / 2)|0;
-  _drv_track_w = swing_px(6);    // wider track
-  _drv_thumb_w = swing_px(28);   // wider thumb
-  _drv_thumb_h = swing_px(12);
-
-  // Master drive character color (matches the per-pad drive palette in
-  // rk_swing_ui_grid_overlay_fx.jsfx-inc). The fader fill, thumb line and
-  // mode pill all key off gfx_drv_mode so the DRIVE control recolors per type.
-  _mdm = gfx_drv_mode | 0;
-  _mdm == 0 ? ( _mdrv_r=0.85; _mdrv_g=0.25; _mdrv_b=0.25; ) :  // SOFT
-  _mdm == 1 ? ( _mdrv_r=0.90; _mdrv_g=0.60; _mdrv_b=0.15; ) :  // TUBE
-  _mdm == 2 ? ( _mdrv_r=0.70; _mdrv_g=0.55; _mdrv_b=0.30; ) :  // TAPE
-  _mdm == 3 ? ( _mdrv_r=0.90; _mdrv_g=0.20; _mdrv_b=0.55; ) :  // FUZZ
-             ( _mdrv_r=0.50; _mdrv_g=0.75; _mdrv_b=0.90; );     // CLIP
-
-  // Track (wider dark groove)
-  _drv_track_x = _drv_cx - (_drv_track_w / 2)|0;
-  gfx_set(0.06, 0.06, 0.08, 1);
-  gfx_rect(_drv_track_x, _drv_y, _drv_track_w, _drv_h);
-  // Track inset bevel
-  gfx_set(0.03, 0.03, 0.05, 0.8);
-  gfx_rect(_drv_track_x, _drv_y, _drv_track_w, 1);
-  gfx_rect(_drv_track_x, _drv_y, 1, _drv_h);
-  gfx_set(0.20, 0.20, 0.22, 0.4);
-  gfx_rect(_drv_track_x, _drv_y + _drv_h - 1, _drv_track_w, 1);
-
-  // Drive-type colored fill (shows current drive level in the track)
-  _drv_fill_h = (gfx_sat_drv * _drv_h)|0;
-  _drv_fill_h > 0 ? (
-    gfx_set(_mdrv_r, _mdrv_g, _mdrv_b, 0.85);
-    gfx_rect(_drv_track_x + 1, _drv_y + _drv_h - _drv_fill_h, _drv_track_w - 2, _drv_fill_h);
-  );
-
-  // Tick marks (5 ticks on left side)
-  gfx_set(0.50, 0.48, 0.45, 0.5);
-  _ti = 0; loop(5,
-    _tick_y = (_drv_y + (_ti / 4.0) * _drv_h)|0;
-    gfx_line(_drv_track_x - 4, _tick_y, _drv_track_x - 1, _tick_y);
-    _ti += 1;
-  );
-
-  // Thumb position
-  _drv_thumb_y = _drv_y + (1.0 - gfx_sat_drv) * (_drv_h - _drv_thumb_h);
-  _drv_thumb_x = _drv_cx - (_drv_thumb_w / 2)|0;
-
-  // Thumb cap (metallic silver)
-  gfx_set(0.62, 0.60, 0.57, 1);
-  gfx_rect(_drv_thumb_x, _drv_thumb_y, _drv_thumb_w, _drv_thumb_h);
-  // Top highlight
-  gfx_set(0.82, 0.80, 0.77, 0.7);
-  gfx_rect(_drv_thumb_x, _drv_thumb_y, _drv_thumb_w, 1);
-  gfx_rect(_drv_thumb_x, _drv_thumb_y, 1, _drv_thumb_h);
-  // Bottom/right shadow
-  gfx_set(0.28, 0.26, 0.23, 0.7);
-  gfx_rect(_drv_thumb_x, _drv_thumb_y + _drv_thumb_h - 1, _drv_thumb_w, 1);
-  gfx_rect(_drv_thumb_x + _drv_thumb_w - 1, _drv_thumb_y, 1, _drv_thumb_h);
-  // Drive-type colored center line on thumb (slightly darker than the fill)
-  gfx_set(_mdrv_r * 0.8, _mdrv_g * 0.8, _mdrv_b * 0.8, 0.85);
-  gfx_rect(_drv_thumb_x + 4, _drv_thumb_y + (_drv_thumb_h / 2)|0, _drv_thumb_w - 8, 2);
-
-  // Drive interaction (vertical drag, ID 270). The thumb is drawn on a
-  // (H - thumb_h) travel, so the pointer maps onto the same travel from the
-  // thumb's centre: mapping it on H made a press on the thumb, without moving,
-  // jump the drive by thumb_h / 2H (0.04 at H = 150) and switch saturation on
-  // (LIB211).
-  active_id == 270 ? ( LMB ? (
-    gfx_sat_drv = max(0, min(1.0, 1.0 - (my - _drv_y - _drv_thumb_h * 0.5) / max(1, _drv_h - _drv_thumb_h)));
-    mark_dirty_kit();
-  ) : active_id = -1; );
-
-  active_id == -1 && mx >= _drv_thumb_x - 4 && mx <= _drv_thumb_x + _drv_thumb_w + 4 && my >= _drv_y && my <= _drv_y + _drv_h && lmb_down ? (
-    // double-click resets to 0 (clean), as the tooltip has always said (LIB211); the second press starts no drag
-    time_precise() - _drv_dbl_t < RK_DBLCLICK_T ? (
-      gfx_sat_drv = 0; mark_dirty_kit(); _drv_dbl_t = 0;
-    ) : (
-      active_id = 270; _drv_dbl_t = time_precise();
-    );
-  );
-
-  // Tooltip: zone 3 = master DRIVE fader. Hover zone uses the same
-  // hitbox as the click + scroll detectors above.
-  mx >= _drv_thumb_x - 6 && mx <= _drv_thumb_x + _drv_thumb_w + 6 && my >= _drv_y && my <= _drv_y + _drv_h ?
-    swing_tooltip_check(3, "Master DRIVE — saturation amount applied at the final stage. 0 = clean, 1 = fully saturated. Drag thumb, scroll wheel, or double-click to reset.");
-
-  // Drive scroll wheel — anywhere over the fader column adjusts the
-  // drive amount. Matches the wheel sensitivity of the LCD 0..1 knobs
-  // (delay feedback / mix etc., 0.02 per tick = 50 ticks full range).
-  // Hitbox uses the thumb width plus a 6px gutter so the user can land
-  // the scroll without aiming exactly at the moving thumb.
-  mx >= _drv_thumb_x - 6 && mx <= _drv_thumb_x + _drv_thumb_w + 6 && my >= _drv_y && my <= _drv_y + _drv_h && frame_wheel != 0 ? (
-    gfx_sat_drv = max(0, min(1.0, gfx_sat_drv + frame_wheel * 0.02));
-    mark_dirty_kit();
-  );
-
-  // Drive label — themed TEXT slot (follows the active theme's text colour);
-  // falls back to the cream-panel dark ink when the bridge isn't publishing.
-  rk_font(1, swing_fs(10), 'b');
-  rkth_setcol(2, 0.18, 0.16, 0.14, 1.0);
-  gfx_measurestr("DRIVE", tw, th);
-  gfx_x = _drv_cx - tw / 2; gfx_y = _drv_y + _drv_h + 4; gfx_drawstr("DRIVE");
-
-  // ── Drive-type pill (click cycles, wheel scrolls) — colored per type ──
-  // Mirrors the per-pad drive pill idiom (dark-tinted rect + full-color text).
-  rk_font(1, swing_fs(8), 'b');
-  _mdm == 0 ? strcpy(#mdrv_lbl, "SOFT") :
-  _mdm == 1 ? strcpy(#mdrv_lbl, "TUBE") :
-  _mdm == 2 ? strcpy(#mdrv_lbl, "TAPE") :
-  _mdm == 3 ? strcpy(#mdrv_lbl, "FUZZ") :
-              strcpy(#mdrv_lbl, "CLIP");
-  gfx_measurestr(#mdrv_lbl, tw, th);
-  _mpill_x = _drv_cx - tw/2 - 4; _mpill_y = _drv_y + _drv_h + 17;
-  _mpill_w = tw + 8; _mpill_h = th + 3;
-  gfx_set(_mdrv_r * 0.3, _mdrv_g * 0.3, _mdrv_b * 0.3, 0.85);
-  gfx_rect(_mpill_x, _mpill_y, _mpill_w, _mpill_h);
-  gfx_set(_mdrv_r, _mdrv_g, _mdrv_b, 1);
-  gfx_x = _drv_cx - tw/2; gfx_y = _mpill_y + 1; gfx_drawstr(#mdrv_lbl);
-
-  // Pill hover/interact zone (distinct from the fader amount zones above).
-  _mpill_hit = mx >= _mpill_x && mx <= _mpill_x + _mpill_w && my >= _mpill_y && my <= _mpill_y + _mpill_h;
-  _mpill_hit ?
-    swing_tooltip_check(24, "Master DRIVE type — SOFT/TUBE/TAPE/FUZZ/CLIP saturation character. Click to cycle, scroll to change.");
-  // Click cycles forward through the 5 types.
-  _mpill_hit && lmb_down ? (
-    gfx_drv_mode = (_mdm + 1) % 5;
-    mark_dirty_play();   // not a kit key; a sound change: its REAPER undo point (2026-10-27)
-  );
-  // Wheel scrolls type (up = next, down = previous).
-  _mpill_hit && frame_wheel != 0 ? (
-    gfx_drv_mode = (_mdm + (frame_wheel > 0 ? 1 : 4)) % 5;
-    mark_dirty_play();
-  );
-
-  // ── Master VOL jog wheel knob (centered in knob zone) ──
-  _mvol_cx = _drv_zone_w + _knob_zone_w / 2;
-  _mvol_cy = _ctrl_area_y + (_ctrl_area_h / 2)|0;
-
-  // Master vol is logged as dB (ver 40+): -48 dB (silence) .. +12 dB, default
-  // 0 dB = unity gain. The knob is driven in POSITION space (0..1) through the
-  // taper above so unity sits at 12 o'clock instead of 80% round. Conversion to
-  // linear amplitude still happens in Swing_ReaKit.jsfx @slider, from master_db.
-  // Tooltip: zone 21 = master VOL knob. Hitbox matches the interact zone.
-  _mvol_dx = mx - _mvol_cx; _mvol_dy = my - _mvol_cy;
-  _mvol_dx*_mvol_dx + _mvol_dy*_mvol_dy <= (_mvol_r+6)*(_mvol_r+6) ?
-    swing_tooltip_check(21, "Master output volume (-48 dB silence to +12 dB). Drag, scroll, or double-click to reset to 0 dB (unity).");
-  _mvol_pos = swing_panels_mvol_db2pos(master_db);
-  jog_knob_draw(_mvol_cx, _mvol_cy, _mvol_r, _mvol_pos, 0, 1, km_master_vol[0],
-                0.15, 0.55, 1.0);
-
-  // Interact: drag, scroll, double-click reset to 0 dB (= position 0.5).
-  // The change test is in POSITION space, not dB: when the knob is untouched
-  // jog_knob_interact hands back cur_val bit-identical, so an automation
-  // envelope driving master_db to a non-0.1 value is never snapped and written
-  // back underneath itself.
-  _mvol_np = jog_knob_interact(km_master_vol, _mvol_cx, _mvol_cy, _mvol_r + 6,
-                               _mvol_pos, 0, 1, 0.5, 0);
-  _mvol_np != _mvol_pos ? (
-    master_db = swing_panels_mvol_pos2db(_mvol_np);
-    slider2 = master_db;
-    slider_automate(slider2);
-    // Recompute global_vol immediately so the next @sample uses the new amp
-    // (don't wait for @slider — it fires on the NEXT block boundary).
-    global_vol = master_db <= -48 ? 0 : exp(master_db * 0.11512925465);
-  );
-
-  // Label: MASTER VOL (bold) — themed TEXT slot (follows the active theme's text
-  // colour); falls back to the cream-panel dark ink when the bridge isn't publishing.
-  rk_font(1, swing_fs(10), 'b');
-  rkth_setcol(2, 0.18, 0.16, 0.14, 1.0);
-  gfx_measurestr("MASTER VOL", tw, th);
-  gfx_x = _mvol_cx - tw / 2; gfx_y = _mvol_cy + _mvol_r + 10; gfx_drawstr("MASTER VOL");
-
-  // Tooltip rendering happens once at end of @gfx via swing_tooltip_draw()
-  // in Swing_ReaKit.jsfx. Hover-site swing_tooltip_check() calls above
-  // have already set the render text + zone-tracking state.
-);

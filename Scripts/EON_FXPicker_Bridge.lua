@@ -65,7 +65,9 @@ local BANK = 141
 -- me anyway: getting view_kf right is no help if the CONSTANT is misplaced.
 local KINDF = 55
 local TBL, TBL_N = 26411008, 8192
-local TB_N, TB_SEQ, TB, TREC, TB_MAX = 0, 1, 16, 40, 48
+-- TB_MAX 96 since 2026-10-30 (sweep BRW17; was 48): MUST match Swing_ReaKit.jsfx FXP_TB_MAX (test_protocol.py reads
+-- the next line as it stands: no comment on it).
+local TB_N, TB_SEQ, TB, TREC, TB_MAX = 0, 1, 16, 40, 96
 local TB_LEN, TB_NAME, TB_KIND, TB_BUCK, TB_COUNT = 0, 1, 25, 26, 27
 local TBNAME_MAX = 24
 local R_LEN, R_NAME, R_FMT, R_BUCKET, R_KIND, R_RIDX = 0, 1, 42, 43, 44, 45

@@ -1,0 +1,365 @@
+// rk_swing_ui_state_p5.jsfx-inc -- part 5 of rk_swing_ui_state.jsfx-inc (5 parts), cut at a function boundary by
+// .dev_tests/split_big_incs.py: REAPER's load time grows with the square of a file's size. Edit freely;
+// keep each file under about 40 KB.
+
+// ⚠️ @init IS LOAD-BEARING (.docs/wiki/02-file-structure.md).
+@init
+
+function swing_ui_draw_lcd_frame() (
+  lcd_x = swing_px(4);
+  lcd_y = left_y + swing_px(4);
+  lcd_w = left_w - swing_px(8);
+  // Was `LCD_H = 130; ... lcd_h = LCD_H;`. EEL2 identifiers are CASE-INSENSITIVE,
+  // so LCD_H and lcd_h were THE SAME VARIABLE — the second line was a no-op and
+  // the net effect was exactly this. Inlined so the two names can't drift apart
+  // and start silently overwriting each other. (Same class of bug as the Drum
+  // Strip's STRIP_HPF/strip_hpf collision, 2026-08-03.)
+  lcd_h = swing_px(130);
+
+  // LCD background (dark blue-green)
+  gfx_set(lcd_bg_r, lcd_bg_g, lcd_bg_b, 1);
+  gfx_rect(lcd_x, lcd_y, lcd_w, lcd_h);
+
+  // LCD border - stronger inset effect
+  // Top/left highlight (lighter, for raised edge illusion)
+  gfx_set(0.15, 0.25, 0.32, 0.8);
+  gfx_rect(lcd_x, lcd_y, lcd_w, 1);
+  gfx_rect(lcd_x, lcd_y, 1, lcd_h);
+  // Bottom/right shadow (darker, for recessed edge)
+  gfx_set(0.02, 0.08, 0.12, 1);
+  gfx_rect(lcd_x, lcd_y + lcd_h - 1, lcd_w, 1);
+  gfx_rect(lcd_x + lcd_w - 1, lcd_y, 1, lcd_h);
+
+  // Subtle scanline effect (very low alpha LCD texture)
+  _scan_y = lcd_y + 1;
+  loop((lcd_h - 2),
+    _scan_y % 2 == 0 ? (
+      gfx_set(0, 0, 0, 0.03);
+      gfx_rect(lcd_x + 1, _scan_y, lcd_w - 2, 1);
+    );
+    _scan_y += 1;
+  );
+
+  // LCD mode tabs: EQ | DLY | RVB | COMP | MIX | FX
+  _num_tabs = 6;
+  _tab_w = ((lcd_w - 4 - (_num_tabs - 1) * 2) / _num_tabs)|0;
+  _tab_h = 14; _tab_y = lcd_y + 2;
+  _tab_x0 = lcd_x + 2;
+  // Init lcd_mode if not set — default to MIX tab
+  lcd_mode == 0 && !lcd_mode_init ? ( lcd_mode = 4; lcd_mode_init = 1; );
+  // Remap legacy modes (7+ → clamp to FX=6). ⚠️ This clamp EATS any mode at
+  // or above its bound: while it read `>= 6 ? 5`, the FX tab could be drawn
+  // and clicked and would snap straight back to COMP, with nothing to see.
+  lcd_mode >= 7 ? lcd_mode = 6;
+
+  // Draw tabs with 3D button effect
+  _ti = 0;
+  loop(_num_tabs,
+    _tx = _tab_x0 + _ti * (_tab_w + 2);
+    // Tab visual order: EQ, DLY, RVB, COMP, MIX, FX → lcd_mode 1,2,3,5,4,6.
+    // Tab INDEX is not lcd_mode -- COMP and MIX are deliberately swapped on
+    // screen, so this map is the only place the two orders meet.
+    _tab_mode = _ti < 3 ? (_ti + 1) :
+                _ti == 3 ? 5 : _ti == 4 ? 4 : 6;
+    _tab_active = (lcd_mode == _tab_mode);
+
+    // Tab background
+    _tab_active ? gfx_set(lcd_tx_r * 0.4, lcd_tx_g * 0.4, lcd_tx_b * 0.4, 0.9)
+                : gfx_set(0.06, 0.18, 0.24, 0.6);
+    gfx_rect(_tx, _tab_y, _tab_w, _tab_h);
+
+    // Tab 3D bevel
+    gfx_set(1, 1, 1, 0.15);
+    gfx_rect(_tx, _tab_y, _tab_w, 1);  // top highlight
+    gfx_set(0, 0, 0, 0.20);
+    gfx_rect(_tx, _tab_y + _tab_h - 1, _tab_w, 1);  // bottom shadow
+
+    // Active tab subtle glow
+    _tab_active ? (
+      gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 0.15);
+      gfx_rect(_tx + 1, _tab_y + 1, _tab_w - 2, _tab_h - 2, 0);  // inset glow ring
+    );
+
+    rk_font(1, 8, 'b');
+    _tab_active ? (
+      gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 1);
+    ) : (
+      gfx_set(lcd_tx_r * 0.5, lcd_tx_g * 0.5, lcd_tx_b * 0.5, 0.6);
+    );
+    _ti == 0 ? strcpy(#_tlab, "EQ") :
+    _ti == 1 ? strcpy(#_tlab, "DLY") :
+    _ti == 2 ? strcpy(#_tlab, "RVB") :
+    _ti == 3 ? strcpy(#_tlab, "COMP") :
+    _ti == 4 ? strcpy(#_tlab, "MIX") :
+               strcpy(#_tlab, "FX");
+    gfx_measurestr(#_tlab, tw, th);
+    gfx_x = _tx + (_tab_w - tw) / 2; gfx_y = _tab_y + (_tab_h - th) / 2;
+    gfx_drawstr(#_tlab);
+
+    // Tab click — normal switches the compact page; Shift+click opens that
+    // page's full-size big view over the pad grid.
+    mx >= _tx && mx <= _tx + _tab_w && my >= _tab_y && my <= _tab_y + _tab_h && lmb_down ? (
+      SHIFT ? (
+        _tab_mode == 1 ? swing_bigview_open(VIEW_EQ) :
+        _tab_mode == 2 ? swing_bigview_open(VIEW_DELAY) :
+        _tab_mode == 3 ? swing_bigview_open(VIEW_REVERB) :
+        _tab_mode == 5 ? swing_bigview_open(VIEW_COMP) :
+        _tab_mode == 6 ? swing_bigview_open(VIEW_FXPICK) :
+                         swing_bigview_open(VIEW_CONSOLE);
+      ) : (
+        lcd_mode = _tab_mode;
+      );
+    );
+    _ti += 1;
+  );
+
+  // ── Kit busy overlay (progress indicator) ──
+  kit_busy ? (
+    gfx_set(0, 0, 0, 0.65);
+    gfx_rect(lcd_x, lcd_y + 18, lcd_w, lcd_h - 18);
+    rk_font(1, 12, 'b');
+    gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 1);
+    kit_export_state == 10 ? strcpy(#_kit_msg, "Enter Kit Name...") :
+    kit_export_state > 0   ? strcpy(#_kit_msg, "Saving Kit...") :
+    kit_import_state == 1  ? strcpy(#_kit_msg, "Select Kit...") :
+    kit_import_state > 0   ? strcpy(#_kit_msg, "Loading Kit...") :
+                             strcpy(#_kit_msg, "Please wait...");
+    gfx_measurestr(#_kit_msg, tw, th);
+    gfx_x = lcd_x + (lcd_w - tw) / 2; gfx_y = lcd_y + (lcd_h - th) / 2 - 8;
+    gfx_drawstr(#_kit_msg);
+    // Progress bar (only show during audio copy phases)
+    kit_total_audio > 0 ? (
+      // clamped: the total is the OUTGOING kit's lengths (layered pads count 1), so a bigger kit's
+      // count ran past it and the bar was drawn many times its width, across the pads (sweep LIB145)
+      _prog = max(0, min(1, kit_copied_audio / kit_total_audio));
+    ) : _prog = 0;
+    kit_export_state == 3 || kit_import_state == 1 ? _prog = 1;
+    kit_export_state == 10 || kit_export_state == 1 ? _prog = 0;
+    _pb_w = lcd_w - 40; _pb_h = 6;
+    _pb_x = lcd_x + 20; _pb_y = lcd_y + (lcd_h + th) / 2;
+    gfx_set(0.15, 0.15, 0.18, 1);
+    gfx_rect(_pb_x, _pb_y, _pb_w, _pb_h);
+    gfx_set(lcd_tx_r, lcd_tx_g, lcd_tx_b, 0.9);
+    gfx_rect(_pb_x, _pb_y, (_pb_w * _prog)|0, _pb_h);
+  );
+
+  // ── LCD-area warning overlays (mutually exclusive). Rendering and
+  // click-detection live in rk_swing_warnings.jsfx-inc. This file just
+  // gates each banner on its specific condition and handles dismissal.
+  //
+  //   1. Bridge not running — kit_bridge_warn flag OR BRIDGE_ALIVE==0
+  //      (the second condition keeps it visible on fresh ReaPack
+  //      installs until the user runs Swing_Kit_Bridge.lua once).
+  //   2. ReaImGui not installed — set by Swing_Browser.lua's early-
+  //      return guard; cleared when ReaImGui is found.
+  //   3. Kit samples missing (P4 step 3) — pad_fail_bits != 0 means one
+  //      or more pads record a disk source that didn't load (marker-chunk
+  //      reopen with moved/deleted files, or a dead browser-drop path).
+  //      6 s grace after a restore so the bridge's auto-rebase gets a
+  //      chance to repair silently first; the bits self-heal via the
+  //      loaders' recompute, which retires the banner. Dismissal is
+  //      per-session (runtime var) — while still broken it legitimately
+  //      returns on the next open.
+  //   4. First-run welcome — only on a fresh empty-pads instance,
+  //      dismissable per-instance via _welcome_dismissed (ser_ver 42).
+  // Bridge heartbeat AGE (2026-09-08): the bridge stamps os.time() at ~1 Hz.
+  // The JSFX has no unix clock, so "stale" = the value has not MOVED for 5 s.
+  // == 0 alone never caught an uncleanly exited bridge (its last stamp stays).
+  _hb_stale = swing_bridge_hb_stale();   // the header's dot reads the same (sweep LIB144)
+  (kit_bridge_warn || _hb_stale) ? (
+    swing_warning_overlay("Kit Bridge not running!",
+                          "Run Swing_Kit_Bridge.lua in Actions",
+                          0.95, 0.40, 0.30) ? kit_bridge_warn = 0;
+  ) :
+  //   1b. The bridge is ALIVE but older than this Swing (2026-09-09). Every
+  //      ReaPack sync produces this state and it lasts until REAPER restarts:
+  //      the files are new, the script running in memory is not. It is not a
+  //      fault and it heals itself, so it says what to do and nothing more.
+  //      Ranked under "not running" because a dead bridge is the worse news.
+  //      Session-volatile dismiss (the _regfull_dismissed pattern, no ser_ver).
+  (!_hb_stale && gmem[GS_BRIDGE_LEVEL] < BRIDGE_LEVEL_WIRED && !_oldbr_dismissed) ? (
+    swing_warning_overlay("Kit Bridge is out of date",
+                          "Restart REAPER to load the version you just installed",
+                          0.95, 0.72, 0.25) ? _oldbr_dismissed = 1;
+  ) :
+  //   1c. Too many instances (2026-09-08): the 16-slot registry is full and this
+  //      instance holds no slot, so no bridge service (kits, browser, multi-out,
+  //      change maps) can address it. _regfull_since is latched in @block; the
+  //      3 s settle keeps a re-claim after a collision from flashing it.
+  //      Session-volatile dismiss (the _relink_dismissed pattern, no ser_ver bump).
+  (_reg_my_slot < 0 && _regfull_since > 0 && time_precise() - _regfull_since > 3 && !_regfull_dismissed) ? (
+    swing_warning_overlay("Too many Swing instances",
+                          "16 are registered -- this one gets no Kit Bridge services",
+                          0.95, 0.60, 0.30) ? _regfull_dismissed = 1;
+  ) :
+  //   1d. Extensions the bridge found missing at boot (GS_EXT_MISSING bitfield,
+  //      bit0 ReaImGui, bit1 js_ReaScriptAPI, bit2 SWS). The console line the
+  //      preflight prints is invisible to a user who never opens the console.
+  (gmem[GS_EXT_MISSING] > 0 && !_ext_dismissed) ? (
+    _ext_bits = gmem[GS_EXT_MISSING] | 0;
+    strcpy(#_ext_sub, "Install via ReaPack, restart REAPER:");
+    _ext_bits & 1 ? strcat(#_ext_sub, " ReaImGui");
+    _ext_bits & 2 ? strcat(#_ext_sub, " js_ReaScriptAPI");
+    _ext_bits & 4 ? strcat(#_ext_sub, " SWS");
+    swing_warning_overlay("Extension missing", #_ext_sub, 0.95, 0.75, 0.30) ? _ext_dismissed = 1;
+  ) :
+  //   1e. A dropped file the bridge could not decode (EON_PADPCM FAILED before anything
+  //      landed): the pad kept its old sample; say so for 4 s. rk_swing_padpcm arms the
+  //      timer and fills the name; the click is ignored (it expires on its own).
+  (time_precise() < _pp_fail_until) ? (
+    swing_warning_overlay("Couldn't read that file", #_pp_fail_name, 0.95, 0.60, 0.30);
+  ) :
+  //   1f. A sample load the Kit Bridge could not take (2026-09-10, plan Phase B): either
+  //      a bridge is running but predates this Swing, so the load was REFUSED and the pad
+  //      left alone (the fix is a restart, and the line says so), or there is no bridge at
+  //      all and Swing read the file itself, the way a fresh install always could. 4 s,
+  //      armed from @block by swing_ldr_bridge_notice (rk_swing_core), which fills both
+  //      strings; the click is ignored (it expires on its own), like 1e.
+  (time_precise() < _ld_notice_until) ? (
+    swing_warning_overlay(#_ld_notice_t, #_ld_notice_s, 0.95, 0.72, 0.25);
+  ) :
+  //   1b. A plain pad longer than a layer was promoted (a layer >= 1 landed
+  //      on it) and cut to LAYER_SIZE. swing_pad_promote (rk_swing_core) arms
+  //      this; the cut is undoable while the undo slot is backed. Session-
+  //      volatile and self-expiring; a click dismisses it.
+  (pad_cut_warn_pad >= 0 && time_precise() < pad_cut_warn_until) ? (
+    swing_pad_lbl(pad_cut_warn_pad, #_cut_pl);   // step 4d: "C4" when the pad is not in the bank on screen
+    sprintf(#_cut_title, "Pad %s cut to %.1f s", #_cut_pl, pad_cut_warn_after);
+    _udo_ready ?
+      sprintf(#_cut_sub, "%.1f s sample - a layer holds %.1f s. Undo restores it.",
+              pad_cut_warn_before, pad_cut_warn_after) :
+      sprintf(#_cut_sub, "%.1f s sample - a layer holds %.1f s. Undo cannot restore it here.",
+              pad_cut_warn_before, pad_cut_warn_after);
+    swing_warning_overlay(#_cut_title, #_cut_sub, 0.95, 0.65, 0.30) ? pad_cut_warn_pad = -1;
+  ) :
+  //   1c. A file longer than the pad (or the layer) holds was trimmed at the cap
+  //      (swing_ldr_finish, rk_swing_core; Spec_Swing_Pad_Banks §5.4 / §8.1). The pad face
+  //      keeps the mark for as long as the sample sits at the cap; this says it once.
+  //      Session-volatile, self-expiring; a click dismisses it.
+  (pad_trim_warn_pad >= 0 && time_precise() < pad_trim_warn_until) ? (
+    swing_pad_lbl(pad_trim_warn_pad, #_trim_pl);
+    sprintf(#_trim_title, "Pad %s trimmed to %.0f s", #_trim_pl, pad_trim_warn_secs);
+    pad_trim_warn_layer >= 0 ?
+      sprintf(#_trim_sub, "Layer %d holds %.0f s at %d Hz - the rest of the file was not loaded.",
+              pad_trim_warn_layer + 1, pad_trim_warn_secs, pad_trim_warn_sr) :
+      sprintf(#_trim_sub, "A pad holds %.0f s at %d Hz - the rest of the file was not loaded.",
+              pad_trim_warn_secs, pad_trim_warn_sr);
+    swing_warning_overlay(#_trim_title, #_trim_sub, 0.95, 0.65, 0.30) ? pad_trim_warn_pad = -1;
+  ) :
+  //   1d. A load was refused for room (Spec_Swing_Pad_Banks §5.4, step 2a): nothing was
+  //      trimmed, the pad is exactly as it was, and the figure is what is left of the
+  //      instrument (the bank that holds it arrives with step 2b). Armed by
+  //      swing_alloc_refuse_note (rk_swing_alloc) from any thread; a click dismisses it.
+  (alloc_refuse_pad >= 0 && time_precise() < alloc_refuse_until) ? (
+    _al_secs = swing_alloc_free_secs();
+    swing_pad_lbl(alloc_refuse_pad, #_al_pl);
+    sprintf(#_al_title, "Instrument full - pad %s not loaded", #_al_pl);
+    sprintf(#_al_sub, "%d:%02d of audio free. Clear a pad to make room; nothing was trimmed.",
+            (_al_secs / 60) | 0, (_al_secs - 60 * ((_al_secs / 60) | 0)) | 0);
+    swing_warning_overlay(#_al_title, #_al_sub, 0.95, 0.45, 0.30) ? alloc_refuse_pad = -1;
+  ) :
+  //   1e. The startup self-check found memory REAPER granted but could not back (rk_swing_alloc,
+  //      2026-09-23): the pool's top was lowered to the last good page, so the free figure is
+  //      honest and nothing plays silence -- but the machine is short, and the user should
+  //      know. Session-volatile; a click dismisses it for the session.
+  (!alloc_backed && !alloc_short_dismissed) ? (
+    _al_secs = swing_alloc_free_secs();
+    sprintf(#_al_sub, "REAPER granted more memory than this machine could back. Pool trimmed to %d:%02d of audio; undo may be off.",
+            (_al_secs / 60) | 0, (_al_secs - 60 * ((_al_secs / 60) | 0)) | 0);
+    swing_warning_overlay("Memory short on this machine", #_al_sub, 0.95, 0.45, 0.30) ? alloc_short_dismissed = 1;
+  ) :
+  gmem[GS_REAIMGUI_MISSING] == 1 ? (
+    swing_warning_overlay("ReaImGui not installed",
+                          "Install via ReaPack to enable the browser",
+                          0.95, 0.65, 0.30) ? gmem[GS_REAIMGUI_MISSING] = 0;
+  ) :
+  // _relink_demo_n: DISPLAY-ONLY banner trigger for the manual generator, 0 =
+  // off. Deliberately a separate variable rather than staging pad_fail_bits —
+  // that one is real state, published to GS_REB_FAIL_BITS and read by the
+  // bridge in three places to drive relink machinery, so faking it would have
+  // the bridge start real recovery work during a screenshot run. This flag is
+  // read here and nowhere else, so the banner that renders is the genuine one
+  // and only the trigger is synthetic. Never set by normal use.
+  (!_relink_dismissed && (pad_fail_bits || _relink_demo_n) &&
+   time_precise() - _reb_restored_at > 6) ? (
+    _relink_n = 0; _relink_i = 0;
+    loop(NUM_PADS,
+      pad_fail_bits & (2 ^ _relink_i) ? _relink_n += 1;
+      _relink_i += 1;
+    );
+    _relink_demo_n > 0 ? _relink_n = _relink_demo_n;   // demo overrides the count
+    _relink_n == 1 ?
+      strcpy(#_relink_msg, "1 pad failed to reload from disk") :
+      sprintf(#_relink_msg, "%d pads failed to reload from disk", _relink_n);
+    swing_warning_overlay("Kit samples missing", #_relink_msg,
+                          0.95, 0.65, 0.30) ? (
+      // P4 step 3e: click opens the action menu instead of just dismissing.
+      swing_state_relinkmenu_open(mouse_x, mouse_y);
+    );
+  ) :
+  //   4b. EON engine absent while a pad actually WANTS it. Tuned and Stretch
+  //      fall back to plain varispeed repitch without the Extension — audible,
+  //      and indistinguishable from a bug unless we say so. Deliberately
+  //      CONTEXTUAL: gated on sp_pitch_any_ext_mode, so a user who never
+  //      leaves Repitch is never told about a component they did not buy.
+  //      sp_pitch_ext_alive starts TRUE and only flips after ~1.4 s without a
+  //      heartbeat, so this cannot flash on a load that does have the engine.
+  //      Dismissal is per-session (runtime var, not serialized): while the
+  //      mode is still set and still inert, it legitimately returns next open.
+  //      The engine is not sold yet (the owner, 2026-10-29): the notice says
+  //      "coming later" and points nowhere; the stepper refuses the two modes
+  //      (swing_lcd_mode_refuse). Point it at the shop when the engine sells.
+  (!_extmiss_dismissed && !sp_pitch_ext_alive && sp_pitch_any_ext_mode) ? (
+    swing_warning_overlay("Tuned and Stretch: coming later",
+                          "These pads play as Repitch for now",
+                          0.95, 0.65, 0.30) ? _extmiss_dismissed = 1;
+  ) :
+  !_welcome_dismissed ? (
+    _wel_empty = 1;
+    _wel_i = 0; loop(NUM_PADS,
+      _wel_i_s = swing_bp(_wel_i);
+      pad_is_playable(_wel_i_s) ? _wel_empty = 0;
+      _wel_i += 1;
+    );
+    _wel_empty ? (
+      swing_warning_overlay("Welcome to Swing!",
+                            "Drag samples to pads or click LOAD for a kit",
+                            0.40, 0.65, 0.95) ?
+        ( _welcome_dismissed = 1; mark_dirty(); );
+    );
+  );
+
+  // P4 step 3e: missing-samples banner menu result.
+  //   1 = Relink samples folder... → bridge CMD 89 (folder picker + basename
+  //       search + CMD-88 restage; see eon_relink_* in the bridge)
+  //   2 = Load kit... → same as the LOAD button's "Load Kit From..." (CMD 16)
+  //   3 = Dismiss (per-session)
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_SAMPLES_MISSING ? (
+    _relink_resp = swing_popup_result; swing_popup_result = 0;
+    _relink_resp == 1 ? (
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 ? (
+        gmem[KIT_GMEM_LOCK] = instance_id;
+        gmem[KIT_GMEM_CMD] = 89;
+      ) : ( kit_bridge_warn = gmem[KIT_GMEM_BRIDGE_ALIVE] <= 0 ? 1 : kit_bridge_warn; );
+    ) :
+    _relink_resp == 2 ? (
+      // the same gates as item 1 and the LOAD button: a free bus, this instance idle, no other
+      // instance's LOCK -- it overwrote a save or load in flight (sweep LIB146)
+      gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? (
+        (gmem[KIT_GMEM_CMD] == 0 && !kit_busy && swing_shared_bands_free()) ? (
+          gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_CMD] = 16;
+          kit_import_state = 1; kit_busy = 1;
+        );
+      ) : ( kit_bridge_warn = 1; );
+    ) : (
+      _relink_dismissed = 1;
+    );
+  );
+
+  // LCD content area
+  _lcd_cx = lcd_x + 4;
+  _lcd_cy = lcd_y + 18;
+  _lcd_cw = lcd_w - 8;
+  _lcd_ch = max(swing_px(10), lcd_h - swing_px(22));
+  _lcd_mid_y = _lcd_cy + _lcd_ch / 2;
+);

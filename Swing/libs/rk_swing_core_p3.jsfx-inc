@@ -1,0 +1,858 @@
+// rk_swing_core_p3.jsfx-inc -- part 3 of rk_swing_core.jsfx-inc (4 parts), cut at a function boundary by
+// .dev_tests/split_big_incs.py: REAPER's load time grows with the square of a file's size. Edit freely;
+// keep each file under about 40 KB.
+
+// ⚠️ @init IS LOAD-BEARING (.docs/wiki/02-file-structure.md).
+@init
+
+// THE STAGED pad-main load (2026-10-15; the user: "its like the pad goes blank then the sample loads").
+// swing_ldr_begin_gmem for a CMD 63 drop whose stream lands in a STAGING region (sp / sl, taken by
+// swing_alloc_take_stage) instead of the pad's own: nothing of the pad changes here -- no clear, no
+// region fit, no path, no rate, its voices keep playing -- so the pad keeps its name, its waveform and its
+// sound for the whole stream, the zero tail and the analysis. swing_ldr_stage_commit switches it over at
+// finish, in one block. The structural undo bracket opens here as in begin_gmem (the caller took the sliced
+// capture of the OLD regions first; they stay live, untouched, until the commit displaces them and the
+// finish frees them once the capture has read them -- phase 2 drains it first, below).
+function swing_ldr_begin_gmem_staged(jb, pad, path_str, fsr, total, sp, sl)
+(
+  jb[LDR_F_PHASE] > 0 ? swing_ldr_abort(jb);   // a new job always wins
+  jb[LDR_F_PAD] = pad; jb[LDR_F_LAYER] = -1;
+  jb[LDR_F_HANDLE] = -1; jb[LDR_F_NCH] = 2; jb[LDR_F_SR] = fsr > 0 ? fsr : srate;
+  jb[LDR_F_POS] = 0; jb[LDR_F_PEAK] = 0.00001; jb[LDR_F_ZPOS] = 0; jb[LDR_F_LEN] = 0;
+  jb[LDR_F_OPENED] = 1; jb[LDR_F_ADSR] = 0; jb[LDR_F_NWIN] = 0;
+  jb[LDR_F_PREVCNT] = 0; jb[LDR_F_REFUSED] = 0;
+  swing_disp_clear(jb + LDR_F_DISP);
+  undo_begin_pad(pad);
+  strcpy(#_ldr_stg_path, path_str);   // the commit stamps it: the caller's path string may be reused by then
+  jb[LDR_F_STGP] = sp; jb[LDR_F_STGL] = sl; jb[LDR_F_STG] = 1;
+  jb[LDR_F_BUF] = sp; jb[LDR_F_CAP] = sl;
+  jb[LDR_F_PHASE] = 5;
+);
+
+// The switch-over of a staged load, at the top of swing_ldr_finish: everything begin_gmem and the CMD 63
+// start used to do to the pad at the stream's FIRST chunk, now at its end. The old voices fade (10 ms, as
+// before); every region the pad had goes onto the job's displaced list (live until the finish below frees
+// it -- the undo capture reads through it) and leaves the pad's table; then the pad is cleared (the
+// clear_pad the drop always made: FX to defaults, names, layers -- its region frees find nothing, so no
+// _clr_skip_audio: this can run on the @gfx stall fallback, and that flag is the @block load's; gfx_race
+// caught the first cut setting it from here); then the staging region becomes the pad's plain region, under
+// the lock with the record cleared in the same hold (the allocator settles either the record or the table,
+// never neither); then its target is reset (the path, the length the finish sets) and its rate set. The
+// rest of swing_ldr_finish then runs exactly as for any other load.
+function swing_ldr_stage_commit(jb) local(_pad, _r, _l) (
+  _pad = jb[LDR_F_PAD];
+  swing_voice_kill_pad_xf(_pad);
+  swing_alloc_lock();
+  _r = 0; loop(MAX_LAYERS + 1,
+    _l = swing_region_len(_pad, _r);
+    _l > 0 ? swing_disp_push_(jb + LDR_F_DISP, _r, swing_region_ptr(_pad, _r), _l);
+    swing_region_set(_pad, _r, -1, 0);
+    _r += 1;
+  );
+  swing_alloc_unlock();
+  clear_pad(_pad);
+  swing_alloc_lock();
+  swing_region_set(_pad, 0, jb[LDR_F_STGP], jb[LDR_F_STGL]);
+  jb[LDR_F_STGP] = 0; jb[LDR_F_STGL] = 0; jb[LDR_F_STG] = 0;
+  swing_alloc_unlock();
+  swing_ldr_reset_target(jb, _pad, -1, #_ldr_stg_path);
+  s_sr[_pad] = jb[LDR_F_SR];
+  jb[LDR_F_BUF] = p_aptr[_pad]; jb[LDR_F_CAP] = p_alen[_pad];
+);
+
+// Window setup for the waveform-aware ADSR pass (the old analyze_adsr
+// Window setup for the waveform-aware ADSR pass (the old analyze_adsr
+// preamble). Which loads analyze: a pad-main load unless the user tuned the
+// pad's ADSR (right-click on the overlay clears that flag); a layer-0 load
+// onto a pad that had no layers.
+function swing_ldr_adsr_setup(jb)
+local(pad, layer, len, sr, tot, dur, wfr, wil, nw)
+(
+  pad = jb[LDR_F_PAD]; layer = jb[LDR_F_LAYER]; len = jb[LDR_F_LEN]; sr = jb[LDR_F_SR];
+  jb[LDR_F_ADSR] = layer < 0 ? !p_adsr_user[pad] : (layer == 0 && jb[LDR_F_PREVCNT] == 0);
+  jb[LDR_F_NWIN] = 0;
+  jb[LDR_F_PHASE] = 4;
+  jb[LDR_F_ADSR] ? (
+    tot = (len / 2)|0;
+    dur = tot / max(1, sr) * 1000.0;
+    // Too short → percussive defaults at finish (no windows). Otherwise cover
+    // the FULL sample in up to 200 windows: ~5 ms for short hits, ~25 ms at 5 s.
+    !(tot < 128 || dur < 10) ? (
+      wfr = max((sr * 0.005)|0, (tot / 200)|0);
+      wil = wfr * 2;
+      nw  = max(1, min(200, (len / wil)|0));
+      jb[LDR_F_WFR] = wfr; jb[LDR_F_WIL] = wil; jb[LDR_F_NWIN] = nw; jb[LDR_F_W] = 0;
+      jb[LDR_F_PKRMS] = 0.00001; jb[LDR_F_PKWIN] = 0;
+      jb[LDR_F_PHASE] = 3;
+    );
+  );
+);
+
+// The old analyze_adsr result derivation, reading the job's RMS windows.
+function swing_ldr_adsr_finish(jb)
+local(pad, _rms_buf, _num_wins, _peak_rms, _peak_win, _win_ms, _dur_ms, _post_peak,
+      _body_start, _body_end, _body_sum, _body_cnt, _body_avg, _sus,
+      _dec_tgt, _dec_win, _dec_found, _rel_tgt, _rel_win, _w,
+      _atk_ms, _dec_ms, _rel_ms, _is_percussive)
+(
+  pad = jb[LDR_F_PAD];
+  _num_wins = jb[LDR_F_NWIN];
+  _num_wins <= 0 ? (
+    // Too short — percussive defaults, no analysis
+    p_attack[pad]  = 0.1;
+    p_decay[pad]   = 50;
+    p_sustain[pad] = 1.0;  // drum sampler: one-shots play through at full amplitude
+    p_release[pad] = 30;
+    p_adsr_user[pad] = 0;  // analyzer owns these values
+    swing_rcp_post_pad(pad);   // @block performs (A-9a): the loader runs on either thread
+  ) : (
+    _rms_buf  = jb + LDR_F_RMS;
+    _peak_rms = jb[LDR_F_PKRMS];
+    _peak_win = jb[LDR_F_PKWIN];
+    _win_ms   = jb[LDR_F_WFR] / max(1, jb[LDR_F_SR]) * 1000.0;
+    _dur_ms   = ((jb[LDR_F_LEN] / 2)|0) / max(1, jb[LDR_F_SR]) * 1000.0;
+    _peak_rms < 0.0001 ? (
+      // Edge case: silent buffer — conservative middle defaults
+      p_attack[pad]  = 5;
+      p_decay[pad]   = 500;
+      p_sustain[pad] = 1.0;  // drum sampler: one-shots play through at full amplitude
+      p_release[pad] = 300;
+      p_adsr_user[pad] = 0;  // analyzer owns these values
+      swing_rcp_post_pad(pad);   // @block performs (A-9a): the loader runs on either thread
+    ) : (
+      // ── Attack: time from start to peak window ────────────────
+      _atk_ms = max(0.1, min(500.0, _peak_win * _win_ms));
+      _post_peak = _num_wins - _peak_win - 1;
+
+      // ── Sustain: body energy (middle 30-70%) vs peak ──────────
+      // This is the "held" level — how loud the sound is during its body
+      _body_start = _peak_win + 1 + max(1, (_post_peak * 0.3)|0);
+      _body_end   = _peak_win + 1 + max(2, (_post_peak * 0.7)|0);
+      _body_start = min(_body_start, _num_wins - 1);
+      _body_end   = min(_body_end, _num_wins);
+      _body_sum = 0; _body_cnt = 0;
+      _w = _body_start;
+      loop(_body_end - _body_start,
+        _w < _num_wins ? ( _body_sum += _rms_buf[_w]; _body_cnt += 1; );
+        _w += 1;
+      );
+      _body_avg = _body_cnt > 0 ? (_body_sum / _body_cnt) : 0;
+      _sus      = max(0.0, min(1.0, _body_avg / _peak_rms));
+
+      // ── Decay: peak → where RMS reaches the body/sustain level ─
+      // Use sustain-relative target: find where sound settles to its body
+      _dec_tgt   = _body_avg + (_peak_rms - _body_avg) * 0.15;  // 15% above body
+      _dec_tgt   = max(_dec_tgt, _peak_rms * 0.10);  // floor: -20dB from peak
+      _dec_win   = _num_wins - 1;
+      _dec_found = 0;
+      _w = _peak_win + 1;
+      loop(_post_peak,
+        !_dec_found && _w < _num_wins ? (
+          _rms_buf[_w] <= _dec_tgt ? (
+            _dec_win = _w; _dec_found = 1;
+          );
+        );
+        _w += 1;
+      );
+      !_dec_found ? (
+        // Sustained sound — decay = 80% of remaining duration
+        _dec_ms = max(10.0, min(5000.0, _post_peak * _win_ms * 0.8));
+      ) : (
+        _dec_ms = max(1.0, min(5000.0, (_dec_win - _peak_win) * _win_ms));
+      );
+
+      // ── Release: scan from end backwards for last window > 5% peak ─
+      _rel_tgt = _peak_rms * 0.05;
+      _rel_win = _num_wins - 1;
+      _w = _num_wins - 1;
+      loop(_num_wins,
+        _w >= 0 && _rms_buf[_w] >= _rel_tgt ? (
+          _rel_win = _w;
+          _w = -1;  // break
+        );
+        _w -= 1;
+      );
+      _rel_ms = max(5.0, min(2000.0, (_num_wins - 1 - _rel_win) * _win_ms));
+      // Floor: 10% of duration up to 50ms — prevents click on voice kill
+      _rel_ms = max(_rel_ms, min(50.0, _dur_ms * 0.1));
+
+      // ── Write results ─────────────────────────────────────────
+      p_attack[pad]  = _atk_ms;
+      p_decay[pad]   = _dec_ms;
+      // Sustain: percussive vs sustained heuristic.
+      //   Percussive (kick/snare/hat): body-RMS/peak-RMS is near zero, which
+      //   would clamp the post-decay tail to ~5% and gut the sample. So for
+      //   short bursts or front-loaded transients we force S=1.0 (the sample
+      //   plays through at full amplitude — sustain is meaningless when the
+      //   audio is already over by the time decay finishes).
+      //   Sustained (pads/loops/vocal hits): body has real energy; the
+      //   computed _sus reflects the actual held level. Floor at 0.10 so
+      //   even quiet sustained sources don't disappear.
+      _is_percussive = _dur_ms < 250 || (_peak_win < _num_wins * 0.05 && _dur_ms < 1000);
+      _is_percussive ? (
+        p_sustain[pad] = 1.0;
+      ) : (
+        p_sustain[pad] = max(0.10, _sus);
+      );
+      p_release[pad] = _rel_ms;
+      p_adsr_user[pad] = 0;  // analyzer owns these values
+      swing_rcp_post_pad(pad);   // @block performs (A-9a): the loader runs on either thread
+    );
+  );
+);
+
+// Everything the old loaders did after the read: normalization gain from the
+// folded-in peak, names, layer promotion / layer metadata, ADSR results,
+// the retry + fail flags, the bridge's source generation, the undo bracket.
+function swing_ldr_finish(jb)
+local(pad, layer, lidx, len, gain, tpath, tname, last_p, i, char, _wl, _lp)
+(
+  pad = jb[LDR_F_PAD]; layer = jb[LDR_F_LAYER]; len = jb[LDR_F_LEN];
+  // a STAGED load switches the pad over here, in this block (swing_ldr_stage_commit); everything below then
+  // runs as for any load
+  jb[LDR_F_STG] && !jb[LDR_F_REFUSED] ? swing_ldr_stage_commit(jb);
+  jb[LDR_F_HANDLE] >= 0 ? ( file_close(jb[LDR_F_HANDLE]); jb[LDR_F_HANDLE] = -1; );
+  // Step 2a: a refused load (no room, §5.4) touched nothing -- say so on the LCD and skip the
+  // bookkeeping below (NCH is 0, so it does). The regions a load that went through displaced
+  // are freed here, once the sliced capture has read everything it needs from them.
+  jb[LDR_F_REFUSED] ? swing_alloc_refuse_note(pad);
+  swing_disp_any(jb + LDR_F_DISP) ? ( udo_cow_drain(pad); swing_disp_free(jb + LDR_F_DISP); );
+  jb[LDR_F_NCH] > 0 ? (
+    gain = 1.0;
+    jb[LDR_F_PEAK] > 0.000001 ? ( gain = min(1.0 / jb[LDR_F_PEAK], 100.0); );
+    layer < 0 ? (
+      s_len[pad] = len;
+      s_norm_gain[pad] = gain;
+      // Extract filename → name slot, then auto-name the pad from keywords
+      tname = get_name_slot(pad);
+      tpath = get_path_slot(pad);
+      last_p = -1; i = 0;
+      while((char = str_getchar(tpath, i)) > 0) (
+        (char == 47 || char == 92) ? last_p = i; i += 1;
+      );
+      last_p >= 0 ? strcpy_from(tname, tpath, last_p + 1) : strcpy(tname, tpath);
+      auto_name_from_file(pad);
+      // A single-sample load is authoritative: the pad becomes a PLAIN pad
+      // (p_layer_cnt = 0 — the whole slot is its sample) and every layer's
+      // metadata is wiped, layer 0's included. The wipe is what fixes the
+      // "load a new sample after a kit and it's quieter" bug: with the old
+      // kit's l_len still nonzero, Sum-mode voice launch divided the gain by
+      // sqrt(_active_cnt). Until 2026-09-08 this promoted the pad to ONE
+      // layer instead, and a layer holds LAYER_SIZE, so every pad was silently
+      // cut to 11.3 s (Spec_Swing_Long_Pad_Layer_Cap). Promotion now lives in
+      // swing_pad_promote and runs only when a layer >= 1 receives audio.
+      len > 0 ? (
+        _wl = 0;
+        loop(MAX_LAYERS,
+          _lp = pad * MAX_LAYERS + _wl;
+          l_len[_lp]       = 0;
+          l_start[_lp]     = 0;
+          l_end[_lp]       = 1.0;
+          l_sr[_lp]        = 0;
+          l_norm[_lp]      = 0;
+          l_norm_gain[_lp] = 1.0;
+          l_gain[_lp]      = 1.0;
+          l_pan[_lp] = 0; l_mute[_lp] = 0; l_solo[_lp] = 0;   // the layer mixer: centred, sounding
+          l_vel_lo[_lp]    = _wl / MAX_LAYERS;
+          l_vel_hi[_lp]    = (_wl + 1) / MAX_LAYERS;
+          l_rr_order[_lp]  = _wl;
+          strcpy(LPATH_STR_BASE + _lp, "");
+          // The new audio is original: every bake anchor goes (2026-10-02). CMD 63 and the kit import clear_pad()
+          // first, which does it; a file dropped on a pad (load_from_path: rk_swing_ui_grid_pads / _overlay) and
+          // the no-embed reload did not, so a Tuned pad kept its old mark -- the new sample played at residual 0,
+          // unpitched, until a bake landed, and with CMD 66's plain-pad refusal its capture was refused for good
+          // (Plan_Swing_Pad_Banks_Tuned §5A.7; EON_Probe_PitchA RL). Here with the wipe, not when the load starts:
+          // until now a layered pad's old layers still play, under their marks, and a load that fails keeps them.
+          sp_baked_tune[_lp] = 0;
+          _wl += 1;
+        );
+        p_layer_cnt[pad]   = 0;
+        p_layer_mode[pad]  = 3;  // Sum = the safe default once layers arrive
+      );
+    ) : (
+      lidx = pad * MAX_LAYERS + layer;
+      l_len[lidx] = len;
+      l_norm_gain[lidx] = gain;
+      l_start[lidx] = 0;
+      l_end[lidx] = 1.0;
+      // Update pad layer count
+      p_layer_cnt[pad] < layer + 1 ? p_layer_cnt[pad] = layer + 1;
+      // Auto-name pad from first layer's filename (layer 0 only)
+      layer == 0 ? (
+        tname = get_name_slot(pad);
+        tpath = get_path_slot(pad);
+        strcpy(tpath, LPATH_STR_BASE + lidx);
+        last_p = -1; i = 0;
+        while((char = str_getchar(tpath, i)) > 0) (
+          (char == 47 || char == 92) ? last_p = i; i += 1;
+        );
+        last_p >= 0 ? strcpy_from(tname, tpath, last_p + 1) : strcpy(tname, tpath);
+        auto_name_from_file(pad);
+      );
+    );
+    // Trimmed at the cap (Spec_Swing_Pad_Banks §5.4): a longer file stopped being read at
+    // LDR_F_CAP and landed exactly there (the streamed route's total is pre-clamped to the
+    // same cap by the bridge). Say so once on the LCD; the pad face keeps the mark for as
+    // long as the sample sits at the cap (pad_trimmed_secs). Until 2026-09-23 this was
+    // silent -- no flag, no banner -- and the then 11 s layer cap read as a bug on ordinary loops
+    // (layers hold 45 s since the same day; the mark now means the POOL or the pad cap).
+    len > 0 && len >= jb[LDR_F_CAP] ? (
+      pad_trim_warn_pad   = pad;
+      pad_trim_warn_layer = layer;
+      pad_trim_warn_sr    = jb[LDR_F_SR] > 0 ? jb[LDR_F_SR] : srate;
+      pad_trim_warn_secs  = jb[LDR_F_CAP] / (2 * pad_trim_warn_sr);
+      pad_trim_warn_until = time_precise() + 8;
+    );
+    jb[LDR_F_ADSR] ? swing_ldr_adsr_finish(jb);
+    s_dirty[pad] = 1;  // rebuild the waveform cache
+  );
+  // A file that OPENS but yields no audio (file_riff nch=0 when the decoder
+  // init loses the same transient AV/indexer race file_open can, or a read of
+  // 0) is the same transient class as an open miss — flag it for the
+  // kit-import loop's per-pad retry (2026-07-19, sibling of the f<0 retry).
+  jb[LDR_F_OPENED] && len <= 0 && !jb[LDR_F_REFUSED] ? kit_pad_open_failed = 1;   // a refusal is not transient: no retry
+  // Pad audio changed → bump the source generation so the Kit Bridge re-captures
+  // this pad's bake/preload source for the Extension (stale-source guard).
+  // Bumped at the END of the load so a capture never sees a partial buffer.
+  sp_src_gen[pad] += 1;
+  // P4 step 3: record the disk-load outcome (covers file_open failure AND
+  // unsupported channel count — both leave the length 0 with the path retained).
+  swing_pad_fail_recompute(pad);
+  undo_cap_end();
+  jb[LDR_F_PHASE] = 0;
+);
+
+// One bounded slice of work on a job. Returns 1 when the job is idle after the
+// call (finished, failed, or nothing in flight), 0 while it is still running.
+// `budget` is in cells and is also the loop ceiling of every loop below.
+function swing_ldr_step(jb, budget)
+local(ph, f, nch, tbuf, cap, pos, left, m, n, i, src, v, peak, wfr, wil, nw, w, fi, sum, rms, rmsbuf,
+      zbase, zlim, pad, layer, need)
+(
+  ph = jb[LDR_F_PHASE];
+  ph == 1 ? (
+    f = jb[LDR_F_HANDLE]; nch = jb[LDR_F_NCH];
+    tbuf = jb[LDR_F_BUF]; cap = jb[LDR_F_CAP]; pos = jb[LDR_F_POS];
+    peak = jb[LDR_F_PEAK];
+    left = cap - pos;
+    n = 0;
+    nch == 2 ? (
+      m = min(budget, left);
+      m > 0 ? ( n = file_mem(f, tbuf + pos, m); );
+      n > 0 ? (
+        i = 0;
+        loop(n,
+          v = abs(tbuf[pos + i]); v > peak ? peak = v;
+          i += 1;
+        );
+      );
+    ) : (
+      // Mono: read m samples into the upper half of the destination window,
+      // then expand L=R forward in place — every write lands at or below its
+      // source cell, so nothing unread is overwritten.
+      m = min((budget / 2)|0, (left / 2)|0);
+      m > 0 ? ( n = file_mem(f, tbuf + pos + m, m); );
+      n > 0 ? (
+        src = tbuf + pos + m;
+        i = 0;
+        loop(n,
+          v = src[i];
+          tbuf[pos + 2 * i] = v; tbuf[pos + 2 * i + 1] = v;
+          v = abs(v); v > peak ? peak = v;
+          i += 1;
+        );
+        n = n * 2;
+      );
+    );
+    jb[LDR_F_PEAK] = peak;
+    pos += n;
+    jb[LDR_F_POS] = pos;
+    (n <= 0 || pos >= cap) ? (
+      file_close(f); jb[LDR_F_HANDLE] = -1;
+      jb[LDR_F_LEN] = pos; jb[LDR_F_ZPOS] = pos;
+      jb[LDR_F_PHASE] = 2;
+    );
+    0;
+  ) :
+  ph == 2 ? (
+    // Zero the unused tail of the slot / layer region. memset is native and
+    // ~50x cheaper per cell than the read slice, so it gets 16x the budget:
+    // a whole 4M-cell slot clears in ~4 blocks instead of ~60, which is what
+    // keeps a one-shot drum hit feeling instant (measured 2026-09-07: 14 defer
+    // ticks for a 0.25 s file at the plain budget).
+    tbuf = jb[LDR_F_BUF]; cap = jb[LDR_F_CAP]; pos = jb[LDR_F_ZPOS];
+    m = max(0, min(budget * 16, cap - pos));   // cap = the REGION's cells since step 2a (0 for the zero job)
+    // Sliced-undo barrier (rk_drumkit_dsp udo_cow_upto): the tail this is about to
+    // zero can still be the only copy of the pad's OLD audio when the capture was
+    // sliced. It saves what we are about to destroy and hands back how far we may
+    // go; a short answer means we zero less this block and pick the rest up next
+    // block. A no-op for every load whose capture copied up front.
+    zbase = jb[LDR_F_LAYER] < 0 ? 0 : jb[LDR_F_LAYER] * LAYER_SIZE;   // virtual-slot coordinates (rk_swing_alloc maps them)
+    m > 0 ? (
+      zlim = udo_cow_upto(jb[LDR_F_PAD], zbase + pos + m) - (zbase + pos);
+      zlim < m ? m = max(zlim, 0);
+      m > 0 ? memset(tbuf + pos, 0, m);
+      pos += m;
+      jb[LDR_F_ZPOS] = pos;
+    );
+    // Step 2a: the region is clean. A job that DISPLACED regions (a bigger file, a drop onto
+    // a layered pad, the kit-empty zero job) now drains the sliced capture a budget per
+    // block -- the writer's reach no longer covers the old audio, which lives in the
+    // displaced regions until finish frees them -- and only then moves on. In place, the
+    // zero tail above pumped the barrier exactly as before.
+    // A STAGED load (2026-10-15) drains it here too, a budget per block: its commit at finish frees the old
+    // regions the capture reads through, and an undrained capture would be finished there in ONE block.
+    pos >= cap ? (
+      ((swing_disp_any(jb + LDR_F_DISP) || jb[LDR_F_STG]) && udo_cow_pending(jb[LDR_F_PAD])) ?
+        udo_cow_upto(jb[LDR_F_PAD], UDO_VSLOT) :
+        swing_ldr_adsr_setup(jb);
+    );
+    0;
+  ) :
+  ph == 3 ? (
+    // RMS windows (mono mix L+R / 2): as many as cover ~budget cells, min one
+    tbuf = jb[LDR_F_BUF];
+    wfr = jb[LDR_F_WFR]; wil = jb[LDR_F_WIL]; nw = jb[LDR_F_NWIN]; w = jb[LDR_F_W];
+    rmsbuf = jb + LDR_F_RMS;
+    m = max(1, (budget / max(1, wil))|0);
+    m = min(m, nw - w);
+    loop(m,
+      sum = 0; fi = w * wil;
+      loop(wfr,
+        v = (tbuf[fi] + tbuf[fi + 1]) * 0.5;
+        sum += v * v;
+        fi += 2;
+      );
+      rms = sqrt(sum / max(1, wfr));
+      rmsbuf[w] = rms;
+      rms > jb[LDR_F_PKRMS] ? ( jb[LDR_F_PKRMS] = rms; jb[LDR_F_PKWIN] = w; );
+      w += 1;
+    );
+    jb[LDR_F_W] = w;
+    w >= nw ? jb[LDR_F_PHASE] = 4;
+    0;
+  ) :
+  ph == 6 ? (
+    // Waiting for room (step 2a): the compaction job is packing the area (alc_req). Re-fit when
+    // it is done; a fit that fails for room again re-files the request, three times at most,
+    // then the load is refused with the pad exactly as it was.
+    alc_req ? 0 : (
+      pad = jb[LDR_F_PAD]; layer = jb[LDR_F_LAYER]; f = jb[LDR_F_HANDLE]; nch = jb[LDR_F_NCH];
+      need = jb[LDR_F_NEED];
+      (layer < 0 ? swing_pad_fit_main(pad, need, jb + LDR_F_DISP)
+                 : swing_pad_fit_layer(pad, layer, need, jb + LDR_F_DISP)) ? (
+        swing_ldr_accept(jb, pad, layer, jb == ldr_job0 ? #_ldr_wpath0 : #_ldr_wpath1, f, nch, jb[LDR_F_SR]);
+      ) : (alc_wait && jb[LDR_F_WAITN] < 3) ? (
+        jb[LDR_F_WAITN] += 1; alc_req = 1;
+      ) : (
+        f >= 0 ? file_close(f);
+        jb[LDR_F_HANDLE] = -1;
+        jb[LDR_F_REFUSED] = 1;
+        // NCH was kept for the resume above; a refusal must drop it, or finish runs the success bookkeeping
+        // with len 0 and EMPTIES the pad (or raises the layer count on an empty layer) that the refusal was
+        // meant to leave as it was (LIB35). begin's and begin_gmem's refusals never set it.
+        jb[LDR_F_NCH] = 0;
+        jb[LDR_F_PHASE] = 4;
+      );
+      0;
+    );
+  ) :
+  ph == 5 ? 0 :   // fed by the EON_PADPCM stream (rk_swing_padpcm); its LAST chunk hands the job to phase 2
+  ph == 4 ? (
+    swing_ldr_finish(jb);
+    1;
+  ) : 1;
+);
+
+// @block entry points: begin the job on first sight of (pad, layer), then pump
+// one ldr_budget slice. Return 1 once the load has landed (or failed) so the
+// caller can move on, 0 while it should hold its place and call again next
+// block with the same arguments.
+function swing_ldr_step_pad(pad, path_str) (
+  (ldr_job0[LDR_F_PHASE] == 0 || ldr_job0[LDR_F_PAD] != pad || ldr_job0[LDR_F_LAYER] != -1) ?
+    swing_ldr_begin(ldr_job0, pad, -1, path_str);
+  swing_ldr_step(ldr_job0, ldr_budget);
+);
+function swing_ldr_step_layer(pad, layer, path_str) (
+  (ldr_job0[LDR_F_PHASE] == 0 || ldr_job0[LDR_F_PAD] != pad || ldr_job0[LDR_F_LAYER] != layer) ?
+    swing_ldr_begin(ldr_job0, pad, layer, path_str);
+  swing_ldr_step(ldr_job0, ldr_budget);
+);
+
+// ─── A pad the new kit leaves EMPTY (Phase 4, A O-2, 2026-09-15) ─────────────
+// clear_pad's four 8 MB layer memsets ran on the audio thread for every kit-empty pad
+// of a VER-201 import: measured 2026-09-15 (EON_Probe_LdrStress, LdrSlice kit, 512
+// samples at 48 kHz) as thirteen 20 ms blocks against a 10.7 ms period -- one overrun
+// per empty pad. This runs the SAME clear_pad, minus the memsets (_clr_skip_audio, the
+// stream drop's pattern), and hands the slot to the loader's phase 2, which zeroes it
+// a bounded slice per block behind the sliced-undo barrier. The job has no file and no
+// audio: phase 2 -> 3 (no windows: len 0) -> 4, and finish() does the pad's bookkeeping
+// (source generation, fail bit, the undo bracket this opened). Inside an import the
+// capture depth is held, so nothing is captured; outside one the lazy capture saves a
+// slice ahead of the zeroing exactly as a drop does.
+function swing_ldr_begin_zero(jb, pad) local(_zr) (
+  jb[LDR_F_PHASE] > 0 ? swing_ldr_abort(jb);   // a new job always wins
+  jb[LDR_F_PAD] = pad; jb[LDR_F_LAYER] = -1;
+  jb[LDR_F_HANDLE] = -1; jb[LDR_F_NCH] = 0; jb[LDR_F_SR] = 0;
+  jb[LDR_F_POS] = 0; jb[LDR_F_PEAK] = 0.00001; jb[LDR_F_ZPOS] = 0; jb[LDR_F_LEN] = 0;
+  jb[LDR_F_OPENED] = 0; jb[LDR_F_ADSR] = 0; jb[LDR_F_PREVCNT] = 0; jb[LDR_F_NWIN] = 0;
+  _udo_cap_lazy_req = 1;
+  undo_begin_pad(pad);          // closed by swing_ldr_finish
+  _udo_cap_lazy_req = 0;
+  _clr_skip_audio = 1;
+  clear_pad(pad);               // nested: raises the depth, captures nothing new
+  _clr_skip_audio = 0;
+  // Step 2a: every region the pad had is displaced -- kept live for the sliced capture, freed
+  // by finish -- and the job has no region of its own: phase 2 only drains the capture.
+  jb[LDR_F_REFUSED] = 0;
+  swing_disp_clear(jb + LDR_F_DISP);
+  _zr = 0; loop(MAX_LAYERS + 1,
+    swing_region_len(pad, _zr) > 0 ?
+      swing_disp_push_(jb + LDR_F_DISP, _zr, swing_region_ptr(pad, _zr), swing_region_len(pad, _zr));
+    swing_region_set(pad, _zr, -1, 0);
+    _zr += 1;
+  );
+  jb[LDR_F_BUF] = -1;
+  jb[LDR_F_CAP] = 0;
+  jb[LDR_F_PHASE] = 2;
+);
+// @block entry point, the swing_ldr_step_pad shape: begin on first sight of the pad,
+// then pump one slice; 1 once the slot is clean, 0 while the caller must hold its place.
+function swing_ldr_zero_pad(pad) (
+  (ldr_job0[LDR_F_PHASE] == 0 || ldr_job0[LDR_F_PAD] != pad || ldr_job0[LDR_F_LAYER] != -1) ?
+    swing_ldr_begin_zero(ldr_job0, pad);
+  swing_ldr_step(ldr_job0, ldr_budget);
+);
+
+// Run a job to completion in one call (UI-side callers and the legacy VER-200
+// import). Each step stays under the loop cap; a full slot takes ~8 steps.
+function swing_ldr_run(jb, pad, layer, path_str) local(_t0) (
+  swing_ldr_begin(jb, pad, layer, path_str);
+  _t0 = time_precise();
+  while (swing_ldr_step(jb, LDR_BUDGET_MAX) == 0) (
+    // A job waiting for room (phase 6) on this synchronous lane packs the area itself -- the
+    // same locked tick @block takes -- for a second at most; then the re-fit refuses.
+    jb[LDR_F_PHASE] == 6 ? (
+      swing_alloc_compact_tick();
+      time_precise() - _t0 > 1.0 ? ( alc_req = 0; jb[LDR_F_WAITN] = 3; );
+    );
+  );
+);
+
+// ─── A load the Kit Bridge could not take (2026-09-10, plan Phase B) ──────
+// Told on the LCD for 4 s (rk_swing_ui_state rung 1f). kind 1: a bridge is
+// running but predates this JSFX -- every ReaPack sync produces this until
+// REAPER restarts -- so the load was REFUSED and the pad left exactly as it was,
+// because a restart fixes it and a file read on the audio thread does not.
+// kind 0: no bridge at all (a fresh install, or it died) -- Swing read the file
+// itself, the way it always could, and says so. Lives here rather than in
+// rk_swing_padpcm because rk_swing_browser_load is imported before that file
+// and EEL2 binds function names in file order.
+// kind 2 (2026-10-16): a project or undo chunk held a saved sample length the read refused (_ser_bad, @serialize),
+// so that pad came back EMPTY; 8 s, named by count -- the flag had been set since 2026-07 and never shown.
+function swing_ldr_bridge_notice(kind) (
+  kind == 2 ? (
+    sprintf(#_ld_notice_t, "%d saved sample%s not restored", _ser_bad | 0, (_ser_bad | 0) == 1 ? "" : "s");
+    strcpy(#_ld_notice_s, "A saved length was corrupt -- the pad is empty, reload it");
+  ) : kind ? (
+    strcpy(#_ld_notice_t, "Sample not loaded");
+    strcpy(#_ld_notice_s, "Kit Bridge is out of date -- restart REAPER");
+  ) : (
+    strcpy(#_ld_notice_t, "Loaded without the Kit Bridge");
+    strcpy(#_ld_notice_s, "It isn't running -- run Swing_Kit_Bridge from the Action List");
+  );
+  _ld_notice_until = time_precise() + (kind == 2 ? 8 : 4);
+);
+
+// ─── Sample loader (synchronous wrappers on the UI-side job lane) ─────────
+function load_from_path(idx, path_str) (
+  idx >= 0 && idx < NUM_SLOTS ? swing_ldr_run(ldr_job1, idx, -1, path_str);
+);
+
+// Set a pad's layer playback mode (0=single 1=vel-split 2=round-robin 3=sum).
+// Mirrors the layer-mode popup in rk_swing_ui_grid_overlay.jsfx-inc: resets the
+// RR cursor and — for vel-split — auto-assigns even velocity ranges when the
+// layers still have default 0-1 ranges. A mode change never promotes a plain
+// pad: it has nothing to sum or split yet, and promoting a pad longer than a
+// layer would cut it (swing_pad_promote runs when a layer >= 1 lands).
+// Self-contained (no GUI dependency) so the RS5k importer can drive it over
+// the INCMD_LMODE channel after stacking layers via CMD 64.
+function swing_layer_set_mode(pad_idx, mode)
+local(_all_default, _ncnt, _base, _li, _k)
+(
+  pad_idx >= 0 && pad_idx < NUM_SLOTS ? (
+    p_layer_mode[pad_idx] = max(0, min(3, mode));
+    p_rr_idx[pad_idx] = 0;
+    // Even vel-split ranges when entering Vel-Split, only if every layer still
+    // has the default 0-1 range (don't stomp user/preset edits).
+    // Over the layers that HOLD AUDIO: an empty layer keeps clear_layer's / the load wipe's 1/MAX_LAYERS slice,
+    // so counting it refused the split for a pad with a gap layer and its upper layer never sounded (select_layer
+    // takes the first match with audio for every velocity) (LIB36). The overlay's layer-mode menu has the same
+    // test (rk_swing_ui_grid_overlay).
+    mode == 1 && p_layer_cnt[pad_idx] > 1 ? (
+      _all_default = 1; _ncnt = 0;
+      _li = 0; loop(p_layer_cnt[pad_idx],
+        _base = pad_idx * MAX_LAYERS + _li;
+        l_len[_base] > 0 ? (
+          _ncnt += 1;
+          (l_vel_lo[_base] > 0.001 || l_vel_hi[_base] < 0.999) ? _all_default = 0;
+        );
+        _li += 1;
+      );
+      _all_default && _ncnt > 1 ? (
+        _k = 0; _li = 0; loop(p_layer_cnt[pad_idx],
+          _base = pad_idx * MAX_LAYERS + _li;
+          l_len[_base] > 0 ? (
+            l_vel_lo[_base] = _k / _ncnt;
+            l_vel_hi[_base] = (_k + 1) / _ncnt;
+            _k += 1;
+          );
+          _li += 1;
+        );
+      );
+    );
+  );
+);
+
+function load_layer_from_path(pad_idx, layer_idx, path_str) (
+  pad_idx >= 0 && pad_idx < NUM_SLOTS && layer_idx >= 0 && layer_idx < MAX_LAYERS ?
+    swing_ldr_run(ldr_job1, pad_idx, layer_idx, path_str);
+);
+
+// ─── The wave looks' cache: Outline and True peaks (2026-10-27) ──────────────────────────────────────
+// slider48 pad_wave_look: 0 Peak (the WV_RES cache below, the look before the THEME menu's PAD WAVE row), 1 Outline
+// (per pixel column the true peak as an outline, the mean |x| as a brighter body), 2 True peaks (per column the true
+// min to the true max). 1 and 2 draw from wvb_cache (Swing_ReaKit @init): WVB_BINS bins a slot, each with the max, min
+// and mean |x| of its span, per channel, RAW -- reverse and normalize apply when drawing, so a knob never rebuilds it.
+// Everything here runs in @gfx (build_wv_cache's caller, swing_ui_misc_cmds, and the pass that draws), so the drawing
+// can never meet a half-written bin; a build that spans passes is not ready until wvb_have takes its generation, LAST.
+function swing_wvb_look() ( max(0, min(2, (pad_wave_look + 0.5) | 0)); );
+function swing_wvb_ready(s) ( wvb_want[s] > 0 && wvb_have[s] == wvb_want[s]; );
+// The look slot s draws in NOW: Outline / True peaks once its bins are in, else 0 = Peak, the WV_RES draw (a slot still
+// building shows Peak for those passes). Every drawing site branches on this one answer.
+function swing_wvb_use(s) local(_l) ( _l = swing_wvb_look(); _l > 0 && swing_wvb_ready(s) ? _l : 0; );
+// The normalize gain of the audio the cache holds, as it stands now (build_wv_cache's choice, read at draw time).
+function swing_wvb_gain(s) local(_l) (
+  _l = wvb_key[s * WVB_KEYN + 1];
+  _l < 0 ? ( s_norm[s] ? s_norm_gain[s] : 1.0 )
+         : ( l_norm[s * MAX_LAYERS + _l] ? l_norm_gain[s * MAX_LAYERS + _l] : 1.0 );
+);
+// Column j of `cols` across slot s's channel c, folded from the bins: wvb_cmx / wvb_cmn = the true max / min, wvb_cme
+// = the mean |x| (raw: the caller scales). rv mirrors the column (a reversed pad; the bins are forward). No drawing,
+// so the harness can hold it to the audio (wvb_test.py).
+// ⚠ The + 0.000000001: EEL2 reads (106 + 1) * 512 / 107 as 511.99999999999994 (measured in the harness: a computed
+// numerator is divided by a reciprocal multiply), so the last column stopped one bin short and the sample's last bin
+// was never drawn. A boundary that is not a whole number sits at least 1 / cols from one, so the nudge moves nothing
+// else. (Peak's swing_grid_wv_span carries the same truncation; left as it is, the look is today's.)
+function swing_wvb_col(s, c, j, cols, rv) local(_base, _jj, _b0, _b1, _k, _sa) (
+  _base = wvb_cache + s * WVB_STRIDE + c * 3 * WVB_BINS;
+  _jj = rv ? cols - 1 - j : j;
+  _b0 = (_jj * WVB_BINS / cols + 0.000000001) | 0;
+  _b1 = ((_jj + 1) * WVB_BINS / cols + 0.000000001) | 0;
+  _b1 <= _b0 ? _b1 = _b0 + 1;
+  wvb_cmx = -2; wvb_cmn = 2; _sa = 0; _k = _b0;
+  loop(_b1 - _b0,
+    _base[_k] > wvb_cmx ? wvb_cmx = _base[_k];
+    _base[WVB_BINS + _k] < wvb_cmn ? wvb_cmn = _base[WVB_BINS + _k];
+    _sa += _base[2 * WVB_BINS + _k];
+    _k += 1;
+  );
+  wvb_cme = _sa / (_b1 - _b0);
+);
+// build_wv_cache runs on EVERY s_dirty: a new sample, and a gain / ADSR / offset / reverse / normalize edit too. The
+// bins are a full pass over the audio (the gallery's same pass: 4.4-7.2 ms for a 10 s stereo loop in REAPER), so they
+// must not follow the knobs. This note gets
+// the source build_wv_cache just chose and compares its key -- the content length, the layer, and two sums of the RAW
+// samples at 512 fixed points taken in forward order (so reverse and normalize, applied at draw time, leave it alone)
+// -- with the key the slot was last asked to build from; a difference asks for a build (wvb_want += 1). Every route
+// that loads, swaps, clears, restores or undoes a sample reaches it through the s_dirty it already raises, so no route
+// has to know this cache exists. The key stands in for the audio: two samples of the same length whose 512 points all
+// match EXACTLY (!==, wiki 1.11) would keep the old bins -- not a case real audio meets. The buffer pointer is left out
+// on purpose: the allocator's compaction moves a region with its content (rk_swing_alloc).
+function swing_wvb_note(idx, buf, wlen, lay) local(_n, _i, _si, _vL, _vR, _s1, _s2, _k) (
+  _n = (wlen / 2) | 0;
+  _s1 = 0; _s2 = 0;
+  _i = 0; loop(512,
+    _si = (((_i + 0.5) * _n / 512) | 0) * 2;
+    _vL = buf[_si]; _vR = buf[_si + 1];
+    _s1 += (_vL + 0.618034 * _vR) * (_i + 1);
+    _s2 += (1.414214 * _vL - _vR) * (((_i * 37) % 101) + 1);
+    _i += 1;
+  );
+  _k = wvb_key + idx * WVB_KEYN;
+  (wvb_want[idx] < 1 || _k[0] !== wlen || _k[1] !== lay || _k[2] !== _s1 || _k[3] !== _s2) ? (
+    _k[0] = wlen; _k[1] = lay; _k[2] = _s1; _k[3] = _s2;
+    wvb_want[idx] += 1;
+  );
+);
+// One pass's share of the building: bins until `secs` (WVB_BUDGET) are spent -- one bin past it at most -- then it
+// returns; a job spans as many passes as it needs (a 45 s stereo layer is about 4.3 x the 10 s loop's work). The bank
+// on screen goes
+// first. The source is looked up again on every pass: the compaction (@block) moves a region and its content without a
+// word, so a job follows the pointer and starts over only when the LENGTH moved (new audio, whose note bumps want too).
+// A slot whose audio is gone is marked done: it draws no wave. wvb_job = slot + 1 (0 = none), and the job's state, are
+// @gfx's and live from one pass to the next.
+function swing_wvb_step(secs) local(_t0, _go, _k, _q, _s, _lay, _buf, _len, _n, _base, _b, _f0, _f1, _f, _vL, _vR,
+                                     _mxL, _mnL, _saL, _mxR, _mnR, _saR) (
+  _t0 = time_precise();
+  _go = 1;
+  while (_go) (
+    !wvb_job ? (
+      _s = -1; _k = 0;
+      while (_s < 0 && _k < NUM_SLOTS) (
+        _q = (bank_cur * NUM_PADS + _k) % NUM_SLOTS;
+        wvb_want[_q] != wvb_have[_q] ? _s = _q;
+        _k += 1;
+      );
+      _s >= 0 ? ( wvb_job = _s + 1; wvb_job_gen = wvb_want[_s]; wvb_job_bin = 0; wvb_job_len = -1; ) : ( _go = 0; );
+    );
+    wvb_job ? (
+      _s = wvb_job - 1;
+      wvb_want[_s] != wvb_job_gen ? ( wvb_job_gen = wvb_want[_s]; wvb_job_bin = 0; );   // asked again mid-build
+      _lay = wvb_key[_s * WVB_KEYN + 1];
+      _lay < 0 ? ( _buf = p_aptr[_s]; _len = s_len[_s]; )
+               : ( _buf = p_lptr[_s * MAX_LAYERS + _lay]; _len = l_len[_s * MAX_LAYERS + _lay]; );
+      _len != wvb_job_len ? ( wvb_job_len = _len; wvb_job_bin = 0; );
+      _n = (_len / 2) | 0;
+      _n < 1 ? (
+        wvb_have[_s] = wvb_job_gen; wvb_job = 0;
+      ) : (
+        _base = wvb_cache + _s * WVB_STRIDE;
+        while (_go && wvb_job_bin < WVB_BINS) (
+          _b = wvb_job_bin;
+          _f0 = (_b * _n / WVB_BINS) | 0;
+          _f1 = ((_b + 1) * _n / WVB_BINS) | 0;
+          _f1 <= _f0 ? _f1 = _f0 + 1;
+          _mxL = -2; _mnL = 2; _saL = 0; _mxR = -2; _mnR = 2; _saR = 0;
+          _f = _f0 * 2;
+          loop(_f1 - _f0,
+            _vL = _buf[_f]; _vR = _buf[_f + 1];
+            _vL > _mxL ? _mxL = _vL; _vL < _mnL ? _mnL = _vL; _saL += abs(_vL);
+            _vR > _mxR ? _mxR = _vR; _vR < _mnR ? _mnR = _vR; _saR += abs(_vR);
+            _f += 2;
+          );
+          _base[_b] = _mxL; _base[WVB_BINS + _b] = _mnL; _base[2 * WVB_BINS + _b] = _saL / (_f1 - _f0);
+          _base[3 * WVB_BINS + _b] = _mxR; _base[4 * WVB_BINS + _b] = _mnR; _base[5 * WVB_BINS + _b] = _saR / (_f1 - _f0);
+          wvb_job_bin += 1;
+          time_precise() - _t0 >= secs ? _go = 0;
+        );
+        wvb_job_bin >= WVB_BINS ? ( wvb_have[_s] = wvb_job_gen; wvb_job = 0; );   // ready: written LAST
+      );
+    );
+  );
+);
+
+// ─── Waveform cache builder ─────────────────────────────────────────────
+function build_wv_cache(idx) local(buf, step, i, _wi, val, si, ptr, ptr_R, _wlen, _wsg, _lidx, _wli, _stereo_found, _louder, _quieter, _cum_diff, _cum_signal, _vL, _vR, _eL, _eR, _ovl, _ov_lidx, _ov_llen, _ov_dst, _ov_dstR, _ov_buf, _ov_step, _ovi, _ov_si, _ov_sg) (
+  // Cache stores raw waveform shape only. User mix knobs (p_gain, l_gain)
+  // are NOT applied — they're shown by their own knobs and would push the
+  // wave outside the pad bounds. ADSR is NOT applied — the FX overlay
+  // draws it as a separate curve. The only multiplier is normalize gain,
+  // which describes the sample's intrinsic loudness so quiet samples still
+  // fill the pad.
+  p_layer_cnt[idx] > 0 ? (
+    _wli = 0;
+    while(_wli < p_layer_cnt[idx] && l_len[idx * MAX_LAYERS + _wli] <= 0) ( _wli += 1; );
+    _wli >= p_layer_cnt[idx] ? _wli = 0; // fallback to 0 if all empty
+    _lidx = idx * MAX_LAYERS + _wli;
+    _wlen = l_len[_lidx];
+    buf = p_lptr[idx * MAX_LAYERS + _wli];
+    _wsg = l_norm[_lidx] ? l_norm_gain[_lidx] : 1.0;
+  ) : (
+    _wlen = s_len[idx];
+    buf = p_aptr[idx];
+    _wsg = s_norm[idx] ? s_norm_gain[idx] : 1.0;
+  );
+  _wlen > 0 ? (
+    swing_wvb_note(idx, buf, _wlen, p_layer_cnt[idx] > 0 ? _wli : -1);   // the wave looks' bins: a new sample only (above)
+    ptr   = wv_cache   + idx * WV_RES;
+    ptr_R = wv_cache_R + idx * WV_RES;
+    step = (_wlen / 2) / WV_RES;
+    // Stereo detection — two checks must both pass for stereo render:
+    //
+    //   1. Relative L/R difference: cumulative |L-R| > 10% of total
+    //      louder-channel signal. Catches the "kick stored as stereo
+    //      with L≈R" case — old per-sample EPS=1e-5 fired on noise
+    //      floor and rendered two near-identical halves that visually
+    //      merged into one waveform wrapping around. Mirror of the
+    //      browser-side check in Swing_Browser.lua generate_peaks().
+    //
+    //   2. Channel-balance: quieter channel >= 30% (≈ -10.5 dB) of
+    //      louder. Catches "bass file with one silent channel" — would
+    //      render with half flat, looks broken. Force mono in that case
+    //      so the louder channel fills the pad.
+    _cum_diff = 0; _cum_signal = 0;
+    _eL = 0; _eR = 0;  // per-channel cumulative |amp| (energy proxy)
+    i = 0; loop(WV_RES,
+      _wi = p_reverse[idx] ? (WV_RES - 1 - i) : i;
+      si = ((_wi * step)|0) * 2;
+      _vL = buf[si];
+      _vR = buf[si + 1];
+      ptr  [i] = _vL * _wsg;
+      ptr_R[i] = _vR * _wsg;
+      _eL += abs(_vL);
+      _eR += abs(_vR);
+      _cum_diff   += abs(_vL - _vR);
+      _cum_signal += max(abs(_vL), abs(_vR));
+      i += 1;
+    );
+    _stereo_found = _cum_signal > 0.001 && (_cum_diff / _cum_signal) >= 0.10;
+    // Channel-balance check by ENERGY (not peak). Peak-based missed
+    // kicks where R had occasional loud spikes (passing 30% peak)
+    // but was mostly silent (low RMS). Energy = cumulative |amp| ≈
+    // area under the curve, mirrors what the user perceives as
+    // "this channel carries content". 30% energy threshold matches
+    // the browser preview's check in Swing_Browser.lua generate_peaks().
+    _louder  = max(_eL, _eR);
+    _quieter = min(_eL, _eR);
+    // 30% (≈ -10.5 dB) — matches browser preview's calibrated value.
+    p_stereo[idx] = _stereo_found && (_louder < 0.001 || (_quieter / _louder) >= 0.30);
+
+    // ── Per-(pad,layer) frozen cache for the pad-detail overlay ──────────────
+    // Built here (on load / s_dirty) so the overlay's overview shows the ORIGINAL
+    // sample even after a Tuned bake overwrites the layer buffer with pitched
+    // audio. Normalized (per-layer norm gain) to match wv_cache. Empty layers
+    // are zeroed. Forward order; the overlay flips for reverse on read.
+    _ovl = 0;
+    loop(MAX_LAYERS,
+      _ov_lidx = idx * MAX_LAYERS + _ovl;
+      // GATE: rebuild this layer's frozen overlay waveform ONLY while it is still
+      // original (sp_baked_tune==0) or has never been captured (ov_cap==0, the
+      // reload fallback). Once baked, KEEP the frozen original so a later s_dirty
+      // (offset / ADSR / gain knob) can't re-snapshot the pitched buffer and move
+      // the displayed waveform. Re-armed (ov_cap=0) on layer load/clear.
+      (sp_baked_tune[_ov_lidx] == 0 || ov_cap[_ov_lidx] == 0) ? (
+        _ov_dst  = ov_wv_cache   + _ov_lidx * WV_RES;
+        _ov_dstR = ov_wv_cache_R + _ov_lidx * WV_RES;
+        _ov_llen = l_len[_ov_lidx];
+        _ov_llen > 0 ? (
+          _ov_buf  = p_lptr[idx * MAX_LAYERS + _ovl];
+          _ov_sg   = l_norm[_ov_lidx] ? l_norm_gain[_ov_lidx] : 1.0;
+          _ov_step = (_ov_llen / 2) / WV_RES;
+          _ovi = 0;
+          loop(WV_RES,
+            _ov_si = ((_ovi * _ov_step)|0) * 2;
+            _ov_dst[_ovi]  = _ov_buf[_ov_si]     * _ov_sg;
+            _ov_dstR[_ovi] = _ov_buf[_ov_si + 1] * _ov_sg;
+            _ovi += 1;
+          );
+        ) : (
+          memset(_ov_dst,  0, WV_RES);
+          memset(_ov_dstR, 0, WV_RES);
+        );
+        ov_cap[_ov_lidx] = 1;   // captured — freeze until re-armed on load/clear
+      );
+      _ovl += 1;
+    );
+
+    s_dirty[idx] = 0;
+    // A pad shown as mono by BALANCE (the channels differ, the quieter under 30 % of the louder: p_stereo 0 above) has
+    // its LOUDER channel fill the pad, as that check's note says; until 2026-10-27 every look drew L, the quiet one when
+    // R was the louder. wv_cache takes R then (Peak's draws, the editor's plain overview, read it as before), and
+    // wv_monoch says R to the reads that pick a channel themselves (the bins' mono lane, the editor's other views). A
+    // genuinely mono file (L = R: no _stereo_found) and a stereo pad keep 0 and today's cache exactly.
+    wv_monoch[idx] = (!p_stereo[idx] && _stereo_found && _eR > _eL) ? 1 : 0;
+    wv_monoch[idx] ? memcpy(ptr, ptr_R, WV_RES);
+  );
+);
+

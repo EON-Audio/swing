@@ -11,9 +11,9 @@
 -- here was pure duplication and would have needed its own arrangement
 -- awareness (removed 2026-07-03; +Song below still feeds the toolbar chain).
 --
--- The window is dockable into a REAPER docker (cfillion Song-switcher pattern:
--- GetWindowDockID / SetNextWindowDockID, last dock persisted in global ExtState)
--- and its open state persists across sessions. All data lives in
+-- The window docks into a REAPER docker with its Dock / Undock button
+-- (toggle_dock: the docker it last sat in persists in global ExtState) and
+-- its open state persists across sessions. All data lives in
 -- pattern_regions.lua + pattern_song.lua — this module is pure UI.
 
 local M = {}
@@ -38,7 +38,7 @@ function M.Toggle() M.SetOpen(not M.IsOpen()) end
 -- module-scoped UI state
 -- =============================================================================
 
-local name_bufs  = {}     -- idx -> in-progress inline-rename buffer
+local name_bufs  = {}     -- region GUID (else idx) -> in-progress inline-rename buffer (render_patterns_table's key)
 local set_dock   = nil    -- pending dock id to apply next frame (nil = none)
 local counts     = {}     -- idx -> note count (throttled cache)
 local counts_t   = 0
@@ -127,7 +127,7 @@ local function render_patterns_table(ctx, list)
   for _, r in ipairs(list) do
     local bar, beat, bars = describe(r)
     rows[#rows + 1] = {
-      idx = r.idx, name = (r.name ~= '' and r.name or ('#' .. r.idx)),
+      idx = r.idx, guid = r.guid, name = (r.name ~= '' and r.name or ('#' .. r.idx)),
       color = r.color, start = r.start, end_ = r.end_,
       bar = bar, beat = beat, bars = bars,
       notes = counts[r.idx] or 0,
@@ -138,8 +138,14 @@ local function render_patterns_table(ctx, list)
   local cur = reaper.GetCursorPosition()
   for _, row in ipairs(rows) do
     local idx = row.idx
+    -- The row's ImGui id and its name buffer go by the region's GUID (2026-10-30; the region GUIDs handoff's "Limits
+    -- and follow-ups"): keyed by the number, a renumber while a name was being typed (the ruler, REAPER's region
+    -- manager) moved the typing -- the active field, its buffer -- onto the region that took the number, and the
+    -- commit renamed that one. Keyed by the GUID they stay with the region; idx is its number this frame. No GUID
+    -- (a REAPER without region GUIDs): the number, as before.
+    local key = row.guid or idx
     reaper.ImGui_TableNextRow(ctx)
-    reaper.ImGui_PushID(ctx, idx)
+    reaper.ImGui_PushID(ctx, tostring(key))
 
     -- col 0: color swatch
     reaper.ImGui_TableSetColumnIndex(ctx, 0)
@@ -149,14 +155,14 @@ local function render_patterns_table(ctx, list)
 
     -- col 1: inline-editable name (commit on deactivate)
     reaper.ImGui_TableSetColumnIndex(ctx, 1)
-    if name_bufs[idx] == nil then name_bufs[idx] = row.name end
+    if name_bufs[key] == nil then name_bufs[key] = row.name end
     reaper.ImGui_SetNextItemWidth(ctx, -1)
-    local rv, nv = reaper.ImGui_InputText(ctx, '##nm', name_bufs[idx])
-    if rv then name_bufs[idx] = nv end
+    local rv, nv = reaper.ImGui_InputText(ctx, '##nm', name_bufs[key])
+    if rv then name_bufs[key] = nv end
     if reaper.ImGui_IsItemDeactivatedAfterEdit(ctx) then
-      patterns.Rename(idx, name_bufs[idx])
+      patterns.Rename(idx, name_bufs[key])
     elseif not reaper.ImGui_IsItemActive(ctx) then
-      name_bufs[idx] = row.name   -- keep synced with external renames
+      name_bufs[key] = row.name   -- keep synced with external renames
     end
 
     -- col 2: bars
@@ -182,7 +188,7 @@ local function render_patterns_table(ctx, list)
     if reaper.ImGui_SmallButton(ctx, '+Song') then song.SongAppend(idx) end
     reaper.ImGui_SameLine(ctx)
     if reaper.ImGui_SmallButton(ctx, 'Del') then
-      patterns.Delete(idx); name_bufs[idx] = nil
+      patterns.Delete(idx); name_bufs[key] = nil
     end
 
     reaper.ImGui_PopID(ctx)
@@ -192,20 +198,26 @@ local function render_patterns_table(ctx, list)
 end
 
 -- =============================================================================
--- docking helpers (cfillion Song-switcher pattern)
+-- docking: the Dock / Undock button
 -- =============================================================================
+-- ReaImGui names REAPER docker n (0..15) by the NEGATIVE dock id -1 - n; 0 is
+-- floating and a positive id is one of ImGui's own dock nodes. Undocking stores
+-- the docker's number; docking goes back to it, or to docker 0 when nothing
+-- usable is stored. The request lands through set_dock on the next frame.
+
+local function remembered_docker()
+  local n = math.tointeger(tonumber(reaper.GetExtState(SECTION, DOCK_KEY)))
+  if n and n >= 0 and n <= 16 then return n end
+  return 0
+end
 
 local function toggle_dock(ctx)
-  local dock_id = reaper.ImGui_GetWindowDockID(ctx)
-  if dock_id >= 0 then
-    -- currently floating -> dock into the last-used (or first) REAPER docker
-    local last = tonumber(reaper.GetExtState(SECTION, DOCK_KEY))
-    if not last or last < 0 or last > 16 then last = 0 end
-    set_dock = ~last
-  else
-    -- currently docked -> remember where, then float
-    reaper.SetExtState(SECTION, DOCK_KEY, tostring(~dock_id), true)
+  local id = reaper.ImGui_GetWindowDockID(ctx)
+  if id < 0 then
+    reaper.SetExtState(SECTION, DOCK_KEY, string.format('%d', -1 - id), true)
     set_dock = 0
+  else
+    set_dock = -1 - remembered_docker()
   end
 end
 
@@ -231,7 +243,11 @@ function M.Render(ctx)
       local idx = patterns.New(nil)
       if idx then
         patterns.JumpTo(idx)   -- land on the new region (placed after the last)
-        name_bufs[idx] = (patterns.GetByIndex(idx) or {}).name or ''
+        local key = idx        -- the table's key for it: its GUID when it has one
+        for _, r in ipairs(patterns.List()) do
+          if r.idx == idx then key = r.guid or idx; break end
+        end
+        name_bufs[key] = (patterns.GetByIndex(idx) or {}).name or ''
       end
     end
     reaper.ImGui_SameLine(ctx)

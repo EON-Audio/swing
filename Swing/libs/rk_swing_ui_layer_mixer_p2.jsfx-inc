@@ -1,0 +1,417 @@
+// rk_swing_ui_layer_mixer_p2.jsfx-inc -- the LAYER MIXER's drawing (2026-10-28): its title row (a click folds it to a
+// bar), the strips L1..L4, the SYN strip and the gold PAD strip. The state and the room it takes:
+// rk_swing_ui_layer_mixer (imported early -- the state, the browsers and the pads call it). This one is imported after
+// rk_swing_ui_overlay_syn (the SYN strip wears the engine's name and colour from _syn_engine_name / _syn_engine_col) and
+// before its callers, rk_swing_ui_grid_overlay and rk_swing_ui_padfx_panel.
+// (c) EON Studios — All Rights Reserved
+
+// ⚠️ @init IS LOAD-BEARING (.docs/wiki/02-file-structure.md): without it this file registers no functions.
+@init
+
+// The gain controls' taper (rk_swing_core swing_gain_*, as the console's): position 0..1 <-> gain 0..4 (+12 dB since
+// 2026-10-29; +6 before), unity at ~0.63
+function swing_lmix_p2g(p) ( swing_gain_p2g(p) );
+function swing_lmix_g2p(g) ( swing_gain_g2p(g) );
+
+// A sample's name for the strip: the path's file name without its extension
+function swing_lmix_name(dst, src) local(n, a, b, k, c) (
+  n = strlen(src); a = 0; b = n; k = 0;
+  loop(n, c = str_getchar(src, k); (c == 47 || c == 92) ? a = k + 1; c == 46 ? b = k; k += 1;);
+  b <= a ? b = n;
+  strcpy_substr(dst, src, a, b - a);
+);
+// A strip's sample name, into dst: its layer's file (a plain pad: the pad's) through swing_lmix_name; L1 with no file
+// behind it (a kit that carries its own audio -- the sandbox pictures, 2026-10-29: a blank L1 strip; the owner: "Fix
+// the layer mixer l1 strip to the show the pads name") the pad's name as the grid shows it (its own, else its sample's)
+function swing_lmix_strip_name(dst, p, L) (
+  p_layer_cnt[p] > 0 ? swing_lmix_name(dst, LPATH_STR_BASE + p * MAX_LAYERS + L) : swing_lmix_name(dst, get_path_slot(p));
+  L == 0 && strlen(dst) == 0 ? ( strcpy(dst, get_cname_slot(p)); strlen(dst) == 0 ? swing_lmix_name(dst, get_name_slot(p)); );
+);
+
+// A line of text in rk_font(1, fs, ff), centred on cx, cut at the end with "~" until it fits maxw (in the editor's
+// TYPEFACE, as ov_font)
+function swing_lmix_text(s, cx, ty, maxw, fs, ff) local(tw, th, n) (
+  rk_font_face = pfx_font; rk_font(1, fs, ff); rk_font_face = 0; strcpy(#lmix_ct, s);
+  gfx_measurestr(#lmix_ct, tw, th);
+  n = strlen(#lmix_ct);
+  while (tw > maxw && n > 1) ( n -= 1; strcpy_substr(#lmix_ct, s, 0, n); strcat(#lmix_ct, "~"); gfx_measurestr(#lmix_ct, tw, th); );
+  gfx_x = cx - tw * 0.5; gfx_y = ty; gfx_drawstr(#lmix_ct);
+);
+
+// S / M: a small square that is lit while on; returns 1 on a press (never while off = disabled)
+// (every size in this file at the mixer's share of the editor's zoom: ov_px / ov_fs, set in swing_lmix_draw)
+function swing_lmix_btn(bx, by, bw, bh, lbl, on, en, cr, cg, cb) local(hot, tw, th) (
+  hot = en && mx >= bx && mx < bx + bw && my >= by && my < by + bh;
+  on ? ov_set(cr, cg, cb, 1) : ov_set(0.17, 0.18, 0.21, 1);
+  gfx_rect(bx, by, bw, bh);
+  hot && !on ? ( ov_set(1, 1, 1, 0.08); gfx_rect(bx, by, bw, bh); );
+  ov_font(9, 'b');
+  on ? ov_set(0.10, 0.08, 0.03, 1) : ov_set(0.70, 0.72, 0.75, en ? 1 : 0.35);
+  gfx_measurestr(lbl, tw, th);
+  gfx_x = bx + (bw - tw) * 0.5; gfx_y = by + (bh - th) * 0.5; gfx_drawstr(lbl);
+  hot && lmb_down;
+);
+
+// ▶: plays the layer (or the pad) on a press
+function swing_lmix_play(cx, cy, r, gold) local(hot) (
+  hot = (mx - cx) * (mx - cx) + (my - cy) * (my - cy) <= (r + 2) * (r + 2);
+  gold ? ov_set(0.23, 0.19, 0.09, 1) : (hot ? ov_set(0.18, 0.44, 0.82, 1) : ov_set(0.17, 0.18, 0.21, 1));
+  gfx_circle(cx, cy, r, 1, 1);
+  gold ? ov_set(0.94, 0.75, 0.38, 1) : ov_set(0.92, 0.93, 0.95, 0.95);
+  gfx_triangle(cx - 2.5 * ov_k, cy - 4 * ov_k, cx - 2.5 * ov_k, cy + 4 * ov_k, cx + 4.5 * ov_k, cy);
+  hot && lmb_down;
+);
+
+// A vertical fader at x = fx, from fy down fh: drag it, wheel it, a double-click puts it at unity. Returns the gain;
+// lmix_fchg = 1 when this call moved it (the caller writes and marks then -- a taper round trip never counts as a move).
+// kind: 0 green, 1 the PAD's gold, 2 lmix_cr / cg / cb as the caller set them (a layer's own colour, the synth's engine's)
+function swing_lmix_fader(id, fx, fy, fh, g, kind) local(p, p0, ty, hot, now) (
+  lmix_fchg = 0;
+  p0 = swing_lmix_g2p(g); p = p0;
+  hot = abs(mx - fx) < ov_px(11) && my >= fy - ov_px(5) && my < fy + fh + ov_px(5);
+  hot && lmb_down ? (
+    now = time_precise();
+    now - lmix_click_t < 0.35 && lmix_click_id == id ? (
+      p = swing_lmix_g2p(1); lmix_drag = -1; lmix_click_t = 0;
+    ) : (
+      lmix_drag = id; lmix_dy0 = my; lmix_dp0 = p0; lmix_click_t = now; lmix_click_id = id;
+    );
+  );
+  lmix_drag == id ? ( LMB ? p = max(0, min(1, lmix_dp0 + (lmix_dy0 - my) / max(1, fh))) : lmix_drag = -1; );
+  hot && frame_wheel != 0 ? ( p = max(0, min(1, p + (frame_wheel > 0 ? 0.02 : -0.02))); frame_wheel = 0; );
+  ov_set(0.17, 0.18, 0.21, 1); gfx_rect(fx - ov_px(2), fy, ov_px(4), fh);
+  ty = fy + (1 - p) * fh;
+  kind == 1 ? ov_set(0.94, 0.75, 0.38, 1) : kind == 2 ? ov_set(lmix_cr, lmix_cg, lmix_cb, 1) : ov_set(0.30, 0.69, 0.42, 1);
+  gfx_rect(fx - ov_px(2), ty, ov_px(4), fy + fh - ty);
+  ov_set(0.45, 0.47, 0.50, 1); gfx_rect(fx - ov_px(7), fy + (1 - swing_lmix_g2p(1)) * fh, ov_px(4), 1);   // unity
+  kind == 1 ? ov_set(0.94, 0.75, 0.38, 1) : ov_set(0.79, 0.80, 0.82, 1);
+  gfx_rect(fx - ov_px(9), ty - ov_px(4), ov_px(18), ov_px(8));
+  p != p0 ? ( lmix_fchg = 1; swing_lmix_p2g(p); ) : g;
+);
+
+// dB for the strip: "-inf", "0.0 dB", "-4.5 dB", "+2.1 dB"
+function swing_lmix_db(dst, g) local(d) (
+  g <= 0.0005 ? strcpy(dst, "-inf") : (
+    d = floor(20 * log10(g) * 10 + 0.5) / 10;
+    d == 0 ? strcpy(dst, "0.0 dB") : sprintf(dst, "%+.1f dB", d);
+  );
+);
+function swing_lmix_pan(dst, p) (
+  abs(p) < 0.005 ? strcpy(dst, "C") : sprintf(dst, "%s%.0f", p < 0 ? "L" : "R", abs(p) * 100);
+);
+
+// A strip sw wide, its knobs side by side (lmix_kn 2): how far each sits off the strip's centre, the pan left, the level
+// right; 0 otherwise
+function swing_lmix_kd(sw) ( lmix_kn == 2 ? min(ov_px(14), floor(sw * 0.25 + 0.5)) : 0 );
+
+// The strip's level (2026-10-29, the owner: "just when it gets too small turn the faders to knobs"): at the mixer's own
+// height and taller a fader (swing_lmix_fader); shorter a knob on the knobs' taper (unity at 12 o'clock, as the pad
+// volume knobs), under the pan while the strip is LMIX_STACK_SH tall, beside it below that (lmix_kn, set by the draw).
+// Its reading under it: the fader's at the strip's foot, a knob's under the knob ("GAIN " before the PAD's, but beside
+// the pan, where half the strip holds it, the bare number). (cx, sw, top, sh) = the strip, py = its pan knob's centre,
+// kind = the fader's colour (swing_lmix_fader), km = the knob's memory. Returns the gain; lmix_fchg = 1 when this call
+// moved it; lmix_kx / lmix_ky = the control's centre.
+function swing_lmix_level(id, cx, sw, top, sh, py, g, kind, km) local(fy, fh, p, nv, ty, tw)
+(
+  lmix_kn == 0 ? (
+    fy = py + ov_px(26); fh = max(20, top + sh - ov_px(16) - fy);
+    g = swing_lmix_fader(id, cx, fy, fh, g, kind);
+    lmix_kx = cx; lmix_ky = fy + fh * 0.5;
+    ty = top + sh - ov_px(13); tw = sw - ov_px(4);
+  ) : (
+    lmix_fchg = 0;
+    lmix_kx = cx + swing_lmix_kd(sw);
+    lmix_ky = lmix_kn == 2 ? py : max(py + ov_px(33), top + floor(sh * 0.5) + ov_px(37));   // under the pan: in the room below it
+    p = swing_kgain_g2p(g);
+    nv = ssl_knob_interact(km, lmix_kx, lmix_ky, ov_px(9), p, 0, 1, KGAIN_UNITY_P, 0);
+    nv != p ? ( lmix_fchg = 1; g = swing_kgain_p2g(nv); );
+    kind == 1 ? ssl_knob_draw(lmix_kx, lmix_ky, ov_px(9), nv, 0, 1, 0, km[0], 0.94, 0.75, 0.38, 0)
+    : kind == 2 ? ssl_knob_draw(lmix_kx, lmix_ky, ov_px(9), nv, 0, 1, 0, km[0], lmix_cr, lmix_cg, lmix_cb, 0)
+    : ssl_knob_draw(lmix_kx, lmix_ky, ov_px(9), nv, 0, 1, 0, km[0], 0.30, 0.69, 0.42, 0);
+    ty = lmix_ky + ov_px(11); tw = lmix_kn == 2 ? floor(sw * 0.5) - ov_px(2) : sw - ov_px(4);
+  );
+  kind == 1 ? ov_set(0.94, 0.75, 0.38, 1) : ov_set(0.80, 0.82, 0.85, 1);
+  swing_lmix_db(#lmix_t, g);
+  lmix_kn == 2 ? ( g > 0.0005 ? strcpy_substr(#lmix_n, #lmix_t, 0, strlen(#lmix_t) - 3) : strcpy(#lmix_n, #lmix_t); )   // "-4.5", "-inf"
+  : kind == 1 ? ( strcpy(#lmix_n, "GAIN "); strcat(#lmix_n, #lmix_t); )
+  : strcpy(#lmix_n, #lmix_t);
+  swing_lmix_text(#lmix_n, lmix_kx, ty, tw, ov_fs(lmix_kn == 2 ? 7 : 8), 0);   // beside the pan a size smaller: half a strip holds "-12.5"
+  g;
+);
+
+// Each layer's own colour (the owner, 2026-10-28: "can we add colors to the layers down there"): L1 teal, L2 blue,
+// L3 violet, L4 pink -- clear of the selection's orange and the PAD's gold. Sets lmix_cr / cg / cb.
+function swing_lmix_lcol(L) (
+  L == 0 ? ( lmix_cr = 0.22; lmix_cg = 0.74; lmix_cb = 0.72; ) :
+  L == 1 ? ( lmix_cr = 0.36; lmix_cg = 0.58; lmix_cb = 0.98; ) :
+  L == 2 ? ( lmix_cr = 0.66; lmix_cg = 0.48; lmix_cb = 0.98; ) :
+           ( lmix_cr = 0.94; lmix_cg = 0.46; lmix_cb = 0.70; );
+);
+
+// A strip's dashed outline (an empty layer, a synth that is off)
+function swing_lmix_dashed(sx, top, sw, sh) local(k) (
+  k = 0; loop(((sw / 6) | 0) + 1, gfx_rect(sx + k, top, min(3, sw - k), 1); gfx_rect(sx + k, top + sh - 1, min(3, sw - k), 1); k += 6;);
+  k = 0; loop(((sh / 6) | 0) + 1, gfx_rect(sx, top + k, 1, min(3, sh - k)); gfx_rect(sx + sw - 1, top + k, 1, min(3, sh - k)); k += 6;);
+);
+
+// The SYN strip's drum (2026-10-28, the owner: "can the track icon be scrollable to the different synth types as well
+// as right click pick each sub type of that synth"): the wheel over it steps the families -- what the SYNTH view's
+// family pills do: the family's defaults, its first type -- and a right-click (or its arrow: an embed gets no
+// right-click) opens the family's types, the current one ticked, and under them the families.
+function swing_lmix_syn_fam(p, f) (
+  ps_engine[p] = f; _syn_engine_defaults(p, f); _syn_autoname(p); mark_dirty_pad(p);
+);
+function swing_lmix_syn_menu(p, px, py) local(_f, _t, _k) (
+  _f = (ps_engine[p] | 0) % 10; _t = floor((ps_engine[p] | 0) / 10);
+  _syn_engine_name(_f); sprintf(#lmix_syn_menu, "#%s", #_syn_en);   // 1: the family
+  _k = 0; loop(rk_syn_dd_type_count(_f),                             // 2 .. 1 + n: its types
+    sprintf(#lmix_t, "|%s%s %d", _k == _t ? "!" : "", #_syn_en, _k + 1); strcat(#lmix_syn_menu, #lmix_t); _k += 1;
+  );
+  strcat(#lmix_syn_menu, "||#Family");                               // 2 + n (the line counts nothing)
+  _k = 0; loop(9,                                                     // 3 + n .. 11 + n: the families
+    _syn_engine_name(_k); sprintf(#lmix_t, "|%s%s", _k == _f ? "!" : "", #_syn_en); strcat(#lmix_syn_menu, #lmix_t); _k += 1;
+  );
+  lmix_syn_pad = p;
+  swing_popup_open(px, py, #lmix_syn_menu, SP_POPUP_CALLER_LMIX_SYN);
+);
+
+// The mixer for pad oi (the editor's pad) at (x, y), w wide: swing_lmix_h() tall (LMIX_H, folded LMIX_BAR_H) at the
+// editor's zoom. Its strips are six to the width, so it takes the zoom only as far as a strip still holds its play / S / M
+// (52 design px): narrower, its type and controls stay smaller than the editor's and its strips keep the full height.
+function swing_lmix_draw(x, y, w)
+local(_cnt, _plain, _top, _sh, _gap, _sep, _u, L, _sx, _sw, _cx, _lidx, _has, _sel, _bw, _yy, _r0x, _nv, _g, _km,
+      _k, _tw, _th, _sound, _nsrc, _syn, _hot, _tog, _ftog, _bhot, _ohot, _bx, _sbit, _mbit,
+      _ahot, _pr, _pf, _ptc, _k0, _tbh, _bs, _pkx, _pw)
+(
+  _k0 = ov_k;
+  ov_k = max(1, min(_k0, ((w - MAX_LAYERS * 4 * _k0 - 10 * _k0) / (MAX_LAYERS + 2.15)) / 52));
+  _tbh = ov_px(14);                         // the title row
+  // the strips' height: the room the host laid out at its zoom (the user's height, swing_lmix_h), or the px a host with
+  // less room hands in (lmix_force_h: the side panel's pinned mixer in a short window -- 2 of the 4 under the strips are
+  // its own, over the title row), never under the least (the strips with knobs)
+  _sh = lmix_force_h > 0 ? max(ov_px(LMIX_H + LMIX_HX_MIN - 18), lmix_force_h - _tbh - floor(2 * _k0 + 0.5))
+                         : floor((swing_lmix_h() - 18) * _k0 + 0.5);
+  // the levels (swing_lmix_level): faders while a strip holds one as long as at the mixer's own height, at the mixer's
+  // own zoom (ov_k here: narrower than the editor's, its strips are taller in its own px -- the owner's screenshot,
+  // 2026-10-29: a strip dragged a little short but still tall had knobs, "at that height tho it still should be
+  // faders"); shorter, knobs -- under the pans while a strip has LMIX_STACK_SH, beside them below that
+  lmix_kn = _sh < ov_px(LMIX_H - 18) ? (_sh < ov_px(LMIX_STACK_SH) ? 2 : 1) : 0;
+  // the SYN drum's menu (swing_lmix_syn_menu): a type of the family, or another family
+  swing_popup_result > 0 && swing_popup_caller_id == SP_POPUP_CALLER_LMIX_SYN ? (
+    _pr = swing_popup_result; swing_popup_result = 0;
+    lmix_syn_pad >= 0 && lmix_syn_pad < NUM_SLOTS ? (
+      _pf = (ps_engine[lmix_syn_pad] | 0) % 10; _ptc = rk_syn_dd_type_count(_pf);
+      _pr >= 2 && _pr <= 1 + _ptc ? ( ps_engine[lmix_syn_pad] = _pf + 10 * (_pr - 2); mark_dirty_pad(lmix_syn_pad); )   // macros kept, as the view's TYPE
+      : _pr >= 3 + _ptc && _pr <= 11 + _ptc && _pr - 3 - _ptc != _pf ? swing_lmix_syn_fam(lmix_syn_pad, _pr - 3 - _ptc);
+    );
+  );
+  swing_popup_result == -1 && swing_popup_caller_id == SP_POPUP_CALLER_LMIX_SYN ? swing_popup_result = 0;
+  _cnt = p_layer_cnt[oi]; _plain = _cnt == 0 && s_len[oi] > SILENCE_T + 4;
+  _syn = ps_enable[oi] > 0.5;
+  // what can sound: S means something only beside another source (a lone layer's solo changes nothing)
+  _nsrc = _syn + (_cnt > 0 ? 0 : _plain);
+  _cnt > 0 ? ( _k = 0; loop(MAX_LAYERS, l_len[oi * MAX_LAYERS + _k] > 0 ? _nsrc += 1; _k += 1;); );
+  !LMB ? lmix_drag = -1;   // a fader let go while its strip was not drawn (the layer emptied, the editor closed) is let go
+  // the title row: a click folds the mixer to it, or opens it -- at the END of this call, so this frame draws the size
+  // the caller laid out
+  _hot = mx >= x && mx < x + w && my >= y && my < y + _tbh;
+  _ftog = _hot && lmb_down;
+  lmix_fold ? ( ov_set(0.13, 0.14, 0.17, 1); gfx_rect(x, y, w, _tbh); _hot ? ( ov_set(1, 1, 1, 0.05); gfx_rect(x, y, w, _tbh); ); );
+  _hot ? ov_set(0.85, 0.87, 0.90, 1) : ov_set(0.68, 0.70, 0.74, 1);
+  lmix_fold ? gfx_triangle(x + 3 * ov_k, y + 3 * ov_k, x + 3 * ov_k, y + 11 * ov_k, x + 8 * ov_k, y + 7 * ov_k)    // ▸ folded
+            : gfx_triangle(x + 1 * ov_k, y + 5 * ov_k, x + 9 * ov_k, y + 5 * ov_k, x + 5 * ov_k, y + 10 * ov_k);   // ▾ open
+  ov_font(9, 'b'); gfx_measurestr("LAYER MIXER", _tw, _th);
+  gfx_x = x + ov_px(13); gfx_y = y + (_tbh - _th) * 0.5; gfx_drawstr("LAYER MIXER");
+  lmix_fold ? (
+    // folded: what the strips would say about mute and solo stays on the bar (S gold, M red, right-aligned)
+    _sbit = swing_mix_solo_shows(oi);
+    _mbit = _syn && ps_mute[oi];
+    _cnt > 0 ? ( _k = 0; loop(MAX_LAYERS, l_len[oi * MAX_LAYERS + _k] > 0 && l_mute[oi * MAX_LAYERS + _k] ? _mbit = 1; _k += 1;); )
+             : ( _plain && l_mute[oi * MAX_LAYERS] ? _mbit = 1; );
+    _bx = x + w - ov_px(4); _bs = ov_px(12);
+    _mbit ? ( _bx -= ov_px(14); ov_set(0.75, 0.27, 0.23, 1); gfx_rect(_bx, y + 1, _bs, _bs);
+              ov_font(9, 'b'); ov_set(0.10, 0.08, 0.03, 1); gfx_measurestr("M", _tw, _th);
+              gfx_x = _bx + (_bs - _tw) * 0.5; gfx_y = y + 1 + (_bs - _th) * 0.5; gfx_drawstr("M"); );
+    _sbit ? ( _bx -= ov_px(14); ov_set(0.85, 0.71, 0.19, 1); gfx_rect(_bx, y + 1, _bs, _bs);
+              ov_font(9, 'b'); ov_set(0.10, 0.08, 0.03, 1); gfx_measurestr("S", _tw, _th);
+              gfx_x = _bx + (_bs - _tw) * 0.5; gfx_y = y + 1 + (_bs - _th) * 0.5; gfx_drawstr("S"); );
+  ) : (
+  _top = y + _tbh;
+  _gap = ov_px(4); _sep = ov_px(10);
+  _u = max(28, ((w - MAX_LAYERS * _gap - _sep) / (MAX_LAYERS + 2.15)) | 0);   // four layers + the SYN strip + the PAD (1.15)
+  L = 0;
+  loop(MAX_LAYERS,
+    _sx = x + L * (_u + _gap); _sw = _u; _cx = _sx + _sw * 0.5;
+    _lidx = oi * MAX_LAYERS + L;
+    _has = _cnt > 0 ? l_len[_lidx] > 0 : (L == 0 && _plain);
+    _sel = overlay_layer == L;
+    swing_lmix_lcol(L);   // the layer's own colour: its band, its L, its pan and its fader (the selection stays orange)
+    _has ? (
+      ov_set(0.11 + lmix_cr * 0.06, 0.115 + lmix_cg * 0.06, 0.14 + lmix_cb * 0.06, 1); gfx_rect(_sx, _top, _sw, _sh);
+      _sel ? ov_set(0.88, 0.54, 0.17, 1) : ov_set(lmix_cr * 0.45, lmix_cg * 0.45, lmix_cb * 0.45, 1);
+      gfx_rect(_sx, _top, _sw, _sh, 0);
+      ov_set(lmix_cr, lmix_cg, lmix_cb, 1); gfx_rect(_sx + 1, _top + 1, _sw - 2, 2);
+    ) : (
+      ov_set(0.12, 0.125, 0.15, 1); gfx_rect(_sx, _top, _sw, _sh);
+      _sel ? ov_set(0.88, 0.54, 0.17, 0.8) : ov_set(lmix_cr * 0.40, lmix_cg * 0.40, lmix_cb * 0.40, 1);   // dashed: an empty layer
+      swing_lmix_dashed(_sx, _top, _sw, _sh);
+    );
+    // L button: the layer the editor shows (as its tab)
+    _bw = min(_sw - ov_px(8), ov_px(30)); _yy = _top + ov_px(4); _bs = ov_px(15);
+    _sel ? ov_set(0.88, 0.54, 0.17, 1) : ov_set(0.18, 0.19, 0.22, 1);
+    gfx_rect(_cx - _bw * 0.5, _yy, _bw, _bs);
+    ov_font(9, 'b');
+    _sel ? ov_set(0.16, 0.09, 0.02, 1) : (_has ? ov_set(lmix_cr, lmix_cg, lmix_cb, 1) : ov_set(lmix_cr * 0.55, lmix_cg * 0.55, lmix_cb * 0.55, 1));
+    sprintf(#lmix_t, "L%d", L + 1); gfx_measurestr(#lmix_t, _tw, _th);
+    gfx_x = _cx - _tw * 0.5; gfx_y = _yy + (_bs - _th) * 0.5; gfx_drawstr(#lmix_t);
+    mx >= _cx - _bw * 0.5 && mx < _cx + _bw * 0.5 && my >= _yy && my < _yy + _bs && lmb_down ? ( overlay_layer = L; _ov_last_tab = L; );
+    // the sample
+    _yy += ov_px(19);
+    _has ? (
+      swing_lmix_strip_name(#lmix_n, oi, L);
+      ov_set(0.68, 0.70, 0.74, 1);
+    ) : ( strcpy(#lmix_n, "empty"); ov_set(0.56, 0.58, 0.62, 1); );   // readable (2026-10-29: 2.5:1)
+    swing_lmix_text(#lmix_n, _cx, _yy, _sw - ov_px(6), ov_fs(9), 0);
+    !_has ? (
+      ov_set(0.58, 0.60, 0.64, 1);   // readable (2026-10-29: the hints read 2.3:1)
+      swing_lmix_text("drop a", _cx, _top + _sh * 0.5, _sw - ov_px(4), ov_fs(9), 0);
+      swing_lmix_text("sample here", _cx, _top + _sh * 0.5 + ov_px(11), _sw - ov_px(4), ov_fs(9), 0);
+    ) : (
+      // play / S / M
+      _yy += ov_px(14); _r0x = _cx - ov_px(24);
+      swing_lmix_play(_r0x + ov_px(7), _yy + ov_px(7), ov_px(7), 0) ? swing_gt_post(oi, p_note[oi], 110, 1000 + L);
+      swing_lmix_btn(_r0x + ov_px(17), _yy, ov_px(14), ov_px(14), "S", l_solo[_lidx], _nsrc >= 2, 0.85, 0.71, 0.19) ? (
+        l_solo[_lidx] = !l_solo[_lidx]; s_dirty[oi] = 1; mark_dirty_pad(oi); swing_gt_post(oi, p_note[oi], 0, 2000);
+      );
+      swing_lmix_btn(_r0x + ov_px(34), _yy, ov_px(14), ov_px(14), "M", l_mute[_lidx], 1, 0.75, 0.27, 0.23) ? (
+        l_mute[_lidx] = !l_mute[_lidx]; s_dirty[oi] = 1; mark_dirty_pad(oi); swing_gt_post(oi, p_note[oi], 0, 2000);
+      );
+      // pan (its knob left of the level's when they sit side by side)
+      _yy += ov_px(28); _km = km_lmix + (oi * (MAX_LAYERS + 1) + L) * KS;
+      _pkx = _cx - swing_lmix_kd(_sw); _pw = lmix_kn == 2 ? floor(_sw * 0.5) - ov_px(2) : _sw - ov_px(4);
+      _nv = ssl_knob_interact(_km, _pkx, _yy, ov_px(9), l_pan[_lidx], -1, 1, 0, 0);
+      _nv != l_pan[_lidx] ? ( l_pan[_lidx] = _nv; s_dirty[oi] = 1; mark_dirty_pad(oi); );
+      ssl_knob_draw(_pkx, _yy, ov_px(9), l_pan[_lidx], -1, 1, 1, _km[0], lmix_cr, lmix_cg, lmix_cb, 0);
+      ov_set(0.68, 0.70, 0.74, 1);
+      swing_lmix_pan(#lmix_t, l_pan[_lidx]); swing_lmix_text(#lmix_t, _pkx, _yy + ov_px(11), _pw, ov_fs(lmix_kn == 2 ? 7 : 8), 0);
+      // level: a fader, or the mixer short a knob (swing_lmix_level), in the layer's colour
+      _g = swing_lmix_level(L, _cx, _sw, _top, _sh, _yy, l_gain[_lidx], 2, km_lmixg + (oi * (MAX_LAYERS + 2) + L) * KS);
+      lmix_fchg ? ( l_gain[_lidx] = _g; s_dirty[oi] = 1; mark_dirty_pad(oi); );
+      // a layer that will not sound on a hit (muted, or something else soloed): the strip dims
+      _sound = swing_layer_sounds(oi, L);
+      !_sound ? ( ov_set(0.08, 0.08, 0.10, 0.45); gfx_rect(_sx + 1, _top + ov_px(34), _sw - 2, _sh - ov_px(35)); );
+    );
+    // a browser drag over the strips lights the ones its drop fills (as the layer tabs do)
+    time_precise() - ovl_drag_t < 0.15 && oi == ovl_tabs_pad && L >= ovl_drag_l0 && L < ovl_drag_l0 + ovl_drag_n ? (
+      ov_set(0.95, 0.72, 0.30, 1);
+      gfx_rect(_sx - 1, _top - 1, _sw + 2, _sh + 2, 0);
+      gfx_rect(_sx, _top, _sw, _sh, 0);
+    );
+    L += 1;
+  );
+  // the SYN strip (the owner: "we left out a synth layer"): the pad's synth in its engine's colour. Its level is the
+  // SYNTH view's LEVEL (ps_level), its pan / mute / solo ps_pan / ps_mute / ps_solo. The SYN button switches the synth
+  // ON / OFF right here, the SYNTH view's own switch (the owner, 2026-10-28: "can we turn it on and off without going to
+  // the synth menu"); under it the drum (the engine's icon, as the pad's badge draws it) and its name -- a click there
+  // opens the SYNTH view, to change it. Off: dashed, "add a synth", and a click on it turns the synth on.
+  _sx = x + MAX_LAYERS * (_u + _gap); _sw = _u; _cx = _sx + _sw * 0.5;
+  _syn_engine_col(ps_engine[oi] | 0, 1);
+  _syn ? (
+    ov_set(0.11 + _syn_ecr * 0.07, 0.115 + _syn_ecg * 0.07, 0.14 + _syn_ecb * 0.07, 1); gfx_rect(_sx, _top, _sw, _sh);
+    ov_set(_syn_ecr * 0.55, _syn_ecg * 0.55, _syn_ecb * 0.55, 1); gfx_rect(_sx, _top, _sw, _sh, 0);
+    ov_set(_syn_ecr, _syn_ecg, _syn_ecb, 1); gfx_rect(_sx + 1, _top + 1, _sw - 2, 2);
+  ) : (
+    ov_set(0.12, 0.125, 0.15, 1); gfx_rect(_sx, _top, _sw, _sh);
+    ov_set(0.24, 0.25, 0.28, 1); swing_lmix_dashed(_sx, _top, _sw, _sh);
+  );
+  // the switch: lit in the engine's colour with its light on while the synth plays
+  _bw = min(_sw - ov_px(6), ov_px(36)); _yy = _top + ov_px(4); _bs = ov_px(15);
+  _bhot = mx >= _cx - _bw * 0.5 && mx < _cx + _bw * 0.5 && my >= _yy && my < _yy + _bs;
+  _syn ? ov_set(_syn_ecr, _syn_ecg, _syn_ecb, 1) : ov_set(0.18, 0.19, 0.22, 1);
+  gfx_rect(_cx - _bw * 0.5, _yy, _bw, _bs);
+  _bhot ? ( ov_set(1, 1, 1, 0.12); gfx_rect(_cx - _bw * 0.5, _yy, _bw, _bs); );
+  ov_font(9, 'b'); gfx_measurestr("SYN", _tw, _th);
+  _syn ? ov_set(1, 1, 1, 1) : ov_set(0.32, 0.33, 0.36, 1);
+  gfx_circle(_cx - _tw * 0.5 - 1, _yy + _bs * 0.5, 2 * ov_k, 1, 1);
+  _syn ? ov_set(1, 1, 1, 1) : ov_set(0.68, 0.70, 0.74, 1);
+  gfx_x = _cx - _tw * 0.5 + ov_px(4); gfx_y = _yy + (_bs - _th) * 0.5; gfx_drawstr("SYN");
+  // the drum and its name: a click opens the SYNTH view; the wheel steps the family, a right-click or the arrow at the
+  // right lists the family's types (swing_lmix_syn_menu)
+  _yy += ov_px(19);
+  _hot = mx >= _sx && mx < _sx + _sw && my >= _yy - ov_px(2) && my < _yy + ov_px(12);
+  _ahot = _hot && mx >= _sx + _sw - ov_px(12);
+  _hot ? ( ov_set(1, 1, 1, 0.07); gfx_rect(_sx + 2, _yy - ov_px(2), _sw - 4, ov_px(14)); );
+  _syn ? ov_set(_syn_ecr, _syn_ecg, _syn_ecb, 1) : ov_set(0.58, 0.60, 0.64, 1);   // (off: readable, 2026-10-29)
+  eon_draw_cat_glyph_hi(swing_grid_syn_cat(oi), _sx + ov_px(10), _yy + ov_px(5), ov_px(6), -1);
+  _syn_engine_name(ps_engine[oi] | 0); sprintf(#lmix_n, "%s %d", #_syn_en, floor((ps_engine[oi] | 0) / 10) + 1);
+  swing_lmix_text(#lmix_n, _cx + ov_px(2), _yy, _sw - ov_px(26), ov_fs(9), 0);
+  _ahot ? ov_set(1, 1, 1, 0.95) : ov_set(0.62, 0.64, 0.70, 0.85);
+  gfx_triangle(_sx + _sw - ov_px(10), _yy + ov_px(3), _sx + _sw - ov_px(4), _yy + ov_px(3), _sx + _sw - ov_px(7), _yy + ov_px(7));   // the arrow: the menu
+  _hot && frame_wheel != 0 ? (
+    swing_lmix_syn_fam(oi, ((ps_engine[oi] | 0) % 10 + (frame_wheel > 0 ? 8 : 1)) % 9);   // up: the family before
+    frame_wheel = 0;
+  );
+  (_hot && rmb_down) || (_ahot && lmb_down) ? ( swing_lmix_syn_menu(oi, mx, my); lmb_down = 0; );
+  _tog = _bhot && lmb_down;
+  !_syn ? (
+    ov_set(0.58, 0.60, 0.64, 1);   // readable (2026-10-29)
+    swing_lmix_text("add a", _cx, _top + _sh * 0.5, _sw - ov_px(4), ov_fs(9), 0);
+    swing_lmix_text("synth", _cx, _top + _sh * 0.5 + ov_px(11), _sw - ov_px(4), ov_fs(9), 0);
+    _ohot = mx >= _sx && mx < _sx + _sw && my >= _yy + ov_px(14) && my < _top + _sh;
+    _ohot ? ( ov_set(1, 1, 1, 0.05); gfx_rect(_sx + 1, _yy + ov_px(14), _sw - 2, _top + _sh - _yy - ov_px(15)); );
+    _ohot && lmb_down ? _tog = 1;
+  ) : (
+    _yy += ov_px(14); _r0x = _cx - ov_px(24);
+    swing_lmix_play(_r0x + ov_px(7), _yy + ov_px(7), ov_px(7), 0) ? swing_gt_post(oi, p_note[oi], 110, -1);   // the synth alone (the SYNTH view's audition)
+    swing_lmix_btn(_r0x + ov_px(17), _yy, ov_px(14), ov_px(14), "S", ps_solo[oi], _nsrc >= 2, 0.85, 0.71, 0.19) ? (
+      ps_solo[oi] = !ps_solo[oi]; s_dirty[oi] = 1; mark_dirty_pad(oi); swing_gt_post(oi, p_note[oi], 0, 2000);
+    );
+    swing_lmix_btn(_r0x + ov_px(34), _yy, ov_px(14), ov_px(14), "M", ps_mute[oi], 1, 0.75, 0.27, 0.23) ? (
+      ps_mute[oi] = !ps_mute[oi]; s_dirty[oi] = 1; mark_dirty_pad(oi); swing_gt_post(oi, p_note[oi], 0, 2000);
+    );
+    _yy += ov_px(28); _km = km_lmix + (oi * (MAX_LAYERS + 1) + MAX_LAYERS) * KS;
+    _pkx = _cx - swing_lmix_kd(_sw); _pw = lmix_kn == 2 ? floor(_sw * 0.5) - ov_px(2) : _sw - ov_px(4);
+    _nv = ssl_knob_interact(_km, _pkx, _yy, ov_px(9), ps_pan[oi], -1, 1, 0, 0);
+    _nv != ps_pan[oi] ? ( ps_pan[oi] = _nv; s_dirty[oi] = 1; mark_dirty_pad(oi); );
+    ssl_knob_draw(_pkx, _yy, ov_px(9), ps_pan[oi], -1, 1, 1, _km[0], _syn_ecr, _syn_ecg, _syn_ecb, 0);
+    ov_set(0.68, 0.70, 0.74, 1);
+    swing_lmix_pan(#lmix_t, ps_pan[oi]); swing_lmix_text(#lmix_t, _pkx, _yy + ov_px(11), _pw, ov_fs(lmix_kn == 2 ? 7 : 8), 0);
+    lmix_cr = _syn_ecr; lmix_cg = _syn_ecg; lmix_cb = _syn_ecb;
+    _g = swing_lmix_level(5, _cx, _sw, _top, _sh, _yy, ps_level[oi], 2, km_lmixg + (oi * (MAX_LAYERS + 2) + MAX_LAYERS) * KS);   // in the engine's colour
+    lmix_fchg ? ( ps_level[oi] = _g; s_dirty[oi] = 1; mark_dirty_pad(oi); );
+    !swing_syn_audible(oi) ? ( ov_set(0.08, 0.08, 0.10, 0.45); gfx_rect(_sx + 1, _top + ov_px(34), _sw - 2, _sh - ov_px(35)); );
+  );
+  _tog ? (
+    ps_enable[oi] = !_syn; _syn_autoname(oi); s_dirty[oi] = 1; mark_dirty_pad(oi);
+    swing_gt_post(oi, p_note[oi], 0, 2000);   // switched off: its ringing voices stop
+  ) : _hot && !_ahot && lmb_down ? swing_synthview_open(oi);
+  // the PAD strip, gold: the whole pad's pan and gain (p_pan / p_gain, what the knob row's PAN / GAIN were)
+  _sx = x + (MAX_LAYERS + 1) * (_u + _gap) - _gap + _sep; _sw = max(ov_px(30), x + w - _sx); _cx = _sx + _sw * 0.5;
+  ov_set(0.165, 0.14, 0.063, 1); gfx_rect(_sx, _top, _sw, _sh);
+  ov_set(0.42, 0.33, 0.125, 1); gfx_rect(_sx, _top, _sw, _sh, 0);
+  ov_set(0.23, 0.24, 0.27, 1); gfx_rect(_sx - _sep * 0.5, _top + ov_px(4), 1, _sh - ov_px(8));   // the rule before it
+  ov_set(0.94, 0.75, 0.38, 1);
+  swing_lmix_text("PAD", _cx, _top + ov_px(6), _sw - ov_px(4), ov_fs(9), 'b');
+  ov_set(0.71, 0.60, 0.32, 1);
+  swing_lmix_text("whole pad", _cx, _top + ov_px(23), _sw - ov_px(4), ov_fs(9), 0);
+  _yy = _top + ov_px(37);
+  swing_lmix_play(_cx, _yy + ov_px(7), ov_px(7), 1) ? swing_gt_post(oi, p_note[oi], 110, 8);
+  _yy += ov_px(28); _km = km_pads + oi * KM_PER_PAD * KS + 5 * KS;   // the knob row's PAN slot
+  _pkx = _cx - swing_lmix_kd(_sw); _pw = lmix_kn == 2 ? floor(_sw * 0.5) - ov_px(2) : _sw - ov_px(4);
+  _nv = ssl_knob_interact(_km, _pkx, _yy, ov_px(9), p_pan[oi], -1, 1, 0, 0);
+  _nv != p_pan[oi] ? ( p_pan[oi] = _nv; p_panL[oi] = 1.0 - max(0.0, _nv); p_panR[oi] = 1.0 + min(0.0, _nv); mark_dirty_pad(oi); );
+  ssl_knob_draw(_pkx, _yy, ov_px(9), p_pan[oi], -1, 1, 1, _km[0], 0.94, 0.75, 0.38, 0);
+  ov_set(0.71, 0.60, 0.32, 1);
+  swing_lmix_pan(#lmix_t, p_pan[oi]);
+  lmix_kn == 2 ? strcpy(#lmix_n, #lmix_t) : ( strcpy(#lmix_n, "PAN "); strcat(#lmix_n, #lmix_t); );   // beside the level: the bare number
+  swing_lmix_text(#lmix_n, _pkx, _yy + ov_px(11), _pw, ov_fs(lmix_kn == 2 ? 7 : 8), 0);
+  _g = swing_lmix_level(4, _cx, _sw, _top, _sh, _yy, p_gain[oi], 1, km_lmixg + (oi * (MAX_LAYERS + 2) + MAX_LAYERS + 1) * KS);
+  lmix_fchg ? ( p_gain[oi] = _g; s_dirty[oi] = 1; mark_dirty_pad(oi); );
+  lmix_pgx = lmix_kx; lmix_pgy = lmix_ky;   // the PAD's level control (for the rig)
+  // the strips as a drop target (rk_swing_ui_grid_overlay _ov_take_drop, the mini browser's and the pads' drags)
+  ovl_lmix_t = time_precise(); ovl_lmix_pad = oi;
+  ovl_lmix_x = x; ovl_lmix_y = _top; ovl_lmix_h = _sh; ovl_lmix_u = _u; ovl_lmix_g = _gap;
+  );
+  _ftog ? lmix_fold = !lmix_fold;
+  ov_k = _k0;   // the editor's zoom back (the mixer took its share)
+);

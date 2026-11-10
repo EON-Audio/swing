@@ -1,0 +1,539 @@
+// rk_drumkit_dsp_p2.jsfx-inc -- part 2 of rk_drumkit_dsp.jsfx-inc (2 parts), cut at a function boundary by
+// .dev_tests/split_big_incs.py: REAPER's load time grows with the square of a file's size. Edit freely;
+// keep each file under about 40 KB.
+
+// ⚠️ @init IS LOAD-BEARING (.docs/wiki/02-file-structure.md).
+@init
+
+// Sliced-capture barrier. "Cells [0, limit) of `pad`'s slot are about to be
+// destroyed" -- this saves whatever the sliced capture has not saved yet, at most
+// one _udo_cow_budget per call, and returns the highest cell the caller may write
+// NOW (exclusive). A caller handed back less than it asked for writes only that
+// much and asks again next block: that throttle IS the mechanism, since a writer
+// that could outrun the backup would leave undo holding half-new audio. Returns
+// `limit` unchanged whenever no sliced capture covers this pad, so every writer
+// that does not participate (and every eagerly-captured load) is untouched.
+//
+// THE INVARIANT the depth test protects: a sliced capture only ever reaches its
+// goal when the whole slot gets destroyed, so after a LAYER drop (or a job the
+// bridge aborted) _udo_cap_lazy can outlive its op with the save incomplete. Both
+// participating writers run INSIDE the structural bracket -- the stream copy
+// between swing_padpcm_begin and the completion half, the zero-tail phase inside
+// swing_ldr_begin_gmem's bracket (closed in swing_ldr_finish) -- and the import
+// tick's leak guard cannot zero the depth under them because a sliced load holds
+// _bl_job_pending the whole time. So requiring an open bracket can only refuse a
+// barrier no live writer is asking for, and it stops a finished op's flag from
+// throttling, or half-extending, an unrelated later one.
+function udo_cow_upto(pad, limit)
+local(_g)
+(
+  (_udo_cap_lazy && _udo_cap_depth > 0 && _udo_st_valid && udo_s2_type == 1 && udo_s2_pad == pad) ? (
+    _g = min(limit, _udo_cap_goal);
+    _g > udo_s2_extent ? udo_cow_copy(_g, _udo_cow_budget);   // through the snapshot (step 2a)
+    udo_s2_extent >= _g ? limit : udo_s2_extent;
+  ) : limit;
+);
+
+// Per-pad structural op (load/clear/clear-layer): outermost call records the
+// one-pad backup; nested calls (clear_pad -> clear_layer) just raise depth.
+// Never while @serialize READS (_srz_udo_hold, 2026-10-27): a REAPER undo / redo reloads every pad from its path
+// through load_from_path, and each capture emptied the knob history and left an entry for the last pad the read
+// reloaded -- taken while the read had just reset that pad, so it held other memory. Swing's UNDO, pressed after
+// the Ctrl+Z, wrote it over pad 16 (silence, or another sample's audio; measured, item I4).
+function udo_struct_begin_pad(pad) (
+  (_udo_cap_depth == 0 && !_udo_applying && !_srz_udo_hold) ? undo_capture_pad(pad);
+  _udo_cap_depth += 1;
+);
+
+// Swap is self-inverse: record only the two indices; undo re-swaps.
+function udo_struct_begin_swap(a, b) local(l) (
+  (_udo_cap_depth == 0 && !_udo_applying && !_srz_udo_hold) ? (
+    udo_s2_type = 2; udo_s2_pad = a; udo_s2_pad2 = b; _udo_st_valid = 1;
+    _udo_uc = 0; _udo_rc = 0;
+    l = 0; loop(NUM_SLOTS, _udo_pend[l] = 0; l += 1;);
+  );
+  _udo_cap_depth += 1;
+);
+
+// Kit / New / Clear-All — kit-level undo is PARKED (2026-06-29). The disk-
+// based design (bridge dumps the outgoing kit to a temp .swing via CMD 83,
+// undo reloads via CMD 82) is fully plumbed on both sides but the bridge half
+// never engaged in live testing; until that's resolved, the entry stays
+// INVALID so the UNDO button honestly greys for kit ops instead of lying.
+// The 1-level rule still applies: a kit op drops the param-undo branch.
+function udo_struct_begin_kit() local(l) (
+  (_udo_cap_depth == 0 && !_udo_applying && !_srz_udo_hold) ? (
+    udo_s2_type = 3; _udo_st_valid = 0;   // PARKED: not undoable (was 1)
+    _udo_uc = 0; _udo_rc = 0;
+    l = 0; loop(NUM_SLOTS, _udo_pend[l] = 0; l += 1;);
+  );
+  _udo_cap_depth += 1;
+);
+
+// Restore the structural undo entry (scoped). Dispatches by type:
+//   per-pad → restore just that pad's slot + metadata (no collateral)
+//   swap    → re-swap (self-inverse; capture suppressed via _udo_applying)
+function undo_restore_struct() local(pad, l, _li, _fit, _v, _p, _e) (
+  _udo_st_valid ? (
+    udo_s2_type == 1 ? (
+      _udo_applying = 1;
+      pad = udo_s2_pad;
+      // End this pad's voices so none reads a half-restored slot, and fade the
+      // output instead of cutting it (A-4). Every other pad keeps sounding.
+      swing_voice_kill_pad_xf(pad);
+      undo_unpack(udo_st_meta, pad);
+      s_len[pad] = udo_s2_aud[0]; s_sr[pad] = udo_s2_aud[1]; p_layer_cnt[pad] = udo_s2_aud[2];
+      l = 0; loop(MAX_LAYERS,
+        _li = pad * MAX_LAYERS + l;
+        l_len[_li]  = udo_s2_aud[3 + l];
+        l_sr[_li]   = udo_s2_aud[7 + l];
+        sp_baked_tune[_li] = udo_s2_aud[11 + l];
+        l += 1;
+      );
+      // Exactly the cells the capture SAVED (see undo_capture_pad). Eager: the pad's
+      // whole used extent. Sliced: the prefix a writer had reached -- everything above
+      // it was never written, so the slot still holds the original there. Beyond both,
+      // the restored s_len / l_len leave the tail unread.
+      // Step 2a: give the pad regions that hold the restored lengths -- in place when they
+      // never shrank, which is the rule; an allocation when a drop freed this pad's layers --
+      // then copy the virtual backup into them, region by region, skipping the gaps.
+      alc_hold = 1;   // the compaction tick stands still while this copies unlocked
+      _fit = swing_pad_fit_restore(pad);
+      (!_fit && alc_wait) ? (
+        // the room exists but is fragmented: pack now, on this thread, and try once more
+        alc_hold = 0; swing_alloc_compact_sync(1.0); alc_hold = 1;
+        _fit = swing_pad_fit_restore(pad);
+      );
+      !_fit ? swing_pad_regions_trim_missing(pad);
+      // Under the lock, as swap_pads does: a compaction move still in flight on one of this
+      // pad's regions is abandoned here. An in-place fit never touches the table, so
+      // swing_region_set never cancelled it; once the hold cleared the tick would finish
+      // the move from alc_pos and commit a destination whose first alc_pos cells held the
+      // newer sample -- a spliced hit (LIB23). The lock also waits out a tick mid-chunk.
+      swing_alloc_lock(); alc_hold = 1; swing_alloc_cancel_move(); swing_alloc_unlock();
+      swing_pad_regions_copy(pad, udo_s2_srcp, udo_s2_srcl);
+      _v = 0;
+      while (_v < udo_s2_extent) (
+        _p = swing_slot_v2p_t(udo_s2_srcp, udo_s2_srcl, _v);
+        _e = min(udo_s2_extent, swing_slot_vend_t(udo_s2_srcp, udo_s2_srcl, _v));
+        _p >= 0 ? memcpy(_p, udo_s2_audio + _v, _e - _v);
+        _v = _e;
+      );
+      !_fit ? swing_alloc_refuse_note(pad);   // a region could not be taken back: told on the LCD
+      alc_hold = 0;
+      _udo_cap_lazy = 0;   // entry consumed: stop throttling any writer still in flight
+      sp_src_gen[pad] += 1;       // invalidate Extension cache / Tuned-Stretch re-bake
+      swing_rcp_post_pad(pad); swing_rcp_post_fx(pad);   // @block performs (A-9a)
+      s_dirty[pad] = 1; col_dirty = 1;
+      _udo_name_req = 1; _udo_name_pad = pad;  // names restored in @gfx (get_*_slot is core-only)
+      _udo_st_valid = 0; _udo_rc = 0;
+      gmem[GS_PROJ_DIRTY] = 1;
+      swing_rup_want(RUP_K_UNDO, pad, -2, -1, 0);   // a REAPER point for the press: "Swing: undo (pad N sample)"
+      _udo_applying = 0;
+    ) : udo_s2_type == 2 ? (
+      // Swap is self-inverse, but swap_pads is defined LATER in this file.
+      // Defer the call to @gfx (runtime) to avoid a def-time forward reference.
+      _udo_swap_req = 1;
+      _udo_st_valid = 0; _udo_rc = 0;
+    ) : udo_s2_type == 3 ? (
+      // Kit-level undo -- UNREACHABLE while kit undo is PARKED (see
+      // udo_struct_begin_kit: it leaves _udo_st_valid = 0, so this dispatch never
+      // sees type 3, and the @gfx CMD 82 sender in Swing_ReaKit.jsfx never fires).
+      // Kept for the un-park: it asks the bridge (via the @gfx processor) to
+      // reload the temp undo sidecar it dumped before the kit op.
+      _udo_kitundo_req = 1;
+      _udo_st_valid = 0; _udo_rc = 0;
+    );
+  );
+);
+
+// Close a structural op's capture window (paired with each udo_struct_begin_*).
+function undo_cap_end() (
+  _udo_cap_depth > 0 ? _udo_cap_depth -= 1;
+);
+
+// UNDO: restore the newest entry; stash current pad state onto the redo ring.
+function undo_do() local(ei, pad) (
+  _udo_uc > 0 ? (
+    _udo_applying = 1;
+    ei  = _udo_uc - 1;
+    pad = udo_ust_pad[ei];
+    // push CURRENT live state of this pad onto the redo ring
+    _udo_rc >= UDO_DEPTH ? (
+      memcpy(udo_urd, udo_urd + UDO_STRIDE, (UDO_DEPTH - 1) * UDO_STRIDE);
+      memcpy(udo_urd_pad, udo_urd_pad + 1, UDO_DEPTH - 1);
+      _udo_rc = UDO_DEPTH - 1;
+    );
+    undo_pack(udo_urd + _udo_rc * UDO_STRIDE, pad);
+    udo_urd_pad[_udo_rc] = pad;
+    // the REAPER point's words: what this press puts back (the live pad, just packed, against the entry)
+    swing_rup_diff(udo_urd + _udo_rc * UDO_STRIDE, udo_ust + ei * UDO_STRIDE);
+    _udo_rc += 1;
+    // restore the undo entry into the live pad
+    _udo_skip_out = 1; undo_unpack(udo_ust + ei * UDO_STRIDE, pad); _udo_skip_out = 0;   // the output choice stays (UDO_K_OUT)
+    _udo_uc = ei;
+    swing_rcp_post_pad(pad); swing_rcp_post_fx(pad);   // @block performs (A-9a)
+    s_dirty[pad] = 1; col_dirty = 1;
+    gmem[GS_PROJ_DIRTY] = 1;  // the project is dirty ...
+    swing_rup_want(RUP_K_UNDO, pad, rup_dk, rup_dk2, rup_dn);   // ... and the press is a REAPER point (2026-10-27)
+    _udo_applying = 0;
+  ) : _udo_st_valid ? (
+    // param ring empty -> the structural snapshot is the next thing to undo
+    undo_restore_struct();
+  );
+);
+
+// REDO: re-apply the newest redo entry; stash current state onto the undo ring.
+function redo_do() local(ei, pad) (
+  _udo_rc > 0 ? (
+    _udo_applying = 1;
+    ei  = _udo_rc - 1;
+    pad = udo_urd_pad[ei];
+    _udo_uc >= UDO_DEPTH ? (
+      memcpy(udo_ust, udo_ust + UDO_STRIDE, (UDO_DEPTH - 1) * UDO_STRIDE);
+      memcpy(udo_ust_pad, udo_ust_pad + 1, UDO_DEPTH - 1);
+      _udo_uc = UDO_DEPTH - 1;
+    );
+    undo_pack(udo_ust + _udo_uc * UDO_STRIDE, pad);
+    udo_ust_pad[_udo_uc] = pad;
+    swing_rup_diff(udo_ust + _udo_uc * UDO_STRIDE, udo_urd + ei * UDO_STRIDE);   // the point's words, as in undo_do
+    _udo_uc += 1;
+    _udo_skip_out = 1; undo_unpack(udo_urd + ei * UDO_STRIDE, pad); _udo_skip_out = 0;   // the output choice stays (UDO_K_OUT)
+    _udo_rc = ei;
+    swing_rcp_post_pad(pad); swing_rcp_post_fx(pad);   // @block performs (A-9a)
+    s_dirty[pad] = 1; col_dirty = 1;
+    gmem[GS_PROJ_DIRTY] = 1;  // the project is dirty, and the press is a REAPER point (2026-10-27)
+    swing_rup_want(RUP_K_REDO, pad, rup_dk, rup_dk2, rup_dn);
+    _udo_applying = 0;
+  );
+);
+
+// REAPER restored Swing (an undo, a redo, an open: @serialize read, and _reb_restore_gen moved at its end). Called at
+// the @gfx head, before any press is handled. Swing's own UNDO / REDO history describes a state that is gone, so it
+// goes: an UNDO pressed now would write an old entry over the restored pads (item I4 of 2026-10-27; the owner chose
+// "clear" over "reconcile"). A request still waiting (a browser load counted before the read too) and a wheel bracket
+// still open go with it -- a point made now would sit on top of REAPER's undo and empty its redo list. A fresh
+// baseline and mark start the next gesture. (A sliced capture still in flight stops throttling by itself: its
+// barrier needs _udo_st_valid, udo_cow_upto.)
+// And Wired and Multi-Out are never both on after a restore (the Multi-Out helper's finding, 2026-10-27): a redo of
+// Multi-Out -> Wired gave back REAPER's copy of Swing taken before Swing had left MULTI (companion cmd 6 clears it
+// here in @gfx, after the bridge's block stored the copy), so Swing came back in Multi-Out beside Wired. Wired wins,
+// as cmd 6 does it: only multi_out is cleared.
+function swing_rup_restore_heal() local(l) (
+  _udo_rst_seen != _reb_restore_gen ? (
+    _udo_rst_seen = _reb_restore_gen;
+    _udo_uc = 0; _udo_rc = 0; _udo_st_valid = 0;
+    _udo_swap_req = 0; _udo_name_req = 0; _udo_kitundo_req = 0;
+    l = 0; loop(NUM_SLOTS, _udo_pend[l] = 0; l += 1;);
+    _udo_nl_t = 0;
+    rup_want = 0; rup_now = 0; rup_ld_seen = rup_ld_n;
+    patch_on > 0.5 && multi_out ? ( multi_out = 0; );
+    undo_capture_baseline();
+  );
+);
+
+// ─── Swap two pads (all metadata, FX, layers, audio) ─────────────────────
+function swap_pads(a, b)
+  local(tmp, li, la, lb, j)
+(
+  a == b ? 0 : (
+    // The pitch bands hold while this runs (sp_swap_busy, through atomic_set: before any per-pad value moves) and
+    // until @block's spot map has followed (the swap queue below): swing_block_pitch_tick, 2026-10-12.
+    atomic_set(sp_swap_busy, 1);
+    udo_struct_begin_swap(a, b);  // Phase 2: self-inverse swap entry (1-level structural undo)
+    // A sounding voice would otherwise finish in the OTHER pad's audio once the
+    // slots move under it (A-4): end both pads' voices and fade the output first.
+    swing_voice_kill_pad_xf(a);
+    swing_voice_kill_pad_xf(b);
+    // Helper macro-style: swap scalar array values
+    // ── Sample metadata ──
+    tmp = s_len[a]; s_len[a] = s_len[b]; s_len[b] = tmp;
+    tmp = s_start[a]; s_start[a] = s_start[b]; s_start[b] = tmp;
+    tmp = s_end[a]; s_end[a] = s_end[b]; s_end[b] = tmp;
+    tmp = s_skip[a]; s_skip[a] = s_skip[b]; s_skip[b] = tmp;
+    tmp = s_norm[a]; s_norm[a] = s_norm[b]; s_norm[b] = tmp;
+    tmp = s_norm_gain[a]; s_norm_gain[a] = s_norm_gain[b]; s_norm_gain[b] = tmp;
+    tmp = s_sr[a]; s_sr[a] = s_sr[b]; s_sr[b] = tmp;
+    s_dirty[a] = 1; s_dirty[b] = 1;
+
+    // ── Pad params ──
+    tmp = p_gain[a]; p_gain[a] = p_gain[b]; p_gain[b] = tmp;
+    tmp = p_pan[a]; p_pan[a] = p_pan[b]; p_pan[b] = tmp;
+    tmp = p_attack[a]; p_attack[a] = p_attack[b]; p_attack[b] = tmp;
+    tmp = p_decay[a]; p_decay[a] = p_decay[b]; p_decay[b] = tmp;
+    tmp = p_sustain[a]; p_sustain[a] = p_sustain[b]; p_sustain[b] = tmp;
+    tmp = p_release[a]; p_release[a] = p_release[b]; p_release[b] = tmp;
+    tmp = p_adsr_user[a]; p_adsr_user[a] = p_adsr_user[b]; p_adsr_user[b] = tmp;   // "I tuned this envelope" travels with it (H17)
+    tmp = p_tune[a]; p_tune[a] = p_tune[b]; p_tune[b] = tmp;
+    tmp = p_note[a]; p_note[a] = p_note[b]; p_note[b] = tmp;
+    tmp = p_note_lock[a]; p_note_lock[a] = p_note_lock[b]; p_note_lock[b] = tmp;
+    tmp = p_rng_lo[a]; p_rng_lo[a] = p_rng_lo[b]; p_rng_lo[b] = tmp;
+    tmp = p_rng_hi[a]; p_rng_hi[a] = p_rng_hi[b]; p_rng_hi[b] = tmp;
+    tmp = p_color[a]; p_color[a] = p_color[b]; p_color[b] = tmp; col_dirty = 1;
+    tmp = p_mute[a]; p_mute[a] = p_mute[b]; p_mute[b] = tmp;
+    tmp = p_solo[a]; p_solo[a] = p_solo[b]; p_solo[b] = tmp;
+    tmp = p_choke[a]; p_choke[a] = p_choke[b]; p_choke[b] = tmp;
+    tmp = p_oneshot[a]; p_oneshot[a] = p_oneshot[b]; p_oneshot[b] = tmp;
+    tmp = p_reverse[a]; p_reverse[a] = p_reverse[b]; p_reverse[b] = tmp;
+    tmp = p_swapLR[a];  p_swapLR[a]  = p_swapLR[b];  p_swapLR[b]  = tmp;
+    tmp = p_output[a]; p_output[a] = p_output[b]; p_output[b] = tmp;
+    // ── SYN slot (ps_* travels with the pad exactly like l_* metadata) ──
+    tmp = ps_enable[a]; ps_enable[a] = ps_enable[b]; ps_enable[b] = tmp;
+    tmp = ps_engine[a]; ps_engine[a] = ps_engine[b]; ps_engine[b] = tmp;
+    tmp = ps_level[a]; ps_level[a] = ps_level[b]; ps_level[b] = tmp;
+    tmp = ps_vel_lo[a]; ps_vel_lo[a] = ps_vel_lo[b]; ps_vel_lo[b] = tmp;
+    tmp = ps_vel_hi[a]; ps_vel_hi[a] = ps_vel_hi[b]; ps_vel_hi[b] = tmp;
+    tmp = ps_rr_order[a]; ps_rr_order[a] = ps_rr_order[b]; ps_rr_order[b] = tmp;
+    tmp = ps_mac0[a]; ps_mac0[a] = ps_mac0[b]; ps_mac0[b] = tmp;
+    tmp = ps_mac1[a]; ps_mac1[a] = ps_mac1[b]; ps_mac1[b] = tmp;
+    tmp = ps_mac2[a]; ps_mac2[a] = ps_mac2[b]; ps_mac2[b] = tmp;
+    tmp = ps_mac3[a]; ps_mac3[a] = ps_mac3[b]; ps_mac3[b] = tmp;
+    tmp = ps_mac4[a]; ps_mac4[a] = ps_mac4[b]; ps_mac4[b] = tmp;
+    tmp = ps_mac5[a]; ps_mac5[a] = ps_mac5[b]; ps_mac5[b] = tmp;
+    tmp = ps_mac6[a]; ps_mac6[a] = ps_mac6[b]; ps_mac6[b] = tmp;
+    tmp = ps_mac7[a]; ps_mac7[a] = ps_mac7[b]; ps_mac7[b] = tmp;
+    tmp = ps_pan[a];  ps_pan[a]  = ps_pan[b];  ps_pan[b]  = tmp;   // the SYN strip (the layer mixer)
+    tmp = ps_mute[a]; ps_mute[a] = ps_mute[b]; ps_mute[b] = tmp;
+    tmp = ps_solo[a]; ps_solo[a] = ps_solo[b]; ps_solo[b] = tmp;
+    // ── FX params ──
+    tmp = fx_hpf_freq[a]; fx_hpf_freq[a] = fx_hpf_freq[b]; fx_hpf_freq[b] = tmp;
+    tmp = fx_lpf_freq[a]; fx_lpf_freq[a] = fx_lpf_freq[b]; fx_lpf_freq[b] = tmp;
+    // the filters' resonance and the pad compressor (2026-10-23, H17: these three stayed on the SLOT, so the moved
+    // sound lost its COMP and RESO and the sound left behind took them; the comp's running envelope stays: both
+    // pads' voices were ended above, it just decays)
+    tmp = fx_reso[a]; fx_reso[a] = fx_reso[b]; fx_reso[b] = tmp;
+    tmp = fx_cmp_amt[a]; fx_cmp_amt[a] = fx_cmp_amt[b]; fx_cmp_amt[b] = tmp;
+    tmp = fx_cmp_mode[a]; fx_cmp_mode[a] = fx_cmp_mode[b]; fx_cmp_mode[b] = tmp;
+    tmp = fx_eq_lo[a]; fx_eq_lo[a] = fx_eq_lo[b]; fx_eq_lo[b] = tmp;
+    tmp = fx_eq_mid[a]; fx_eq_mid[a] = fx_eq_mid[b]; fx_eq_mid[b] = tmp;
+    tmp = fx_eq_mid2[a]; fx_eq_mid2[a] = fx_eq_mid2[b]; fx_eq_mid2[b] = tmp;
+    tmp = fx_eq_mid_q[a]; fx_eq_mid_q[a] = fx_eq_mid_q[b]; fx_eq_mid_q[b] = tmp;
+    tmp = fx_eq_mid2_q[a]; fx_eq_mid2_q[a] = fx_eq_mid2_q[b]; fx_eq_mid2_q[b] = tmp;
+    tmp = fx_eq_lo_q[a]; fx_eq_lo_q[a] = fx_eq_lo_q[b]; fx_eq_lo_q[b] = tmp;
+    tmp = fx_eq_hi_q[a]; fx_eq_hi_q[a] = fx_eq_hi_q[b]; fx_eq_hi_q[b] = tmp;
+    tmp = fx_eq_hi[a]; fx_eq_hi[a] = fx_eq_hi[b]; fx_eq_hi[b] = tmp;
+    tmp = fx_eq_lo_freq[a]; fx_eq_lo_freq[a] = fx_eq_lo_freq[b]; fx_eq_lo_freq[b] = tmp;
+    tmp = fx_eq_mid_freq[a]; fx_eq_mid_freq[a] = fx_eq_mid_freq[b]; fx_eq_mid_freq[b] = tmp;
+    tmp = fx_eq_mid2_freq[a]; fx_eq_mid2_freq[a] = fx_eq_mid2_freq[b]; fx_eq_mid2_freq[b] = tmp;
+    tmp = fx_eq_hi_freq[a]; fx_eq_hi_freq[a] = fx_eq_hi_freq[b]; fx_eq_hi_freq[b] = tmp;
+    tmp = fx_sat_drv[a]; fx_sat_drv[a] = fx_sat_drv[b]; fx_sat_drv[b] = tmp;
+    tmp = fx_drv_mode[a]; fx_drv_mode[a] = fx_drv_mode[b]; fx_drv_mode[b] = tmp;
+    tmp = fx_bc_rate[a]; fx_bc_rate[a] = fx_bc_rate[b]; fx_bc_rate[b] = tmp;
+    tmp = fx_bc_bits[a]; fx_bc_bits[a] = fx_bc_bits[b]; fx_bc_bits[b] = tmp;
+    tmp = fx_snd_dly[a]; fx_snd_dly[a] = fx_snd_dly[b]; fx_snd_dly[b] = tmp;
+    tmp = fx_snd_rvb[a]; fx_snd_rvb[a] = fx_snd_rvb[b]; fx_snd_rvb[b] = tmp;
+    tmp = fx_snd_smash[a]; fx_snd_smash[a] = fx_snd_smash[b]; fx_snd_smash[b] = tmp;
+
+    // ── Layer + repeat data ──
+    tmp = p_layer_cnt[a]; p_layer_cnt[a] = p_layer_cnt[b]; p_layer_cnt[b] = tmp;
+    tmp = p_layer_mode[a]; p_layer_mode[a] = p_layer_mode[b]; p_layer_mode[b] = tmp;
+    tmp = p_rr_idx[a]; p_rr_idx[a] = p_rr_idx[b]; p_rr_idx[b] = tmp;
+    tmp = p_sum_tight[a]; p_sum_tight[a] = p_sum_tight[b]; p_sum_tight[b] = tmp;
+    tmp = p_rpt_div[a]; p_rpt_div[a] = p_rpt_div[b]; p_rpt_div[b] = tmp;
+    tmp = p_sample_offset[a]; p_sample_offset[a] = p_sample_offset[b]; p_sample_offset[b] = tmp;
+    // ── Pitch state (2026-09-23: a Tuned pad came out of a swap as Repitch -- the sp_*
+    //    arrays were never in this list, so the mode and algo stayed with the SLOT) ──
+    tmp = sp_pitch_mode[a]; sp_pitch_mode[a] = sp_pitch_mode[b]; sp_pitch_mode[b] = tmp;
+    tmp = sp_pitch_algo[a]; sp_pitch_algo[a] = sp_pitch_algo[b]; sp_pitch_algo[b] = tmp;
+    // sp_pitch_trigger_cnt stays put (since Pad Banks step 4 it is the SPOT's): the Extension diffs it against a per-spot
+    // shadow, so swapping it would read as a trigger. Both slots' sources moved, so both
+    // re-capture (the same bump a load, a clear and a promotion make):
+    sp_src_gen[a] += 1; sp_src_gen[b] += 1;
+    // The spots follow the audio (Pad Banks step 4, plan §6.4): a pad's spot keeps serving the same sound. The spot
+    // tables have ONE writer, @block (swing_spot_tick), and a swap runs from @gfx: the pair goes in the swap queue,
+    // one cell (a * NUM_SLOTS + b, one store), the count last. sp_swap_req is kept global on purpose (wiki 4.1): it
+    // is the queue's count, written here only, through atomic_set (EEL2's atomics take a lock, so the cell is
+    // visible before the count on a CPU that reorders stores too). Until 2026-10-12 this was ONE pair
+    // (sp_swap_a / sp_swap_b): a second swap before @block read it replaced the first, whose spots stayed behind.
+    sp_swap_q[sp_swap_req % SP_SWAP_QN] = a * NUM_SLOTS + b;
+    atomic_set(sp_swap_req, sp_swap_req + 1);
+    li = 0;
+    loop(MAX_LAYERS,
+      la = a * MAX_LAYERS + li;
+      lb = b * MAX_LAYERS + li;
+      tmp = l_len[la]; l_len[la] = l_len[lb]; l_len[lb] = tmp;
+      tmp = l_start[la]; l_start[la] = l_start[lb]; l_start[lb] = tmp;
+      tmp = l_end[la]; l_end[la] = l_end[lb]; l_end[lb] = tmp;
+      tmp = l_norm[la]; l_norm[la] = l_norm[lb]; l_norm[lb] = tmp;
+      tmp = l_norm_gain[la]; l_norm_gain[la] = l_norm_gain[lb]; l_norm_gain[lb] = tmp;
+      tmp = l_vel_lo[la]; l_vel_lo[la] = l_vel_lo[lb]; l_vel_lo[lb] = tmp;
+      tmp = l_vel_hi[la]; l_vel_hi[la] = l_vel_hi[lb]; l_vel_hi[lb] = tmp;
+      tmp = l_rr_order[la]; l_rr_order[la] = l_rr_order[lb]; l_rr_order[lb] = tmp;
+      tmp = l_sr[la]; l_sr[la] = l_sr[lb]; l_sr[lb] = tmp;
+      tmp = l_gain[la]; l_gain[la] = l_gain[lb]; l_gain[lb] = tmp;
+      tmp = l_pan[la];  l_pan[la]  = l_pan[lb];  l_pan[lb]  = tmp;   // the layer mixer's settings swap with their layer
+      tmp = l_mute[la]; l_mute[la] = l_mute[lb]; l_mute[lb] = tmp;
+      tmp = l_solo[la]; l_solo[la] = l_solo[lb]; l_solo[lb] = tmp;
+      tmp = sp_baked_tune[la]; sp_baked_tune[la] = sp_baked_tune[lb]; sp_baked_tune[lb] = tmp;  // the bake anchor travels with the baked audio
+      ov_cap[la] = 0; ov_cap[lb] = 0;   // re-arm the overlay waveform capture on both sides, as a load does
+      li += 1;
+    );
+
+    // ── Audio swap: the REGIONS change hands (banks step 2a) ──
+    // Until 2026-09-23 the audio itself was copied, slot to slot, through _swap_tmp_buf (and
+    // until the same morning only region 0 of it: layers 1..3 stayed behind). With per-pad
+    // regions (rk_swing_alloc) a swap is five pointer pairs: the plain region and the four
+    // layer regions exchange owners, audio untouched, nothing allocated or freed. The
+    // metadata was exchanged above, so lengths and regions travel together. Undo re-runs
+    // this swap, so it stays self-inverse. Voices were ended first (kill + crossfade).
+    swing_alloc_lock();           // table writes outside swing_region_set: under the lock, and
+    swing_alloc_cancel_move();    // they abandon a compaction move in flight on either pad
+    tmp = p_aptr[a]; p_aptr[a] = p_aptr[b]; p_aptr[b] = tmp;
+    tmp = p_alen[a]; p_alen[a] = p_alen[b]; p_alen[b] = tmp;
+    li = 0; loop(MAX_LAYERS,
+      la = a * MAX_LAYERS + li;
+      lb = b * MAX_LAYERS + li;
+      tmp = p_lptr[la]; p_lptr[la] = p_lptr[lb]; p_lptr[lb] = tmp;
+      tmp = p_llen[la]; p_llen[la] = p_llen[lb]; p_llen[lb] = tmp;
+      li += 1;
+    );
+    swing_alloc_unlock();
+
+    // NOTE: pad name strings must be swapped by caller (get_cname_slot lives in rk_swing_core)
+
+    // Recalculate derived values -- requested, @block performs (A-9a)
+    swing_rcp_post_pad(a); swing_rcp_post_pad(b);
+    swing_rcp_post_fx(a); swing_rcp_post_fx(b);
+    undo_cap_end();
+    atomic_set(sp_swap_busy, 0);   // after the queue post above: the bands stay held until @block follows
+  );
+);
+
+// ─── Layer selection for voice launch ──────────────────────────────────────
+// Returns layer index (0–MAX_LAYERS-1) based on mode and velocity
+// vel = 0.0–1.0, mode: 0=single, 1=vel-split, 2=round-robin, 3=sum (handled externally)
+// For mode=3 (sum), caller loops all layers — this function is not called.
+// The layer mixer (2026-10-28, the owner: "a way to solo each layer"). Is anything of `pad` soloed? A LOADED layer (a
+// solo left on a layer since emptied silences nothing), a plain pad's L1 (its one sample at the slot base), or its
+// synth while the synth is on (the SYN strip: the owner, the same day, "we left out a synth layer").
+function swing_mix_any_solo(pad) local(_ms_b, _ms_k, _ms_any) (
+  _ms_b = pad * MAX_LAYERS;
+  _ms_any = ps_enable[pad] && ps_solo[pad] ? 1 : 0;
+  p_layer_cnt[pad] > 0 ? (
+    _ms_k = 0; loop(MAX_LAYERS, l_solo[_ms_b + _ms_k] && l_len[_ms_b + _ms_k] > 0 ? _ms_any = 1; _ms_k += 1;);
+  ) : (
+    l_solo[_ms_b] && s_len[pad] > SILENCE_T + 4 ? _ms_any = 1;
+  );
+  _ms_any;
+);
+
+// Can layer `li` of `pad` sound on a hit? Loaded, not muted, and -- while anything of the pad is soloed -- soloed
+// itself. Every layer mode asks this (select_layer below, the Sum loop in launch_voices_for_pad_ofs, the mute / solo
+// stop in swing_block_gt_consume); the strip's play button does not (lmix_force).
+function swing_layer_audible(pad, li) local(_la_b) (
+  _la_b = pad * MAX_LAYERS;
+  l_len[_la_b + li] > 0 && !l_mute[_la_b + li] && (!swing_mix_any_solo(pad) || l_solo[_la_b + li]);
+);
+
+// The same question for any pad: a PLAIN pad (no layers, its one sample at the slot base) is the mixer's L1 -- its
+// layer-0 mute silences it, and so does a soloed synth (its L1 solo keeps it beside one).
+function swing_layer_sounds(pad, li) (
+  p_layer_cnt[pad] > 0 ? swing_layer_audible(pad, li)
+    : (li == 0 && !l_mute[pad * MAX_LAYERS] && (!swing_mix_any_solo(pad) || l_solo[pad * MAX_LAYERS]));
+);
+
+// The pad face's S badge and the folded mixer's: something of the pad is soloed AND something else that could sound is
+// not (a lone source's solo silences nothing, so it says nothing)
+function swing_mix_solo_shows(pad) local(_mb, _mk, _off) (
+  _mb = pad * MAX_LAYERS;
+  _off = ps_enable[pad] && !ps_solo[pad] ? 1 : 0;
+  p_layer_cnt[pad] > 0 ? (
+    _mk = 0; loop(MAX_LAYERS, l_len[_mb + _mk] > 0 && !l_solo[_mb + _mk] ? _off = 1; _mk += 1;);
+  ) : (
+    s_len[pad] > SILENCE_T + 4 && !l_solo[_mb] ? _off = 1;
+  );
+  _off && swing_mix_any_solo(pad);
+);
+
+// ...and for the synth (the SYN strip): on, not muted, and soloed itself while anything of the pad is. Its round-robin
+// turn, its velocity range, its place under a Sum all ask this; its play button and the SYNTH view's audition do not.
+function swing_syn_audible(pad) (
+  ps_enable[pad] && !ps_mute[pad] && (!swing_mix_any_solo(pad) || ps_solo[pad]);
+);
+
+// Returns a layer index 0..MAX_LAYERS-1, or MAX_LAYERS = the SYN slot sentinel
+// (round-robin only: the synth competes in the rotation via ps_rr_order,
+// clamped into the effective range so the default order MAX_LAYERS still
+// plays last on pads with fewer layers). Spec_Swing_Synth_Layer §2.2.
+// -1 = no layer may sound (the layer mixer: muted, or soloed out) -- the caller plays no sample voice.
+function select_layer(pad, vel, mode) local(cnt, li, fi, _base, best, _oidx, _syn_on, _tot, _spos, _scan, _k) (
+  cnt = p_layer_cnt[pad];
+  // RR pads with an enabled synth must reach the mode-2 branch even at one
+  // layer (sweep finding: the cnt<=1 early-out silently muted the synth turn)
+  cnt <= 1 && !(mode == 2 && ps_enable[pad]) ? (swing_layer_audible(pad, 0) ? 0 : -1) : (
+    mode == 1 ? (  // velocity split: use per-layer vel_lo/vel_hi ranges
+      // The range's own layer, loaded: when the mixer silences it the hit is silent (a muted hard layer leaves hard
+      // hits quiet -- it does not borrow a neighbour); no loaded layer in range = the old nearest-with-audio fallback.
+      best = -1; li = 0;
+      while(li < cnt) (
+        _base = pad * MAX_LAYERS + li;
+        vel >= l_vel_lo[_base] && (vel < l_vel_hi[_base] || l_vel_hi[_base] >= 1.0) && l_len[_base] > 0 ? (
+          best = swing_layer_audible(pad, li) ? li : -2; li = cnt; // found — break (-2 = in range but silenced)
+        );
+        li += 1;
+      );
+      // Fallback: if no range matched, find nearest layer that may sound
+      best == -1 ? (
+        fi = 0;
+        while(fi < cnt && !swing_layer_audible(pad, fi)) ( fi += 1; );
+        best = fi < cnt ? fi : -1;
+      );
+      max(-1, best);
+    ) :
+    mode == 2 ? (  // round-robin: follow l_rr_order sequence (+ SYN slot)
+      // p_rr_idx tracks position in the order sequence (0, 1, 2, ...).
+      // An enabled synth extends the rotation by one position; when the
+      // rotation lands on ps_rr_order (clamped), the SYN sentinel is returned
+      // and launch_voices_for_pad plays the synth instead of a sample layer.
+      _syn_on = ps_enable[pad] ? 1 : 0;
+      _tot = max(cnt, 1) + _syn_on;
+      _spos = min(ps_rr_order[pad], _tot - 1);   // synth's rotation position
+      // The layer mixer (2026-10-28): a turn whose layer may not sound (muted, or soloed out) is SPENT and the next
+      // turn taken, up to one whole cycle -- so a muted layer drops out of the cycle (L1 L3 L1 L3, never L1 L3 L3).
+      // best: -1 = keep looking, which is also the answer when a whole cycle found nothing (no sample voice).
+      best = -1; fi = 0;
+      while(fi < _tot && best == -1) (
+        _oidx = p_rr_idx[pad] % _tot;
+        p_rr_idx[pad] = (_oidx + 1) % _tot;
+        _syn_on && _oidx == _spos ? (
+          best = swing_syn_audible(pad) ? MAX_LAYERS : -1;   // SYN sentinel; a muted or soloed-out synth's turn is spent
+        ) : (
+        // Find the layer whose rr_order matches. The synth consumed one rotation
+        // position, so scan positions past it shift down by one — otherwise the
+        // layer at order == _spos becomes unreachable and the last layer doubles
+        // (sweep finding).
+        _scan = _syn_on && _oidx > _spos ? _oidx - 1 : _oidx;
+        li = 0;
+        while(li < cnt) (
+          _base = pad * MAX_LAYERS + li;
+          l_rr_order[_base] == _scan && l_len[_base] > 0 ? (
+            best = swing_layer_audible(pad, li) ? li : -2; li = cnt; // break (-2 = its turn, silenced)
+          );
+          li += 1;
+        );
+        // Fallback: just use the compensated position directly if lookup fails
+        best == -1 ? (
+          best = max(0, min(_scan, cnt - 1));
+          // Skip empty
+          _k = 0;
+          while(_k < cnt && l_len[pad * MAX_LAYERS + best] <= 0) (
+            best = (best + 1) % cnt;
+            _k += 1;
+          );
+          best = _k >= cnt ? -1 : (swing_layer_audible(pad, best) ? best : -2);
+        );
+        best == -2 ? best = -1;   // spent: the next turn
+        );
+        fi += 1;
+      );
+      best;
+    ) :
+    (  // single (mode 0) — first layer that may sound (prefer layer 0); none = -1
+      swing_layer_audible(pad, 0) ? 0 : (
+        fi = 1;
+        while(fi < cnt && !swing_layer_audible(pad, fi)) ( fi += 1; );
+        fi < cnt ? fi : -1;
+      );
+    );
+  );
+);

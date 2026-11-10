@@ -1,0 +1,686 @@
+// rk_swing_core_p2.jsfx-inc -- part 2 of rk_swing_core.jsfx-inc (4 parts), cut at a function boundary by
+// .dev_tests/split_big_incs.py: REAPER's load time grows with the square of a file's size. Edit freely;
+// keep each file under about 40 KB.
+
+// ⚠️ @init IS LOAD-BEARING (.docs/wiki/02-file-structure.md).
+@init
+
+// ─── Clear entire pad (all layers + legacy + name/path) ─────────────────
+function clear_pad(i) local(li) (
+  undo_begin_pad(i);  // Phase 2: back up this pad (audio+meta+names) for scoped structural undo
+  s_len[i] = 0; s_start[i] = 0; s_end[i] = 1.0;
+  // Eagerly clear the gmem blank signal too, so consumers (Kit Bridge
+  // multi-out coloring, Drum Matrix lane sync) see the pad as blank on
+  // the very next gmem read — not after the next @block runs the flush.
+  // Without this, a kit-load cycle leaves the previous kit's purple-ish
+  // positional hue painted on emptied multi-out tracks during the gap.
+  // Pad Banks step 5c: the band is the bank on screen's sixteen tiles; an absolute i wrote past it.
+  swing_pad_bank(i) == bank_cur ? gmem[KIT_GMEM_AUDIOLEN + swing_pad_tile(i)] = 0;
+  s_sr[i] = 0; s_norm[i] = 0; s_norm_gain[i] = 1.0;
+  s_dirty[i] = 1;
+  strcpy(get_name_slot(i), "");
+  strcpy(get_path_slot(i), "");
+  strcpy(get_cname_slot(i), "");
+  p_layer_cnt[i] = 0;
+  p_layer_mode[i] = 3;
+  li = 0; loop(MAX_LAYERS, clear_layer(i, li); li += 1;);
+  // Step 2a: the plain region goes the way of the layers' (clear_layer above): freed, not
+  // zeroed. A promoted pad has no plain region any more (the promotion moved it to layer 0),
+  // so this is a no-op there and the layer pass already released everything.
+  !_clr_skip_audio ? swing_region_free(i, 0);
+  // Reset FX to defaults
+  fx_hpf_freq[i] = 20; fx_lpf_freq[i] = 20000;
+  fx_eq_lo[i] = 0; fx_eq_mid[i] = 0; fx_eq_mid2[i] = 0; fx_eq_hi[i] = 0;
+  fx_eq_lo_freq[i] = 200; fx_eq_mid_freq[i] = 1000; fx_eq_mid2_freq[i] = 3000; fx_eq_hi_freq[i] = 5000;
+  fx_eq_mid_q[i] = 0.8; fx_eq_mid2_q[i] = 0.8;
+  fx_eq_lo_q[i] = 0.7071; fx_eq_hi_q[i] = 0.7071;
+  fx_sat_drv[i] = 0; fx_drv_mode[i] = 0;
+  fx_bc_rate[i] = 0; fx_bc_bits[i] = 16;
+  fx_snd_dly[i] = 0; fx_snd_rvb[i] = 0; fx_snd_smash[i] = 0;
+  s_skip[i] = 0; p_reverse[i] = 0; p_swapLR[i] = 0; p_stereo[i] = 0; wv_monoch[i] = 0; p_oneshot[i] = -1; p_choke[i] = 0;
+  p_rng_lo[i] = 0; p_rng_hi[i] = 0;  // clear chromatic range → single-note pad
+  p_gain[i] = 1.0; p_pan[i] = 0; p_tune[i] = 0; p_sample_offset[i] = 0;
+  p_mute[i] = 0; p_solo[i] = 0;
+  p_color[i] = (i % NUM_PADS) / 16.0;  // default: the TILE's evenly-spaced hue, the same sixteen in every bank, as
+                          // @init (rk_swing_defaults) and Reset Colors have it. Was i / 16 with the absolute slot:
+                          // every bank B..D pad a load cleared got a hue of 1.0..3.94, which hsl_to_rgb paints
+                          // in its last sector (pink) once auto colour is off, and the kit file kept it (LIB330).
+                          // Before that it was 0 (= hue red), which made every pad/mixer strip red after Clear Kit.
+  // NOTE: ps_* (SYN slot) is deliberately NOT reset here. clear_pad is called
+  // by LOAD paths too (CMD-63 swing_browser_load_pad, kit-import empty-pad
+  // clears in rk_swing_ui_state) and the user-ratified clear-semantics table
+  // (Spec_Swing_Change_Map_And_Reroll §4.4b) says loads replace samples and
+  // leave the synth slot alive. Explicit user Clear gestures additionally call
+  // clear_pad_syn() below.
+  swing_pad_fail_recompute(i);  // P4 step 3: paths wiped → fail bit clears (intentional removal)
+  _kd_site = 2; mark_dirty_kit();
+  undo_cap_end();
+);
+
+// ─── Clear Layer as the user means it ──────────────────────────────────
+// A plain pad (p_layer_cnt 0, which every single-file load makes since 2026-09-08) has no layers: its layer 0 IS
+// the sample, so "Clear Layer" there removes the sample, with its name, path and category label, and keeps the
+// pad's FX and mix (Clear Pad's job). A layered pad clears the layer. ONE copy for the editor's direct path and
+// the bridge's acked path (rk_swing_ui_state, _undo_pending 3): the acked path ran clear_layer alone, which only
+// zeroed the already-empty l_len[pad * 4], so with the bridge alive -- the normal state -- the sample stayed and
+// an undo entry "Clear Layer" was recorded for nothing (LIB314). The plain clear here does what the editor's
+// fallback did, plus clear_layer's bookkeeping: the undo bracket, the freed region, the bake anchor, the source
+// generation, the fail bit.
+function clear_layer_eff(pad_idx, layer_idx) local(_l0) (
+  p_layer_cnt[pad_idx] > 0 ? clear_layer(pad_idx, layer_idx) :
+  layer_idx == 0 ? (
+    undo_begin_pad(pad_idx);
+    _l0 = pad_idx * MAX_LAYERS;
+    s_len[pad_idx] = 0; s_start[pad_idx] = 0; s_end[pad_idx] = 1.0;
+    swing_pad_bank(pad_idx) == bank_cur ? gmem[KIT_GMEM_AUDIOLEN + swing_pad_tile(pad_idx)] = 0;
+    s_sr[pad_idx] = 0; s_norm[pad_idx] = 0; s_norm_gain[pad_idx] = 1.0;
+    s_dirty[pad_idx] = 1;
+    strcpy(get_name_slot(pad_idx), "");
+    strcpy(get_path_slot(pad_idx), "");
+    strcpy(get_cname_slot(pad_idx), "");
+    sp_baked_tune[_l0] = 0; ov_cap[_l0] = 0;
+    sp_src_gen[pad_idx] += 1;
+    !_clr_skip_audio ? swing_region_free(pad_idx, 0);
+    swing_pad_fail_recompute(pad_idx);
+    undo_cap_end();
+  );
+);
+
+// Explicit user "Clear Pad" / "Clear Kit" / "New Kit" gestures say "ALL layers
+// + FX" — those (and ONLY those) also reset the SYN slot. Call directly after
+// clear_pad(i) at the gesture sites, never from load paths.
+function clear_pad_syn(i) local() (
+  ps_enable[i] = 0; ps_engine[i] = 0; ps_level[i] = 1;
+  ps_vel_lo[i] = 0; ps_vel_hi[i] = 1; ps_rr_order[i] = MAX_LAYERS;
+  ps_mac0[i] = 0.5; ps_mac1[i] = 0.5; ps_mac2[i] = 0.5; ps_mac3[i] = 0.5;
+  ps_mac4[i] = 0.5; ps_mac5[i] = 0.5; ps_mac6[i] = 0.5; ps_mac7[i] = 0.5;
+  ps_pan[i] = 0; ps_mute[i] = 0; ps_solo[i] = 0;   // the SYN strip: centred, sounding
+);
+
+// ─── Memory readout + the trim mark (Spec_Swing_Pad_Banks §5.4 / §8.1, 2026-09-23) ──
+// The standing figure the kit bar shows is what is LEFT of the pad-audio area, in seconds at
+// the project rate ("8:32 free" -- people act on what is left). Since step 2a it is the
+// allocator's figure (rk_swing_alloc): alloc_live counts REGIONS, and a region is what a load
+// asked for -- rounded to a page, never shrunk on a reload, freed by a clear -- so the figure
+// says what a next load can actually have, not a sum of content lengths. Every pad still
+// caps at SLOT_SIZE on its own; the per-pad edge is the trim mark below. When banks land the
+// kit bar narrows to the active bank and the strip carries the instrument's.
+function swing_mem_free_secs() ( swing_alloc_free_secs(); );
+// Step 4b (Pad Banks): what one BANK holds -- any playable pad, and the seconds its regions hold at each
+// region's stored rate (main + layers; the pool's grant, so the sum of the four is what the pool has given).
+// The strip's height where the big views start under it: the full UI only. The rack / dock face shows the strip
+// too since 2026-10-15 (the user: with the mini browser open or Swing docked "it does not show me the correct bank
+// i'm on"; spec 8.1 had left it out), but only over the pad grid -- a big view in the rack face covers it, so the
+// views that start under it (console, FX picker) still add nothing there.
+function swing_banktabs_h() ( dock_face ? 0 : swing_px(BANK_STRIP_H); );
+// Is the strip on screen this frame? The full UI: always (it stands over every big view). The rack face: while the
+// pad grid is what shows (no big view), in the band rk_swing_ui_state's rack header leaves between itself and the
+// grid. One rule for the paint (Swing_ReaKit's two sites), the click (swing_banktabs_input) and the hit test below.
+function swing_banktabs_shown() ( !dock_face || big_view_id == VIEW_NONE; );
+// The pad editor is the modal on top: it is the last branch of the main @gfx's view dispatch, so it paints only when
+// no picker, macro editor or big view is up. Its panel is centred over the window (a full-window dim behind it), so
+// the strip's band runs under the panel: the strip paints BEFORE the editor (dimmed, the panel over it) and its
+// click leaves the panel's rect to the editor's own rows (user 2026-10-13: the tabs sat over the editor's layer
+// row). Outside the panel a tab click still selects the bank and closes the editor (spec 8.1). One rule for both
+// passes (the main @gfx's paint order, swing_banktabs_input).
+function swing_banktabs_under_editor() (
+  overlay_pad >= 0 && !kmac_ed_open && rng_ov_pad < 0 && cat_ov_pad < 0 && pk_ov_pad < 0 && big_view_id == VIEW_NONE;
+);
+// Does the strip PAINT before the dispatch (under the modal) this frame? Under the pad editor (above), and under the
+// pickers and the macro editor -- the dispatch's first branches: the range, category and note pickers and the macro
+// editor each dim the window from y = 28 and centre their panel there, and the strip's click is already inert under
+// them (swing_banktabs_input), but the strip painted AFTER them, undimmed over the dim and over their panels (the
+// owner, 2026-10-27: the LCD category pill's glyph picker "partly hides behind the bank buttons"). The click pass
+// keeps swing_banktabs_under_editor: only the editor's panel rect is carved out of a live strip.
+function swing_banktabs_paint_first() (
+  swing_banktabs_under_editor() || kmac_ed_open || rng_ov_pad >= 0 || cat_ov_pad >= 0 || pk_ov_pad >= 0;
+);
+// The bank strip's select (Pad Banks step 4b; here since 4d so the MAP presets and the bank actions reach it):
+// the selection moves to the same tile in the new bank, an open pad editor closes, mark_dirty (bank_cur is
+// serialized) -- and, since 2026-10-27 (the owner: "a bank switch if it changes saved state"), a REAPER undo point of
+// its own, a weak one: New Kit's switch to bank A, a MAP preset's, a multi-out build's ride in their own points.
+function swing_banktabs_select(b) (
+  b >= 0 && b < NUM_BANKS && b != bank_cur ? (
+    bank_cur = b;
+    sel_pad = b * NUM_PADS + (sel_pad % NUM_PADS);   // the same tile, in the new bank
+    overlay_pad = -1;                                // a pad editor open on the old bank closes
+    cat_ov_pad = -1; rng_ov_pad = -1; pk_ov_pad = -1;   // ...and so do the pickers (they read the bands at the tile)
+    mark_dirty(); swing_rup_want(RUP_K_BANK, b, -1, -1, 0);
+    _reg_my_slot >= 0 ? gmem[GS_INST_BANK_CUR + _reg_my_slot] = bank_cur;   // step 5a: at once -- a build posted this frame reads it
+  );
+);
+// The bank tab under (x, y), or -1: the strip's geometry (bt_*, rk_swing_ui_grid_pads) as of its last pass.
+// Here because the kits view (imported before the grid) reads it for the drag-a-card-onto-a-tab drop (4c).
+function swing_banktabs_hit(x, y) (
+  swing_banktabs_shown() && bt_tabw > 0 && x >= bt_x && x < bt_x + bt_tabw * NUM_BANKS && y >= bt_y && y < bt_y + bt_h ? ((x - bt_x) / bt_tabw) | 0 : -1;
+);
+function swing_bank_has_sound(b) local(_i, _r) (
+  _r = 0; _i = 0; loop(NUM_PADS, pad_is_playable(b * NUM_PADS + _i) ? _r = 1; _i += 1; );
+  _r;
+);
+
+// ── Pad Banks Outputs step 3: choosing an output (Plan_Swing_Pad_Banks_Outputs.md 5) ─────────────────────────────
+// A split pair (OUT_PAIR_SPLIT..) is FREE for slot ap when no other slot chose it, playable or not: two pads on one
+// own output would share its track. Held = chosen by some slot (the "n of 10" counts).
+function swing_out_split_free(p, ap) local(i, f) (
+  f = 1; i = 0; loop(NUM_SLOTS, i != ap && (p_output[i] | 0) == p ? f = 0; i += 1; );
+  f;
+);
+function swing_out_split_held() local(k, n) (
+  n = 0; k = OUT_PAIR_SPLIT; loop(OUT_PAIRS - OUT_PAIR_SPLIT, !swing_out_split_free(k, -1) ? n += 1; k += 1; );
+  n;
+);
+// Whose track the bridge made for split pair k (0..9): slot + 1, 0 = no track (or no bridge). Lua -> Swing, the
+// strip band's OUT_TRK; read only to choose a pair, so a stale cell (another project, a bridge gone) costs no more
+// than a less fitting choice.
+function swing_out_trk_owner(k) (
+  _reg_my_slot >= 0 ? gmem[GS_STRIP_BASE + _reg_my_slot * GS_STRIP_STRIDE + GS_STRIP_OFF_OUT_TRK + k] | 0 : 0;
+);
+// The pair "Own output" gives slot ap, or -1 when all ten are taken: a free pair whose track is already this pad's
+// (put back and split off again, it gets its own track and its FX back), else a free pair nobody has a track on yet,
+// else any free pair -- whose track then follows this pad (the bridge renames it and moves it to this pad's bank).
+function swing_out_split_pick(ap) local(k, p, own, fresh, any, t) (
+  own = -1; fresh = -1; any = -1;
+  k = 0; loop(OUT_PAIRS - OUT_PAIR_SPLIT,
+    p = OUT_PAIR_SPLIT + k;
+    swing_out_split_free(p, ap) ? (
+      t = swing_out_trk_owner(k);
+      own < 0 && t == ap + 1 ? own = p;
+      fresh < 0 && t == 0 ? fresh = p;
+      any < 0 ? any = p;
+    );
+    k += 1;
+  );
+  own >= 0 ? own : fresh >= 0 ? fresh : any;
+);
+// A person's output choice, counted for the bridge (strip OUT_UREQ; 2026-10-16, the user: "the output returns to the
+// bank but undo does not remove the track"): the bridge gives each one a REAPER undo point -- with the track it makes,
+// when it makes one -- so Ctrl+Z takes the choice and the track back together; Swing's own UNDO leaves output choices
+// alone (UDO_K_OUT). Every path a person takes calls this (the Out menu, the LCD stepper, the OUTPUTS panel, Auto
+// Assign / Reset All / the MULTI toggle); a kit load, a build's adopt and the bridge's commands do not. The count is
+// never reset by @init (a sample-rate change re-runs it; the bridge re-syncs on a count that went down).
+// REAPER keeps an undo point only when the state it can see has changed, and a choice made in here is one it cannot
+// see until it reads Swing's state again: the bridge nudges the hidden "Dirty: Global" counter (slider3) through
+// the API before its point (eon_out_poke). A sliderchange on that counter from here was tried first and changed
+// nothing (2026-10-16): REAPER re-reads the state for a parameter set through the API, not for one the plugin reports.
+function swing_out_touched() ( out_ureq += 1; );
+// Write a choice: the kit-dirty mark, the bridge's count and the OUTPUT colour mode's refresh, only when it changes.
+function swing_out_set(ap, v) (
+  v >= 0 && v != (p_output[ap] | 0) ? ( p_output[ap] = v; mark_dirty_pad(ap); col_dirty = 1; swing_out_touched(); );
+);
+// The Out menu, one builder for the pad tile, the FX overlay and the LCD stepper (they disagreed on nothing only
+// because each listed Out 1-16). Bank A: Out 1-16, then the tracks of the banks that have sounds -- or the one it
+// plays through now (decision 9). Banks B-D: the bank's track, or the pad's own output (greyed when all ten are
+// taken). out_menu_val[result - 1] = what a pick writes: a value, -1 = take a split pair, -2 = nothing (the entry
+// already chosen, the greyed one).
+function swing_out_menu(ap, dest) local(b, cur, n, k, v) (
+  b = swing_pad_bank(ap); cur = swing_out_pair(ap); n = 0;
+  strcpy(dest, "");
+  b == 0 ? (
+    k = 0; loop(NUM_PADS,
+      n > 0 ? strcat(dest, "|");
+      cur == k ? strcat(dest, "!");
+      sprintf(#_om_t, "Out %d", k + 1); strcat(dest, #_om_t);
+      out_menu_val[n] = cur == k ? -2 : k; n += 1;
+      k += 1;
+    );
+    k = 1; loop(NUM_BANKS - 1,
+      v = OUT_PAIR_BANK + k - 1;
+      cur == v || swing_bank_has_sound(k) ? (
+        n == NUM_PADS ? strcat(dest, "||") : strcat(dest, "|");   // a separator row before the first (no result number)
+        cur == v ? strcat(dest, "!");
+        sprintf(#_om_t, "Bank %c", 65 + k); strcat(dest, #_om_t);
+        out_menu_val[n] = cur == v ? -2 : v; n += 1;
+      );
+      k += 1;
+    );
+  ) : (
+    v = cur == OUT_PAIR_BANK + b - 1;
+    v ? sprintf(dest, "!Bank %c", 65 + b) : sprintf(dest, "Bank %c", 65 + b);
+    out_menu_val[0] = v ? -2 : swing_pad_tile(ap);   // 0..15 = the bank's track (the step 2b default)
+    cur >= OUT_PAIR_SPLIT ? (
+      strcat(dest, "|!Own output"); out_menu_val[1] = -2;
+    ) : swing_out_split_pick(ap) >= 0 ? (
+      strcat(dest, "|Own output"); out_menu_val[1] = -1;
+    ) : (
+      strcat(dest, "|#^g Own output: all 10 in use"); out_menu_val[1] = -2;
+    );
+  );
+);
+function swing_out_menu_pick(ap, res) local(v) (
+  ap >= 0 && ap < NUM_SLOTS && res >= 1 && res <= 32 ? (
+    v = out_menu_val[res - 1];
+    v == -1 ? v = swing_out_split_pick(ap);
+    swing_out_set(ap, v);
+  );
+);
+// After a kit load lands bank b's pads: a kit keeps each pad's choice as it was saved, and an own output that was
+// free there may be another pad's here. A bank A pad carrying a split pair goes back to its own output; a bank B-D
+// pad whose split pair another slot holds takes a free one (its bank's track when all ten are taken); a bank B-D pad
+// on another bank's track goes back to its own bank's. Everything else stays: a kit loaded back where it was saved
+// keeps its own outputs, and their tracks.
+function swing_out_loaded(b) local(i, ap, v) (
+  i = 0; loop(NUM_PADS,   // this bank: the one the kit load just landed (kit_load_bank)
+    ap = b * NUM_PADS + i; v = p_output[ap] | 0;
+    v >= OUT_PAIR_SPLIT && v < OUT_PAIRS ? (
+      b == 0 ? p_output[ap] = i :
+      !swing_out_split_free(v, ap) ? ( v = swing_out_split_pick(ap); p_output[ap] = v >= 0 ? v : i; );
+    ) : b > 0 && v >= OUT_PAIR_BANK && v < OUT_PAIR_SPLIT && v != OUT_PAIR_BANK + b - 1 ? p_output[ap] = i;
+    i += 1;
+  );
+);
+// The LCD arrows and the wheel over an Out control: bank A steps through Out 1-16 (from a bank track: to Out 1 or
+// Out 16); a bank B-D pad goes to its own output one way (dir > 0) and back to its bank's track the other.
+function swing_out_step(ap, dir) local(v) (
+  v = p_output[ap] | 0;
+  swing_pad_bank(ap) == 0 ? (
+    v = v >= NUM_PADS ? (dir > 0 ? 0 : NUM_PADS - 1) : (v + (dir > 0 ? 1 : -1) + NUM_PADS) % NUM_PADS;
+  ) : dir > 0 ? (
+    swing_out_pair(ap) < OUT_PAIR_SPLIT ? v = swing_out_split_pick(ap);
+  ) : (
+    swing_out_pair(ap) >= OUT_PAIR_SPLIT ? v = swing_pad_tile(ap);
+  );
+  swing_out_set(ap, v);
+);
+function swing_bank_used_secs(b) local(_i, _ap, _r, _s, _rate, _len) (
+  _s = 0; _i = 0; loop(NUM_PADS,
+    _ap = b * NUM_PADS + _i;
+    _r = 0; loop(MAX_LAYERS + 1,
+      _len = swing_region_len(_ap, _r);
+      _len > 0 ? (
+        _rate = _r == 0 ? s_sr[_ap] : l_sr[_ap * MAX_LAYERS + _r - 1];
+        _s += _len / (2 * (_rate > 0 ? _rate : srate));
+      );
+      _r += 1;
+    );
+    _i += 1;
+  );
+  _s;
+);
+// A pad whose audio sits AT its cap was trimmed on load (swing_ldr_step stops reading at
+// LDR_F_CAP, so a longer file lands exactly there) or cut on promotion. Derived from the
+// lengths rather than kept as a flag: it survives a project reload, travels with a swap
+// and clears with the next load or clear by itself. Returns the cap in seconds at the
+// pad's stored rate (45 at 44.1k for a pad and, since 2026-09-23, for a layer too), 0 when nothing is trimmed.
+function pad_trimmed_secs(i) local(_pt_l, _pt_lidx, _pt_s) (
+  _pt_s = 0;
+  p_layer_cnt[i] > 0 ? (
+    _pt_l = 0; loop(MAX_LAYERS,
+      _pt_lidx = i * MAX_LAYERS + _pt_l;
+      _pt_s == 0 && l_len[_pt_lidx] >= LAYER_SIZE ? (
+        _pt_s = LAYER_SIZE / (2 * (l_sr[_pt_lidx] > 0 ? l_sr[_pt_lidx] : srate));
+      );
+      _pt_l += 1;
+    );
+  ) : (
+    s_len[i] >= SLOT_SIZE ? ( _pt_s = SLOT_SIZE / (2 * (s_sr[i] > 0 ? s_sr[i] : srate)); );
+  );
+  _pt_s;
+);
+
+// ─── Plain pads, layers, and the promotion cut ────────────────────────────
+// (Spec_Swing_Long_Pad_Layer_Cap.md) A pad holding ONE sample is a PLAIN pad:
+// p_layer_cnt = 0, the audio at the slot base, s_len up to SLOT_SIZE (45 s at
+// 44.1k). It becomes a layered pad only when a layer >= 1 receives audio, and
+// a layer holds LAYER_SIZE -- which WAS 11.3 s, so promoting a pad longer than that CUT
+// it (announced on the LCD, undoable); since 2026-09-23 LAYER_SIZE == SLOT_SIZE and the cut
+// below is unreachable, kept as the guard. The historical mechanism, for the record:
+// (whole-slot backup). Until 2026-09-08 every load promoted the pad to a
+// one-layer pad, which capped every pad at 11.3 s in playback, @serialize, the
+// kit export and the kit import while s_len kept the true length — the
+// header/blob mismatch of the 2026-09-07 audit.
+
+// Layer index an "add a layer" gesture should target: a plain pad with audio
+// stacks on layer 1 (layer 0 is its sample); otherwise the next free slot,
+// clamped so a full pad stacks on its last layer rather than doing nothing.
+function swing_pad_next_layer(pad) (
+  p_layer_cnt[pad] == 0 && s_len[pad] > 0 ? 1 : min(p_layer_cnt[pad], MAX_LAYERS - 1);
+);
+// A browser drop on the pad editor's layer tab k (0..3; the user, 2026-10-22): the layer the first file goes to -- k
+// itself when that layer holds a sound (it is replaced), else the pad's next free layer (the layers stay in order);
+// -1 = the first file REPLACES the pad as a plain load (tab L1 of a plain or an empty pad) and the rest stack from
+// layer 1. More files take the layers after it, four at most (the bridge's verb 7, the big browser's claim).
+function swing_layer_drop_first(pad, k) local(_ld_n) (
+  _ld_n = p_layer_cnt[pad] > 0 ? p_layer_cnt[pad] : (s_len[pad] > 0 ? 1 : 0);
+  k == 0 && p_layer_cnt[pad] == 0 ? -1 : k < _ld_n ? k : _ld_n == 0 ? -1 : min(_ld_n, MAX_LAYERS - 1);
+);
+
+// Promote a plain pad's sample into layer 0. Since 2026-09-23 LAYER_SIZE == SLOT_SIZE, so the cut
+// below never fires (kept: it is the guard, and the banner, should the two ever differ again).
+// The plain REGION becomes layer 0's (banks
+// step 2a: a transfer of the pointer pair, no copy, no allocation -- its size stays, so
+// undo fits back in place), and the rest is metadata — plus the cut when the sample is
+// longer than a layer. Safe inside an existing undo capture or standalone
+// (captures are depth-counted; the outermost caller records the backup).
+// Idempotent: a layered or empty pad is left alone.
+function swing_pad_promote(pad)
+local(_lidx, _old_len, _sr)
+(
+  pad >= 0 && pad < NUM_SLOTS && p_layer_cnt[pad] == 0 && s_len[pad] > 0 ? (
+    undo_begin_pad(pad);
+    _lidx = pad * MAX_LAYERS;
+    _old_len = s_len[pad];
+    // The transfer (step 2a): a stale layer-0 region on a plain pad cannot normally exist,
+    // but if one does it is released rather than leaked.
+    p_llen[_lidx] > 0 ? swing_region_free(pad, 1);
+    swing_alloc_lock();            // a table write outside swing_region_set: under the lock, and
+    swing_alloc_cancel_move();     // it abandons a compaction move in flight on this pad
+    p_lptr[_lidx] = p_aptr[pad]; p_llen[_lidx] = p_alen[pad];
+    p_aptr[pad] = -1; p_alen[pad] = 0;
+    swing_alloc_unlock();
+    _old_len > LAYER_SIZE ? (
+      // The cut (unreachable since 2026-09-23, see above). Trim fractions are relative to the
+      // length: a trim that lies inside the surviving LAYER_SIZE stays where it is, the rest clamps to
+      // the new end; an inverted pair falls back to the whole layer.
+      s_start[pad] = min(1.0, s_start[pad] * _old_len / LAYER_SIZE);
+      s_end[pad]   = min(1.0, s_end[pad]   * _old_len / LAYER_SIZE);
+      s_start[pad] >= s_end[pad] ? ( s_start[pad] = 0; s_end[pad] = 1.0; );
+      s_len[pad] = LAYER_SIZE;
+      _sr = s_sr[pad] > 0 ? s_sr[pad] : srate;
+      pad_cut_warn_pad    = pad;
+      pad_cut_warn_before = _old_len / (2 * _sr);
+      pad_cut_warn_after  = LAYER_SIZE / (2 * _sr);
+      pad_cut_warn_until  = time_precise() + 8;
+      sp_src_gen[pad] += 1;   // the Extension re-captures this pad's source
+    );
+    l_len[_lidx]       = s_len[pad];
+    l_start[_lidx]     = s_start[pad];
+    l_end[_lidx]       = s_end[pad];
+    l_sr[_lidx]        = s_sr[pad];
+    l_norm[_lidx]      = s_norm[pad];
+    l_norm_gain[_lidx] = s_norm_gain[pad];
+    // l_gain / l_pan / l_mute / l_solo of layer 0 are KEPT: a plain pad already plays by them (the mixer's L1 strip,
+    // 2026-10-28), so a promotion carries its level, pan and mute on to L1 instead of resetting them
+    l_vel_lo[_lidx]    = 0;
+    l_vel_hi[_lidx]    = 1.0;
+    l_rr_order[_lidx]  = 0;
+    strcpy(LPATH_STR_BASE + _lidx, get_path_slot(pad));
+    p_layer_cnt[pad] = 1;
+    p_layer_mode[pad] == 0 ? p_layer_mode[pad] = 3;
+    s_dirty[pad] = 1;
+    undo_cap_end();
+  );
+);
+
+// ─── Waveform-aware ADSR analysis ─────────────────────────────────────────
+// Derives ADSR parameters from actual waveform shape. Runs at load time
+// (never in @sample — sqrt is intentional and safe here).
+// ─── Sliced sample loader ─────────────────────────────────────────────────
+// One resumable load JOB per lane. Job 0 belongs to @block (kit import, the
+// CMD-88 reload pump, CMD 63/64) and is pumped one bounded slice per block;
+// job 1 belongs to the UI side (@gfx drops, @serialize reloads) and is run to
+// completion in one call by the load_from_path / load_layer_from_path
+// wrappers. The lanes never share state, so a drop during a kit load cannot
+// corrupt the in-flight job. A job walks: open + header (begin) → read in
+// slices with the peak folded in → zero the unused tail → RMS windows for the
+// waveform-aware ADSR → finish (metadata, names, layer promotion, ADSR
+// results, flags). Every loop inside one slice stays far under EEL2's 2^20
+// iteration cap; the old one-shot loader tripped it on samples longer than
+// 2^20 cells (its peak scan saw only the first 1,048,576 cells, and a mono file
+// lost everything past 1,048,576 frames) — measured 2026-09-07 with
+// .dev_tests/EON_Probe_LdrSlice_*. Job records live in host-allocated memory
+// (swing_ldr_init) — this inc claims no freemem itself (wiki 2.4).
+LDR_F_PHASE   = 0;   // 0 idle · 1 read · 2 zero tail · 3 RMS windows · 4 finish
+LDR_F_PAD     = 1;
+LDR_F_LAYER   = 2;   // -1 = pad main
+LDR_F_HANDLE  = 3;
+LDR_F_NCH     = 4;
+LDR_F_SR      = 5;
+LDR_F_BUF     = 6;
+LDR_F_CAP     = 7;
+LDR_F_POS     = 8;   // cells landed so far
+LDR_F_PEAK    = 9;
+LDR_F_ZPOS    = 10;  // zero-tail cursor
+LDR_F_WFR     = 11;  // RMS window: frames
+LDR_F_WIL     = 12;  // RMS window: interleaved cells
+LDR_F_NWIN    = 13;
+LDR_F_W       = 14;  // RMS window cursor
+LDR_F_PKRMS   = 15;
+LDR_F_PKWIN   = 16;
+LDR_F_ADSR    = 17;  // 1 = the analyzer owns this pad's ADSR after the load
+LDR_F_PREVCNT = 18;  // layer loads: p_layer_cnt before the load
+LDR_F_OPENED  = 19;  // file_open succeeded
+LDR_F_LEN     = 20;  // final cell count
+LDR_F_DISP    = 21;  // step 2a: the regions this job displaced (rk_swing_alloc list, 2 * (MAX_LAYERS + 1) = 10 cells, 21..30), freed at finish / abort
+LDR_F_REFUSED = 31;  // step 2a: 1 = refused for room (Spec_Swing_Pad_Banks §5.4) -- the pad is left exactly as it was
+LDR_F_NEED    = 32;  // step 2a: cells the file needs, kept while the job WAITS for room (phase 6)
+LDR_F_WAITN   = 33;  // step 2a: re-fits tried from phase 6 (three at most, then the load is refused)
+LDR_F_STG     = 34;  // 2026-10-15: 1 = a STAGED load -- the stream lands in a staging region, the pad keeps its old sample
+LDR_F_STGP    = 35;  //   until swing_ldr_stage_commit at finish. STGP / STGL = the staging region (ptr, len), the record the
+LDR_F_STGL    = 36;  //   allocator settles above (swing_alloc_register_stage); 0 / 0 once committed or released.
+LDR_F_RMS     = 40;  // 200-cell RMS scratch (LDR_JOB_STRIDE is 256)
+
+function swing_ldr_init(fm) (
+  ldr_job0 = fm;
+  ldr_job1 = fm + LDR_JOB_STRIDE;
+  memset(fm, 0, 2 * LDR_JOB_STRIDE);   // an @init re-run drops any in-flight job
+  ldr_job0[LDR_F_HANDLE] = -1;
+  ldr_job1[LDR_F_HANDLE] = -1;
+  ldr_budget = LDR_BUDGET_MIN;         // @block rescales it from samplesblock
+  fm + 2 * LDR_JOB_STRIDE;
+);
+
+// Drop an in-flight job: a newer job for the same lane, or a state machine the
+// bridge abandoned mid-flight. The pad keeps the zero length begin() gave it -- or, for a
+// STAGED load (never committed), the old sample it never stopped holding: the staging
+// region is released and the pad is untouched.
+function swing_ldr_abort(jb) local(_sp, _sl) (
+  jb[LDR_F_PHASE] > 0 ? (
+    jb[LDR_F_HANDLE] >= 0 ? file_close(jb[LDR_F_HANDLE]);
+    jb[LDR_F_HANDLE] = -1;
+    jb[LDR_F_STG] ? (
+      swing_alloc_lock();
+      _sp = jb[LDR_F_STGP]; _sl = jb[LDR_F_STGL];
+      jb[LDR_F_STGP] = 0; jb[LDR_F_STGL] = 0; jb[LDR_F_STG] = 0;   // out of the record FIRST: the release settles
+      swing_alloc_release_(_sp, _sl);
+      swing_alloc_unlock();
+    );
+    // Step 2a: the regions this job displaced are freed here; the undo capture reads
+    // through them, so it is completed first (eagerly -- an abort is rare, off the hot path).
+    swing_disp_any(jb + LDR_F_DISP) ? ( udo_cow_drain(jb[LDR_F_PAD]); swing_disp_free(jb + LDR_F_DISP); );
+    swing_pad_fail_recompute(jb[LDR_F_PAD]);
+    undo_cap_end();
+    jb[LDR_F_PHASE] = 0;
+  );
+);
+
+// The target's metadata reset a load makes before it reads: the pad-main path and lengths,
+// or one layer's fields. Since step 2a it runs AFTER the region fit succeeded (a refused load
+// never reaches it, so the pad keeps its audio, path and lengths) and, as it always did, on
+// an open failure or an unsupported file -- the pad then ends empty with the path kept and the
+// fail bit set.
+function swing_ldr_reset_target(jb, pad, layer, path_str) local(lidx) (
+  layer < 0 ? (
+    s_len[pad] = 0;  // stays 0 if the load fails
+    s_sr[pad]  = 0;
+    strcpy(get_path_slot(pad), path_str);
+  ) : (
+    lidx = pad * MAX_LAYERS + layer;
+    // Freshly loaded layer = original (unbaked) audio: clear the bake anchor (so
+    // the residual tracks full tune until a new bake lands, and the bridge can
+    // re-capture this layer's source) and re-arm the overlay waveform capture.
+    sp_baked_tune[lidx] = 0;
+    ov_cap[lidx] = 0;
+    l_len[lidx] = 0; l_start[lidx] = 0; l_end[lidx] = 1.0; l_sr[lidx] = 0;
+    l_norm[lidx] = 0; l_norm_gain[lidx] = 1.0; l_vel_lo[lidx] = 0; l_vel_hi[lidx] = 1.0;
+    l_rr_order[lidx] = layer; l_gain[lidx] = 1.0;
+    l_pan[lidx] = 0; l_mute[lidx] = 0; l_solo[lidx] = 0;   // the layer mixer: centred, sounding
+    strcpy(LPATH_STR_BASE + lidx, path_str);  // layer file path for serialization
+  );
+);
+
+// Cells a file would need in a pad (interleaved stereo: a mono file expands to twice its
+// frames), through the same open / rate-ceiling path swing_ldr_begin takes; -1 when it does
+// not open or has an unsupported channel count. For a caller that must know whether a load
+// fits BEFORE it clears the pad (the no-bridge CMD 63), so a refusal leaves the pad intact.
+function swing_ldr_file_cells(path_str) local(f, nch, fsr, n) (
+  n = -1;
+  f = file_open(path_str);
+  f >= 0 ? (
+    file_riff(f, nch, fsr);
+    fsr > STORE_RATE_MAX ? (
+      file_close(f);
+      f = file_open(path_str);
+      f >= 0 ? ( nch = 'rqsr'; fsr = STORE_RATE_MAX; file_riff(f, nch, fsr); ) : ( nch = 0; );
+    );
+    (nch > 0 && nch < 3) ? ( n = file_avail(f); nch == 1 ? n = n * 2; );
+    f >= 0 ? file_close(f);
+  );
+  n;
+);
+
+// An IN-PLACE load (the fit kept the pad's region: no table write) must still abandon a compaction move of that
+// pad's region. A move is cancelled only by a table write (swing_region_set), and a move this job paused -- the tick
+// stands still while a loader lane is busy -- resumed after the finish and committed a copy whose head, copied
+// before the load, was the OLD audio: the pad played a splice (LIB34). Under the lock, as swing_pad_promote does.
+function swing_ldr_claim_region(pad) (
+  swing_alloc_lock();
+  alc_ap == pad ? swing_alloc_cancel_move();
+  swing_alloc_unlock();
+);
+
+// The fit succeeded: adopt the target and start reading. Shared by swing_ldr_begin and the
+// phase-6 resume (a job that waited for the compaction job to make room).
+function swing_ldr_accept(jb, pad, layer, path_str, f, nch, fsr) (
+  swing_ldr_claim_region(pad);
+  swing_ldr_reset_target(jb, pad, layer, path_str);
+  jb[LDR_F_HANDLE] = f;
+  jb[LDR_F_NCH] = nch;
+  jb[LDR_F_SR] = fsr > 0 ? fsr : srate;
+  layer < 0 ? ( s_sr[pad] = jb[LDR_F_SR]; ) : ( l_sr[pad * MAX_LAYERS + layer] = jb[LDR_F_SR]; );
+  // A plain pad receiving a layer (only once the file really opened, so
+  // a missed open leaves the plain pad intact): a layer >= 1 promotes its
+  // sample to layer 0 first — the cut and the banner live in
+  // swing_pad_promote; a layer-0 load replaces the plain sample outright,
+  // so its pad-main length goes with it (playback, the kit header and the
+  // Extension capture follow l_len[0] from here on).
+  layer >= 1 ? swing_pad_promote(pad) :
+  (layer == 0 && p_layer_cnt[pad] == 0 ? s_len[pad] = 0);
+  layer < 0 ? ( jb[LDR_F_BUF] = p_aptr[pad]; jb[LDR_F_CAP] = p_alen[pad]; )
+            : ( jb[LDR_F_BUF] = p_lptr[pad * MAX_LAYERS + layer]; jb[LDR_F_CAP] = p_llen[pad * MAX_LAYERS + layer]; );
+  jb[LDR_F_PHASE] = 1;
+);
+
+function swing_ldr_begin(jb, pad, layer, path_str)
+local(f, nch, fsr, need)
+(
+  jb[LDR_F_PHASE] > 0 ? swing_ldr_abort(jb);   // a new job always wins
+  jb[LDR_F_PAD] = pad; jb[LDR_F_LAYER] = layer;
+  jb[LDR_F_HANDLE] = -1; jb[LDR_F_NCH] = 0; jb[LDR_F_SR] = 0;
+  jb[LDR_F_POS] = 0; jb[LDR_F_PEAK] = 0.00001; jb[LDR_F_ZPOS] = 0; jb[LDR_F_LEN] = 0;
+  jb[LDR_F_OPENED] = 0; jb[LDR_F_ADSR] = 0; jb[LDR_F_NWIN] = 0;
+  jb[LDR_F_PREVCNT] = layer < 0 ? 0 : p_layer_cnt[pad];   // layer loads: the count before the load
+  jb[LDR_F_BUF] = -1; jb[LDR_F_CAP] = 0; jb[LDR_F_REFUSED] = 0;
+  swing_disp_clear(jb + LDR_F_DISP);
+  undo_begin_pad(pad);  // Phase 2: back up this pad (audio+meta+names) for scoped structural undo
+  f = file_open(path_str);
+  // Transient open miss (AV/indexer read-lock on a valid file): flag it so the
+  // kit-import loop retries THIS pad next @block instead of leaving it blank
+  // (2026-07-19). SET only — the loop clears it per pass.
+  f < 0 ? kit_pad_open_failed = 1;
+  f >= 0 ? (
+    jb[LDR_F_OPENED] = 1;
+    file_riff(f, nch, fsr);
+    // The storage-rate ceiling on the no-bridge path (Spec_Swing_Pad_Banks §5.5, step 1c,
+    // 2026-09-23). A file above STORE_RATE_MAX is re-opened with file_riff's 'rqsr'
+    // request and REAPER resamples it on read. Measured by EON_Probe_Rqsr: 'rqsr' 48000 on
+    // a 96k file hands back rate 48000, the REAL channel count and half the frames, with
+    // the sine intact -- and a file BELOW the request is upsampled, which is why the
+    // request is made only after a plain file_riff has shown the native rate is above the
+    // ceiling: never upsample, a 44.1k file stays 44.1k. What file_riff hands back after
+    // the request is the authority for s_sr / l_sr below, never the number asked for.
+    fsr > STORE_RATE_MAX ? (
+      file_close(f);
+      f = file_open(path_str);
+      f >= 0 ? ( nch = 'rqsr'; fsr = STORE_RATE_MAX; file_riff(f, nch, fsr); ) : ( nch = 0; );
+    );
+    nch > 0 && nch < 3 ? (
+      // Step 2a: the region is taken HERE, sized to the file (file_avail after file_riff is
+      // the samples left -- interleaved for stereo; a mono file expands to twice that),
+      // before anything of the pad is touched, so a refusal leaves it exactly as it was
+      // (§5.4: refusal, not truncation). A layer >= 1 on a plain pad fits its own region
+      // first and promotes after; a layer 0 on a plain pad takes the plain region over
+      // inside the fit. The old regions a fit replaces ride in the job's displaced list.
+      need = file_avail(f); nch == 1 ? need = need * 2;
+      need = max(need, 2);
+      (layer < 0 ? swing_pad_fit_main(pad, need, jb + LDR_F_DISP)
+                 : swing_pad_fit_layer(pad, layer, need, jb + LDR_F_DISP)) ? (
+        swing_ldr_accept(jb, pad, layer, path_str, f, nch, fsr);
+      ) : alc_wait ? (
+        // No room now, room once the compaction job has packed the area (the fit filed the
+        // request): WAIT in phase 6 with the file open. A kit import yields on a job in
+        // flight, the no-bridge CMD 63 resumes it, swing_ldr_run packs synchronously; the
+        // resume re-fits and adopts the target only then, so a refusal still leaves the pad
+        // exactly as it was.
+        jb[LDR_F_HANDLE] = f; jb[LDR_F_NCH] = nch; jb[LDR_F_SR] = fsr; jb[LDR_F_NEED] = need;
+        jb[LDR_F_WAITN] = 0;
+        strcpy(jb == ldr_job0 ? #_ldr_wpath0 : #_ldr_wpath1, path_str);
+        jb[LDR_F_PHASE] = 6;
+      ) : (
+        file_close(f);
+        jb[LDR_F_REFUSED] = 1;   // finish says so on the LCD and touches nothing else
+        jb[LDR_F_PHASE] = 4;
+      );
+    ) : (
+      f >= 0 ? file_close(f);   // unsupported channel count (or the reopen above failed): finish records the failure
+      swing_ldr_reset_target(jb, pad, layer, path_str);
+      jb[LDR_F_PHASE] = 4;
+    );
+  ) : (
+    swing_ldr_reset_target(jb, pad, layer, path_str);
+    jb[LDR_F_PHASE] = 4;
+  );
+);
+
+// Stream-fed twin of swing_ldr_begin (EON_PADPCM, rk_swing_padpcm.jsfx-inc; go-live
+// Stream-fed twin of swing_ldr_begin (EON_PADPCM, rk_swing_padpcm.jsfx-inc; go-live
+// hardening Phase 2, 2026-09-08). The Kit Bridge already opened and decoded the
+// file on the UI thread and hands the PCM over as interleaved stereo, so this
+// does everything begin() does EXCEPT file_open / file_riff -- the ~30 ms stall
+// that used to sit on the audio thread once per drop. `total` = the interleaved
+// cell count the bridge will deliver, `fsr` its sample rate. Phase 5 = "fed by
+// the stream": swing_padpcm_tick copies the cells straight into LDR_F_BUF and
+// folds the peak, then hands the job to phase 2 at the stream's LAST chunk, and
+// phases 2/3/4 (zero tail, RMS/ADSR, finish) run exactly as for a file read.
+function swing_ldr_begin_gmem(jb, pad, layer, path_str, fsr, total)
+local(lidx)
+(
+  jb[LDR_F_PHASE] > 0 ? swing_ldr_abort(jb);   // a new job always wins
+  jb[LDR_F_PAD] = pad; jb[LDR_F_LAYER] = layer;
+  jb[LDR_F_HANDLE] = -1; jb[LDR_F_NCH] = 0; jb[LDR_F_SR] = 0;
+  jb[LDR_F_POS] = 0; jb[LDR_F_PEAK] = 0.00001; jb[LDR_F_ZPOS] = 0; jb[LDR_F_LEN] = 0;
+  jb[LDR_F_OPENED] = 0; jb[LDR_F_ADSR] = 0; jb[LDR_F_NWIN] = 0;
+  jb[LDR_F_PREVCNT] = layer < 0 ? 0 : p_layer_cnt[pad];
+  jb[LDR_F_BUF] = -1; jb[LDR_F_CAP] = 0; jb[LDR_F_REFUSED] = 0;
+  swing_disp_clear(jb + LDR_F_DISP);
+  undo_begin_pad(pad);
+  lidx = pad * MAX_LAYERS + max(layer, 0);
+  total > 0 ? (
+    // Step 2a: the region, sized to what the bridge will deliver. swing_padpcm_begin asked
+    // swing_pad_can_fit before it cleared the pad, so this refuses only if the room went
+    // between the two -- and then the pad is left as the clear left it, told on the LCD.
+    (layer < 0 ? swing_pad_fit_main(pad, total, jb + LDR_F_DISP)
+               : swing_pad_fit_layer(pad, layer, total, jb + LDR_F_DISP)) ? (
+      swing_ldr_claim_region(pad);             // an in-place fit abandons a paused move of this pad's region (LIB34)
+      swing_ldr_reset_target(jb, pad, layer, path_str);
+      jb[LDR_F_OPENED] = 1;
+      jb[LDR_F_NCH] = 2;                       // the stream is always interleaved stereo
+      jb[LDR_F_SR] = fsr > 0 ? fsr : srate;
+      layer < 0 ? ( s_sr[pad] = jb[LDR_F_SR]; ) : ( l_sr[lidx] = jb[LDR_F_SR]; );
+      layer >= 1 ? swing_pad_promote(pad) :
+      (layer == 0 && p_layer_cnt[pad] == 0 ? s_len[pad] = 0);
+      layer < 0 ? ( jb[LDR_F_BUF] = p_aptr[pad]; jb[LDR_F_CAP] = p_alen[pad]; )
+                : ( jb[LDR_F_BUF] = p_lptr[lidx]; jb[LDR_F_CAP] = p_llen[lidx]; );
+      jb[LDR_F_PHASE] = 5;
+    ) : (
+      jb[LDR_F_REFUSED] = 1;
+      jb[LDR_F_PHASE] = 4;
+    );
+  ) : (
+    // the bridge could not decode it: the same transient class as an open miss
+    swing_ldr_reset_target(jb, pad, layer, path_str);
+    kit_pad_open_failed = 1;
+    jb[LDR_F_PHASE] = 4;
+  );
+);
+

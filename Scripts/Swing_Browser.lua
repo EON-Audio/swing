@@ -324,6 +324,7 @@ end
 local function scan_kits()
   local kits_dir = get_kits_dir()
   kit_browser.kits = {}
+  core.recover_prev_dir(kits_dir, ".swing")   -- a kit a crash mid-save left as .prev (F06)
   local idx = 0
   while true do
     local fname = reaper.EnumerateFiles(kits_dir, idx)
@@ -445,6 +446,7 @@ end
 -- Load .swing v2 database (Lua table)
 local function load_kit_database(filepath)
   if not filepath then return nil end
+  core.recover_prev(filepath)   -- a crash mid-save left only the .prev (F06)
   local chunk, err = loadfile(filepath, "t", {})
   if not chunk then return nil end
   -- Bounded, not just sandboxed: a v2 kit is Lua text the user may have
@@ -649,6 +651,11 @@ local function ensure_user_dir()
   reaper.RecursiveCreateDirectory(USER_DIR, 0)
 end
 
+local settings_save_warned = false   -- a failing settings save says so once, not once per click
+
+-- Returns ok, err. Every UI change saves, so a failure is retried by the next
+-- change and at close; the console says so once per run of failures (outside
+-- audit F05, 2026-10-28: the result was ignored and a failed save was silent).
 local function save_settings()
   settings.last_folder    = file_mgr.current_path
   settings.volume         = playback.volume
@@ -660,12 +667,11 @@ local function save_settings()
   settings.loop_preview   = playback.loop
 
   ensure_user_dir()
-  -- Atomic tmp+rename via core.atomic_write: a crash mid-write must never
-  -- leave a truncated settings file (load_settings would then silently
-  -- reset every pref to defaults). The brief missing-file window between
-  -- remove+rename is acceptable because load_settings treats missing as
-  -- "use defaults" (same tradeoff as save_persistent_cache).
-  core.atomic_write(SETTINGS_FILE, function(f)
+  -- core.atomic_write: a failed write, close or rename leaves the old settings
+  -- file in place (a truncated one would make load_settings reset every pref).
+  -- Only a crash in the instant between its two renames leaves no file (outside
+  -- audit F06, open); load_settings then uses defaults.
+  local ok, err = core.atomic_write(SETTINGS_FILE, function(f)
     f:write("return {\n")
     -- version (required for future migration — see §11)
     f:write(string.format('  version = %d,\n', SETTINGS_VERSION))
@@ -712,6 +718,16 @@ local function save_settings()
     f:write('  },\n')
     f:write("}\n")
   end)
+  if not ok then
+    if not settings_save_warned then
+      settings_save_warned = true
+      reaper.ShowConsoleMsg("[EON] Warning: could not save the browser settings to " .. SETTINGS_FILE ..
+                            " (" .. tostring(err) .. ")\n")
+    end
+    return false, err
+  end
+  settings_save_warned = false
+  return true
 end
 
 -- Settings migration (§11.3): add future migrations here
@@ -733,6 +749,8 @@ local function load_settings()
   -- the legacy contents over (preserves favorites/recent), then leave the
   -- legacy file in place — but it will no longer be written to. (Don't
   -- delete it: that would break a downgrade-then-upgrade cycle.)
+  local src = SETTINGS_FILE
+  core.recover_prev(SETTINGS_FILE)   -- a crash mid-save left only the .prev (F06)
   local existing = io.open(SETTINGS_FILE, "r")
   if existing then
     existing:close()
@@ -744,21 +762,60 @@ local function load_settings()
       ensure_user_dir()
       -- Atomic like save_settings: a crash mid-copy would otherwise leave a
       -- truncated file that both fails to load AND blocks this migration
-      -- from ever re-running (the file would exist).
-      core.atomic_write(SETTINGS_FILE, body)
+      -- from ever re-running (the file would exist). A copy that fails reads
+      -- the legacy file for this run instead (the favourites and recent
+      -- folders still show) and is tried again at the next start (outside
+      -- audit F05: the failure was ignored and the run started on defaults).
+      if not core.atomic_write(SETTINGS_FILE, body) then src = LEGACY_SETTINGS_FILE end
     end
   end
 
-  local f = io.open(SETTINGS_FILE, "r")
+  local f = io.open(src, "r")
   if not f then return end
   f:close()
 
-  local chunk, err = loadfile(SETTINGS_FILE, "t", {})
+  local chunk, err = loadfile(src, "t", {})
   local ok, loaded = false, nil
   -- Bounded like a kit (load_kit_database): the empty env keeps it away from
   -- io/os, but only the instruction budget stops a `while true do end`.
   if chunk then ok, loaded = core.run_bounded(chunk) end
   if ok and type(loaded) == "table" then
+    -- The file is hand-editable, so every value is checked before it is used:
+    -- one of the wrong type, or a number that is not a real one (NaN, inf, or
+    -- past 2^53, where save_settings' %d can no longer write it), keeps its
+    -- default (outside audit F04, 2026-10-28: window_w = "bad" raised in the
+    -- math.max below and the browser never opened; favorites = "oops" broke
+    -- the next save). Keys with no default pass through as before. The bound
+    -- is wide on purpose: dock_id is an ImGui id and can pass 2^31.
+    for k, v in pairs(loaded) do
+      local d = settings[k]
+      if d ~= nil and (type(v) ~= type(d)
+                       or (type(v) == "number" and not (v == v and math.abs(v) < 2^53))) then
+        loaded[k] = nil
+      end
+    end
+    -- The lists keep their well-formed entries only: save_settings %q-writes
+    -- each path and name, and a nil there raises inside the writer.
+    if loaded.favorites then
+      local keep = {}
+      for _, fav in ipairs(loaded.favorites) do
+        if type(fav) == "table" and type(fav.path) == "string" then
+          keep[#keep + 1] = { path = fav.path, name = type(fav.name) == "string" and fav.name or fav.path }
+        end
+      end
+      loaded.favorites = keep
+    end
+    if loaded.recent_folders then
+      local keep = {}
+      for _, r in ipairs(loaded.recent_folders) do
+        if type(r) == "string" then keep[#keep + 1] = r end
+      end
+      loaded.recent_folders = keep
+    end
+    -- Preview volume is 0..1 everywhere else (preview_set_volume clamps); a
+    -- fractional sort column would make every later save raise on its %d.
+    if loaded.volume then loaded.volume = math.max(0, math.min(1, loaded.volume)) end
+    if loaded.sort_column then loaded.sort_column = math.floor(loaded.sort_column) end
     -- Merge missing keys from defaults (§11.2)
     for k, v in pairs(settings) do
       if loaded[k] == nil then loaded[k] = v end
@@ -806,6 +863,7 @@ local load_layer_to_pad  -- fwd decl: process_import_queue (above its def) uses 
 
 local cache_dirty = false
 local cache_last_save = 0
+local cache_save_warned = false   -- a failing cache save says so once, not once a second
 
 -- mtime via JS_ReaScriptAPI (soft dep). Returns nil if extension missing,
 -- so cache lookup degrades to "trust until file is re-cached" gracefully.
@@ -824,6 +882,7 @@ end
 
 local function load_persistent_cache()
   local cache_path = core.get_cache_dir() .. sep .. "analysis.lua"
+  core.recover_prev(cache_path)   -- a crash mid-save left only the .prev (F06)
   local f = io.open(cache_path, "r")
   if not f then return {} end
   local content = f:read("*a"); f:close()
@@ -861,10 +920,11 @@ local function save_persistent_cache(force)
   if not force and now - cache_last_save < 1.0 then return end
 
   local cache_path = core.get_cache_dir() .. sep .. "analysis.lua"
-  -- Atomic tmp+rename via core.atomic_write. Brief missing-file window is
-  -- acceptable because load_persistent_cache treats missing as empty and
-  -- we'll rebuild from live metrics as the user browses.
-  core.atomic_write(cache_path, function(f)
+  -- core.atomic_write: a failed write, close or rename leaves the old cache in
+  -- place and returns false. Only a crash in the instant between its two
+  -- renames leaves no cache (outside audit F06, open); load_persistent_cache
+  -- then starts empty and the browser re-measures as the user browses.
+  local ok, err = core.atomic_write(cache_path, function(f)
     f:write("return {\n  version = 1,\n  entries = {\n")
     for path, entry in pairs(analysis_cache) do
       -- Re-pack live metrics; entries loaded from disk and never re-measured
@@ -890,8 +950,21 @@ local function save_persistent_cache(force)
     end
     f:write("  },\n}\n")
   end)
-  cache_dirty = false
+  -- The clock moves either way, so a failing save is retried at the 1 s pace
+  -- the good ones run at, never every frame. The dirty flag clears only on a
+  -- save that landed: clearing it on a failure lost the analysis for good
+  -- (outside audit F03, 2026-10-28). One console line per run of failures.
   cache_last_save = now
+  if not ok then
+    if not cache_save_warned then
+      cache_save_warned = true
+      reaper.ShowConsoleMsg("[EON] Warning: could not save the BPM / key cache to " .. cache_path ..
+                            " (" .. tostring(err) .. "); the browser keeps trying\n")
+    end
+    return
+  end
+  cache_save_warned = false
+  cache_dirty = false
 end
 
 analysis_cache = load_persistent_cache()
@@ -2089,13 +2162,18 @@ local function process_import_queue()
   if not item.loaded then
     if item.layers and #item.layers > 1 then
       local lc = item.lcur or 0
-      if load_layer_to_pad(item.layers[lc + 1], item.pad, lc) then
+      local r = load_layer_to_pad(item.layers[lc + 1], item.pad, lc)
+      if r then   -- "refused" (a path too long) skips the layer; every layer refused = the pad refused (below)
+        if r == "refused" then item.nref = (item.nref or 0) + 1 end
         lc = lc + 1
         item.lcur = lc
-        if lc >= #item.layers then item.loaded = true end
+        if lc >= #item.layers then item.loaded = true; item.refused = (item.nref or 0) >= #item.layers end
       end
     else
-      if load_sample_to_pad(item.path, item.pad) then item.loaded = true end
+      local r = load_sample_to_pad(item.path, item.pad)
+      -- a path too long for Swing (refused, its console line written): the pad is left as it was, so its settings
+      -- are not put onto whatever it holds (item.refused, below)
+      if r then item.loaded = true; item.refused = r == "refused" end
     end
     return
   end
@@ -2105,7 +2183,7 @@ local function process_import_queue()
   -- all three, so they post unconditionally. volume (dB) → linear gain. For
   -- layered pads, layer_mode sets vel-split / RR (auto even-split JSFX-side).
   local slot = core.resolve_inst_slot(active_inst_id)
-  if slot then
+  if slot and not item.refused then
     -- INCMD is bank-RELATIVE (audit H26): each region is sixteen pads wide, so the TILE is posted. The flag
     -- carries the item's BANK (2 + 4 x (bank + 1), Swing_ReaKit's swing_incmd_slot): the instance takes the cell
     -- when it can -- the whole mailbox is held while it is busy -- and without the stamp it mapped the tile
@@ -2684,9 +2762,8 @@ local function calculate_spectral_data(file_path, num_slices)
   -- the undo history (every file selection would otherwise leave a
   -- "Delete track" undo entry). Wrap the entire add/use/remove sequence
   -- in PreventUIRefresh so REAPER skips the per-step UI redraw, and put
-  -- it inside an undo block whose "title" we'll never end (Undo_EndBlock2
-  -- with flags=-1 to discard the changes — they're transient analysis
-  -- scaffolding, not user-facing state).
+  -- it inside one undo block (net change nothing: REAPER keeps no point,
+  -- measured -- see the block's close below).
   reaper.PreventUIRefresh(1)
   reaper.Undo_BeginBlock2(0)
 
@@ -2786,10 +2863,11 @@ local function calculate_spectral_data(file_path, num_slices)
   -- the take's source reference — do NOT call PCM_Source_Destroy after)
   reaper.DeleteTrack(scratch_tr)
 
-  -- Close the undo block and discard the recorded changes (-1 flag) —
-  -- the scratch track is transient analysis scaffolding, the user
-  -- shouldn't see "Delete track" cluttering their undo history. Then
-  -- release the UI-refresh suppression.
+  -- Close the undo block, then release the UI-refresh suppression. -1 is
+  -- ALL flags, not a discard; REAPER keeps no point for this block because
+  -- the insert + delete leave the project as it was (measured 2026-10-29 in
+  -- a project with history, .dev_tests/S1_Probe_SpectralUndo_run.ps1: the
+  -- undo top unchanged after two analyses, with or without the block).
   reaper.Undo_EndBlock2(0, "Spectral analysis (transient)", -1)
   reaper.PreventUIRefresh(-1)
   return out
@@ -3155,12 +3233,9 @@ load_sample_to_pad = function(filepath, pad_idx)
   if math.floor(reaper.gmem_read(G.CMD)) ~= 0 then return false end -- busy
   if math.floor(reaper.gmem_read(G.LOCK)) ~= 0 then return false end -- bridge busy
 
-  -- Write file path as character codes directly to gmem
-  local path_len = math.min(#filepath, G.GS_BROWSER_PATH_MAX - 1)
-  for i = 0, path_len - 1 do
-    reaper.gmem_write(G.GS_BROWSER_PATH + i, filepath:byte(i + 1))
-  end
-  reaper.gmem_write(G.GS_BROWSER_PATH_LEN, path_len)
+  -- The path into the staging band. One too long for it is refused with a console line (core.gmem_put_path, sweep
+  -- SCR132; it used to be cut to 259 bytes and posted) and answers "refused": a queue drops it, never retries it.
+  if not core.gmem_put_path(filepath, "Sample Browser") then return "refused" end
 
   -- Write pad name to gmem PADNAME area
   local fname = filepath:match("[/\\]([^/\\]+)$") or filepath
@@ -3207,12 +3282,8 @@ load_layer_to_pad = function(filepath, pad_idx, layer_idx)
   if math.floor(reaper.gmem_read(G.CMD)) ~= 0 then return false end -- busy
   if math.floor(reaper.gmem_read(G.LOCK)) ~= 0 then return false end -- bridge busy
 
-  -- Write file path as character codes directly to gmem
-  local path_len = math.min(#filepath, G.GS_BROWSER_PATH_MAX - 1)
-  for i = 0, path_len - 1 do
-    reaper.gmem_write(G.GS_BROWSER_PATH + i, filepath:byte(i + 1))
-  end
-  reaper.gmem_write(G.GS_BROWSER_PATH_LEN, path_len)
+  -- The path into the staging band; one too long is refused, as in load_sample_to_pad.
+  if not core.gmem_put_path(filepath, "Sample Browser") then return "refused" end
 
   -- Write pad name to gmem PADNAME area (only for layer 0)
   if layer_idx == 0 then
@@ -3486,9 +3557,23 @@ end
 -- Queue the drop through the SAME retry-safe path the multi-select load uses
 -- (load_sample_to_pad fails fast while a CMD/LOCK is in flight, so a direct
 -- call here could silently drop the file).
-function xdrag.commit(inst, pad, code)
+function xdrag.commit(inst, pad, code, alt)
   if not xdrag.paths or not pad or pad < 0 then return end
   multi_load_status = ""
+  -- Alt onto the plugin's own PAD (sweep BRW26, 2026-10-30): the files stack on it as layers -- the mini grid's and
+  -- the "+ LAYER" button's rule -- instead of filling the pads from it. A pad's claim says how many layers it holds
+  -- (code = -(1 + n), Swing's rk_swing_ui_grid_pads_p2), so it becomes the layer tab's code: an empty pad's first file
+  -- loads the pad and the rest stack from layer 1 (9); n layers stack from layer n (n + 1); a full pad takes nothing.
+  -- An older Swing answers 0 for a pad: Alt then replaces, as before.
+  if alt and code and code < 0 then
+    local n = -code - 1
+    if n >= 4 then
+      multi_load_status = "pad full \xC2\xB7 max 4 layers"
+      xdrag.consumed_at = reaper.time_precise()
+      return
+    end
+    code = (n == 0) and 9 or (n + 1)
+  end
   if code and code > 0 then
     -- onto the pad editor's layer tab (the user, 2026-10-22): the JSFX resolved where -- code - 1 = the first layer,
     -- 9 = the first file replaces the pad and the rest stack from layer 1 -- four layers at most
@@ -3563,7 +3648,8 @@ function xdrag.update()
     -- here (xdrag.hit rejects our ImGui class), so ImGui's mini pad grid keeps
     -- sole ownership of that drop and nothing loads twice.
     if inst and pad and pad >= 0 then
-      xdrag.commit(inst, pad, code)
+      -- Alt at the release (JS_Mouse_GetState's 16; sweep BRW26): stack on a plugin pad as layers (xdrag.commit)
+      xdrag.commit(inst, pad, code, (reaper.JS_Mouse_GetState(16) & 16) ~= 0)
     end
     xdrag.abort()
     return

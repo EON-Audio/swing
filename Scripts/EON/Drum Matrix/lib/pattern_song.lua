@@ -56,6 +56,14 @@ local KEY_ARRS   = 'song_arrs'        -- JSON: [ { name = '', chain = [{r,n},...
 local KEY_ARRACT = 'song_arr_active'  -- 1-based index into KEY_ARRS
 -- (the old 'song_loop' ExtState flag is retired: LOOP now IS the transport
 -- repeat — see GetLoop/SetLoop down in the playback-driver section)
+-- REGION IDENTITY (DM222, 2026-10-29; pattern_regions' IDS_KEY says why): a chain entry also carries its region's GUID
+-- (`g`) beside the number (`r`), and the heal in SongList follows the GUID, rewriting `r` to the region's number now,
+-- so "Renumber all regions" no longer re-points the chain. An entry from before (no `g`) is found by number once and
+-- gets its GUID then. An older reader keeps `r` / `n` and skips `g`. An entry whose pattern is DETACHED (its region
+-- deleted) leaves the chain for KEY_DET -- [ { g, n, at = its place then }, ... ] -- and comes back at that place when
+-- an undo brings the region back. KEY_DET belongs to the live chain: a switch of arrangement or a Clear drops it.
+local KEY_DET    = 'song_detached'
+local DET_MAX    = 64
 
 -- 'smoothseek' value used while a song plays. 3 = seek at end of region (the
 -- value the community "GoTo Region Player" uses). Tunable if transitions feel
@@ -79,7 +87,7 @@ local function read_song()
   local clean = {}
   for _, e in ipairs(arr) do
     if type(e) == 'table' and type(e.r) == 'number' then
-      clean[#clean + 1] = { r = e.r, n = (type(e.n) == 'number' and e.n or 1) }
+      clean[#clean + 1] = { r = e.r, n = (type(e.n) == 'number' and e.n or 1), g = (type(e.g) == 'string' and e.g or nil) }
     end
   end
   return clean
@@ -89,6 +97,35 @@ local function write_song(arr)
   if not json then return end
   local ok, enc = pcall(json.encode, arr)
   if ok and enc then reaper.SetProjExtState(0, SECTION, KEY, enc) end
+end
+
+-- KEY_DET: the entries of DETACHED patterns, kept aside for an undo.
+local function read_det()
+  if not json then return {} end
+  local _, raw = reaper.GetProjExtState(0, SECTION, KEY_DET)
+  if not raw or raw == '' then return {} end
+  local ok, arr = pcall(json.decode, raw)
+  if not ok or type(arr) ~= 'table' then return {} end
+  local out = {}
+  for _, e in ipairs(arr) do
+    if type(e) == 'table' and type(e.g) == 'string' and type(e.at) == 'number' then
+      out[#out + 1] = { g = e.g, n = (type(e.n) == 'number' and e.n or 1), at = math.floor(e.at) }
+    end
+  end
+  return out
+end
+
+local function write_det(arr)
+  if not json then return end
+  while #arr > DET_MAX do table.remove(arr, 1) end
+  local ok, enc = pcall(json.encode, arr)
+  if ok and enc then reaper.SetProjExtState(0, SECTION, KEY_DET, enc) end
+end
+
+-- The live chain was replaced (an arrangement switch, a Clear): what was kept aside for it goes.
+local function clear_det()
+  local _, raw = reaper.GetProjExtState(0, SECTION, KEY_DET)
+  if raw and raw ~= '' then reaper.SetProjExtState(0, SECTION, KEY_DET, '') end
 end
 
 -- =============================================================================
@@ -107,7 +144,7 @@ local function read_arrs()
       local ch = {}
       for _, e in ipairs(a.chain) do
         if type(e) == 'table' and type(e.r) == 'number' then
-          ch[#ch + 1] = { r = e.r, n = (type(e.n) == 'number' and e.n or 1) }
+          ch[#ch + 1] = { r = e.r, n = (type(e.n) == 'number' and e.n or 1), g = (type(e.g) == 'string' and e.g or nil) }
         end
       end
       clean[#clean + 1] = { name = (type(a.name) == 'string' and a.name or ''), chain = ch }
@@ -177,6 +214,7 @@ function M.ArrSwitch(i)
     write_arrs(arrs)
     write_arr_active(i)
     write_song(arrs[i].chain)
+    clear_det()
     M.QueueChainSwitch()   -- "play next": hand over at the current pattern's end
   end
 end
@@ -198,7 +236,7 @@ function M.ArrDuplicate(i)
   if i < 1 or i > #arrs then return end
   local copy = { name = arrs[i].name or '', chain = {} }
   for _, e in ipairs(arrs[i].chain) do
-    copy.chain[#copy.chain + 1] = { r = e.r, n = e.n }
+    copy.chain[#copy.chain + 1] = { r = e.r, n = e.n, g = e.g }
   end
   arrs[#arrs + 1] = copy
   write_arrs(arrs)
@@ -226,6 +264,7 @@ function M.ArrDelete(i)
   write_arr_active(nact)
   if i == act then
     write_song(arrs[nact].chain)
+    clear_det()
     M.QueueChainSwitch()
   end
 end
@@ -234,23 +273,83 @@ end
 -- public list (self-healed against live pattern regions)
 -- =============================================================================
 
--- Returns ordered chain: { { idx, repeats, region = {idx,name,start,end_,color} }, ... }
--- Steps whose region no longer exists are dropped (and the stored chain rewritten).
+-- Returns ordered chain: { { idx, repeats, region = {idx,name,start,end_,color,guid}, g }, ... }
+-- Steps whose region no longer exists are dropped (and the stored chain rewritten); a step of a DETACHED
+-- pattern is kept aside in KEY_DET and put back at its place when its region returns (see KEY_DET).
+-- The PARKED arrangements' entries get their region's GUID too. Only the live chain was healed (SongList below), so
+-- an arrangement parked by a release from before the GUIDs kept bare numbers until it was switched to: a "Renumber
+-- all regions" in between and it came up on other regions -- the trap the GUIDs close, left open for every
+-- arrangement but the one on screen (the 3.0.21 outside review, 2026-11-10). An entry with no GUID is found by
+-- number ONCE, here, on the first read that sees region GUIDs; an entry that has one keeps it (a switch follows it).
+-- Cheap when quiet: one ExtState read and a string compare against the store last seen whole.
+local arrs_seen_raw = nil
+local function stamp_parked(byidx)
+  if not json then return end
+  local _, raw = reaper.GetProjExtState(0, SECTION, KEY_ARRS)
+  if not raw or raw == '' or raw == arrs_seen_raw then return end
+  local arrs, changed = read_arrs(), false
+  for _, a in ipairs(arrs) do
+    for _, e in ipairs(a.chain) do
+      local r = (not e.g) and byidx[e.r] or nil
+      if r and r.guid then e.g = r.guid; changed = true end
+    end
+  end
+  if changed then
+    write_arrs(arrs)
+    _, raw = reaper.GetProjExtState(0, SECTION, KEY_ARRS)
+  end
+  arrs_seen_raw = raw
+end
+
 function M.SongList()
   local arr = read_song()
-  local byidx = {}
+  local byidx, byguid, gmode = {}, {}, false
   if patterns then
-    for _, r in ipairs(patterns.List()) do byidx[r.idx] = r end
+    for _, r in ipairs(patterns.List()) do
+      byidx[r.idx] = r
+      if r.guid then byguid[r.guid] = r; gmode = true end
+    end
   end
-  local out, clean, changed = {}, {}, false
-  for _, e in ipairs(arr) do
-    local r = byidx[e.r]
+  if gmode then stamp_parked(byidx) end
+  -- the detached patterns' GUIDs; nil without region GUIDs (then nothing is kept aside, as before)
+  local dg = patterns and patterns.DetachedGuids and patterns.DetachedGuids() or nil
+  local det = dg and read_det() or {}
+  local out, clean, changed, det_changed = {}, {}, false, false
+  for pos, e in ipairs(arr) do
+    -- by GUID; by number for an entry that has none yet (it gets one here), and for every entry where no member's
+    -- GUID could be read (a REAPER that cannot: the entries' GUIDs are kept, not trusted, not dropped)
+    local r
+    if e.g and gmode then r = byguid[e.g] else r = byidx[e.r] end
     if r then
-      out[#out + 1]   = { idx = e.r, repeats = e.n or 1, region = r }
-      clean[#clean + 1] = { r = e.r, n = e.n or 1 }
+      local g = r.guid or e.g
+      out[#out + 1]   = { idx = r.idx, repeats = e.n or 1, region = r, g = g }
+      clean[#clean + 1] = { r = r.idx, n = e.n or 1, g = g }
+      if r.idx ~= e.r or g ~= e.g then changed = true end
     else
       changed = true
+      if e.g and dg and dg[e.g] then
+        det[#det + 1] = { g = e.g, n = e.n or 1, at = pos }
+        det_changed = true
+      end
     end
+  end
+  if dg then
+    -- a step kept aside whose region is back (an undo) returns to its place; one whose pattern was forgotten goes
+    local keep, back = {}, {}
+    for _, d in ipairs(det) do
+      if byguid[d.g] then back[#back + 1] = d
+      elseif dg[d.g] then keep[#keep + 1] = d
+      else det_changed = true end
+    end
+    table.sort(back, function(a, b) return a.at < b.at end)
+    for _, d in ipairs(back) do
+      local r = byguid[d.g]
+      local at = math.max(1, math.min(d.at, #clean + 1))
+      table.insert(clean, at, { r = r.idx, n = d.n, g = d.g })
+      table.insert(out, at, { idx = r.idx, repeats = d.n, region = r, g = d.g })
+      changed, det_changed = true, true
+    end
+    if det_changed then write_det(keep) end
   end
   if changed then write_song(clean) end
   return out
@@ -346,6 +445,7 @@ end
 
 function M.SongClear()
   write_song({})
+  clear_det()
   chain_edited(function() return nil end)   -- an empty chain stops the song
 end
 
@@ -418,7 +518,7 @@ local function build_seq()
   for entry, e in ipairs(M.SongList()) do
     local reps = math.max(1, e.repeats or 1)
     for rep = 1, reps do
-      out[#out + 1] = { idx = e.idx, start = e.region.start, end_ = e.region.end_, entry = entry, rep = rep }
+      out[#out + 1] = { idx = e.idx, g = e.g, start = e.region.start, end_ = e.region.end_, entry = entry, rep = rep }
     end
   end
   return out
@@ -595,7 +695,9 @@ function M.SongTick()
 
   -- Queue the jump to the step AFTER the current one (idempotent each frame;
   -- REAPER fires it at the current region's end). use_timeline_order = false,
-  -- so the index is the region's own marker/region index number. A pending
+  -- so the index is the region's own marker/region index number -- the number
+  -- its GUID has NOW (a renumber while the song plays), the one the step was
+  -- built with when there is no GUID. A pending
   -- arrangement switch overrides: next stop is the NEW chain's first region.
   local after
   if pending then
@@ -608,7 +710,10 @@ function M.SongTick()
       after = seq[after_i]
     end
   end
-  if after then reaper.GoToRegion(0, after.idx, false) end
+  if after then
+    local num = after.g and patterns and patterns.NumberOfGuid and patterns.NumberOfGuid(after.g) or nil
+    reaper.GoToRegion(0, num or after.idx, false)
+  end
 
   last_pp = pp
 end

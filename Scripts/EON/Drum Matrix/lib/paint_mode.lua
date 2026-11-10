@@ -139,13 +139,74 @@ local note_draw_anchor_my  = 0
 local ms_drag_active   = false   -- a drag is in progress
 local ms_drag_kind     = nil     -- 'mute' | 'solo'
 local ms_drag_target_v = 0       -- value to write (B_MUTE: 0/1; I_SOLO: 0/2)
-local ms_drag_touched  = {}      -- { [track] = true } so a lane isn't toggled twice
+local ms_drag_touched  = {}      -- { [button key] = true } so a lane / pad isn't toggled twice
+local ms_drag_grey     = false   -- a greying lane / pad was toggled: the notes are greyed before the block closes
+
+-- The stereo and merged layouts' M / S (2026-10-30, the owner's "each greys its own", "only grey the notes", "add
+-- them now"): a stereo lane IS Swing's own track and a merged lane is the pad's audio track, so their M / S muted /
+-- soloed those tracks -- every source through Swing (live keys, Swing's own sequencer, Steppa) went silent with them.
+-- Their state now lives on the track (note_mute.DM_STATE; the stereo kit's pads: note_mute.DM_PADS, the per-pad
+-- buttons beside its rows) and greys only the Drum Matrix's notes (note_mute.dm_apply), inside the drag's one undo
+-- block: one Ctrl+Z takes back the click and the notes. REAPER's own mute on those tracks stays the user's mixer mute.
+-- Classic lanes keep their track mute / solo. GetLanes: every lane in the project (one lane's solo greys the others).
+local note_mute = dofile(_SCRIPT_DIR .. 'note_mute.lua')
+local function ms_greys(lt) return note_mute.dm_kind(lt.lane_info) ~= nil end
+-- pad = a stereo kit's pad (its per-pad button), nil = the lane's own button
+local function ms_current(lt, kind, pad)
+  if pad then
+    local m, s = note_mute.dm_pad_state(lt.track, pad)
+    if kind == 'mute' then return m and 1 or 0 end
+    return s and 2 or 0
+  end
+  if ms_greys(lt) then
+    local m, s = note_mute.dm_state(lt.track)
+    if kind == 'mute' then return m and 1 or 0 end
+    return s and 2 or 0
+  end
+  return reaper.GetMediaTrackInfo_Value(lt.track, kind == 'mute' and 'B_MUTE' or 'I_SOLO') or 0
+end
+local function ms_write(lt, kind, v, pad)
+  if pad then
+    note_mute.dm_pad_set(lt.track, pad, kind, v > 0.5)
+    ms_drag_grey = true
+  elseif ms_greys(lt) then
+    note_mute.dm_set(lt.track, kind, v > 0.5)
+    ms_drag_grey = true
+  else
+    reaper.SetMediaTrackInfo_Value(lt.track, kind == 'mute' and 'B_MUTE' or 'I_SOLO', v)
+  end
+end
+local function ms_in(rr, mx, my) return rr and mx >= rr.x and mx <= rr.x + rr.w and my >= rr.y and my <= rr.y + rr.h end
+-- Every M / S button of the lanes: { lt, pad (nil = the lane's own pair), key, mute = rect, solo = rect }.
+local function ms_buttons(lane_targets)
+  local out = {}
+  for _, lt in ipairs(lane_targets) do
+    if lt.track then
+      out[#out + 1] = { lt = lt, key = lt.track, mute = lt.mute, solo = lt.solo }
+      for _, pr in ipairs(lt.pad_ms or {}) do
+        out[#out + 1] = { lt = lt, pad = pr.pad, key = tostring(lt.track) .. ':' .. pr.pad, mute = pr.mute, solo = pr.solo }
+      end
+    end
+  end
+  return out
+end
 
 local function reset_ms_drag()
   ms_drag_active   = false
   ms_drag_kind     = nil
   ms_drag_target_v = 0
   ms_drag_touched  = {}
+  ms_drag_grey     = false
+end
+-- Every end of a mute / solo drag: the greying lanes' notes greyed INSIDE the block, then the block closed.
+local function ms_drag_end(label)
+  if ms_drag_grey then
+    local ok, err = pcall(function()
+      return note_mute.dm_apply(note_mute.dm_with_rows(lane_tools.GetLanes(), lane_tools.StereoRows))
+    end)
+    if not ok then reaper.ShowConsoleMsg('[EON DM] lane mute: ' .. tostring(err) .. '\n') end
+  end
+  reaper.Undo_EndBlock(label, -1)
 end
 
 -- Set by the main script each frame: true when the mouse is over the cog button
@@ -1010,7 +1071,7 @@ function M.Update(ctx, lane_targets, coords)
       reset_note_draw()
     end
     if ms_drag_active then
-      reaper.Undo_EndBlock('EON DM: bulk mute/solo', -1)
+      ms_drag_end('EON DM: bulk mute/solo')
       reset_ms_drag()
     end
     return
@@ -1070,7 +1131,7 @@ function M.Update(ctx, lane_targets, coords)
   if ms_drag_active
      and not reaper.ImGui_IsMouseDown(ctx, 0)
      and not reaper.ImGui_IsMouseReleased(ctx, 0) then
-    reaper.Undo_EndBlock('EON DM: bulk mute/solo', -1)
+    ms_drag_end('EON DM: bulk mute/solo')
     reset_ms_drag()
     return
   end
@@ -1139,7 +1200,7 @@ function M.Update(ctx, lane_targets, coords)
   if (drag_active or strip_drag_active or length_drag_active or note_move_active or note_draw_active or select_rect_active or ms_drag_active)
      and mouse_far_from_lanes(my, lane_targets, 80) then
     if ms_drag_active then
-      reaper.Undo_EndBlock('EON DM: bulk mute/solo', -1)
+      ms_drag_end('EON DM: bulk mute/solo')
       reset_ms_drag()
     end
     if drag_active then
@@ -1257,19 +1318,15 @@ function M.Update(ctx, lane_targets, coords)
   -- the same state. Ctrl is reserved for rect-select, so M/S ignores Ctrl.
   if ms_drag_active then
     if reaper.ImGui_IsMouseDown(ctx, 0) then
-      local prop = (ms_drag_kind == 'mute') and 'B_MUTE' or 'I_SOLO'
-      for _, lt in ipairs(lane_targets) do
-        if lt.track and not ms_drag_touched[lt.track] then
-          local rr = (ms_drag_kind == 'mute') and lt.mute or lt.solo
-          if rr and mx >= rr.x and mx <= rr.x + rr.w and my >= rr.y and my <= rr.y + rr.h then
-            reaper.SetMediaTrackInfo_Value(lt.track, prop, ms_drag_target_v)
-            ms_drag_touched[lt.track] = true
-          end
+      for _, bt in ipairs(ms_buttons(lane_targets)) do
+        if not ms_drag_touched[bt.key] and ms_in(ms_drag_kind == 'mute' and bt.mute or bt.solo, mx, my) then
+          ms_write(bt.lt, ms_drag_kind, ms_drag_target_v, bt.pad)   -- a greying lane's / pad's own state, else the track's
+          ms_drag_touched[bt.key] = true
         end
       end
       return
     elseif reaper.ImGui_IsMouseReleased(ctx, 0) then
-      reaper.Undo_EndBlock(('EON DM: bulk %s'):format(ms_drag_kind == 'mute' and 'mute' or 'solo'), -1)
+      ms_drag_end(('EON DM: bulk %s'):format(ms_drag_kind == 'mute' and 'mute' or 'solo'))
       reset_ms_drag()
       return
     end
@@ -1279,26 +1336,17 @@ function M.Update(ctx, lane_targets, coords)
      and not ms_drag_active and not drag_active and not strip_drag_active
      and not length_drag_active and not note_move_active and not note_draw_active
      and not select_rect_active then
-    for _, lt in ipairs(lane_targets) do
-      local rm = lt.mute
-      if rm and mx >= rm.x and mx <= rm.x + rm.w and my >= rm.y and my <= rm.y + rm.h then
-        local cur  = reaper.GetMediaTrackInfo_Value(lt.track, 'B_MUTE') or 0
-        local newv = (cur > 0.5) and 0 or 1
-        reaper.Undo_BeginBlock()
-        reaper.SetMediaTrackInfo_Value(lt.track, 'B_MUTE', newv)
-        ms_drag_active = true; ms_drag_kind = 'mute'; ms_drag_target_v = newv
-        ms_drag_touched = { [lt.track] = true }
-        return
-      end
-      local rs = lt.solo
-      if rs and mx >= rs.x and mx <= rs.x + rs.w and my >= rs.y and my <= rs.y + rs.h then
-        local cur  = reaper.GetMediaTrackInfo_Value(lt.track, 'I_SOLO') or 0
-        local newv = (cur > 0.5) and 0 or 2
-        reaper.Undo_BeginBlock()
-        reaper.SetMediaTrackInfo_Value(lt.track, 'I_SOLO', newv)
-        ms_drag_active = true; ms_drag_kind = 'solo'; ms_drag_target_v = newv
-        ms_drag_touched = { [lt.track] = true }
-        return
+    for _, bt in ipairs(ms_buttons(lane_targets)) do
+      for _, kind in ipairs({ 'mute', 'solo' }) do
+        if ms_in(bt[kind], mx, my) then
+          local cur  = ms_current(bt.lt, kind, bt.pad)
+          local newv = (cur > 0.5) and 0 or (kind == 'mute' and 1 or 2)
+          reaper.Undo_BeginBlock()
+          ms_write(bt.lt, kind, newv, bt.pad)   -- a greying lane's / pad's own state (notes greyed at the block's end)
+          ms_drag_active = true; ms_drag_kind = kind; ms_drag_target_v = newv
+          ms_drag_touched = { [bt.key] = true }
+          return
+        end
       end
     end
   end
@@ -1833,7 +1881,8 @@ function M.Update(ctx, lane_targets, coords)
       if reaper.ImGui_MenuItem(ctx, 'Shift right')   then lane_tools.ShiftLane(lane,  1); reaper.ImGui_CloseCurrentPopup(ctx) end
       reaper.ImGui_Separator(ctx)
       if reaper.ImGui_MenuItem(ctx, 'Duplicate bar \xE2\x86\x92 next (this lane)') then lane_tools.DuplicateBarToNext(lane); reaper.ImGui_CloseCurrentPopup(ctx) end
-      if reaper.ImGui_MenuItem(ctx, 'Duplicate bar \xE2\x86\x92 next (all lanes)') then lane_tools.DuplicateBarAllLanes();   reaper.ImGui_CloseCurrentPopup(ctx) end
+      -- all lanes of THIS lane's kit (two kits in a project: the other kit is not touched)
+      if reaper.ImGui_MenuItem(ctx, 'Duplicate bar \xE2\x86\x92 next (all lanes)') then lane_tools.DuplicateBarAllLanes(nil, lane_tools.KitOf(lane.lane_info)); reaper.ImGui_CloseCurrentPopup(ctx) end
       reaper.ImGui_Separator(ctx)
       -- clear_first = true: "Fill every N" SETS the lane to exactly every-N (replace),
       -- not additive. Without it, Fill-2 then Fill-8 stays every-2 (8's steps are a subset

@@ -1,0 +1,168 @@
+// rk_swing_ui_layer_mixer.jsfx-inc -- the pad editor's LAYER MIXER (2026-10-28). The owner: "i also need a way to solo
+// each layer when i have layers. Maybe a mini layer mixer" ... "i want a trigger per layer" ... "I want the arrangement
+// actually to be vertical, almost a little bit like a mixer" -- the approved look (pad_fx_layer_mixer_vertical_pan):
+// one strip per layer L1..L4 -- its button (the layer the editor shows), its sample, play / S / M, a pan knob and a
+// level fader in dB -- then the SYN strip (the pad's synth: "we left out a synth layer", the same day) and a gold PAD
+// strip: the whole pad's pan and gain, which leave the knob row while the mixer shows. Under the editor's buttons (the
+// owner: "put the mini mixer right up under where like the buttons are"); its title row folds it to a bar ("it's just
+// a very tall mixer" -- lmix_fold, saved with the project).
+// The engine: l_pan / l_mute / l_solo and ps_pan / ps_mute / ps_solo (Swing_ReaKit.jsfx), swing_layer_audible /
+// swing_layer_sounds / swing_syn_audible (rk_drumkit_dsp), the click codes 1000 + L (play one layer), -1 (the synth
+// alone) and 2000 (a mute / solo changed) in rk_swing_block. A PLAIN pad (its one sample, no layers) is L1: its level,
+// pan and mute are layer 0's.
+// This file: the state, the room the mixer takes, and the strips' drop-target test (the state, the browsers and the
+// pads, imported before them, call these). The drawing: rk_swing_ui_layer_mixer_p2 (after rk_swing_ui_overlay_syn,
+// whose engine names and colours the SYN strip wears).
+// (c) EON Studios — All Rights Reserved
+
+// ⚠️ @init IS LOAD-BEARING (.docs/wiki/02-file-structure.md).
+@init
+LMIX_H = 180;           // the mixer's height under the buttons (title row + strips), unscaled px like the editor's 420 x 560
+                        // (200 until 2026-10-28: the owner's polish pass, "tighter strips"; the faders keep ~55 px of travel)
+lmix_syn_pad = -1;      // the pad the SYN drum's menu was opened for (swing_lmix_syn_menu; its pick lands there)
+LMIX_BAR_H = 16;        // folded: its title row alone (lmix_fold -- saved with the project, gate 85; never assigned here)
+ov_lmix_on = 0;         // the layout drawing the editor shows the WHOLE mixer (set by each caller before the sections):
+ov_lmix_h = 0;          // the knob row then drops GAIN / PAN; ov_lmix_h = what the buttons sit above (the bar, folded)
+lmix_drag = -1;         // the fader held: 0..3 a layer's, 4 the PAD gain, 5 the synth's level; -1 none
+lmix_dy0 = 0; lmix_dp0 = 0; lmix_click_t = 0; lmix_click_id = -1; lmix_fchg = 0;
+ovl_lmix_t = 0;         // the strips as a drop target (a file onto a strip loads that layer): drawn at, pad, x, y, h,
+ovl_lmix_pad = -1; ovl_lmix_x = 0; ovl_lmix_y = 0; ovl_lmix_h = 0; ovl_lmix_u = 0; ovl_lmix_g = 0;   // strip width, gap
+
+// ── The pad editor's ZOOM (2026-10-28, the owner: "all the text is really small" ... "the tabs themselves are small" ...
+// "maybe im asking for smarter scaling"). Every size in the editor's sections and in this mixer is a design px of the
+// 420 x 560 floating editor, drawn through ov_k: ov_px(v) for a length, ov_font(sz, fl) for type. ov_k = the text size
+// the user picked (pfx_tsz, the editor's OWN since 2026-10-29 -- the owner: "Can pad fx get its own options sepereate
+// fromt the mini browser" -- set on its OPTIONS sheet, saved, gate 90: -4..+6 -> 1.0..2.0, default 1.4; until then the
+// mini browser's SIZE, shared),
+// times what the panel's width gives past 420 (drag the side panel wider and all of it grows together), and never more
+// than the width holds: OV_MIN_DW design px across (the buttons' row is the widest fixed row). Set by each host before
+// the sections: swing_ov_zoom(w) for a panel, swing_ov_fk() for the floating editor (its window's room). The mixer
+// takes its own share (swing_lmix_draw: its strips' width). Design px stay design px everywhere else: OV_* heights,
+// swing_lmix_h(), ov_lmix_h; a host multiplies where it lays them out.
+ov_k = 1;
+OV_MIN_DW = 290;   // the buttons' row: OUT LEARN CHOKE from the left (174), 1SHOT REV from the right (108), a gap between
+function ov_px(v) ( floor(v * ov_k + 0.5) );
+function ov_fs(sz) ( max(7, floor(sz * ov_k + 0.5)) );
+// in the editor's TYPEFACE (pfx_font 0..4, set on its OPTIONS sheet, gate 91; 0 Arial): rk_font_face for this call only
+function ov_font(sz, fl) ( rk_font_face = pfx_font; rk_font(1, ov_fs(sz), fl); rk_font_face = 0; );
+function swing_ov_userk() ( 1 + 0.1 * (max(-4, min(6, pfx_tsz)) + 4) );
+function swing_ov_zoom(w) ( ov_k = max(1, min(swing_ov_userk() * max(1, w / 420), w / OV_MIN_DW)); );
+// A line of text at (x, y) in the font set now, cut at the end with "~" until it fits maxw (the header's name: the zoom
+// gives it less room)
+function ov_ltext(s, x, y, maxw) local(tw, th, n) (
+  strcpy(#ov_lt, s); gfx_measurestr(#ov_lt, tw, th); n = strlen(#ov_lt);
+  while (tw > maxw && n > 1) ( n -= 1; strcpy_substr(#ov_lt, s, 0, n); strcat(#ov_lt, "~"); gfx_measurestr(#ov_lt, tw, th); );
+  maxw > 0 ? ( gfx_x = x; gfx_y = y; gfx_drawstr(#ov_lt); );
+);
+
+// ── The LCD look (2026-10-28, step 3; the owner: "should we make this like the mini browser? lcd or theme?"): the
+// editor's OWN look since 2026-10-29, pfx_look (0 CHASSIS, 1 LCD, 2 THEME below; its OPTIONS sheet, saved, gate 90 -- until then the
+// browser's fb_lcd, shared). CHASSIS: the editor as it was, its fixed dark chassis. On: every colour the editor and this mixer set goes through ov_set,
+// which maps a NEUTRAL grey onto the LCD's colours (lcd_bg_* / lcd_tx_*, rk_swing_ui_state_p3): the chassis ground
+// (luma 0.16) becomes the screen's ground, the ink (0.75) its text, the greys between a blend of the two, a darker one
+// a darker ground, a brighter one past the text; a colour (the pad's, a knob's cap, an accent, a swatch) passes as it is.
+// One mapping, so the whole editor turns at once and nothing is coloured twice. ov_cr / cg / cb: the colour it set (the rig
+// reads them: the harness keeps no gfx_r).
+// THEME (pfx_look 2; the same day, the owner: "I've never liked its plain background. should it match the theme?" --
+// "Yes"): the same one mapping onto the theme's own: the ground the side panel takes from it (pad_well_*: the mini
+// browser's chassis, rk_swing_ui_minibrowser_p3 swing_fb_ground) and its ink, black or white, whichever stands further
+// from that ground. One straight line from the ground to the ink through the chassis' greys -- a darker one steps past
+// the ground the other way (on a light theme: a lighter band), a brighter one toward the ink -- so a light theme's editor
+// reads dark-on-light whole. Then a FLOOR (the owner: "make sure all the texxt is visible and easy to read. Values too.
+// ANd ensure that themes dont make things hard to see"): a grey the chassis uses for text or a mark (luma 0.45 and up)
+// is drawn at least ov_th_tmin of the way to the ink, the step that stands 4.5:1 from the ground (WCAG), worked out when
+// the theme's ground changes (_ov_theme_prep) -- so no tray, however mid-grey, leaves a label or a value faint. Every
+// colour passes, as in LCD -- and so do the SCREENS (the waveform's, its folded strip, the EQ's: ov_scr, set while one
+// draws): their marks (the trim handles, the envelope, the frequencies) were made for a dark screen, and a light theme
+// turned the screen itself light under them (the sandbox pictures).
+ov_scr = 0;
+ov_th_r = -1; ov_th_g = -1; ov_th_b = -1; ov_th_ink = 1; ov_th_tmin = 0.6;
+function _ov_lum(c) ( c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4) );
+function _ov_rl(r, g, b) ( 0.2126 * _ov_lum(r) + 0.7152 * _ov_lum(g) + 0.0722 * _ov_lum(b) );
+function _ov_theme_prep() local(lg, lo, hi, mid, lc) (
+  pad_well_r != ov_th_r || pad_well_g != ov_th_g || pad_well_b != ov_th_b ? (
+    ov_th_r = pad_well_r; ov_th_g = pad_well_g; ov_th_b = pad_well_b;
+    lg = _ov_rl(ov_th_r, ov_th_g, ov_th_b);
+    ov_th_ink = 1.05 / (lg + 0.05) >= (lg + 0.05) / 0.05 ? 1 : 0;   // white or black: the one further from the ground
+    lo = 0; hi = 1;
+    loop(16,
+      mid = (lo + hi) * 0.5;
+      lc = _ov_rl(ov_th_r + (ov_th_ink - ov_th_r) * mid, ov_th_g + (ov_th_ink - ov_th_g) * mid, ov_th_b + (ov_th_ink - ov_th_b) * mid);
+      (max(lc, lg) + 0.05) / (min(lc, lg) + 0.05) >= 4.5 ? hi = mid : lo = mid;
+    );
+    ov_th_tmin = hi;
+  );
+);
+function ov_set(r, g, b, a) local(v, t) (
+  ov_cr = r; ov_cg = g; ov_cb = b;
+  pfx_look == 2 && !ov_scr && max(r, max(g, b)) - min(r, min(g, b)) < 0.10 ? (
+    _ov_theme_prep();
+    v = r * 0.299 + g * 0.587 + b * 0.114;
+    t = max(-0.3, min(1, (v - 0.16) / 0.59));
+    v >= 0.45 ? t = max(t, ov_th_tmin);   // text and marks: never fainter than 4.5:1
+    ov_cr = max(0, min(1, ov_th_r + (ov_th_ink - ov_th_r) * t));
+    ov_cg = max(0, min(1, ov_th_g + (ov_th_ink - ov_th_g) * t));
+    ov_cb = max(0, min(1, ov_th_b + (ov_th_ink - ov_th_b) * t));
+  );
+  pfx_look == 1 && max(r, max(g, b)) - min(r, min(g, b)) < 0.10 ? (
+    v = r * 0.299 + g * 0.587 + b * 0.114;
+    v <= 0.16 ? ( t = v / 0.16; ov_cr = lcd_bg_r * t; ov_cg = lcd_bg_g * t; ov_cb = lcd_bg_b * t; )
+              : ( t = min(1.25, (v - 0.16) / 0.59);
+                  ov_cr = max(0, min(1, lcd_bg_r + (lcd_tx_r - lcd_bg_r) * t));
+                  ov_cg = max(0, min(1, lcd_bg_g + (lcd_tx_g - lcd_bg_g) * t));
+                  ov_cb = max(0, min(1, lcd_bg_b + (lcd_tx_b - lcd_bg_b) * t)); );
+  );
+  gfx_set(ov_cr, ov_cg, ov_cb, a);
+);
+// A COLOURED label on the editor's own ground (a folded bar's line, the clear buttons' words): ov_set, and in THEME (off
+// a screen) held at 4.5:1 from the theme's ground -- its colour stepped toward the ink (darker on a light theme) only as
+// far as that takes. A colour passes ov_set as it is, and a gold made for the dark chassis vanished on a light tray (the
+// sandbox pictures, 2026-10-29).
+function ov_ink(r, g, b, a) local(lg, k, rr, gg, bb, lc) (
+  ov_set(r, g, b, a);
+  pfx_look == 2 && !ov_scr ? (
+    _ov_theme_prep(); lg = _ov_rl(ov_th_r, ov_th_g, ov_th_b);
+    k = 0; rr = r; gg = g; bb = b;
+    loop(20,
+      lc = _ov_rl(rr, gg, bb);
+      (max(lc, lg) + 0.05) / (min(lc, lg) + 0.05) < 4.5 ? (
+        k = min(1, k + 0.05); rr = r + (ov_th_ink - r) * k; gg = g + (ov_th_ink - g) * k; bb = b + (ov_th_ink - b) * k;
+      );
+    );
+    ov_cr = rr; ov_cg = gg; ov_cb = bb; gfx_set(rr, gg, bb, a);
+  );
+);
+
+// Its height is the user's (2026-10-29, the owner: "can we give the layer mixer a handle to make it taller"): LMIX_H +
+// lmix_hx, dragged on the side panel's handle over the pinned mixer (rk_swing_ui_padfx_panel swing_pfx_pin_draw), saved
+// with the project (gate 89; a view setting, swing_view_keep b[63]; never assigned here, 0 = the default 180). Every
+// host lays the mixer out at it. lmix_force_h: a host that has less room than that hands the mixer its height in px
+// (the pinned mixer in a short window); 0 = none. Shorter than LMIX_H the strips' faders turn into knobs (the owner, the
+// same day: "just when it gets too small turn the faders to knobs"; rk_swing_ui_layer_mixer_p2 swing_lmix_level), which
+// is what lets it go this short.
+LMIX_HX_MIN = -72;      // 108 design px at least: the strips with knobs (the play / S / M row, the pan and level knobs side by side)
+LMIX_HX_MAX = 420;      // 600 at most
+LMIX_STACK_SH = 122;    // a strip at least this tall (design px) keeps the level knob under its pan; shorter, beside it
+lmix_force_h = 0;
+lmix_kn = 0; lmix_kx = 0; lmix_ky = 0;   // the draw's level: 0 faders, 1 knobs under the pans, 2 beside them; the last control's centre
+lmix_pgx = 0; lmix_pgy = 0;              // the PAD strip's level control's centre (for the rig)
+// The room the mixer takes: the strips, or folded its bar (design px)
+function swing_lmix_h() ( lmix_fold ? LMIX_BAR_H : LMIX_H + max(LMIX_HX_MIN, min(LMIX_HX_MAX, lmix_hx)) );
+
+// The pop-up editor (over the pads, the compact faces) carries the mixer only where the window has the room: a small
+// face keeps its 560 and the GAIN / PAN knobs. The side panel and the panel below the pads always show it (they scroll).
+// Its zoom: the user's, as far as the window holds the editor whole (it cannot scroll); its size in px follows.
+function swing_ov_lmix_fits() ( ui_bot - 28 >= 560 + swing_lmix_h() + 8 );
+function swing_ov_fk() ( max(1, min(swing_ov_userk(), min((ui_bot - 36) / (560 + (swing_ov_lmix_fits() ? swing_lmix_h() : 0)), (gfx_w - 16) / 420))) );
+function swing_ov_w() ( floor(420 * swing_ov_fk() + 0.5) );
+function swing_ov_h() ( floor((560 + (swing_ov_lmix_fits() ? swing_lmix_h() : 0)) * swing_ov_fk() + 0.5) );
+
+// The layer under (px, py) on the mixer's strips drawn this quarter second for pad `pad`, or -1 (the SYN strip, past
+// the four, takes no drop)
+function swing_lmix_layer_at(pad, px, py) local(k) (
+  time_precise() - ovl_lmix_t < 0.25 && ovl_lmix_pad == pad && py >= ovl_lmix_y && py <= ovl_lmix_y + ovl_lmix_h
+    && px >= ovl_lmix_x && ovl_lmix_u > 0 ? (
+    k = ((px - ovl_lmix_x) / (ovl_lmix_u + ovl_lmix_g)) | 0;
+    k < MAX_LAYERS && px - ovl_lmix_x - k * (ovl_lmix_u + ovl_lmix_g) <= ovl_lmix_u ? k : -1;
+  ) : -1;
+);

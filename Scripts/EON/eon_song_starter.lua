@@ -476,6 +476,7 @@ end
 
 function M.user_templates()
   local out = {}
+  core.recover_prev(user_templates_path())   -- a crash mid-save left only the .prev (F06)
   local f = io.open(user_templates_path(), "r")
   if not f then return out end
   for line in f:lines() do
@@ -511,31 +512,34 @@ function M.save_template(t)
                 bars = tonumber(t.bars) or M.DEFAULT_BARS,
                 sections = clean(t.sections) }
 
+  -- An unreadable file is not an absent one (wiki 6.14): user_templates()
+  -- reads a locked file as "no templates", and saving that list would replace
+  -- every saved template with this one row.
+  local path = user_templates_path()
+  if reaper.file_exists(path) then
+    local rf = io.open(path, "r")
+    if not rf then return false, "cannot read the saved templates: " .. path end
+    rf:close()
+  end
+
   local list, replaced = M.user_templates(), false
   for i, e in ipairs(list) do
     if e.name:lower() == name:lower() then list[i] = row; replaced = true; break end
   end
   if not replaced then list[#list + 1] = row end
 
-  -- A temp file, every write checked, then renamed over the old one. "w" in
-  -- place emptied the file FIRST, so a failed write (disk full, a dropped
-  -- share, an AV lock) wiped every saved template and still returned true
-  -- (sweep SCR120; the house pattern, wiki 6.14).
-  local path = user_templates_path()
-  local tmp = path .. ".tmp"
-  local f, err = io.open(tmp, "w")
-  if not f then return false, tostring(err) end
-  for _, e in ipairs(list) do
-    -- %.10g so a whole-number tempo writes "120", not "120.0".
-    local ok, werr = f:write(string.format("%s\t%.10g\t%.10g\t%s\n",
-                                           e.name, e.bpm, e.bars, e.sections))
-    if not ok then f:close(); os.remove(tmp); return false, tostring(werr) end
-  end
-  local ok, cerr = f:close()
-  if not ok then os.remove(tmp); return false, tostring(cerr) end
-  os.remove(path)
-  local rok, rerr = os.rename(tmp, path)
-  if not rok then return false, tostring(rerr) end
+  -- The house checked writer (temp file, every write and the close checked,
+  -- the old file stepped aside and put back if the swap fails). "w" in place
+  -- emptied the file FIRST (sweep SCR120); the inline temp+rename that replaced
+  -- it still REMOVED the old file before the rename, so a failed rename (an AV
+  -- hold on the fresh temp) lost every template (outside audit F01, 2026-10-28).
+  local ok, err = core.atomic_write(path, function(f)
+    for _, e in ipairs(list) do
+      -- %.10g so a whole-number tempo writes "120", not "120.0".
+      f:write(string.format("%s\t%.10g\t%.10g\t%s\n", e.name, e.bpm, e.bars, e.sections))
+    end
+  end)
+  if not ok then return false, tostring(err) end
   return true
 end
 

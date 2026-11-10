@@ -275,11 +275,30 @@ local function draw_tools_tab(ctx)
   r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonActive(),  0xAA3333FF)
   if r.ImGui_Button(ctx, 'Clear ALL lanes', 200, 0) then
     -- The count is the kit's, not a fixed 16 (DM227): a stereo grid is one lane, a parallel set is 32.
-    local n_lanes = #lanes
-    if r.ShowMessageBox(string.format('Delete every note across all %d drum lane%s?\nThis can be undone with Ctrl+Z.',
-                                      n_lanes, n_lanes == 1 and '' or 's'),
-                        'EON Drum Matrix', 4) == 6 then
-      lane_tools.ClearAllLanes()
+    -- LOCKED lanes are kept (ClearAllLanes skips them), so the count is the lanes it will clear.
+    -- ONE kit (2026-11-05): with two kits in the project, the one the selection names; none named -> nothing cleared
+    -- (ToolLanes says why in the status bar). The kit is resolved once and handed on, so the box and the clear agree.
+    local kit = lane_tools.CurrentKit(lanes)
+    local kit_lanes = kit and lane_tools.GetKitLanes(kit, lanes) or lane_tools.ToolLanes(nil)
+    if kit_lanes then
+      local n_clear, n_locked = 0, 0
+      for _, lane in ipairs(kit_lanes) do
+        if lane.lane_info.locked == true then n_locked = n_locked + 1 else n_clear = n_clear + 1 end
+      end
+      local kit_part = ''
+      if #lane_tools.Kits(lanes) > 1 then
+        local nm = lane_tools.KitName(kit)
+        kit_part = nm and (' of the kit "' .. nm .. '"') or ' of the selected kit'
+      end
+      if n_clear == 0 then   -- the tab returned above when there are no lanes, so every one is locked
+        reaper.Help_Set('EON DM: every lane is locked -- nothing to clear (unlock in Settings > Pads)', false)
+      elseif r.ShowMessageBox(string.format('Delete every note on %d drum lane%s%s?%s\nThis can be undone with Ctrl+Z.',
+                                            n_clear, n_clear == 1 and '' or 's', kit_part,
+                                            n_locked > 0 and string.format('\n%d locked lane%s will be kept.',
+                                                                           n_locked, n_locked == 1 and '' or 's') or ''),
+                              'EON Drum Matrix', 4) == 6 then
+        lane_tools.ClearAllLanes(kit)
+      end
     end
   end
   r.ImGui_PopStyleColor(ctx, 3)
@@ -311,8 +330,9 @@ local function draw_tools_tab(ctx)
   end
   if r.ImGui_IsItemHovered(ctx) then
     r.ImGui_SetTooltip(ctx,
-      'Flatten every lane into one MIDI item on a new track below the kit, ' ..
-      'routed into Swing like the lanes. Source lanes are untouched; one undo step.')
+      'Flatten every lane of the kit into one MIDI item on a new track below it, ' ..
+      'routed into its Swing like the lanes. Source lanes are untouched; one undo step. ' ..
+      'With two kits in the project, select a track of the kit first.')
   end
 end
 
@@ -659,32 +679,36 @@ function M.Draw(ctx, overlay_bounds)
       -- without an exact (genre, category) match still get patterns. Reports
       -- counts via status bar so the user knows what happened.
       local picked_genre = settings.Get('genre') or 'hip-hop'
-      reaper.Undo_BeginBlock()
-      local rolled, skipped_locked, skipped_nopreset, skipped_stereo = 0, 0, 0, 0
-      for _, lane in ipairs(lane_tools.GetLanes()) do
-        if lane.lane_info.locked then
-          skipped_locked = skipped_locked + 1
-        elseif lane.lane_info.stereo == true then
-          -- whole-kit lane: a per-pad preset has no single row to land on
-          skipped_stereo = skipped_stereo + 1
-        else
-          local cat = category.GetForLane(lane.lane_info)
-          local preset = preset_lib.GetRandom(picked_genre, cat)
-          if preset then
-            preset_lib.Apply(lane, preset)
-            rolled = rolled + 1
+      -- ONE kit (2026-11-05): the one the selection names, the only one, or none (ToolLanes says why)
+      local kit_lanes = lane_tools.ToolLanes(nil)
+      if kit_lanes then
+        reaper.Undo_BeginBlock()
+        local rolled, skipped_locked, skipped_nopreset, skipped_stereo = 0, 0, 0, 0
+        for _, lane in ipairs(kit_lanes) do
+          if lane.lane_info.locked then
+            skipped_locked = skipped_locked + 1
+          elseif lane.lane_info.stereo == true then
+            -- whole-kit lane: a per-pad preset has no single row to land on
+            skipped_stereo = skipped_stereo + 1
           else
-            skipped_nopreset = skipped_nopreset + 1
+            local cat = category.GetForLane(lane.lane_info)
+            local preset = preset_lib.GetRandom(picked_genre, cat)
+            if preset then
+              preset_lib.Apply(lane, preset)
+              rolled = rolled + 1
+            else
+              skipped_nopreset = skipped_nopreset + 1
+            end
           end
         end
+        reaper.Undo_EndBlock(string.format("EON DM: randomize kit (%s)", picked_genre), -1)
+        reaper.Help_Set(string.format(
+          'EON DM Randomize Kit: %d rolled, %d locked, %d no preset%s',
+          rolled, skipped_locked, skipped_nopreset,
+          skipped_stereo > 0 and string.format(', %d stereo grid lane skipped', skipped_stereo) or ''), false)
       end
-      reaper.Undo_EndBlock(string.format("EON DM: randomize kit (%s)", picked_genre), -1)
-      reaper.Help_Set(string.format(
-        'EON DM Randomize Kit: %d rolled, %d locked, %d no preset%s',
-        rolled, skipped_locked, skipped_nopreset,
-        skipped_stereo > 0 and string.format(', %d stereo grid lane skipped', skipped_stereo) or ''), false)
     end
-    r.ImGui_SetItemTooltip(ctx, "Roll a random preset on every unlocked lane whose category has presets in the current genre. Lanes without a matching preset stay untouched — not every sound fits every genre.")
+    r.ImGui_SetItemTooltip(ctx, "Roll a random preset on every unlocked lane whose category has presets in the current genre. Lanes without a matching preset stay untouched — not every sound fits every genre. With two kits in the project, select a track of the kit first.")
 
     r.ImGui_SameLine(ctx)
     if r.ImGui_Button(ctx, 'Full Kit', 90, 0) then
@@ -693,15 +717,19 @@ function M.Draw(ctx, overlay_bounds)
       -- lane by category. Unlike Randomize Kit (independent per-lane rolls), the
       -- lanes come from the same human-made loop, so they stay mutually musical.
       local picked_genre = settings.Get('genre') or 'hip-hop'
-      local group = preset_lib.GetRandomGroup(picked_genre, last_full_kit_group[picked_genre])
-      if not group then
+      -- ONE kit (2026-11-05): the one the selection names, the only one, or none (ToolLanes says why)
+      local kit_lanes = lane_tools.ToolLanes(nil)
+      local group = kit_lanes and preset_lib.GetRandomGroup(picked_genre, last_full_kit_group[picked_genre])
+      if not kit_lanes then
+        -- nothing: the status bar already asks for the kit
+      elseif not group then
         reaper.Help_Set(string.format(
           'EON DM Full Kit: no imported kits for "%s" — run EON_DM_ImportMIDI first', picked_genre), false)
       else
         last_full_kit_group[picked_genre] = group
         reaper.Undo_BeginBlock()
         local rolled, skipped_locked, cleared, skipped_stereo = 0, 0, 0, 0
-        for _, lane in ipairs(lane_tools.GetLanes()) do
+        for _, lane in ipairs(kit_lanes) do
           if lane.lane_info.locked then
             skipped_locked = skipped_locked + 1
           elseif lane.lane_info.stereo == true then
@@ -731,7 +759,7 @@ function M.Draw(ctx, overlay_bounds)
           skipped_stereo > 0 and string.format(', %d stereo grid lane skipped', skipped_stereo) or ''), false)
       end
     end
-    r.ImGui_SetItemTooltip(ctx, "Stamp one imported loop as a coherent full kit: every unlocked lane gets that same loop's fragment for its category. Click again to roll a different kit. Needs imported MIDI (EON_DM_ImportMIDI).")
+    r.ImGui_SetItemTooltip(ctx, "Stamp one imported loop as a coherent full kit: every unlocked lane gets that same loop's fragment for its category. Click again to roll a different kit. Needs imported MIDI (EON_DM_ImportMIDI). With two kits in the project, select a track of the kit first.")
 
     r.ImGui_Separator(ctx)
 

@@ -230,6 +230,49 @@ local function lg_set(id, pad, pid, v)
   b[pid] = v
 end
 
+-- The kit-wide STRIPS view and VU face (inst.view_mode / inst.vu_style, set by Swing's chips or a strip's ">ALL"),
+-- keyed by instance id like last_good, so they outlive the instance record (2026-10-30, the readers check of the
+-- round-2 project-tabs job): scan_structure walks the ACTIVE project only and drops a Swing whose tab went to the
+-- background; its record came back with both nil, and a strip inserted or re-instantiated after that never took the
+-- kit's choice until a chip was clicked again. Not across a restart of this script or a project reopen (Swing
+-- re-posts its choice only on a click).
+local view_keep = {}
+local function view_restore(inst, id)
+  local k = view_keep[id]
+  if k then inst.view_mode, inst.vu_style = k.view, k.vu end
+end
+
+-- The re-init window PER STRIP (sweep SCR216, 2026-10-30). The shared pulse (GS_STRIP_REINIT_PULSE) says that SOME
+-- strip came up fresh, so its window opened the restore pass for EVERY strip: a knob a user reset to its default on
+-- strip X within REINIT_HOLD_S of any other strip's fresh instance (an insert, a project open) was put back. Each strip
+-- now writes its own instance number into its hidden "Init Generation" slider on its first @block (EON_Drum_Strip
+-- slider33), and only the strip whose number ROSE gets the window, keyed by its FX GUID so a record rebuilt during a
+-- minimize keeps it. First sight (or the slider's unset 0) records the number without a window; a number that went
+-- DOWN (an undo putting back an older chunk) is ignored. A strip without the slider (an older build) keeps the shared
+-- window. Returns whether `ch` is inside its window now.
+local gen_seen, gen_until = {}, {}
+local function child_reinit(ch, reinit, now)
+  local gi = ch.pmap and ch.pmap.igen
+  if not gi or not ch.guid or ch.guid == "" then return reinit end
+  local g = reaper.TrackFX_GetParam(ch.tr, ch.fxidx, gi) or 0
+  local seen = gen_seen[ch.guid]
+  if seen == nil or seen < 0.5 then
+    gen_seen[ch.guid] = g
+  elseif g > seen + 0.5 then
+    gen_seen[ch.guid] = g
+    gen_until[ch.guid] = now + REINIT_HOLD_S
+  end
+  return now < (gen_until[ch.guid] or 0)
+end
+-- keep a strip's window open while the restore pass is healing it (the shared window for an older strip)
+local function child_reinit_extend(ch, now)
+  if ch.pmap and ch.pmap.igen and ch.guid and ch.guid ~= "" then
+    gen_until[ch.guid] = math.max(gen_until[ch.guid] or 0, now + 2.0)
+  else
+    reinit_until = math.max(reinit_until, now + 2.0)
+  end
+end
+
 -- ── Helpers ────────────────────────────────────────────────────────────────
 
 local function find_fx_by_guid(tr, guid)
@@ -360,6 +403,7 @@ local function build_pmap(tr, fxidx)
   pmap.vbcast = by_name["View Broadcast"]
   pmap.vset   = by_name["View Push"]
   pmap.vuset  = by_name["VU Set"]
+  pmap.igen   = by_name["Init Generation"]   -- SCR216 (child_reinit); absent on older strips -> the shared pulse
   return pmap, missing
 end
 
@@ -634,6 +678,7 @@ local function scan_structure()
             for p = SPLIT0, SPLIT0 + SPLIT_N - 1 do
               inst.cache[p] = {}; inst.expected[p] = {}; inst.inflight[p] = {}
             end
+            view_restore(inst, id)   -- the kit's STRIPS / VU choice if this Swing had a record before (a tab switch)
             instances[id] = inst
           end
           inst.id    = id
@@ -944,10 +989,12 @@ local function sync_instance(inst, reinit)
   -- (last_good, else the band) and RE-ASSERT into Swing so a wiped Swing pad heals
   -- too. Only runs inside the pulse window, so normal editing (incl. deliberately
   -- turning a filter OFF, or a double-click back to default) is untouched.
-  if reinit then
-    local now0 = reaper.time_precise()
+  -- Since 2026-10-30 (SCR216) the window is each strip's own (child_reinit, ch.ri): only the strip that came up fresh.
+  local now0 = reaper.time_precise()
+  for _, ch in pairs(kids) do ch.ri = child_reinit(ch, reinit, now0) end
+  do
     for pad, ch in pairs(kids) do
-      for pid in pairs(PID_TO_STRIP) do
+      if ch.ri then for pid in pairs(PID_TO_STRIP) do
         local def = STRIP_DEFAULT[pid]
         if def ~= nil and not inst.inflight[pad][pid] then
           local sv = reaper.TrackFX_GetParam(ch.tr, ch.fxidx, ch.pmap[pid])
@@ -973,11 +1020,11 @@ local function sync_instance(inst, reinit)
               end
               if not found then inst.queue[#inst.queue + 1] = { pad = pad, pid = pid, val = rb } end
               -- keep the window alive while we are actively healing
-              reinit_until = math.max(reinit_until, now0 + 2.0)
+              child_reinit_extend(ch, now0)
             end
           end
         end
-      end
+      end end
     end
   end
 
@@ -1077,7 +1124,7 @@ local function sync_instance(inst, reinit)
         -- A genuine strip edit observed OUTSIDE a re-init window is the user's
         -- intent → record it as durable. Inside the window we never get here for
         -- a wipe (the restore pass settled expected first), but guard anyway.
-        if not reinit and inst.id then lg_set(inst.id, pad, pid, sv) end
+        if not ch.ri and inst.id then lg_set(inst.id, pad, pid, sv) end
         local found = false
         local i = 1
         while i <= #inst.queue do
@@ -1088,7 +1135,7 @@ local function sync_instance(inst, reinit)
         if not found then
           inst.queue[#inst.queue + 1] = { pad = pad, pid = pid, val = sv }
         end
-      elseif not reinit and inst.id and not inst.inflight[pad][pid] then
+      elseif not ch.ri and inst.id and not inst.inflight[pad][pid] then
         -- Settled value (strip matches what we last set; nothing pending) →
         -- keep the durable record current, including deliberate defaults.
         lg_set(inst.id, pad, pid, sv)
@@ -1164,6 +1211,7 @@ local function sync_view(inst)
     inst.vu_style = math.max(-1, math.min(19, math.floor(vreq + 0.5) - 2))
     vevent = true
   end
+  if inst.id and (req ~= nil or vevent) then view_keep[inst.id] = { view = inst.view_mode, vu = inst.vu_style } end
 
   -- 2. Push the shared view mode / VU face to every sibling whose pushed value is stale.
   -- On a broadcast EVENT (req / vevent) a sibling whose pushed value already equals the mode gets

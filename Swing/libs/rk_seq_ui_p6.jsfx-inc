@@ -1,0 +1,183 @@
+// rk_seq_ui_p6.jsfx-inc -- part 6 of rk_seq_ui.jsfx-inc (6 parts), cut at a function boundary by
+// .dev_tests/split_big_incs.py: REAPER's load time grows with the square of a file's size. Edit freely;
+// keep each file under about 40 KB.
+
+// ⚠️ @init IS LOAD-BEARING (.docs/wiki/02-file-structure.md).
+@init
+
+// ── The big view: the same grid over the whole window (the dock face, the embeds, the action script) ──
+// The framework parks the mouse in the _ov_* copies and this restores them, so nothing under the view sees a
+// click; it draws under the 28 px header and the bank strip, like the FX picker (swing_banktabs_geom knows it
+// as a full-window view).
+// The cursor the sequencer wants (0 = none): set every frame it is wanted, and the arrow put back ONCE the frame it
+// stops -- REAPER keeps the last cursor a plugin set (the user, 2026-10-20: "the mouse handle stays stuck").
+function seq_ui_cursor_apply(_ca_c) (
+  _ca_c > 0 ? gfx_setcursor(_ca_c) : ( seq_ui_cursor ? gfx_setcursor(32512); );
+  seq_ui_cursor = _ca_c > 0;
+);
+function swing_seq_bigview_draw() local(pd, x, y, w, h) (
+  lmb_down = _ov_lmb_down; rmb_down = _ov_rmb_down;
+  LMB = _ov_LMB; RMB = _ov_RMB; frame_wheel = _ov_wheel;
+  pd = swing_px(8);
+  x = pd; y = 28 + swing_banktabs_h() + 6; w = gfx_w - pd * 2; h = gfx_h - y - pd;
+  gfx_set(0, 0, 0, 0.45); gfx_rect(0, 28, gfx_w, gfx_h - 28);
+  swing_seq_panel_draw(x, y, w, h, 1);
+  seq_ui_cursor_apply(seq_ui_want_cur);
+  lmb_down = 0; rmb_down = 0; LMB = 0; RMB = 0; frame_wheel = 0;
+);
+
+// ── The gutter and the panel under the pads (the full UI; the host calls this after the browser strip) ──
+// The gutter sits at ui_bot at all times (the browser's chevron column, turned on its side): the chevron at its
+// left end opens and closes the panel (it points the way the panel will MOVE), the status reads in the middle,
+// and with the panel open the rest of the strip is the handle: drag it UP for a taller panel, down for a
+// shorter one (the window follows through the bridge; where it cannot, the pads give or take the difference),
+// wheel for the same in small steps. seq_h is saved with the project; 0 = the default height.
+// A chip on the strip for a panel placed below the pads (2026-10-22): lit when it is the one shown, half-lit when it is
+// open behind another; a click closes it when it is shown, brings it to the front when it is open behind another
+// (its stamp), opens it otherwise. _bc_k: 2 the browser, 3 the pad editor. Returns the chip's left edge.
+function seq_ui_bot_chip(_bc_lbl, _bc_k, _bc_xr, _bc_gy, _bc_gh, _bc_tip) local(_bc_tw, _bc_th, _bc_x, _bc_on, _bc_hov) (
+  rk_font(1, swing_fs(8), 'b'); gfx_measurestr(_bc_lbl, _bc_tw, _bc_th);
+  _bc_x = _bc_xr - _bc_tw;
+  _bc_on = _bc_k == 2 ? fb_open : pfx_open;
+  _bc_hov = mx >= _bc_x - 5 && mx < _bc_x + _bc_tw + 5 && my >= _bc_gy && my < _bc_gy + _bc_gh;
+  bot_panel == _bc_k ? gfx_set(0.25, 0.47, 0.68, 1) : _bc_on ? gfx_set(0.20, 0.30, 0.42, 1) : gfx_set(0.16, 0.20, 0.26, _bc_hov ? 1 : 0.9);
+  gfx_rect(_bc_x - 5, _bc_gy + 2, _bc_tw + 10, _bc_gh - 4);
+  gfx_set(1, 1, 1, _bc_on ? 1 : 0.7); gfx_x = _bc_x; gfx_y = _bc_gy + (_bc_gh - _bc_th) * 0.5; gfx_drawstr(_bc_lbl);
+  _bc_hov ? swing_tooltip_check(_bc_tip, _bc_k == 2 ? "The sample browser, placed below the pads (OPT): click to show it here, or to close it when it is the one shown."
+                                                  : "The pad editor, placed below the pads (OPT): click to show it here, or to close it when it is the one shown.");
+  _bc_hov && lmb_down ? (
+    bot_panel == _bc_k ? ( _bc_k == 2 ? fb_open = 0 : pfx_open = 0; )
+    : _bc_on ? ( _bc_k == 2 ? fb_bstamp = (bot_stamp += 1) : pfx_bstamp = (bot_stamp += 1); )
+    : ( _bc_k == 2 ? ( fb_open = 1; swing_fb_request(0, 0, -1); ) : pfx_open = 1; );
+  );
+  _bc_k == 3 ? ( pfx_chip_cx = _bc_x + _bc_tw * 0.5; pfx_chip_cy = _bc_gy + _bc_gh * 0.5; );   // for the rig
+  _ug_bc_hov = _ug_bc_hov || _bc_hov;
+  _bc_x - 5;
+);
+function swing_seq_under_draw() local(gy, gh, hot, chev, grip, cx, cy, i, tw, th, k, _sv_ld, _sv_rd, _sv_lc, _sv_rc, _sv_w, _sv_pk) (
+  // The gutter and the panel see exactly what the gate claimed for them (zeros when the press is the face's or
+  // nothing is pressed); after them the frame sees nothing of a claimed press and all of an unclaimed one.
+  _sv_ld = lmb_down; _sv_rd = rmb_down; _sv_lc = LMB; _sv_rc = RMB; _sv_w = frame_wheel;
+  lmb_down = _seq_g_lmbdown; rmb_down = _seq_g_rmbdown; LMB = _seq_g_lmbclick; RMB = _seq_g_rmbclick; frame_wheel = _seq_g_wheel;
+  // the drawn picker up (wherever its home): the gutter is outside it, so the gutter sees nothing -- its chevron would
+  // close the panel, its grip start a resize -- and the press only closes the picker (it reads the raw button); the
+  // panel below gets the stash back for its own draw, where the picker takes its share (the hunt audit, 2026-10-23)
+  _sv_pk = seq_ui_pk_lane >= 0;
+  _sv_pk ? ( lmb_down = 0; rmb_down = 0; LMB = 0; RMB = 0; frame_wheel = 0; );
+  gy = ui_bot; gh = seq_gut_h; grip = 0;
+  gh > 0 ? (
+    gfx_set(hd_r * 0.72, hd_g * 0.72, hd_b * 0.72, 1); gfx_rect(0, gy, gfx_w, gh);
+    gfx_set(0, 0, 0, 0.30); gfx_rect(0, gy, gfx_w, 1);
+    gfx_set(1, 1, 1, 0.06); gfx_rect(0, gy + 1, gfx_w, 1);
+    hot = mx >= 0 && mx < gfx_w && my >= gy && my < gy + gh && big_view_id == VIEW_NONE;
+    chev = hot && mx < swing_px(40);
+    hot ? ( gfx_set(1, 1, 1, chev ? 0.12 : 0.06); gfx_rect(0, gy, chev ? swing_px(40) : gfx_w, gh); );
+    // the chevron: the panel comes in BELOW, so it points down to open and up to close
+    cx = swing_px(20); cy = gy + gh * 0.5;
+    gfx_set(0.62, 0.70, 0.82, hot ? 1 : 0.72);
+    i = 0; loop(5,
+      bot_panel > 0 ? gfx_line(cx - 5 + i, cy + 2 - i * 0.5, cx + 5 - i, cy + 2 - i * 0.5)
+                    : gfx_line(cx - 5 + i, cy - 2 + i * 0.5, cx + 5 - i, cy - 2 + i * 0.5);
+      i += 1;
+    );
+    // the status: what the sequencer is doing
+    rk_font(1, swing_fs(9), 'b');
+    gfx_set(0.72, 0.78, 0.88, 0.9);
+    // the bar : beat: REAPER's own through the bridge's words (P0a), the plugin's count from the project start until
+    // the bridge has written them (a bridge started before this build writes none: the word reads 0)
+    gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && seq_tr_meas > 0 ? (
+      sprintf(#seq_ui_pos, "%d.%d.%02d", seq_tr_meas | 0, floor(seq_tr_beat / 1000) + 1, floor(((seq_tr_beat / 1000) - floor(seq_tr_beat / 1000)) * 100));
+    ) : (
+      k = ts_num > 0 && ts_denom > 0 ? ts_num * 4 / ts_denom : 4;   // quarter notes in a bar
+      i = (beat_position - k * floor(beat_position / k)) * ts_denom / 4;   // beats into the bar, in the signature's unit
+      sprintf(#seq_ui_pos, "%d.%d.%02d", floor(beat_position / k) + 1, floor(i) + 1, floor((i - floor(i)) * 100));
+    );
+    seq_playing ? sprintf(#seq_ui_lbl, "STEP SEQ  ·  pattern %d  ·  playing  ·  %s", (seq_cur | 0) + 1, #seq_ui_pos)
+                : (seq_off ? sprintf(#seq_ui_lbl, "STEP SEQ  ·  pattern %d  ·  PLAY off  ·  %s", (seq_cur | 0) + 1, #seq_ui_pos)
+                           : sprintf(#seq_ui_lbl, "STEP SEQ  ·  pattern %d  ·  %s", (seq_cur | 0) + 1, #seq_ui_pos));
+    gfx_measurestr(#seq_ui_lbl, tw, th);
+    gfx_x = swing_px(44); gfx_y = gy + (gh - th) * 0.5; gfx_drawstr(#seq_ui_lbl);
+    // MIDI out's lamp and channel (the toolbar pass; the switch is in OPT): the lamp lights for a tenth of a second per note
+    seq_opt_midiout ? (
+      seq_mirror_pulses != seq_ui_mo_seen ? ( seq_ui_mo_seen = seq_mirror_pulses; seq_ui_mo_t = time_precise(); );
+      sprintf(#seq_ui_lbl, "MIDI out %d", max(1, min(16, seq_opt_midich | 0)));
+      rk_font(1, swing_fs(8), 'b'); gfx_measurestr(#seq_ui_lbl, tw, th);
+      cx = gfx_w - swing_px(12) - tw; cy = gy + gh * 0.5;
+      time_precise() - seq_ui_mo_t < 0.1 ? gfx_set(0.78, 1.0, 0.47, 1) : gfx_set(0.30, 0.42, 0.26, 1);
+      gfx_circle(cx - swing_px(8), cy, swing_px(3), 1, 1);
+      gfx_set(0.72, 0.78, 0.88, 0.9); gfx_x = cx; gfx_y = gy + (gh - th) * 0.5; gfx_drawstr(#seq_ui_lbl);
+      mx >= cx - swing_px(14) && mx < gfx_w - swing_px(8) && my >= gy && my < gy + gh ? swing_tooltip_check(1466, "MIDI out: every hit the sequencer plays also leaves as a note on this channel (the lamp blinks per note). The switch and the channel are in OPT.");
+    );
+    // the chips for the panels placed below the pads (BROWSER: fb_place 3; PAD FX: fx_place 3), right to left from the
+    // MIDI-out lamp's room; the grip and the open click keep clear of them
+    _ug_bc_hov = 0; pfx_chip_cx = -1; pfx_chip_cy = -1;
+    _ug_xr = gfx_w - swing_px(160);
+    fb_place == 3 ? _ug_xr = seq_ui_bot_chip("BROWSER", 2, _ug_xr, gy, gh, 1488) - swing_px(8);
+    fx_place == 3 ? _ug_xr = seq_ui_bot_chip("PAD FX", 3, _ug_xr, gy, gh, 1490) - swing_px(8);
+    // the grip, middle of the run, only with something to drag (the panel open): three marks that light up under the
+    // mouse, and the up / down resize cursor over the whole handle (the user, 2026-10-20: "i cant tell when its
+    // available for me to resize or not"; closed, the strip is a button -- a click opens the panel -- and shows no grip)
+    // The grab (2026-10-27; the owner: "hard to grab"): the strip but its chevron and chips, plus its reach over the pads'
+    // margin just above it (seq_ui_grip_ext); under the mouse or dragging, its top edge -- the line between the pads and
+    // the panel -- lights in the house blue, over the strip's own faint lift
+    grip = bot_panel > 0 && ((hot && !chev && !_ug_bc_hov) || seq_ui_grip_ext(mx, my));
+    bot_panel > 0 ? (
+      gfx_set(1, 1, 1, grip || seq_ui_gdrag ? 0.85 : 0.30);
+      k = 0; loop(3, gfx_rect(gfx_w * 0.5 - 20 + k * 16, gy + gh * 0.5 - 1, 10, 2); k += 1; );
+      grip || seq_ui_gdrag ? ( gfx_set(0.20, 0.62, 0.86, 0.95); gfx_rect(0, gy, gfx_w, max(2, swing_px(2))); );
+    );
+    // the chevron and a click on the strip: close the panel shown below, or open one placed below (the sequencer first,
+    // then the browser, then the pad editor); nothing placed below (all at the side): the side sequencer
+    chev && lmb_down ? (
+      bot_panel == 3 ? pfx_open = 0 : bot_panel == 2 ? fb_open = 0 : bot_panel == 1 ? seq_shown = 0
+      : seq_place != 1 ? seq_shown = 1 : fb_place == 3 ? ( fb_open = 1; swing_fb_request(0, 0, -1); ) : fx_place == 3 ? pfx_open = 1 : ( seq_shown = !seq_shown; seq_shown ? side_front = 2; );
+    );
+    ((hot && !chev && !_ug_bc_hov) || grip) && lmb_down ? (
+      bot_panel > 0 ? ( seq_ui_gdrag = 1; seq_ui_gdrag_y0 = my; seq_ui_gdrag_h0 = bot_panel == 2 ? swing_fb_req_h() : bot_panel == 3 ? swing_pfx_req_h() : swing_seq_req_h(); )
+      : ( seq_place != 1 ? seq_shown = 1 : fb_place == 3 ? ( fb_open = 1; swing_fb_request(0, 0, -1); ) : fx_place == 3 ? pfx_open = 1 : ( seq_shown = 1; side_front = 2; ); );
+    );
+    seq_ui_gdrag && LMB ? ( bot_panel == 2 ? fb_h = max(swing_px(SEQ_H_MIN_B), min(2000, seq_ui_gdrag_h0 + (seq_ui_gdrag_y0 - my)))
+                          : bot_panel == 3 ? fx_h = max(swing_px(PFX_BOTTOM_MIN_B), min(2000, seq_ui_gdrag_h0 + (seq_ui_gdrag_y0 - my)))
+                                           : seq_h = max(swing_px(SEQ_H_MIN_B), min(2000, seq_ui_gdrag_h0 + (seq_ui_gdrag_y0 - my))); );
+    !LMB ? seq_ui_gdrag = 0;
+    grip && frame_wheel != 0 ? (
+      bot_panel == 2 ? fb_h = max(swing_px(SEQ_H_MIN_B), min(2000, swing_fb_req_h() + (frame_wheel > 0 ? swing_px(20) : -swing_px(20))))
+      : bot_panel == 3 ? fx_h = max(swing_px(PFX_BOTTOM_MIN_B), min(2000, swing_pfx_req_h() + (frame_wheel > 0 ? swing_px(20) : -swing_px(20))))
+                     : seq_h = max(swing_px(SEQ_H_MIN_B), min(2000, swing_seq_req_h() + (frame_wheel > 0 ? swing_px(20) : -swing_px(20))));
+    );
+    (hot && !_ug_bc_hov) || grip ? swing_tooltip_check(1433, bot_panel == 3 ? "The pad editor, below the pads. Chevron: close it. Drag the strip up or down (or wheel) for a taller or shorter panel; the window follows."
+                                          : bot_panel == 2 ? "The sample browser, below the pads. Chevron: close it. Drag the strip up or down (or wheel) for a taller or shorter panel; the window follows."
+                                          : bot_panel == 1 ? "The step sequencer. Chevron: close it. Drag the strip up or down (or wheel) for a taller or shorter panel; the window follows."
+                                          : seq_place == 1 ? "The step sequencer, placed at the side (OPT): click to open it there."
+                                                           : "The step sequencer: click to open it under the pads. The window grows to make room; docked, the pads make it.");
+    bot_panel == 1 && seq_h_cur > 2 && seq_ui_focus && !is_embedded && !fb_filt_focus && pne_pad < 0 && !swing_popup_active && _char > 0 ? seq_ui_keys();   // at the side the slot's draw serves them
+    // Not under a big view: the full-face sequencer IS this grid, and a second draw here, with no button held (the
+    // claim stands down under a view), cancelled its drags every frame -- a click worked, no drag ever did (the user,
+    // 2026-10-20: "none of the notes drag"; since the panel arrived in S1b, the full-face view's paint drag too).
+    seq_h_cur > 2 && big_view_id == VIEW_NONE ? (
+      _sv_pk ? ( lmb_down = _seq_g_lmbdown; rmb_down = _seq_g_rmbdown; LMB = _seq_g_lmbclick; RMB = _seq_g_rmbclick; frame_wheel = _seq_g_wheel; );
+      bot_panel == 2 ? (
+        // the browser below: its draw reads the side slot's stash; hand it this slot's for the call (the side slot drew
+        // before this, its stash is spent) and put the words back
+        _ug_l = _fb_g_lmbdown; _ug_c = _fb_g_lmbclick; _ug_r = _fb_g_rmbdown; _ug_rc = _fb_g_rmbclick; _ug_w = _fb_g_wheel;
+        _fb_g_lmbdown = _seq_g_lmbdown; _fb_g_lmbclick = _seq_g_lmbclick; _fb_g_rmbdown = _seq_g_rmbdown; _fb_g_rmbclick = _seq_g_rmbclick; _fb_g_wheel = _seq_g_wheel;
+        // a gutter's width MORE than the window: the browser's own gutter (its vertical chevron column, pinned to the right
+        // end of what it is given) falls off the canvas -- this strip's chevron and the BROWSER chip serve the panel here --
+        // and its body spans the window (the audit: a sideways handle inside the bottom panel)
+        swing_fb_draw(0, gy + gh, gfx_w + FB_GUTTER_W, seq_h_cur);
+        _fb_g_lmbdown = _ug_l; _fb_g_lmbclick = _ug_c; _fb_g_rmbdown = _ug_r; _fb_g_rmbclick = _ug_rc; _fb_g_wheel = _ug_w;
+      ) : bot_panel == 3 ? swing_pfx_panel_draw(0, gy + gh, gfx_w, seq_h_cur, 1)   // the pad editor's pages, wide (rk_swing_ui_padfx_panel), on this slot's stash
+        : swing_seq_panel_draw(0, gy + gh, gfx_w, seq_h_cur, 0);
+    );
+  );
+  // The resize cursor over the handle (the up / down arrows, IDC_SIZENS) -- and the arrow BACK the frame the mouse leaves
+  // it: REAPER keeps the last cursor a plugin set (the user, 2026-10-20: "the mouse handle stays stuck"). The arrow is
+  // set once, only after this code set the other, so nothing else's cursor is touched.
+  big_view_id == VIEW_NONE ? (   // under a big view the view sets it (swing_seq_bigview_draw)
+    k = gh > 0 && bot_panel > 0 && (grip || seq_ui_gdrag);
+    seq_ui_cursor_apply(k ? 32645 : side_cur_want > 0 ? side_cur_want : ((seq_h_cur > 2 && bot_panel == 1) || (seq_place == 1 && seq_shown)) ? seq_ui_want_cur : 0);   // the side slot's width handle, then the sequencer's own want
+  ) : big_view_id != VIEW_SEQ ? seq_ui_cursor_apply(0);   // another view: the arrow back once
+  _seq_claim ? ( lmb_down = 0; rmb_down = 0; LMB = 0; RMB = 0; frame_wheel = 0; )
+             : ( lmb_down = _sv_ld; rmb_down = _sv_rd; LMB = _sv_lc; RMB = _sv_rc; frame_wheel = _sv_w; );
+);
+

@@ -18,7 +18,9 @@
 // Dirty policy (spec §3): macro VALUE motion (knobs, DICE) never marks dirty
 // — slider write + slider_automate touch only. STRUCTURE edits (add / remove
 // / range drag) call mark_dirty_kit() and raise kmac_force so the engine
-// re-applies the mapping at the current macro value immediately.
+// re-applies the mapping at the current macro value immediately. A PRESET
+// template is the one structure edit that does not: it is inert until a
+// knob moves (LIB315, see the templates below).
 //
 // Naming: functions swing_macroed_*, mutable scratch _me_* (globals) — the
 // overlay-scaffold idiom (single @gfx writer, no @block contention).
@@ -201,8 +203,16 @@ function swing_macroed_set_val(_me_k, _me_nv) (
 // template REPLACES all 8 macros' mappings — that's what "apply preset"
 // means — and it is a structure edit (mark_dirty_kit), so REAPER undo
 // restores the previous mappings (the whole kmac model rides ser_ver 54).
-// Every lo end = the engine default, so applying a template changes NOTHING
-// audible until a knob moves — the same contract as everything else here.
+// Applying a template changes NOTHING audible until a knob moves: it writes
+// the rows and asks the engine for no re-apply (no kmac_force), so hand-set
+// sends / comp / EQ stay as they are; a knob's first move applies its own
+// macro's rows at the new value (kmac_tick's change test). A knob left away
+// from zero jumps its targets on that first move (LIB315, the owner's call
+// 2026-10-29; the force applied every row at once, fixed lo ends over the
+// user's own values). A KIT saved with an untouched template plays it when the
+// kit is loaded again: the kit import applies every row at the saved knobs, as
+// authored (kept on purpose, the owner's call 2026-10-29). A project reopen
+// applies nothing.
 // PUNCH is CATEGORY-SMART: it targets the pads whose published category is
 // in the kick..clap family (ids 0-3, rk_cat_glyphs vocabulary), resolved
 // at click time into concrete, visible, editable rows; an uncategorised
@@ -221,21 +231,40 @@ function swing_macroed_add_map(_ma_m, _ma_pad, _ma_pid, _ma_lo, _ma_hi) local(_m
     1;
   ) : 0;
 );
+// The 8-row cap notice (LIB316): a template or an ADD > ALL that wanted more
+// pads than its macro had rows left says so -- "VIBE > CRUSH 8 of 12 mapped"
+// -- for a few seconds after the MAPPINGS title. One line per action: reset
+// first, then each short call appends.
+function swing_macroed_cap_reset() (
+  strcpy(#me_cap_note, ""); me_cap_t = 0;
+);
+function swing_macroed_cap_note(_ma_m, _ma_pid, _ma_n, _ma_want) (
+  _ma_n < _ma_want ? (
+    swing_lcd_kmac_label(_ma_m, #_me_capm);
+    swing_macroed_pid_lbl(_ma_pid, -2, #_me_capp);
+    sprintf(#_me_capt, "%s > %s %d of %d mapped", #_me_capm, #_me_capp, _ma_n, _ma_want);
+    strlen(#me_cap_note) > 0 ? strcat(#me_cap_note, ", ");
+    strcat(#me_cap_note, #_me_capt);
+    me_cap_t = time_precise();
+  );
+);
 // The category-smart templates find their drums in the bank ON SCREEN -- the
 // only bank whose categories Swing holds (the PADCAT band is bank-relative) --
 // and map those pads' SLOTS (swing_bp), so HOUSE applied with bank C shown
 // maps bank C's kicks. The ALL rows reach every bank through the engine.
 function swing_macroed_map_cat(_ma_m, _ma_c0, _ma_c1, _ma_pid, _ma_lo, _ma_hi)
-local(_ma_p, _ma_c, _ma_n, _ma_p_s) (
-  _ma_n = 0; _ma_p = 0;
+local(_ma_p, _ma_c, _ma_n, _ma_w, _ma_p_s) (
+  _ma_n = 0; _ma_w = 0; _ma_p = 0;
   loop(NUM_PADS,
     _ma_p_s = swing_bp(_ma_p);
     _ma_c = swing_lcd_padcat_eff(_ma_p_s);
     _ma_c >= _ma_c0 && _ma_c <= _ma_c1 ? (
+      _ma_w += 1;
       _ma_n += swing_macroed_add_map(_ma_m, _ma_p_s, _ma_pid, _ma_lo, _ma_hi);
     );
     _ma_p += 1;
   );
+  swing_macroed_cap_note(_ma_m, _ma_pid, _ma_n, _ma_w);
   _ma_n;
 );
 // Per-pad RELATIVE mapping: lo = the pad's CURRENT value, hi derived from
@@ -244,43 +273,94 @@ local(_ma_p, _ma_c, _ma_n, _ma_p_s) (
 // keep every pad's own state as the neutral point. c0 = -3 catches
 // uncategorised pads too (padcat_eff returns -1/-3 for none/NONE).
 function swing_macroed_map_cat_rel(_ma_m, _ma_c0, _ma_c1, _ma_pid, _ma_mult, _ma_add, _ma_hmin, _ma_hmax)
-local(_ma_p, _ma_c, _ma_n, _ma_cur, _ma_p_s) (
-  _ma_n = 0; _ma_p = 0;
+local(_ma_p, _ma_c, _ma_n, _ma_w, _ma_cur, _ma_p_s) (
+  _ma_n = 0; _ma_w = 0; _ma_p = 0;
   loop(NUM_PADS,
     _ma_p_s = swing_bp(_ma_p);
     _ma_c = swing_lcd_padcat_eff(_ma_p_s);
     _ma_c >= _ma_c0 && _ma_c <= _ma_c1 ? (
+      _ma_w += 1;
       _ma_cur = swing_macroed_get(_ma_p_s, _ma_pid);
       _ma_n += swing_macroed_add_map(_ma_m, _ma_p_s, _ma_pid, _ma_cur,
                  max(_ma_hmin, min(_ma_hmax, _ma_cur * _ma_mult + _ma_add)));
     );
     _ma_p += 1;
   );
+  swing_macroed_cap_note(_ma_m, _ma_pid, _ma_n, _ma_w);
   _ma_n;
 );
 // WIDTH spread: alternate matching pads left/right (lo = current pan, so
 // zero = the mix as-is; turning up fans the family across the field).
 function swing_macroed_map_width(_ma_m, _ma_c0, _ma_c1, _ma_amt)
-local(_ma_p, _ma_c, _ma_n, _ma_p_s) (
-  _ma_n = 0; _ma_p = 0;
+local(_ma_p, _ma_c, _ma_n, _ma_w, _ma_p_s) (
+  _ma_n = 0; _ma_w = 0; _ma_p = 0;
   loop(NUM_PADS,
     _ma_p_s = swing_bp(_ma_p);
     _ma_c = swing_lcd_padcat_eff(_ma_p_s);
     _ma_c >= _ma_c0 && _ma_c <= _ma_c1 ? (
+      _ma_w += 1;
       _ma_n += swing_macroed_add_map(_ma_m, _ma_p_s, KMAC_PID_PAN, p_pan[_ma_p_s],
                  (_ma_n & 1) ? -_ma_amt : _ma_amt);
     );
     _ma_p += 1;
   );
+  swing_macroed_cap_note(_ma_m, KMAC_PID_PAN, _ma_n, _ma_w);
   _ma_n;
 );
 
+// ADD > ALL (LIB318, the owner's call 2026-10-29): every pad moves from its
+// OWN setting. One ALL row (pad -2) writes the same lo to all NUM_SLOTS pads,
+// so it is taken only when every pad that holds a sound already holds that
+// value (then it is exact for everything audible, and costs one row; a silent
+// pad takes the value, as the ALL row always did); otherwise one RELATIVE row
+// per pad that holds a sound -- lo = the pad's own value, hi = `_ma_hi` (a
+// single-pad ADD's [current .. full-scale end] default) -- the bank on screen
+// first, up to the 8-row cap, with the cap notice. Nothing playable anywhere:
+// the ALL row from the selected pad (no sound to keep). The engine-knob cells
+// keep the one ALL row from the selected pad's value: index 1 is DECAY on a
+// snare and P.DEC on a kick, so a per-pad "own value" means a different thing
+// on every family. Returns the rows added.
+function swing_macroed_add_all(_ma_m, _ma_pid, _ma_hi)
+local(_ma_p, _ma_k, _ma_v0, _ma_same, _ma_n, _ma_w) (
+  swing_macroed_cap_reset();
+  _ma_pid >= KMAC_PID_SYN_BASE && _ma_pid < KMAC_PID_SYN_BASE + KMAC_PID_SYN_N ? (
+    swing_macroed_add_map(_ma_m, -2, _ma_pid,
+      swing_macroed_get(max(0, min(NUM_SLOTS - 1, sel_pad)), _ma_pid), _ma_hi);
+  ) : (
+    _ma_v0 = swing_macroed_get(max(0, min(NUM_SLOTS - 1, sel_pad)), _ma_pid);
+    _ma_same = 1; _ma_w = 0; _ma_p = 0;
+    loop(NUM_SLOTS,
+      pad_is_playable(_ma_p) ? (
+        _ma_w == 0 ? ( _ma_v0 = swing_macroed_get(_ma_p, _ma_pid); )
+                   : ( swing_macroed_get(_ma_p, _ma_pid) != _ma_v0 ? _ma_same = 0; );
+        _ma_w += 1;
+      );
+      _ma_p += 1;
+    );
+    _ma_same ? (   // also nothing playable (_ma_v0 = the selected pad's) or one pad (its own value)
+      swing_macroed_add_map(_ma_m, -2, _ma_pid, _ma_v0, _ma_hi);
+    ) : (
+      _ma_n = 0; _ma_k = 0;
+      loop(NUM_SLOTS,
+        _ma_p = (bank_cur * NUM_PADS + _ma_k) % NUM_SLOTS;   // the bank on screen first
+        pad_is_playable(_ma_p) ? (
+          _ma_n += swing_macroed_add_map(_ma_m, _ma_p, _ma_pid, swing_macroed_get(_ma_p, _ma_pid), _ma_hi);
+        );
+        _ma_k += 1;
+      );
+      swing_macroed_cap_note(_ma_m, _ma_pid, _ma_n, _ma_w);
+      _ma_n;
+    );
+  );
+);
+
+// No kmac_force: a template is inert until a knob moves (LIB315, the header above).
 function swing_macroed_tpl_finish() (
   macro_sel = 0; slider_automate(2^40);
   mark_dirty_kit();
-  kmac_force += 1;
 );
 function swing_macroed_tpl_clear() local(_ma_m) (
+  swing_macroed_cap_reset();
   _ma_m = 0; loop(KMAC_N, kmac_nmap[_ma_m] = 0; _ma_m += 1;);
 );
 function swing_macroed_tpl_house() (
@@ -651,6 +731,14 @@ local(_me_px, _me_py, _me_pw, _me_ph, _me_k, _me_cellw, _me_cellh, _me_kx,
   ) : sprintf(#_me_s, "MAPPINGS — %s", #_me_s2);
   gfx_set(kmac_pal_r, kmac_pal_g, kmac_pal_b, 1);
   gfx_x = _me_px + 12; gfx_y = _me_y0; gfx_drawstr(#_me_s);
+  // the 8-row cap notice (LIB316), six seconds after the template / ADD > ALL that hit it, clipped short of the
+  // title row's buttons (+ EXT sits at pw - 210)
+  me_cap_t > 0 && time_precise() - me_cap_t < 6 ? (
+    rk_font(1, swing_fs(9), 0);
+    gfx_set(0.93, 0.68, 0.22, 0.95);
+    gfx_x += 10; gfx_y = _me_y0 + 1;
+    gfx_drawstr(#me_cap_note, 0, _me_px + _me_pw - 216, _me_y0 + 14);
+  );
   gfx_set(0.30, 0.34, 0.40, 0.7);
   gfx_rect(_me_px + 10, _me_y0 + 14, _me_pw - 20, 1);
 
@@ -740,11 +828,13 @@ local(_me_px, _me_py, _me_pw, _me_ph, _me_k, _me_cellw, _me_cellh, _me_kx,
         // ⚠️ Through the GUARDED helper, as + LAST and the templates append (2026-10-23, H22): this wrote row
         // kmac_nmap with no fullness test, and row 8 of macro m is row 0 of macro m+1 (back-to-back blocks of
         // KMAC_MAX_MAP) -- macro 8's lands in kmac_pid/lo/hi/curve[0] and snapshot I's macro 1.
+        // ALL: each pad from its own value (swing_macroed_add_all, LIB318), not the selected pad's copied to 64.
         _me_pid = swing_macroed_pick_pid(_me_i);
         swing_macroed_pid_range(_me_pid);
-        swing_macroed_add_map(_me_msel, kmac_ed_addpad, _me_pid,
-          swing_macroed_get(kmac_ed_addpad >= 0 ? kmac_ed_addpad : max(0, min(NUM_SLOTS - 1, sel_pad)), _me_pid),
-          kmac_ed_pmax) ? (
+        (kmac_ed_addpad == -2 ? swing_macroed_add_all(_me_msel, _me_pid, kmac_ed_pmax) :
+          swing_macroed_add_map(_me_msel, kmac_ed_addpad, _me_pid,
+            swing_macroed_get(kmac_ed_addpad >= 0 ? kmac_ed_addpad : max(0, min(NUM_SLOTS - 1, sel_pad)), _me_pid),
+            kmac_ed_pmax)) ? (
           mark_dirty_kit();
           kmac_force += 1;
         );

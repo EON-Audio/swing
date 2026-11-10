@@ -1,0 +1,471 @@
+// rk_seq_ui_p3.jsfx-inc -- part 3 of rk_seq_ui.jsfx-inc (6 parts), cut at a function boundary by
+// .dev_tests/split_big_incs.py: REAPER's load time grows with the square of a file's size. Edit freely;
+// keep each file under about 40 KB.
+
+// ⚠️ @init IS LOAD-BEARING (.docs/wiki/02-file-structure.md).
+@init
+
+// one range row of the KEYS menu: the tick, the label, and the pad it covers when one sits on its notes (round two C)
+function seq_ui_trig_range_row(_tr_b, _tr_lbl) local(_tr_o) (
+  _tr_o = seq_ui_trig_overlap_at(_tr_b);
+  sprintf(#seq_ui_lbl2, "|%s%s", seq_trig_base == _tr_b ? "!" : "", _tr_lbl); strcat(#seq_ui_menu, #seq_ui_lbl2);
+  _tr_o >= 0 ? ( sprintf(#seq_ui_lbl2, ": covers pad %c%d", 65 + floor(_tr_o / NUM_PADS), _tr_o - NUM_PADS * floor(_tr_o / NUM_PADS) + 1); strcat(#seq_ui_menu, #seq_ui_lbl2); );
+);
+// The TRIG menu (S3): rows 1..4 the mode (off, change, change + resync, change + resync on the beat), 5..9 the
+// trigger notes' base (C-1, C0, G#0, E7, E8 = notes 0, 12, 20, 100, 112: sixteen notes up from it pick patterns
+// 1..16); the current ones ticked.
+// Round two C (the user, on a full four-bank kit: "where are the keys starting at?" -> "Yes change them"): the ranges keep
+// clear of a default kit's sixty-four pads (C2..D#7) -- C1 (24-39) took bank A's first four, C7 (96-111) bank D's top
+// four; now G#0 (20-35) ends just below the pads and E7 (100-115) starts just above bank D. Any row whose notes a playable
+// pad sits on says which (a moved root or a locked note can still land there), and the range in use landing on a pad
+// adds a red header row at the END, so the rows' numbers never move.
+function seq_ui_trig_menu_open() (
+  sprintf(#seq_ui_menu, "%sOff|%sChange the pattern at the next step|%sChange + restart from step 1 at the switch|%sChange + restart on the beat",
+          seq_trig_mode == 0 ? "!" : "", seq_trig_mode == 1 ? "!" : "", seq_trig_mode == 2 ? "!" : "", seq_trig_mode >= 3 ? "!" : "");
+  seq_ui_trig_range_row(0, "Notes from C-1 (0-15)");
+  seq_ui_trig_range_row(12, "from C0 (12-27)");
+  seq_ui_trig_range_row(SEQ_TRIG_G0S, "from G#0 (20-35)");
+  seq_ui_trig_range_row(SEQ_TRIG_E7, "from E7 (100-115)");
+  seq_ui_trig_range_row(SEQ_TRIG_E8, "from E8 (112-127)");
+  // Rows 10..12 (the owner, 2026-10-27: "can we change the keys from where it starts?" -- any start note): LEARN, ticked
+  // while it waits for a key (rk_seq_core seq_trig_learn_take; picked again it stops waiting), and an octave up / down,
+  // each naming where it lands (clamped to C-1 .. SEQ_TRIG_TOP, so base + 15 <= 127). A start that is none of the five
+  // above shows as a ticked row after them (it picks nothing), ahead of the warning: the rows' numbers never move.
+  sprintf(#seq_ui_lbl2, "||%sLearn: play the key the notes start from", seq_trig_lrn_on ? "!" : ""); strcat(#seq_ui_menu, #seq_ui_lbl2);
+  seq_ui_note_name(min(SEQ_TRIG_TOP, seq_trig_base + 12)); sprintf(#seq_ui_lbl2, "|An octave up: from %s", #seq_ui_gstr); strcat(#seq_ui_menu, #seq_ui_lbl2);
+  seq_ui_note_name(max(0, seq_trig_base - 12));            sprintf(#seq_ui_lbl2, "|An octave down: from %s", #seq_ui_gstr); strcat(#seq_ui_menu, #seq_ui_lbl2);
+  seq_trig_base != 0 && seq_trig_base != 12 && seq_trig_base != SEQ_TRIG_G0S && seq_trig_base != SEQ_TRIG_E7 && seq_trig_base != SEQ_TRIG_E8 ? (
+    seq_ui_note_name(seq_trig_base); sprintf(#seq_ui_lbl, "from %s (%d-%d)", #seq_ui_gstr, seq_trig_base, seq_trig_base + SEQ_TRIG_N - 1);
+    seq_ui_trig_range_row(seq_trig_base, #seq_ui_lbl);
+  );
+  seq_ui_trig_ovl = seq_ui_trig_overlap();
+  seq_ui_trig_ovl >= 0 ? (
+    sprintf(#seq_ui_lbl2, "|#Pad %c%d sits on the notes in use: it won't play from MIDI while KEYS is on", 65 + floor(seq_ui_trig_ovl / NUM_PADS), seq_ui_trig_ovl - NUM_PADS * floor(seq_ui_trig_ovl / NUM_PADS) + 1);
+    strcat(#seq_ui_menu, #seq_ui_lbl2);
+  );
+  swing_popup_open(mx, my, #seq_ui_menu, SP_POPUP_CALLER_SEQ_TRIG);
+);
+// The TRIG menu's answer, row k of seq_ui_trig_menu_open (consumed in swing_seq_panel_draw): the mode, or the trigger
+// notes' base; project state, no undo point. 2026-10-27: Learn (arm / disarm; the footer says which), an octave up /
+// down (clamped to 0 .. SEQ_TRIG_TOP); a later row (the custom start's, the warning) picks nothing.
+function seq_ui_trig_pick(_tp_k) (
+  _tp_k <= 4 ? seq_trig_mode = _tp_k - 1
+  : _tp_k == 5 ? seq_trig_base = 0 : _tp_k == 6 ? seq_trig_base = 12 : _tp_k == 7 ? seq_trig_base = SEQ_TRIG_G0S : _tp_k == 8 ? seq_trig_base = SEQ_TRIG_E7 : _tp_k == 9 ? seq_trig_base = SEQ_TRIG_E8   // round two C: G#0, E7
+  : _tp_k == 10 ? (
+    // through the op queue: @block owns the armed flag (rk_seq_core seq_trig_lrn_on)
+    !seq_post_op(SEQ_OP_LEARN, !seq_trig_lrn_on, 0) ? seq_ui_say("Busy: try again")
+    : seq_trig_lrn_on ? seq_ui_say("KEYS: stopped waiting for a key")
+    : seq_ui_say("KEYS: play the key the patterns should start from (it plays nothing)");
+  )
+  : _tp_k == 11 ? seq_trig_base = min(SEQ_TRIG_TOP, seq_trig_base + 12) : _tp_k == 12 ? seq_trig_base = max(0, seq_trig_base - 12);
+  _tp_k != 10 ? mark_dirty();   // arming Learn changes nothing saved; the take marks it (seq_trig_learn_take)
+);
+// The lane columns' menu (the polish pass; the user: "I want all the colomns in the lans collapasable like they were in
+// steppa"): rows 1 the icon, 2 M / S, 3 the name, 4 the length, 5 the division, 6 the swing (ticked when shown), 7 all of them.
+function seq_ui_cols_menu_open() (
+  sprintf(#seq_ui_menu, "%sLane icons|%sMute / Solo|%sName|%sLength|%sDivision|%sSwing|Show every column",
+          seq_opt_icons ? "!" : "", (seq_col_hide & 1) ? "" : "!", (seq_col_hide & 2) ? "" : "!",
+          (seq_col_hide & 4) ? "" : "!", (seq_col_hide & 8) ? "" : "!", (seq_col_hide & 16) ? "" : "!");
+  swing_popup_open(mx, my, #seq_ui_menu, SP_POPUP_CALLER_SEQ_COLS);
+);
+// A column's label on the ruler (the polish pass): dim, brighter under the mouse; a click hides the column, a right-click
+// opens the column menu. A hidden column (_cl_x < 0) has no label: the menu brings it back. _cl_bit: the column's bit index.
+// The hidden columns are view state: saved with the project's next save, no project mark (the owner's D8, 2026-10-29).
+function seq_ui_col_label(_cl_x, _cl_w, _cl_y, _cl_h, _cl_s, _cl_bit) local(_cl_hov, _cl_tw, _cl_th) (
+  _cl_x >= 0 && _cl_w > 0 ? (
+    _cl_hov = mx >= _cl_x && mx < _cl_x + _cl_w && my >= _cl_y && my < _cl_y + _cl_h;
+    rk_font(1, swing_fs(7), 0); gfx_set(0.75, 0.82, 0.9, _cl_hov ? 1 : 0.45);
+    gfx_measurestr(_cl_s, _cl_tw, _cl_th); gfx_x = _cl_x + (_cl_w - _cl_tw) * 0.5; gfx_y = _cl_y + (_cl_h - _cl_th) * 0.5; gfx_drawstr(_cl_s);
+    _cl_hov && lmb_down ? ( !seq_bit(seq_col_hide, _cl_bit) ? seq_col_hide += 2 ^ _cl_bit; );
+    _cl_hov && rmb_down ? seq_ui_cols_menu_open();
+    _cl_hov ? swing_tooltip_check(1456, "Click to hide this column; the menu at the left (or a right-click here) brings columns back.");
+  );
+);
+// The OPTIONS menu (the toolbar pass): the three switches, MIDI out and its channel, the bank re-aim, re-aim on load,
+// bottom-up, the placements. Rows 1..3 the switches, 4 MIDI out, 5 its channel (the channel menu), 6..9 the banks,
+// 10 re-aim, 11 bottom-up, 12 sequencer at the side, 13 browser below, 14 pad editor below.
+function seq_ui_options_open() (
+  sprintf(#seq_ui_menu, "%sLane icons|%sFollow the playhead|%sTransport buttons|%sMIDI out: every hit as a note on channel %d|MIDI out channel ...|Aim this pattern at bank A|Aim this pattern at bank B|Aim this pattern at bank C|Aim this pattern at bank D|%sRe-aim the lanes when a kit load moves the pads|%sLanes bottom-up, like the pads|%sSequencer at the side of the pads|%sBrowser below the pads|%sPad editor below the pads",
+          seq_opt_icons ? "!" : "", seq_opt_follow ? "!" : "", seq_opt_transport ? "!" : "", seq_opt_midiout ? "!" : "", max(1, min(16, seq_opt_midich | 0)), seq_opt_adapt ? "!" : "", seq_opt_topdown ? "" : "!",
+          seq_place == 1 ? "!" : "", fb_place == 3 ? "!" : "", fx_place == 3 ? "!" : "");   // the placements (round two J's swap, 2026-10-22; Spec 7.1's cells; the editor's the same day)
+  swing_popup_open(mx, my, #seq_ui_menu, SP_POPUP_CALLER_SEQ_OPTIONS);
+);
+// The right-click lane menu (S3a): the fills from step 1 (rows 1..4: every step, every 2nd, 4th, 8th), the lane cleared
+// (5), the piano roll (6), MIDI out on a channel (7) and aim at another pad (8).
+function seq_ui_lane_menu_open() (
+  sprintf(#seq_ui_menu, "Every step|Every 2nd step|Every 4th step|Every 8th step|Clear the lane|%sPiano roll: notes, chords, lengths|MIDI out on a channel ...|Aim at another pad ...",
+          seq_ui_rc_l >= 0 && seq_ui_rc_l < SEQ_LANES && seq_lane_roll(seq_lane_at(max(0, min(SEQ_PATS - 1, seq_cur | 0)), seq_ui_rc_l)) ? "!" : "");
+  swing_popup_open(mx, my, #seq_ui_menu, SP_POPUP_CALLER_SEQ_LANE);
+);
+// S5: the channel menu (a lane aimed at a MIDI channel plays its notes out as MIDI) and the scale menu (a roll's rows).
+function seq_ui_chan_menu_open() local(_cm_i, _cm_t) (
+  _cm_t = seq_ui_chan_lane == -2 ? -max(1, min(16, seq_opt_midich | 0))   // the drum mirror's channel (S6)
+        : seq_ui_chan_lane >= 0 ? seq_lane_at(max(0, min(SEQ_PATS - 1, seq_cur | 0)), seq_ui_chan_lane)[0] | 0 : 0;
+  strcpy(#seq_ui_menu, "");
+  _cm_i = 1; loop(16, sprintf(#seq_ui_lbl, "%s%sMIDI channel %d", _cm_i > 1 ? "|" : "", _cm_t == -_cm_i ? "!" : "", _cm_i); strcat(#seq_ui_menu, #seq_ui_lbl); _cm_i += 1; );
+  swing_popup_open(mx, my, #seq_ui_menu, SP_POPUP_CALLER_SEQ_CHAN);
+);
+function seq_scale_mask(_sm_m) ( _sm_m == 1 ? 2741 : _sm_m == 2 ? 1453 : _sm_m == 3 ? 1709 : _sm_m == 4 ? 1717 : _sm_m == 5 ? 661 : _sm_m == 6 ? 1193 : _sm_m == 7 ? 2477 : _sm_m == 8 ? 1257 : 4095; );
+function seq_scale_name(_sn_m) ( _sn_m == 1 ? "major" : _sn_m == 2 ? "minor" : _sn_m == 3 ? "dorian" : _sn_m == 4 ? "mixolydian" : _sn_m == 5 ? "pent. major" : _sn_m == 6 ? "pent. minor" : _sn_m == 7 ? "harm. minor" : _sn_m == 8 ? "blues" : "chromatic"; );
+// (seq_pc_name and seq_ui_note_name sit above the KEYS menu, which names its octave rows with them: 2026-10-27)
+// Is the pitch on the lane's scale (lane field 11 = mode + 16 x root; mode 0 = every note)? And the nearest pitch that is.
+function seq_in_scale(_is_lb, _is_p) local(_is_c) (
+  _is_c = _is_lb[11] | 0;
+  (_is_c % 16) == 0 ? 1 : seq_bit(seq_scale_mask(_is_c % 16), (_is_p - (floor(_is_c / 16) % 12) + 120) % 12);
+);
+function seq_scale_snap(_ss_lb, _ss_p) local(_ss_d, _ss_q) (
+  _ss_q = _ss_p; _ss_d = 0;
+  while(_ss_d < 7 && !seq_in_scale(_ss_lb, _ss_q)) ( _ss_d += 1; _ss_q = seq_in_scale(_ss_lb, _ss_p - _ss_d) ? _ss_p - _ss_d : _ss_p + _ss_d; );
+  max(0, min(127, _ss_q));
+);
+function seq_ui_scale_menu_open() local(_sc_c, _sc_i) (
+  _sc_c = seq_ui_scale_lane >= 0 ? seq_lane_at(max(0, min(SEQ_PATS - 1, seq_cur | 0)), seq_ui_scale_lane)[11] | 0 : 0;
+  strcpy(#seq_ui_menu, "");
+  _sc_i = 0; loop(9, sprintf(#seq_ui_lbl, "%s%sScale: %s", _sc_i ? "|" : "", (_sc_c % 16) == _sc_i ? "!" : "", seq_scale_name(_sc_i)); strcat(#seq_ui_menu, #seq_ui_lbl); _sc_i += 1; );
+  _sc_i = 0; loop(12, sprintf(#seq_ui_lbl, "|%sRoot %s", (floor(_sc_c / 16) % 12) == _sc_i ? "!" : "", seq_pc_name(_sc_i)); strcat(#seq_ui_menu, #seq_ui_lbl); _sc_i += 1; );
+  swing_popup_open(mx, my, #seq_ui_menu, SP_POPUP_CALLER_SEQ_SCALE);
+);
+// SNAP's grid in steps (0 = free), and a note length's step (a third has no quarter-step length: a quarter then).
+function seq_ui_snap_q() ( seq_opt_snap == 0 ? 1 : seq_opt_snap == 1 ? 0.5 : seq_opt_snap == 2 ? 1 / 3 : 0; );
+function seq_ui_len_q() ( seq_opt_snap == 0 ? 1 : seq_opt_snap == 1 ? 0.5 : 0.25; );
+// A step's first free note slot (-1 when six notes are there), and a note written into a slot: the velocity and the packed
+// cell first, the pitch LAST (@block takes a slot as live once its pitch is set).
+function seq_note_free(_nf_p, _nf_l, _nf_s) local(_nf_b, _nf_k, _nf_hit) (
+  _nf_b = seq_note_at(_nf_p, _nf_l, _nf_s); _nf_hit = -1; _nf_k = 0;
+  loop(SEQ_CHORD_N, _nf_hit < 0 && _nf_b[_nf_k * SEQ_NOTE_F] == 0 ? _nf_hit = _nf_k; _nf_k += 1; );
+  _nf_hit;
+);
+function seq_note_put(_nt_p, _nt_l, _nt_s, _nt_k, _nt_pitch, _nt_vel, _nt_len, _nt_nud) local(_nt_b) (
+  _nt_b = seq_note_at(_nt_p, _nt_l, _nt_s) + _nt_k * SEQ_NOTE_F;
+  _nt_b[1] = max(1, min(127, _nt_vel | 0)); _nt_b[2] = seq_npack(_nt_len, _nt_nud); _nt_b[0] = max(0, min(127, _nt_pitch | 0)) + 1;
+);
+// A lane switched to the roll with no notes yet takes its hits along: each step that is on becomes a note on the pad's
+// root, a step long, with the step's velocity and nudge -- the lane sounds the same the moment it switches. Back to the
+// grid, the step grid (never touched meanwhile) plays again and the notes wait in the store.
+function seq_ui_roll_adopt(_ra_p, _ra_l) local(_ra_lb, _ra_s, _ra_sb, _ra_n, _ra_b, _ra_root) (
+  _ra_lb = seq_lane_at(_ra_p, _ra_l); _ra_n = 0;
+  _ra_b = seq_note_at(_ra_p, _ra_l, 0); loop(SEQ_STEPS * SEQ_CHORD_N, _ra_b[0] > 0 ? _ra_n += 1; _ra_b += SEQ_NOTE_F; );
+  _ra_root = (_ra_lb[0] | 0) >= 0 && (_ra_lb[0] | 0) < NUM_SLOTS ? p_note[_ra_lb[0] | 0] : 60;
+  _ra_n == 0 ? (
+    _ra_s = 0;
+    loop(SEQ_STEPS, _ra_sb = seq_step_at(_ra_p, _ra_l, _ra_s); _ra_sb[0] ? seq_note_put(_ra_p, _ra_l, _ra_s, 0, _ra_root, _ra_sb[1], 1, _ra_sb[5]); _ra_s += 1; );
+  );
+);
+// The right-click step menu: the step's own roll, probability, nudge and accent ticked. Rows: 1 hear the pad, 2..5
+// roll off / x2 / x3 / x4, 6..9 probability 25 / 50 / 75 / 100, 10..12 nudge early / late / none, 13 accent, 14 clear,
+// 15..17 a fill from this step every 2nd / 4th / 8th, 18 clear the lane (S3a).
+function seq_ui_step_menu_open(_sm_b) local(_sm_on, _sm_rt, _sm_pr, _sm_nu) (
+  _sm_on = _sm_b[0]; _sm_rt = _sm_on ? max(1, min(4, _sm_b[3] | 0)) : 0; _sm_pr = _sm_on ? _sm_b[2] : -1; _sm_nu = _sm_on ? _sm_b[5] : 0;
+  sprintf(#seq_ui_menu, "Hear the pad|%sRoll off|%sRoll x2|%sRoll x3|%sRoll x4|%sProbability 25 %%|%sProbability 50 %%|%sProbability 75 %%|%sProbability 100 %%|%sNudge early|%sNudge late|%sNudge none|%sAccent|Clear the step|Every 2nd step from here|Every 4th step from here|Every 8th step from here|Clear the lane",
+          _sm_rt == 1 ? "!" : "", _sm_rt == 2 ? "!" : "", _sm_rt == 3 ? "!" : "", _sm_rt == 4 ? "!" : "",
+          _sm_pr == 25 ? "!" : "", _sm_pr == 50 ? "!" : "", _sm_pr == 75 ? "!" : "", _sm_pr == 100 ? "!" : "",
+          (_sm_on && _sm_nu < 0) ? "!" : "", (_sm_on && _sm_nu > 0) ? "!" : "", (_sm_on && _sm_nu == 0) ? "!" : "",
+          (_sm_on && _sm_b[8]) ? "!" : "");
+  swing_popup_open(mx, my, #seq_ui_menu, SP_POPUP_CALLER_SEQ_STEP);
+);
+// The lane whose length is the longest (FOLLOW with no step selected follows its playhead).
+function seq_ui_longest_lane(_ll_p) local(_ll_l, _ll_best, _ll_len, _ll_n) (
+  _ll_best = 0; _ll_len = 0;
+  _ll_l = 0; loop(SEQ_LANES, _ll_n = seq_lane_at(_ll_p, _ll_l)[1] | 0; _ll_n > _ll_len ? ( _ll_len = _ll_n; _ll_best = _ll_l; ); _ll_l += 1; );
+  _ll_best;
+);
+// A pad's category for the lane icon: the band for the bank on screen, else the name (the pad grid's own order).
+function seq_ui_pad_cat(_pc_t) local(_pc_c, _pc_n) (
+  _pc_c = -1;
+  _pc_t >= 0 && _pc_t < NUM_SLOTS ? (
+    floor(_pc_t / NUM_PADS) == bank_cur ? _pc_c = swing_lcd_padcat_eff(_pc_t);
+    _pc_c < 0 && _pc_c != PADCAT_NONE ? (
+      _pc_n = get_cname_slot(_pc_t); strlen(_pc_n) == 0 ? _pc_n = get_name_slot(_pc_t);
+      _pc_c = strlen(_pc_n) ? eon_cat_for_name(_pc_n) : -1;
+    );
+  );
+  _pc_c;
+);
+// "Hear the pad": the pad grid's own click road -- the voice launch posted to @block's ring (swing_gt_post, the one road
+// a mouse launch takes; rk_drumkit_dsp) and the press cells held for a short while so the host's frame-end release
+// (which waits for seq_ui_tap_until) ends a gate-mode pad after it. Until 2026-10-21 (round two D, the user: "the track
+// icon is not playing the pad") this set the held cells only, and the step menu's "Hear the pad" was silent since P0a:
+// the cells are the release's bookkeeping, not a launch (FINDINGS_LOG). An empty pad does nothing, as on the grid.
+function seq_ui_tap_pad(_tp_pad) (
+  _tp_pad >= 0 && _tp_pad < NUM_SLOTS && gui_held_pad < 0 && pad_is_playable(_tp_pad) ? (
+    swing_gt_post(_tp_pad, p_note[_tp_pad], 127, 8);
+    p_held[_tp_pad] = 1; p_held_vel[_tp_pad] = 127; p_held_note[_tp_pad] = p_note[_tp_pad]; gui_held_pad = _tp_pad;
+    seq_ui_tap_until = time_precise() + 0.12;
+  );
+);
+// Release, then tap (the small things round): the host's frame-end release (Swing_ReaKit's "Release GUI-held pad on
+// mouse-up": a gate-mode pad's release posted, its held cell cleared, gui_held_pad back to -1) done NOW for the pad
+// held, then the tap. seq_ui_tap_pad refuses while a pad is held, and the frame-end release waits for the button to come
+// up: a scrub holds the button, and the picker's hover moves on inside the tap's 0.12 s hold -- without this every lane
+// after the first, every tile after the first, was silent. A pad that cannot play is released and nothing sounds.
+function seq_ui_retap(_rt_pad) local(_rt_eos) (
+  gui_held_pad >= 0 ? (
+    _rt_eos = p_oneshot[gui_held_pad];
+    (_rt_eos == 0 || (_rt_eos < 0 && !oneshot_global)) ? swing_gt_post_release(gui_held_pad);
+    p_held[gui_held_pad] = 0;
+    gui_held_pad = -1;
+  );
+  seq_ui_tap_pad(_rt_pad);
+);
+// A scrub starts (a press on a lane's icon, or its chip): that lane's pad sounds; a MIDI channel lane has none and the
+// scrub starts silent. The lane loop carries it on (swing_seq_panel_draw) until the button comes up.
+function seq_ui_scrub_start(_sk_l, _sk_t) (
+  seq_ui_scrub = 1; seq_ui_scrub_l = _sk_l;
+  _sk_t >= 0 && _sk_t < NUM_SLOTS ? seq_ui_retap(_sk_t);
+);
+
+// The panel's background (the toolbar pass; the user: "the background is always blue"): the theme's PANEL colour, held
+// dark -- the same hue and saturation, the value capped at the LCD's depth -- so the panel follows the theme (slate in EON,
+// grey in a grey theme, warm in a warm one) while the face's light ink stays readable on it, in a light theme too.
+// Without a theme band the LCD's own teal, as before.
+function seq_ui_theme_bg() local(_tb_r, _tb_g, _tb_b, _tb_v, _tb_k) (
+  gmem[GS_THEME_ID] > 0 ? ( _tb_r = pad_well_r; _tb_g = pad_well_g; _tb_b = pad_well_b; ) : ( _tb_r = lcd_bg_r; _tb_g = lcd_bg_g; _tb_b = lcd_bg_b; );
+  _tb_v = max(_tb_r, max(_tb_g, _tb_b));
+  _tb_k = _tb_v > 0.36 ? 0.36 / _tb_v : 1;
+  seq_ui_bg_r = _tb_r * _tb_k; seq_ui_bg_g = _tb_g * _tb_k; seq_ui_bg_b = _tb_b * _tb_k;
+  // a near-black theme panel still reads as a surface: lift it to a floor
+  max(seq_ui_bg_r, max(seq_ui_bg_g, seq_ui_bg_b)) < 0.14 ? ( seq_ui_bg_r += 0.08; seq_ui_bg_g += 0.09; seq_ui_bg_b += 0.11; );
+);
+// ─── Round two H: the pattern chips' helpers ───
+// the region bound to a pattern while SONG is on (the map: region i plays seq_map[i * 4 + 2]); -1 none
+function seq_ui_region_of(_ro_p) local(_ro_i, _ro_hit) (
+  _ro_hit = -1; _ro_i = 0;
+  loop(max(0, min(64, seq_map_n | 0)), _ro_hit < 0 && (seq_map[_ro_i * 4 + 2] | 0) == _ro_p ? _ro_hit = _ro_i; _ro_i += 1; );
+  _ro_hit;
+);
+// a chip's colour into _hsl_r / g / b: the pattern's own, else its region's while SONG is on, else a hue from its number
+function seq_ui_pat_rgb(_pr_p) local(_pr_c, _pr_i, _pr_h) (
+  _pr_c = seq_meta_col(_pr_p);
+  _pr_c == 0 && seq_opt_sync ? ( _pr_i = seq_ui_region_of(_pr_p); _pr_i >= 0 ? _pr_c = seq_map[_pr_i * 4 + 3] | 0; );
+  _pr_c > 0 ? ( _hsl_r = floor(_pr_c / 65536) / 255; _hsl_g = (floor(_pr_c / 256) - 256 * floor(_pr_c / 65536)) / 255; _hsl_b = (_pr_c - 256 * floor(_pr_c / 256)) / 255; )
+            : ( _pr_h = _pr_p * 137.508; _pr_h = (_pr_h - 360 * floor(_pr_h / 360)) / 360; hsl_to_rgb(_pr_h, 0.5, 0.42); );
+);
+// a chip's name into #seq_ui_gstr: the pattern's own, else its region's while SONG is on; 1 when there is one
+function seq_ui_pat_name(_pn_p) local(_pn_i) (
+  seq_meta_has_name(_pn_p) ? ( seq_meta_name(_pn_p); strcpy(#seq_ui_gstr, #seq_meta_str); 1; )
+  : ( _pn_i = seq_opt_sync ? seq_ui_region_of(_pn_p) : -1; _pn_i >= 0 ? ( seq_ui_map_name(_pn_i); strlen(#seq_ui_gstr) > 0; ) : ( strcpy(#seq_ui_gstr, ""); 0; ); );
+);
+function seq_ui_ren_commit() ( seq_ui_ren_p >= 0 ? ( seq_meta_name_set(seq_ui_ren_p, #seq_ui_ren_buf); seq_ui_ren_p = -1; seq_ui_edited(); ); );
+// the colour menu (caller 47): auto, then the menu library's own seven colours (the rows wear them)
+function seq_ui_colour_menu_open() (
+  swing_popup_open(mx, my, "Auto: a hue from the number|^r Red|^a Orange|^G Green|^c Cyan|^b Blue|^p Purple|^g Grey", SP_POPUP_CALLER_SEQ_COLOUR);
+);
+// The PATTERN menu (the toolbar pass; the user: the five bare words "come across confusing... maybe we need those in a
+// menu?"): rows 1 copy, 2 paste (greyed with nothing copied), 3 duplicate, 4 halve, 5 double, 6 clear this pattern,
+// 7 clear all, 8..11 aim at bank A..D, 12 rename, 13 colour, 14 remove the last pattern (greyed unless it is empty and
+// no region plays it). From the PATTERN button for the pattern on screen, from a chip's right-click for that chip's
+// pattern.
+function seq_ui_pattern_menu_open(_pm_p) (
+  seq_ui_pmenu_pat = max(0, min(SEQ_PATS - 1, _pm_p | 0));
+  sprintf(#seq_ui_menu, "Copy pattern %d|%sPaste over pattern %d|Duplicate into the next empty slot|Halve: half the steps, each twice as long|Double: twice the steps, each half as long|Clear pattern %d|Clear ALL %d patterns|Aim pattern %d at bank A|Aim pattern %d at bank B|Aim pattern %d at bank C|Aim pattern %d at bank D|Rename pattern %d ...|Colour of pattern %d ...|%sRemove the last pattern (%d)",
+          seq_ui_pmenu_pat + 1, seq_clip_full ? "" : "#", seq_ui_pmenu_pat + 1, seq_ui_pmenu_pat + 1, SEQ_PATS, seq_ui_pmenu_pat + 1, seq_ui_pmenu_pat + 1, seq_ui_pmenu_pat + 1, seq_ui_pmenu_pat + 1,
+          seq_ui_pmenu_pat + 1, seq_ui_pmenu_pat + 1, (seq_npat > 1 && !seq_pat_used(seq_npat - 1) && !(seq_opt_sync && seq_ui_region_of(seq_npat - 1) >= 0)) ? "" : "#", seq_npat);   // round two H: rename, colour, remove
+  swing_popup_open(mx, my, #seq_ui_menu, SP_POPUP_CALLER_SEQ_PATTERN);
+);
+// The key row (round two C; the toolbar pass's strip until then -- the user: "We deffinetley need a way to see the keys
+// better than that. Its far too small"): while KEYS is on, a keyboard of the sixteen trigger notes across the panel under
+// the chips, white and black keys where the notes fall (an end that is a black key gets half a white key's room, so it
+// never hangs outside). Each key of a pattern on show carries that pattern's chip colour and number at its foot; keys past
+// the count are dim and do nothing. The pattern on screen's key is lit blue; a switch waiting for its step (seq_sw_pat)
+// lights its key amber and the right end says NEXT and its number; the left end says where the notes start. A click on a
+// key puts its pattern on screen; hovering one names its note and its pattern.
+function seq_pc_black(_pb) ( _pb == 1 || _pb == 3 || _pb == 6 || _pb == 8 || _pb == 10; );
+function seq_ui_keystrip_draw(_ks_x, _ks_y, _ks_w, _ks_h, _ks_pat)
+local(_ks_k, _ks_nw, _ks_ww, _ks_wi, _ks_kx, _ks_kw, _ks_blk, _ks_hov, _ks_tw, _ks_th, _ks_lit, _ks_next, _ks_lw, _ks_ax, _ks_aw,
+      _ks_x0, _ks_bh, _ks_hk, _ks_band, _ks_on) (
+  gfx_set(0, 0, 0, 0.22); gfx_rect(_ks_x, _ks_y, _ks_w, _ks_h);
+  _ks_lw = swing_px(SEQ_UI_KEYS_LBL_B);
+  _ks_ax = _ks_x + _ks_lw; _ks_aw = max(swing_px(80), _ks_w - 2 * _ks_lw);   // the keys' area between the two label zones
+  seq_ui_keys_x = _ks_ax; seq_ui_keys_w = _ks_aw;
+  _ks_nw = 0; _ks_k = 0; loop(SEQ_TRIG_N, seq_pc_black((seq_trig_base + _ks_k) % 12) ? 0 : _ks_nw += 1; _ks_k += 1; );
+  _ks_ww = _ks_aw / max(1, _ks_nw + (seq_pc_black(seq_trig_base % 12) ? 0.5 : 0) + (seq_pc_black((seq_trig_base + SEQ_TRIG_N - 1) % 12) ? 0.5 : 0));
+  _ks_x0 = _ks_ax + (seq_pc_black(seq_trig_base % 12) ? _ks_ww * 0.5 : 0);
+  _ks_bh = floor(_ks_h * 0.62);
+  _ks_next = seq_sw_pat >= 0 && seq_sw_pat < SEQ_PATS ? seq_sw_pat : -1;
+  _ks_hk = -1;
+  // the white keys, then the black ones over their seams (a press on a black key wins: it is handled last)
+  _ks_wi = 0; _ks_k = 0;
+  loop(SEQ_TRIG_N,
+    !seq_pc_black((seq_trig_base + _ks_k) % 12) ? (
+      _ks_kx = _ks_x0 + _ks_wi * _ks_ww; _ks_kw = _ks_ww;
+      _ks_on = _ks_k < seq_npat; _ks_lit = _ks_k == _ks_pat;
+      _ks_hov = mx >= _ks_kx && mx < _ks_kx + _ks_kw && my >= _ks_y && my < _ks_y + _ks_h;
+      _ks_hov ? _ks_hk = _ks_k;
+      _ks_k == _ks_next ? gfx_set(0.95, 0.70, 0.25, 1) : _ks_lit ? gfx_set(0.42, 0.68, 0.92, 1) : gfx_set(0.86, 0.88, 0.91, !_ks_on ? 0.3 : (_ks_hov ? 1 : 0.9));
+      gfx_rect(_ks_kx + 1, _ks_y, _ks_kw - 2, _ks_h);
+      _ks_band = floor(_ks_h * 0.38);
+      _ks_on ? ( seq_ui_pat_rgb(_ks_k); gfx_set(_hsl_r, _hsl_g, _hsl_b, 1); gfx_rect(_ks_kx + 3, _ks_y + _ks_h - _ks_band - 2, _ks_kw - 6, _ks_band); );
+      sprintf(#seq_ui_lbl, "%d", _ks_k + 1); rk_font(1, swing_fs(11), 'b');
+      _ks_on ? ( (_hsl_r + _hsl_g + _hsl_b) * 0.333 > 0.55 ? gfx_set(0.08, 0.09, 0.12, 1) : gfx_set(1, 1, 1, 1); ) : gfx_set(0.12, 0.14, 0.17, 0.45);
+      gfx_measurestr(#seq_ui_lbl, _ks_tw, _ks_th); gfx_x = _ks_kx + (_ks_kw - _ks_tw) * 0.5; gfx_y = _ks_y + _ks_h - 2 - (_ks_band + _ks_th) * 0.5; gfx_drawstr(#seq_ui_lbl);
+      _ks_hov && lmb_down && _ks_k != _ks_pat && _ks_on ? ( seq_cur = _ks_k; seq_ui_sel_l = -1; mark_dirty(); seq_ui_loop_follow(_ks_k, 0); );
+      _ks_wi += 1;
+    );
+    _ks_k += 1;
+  );
+  _ks_wi = 0; _ks_k = 0;
+  loop(SEQ_TRIG_N,
+    seq_pc_black((seq_trig_base + _ks_k) % 12) ? (
+      _ks_kw = _ks_ww * 0.62; _ks_kx = _ks_x0 + _ks_wi * _ks_ww - _ks_kw * 0.5;
+      _ks_on = _ks_k < seq_npat; _ks_lit = _ks_k == _ks_pat;
+      _ks_hov = mx >= _ks_kx && mx < _ks_kx + _ks_kw && my >= _ks_y && my < _ks_y + _ks_bh;
+      _ks_hov ? _ks_hk = _ks_k;
+      _ks_k == _ks_next ? gfx_set(0.95, 0.70, 0.25, 1) : _ks_lit ? gfx_set(0.30, 0.56, 0.84, 1) : gfx_set(0.12, 0.14, 0.17, !_ks_on ? 0.45 : (_ks_hov ? 0.85 : 1));
+      gfx_rect(_ks_kx, _ks_y, _ks_kw, _ks_bh);
+      _ks_band = floor(_ks_bh * 0.48);
+      _ks_on ? ( seq_ui_pat_rgb(_ks_k); gfx_set(_hsl_r, _hsl_g, _hsl_b, 1); gfx_rect(_ks_kx + 2, _ks_y + _ks_bh - _ks_band - 2, _ks_kw - 4, _ks_band); );
+      sprintf(#seq_ui_lbl, "%d", _ks_k + 1); rk_font(1, swing_fs(9), 'b');
+      _ks_on ? ( (_hsl_r + _hsl_g + _hsl_b) * 0.333 > 0.55 ? gfx_set(0.08, 0.09, 0.12, 1) : gfx_set(1, 1, 1, 1); ) : gfx_set(0.92, 0.94, 0.97, 0.45);
+      gfx_measurestr(#seq_ui_lbl, _ks_tw, _ks_th); gfx_x = _ks_kx + (_ks_kw - _ks_tw) * 0.5; gfx_y = _ks_y + _ks_bh - 2 - (_ks_band + _ks_th) * 0.5; gfx_drawstr(#seq_ui_lbl);
+      _ks_hov && lmb_down && _ks_k != _ks_pat && _ks_on ? ( seq_cur = _ks_k; seq_ui_sel_l = -1; mark_dirty(); seq_ui_loop_follow(_ks_k, 0); );
+    ) : _ks_wi += 1;
+    _ks_k += 1;
+  );
+  // the left end: where the notes start; the right end: the pattern waiting for its step
+  rk_font(1, swing_fs(8), 'b'); gfx_set(0.75, 0.82, 0.9, 0.6); gfx_x = _ks_x + swing_px(8); gfx_y = _ks_y + swing_px(5); gfx_drawstr("KEYS FROM");
+  seq_ui_note_name(seq_trig_base); rk_font(1, swing_fs(14), 'b'); gfx_set(0.92, 0.95, 0.98, 0.95);
+  gfx_x = _ks_x + swing_px(8); gfx_y = _ks_y + _ks_h - swing_fs(14) - swing_px(5); gfx_drawstr(#seq_ui_gstr);
+  _ks_next >= 0 ? (
+    rk_font(1, swing_fs(8), 'b'); gfx_set(0.95, 0.70, 0.25, 0.85); gfx_measurestr("NEXT", _ks_tw, _ks_th);
+    gfx_x = _ks_x + _ks_w - swing_px(8) - _ks_tw; gfx_y = _ks_y + swing_px(5); gfx_drawstr("NEXT");
+    sprintf(#seq_ui_lbl, "%d", _ks_next + 1); rk_font(1, swing_fs(16), 'b'); gfx_set(0.95, 0.70, 0.25, 1); gfx_measurestr(#seq_ui_lbl, _ks_tw, _ks_th);
+    gfx_x = _ks_x + _ks_w - swing_px(8) - _ks_tw; gfx_y = _ks_y + _ks_h - _ks_th - swing_px(3); gfx_drawstr(#seq_ui_lbl);
+  );
+  // a key's tooltip names its note and its pattern
+  _ks_hk >= 0 ? (
+    seq_ui_note_name(seq_trig_base + _ks_hk); strcpy(#seq_ui_ks_note, #seq_ui_gstr);
+    _ks_hk < seq_npat ? (
+      seq_ui_pat_name(_ks_hk) ? sprintf(#seq_ui_lbl, "%s plays pattern %d, %s. Click to put it on screen.", #seq_ui_ks_note, _ks_hk + 1, #seq_ui_gstr)
+                              : sprintf(#seq_ui_lbl, "%s plays pattern %d. Click to put it on screen.", #seq_ui_ks_note, _ks_hk + 1);
+    ) : sprintf(#seq_ui_lbl, "%s would play pattern %d. Add patterns with + to use it.", #seq_ui_ks_note, _ks_hk + 1);
+    swing_tooltip_check(1465, #seq_ui_lbl);
+  ) : mx >= _ks_x && mx < _ks_x + _ks_w && my >= _ks_y && my < _ks_y + _ks_h ?
+    swing_tooltip_check(1465, "The trigger notes, one key per pattern: play one on your keyboard and that pattern plays next (amber while it waits for its step).");
+);
+// PRINT (S6): the pattern on screen as a MIDI item, through the bridge (CMD 96: the cycles, and one cycle in beats --
+// the longest lane's -- so the bridge can snap the edit cursor to a cycle boundary; the band's state gates one print at
+// a time). Returns 1 when posted; the footer says why not otherwise.
+function seq_ui_print(_pn_n) local(_pn_p) (
+  _pn_p = max(0, min(SEQ_PATS - 1, seq_cur | 0));
+  gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 && !kit_busy && (gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id)
+    && gmem[EON_SEQ_PRINT_BASE] == 0 ? (
+    gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_PARAM1] = max(1, _pn_n | 0); gmem[KIT_GMEM_NPADS] = seq_pat_cycle_beats(_pn_p);
+    gmem[KIT_GMEM_CMD] = 96;
+    sprintf(#seq_ui_lbl, "Writing pattern %d as a MIDI item, %d cycle%s of the longest lane, from the cursor's bar ...", _pn_p + 1, max(1, _pn_n | 0), _pn_n > 1 ? "s" : ""); seq_ui_say(#seq_ui_lbl); 1;
+  ) : ( seq_ui_say(gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? "TO ITEM: the bridge is busy, or an item is still on its way -- try again in a moment" : "TO ITEM needs the Kit Bridge"); 0; );
+);
+// Round two G (the user: "in song mode in steppa the patterns matched the regions 1:1 ... should it?" -> "Both: every region
+// in place by default, and a right-click choice to write the chain from the edit cursor"; an empty region gets no item):
+// with SONG on, TO ITEM writes the song through the bridge. Mode 1 = one MIDI item under every region, in place, named
+// after it, holding the pattern the region plays (the map's link) over its length, anchored at its start as it plays;
+// mode 2 = the chain in play order with its repeats, laid out from the edit cursor. The walks go one at a time through the
+// print band; the bridge keeps the hits and builds every item in one tick, one undo point. Returns 1 when posted.
+// The small things round (2026-10-23, the user's PRINT SONG): each drum onto its own track where the kit has one (else
+// this track), the span cleared first, the sequencer standing aside over what was printed -- the bridge's side. The
+// command moved from 97 to 53: 97 is the bridge's "a dialog is open" park on the same cell, so a print and an open Save
+// form read alike (the round's notes, Notes_print section "CMD 97 has two meanings"). A bridge older than the round
+// (SEQ_UI_SONG_LEVEL) knows no 53: refused with a word, never raised into it (it would sit until the bridge's sweep).
+function seq_ui_print_song(_ps_mode) (
+  gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[GS_BRIDGE_LEVEL] < SEQ_UI_SONG_LEVEL ? ( seq_ui_say("TO ITEM with SONG on needs the newer Kit Bridge: restart REAPER to load the version you installed"); 0; )
+  : gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 && !kit_busy && (gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id)
+    && gmem[EON_SEQ_PRINT_BASE] == 0 ? (
+    gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_PARAM1] = _ps_mode == 2 ? 2 : 1; gmem[KIT_GMEM_NPADS] = 0;
+    gmem[KIT_GMEM_CMD] = 53;
+    _ps_mode == 2 ? seq_ui_say("Writing the chain from the edit cursor, one MIDI item per entry ...") : seq_ui_say("Writing the song: one MIDI item under every region ..."); 1;
+  ) : ( seq_ui_say(gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 ? "TO ITEM: the bridge is busy, or an item is still on its way -- try again in a moment" : "TO ITEM needs the Kit Bridge"); 0; );
+);
+function seq_ui_print_menu_open() local(_pm_sb) (
+  seq_opt_sync ? (   // SONG on: the song's two shapes; the chain's row is a header (no pick) while the chain is empty
+    _pm_sb = EON_SS_SONG_BASE + max(0, _reg_my_slot) * EON_SS_SONG_STRIDE;
+    sprintf(#seq_ui_menu, "Every region, in place|%sThe chain from the edit cursor", (gmem[_pm_sb + 1] | 0) > 0 && _reg_my_slot >= 0 ? "" : "#");
+  ) : strcpy(#seq_ui_menu, "1 cycle|2 cycles|4 cycles|8 cycles");
+  swing_popup_open(mx, my, #seq_ui_menu, SP_POPUP_CALLER_SEQ_PRINT);
+);
+// A transport press to the bridge (the plugin cannot drive the transport). Returns 1 when posted. A bridge of
+// SEQ_UI_TR_LEVEL takes it through the transport mailbox (above), so it goes out during a kit load too; an older bridge
+// through CMD 95 on an idle bus only (a load holds the bus: the press is not posted).
+function seq_ui_transport(_tr_a) local(_tr_b, _tr_n) (
+  gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[GS_BRIDGE_LEVEL] >= SEQ_UI_TR_LEVEL && _reg_my_slot >= 0 ? (
+    _tr_b = EON_SS_SYNC_BASE + _reg_my_slot * EON_SS_SYNC_STRIDE;
+    _tr_n = max(seq_ui_trreq_seq, gmem[_tr_b + SEQ_UI_TR_REQ] | 0) + 1;
+    gmem[_tr_b + SEQ_UI_TR_ACT + (_tr_n & 1)] = _tr_a;   // the payload first
+    seq_ui_trreq_seq = _tr_n;
+    gmem[_tr_b + SEQ_UI_TR_REQ] = _tr_n;                 // the counter LAST
+    1;
+  ) : gmem[KIT_GMEM_BRIDGE_ALIVE] > 0 && gmem[KIT_GMEM_CMD] == 0 && !kit_busy && (gmem[KIT_GMEM_LOCK] == 0 || gmem[KIT_GMEM_LOCK] == instance_id) ? (
+    gmem[KIT_GMEM_LOCK] = instance_id; gmem[KIT_GMEM_PARAM1] = _tr_a; gmem[KIT_GMEM_CMD] = 95; 1;
+  ) : 0;
+);
+// The transport's loop icon pressed (2026-10-26). _lt_song: the song's loop is live (SONG on, a bridge of the round) --
+// then on (SONG +5 = _lt_lit, 1 or 2) turns it off, and off turns it on in the mode last used (seq_ui_loop_last, Region
+// first), each the same song op 16 the LOOP group sends (A2 = _lt_ord, the region of the pattern on screen, _lt_pat).
+// Without it, REAPER's plain repeat flips (CMD 95 action 3), as the icon did before the small things round.
+function seq_ui_loop_toggle(_lt_song, _lt_lit, _lt_ord, _lt_pat) local(_lt_m) (
+  _lt_song ? (
+    _lt_lit > 0 ? seq_ui_song_cmd(16, 0, _lt_ord) : (
+      _lt_m = seq_ui_loop_last == 2 ? 2 : 1;
+      _lt_m == 1 && _lt_ord < 1 ? seq_ui_say("This pattern has no region in the song yet.")
+      : ( seq_ui_song_cmd(16, _lt_m, _lt_ord); seq_ui_lf_pat = _lt_pat; );
+    );
+  ) : seq_ui_transport(3);
+);
+// The keyboard, one key a frame (the frame globals took it into _char; the browser filter reads it the same way).
+// Runs only when the panel owns the last click, is open in a window and no text box has the keys.
+function seq_ui_keys() local(_k_c, _k_sb, _k_p, _k_used, _k_pages, _k_t, _k_nav) (
+  _k_c = _char; _k_used = 1; _k_nav = 0;
+  _k_p = max(0, min(SEQ_PATS - 1, seq_cur | 0));
+  _k_pages = max(1, ceil(SEQ_STEPS / max(1, seq_ui_shown)));   // the panel's count (K5: 48 shown leaves a page of sixteen)
+  seq_ui_pk_lane >= 0 ? (   // the drawn picker is up (the small things round): Escape closes it, Space still plays; nothing edits under it
+    _k_c == 27 ? seq_ui_pk_lane = -1 : _k_c == ' ' ? seq_ui_transport(6) : _k_used = 0;
+    _k_used ? _char = 0;
+  ) : seq_ui_ren_p >= 0 ? (   // a pattern's rename box has the keys (round two H): Enter keeps the name, Escape drops it
+    _k_c == 13 ? seq_ui_ren_commit()
+    : _k_c == 27 ? seq_ui_ren_p = -1
+    : _k_c == 8 ? ( strlen(#seq_ui_ren_buf) ? ( strcpy_substr(#seq_ui_lbl, #seq_ui_ren_buf, 0, strlen(#seq_ui_ren_buf) - 1); strcpy(#seq_ui_ren_buf, #seq_ui_lbl); ); )
+    : _k_c >= 32 && _k_c < 127 && _k_c != '|' ? ( strlen(#seq_ui_ren_buf) < SEQ_NAME_LEN ? ( sprintf(#seq_ui_lbl, "%s%c", #seq_ui_ren_buf, _k_c); strcpy(#seq_ui_ren_buf, #seq_ui_lbl); ); )
+    : _k_used = 0;
+    _k_used ? _char = 0;
+  ) : seq_ui_plist ? (   // the preset list has the keys (S3b): Escape closes, Backspace and the printable keys type the filter
+    _k_c == 27 ? ( seq_ui_plist = 0; )
+    : _k_c == 8 ? ( strlen(#seq_ui_plist_filt) ? ( strcpy_substr(#seq_ui_lbl, #seq_ui_plist_filt, 0, strlen(#seq_ui_plist_filt) - 1); strcpy(#seq_ui_plist_filt, #seq_ui_lbl); seq_ui_plist_dirty = 1; ); )
+    : _k_c >= 32 && _k_c < 127 ? ( strlen(#seq_ui_plist_filt) < 24 ? ( sprintf(#seq_ui_lbl, "%s%c", #seq_ui_plist_filt, _k_c); strcpy(#seq_ui_plist_filt, #seq_ui_lbl); seq_ui_plist_dirty = 1; ); )
+    : _k_used = 0;
+    _k_used ? _char = 0;
+  ) : (
+  (_k_c == SEQ_KEY_LEFT || _k_c == SEQ_KEY_RIGHT || _k_c == SEQ_KEY_UP || _k_c == SEQ_KEY_DOWN) && seq_ui_sel_l < 0 ? (
+    seq_ui_sel_l = 0; seq_ui_sel_s = seq_page * seq_ui_shown; _k_nav = 1;
+  ) : _k_c == SEQ_KEY_LEFT ? ( seq_ui_sel_s = max(0, seq_ui_sel_s - 1); _k_nav = 1; )
+  : _k_c == SEQ_KEY_RIGHT ? ( seq_ui_sel_s = min(SEQ_STEPS - 1, seq_ui_sel_s + 1); _k_nav = 1; )
+  : _k_c == SEQ_KEY_UP ? ( seq_ui_sel_l = seq_opt_topdown ? max(0, seq_ui_sel_l - 1) : min(SEQ_LANES - 1, seq_ui_sel_l + 1); _k_nav = 1; )   // the lane ABOVE on screen
+  : _k_c == SEQ_KEY_DOWN ? ( seq_ui_sel_l = seq_opt_topdown ? min(SEQ_LANES - 1, seq_ui_sel_l + 1) : max(0, seq_ui_sel_l - 1); _k_nav = 1; )
+  : _k_c == SEQ_KEY_PGUP ? ( seq_page = max(0, seq_page - 1); seq_opt_follow = 0; )
+  : _k_c == SEQ_KEY_PGDN ? ( seq_page = min(_k_pages - 1, seq_page + 1); seq_opt_follow = 0; )
+  : _k_c == 's' ? seq_view = 0 : _k_c == 'v' ? seq_view = 1 : _k_c == 'p' ? seq_view = 2
+  : _k_c == 'r' ? seq_view = 3 : _k_c == 'n' ? seq_view = 4 : _k_c == 'a' ? seq_view = 5
+  : _k_c >= '1' && _k_c <= '8' ? ( _k_t = (seq_ui_chip0 | 0) + _k_c - '1'; _k_t < seq_npat ? ( seq_cur = _k_t; seq_ui_sel_l = -1; mark_dirty(); seq_ui_loop_follow(_k_t, 0); ); )   // from the first chip shown; past the count: nothing (round two H)
+  : _k_c == 3 ? ( seq_post_op(SEQ_OP_COPY, _k_p, 0); sprintf(#seq_ui_lbl, "Pattern %d copied", _k_p + 1); seq_ui_say(#seq_ui_lbl); )   // Ctrl+C
+  : _k_c == 22 ? ( seq_clip_full ? ( seq_post_op(SEQ_OP_PASTE, _k_p, 0); seq_ui_sel_l = -1; seq_ui_edited(); sprintf(#seq_ui_lbl, "Pasted into pattern %d", _k_p + 1); seq_ui_say(#seq_ui_lbl); ) : seq_ui_say("Nothing copied yet"); )   // Ctrl+V
+  : _k_c == ' ' ? seq_ui_transport(6)
+  : (_k_c == 13 || _k_c == SEQ_KEY_DEL || _k_c == '+' || _k_c == '=' || _k_c == '-') && seq_ui_sel_l >= 0 && seq_ui_sel_s >= 0 ? (
+    _k_sb = seq_step_at(_k_p, seq_ui_sel_l, seq_ui_sel_s);
+    _k_c == 13 ? ( _k_sb[0] ? seq_step_off(_k_sb) : seq_step_on_at(_k_p, seq_ui_sel_l, seq_ui_sel_s, SEQ_VEL_DEFAULT); )
+    : _k_c == SEQ_KEY_DEL ? seq_step_off(_k_sb)
+    : _k_c == '-' ? ( _k_sb[0] ? _k_sb[1] = max(1, _k_sb[1] - 4); )
+    : ( _k_sb[0] ? _k_sb[1] = min(127, _k_sb[1] + 4); );
+    seq_ui_edited(); _k_nav = 1;
+  ) : _k_used = 0;
+  // the selection moved off the page (the arrows), or was edited off it (Enter, Delete, + / - after FOLLOW paged away):
+  // turn the page to it (view state), and FOLLOW yields to the hand. Only those keys: PgUp / PgDn, Space, the views and
+  // 1-8 leave the page where they put it (audit K6: every key snapped the page back to the last clicked step, so once a
+  // step had been clicked PgDn never turned the page and FOLLOW went off)
+  _k_nav && seq_ui_sel_s >= 0 && floor(seq_ui_sel_s / seq_ui_shown) != seq_page ? ( seq_page = floor(seq_ui_sel_s / seq_ui_shown); seq_opt_follow = 0; );
+  // ...and the lanes' window the same way (2026-10-27: the lanes scroll from 24 px rows): the selection moved or edited
+  // onto a lane outside the rows the last draw showed (seq_ui_nvis of them from seq_ui_lscr) brings that lane into view
+  _k_nav && seq_ui_sel_l >= 0 && seq_ui_nvis > 0 && seq_ui_nvis < SEQ_LANES ? (
+    seq_ui_sel_l < seq_ui_lscr ? seq_ui_lscr = seq_ui_sel_l
+    : seq_ui_sel_l >= seq_ui_lscr + seq_ui_nvis ? seq_ui_lscr = seq_ui_sel_l - seq_ui_nvis + 1;
+  );
+  _k_used ? _char = 0;   // consumed: the popup / overlay ESC checks and the browser filter never see it
+  );
+);
+

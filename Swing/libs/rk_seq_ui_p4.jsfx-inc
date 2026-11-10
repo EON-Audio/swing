@@ -1,0 +1,544 @@
+// rk_seq_ui_p4.jsfx-inc -- part 4 of rk_seq_ui.jsfx-inc (6 parts), cut at a function boundary by
+// .dev_tests/split_big_incs.py: REAPER's load time grows with the square of a file's size. Edit freely;
+// keep each file under about 40 KB.
+
+// ⚠️ @init IS LOAD-BEARING (.docs/wiki/02-file-structure.md).
+@init
+
+// SNAP (S5): where a moved hit or a dragged note lands, and a note length's step. In the footer and beside the folded
+// roll (the user, 2026-10-20: "Where is snap?"). Click: the next, right-click: the previous. Returns 1 under the mouse.
+function seq_ui_snap_btn(_sn_x, _sn_y, _sn_w, _sn_h) local(_sn_hov) (
+  sprintf(#seq_ui_lbl, "SNAP %s", seq_opt_snap == 0 ? "step" : seq_opt_snap == 1 ? "1/2" : seq_opt_snap == 2 ? "1/3" : "off");
+  _sn_hov = seq_ui_btn(_sn_x, _sn_y, _sn_w, _sn_h, #seq_ui_lbl, seq_opt_snap == 3);
+  _sn_hov && lmb_down ? ( seq_opt_snap = seq_opt_snap >= 3 ? 0 : seq_opt_snap + 1; mark_dirty(); );
+  _sn_hov && rmb_down ? ( seq_opt_snap = seq_opt_snap <= 0 ? 3 : seq_opt_snap - 1; mark_dirty(); );
+  _sn_hov ? swing_tooltip_check(1461, "SNAP: where a moved hit or note lands -- a whole step, a half, a third (triplets), or off (free). Click: the next, right-click: the previous.");
+  _sn_hov;
+);
+// ── S5: the piano roll, a lane folded out (spec 2.10, decision 14) ──────────────────────────────────────────────────
+// Drawn at the bottom of the lane area under its lane's own row, the fifteen other lanes compacted above it and a grabber
+// between (the user, 2026-10-20: "Can we get adjustable height grabbers for when the piano lane is used"). Its left
+// column is the lane header's room (held to SEQ_UI_ROLL_LEFT_B at least while a roll is open, columns hidden or not):
+// the lane's colour strip, the buttons -- FOLD, SNAP, < OCT >, SCALE -- the lane's name, and a keyboard against the grid
+// ("the actual piano is ugly"): white keys the strip's width, black keys set in from the left, the white keys' seams
+// showing from under them, the C's named, the pad's root tinted amber, the key under the mouse lit. The rows are pitches,
+// SEQ_UI_ROLL_ROW_B design px each (twelve at least); the grid's bands follow the keys. OCT moves the window an octave,
+// the wheel over an empty spot a semitone; it opens around the pad's root. A press on an empty spot puts a note (the row's
+// pitch snapped to the lane's scale, the last length) and the drag draws its length; a press on a note selects it and
+// drags it (SNAP's grid; another step needs a free slot) or, from its right third, its length; a right-click deletes it;
+// the wheel over a note sets its velocity. Up to six notes start on one step: a chord.
+function seq_scale_abbr(_sa_m) ( _sa_m == 1 ? "maj" : _sa_m == 2 ? "min" : _sa_m == 3 ? "dor" : _sa_m == 4 ? "mixo" : _sa_m == 5 ? "pent+" : _sa_m == 6 ? "pent-" : _sa_m == 7 ? "harm" : _sa_m == 8 ? "blues" : "chrom"; );
+// A lane's name: the pad's category name, its file name, "MIDI ch n" or "Pad n"; the bank letter outside bank A.
+function seq_ui_lane_name(_ln_tgt) local(_ln_nm) (
+  _ln_nm = _ln_tgt >= 0 && _ln_tgt < NUM_SLOTS ? get_cname_slot(_ln_tgt) : "";
+  _ln_tgt >= 0 && _ln_tgt < NUM_SLOTS && strlen(_ln_nm) == 0 ? _ln_nm = get_name_slot(_ln_tgt);
+  strlen(_ln_nm) == 0 ? ( _ln_tgt < 0 ? sprintf(#seq_ui_nm, "MIDI ch %d", -_ln_tgt) : sprintf(#seq_ui_nm, "Pad %d", _ln_tgt + 1); _ln_nm = #seq_ui_nm; );
+  _ln_tgt >= NUM_PADS && _ln_tgt < NUM_SLOTS ? ( sprintf(#seq_ui_nm2, "%c%d %s", 65 + floor(_ln_tgt / NUM_PADS), _ln_tgt - NUM_PADS * floor(_ln_tgt / NUM_PADS) + 1, _ln_nm); _ln_nm = #seq_ui_nm2; );
+  _ln_nm;
+);
+function seq_ui_roll_body(_rb_pat, _rb_l, _rb_lb, _rb_x, _rb_y, _rb_w, _rb_h, _rb_gx, _rb_cw, _rb_n0, _rb_shown, _rb_len, _rb_tgt, _rb_r, _rb_g, _rb_b)
+local(_rb_rows, _rb_rp, _rb_root, _rb_base, _rb_bx, _rb_by, _rb_bh, _rb_bw, _rb_i, _rb_p, _rb_ry, _rb_rh, _rb_blk, _rb_s, _rb_st, _rb_nb, _rb_k, _rb_c,
+      _rb_nx, _rb_nw, _rb_hs, _rb_hk, _rb_hx, _rb_hw, _rb_in, _rb_mp, _rb_q, _rb_t, _rb_ns, _rb_nn, _rb_np, _rb_kx, _rb_kw, _rb_bkw, _rb_hp,
+      _rb_tw, _rb_th, _rb_vel, _rb_ln, _rb_ph, _rb_sc) (
+  gfx_set(0, 0, 0, 0.22); gfx_rect(_rb_x + 1, _rb_y, _rb_w - 2, _rb_h);
+  gfx_set(_rb_r, _rb_g, _rb_b, 0.7); gfx_rect(_rb_x + 3, _rb_y, swing_px(6), _rb_h - 2);
+  _rb_rows = max(12, min(49, floor(_rb_h / swing_px(SEQ_UI_ROLL_ROW_B)))); _rb_rp = _rb_h / _rb_rows;
+  _rb_root = _rb_tgt >= 0 && _rb_tgt < NUM_SLOTS ? p_note[_rb_tgt] : 60;
+  _rb_base = seq_ui_rbase[_rb_l]; _rb_base < 0 ? _rb_base = _rb_root - floor(_rb_rows / 2);
+  _rb_base = max(0, min(128 - _rb_rows, _rb_base | 0)); seq_ui_rbase[_rb_l] = _rb_base;
+  seq_ui_roll_y0 = _rb_y; seq_ui_roll_rowp = _rb_rp; seq_ui_roll_base = _rb_base; seq_ui_roll_rows = _rb_rows;
+  // the keyboard's strip against the grid; the buttons stacked in the column left of it, as many as the height takes
+  _rb_kw = swing_px(SEQ_UI_KEYS_B); _rb_kx = _rb_gx - _rb_kw;
+  _rb_bx = _rb_x + swing_px(12); _rb_bw = min(swing_px(76), _rb_kx - swing_px(4) - _rb_bx); _rb_by = _rb_y + swing_px(4); _rb_bh = swing_px(18);
+  _rb_bw >= swing_px(40) ? (
+    seq_ui_btn(_rb_bx, _rb_by, _rb_bw, _rb_bh, "FOLD", 0) && lmb_down ? seq_ui_roll_lane = -1;
+    _rb_by += _rb_bh + 3;
+    _rb_by + _rb_bh <= _rb_y + _rb_h ? ( seq_ui_snap_btn(_rb_bx, _rb_by, _rb_bw, _rb_bh); _rb_by += _rb_bh + 3; );
+    _rb_by + _rb_bh <= _rb_y + _rb_h ? (
+      seq_ui_btn(_rb_bx, _rb_by, swing_px(22), _rb_bh, "<", 0) && lmb_down ? seq_ui_rbase[_rb_l] = max(0, _rb_base - 12);
+      rk_font(1, swing_fs(8), 'b'); gfx_set(0.75, 0.82, 0.9, 0.85); gfx_measurestr("OCT", _rb_tw, _rb_th);
+      gfx_x = _rb_bx + swing_px(22) + (_rb_bw - swing_px(44) - _rb_tw) * 0.5; gfx_y = _rb_by + (_rb_bh - _rb_th) * 0.5; gfx_drawstr("OCT");
+      seq_ui_btn(_rb_bx + _rb_bw - swing_px(22), _rb_by, swing_px(22), _rb_bh, ">", 0) && lmb_down ? seq_ui_rbase[_rb_l] = min(128 - _rb_rows, _rb_base + 12);
+      _rb_by += _rb_bh + 3;
+    );
+    _rb_by + _rb_bh <= _rb_y + _rb_h ? (
+      _rb_sc = _rb_lb[11] | 0;
+      (_rb_sc % 16) ? sprintf(#seq_ui_lbl, "%s %s", seq_pc_name(floor(_rb_sc / 16) % 12), seq_scale_abbr(_rb_sc % 16)) : strcpy(#seq_ui_lbl, "SCALE");
+      seq_ui_btn(_rb_bx, _rb_by, _rb_bw, _rb_bh, #seq_ui_lbl, (_rb_sc % 16) > 0) && lmb_down ? ( seq_ui_scale_lane = _rb_l; seq_ui_scale_menu_open(); );
+      _rb_by += _rb_bh + 5;
+    );
+    // the lane's name, in its colour (the compacted row above shows none)
+    _rb_by + swing_fs(10) + 2 <= _rb_y + _rb_h ? (
+      rk_font(1, swing_fs(9), 'b'); gfx_set(min(1, _rb_r * 0.6 + 0.4), min(1, _rb_g * 0.6 + 0.4), min(1, _rb_b * 0.6 + 0.4), 0.95);
+      swing_mapping_name_line(_rb_bx + _rb_bw * 0.5, _rb_by, _rb_bw, seq_ui_lane_name(_rb_tgt), 0);
+    );
+  );
+  // the rows: the grid's bands (lighter on the naturals, darker on the sharps, dimmed off the scale, amber on the root,
+  // an octave line at the top of each C) and the keyboard; the row under the mouse lit on both
+  _rb_hp = mx >= _rb_kx && mx < _rb_gx + _rb_shown * _rb_cw && my >= _rb_y && my < _rb_y + _rb_h && !swing_popup_active
+           ? _rb_base + _rb_rows - 1 - floor((my - _rb_y) / max(1, _rb_rp)) : -1;
+  _rb_bkw = floor(_rb_kw * 0.58);
+  _rb_i = 0;
+  loop(_rb_rows,
+    _rb_p = _rb_base + _rb_rows - 1 - _rb_i; _rb_ry = _rb_y + _rb_i * _rb_rp; _rb_rh = max(1, _rb_rp - 1);
+    _rb_blk = (_rb_p % 12) == 1 || (_rb_p % 12) == 3 || (_rb_p % 12) == 6 || (_rb_p % 12) == 8 || (_rb_p % 12) == 10;
+    !seq_in_scale(_rb_lb, _rb_p) ? gfx_set(0, 0, 0, 0.30) : _rb_p == _rb_root ? gfx_set(0.95, 0.80, 0.45, 0.10) : _rb_blk ? gfx_set(0, 0, 0, 0.16) : gfx_set(1, 1, 1, 0.05);
+    gfx_rect(_rb_gx, _rb_ry, _rb_shown * _rb_cw, _rb_rh);
+    _rb_p == _rb_hp ? ( gfx_set(1, 1, 1, 0.06); gfx_rect(_rb_gx, _rb_ry, _rb_shown * _rb_cw, _rb_rh); );
+    (_rb_p % 12) == 0 ? ( gfx_set(1, 1, 1, 0.16); gfx_rect(_rb_gx, _rb_ry, _rb_shown * _rb_cw, 1); );
+    // the key: white the row's full height (the seams below), the black one set in from the left
+    _rb_p == _rb_root ? gfx_set(0.95, 0.74, 0.32, 1) : gfx_set(0.86, 0.88, 0.91, 1);
+    gfx_rect(_rb_kx, _rb_ry, _rb_kw, ceil(_rb_rp));
+    _rb_blk ? (
+      _rb_p == _rb_root ? gfx_set(0.60, 0.40, 0.08, 1) : gfx_set(0.12, 0.14, 0.17, 1);
+      gfx_rect(_rb_kx, _rb_ry + 1, _rb_bkw, _rb_rh - 1);
+      gfx_set(0.52, 0.55, 0.60, 1); gfx_rect(_rb_kx + _rb_bkw, _rb_ry + floor(_rb_rp * 0.5), _rb_kw - _rb_bkw, 1);   // the two white keys' seam from under it
+    ) : (
+      ((_rb_p % 12) == 4 || (_rb_p % 12) == 11) ? ( gfx_set(0.52, 0.55, 0.60, 1); gfx_rect(_rb_kx, _rb_ry, _rb_kw, 1); );   // E / F, B / C: two white keys meet
+    );
+    _rb_p == _rb_hp ? ( gfx_set(0.35, 0.65, 1.0, 0.35); gfx_rect(_rb_kx, _rb_ry, _rb_kw, ceil(_rb_rp)); );
+    _rb_rp >= swing_px(9) && ((_rb_p % 12) == 0 || _rb_p == _rb_root) ? (
+      seq_ui_note_name(_rb_p); rk_font(1, swing_fs(7), 0); gfx_set(0.18, 0.20, 0.24, 0.95);
+      gfx_measurestr(#seq_ui_gstr, _rb_tw, _rb_th); gfx_x = _rb_kx + _rb_kw - 3 - _rb_tw; gfx_y = _rb_ry + (_rb_rp - _rb_th) * 0.5; gfx_drawstr(#seq_ui_gstr);
+    );
+    _rb_i += 1;
+  );
+  gfx_set(0, 0, 0, 0.55); gfx_rect(_rb_kx - 1, _rb_y, 1, _rb_h); gfx_rect(_rb_gx - 1, _rb_y, 1, _rb_h);   // the strip's edges
+  // the playhead's step
+  _rb_ph = seq_playing && seq_eng_pat == _rb_pat ? (seq_wk[_rb_l * SEQ_WK_F + 1] | 0) - _rb_n0 : -1;
+  _rb_ph >= 0 && _rb_ph < _rb_shown ? ( gfx_set(1, 1, 1, 0.08); gfx_rect(_rb_gx + _rb_ph * _rb_cw, _rb_y, _rb_cw, _rb_h); );
+  // the notes (on the page shown), and the one under the mouse
+  _rb_hs = -1; _rb_hk = -1;
+  _rb_s = 0;
+  loop(_rb_shown,
+    _rb_st = _rb_n0 + _rb_s;
+    _rb_st < SEQ_STEPS ? (
+      _rb_nb = seq_note_at(_rb_pat, _rb_l, _rb_st); _rb_k = 0;
+      loop(SEQ_CHORD_N,
+        _rb_p = _rb_nb[_rb_k * SEQ_NOTE_F] | 0;
+        _rb_p > 0 ? (
+          _rb_i = _rb_base + _rb_rows - _rb_p;   // the row of pitch p - 1
+          _rb_i >= 0 && _rb_i < _rb_rows ? (
+            _rb_c = _rb_nb[_rb_k * SEQ_NOTE_F + 2];
+            _rb_nx = _rb_gx + (_rb_s + seq_nnud(_rb_c) * 0.01) * _rb_cw; _rb_nw = max(3, seq_nlen(_rb_c) * _rb_cw - 2);
+            _rb_ry = _rb_y + _rb_i * _rb_rp;
+            gfx_set(_rb_r, _rb_g, _rb_b, _rb_st < _rb_len ? 0.45 + 0.55 * (_rb_nb[_rb_k * SEQ_NOTE_F + 1] | 0) / 127 : 0.25);
+            gfx_rect(_rb_nx + 1, _rb_ry + 1, _rb_nw, max(2, _rb_rp - 2));
+            seq_ui_ns_l == _rb_l && seq_ui_ns_s == _rb_st && seq_ui_ns_k == _rb_k ? (
+              gfx_set(1, 1, 1, 0.95); gfx_rect(_rb_nx + 1, _rb_ry + 1, _rb_nw, 1); gfx_rect(_rb_nx + 1, _rb_ry + max(2, _rb_rp - 2), _rb_nw, 1);
+              gfx_rect(_rb_nx + 1, _rb_ry + 1, 1, max(2, _rb_rp - 2)); gfx_rect(_rb_nx + _rb_nw, _rb_ry + 1, 1, max(2, _rb_rp - 2));
+            );
+            mx >= _rb_nx && mx < _rb_nx + _rb_nw + 2 && my >= _rb_ry && my < _rb_ry + _rb_rp ? ( _rb_hs = _rb_st; _rb_hk = _rb_k; _rb_hx = _rb_nx; _rb_hw = _rb_nw; );
+          );
+        );
+        _rb_k += 1;
+      );
+    );
+    _rb_s += 1;
+  );
+  // the mouse
+  _rb_in = mx >= _rb_gx && mx < _rb_gx + _rb_shown * _rb_cw && my >= _rb_y && my < _rb_y + _rb_h;
+  _rb_in ? seq_ui_roll_hov = 1;
+  _rb_mp = _rb_base + _rb_rows - 1 - floor((my - _rb_y) / max(1, _rb_rp));
+  _rb_in && lmb_down ? (
+    _rb_hs >= 0 ? (
+      // a note: select it, then drag it, or its length from its right third
+      seq_ui_ns_l = _rb_l; seq_ui_ns_s = _rb_hs; seq_ui_ns_k = _rb_hk;
+      _rb_c = seq_note_at(_rb_pat, _rb_l, _rb_hs)[_rb_hk * SEQ_NOTE_F + 2];
+      seq_ui_nd = mx > _rb_hx + _rb_hw - max(swing_px(4), min(swing_px(10), _rb_hw / 3)) ? 2 : 1;
+      seq_ui_nd_mx0 = mx; seq_ui_nd_my0 = my; seq_ui_nd_live = 0;
+      seq_ui_nd_grab = (mx - _rb_gx) / _rb_cw + _rb_n0 - (_rb_hs + seq_nnud(_rb_c) * 0.01);
+      seq_ui_nd_nx = _rb_hx;
+    ) : (
+      // an empty spot: a new note there -- the step under the mouse, the row's pitch on the scale, the last length
+      _rb_st = _rb_n0 + floor((mx - _rb_gx) / _rb_cw);
+      _rb_st < _rb_len ? (
+        _rb_k = seq_note_free(_rb_pat, _rb_l, _rb_st);
+        _rb_k >= 0 ? (
+          seq_note_put(_rb_pat, _rb_l, _rb_st, _rb_k, seq_scale_snap(_rb_lb, max(0, min(127, _rb_mp))), SEQ_VEL_DEFAULT, seq_ui_last_len, 0);
+          seq_ui_ns_l = _rb_l; seq_ui_ns_s = _rb_st; seq_ui_ns_k = _rb_k;
+          seq_ui_nd = 2; seq_ui_nd_nx = _rb_gx + (_rb_st - _rb_n0) * _rb_cw;   // drawing on sets its length
+          seq_ui_nd_mx0 = mx; seq_ui_nd_my0 = my; seq_ui_nd_live = 0;   // ...once the mouse moves: a click alone keeps the last length
+          seq_ui_edited();
+        ) : seq_ui_say("Six notes start on one step at most");
+      ) : seq_ui_say("Past the lane's length: LEN makes room");
+    );
+  );
+  _rb_in && rmb_down && _rb_hs >= 0 ? (
+    seq_note_at(_rb_pat, _rb_l, _rb_hs)[_rb_hk * SEQ_NOTE_F] = 0;
+    seq_ui_ns_l == _rb_l && seq_ui_ns_s == _rb_hs && seq_ui_ns_k == _rb_hk ? seq_ui_ns_l = -1;
+    seq_ui_edited();
+  );
+  // the drag, once the mouse has moved: the length, or the note along the steps (SNAP) and across the rows (the scale)
+  // a move goes live on 4 px of travel either way -- straight up or down changes the pitch (audit K7: sideways travel alone
+  // counted, so a note dragged up three rows stayed put until the hand drifted); a length drag on sideways travel alone
+  seq_ui_nd && LMB && !seq_ui_nd_live && (abs(mx - seq_ui_nd_mx0) >= swing_px(4) || (seq_ui_nd == 1 && abs(my - seq_ui_nd_my0) >= swing_px(4))) ? seq_ui_nd_live = 1;
+  seq_ui_nd && LMB && seq_ui_nd_live && seq_ui_ns_l == _rb_l && seq_ui_ns_s >= 0 && seq_ui_ns_k >= 0 ? (
+    _rb_nb = seq_note_at(_rb_pat, _rb_l, seq_ui_ns_s) + seq_ui_ns_k * SEQ_NOTE_F;
+    _rb_nb[0] > 0 ? (
+      _rb_c = _rb_nb[2];
+      seq_ui_nd == 2 ? (
+        _rb_q = seq_ui_len_q();
+        _rb_ln = max(0.25, min(64, _rb_q * floor((mx - seq_ui_nd_nx) / _rb_cw / _rb_q + 0.5)));
+        _rb_ln != seq_nlen(_rb_c) ? ( _rb_nb[2] = seq_npack(_rb_ln, seq_nnud(_rb_c)); seq_ui_last_len = _rb_ln; seq_ui_edited(); );
+      ) : (
+        _rb_t = (mx - _rb_gx) / _rb_cw + _rb_n0 - seq_ui_nd_grab;
+        _rb_q = seq_ui_snap_q(); _rb_q > 0 ? _rb_t = _rb_q * floor(_rb_t / _rb_q + 0.5);
+        _rb_ns = max(0, min(_rb_len - 1, floor(_rb_t + 0.5)));
+        _rb_nn = max(-50, min(50, floor((_rb_t - _rb_ns) * 100 + 0.5)));
+        _rb_np = seq_scale_snap(_rb_lb, max(0, min(127, _rb_mp)));
+        _rb_ns != seq_ui_ns_s ? (
+          _rb_k = seq_note_free(_rb_pat, _rb_l, _rb_ns);
+          _rb_k >= 0 ? (
+            _rb_vel = _rb_nb[1]; _rb_ln = seq_nlen(_rb_c);
+            _rb_nb[0] = 0;   // out of the old step first (a block's gap at worst, never a doubled note)
+            seq_note_put(_rb_pat, _rb_l, _rb_ns, _rb_k, _rb_np, _rb_vel, _rb_ln, _rb_nn);
+            seq_ui_ns_s = _rb_ns; seq_ui_ns_k = _rb_k; seq_ui_edited();
+          );
+        ) : (
+          _rb_nn != seq_nnud(_rb_c) || _rb_np != (_rb_nb[0] | 0) - 1 ? ( _rb_nb[2] = seq_npack(seq_nlen(_rb_c), _rb_nn); _rb_nb[0] = _rb_np + 1; seq_ui_edited(); );
+        );
+      );
+    );
+  );
+  !LMB ? seq_ui_nd = 0;
+  seq_ui_nd == 2 && LMB ? seq_ui_want_cur = 32644 : seq_ui_nd == 1 && LMB ? seq_ui_want_cur = 32646 :
+  _rb_in && _rb_hs >= 0 && !swing_popup_active ? seq_ui_want_cur = (mx > _rb_hx + _rb_hw - max(swing_px(4), min(swing_px(10), _rb_hw / 3)) ? 32644 : 32646);
+  // the wheel: over a note its velocity; over an empty spot the rows, a semitone
+  _rb_in && frame_wheel != 0 ? (
+    _rb_hs >= 0 ? (
+      _rb_nb = seq_note_at(_rb_pat, _rb_l, _rb_hs) + _rb_hk * SEQ_NOTE_F;
+      _rb_nb[1] = max(1, min(127, (_rb_nb[1] | 0) + (frame_wheel > 0 ? 4 : -4)));
+      seq_ui_ns_l = _rb_l; seq_ui_ns_s = _rb_hs; seq_ui_ns_k = _rb_hk; seq_ui_edited();
+    ) : ( seq_ui_rbase[_rb_l] = max(0, min(128 - _rb_rows, _rb_base + (frame_wheel > 0 ? 1 : -1))); );
+  );
+);
+
+// ── The drawn picker (the small things round, 2026-10-23; the user: "right click, change it to the different note ... on
+// top of the ... icon", "show like a piano and or pad view so people can make that change quickly"; "I like the pad picker
+// sketch. I think that will work.") ──
+// A panel drawn LAST inside the sequencer's rect, beside where it was opened: "<lane> plays", the tabs PADS | PIANO and
+// the banks A-D (a bank with no sound dimmed), then
+//   PADS  the bank's sixteen pads laid out like the grid (pad 1 bottom-left: tile = (3 - row) * 4 + col), each in its
+//         colour with its category glyph and its name, the lane's pad ringed;
+//   PIANO two octaves of keys, an octave a column (the low one left, high notes at the top), < > an octave: a key whose
+//         note is a pad's note in the bank shown wears that pad's colour and name; a key with none is dim and does
+//         nothing -- the same choice seen by note;
+// and "MIDI channel ..." (today's channel menu). Hover = hear (seq_ui_retap, once per pad entered, no button held); a
+// click chooses: the lane's target is that pad, a lane that played a MIDI channel goes back to steps (field 10), one undo
+// point (seq_ui_edited). Modal: swing_seq_panel_draw parks the mouse for everything under it, and swing_seq_gate takes the
+// face's (a press on the face outside the panel); Escape, a right-click, or a press outside it closes it, and the press
+// is consumed. The bottom panel, the side column and the full-face view alike. A panel too small for it (a tile under
+// SEQ_UI_PK_TILE_MIN_B): today's text menu (seq_ui_pick_open) instead.
+
+// Its geometry for a panel's rect: 1 when it fits (seq_ui_pk_x / y / w / h, the tile, the body's corner), else 0.
+function seq_ui_pk_geom(_pg_x, _pg_y, _pg_w, _pg_h) local(_pg_pad, _pg_gap, _pg_hdr, _pg_ft, _pg_aw, _pg_ah, _pg_t, _pg_gw) (
+  _pg_pad = swing_px(6); _pg_gap = swing_px(3); _pg_hdr = swing_px(18 + 2 + 18 + 4); _pg_ft = swing_px(4 + 18);
+  _pg_aw = _pg_w - swing_px(16); _pg_ah = _pg_h - swing_px(8);
+  _pg_t = floor(min((_pg_aw - 2 * _pg_pad - 3 * _pg_gap) / 4, (_pg_ah - 2 * _pg_pad - _pg_hdr - _pg_ft - 3 * _pg_gap) / 4));
+  _pg_t = min(_pg_t, swing_px(SEQ_UI_PK_TILE_MAX_B));
+  _pg_gw = 4 * _pg_t + 3 * _pg_gap;
+  seq_ui_pk_tile = _pg_t;
+  seq_ui_pk_w = max(swing_px(SEQ_UI_PK_MIN_W_B), _pg_gw + 2 * _pg_pad);
+  seq_ui_pk_h = 2 * _pg_pad + _pg_hdr + _pg_gw + _pg_ft;
+  // beside the point it opened from: to its right, else to its left; centred on it; inside the rect whatever
+  seq_ui_pk_x = seq_ui_pk_ax + swing_px(14);
+  seq_ui_pk_x + seq_ui_pk_w > _pg_x + _pg_w - swing_px(8) ? seq_ui_pk_x = seq_ui_pk_ax - swing_px(14) - seq_ui_pk_w;
+  seq_ui_pk_x = floor(max(_pg_x + swing_px(8), min(_pg_x + _pg_w - swing_px(8) - seq_ui_pk_w, seq_ui_pk_x)));
+  seq_ui_pk_y = floor(max(_pg_y + swing_px(4), min(_pg_y + _pg_h - swing_px(4) - seq_ui_pk_h, seq_ui_pk_ay - seq_ui_pk_h * 0.5)));
+  seq_ui_pk_gx = seq_ui_pk_x + floor((seq_ui_pk_w - _pg_gw) * 0.5); seq_ui_pk_gy = seq_ui_pk_y + _pg_pad + _pg_hdr;
+  _pg_t >= swing_px(SEQ_UI_PK_TILE_MIN_B) && seq_ui_pk_w <= _pg_aw && seq_ui_pk_h <= _pg_ah;
+);
+// Open it for lane _po_l of the pattern on screen, beside the mouse, in the panel's rect; the text menu where it does not fit.
+// A scrub or a strip drag in flight ends: the parked mouse would read as their release far away.
+function seq_ui_pk_open(_po_l, _po_x, _po_y, _po_w, _po_h) local(_po_t, _po_n, _po_i) (
+  _po_t = seq_lane_at(max(0, min(SEQ_PATS - 1, seq_cur | 0)), _po_l)[0] | 0;
+  seq_ui_pk_bank = _po_t >= 0 && _po_t < NUM_SLOTS ? floor(_po_t / NUM_PADS) : max(0, min(NUM_BANKS - 1, bank_cur | 0));
+  seq_ui_pk_ax = mx; seq_ui_pk_ay = my;
+  seq_ui_sdrag = 0; seq_ui_scrub = 0;
+  seq_ui_pk_geom(_po_x, _po_y, _po_w, _po_h) ? (
+    seq_ui_pk_lane = _po_l; seq_ui_pk_pat = max(0, min(SEQ_PATS - 1, seq_cur | 0));
+    seq_ui_pk_tab = _po_t < 0 ? 1 : 0;   // a lane that plays a MIDI channel thinks in notes: PIANO first
+    // the keys open on the octave of the lane's pad, else of the bank's lowest pad note
+    _po_n = _po_t >= 0 && _po_t < NUM_SLOTS ? p_note[_po_t] : 128;
+    _po_n >= 128 ? ( _po_i = 0; loop(NUM_PADS, _po_n = min(_po_n, p_note[seq_ui_pk_bank * NUM_PADS + _po_i]); _po_i += 1; ); );
+    seq_ui_pk_oct = max(0, min(108, 12 * floor(max(0, min(127, _po_n | 0)) / 12)));
+    seq_ui_pk_hov = -1; seq_ui_pk_just = 1;
+    seq_ui_pick_lane = -1;
+  ) : (
+    seq_ui_pk_lane = -1;
+    seq_ui_pick_lane = _po_l; seq_ui_pick_open(seq_ui_pk_bank);
+  );
+);
+// The lane's pad chosen (a PADS tile or a PIANO key): its target, and a MIDI channel lane back to steps -- field 10
+// cleared FIRST: a negative target is a roll whatever field 10 says (seq_lane_roll), so the lane stays the channel's roll
+// until the target turns, and no block meets a roll aimed at a pad (its notes, pitched for the channel, on the pad) between
+// the two writes; one undo point. The picker closes.
+function seq_ui_pk_choose(_pc_slot) local(_pc_lb, _pc_ch) (
+  seq_ui_pk_lane >= 0 && seq_ui_pk_lane < SEQ_LANES && _pc_slot >= 0 && _pc_slot < NUM_SLOTS ? (
+    _pc_lb = seq_lane_at(seq_ui_pk_pat, seq_ui_pk_lane);
+    _pc_ch = (_pc_lb[0] | 0) < 0;
+    _pc_ch ? ( _pc_lb[10] = 0; seq_ui_roll_lane == seq_ui_pk_lane ? seq_ui_roll_lane = -1; );
+    _pc_lb[0] = _pc_slot;
+    seq_ui_edited();
+  );
+  seq_ui_pk_lane = -1;
+);
+// One choice drawn into a box: the pad's colour (faint when it cannot play), its category glyph and number where the box is
+// a tile, its name (cut with "..." to the box); the lane's pad ringed.
+function seq_ui_pk_tile_draw(_pt_s, _pt_x, _pt_y, _pt_w, _pt_h, _pt_hov, _pt_cur) local(_pt_on, _pt_cat, _pt_lum, _pt_nm, _pt_tw, _pt_th, _pt_dk) (
+  _pt_on = pad_is_playable(_pt_s);
+  swing_color_pad_hsl(_pt_s, 0.75, 0.5);
+  gfx_set(_hsl_r, _hsl_g, _hsl_b, _pt_on ? (_pt_hov ? 1 : 0.82) : (_pt_hov ? 0.45 : 0.28)); gfx_rect(_pt_x, _pt_y, _pt_w, _pt_h);
+  _pt_lum = (_hsl_r + _hsl_g + _hsl_b) * 0.333;
+  _pt_dk = _pt_on && _pt_lum > 0.55;   // dark ink on a light pad
+  _pt_cur ? ( gfx_set(1, 1, 1, 0.95); gfx_rect(_pt_x, _pt_y, _pt_w, 2); gfx_rect(_pt_x, _pt_y + _pt_h - 2, _pt_w, 2); gfx_rect(_pt_x, _pt_y, 2, _pt_h); gfx_rect(_pt_x + _pt_w - 2, _pt_y, 2, _pt_h); );
+  _pt_nm = get_cname_slot(_pt_s); strlen(_pt_nm) == 0 ? _pt_nm = get_name_slot(_pt_s);
+  strlen(_pt_nm) == 0 ? ( sprintf(#seq_ui_pk_nm, "Pad %d", _pt_s - NUM_PADS * floor(_pt_s / NUM_PADS) + 1); _pt_nm = #seq_ui_pk_nm; );
+  _pt_h >= swing_px(30) ? (
+    // a tile: the glyph above the middle, the pad's number in its corner, the name at its foot
+    _pt_cat = seq_ui_pad_cat(_pt_s);
+    _pt_cat >= 0 ? (
+      _pt_dk ? gfx_set(0.08, 0.09, 0.12, 0.9) : gfx_set(1, 1, 1, _pt_on ? 0.92 : 0.4);
+      eon_draw_cat_glyph_hi(_pt_cat, (_pt_x + _pt_w * 0.5) | 0, (_pt_y + _pt_h * 0.42) | 0, max(3, (_pt_h * 0.2) | 0), -1);
+    );
+    sprintf(#seq_ui_pk_s2, "%c%d", 65 + floor(_pt_s / NUM_PADS), _pt_s - NUM_PADS * floor(_pt_s / NUM_PADS) + 1);
+    rk_font(1, swing_fs(7), 0); _pt_dk ? gfx_set(0.08, 0.09, 0.12, 0.7) : gfx_set(1, 1, 1, _pt_on ? 0.7 : 0.35);
+    gfx_x = _pt_x + 3; gfx_y = _pt_y + 2; gfx_drawstr(#seq_ui_pk_s2);
+    rk_font(1, swing_fs(8), 0); _pt_dk ? gfx_set(0.08, 0.09, 0.12, 0.95) : gfx_set(1, 1, 1, _pt_on ? 0.95 : 0.45);
+    seq_ui_fit(_pt_nm, _pt_w - 6); _pt_tw = 0; _pt_th = 0; gfx_measurestr(#seq_ui_fit, _pt_tw, _pt_th);
+    gfx_x = _pt_x + (_pt_w - _pt_tw) * 0.5; gfx_y = _pt_y + _pt_h - _pt_th - 3; gfx_drawstr(#seq_ui_fit);
+  ) : (
+    // a key's band: the name along it
+    rk_font(1, swing_fs(8), 0); _pt_dk ? gfx_set(0.08, 0.09, 0.12, 0.95) : gfx_set(1, 1, 1, _pt_on ? 0.95 : 0.45);
+    seq_ui_fit(_pt_nm, _pt_w - 8); _pt_tw = 0; _pt_th = 0; gfx_measurestr(#seq_ui_fit, _pt_tw, _pt_th);
+    gfx_x = _pt_x + 4; gfx_y = _pt_y + (_pt_h - _pt_th) * 0.5; gfx_drawstr(#seq_ui_fit);
+  );
+);
+// The picker, drawn and handled LAST in swing_seq_panel_draw with the real mouse (the panel under it saw it parked).
+function seq_ui_pk_draw(_pd_px, _pd_py, _pd_pw, _pd_ph)
+local(_kd_x, _kd_y, _kd_w, _kd_h, _kd_t, _kd_gap, _kd_in, _kd_hs, _kd_i, _kd_s, _kd_r, _kd_c, _kd_tx, _kd_ty, _kd_tw, _kd_th, _kd_hov,
+      _kd_cur, _kd_n, _kd_cw, _kd_rh, _kd_kw, _kd_blk, _kd_hk, _kd_inp, _kd_nh) (
+  !seq_ui_pk_geom(_pd_px, _pd_py, _pd_pw, _pd_ph) ? seq_ui_pk_lane = -1 : (   // the panel shrank under it: closed
+    seq_ui_pk_seen = 1;   // a home drew it: the gate may hold the face's mouse for it next pass
+    _kd_x = seq_ui_pk_x; _kd_y = seq_ui_pk_y; _kd_w = seq_ui_pk_w; _kd_h = seq_ui_pk_h; _kd_t = seq_ui_pk_tile; _kd_gap = swing_px(3);
+    _kd_cur = seq_lane_at(seq_ui_pk_pat, seq_ui_pk_lane)[0] | 0;   // the lane's target now
+    _kd_in = mx >= _kd_x && mx < _kd_x + _kd_w && my >= _kd_y && my < _kd_y + _kd_h;
+    _kd_inp = mx >= _pd_px && mx < _pd_px + _pd_pw && my >= _pd_py && my < _pd_py + _pd_ph;
+    // the veil over the panel, the ground, the edge
+    gfx_set(0, 0, 0, 0.30); gfx_rect(_pd_px, _pd_py, _pd_pw, _pd_ph);
+    gfx_set(seq_ui_bg_r * 0.78, seq_ui_bg_g * 0.78, seq_ui_bg_b * 0.78, 1); gfx_rect(_kd_x, _kd_y, _kd_w, _kd_h);
+    gfx_set(0.40, 0.58, 0.80, 0.8);
+    gfx_rect(_kd_x, _kd_y, _kd_w, 1); gfx_rect(_kd_x, _kd_y + _kd_h - 1, _kd_w, 1); gfx_rect(_kd_x, _kd_y, 1, _kd_h); gfx_rect(_kd_x + _kd_w - 1, _kd_y, 1, _kd_h);
+    // the title: "<lane> plays"
+    sprintf(#seq_ui_pk_s, "%s plays", seq_ui_lane_name(_kd_cur));
+    rk_font(1, swing_fs(10), 'b'); gfx_set(0.85, 0.9, 0.96, 0.95);
+    seq_ui_fit(#seq_ui_pk_s, _kd_w - swing_px(12)); _kd_tw = 0; _kd_th = 0; gfx_measurestr(#seq_ui_fit, _kd_tw, _kd_th);
+    gfx_x = _kd_x + swing_px(6); gfx_y = _kd_y + swing_px(6) + (swing_px(18) - _kd_th) * 0.5; gfx_drawstr(#seq_ui_fit);
+    // the tabs, and the banks at the right
+    _kd_ty = _kd_y + swing_px(6 + 18 + 2); _kd_tx = _kd_x + swing_px(6);
+    _kd_hov = seq_ui_btn(_kd_tx, _kd_ty, swing_px(44), swing_px(18), "PADS", seq_ui_pk_tab == 0);
+    _kd_hov && lmb_down && !seq_ui_pk_just ? seq_ui_pk_tab = 0;
+    _kd_hov ? swing_tooltip_check(1495, "The pads, laid out like the grid: pad 1 at the bottom left.");
+    _kd_tx += swing_px(46);
+    _kd_hov = seq_ui_btn(_kd_tx, _kd_ty, swing_px(48), swing_px(18), "PIANO", seq_ui_pk_tab == 1);
+    _kd_hov && lmb_down && !seq_ui_pk_just ? seq_ui_pk_tab = 1;
+    _kd_hov ? swing_tooltip_check(1495, "The same pads by note: a key wears the pad that sits on its note.");
+    _kd_tx = _kd_x + _kd_w - swing_px(6) - 4 * swing_px(22) + swing_px(2);
+    _kd_i = 0;
+    loop(NUM_BANKS,
+      sprintf(#seq_ui_lbl, "%c", 65 + _kd_i);
+      _kd_hov = swing_bank_has_sound(_kd_i) || seq_ui_pk_bank == _kd_i ? seq_ui_btn(_kd_tx, _kd_ty, swing_px(20), swing_px(18), #seq_ui_lbl, seq_ui_pk_bank == _kd_i)
+                                                                       : seq_ui_btn_dim(_kd_tx, _kd_ty, swing_px(20), swing_px(18), #seq_ui_lbl);
+      _kd_hov && lmb_down && !seq_ui_pk_just ? ( seq_ui_pk_bank = _kd_i; seq_ui_pk_hov = -1; );
+      _kd_hov ? swing_tooltip_check(1495, swing_bank_has_sound(_kd_i) ? "A bank: its pads here." : "A bank with no sound in it yet: its pads here, empty.");
+      _kd_tx += swing_px(22); _kd_i += 1;
+    );
+    // the body
+    _kd_hs = -1;   // the pad under the pointer
+    seq_ui_pk_tab == 0 ? (
+      _kd_r = 0;
+      loop(4,
+        _kd_c = 0;
+        loop(4,
+          _kd_s = seq_ui_pk_bank * NUM_PADS + (3 - _kd_r) * 4 + _kd_c;   // like the pads: pad 1 at the bottom left
+          _kd_tx = seq_ui_pk_gx + _kd_c * (_kd_t + _kd_gap); _kd_ty = seq_ui_pk_gy + _kd_r * (_kd_t + _kd_gap);
+          _kd_hov = mx >= _kd_tx && mx < _kd_tx + _kd_t && my >= _kd_ty && my < _kd_ty + _kd_t;
+          _kd_hov ? _kd_hs = _kd_s;
+          seq_ui_pk_tile_draw(_kd_s, _kd_tx, _kd_ty, _kd_t, _kd_t, _kd_hov, _kd_s == _kd_cur);
+          _kd_c += 1;
+        );
+        _kd_r += 1;
+      );
+      _kd_hs >= 0 ? (
+        sprintf(#seq_ui_lbl2, "%s: hover to hear it, click to play it on this lane.", seq_ui_lane_name(_kd_hs));
+        swing_tooltip_check(1494, #seq_ui_lbl2);
+      );
+    ) : (
+      // PIANO: two octaves from seq_ui_pk_oct, the low one in the left column; each key a row, high at the top
+      _kd_cw = floor((4 * _kd_t + 2 * _kd_gap) * 0.5); _kd_rh = (4 * _kd_t + 3 * _kd_gap) / 12;
+      _kd_kw = min(swing_px(28), floor(_kd_cw * 0.34));
+      _kd_hk = -1;
+      _kd_c = 0;
+      loop(2,
+        _kd_r = 0;
+        loop(12,
+          _kd_n = seq_ui_pk_oct + _kd_c * 12 + 11 - _kd_r;
+          _kd_tx = seq_ui_pk_gx + _kd_c * (_kd_cw + _kd_gap); _kd_ty = floor(seq_ui_pk_gy + _kd_r * _kd_rh);
+          _kd_th = max(1, floor(seq_ui_pk_gy + (_kd_r + 1) * _kd_rh) - _kd_ty - 1);
+          // the first pad of the bank shown that sits on this note
+          _kd_s = -1; _kd_i = 0;
+          _kd_n <= 127 ? loop(NUM_PADS, _kd_s < 0 && (p_note[seq_ui_pk_bank * NUM_PADS + _kd_i] | 0) == _kd_n ? _kd_s = seq_ui_pk_bank * NUM_PADS + _kd_i; _kd_i += 1; );
+          _kd_hov = mx >= _kd_tx && mx < _kd_tx + _kd_cw && my >= _kd_ty && my < _kd_ty + _kd_th + 1;
+          _kd_hov ? ( _kd_hk = _kd_n; _kd_s >= 0 ? _kd_hs = _kd_s; );
+          // the key: white or black, its name where the row has the room (the C's always)
+          _kd_blk = seq_pc_black(_kd_n % 12);
+          _kd_blk ? gfx_set(0.14, 0.16, 0.19, 1) : gfx_set(0.84, 0.86, 0.89, _kd_n > 127 ? 0.3 : (_kd_hov ? 1 : 0.92));
+          gfx_rect(_kd_tx, _kd_ty, _kd_kw, _kd_th);
+          _kd_n <= 127 && ((_kd_n % 12) == 0 || _kd_th >= swing_px(12)) ? (
+            seq_ui_note_name(_kd_n); rk_font(1, swing_fs(7), 0); _kd_blk ? gfx_set(0.85, 0.88, 0.92, 0.9) : gfx_set(0.18, 0.20, 0.24, 0.95);
+            _kd_tw = 0; _kd_nh = 0; gfx_measurestr(#seq_ui_gstr, _kd_tw, _kd_nh);
+            gfx_x = _kd_tx + 2; gfx_y = _kd_ty + (_kd_th - _kd_nh) * 0.5; gfx_drawstr(#seq_ui_gstr);
+          );
+          // the pad on it, or nothing (dim)
+          _kd_s >= 0 ? seq_ui_pk_tile_draw(_kd_s, _kd_tx + _kd_kw + 1, _kd_ty, _kd_cw - _kd_kw - 1, _kd_th, _kd_hov, _kd_s == _kd_cur)
+                     : ( gfx_set(1, 1, 1, 0.04); gfx_rect(_kd_tx + _kd_kw + 1, _kd_ty, _kd_cw - _kd_kw - 1, _kd_th); );
+          _kd_r += 1;
+        );
+        _kd_c += 1;
+      );
+      _kd_hk >= 0 && _kd_hk <= 127 ? (
+        seq_ui_note_name(_kd_hk); strcpy(#seq_ui_pk_s2, #seq_ui_gstr);
+        _kd_hs >= 0 ? sprintf(#seq_ui_lbl2, "%s: %s -- hover to hear it, click to play it on this lane.", #seq_ui_pk_s2, seq_ui_lane_name(_kd_hs))
+                    : sprintf(#seq_ui_lbl2, "%s: no pad of bank %c sits on this note.", #seq_ui_pk_s2, 65 + seq_ui_pk_bank);
+        swing_tooltip_check(1494, #seq_ui_lbl2);
+      );
+      // the wheel over the keys: an octave
+      mx >= seq_ui_pk_gx && mx < seq_ui_pk_gx + 4 * _kd_t + 3 * _kd_gap && my >= seq_ui_pk_gy && my < seq_ui_pk_gy + 4 * _kd_t + 3 * _kd_gap && frame_wheel != 0 && !seq_ui_pk_just ?
+        seq_ui_pk_oct = max(0, min(108, seq_ui_pk_oct + (frame_wheel > 0 ? 12 : -12)));
+    );
+    // the foot: "MIDI channel ..." and, with the keys, their octave
+    _kd_ty = _kd_y + _kd_h - swing_px(6 + 18);
+    _kd_hov = seq_ui_btn(_kd_x + swing_px(6), _kd_ty, swing_px(104), swing_px(18), "MIDI channel ...", _kd_cur < 0);
+    _kd_hov && lmb_down && !seq_ui_pk_just ? ( seq_ui_chan_lane = seq_ui_pk_lane; seq_ui_pk_lane = -1; seq_ui_chan_menu_open(); );
+    _kd_hov ? swing_tooltip_check(1483, "This lane plays its notes out as MIDI on a channel instead (a piano roll lane).");
+    seq_ui_pk_tab == 1 ? (
+      _kd_tx = _kd_x + _kd_w - swing_px(6 + 20);
+      _kd_hov = seq_ui_btn(_kd_tx, _kd_ty, swing_px(20), swing_px(18), ">", 0);
+      _kd_hov && lmb_down && !seq_ui_pk_just ? seq_ui_pk_oct = min(108, seq_ui_pk_oct + 12);
+      _kd_hov ? swing_tooltip_check(1497, "The keys an octave up (or the wheel over them).");
+      seq_ui_note_name(seq_ui_pk_oct); rk_font(1, swing_fs(8), 'b'); gfx_set(0.75, 0.82, 0.9, 0.9);
+      _kd_tw = 0; _kd_th = 0; gfx_measurestr(#seq_ui_gstr, _kd_tw, _kd_th);
+      gfx_x = _kd_tx - swing_px(4) - _kd_tw; gfx_y = _kd_ty + (swing_px(18) - _kd_th) * 0.5; gfx_drawstr(#seq_ui_gstr);
+      _kd_tx -= swing_px(8) + _kd_tw + swing_px(20);
+      _kd_hov = seq_ui_btn(_kd_tx, _kd_ty, swing_px(20), swing_px(18), "<", 0);
+      _kd_hov && lmb_down && !seq_ui_pk_just ? seq_ui_pk_oct = max(0, seq_ui_pk_oct - 12);
+      _kd_hov ? swing_tooltip_check(1497, "The keys an octave down (or the wheel over them).");
+    );
+    // closing, choosing, hearing -- not on the frame it opened (the press that opened it is not its own)
+    !seq_ui_pk_just ? (
+      _char == 27 ? ( seq_ui_pk_lane = -1; _char = 0; );
+      rmb_down || seq_ui_pk_rawr ? seq_ui_pk_lane = -1;     // a right press here, or on the face (the gate kept it; spent here)
+      seq_ui_pk_rawr = 0;
+      lmb_down && !_kd_in ? seq_ui_pk_lane = -1;            // inside the panel: closed, and the press was nobody else's
+      _raw_lmb_down && !_kd_inp ? seq_ui_pk_lane = -1;      // outside the panel: closed (the gate took it from the face)
+      seq_ui_pk_lane >= 0 ? (
+        _kd_hs != seq_ui_pk_hov ? ( seq_ui_pk_hov = _kd_hs; _kd_hs >= 0 && !_raw_LMB ? seq_ui_retap(_kd_hs); );
+        _kd_hs >= 0 && lmb_down ? seq_ui_pk_choose(_kd_hs);
+      );
+    );
+    seq_ui_pk_just = 0;
+  );
+);
+
+// ── The song strip's drags (the small things round; Steppa's rules, EON_StepSeq ~9083 / ~9332 / ~10936) ──
+// The chain's drop gap under x (0..the chips drawn): the chips whose middle lies left of it, by their REAL widths as drawn
+// (Steppa's caret took one width for every chip and could point at another gap than the drop).
+function seq_ui_ch_gap(_cg_x) local(_cg_i, _cg_g) (
+  _cg_g = 0; _cg_i = 0;
+  seq_ui_chgeo > 0 ? loop(max(0, min(32, seq_ui_chn)), _cg_x >= seq_ui_chgeo[_cg_i * 2] + seq_ui_chgeo[_cg_i * 2 + 1] * 0.5 ? _cg_g = _cg_i + 1; _cg_i += 1; );
+  _cg_g;
+);
+// ...and a gap's x: between two chips, or just outside the first or the last (the chain's area with no chips).
+function seq_ui_ch_gap_x(_cx_g) local(_cx_n) (
+  _cx_n = seq_ui_chgeo > 0 ? max(0, min(32, seq_ui_chn)) : 0;
+  _cx_n == 0 ? seq_ui_ch_x0
+  : _cx_g <= 0 ? seq_ui_chgeo[0] - swing_px(2)
+  : _cx_g >= _cx_n ? seq_ui_chgeo[(_cx_n - 1) * 2] + seq_ui_chgeo[(_cx_n - 1) * 2 + 1]
+  : floor((seq_ui_chgeo[(_cx_g - 1) * 2] + seq_ui_chgeo[(_cx_g - 1) * 2 + 1] + seq_ui_chgeo[_cx_g * 2]) * 0.5) - 1;
+);
+// The pointer is over the chain's area along the strip (its chips, the empty chain's drop zone, a little slack at the
+// front for the first gap); the band's height is the caller's test.
+function seq_ui_over_chain() ( mx >= seq_ui_ch_x0 - swing_px(10) && mx < seq_ui_ch_x1 + swing_px(8); );
+// Once a frame after the strip drew (its band and the chain's chips are this frame's). The button is the RAW one, so a press
+// that leaves the panel (or the side column) keeps the drag until it comes up, and the drop is judged where it comes up,
+// against the chain as it is THEN (another Swing, Steppa or the Drum Matrix may have changed it): a pattern or a region
+// dropped on the chain goes in at the gap under it (op 17, one write; the spec: "released over the chain"), dropped
+// anywhere else -- the regions' timeline, CHAIN > [] CLR -- nothing (a region chip's click that drifted must not add it), a
+// pattern with no region refused; a chain chip dropped on the chain or within a row of it moves there (op 3), dropped a
+// row from it but left of the chain nothing, dropped further away it leaves the chain (op 2), never moved it does nothing;
+// an entry that is no longer the one taken is left alone.
+function seq_ui_sdrag_tick() local(_dk_sb, _dk_len, _dk_g, _dk_to, _dk_band, _dk_near) (
+  !seq_opt_sync || _reg_my_slot < 0 ? seq_ui_sdrag = 0;
+  seq_ui_sdrag ? (
+    _dk_sb = EON_SS_SONG_BASE + _reg_my_slot * EON_SS_SONG_STRIDE;
+    _raw_LMB ? (
+      seq_ui_sdrag == 1 && my - seq_ui_sdrag_y0 > swing_px(6) ? ( seq_ui_sdrag = 2; seq_ui_sdrag_ord = seq_ui_region_of(seq_ui_sdrag_pat) + 1; );   // a tab dragged down
+      seq_ui_sdrag == 4 && (abs(mx - seq_ui_sdrag_x0) > swing_px(6) || abs(my - seq_ui_sdrag_y0) > swing_px(6)) ? seq_ui_sdrag = 2;            // a region chip dragged (6 px, a tab's)
+      seq_ui_sdrag == 3 && (abs(mx - seq_ui_sdrag_x0) > swing_px(3) || abs(my - seq_ui_sdrag_y0) > swing_px(3)) ? seq_ui_sdrag_moved = 1;
+    ) : (
+      _dk_len = max(0, min(EON_SS_SONG_ENTRY_MAX, gmem[_dk_sb + 1] | 0));
+      _dk_band = my >= seq_ui_song_by - 1 && my < seq_ui_song_by + seq_ui_song_bh + 1;
+      // (without the host's geometry claim -- a host older than the round -- there is no gap to aim at: a drop goes on the
+      // end and a chip is not moved; dropped clear, it still leaves)
+      seq_ui_sdrag == 2 && _dk_band && seq_ui_over_chain() ? (
+        seq_ui_sdrag_ord < 1 ? seq_ui_say("This pattern has no region in the song yet.")
+        : !seq_ui_song_new_ok() ? 0   // op 17 is the round's: the footer said why
+        : _dk_len >= EON_SS_SONG_ENTRY_MAX ? seq_ui_say("The chain is full: 32 entries.")
+        : (
+          _dk_g = seq_ui_chgeo > 0 ? min(seq_ui_ch_gap(mx), _dk_len) : _dk_len;
+          seq_ui_song_cmd(17, seq_ui_sdrag_ord, _dk_g + 1);
+        );
+      ) : seq_ui_sdrag == 3 && seq_ui_sdrag_moved ? (
+        seq_ui_sdrag_from > _dk_len || (gmem[_dk_sb + 8 + (seq_ui_sdrag_from - 1) * 2] | 0) != seq_ui_sdrag_v ? seq_ui_say("The chain changed while you dragged: nothing moved.")
+        : (
+          _dk_near = my >= seq_ui_song_by - seq_ui_song_bh && my < seq_ui_song_by + 2 * seq_ui_song_bh;   // the strip, or a row from it
+          _dk_near ? (
+            // left of the chain (over the timeline or CHAIN > [] CLR) there is no gap: nothing moves (it went to the front)
+            seq_ui_chgeo > 0 && seq_ui_over_chain() ? (
+              _dk_g = min(seq_ui_ch_gap(mx), _dk_len);
+              _dk_to = _dk_g + 1 <= seq_ui_sdrag_from ? _dk_g + 1 : _dk_g;   // lift-and-insert (SongReorder): a gap past the entry counts one less
+              _dk_to = max(1, min(_dk_len, _dk_to));
+              _dk_to != seq_ui_sdrag_from ? seq_ui_song_cmd(3, seq_ui_sdrag_from, _dk_to);
+            );
+          ) : seq_ui_song_cmd(2, seq_ui_sdrag_from, 0);
+        );
+      );
+      seq_ui_sdrag = 0;
+    );
+  );
+);
+// The drag's look (Steppa's): a 2 px caret at the gap it would drop into while it is over the strip, and a small ghost chip
+// with the pattern's number riding the pointer -- red where the drop would be refused or would take the entry out.
+function seq_ui_sdrag_draw() local(_sg_band, _sg_g, _sg_p, _sg_bad, _sg_out, _sg_tw, _sg_th, _sg_v, _sg_ord) (
+  (seq_ui_sdrag == 2 || (seq_ui_sdrag == 3 && seq_ui_sdrag_moved)) && _raw_LMB && seq_opt_sync ? (
+    _sg_band = my >= seq_ui_song_by - 1 && my < seq_ui_song_by + seq_ui_song_bh + 1;
+    _sg_bad = seq_ui_sdrag == 2 && seq_ui_sdrag_ord < 1;
+    _sg_out = seq_ui_sdrag == 3 && !(my >= seq_ui_song_by - seq_ui_song_bh && my < seq_ui_song_by + 2 * seq_ui_song_bh);
+    _sg_band && !_sg_bad && seq_ui_over_chain() ? (   // the caret only where a drop does something (seq_ui_sdrag_tick)
+      _sg_g = seq_ui_ch_gap(mx);
+      gfx_set(0.99, 1, 1, 0.9); gfx_rect(seq_ui_ch_gap_x(_sg_g), seq_ui_song_by, 2, seq_ui_song_bh);
+    );
+    seq_ui_sdrag == 2 ? _sg_p = seq_ui_sdrag_pat : (
+      _sg_v = gmem[EON_SS_SONG_BASE + max(0, _reg_my_slot) * EON_SS_SONG_STRIDE + 8 + (seq_ui_sdrag_from - 1) * 2] | 0; _sg_ord = _sg_v - 256 * floor(_sg_v / 256);
+      _sg_p = _sg_ord >= 1 && _sg_ord <= seq_map_n ? seq_map[(_sg_ord - 1) * 4 + 2] | 0 : -1;
+    );
+    _sg_bad || _sg_out ? gfx_set(0.95, 0.35, 0.30, 0.6) : gfx_set(1, 1, 1, 0.38);
+    gfx_rect(mx - swing_px(9), my - swing_px(8), swing_px(18), swing_px(16));
+    _sg_p >= 0 && _sg_p < SEQ_PATS ? sprintf(#seq_ui_lbl, "%d", _sg_p + 1) : strcpy(#seq_ui_lbl, "-");
+    rk_font(1, swing_fs(8), 0); gfx_set(0.05, 0.06, 0.08, 0.9); _sg_tw = 0; _sg_th = 0; gfx_measurestr(#seq_ui_lbl, _sg_tw, _sg_th);
+    gfx_x = mx - _sg_tw * 0.5; gfx_y = my - _sg_th * 0.5; gfx_drawstr(#seq_ui_lbl);
+    _sg_bad ? swing_tooltip_check(1496, "This pattern has no region in the song yet.");
+  );
+);
+
