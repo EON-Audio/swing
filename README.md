@@ -10,4 +10,4 @@ If you ran the beta: your install keeps working and your songs open as before. W
 error for the beta's address. That's expected. To stop it, untick "EON Studios — Swing 2" in
 Extensions > ReaPack > Manage repositories. Untick it, don't Uninstall it: Uninstall deletes the files your songs use.
 
-*EON Studios*
+*EON Audio*
